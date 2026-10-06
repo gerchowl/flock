@@ -565,6 +565,10 @@ fn main() -> io::Result<()> {
                 "Agent/terminal helpers over the socket API",
             ),
             (
+                "flk delegate <subcommand>",
+                "Hand a task to an agent: start, send, wait, result, status, reap",
+            ),
+            (
                 "flk pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),

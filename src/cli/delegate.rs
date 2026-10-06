@@ -30,7 +30,7 @@
 //! and the subverb keeps the six verbs in the help table where a reader is
 //! already looking.
 //!
-//! ## The two things that are easy to get wrong
+//! ## The three things that are easy to get wrong
 //!
 //! **Focus.** A delegate never asks for focus, and never runs in the workspace
 //! the operator is looking at. `workspace.create` and `worktree.create` are both
@@ -45,17 +45,25 @@
 //! then reports one. A round is therefore reported only when the agent actually
 //! entered `working` after that round's cursor AND a reply exists from after the
 //! submit — which is what `settled` alone would have let it get wrong.
+//!
+//! **What may be destroyed.** Every request this module makes is bounded, and
+//! every kill or close is preceded by an identity check against what the
+//! registry recorded. A workspace id is a name, not a claim: one can be
+//! reassigned by a server restart, and closing the workspace a stale entry names
+//! would take the operator's checkout with it. So [`tear_down`] — the one
+//! routine a failed start and a `reap` both run — closes nothing whose recorded
+//! identity it has not just re-checked.
 
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::os::unix::fs::PermissionsExt;
-
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    AgentResultParams, AgentStartParams, AgentTarget, Method, PaneTarget, Request,
-    WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
+    AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, Method, PaneListParams,
+    PaneTarget, Request, WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams,
+    WorktreeKillParams,
 };
 
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
@@ -110,6 +118,13 @@ const RESULT_POLL: Duration = Duration::from_millis(250);
 /// How often the readiness gate asks whether the agent is at its prompt.
 const READY_POLL: Duration = Duration::from_millis(200);
 
+/// Cap on any single socket request this module makes.
+///
+/// A delegate is a long-lived client and a live handoff replaces the socket
+/// underneath it, so bounding each request means such a stall costs one poll
+/// rather than the whole command. The same cap the settled core uses.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// `delegate`'s own exit codes.
 ///
 /// `0`/`3`/`4`/`124` are `settled::exit`, shared with the two wait verbs so a
@@ -146,13 +161,23 @@ const UNSAFE_PATH_CHARS: [char; 6] = ['!', '$', '`', '\u{22}', '\'', '\\'];
 /// "not yet" would make the grace hang until the deadline and then report
 /// `no_result`, which is a lie about a server that answered.
 ///
-/// `no_agent_session` is the no-session refusal: the pane has not reported a
-/// session yet, so there is no store to read.
+/// `no_agent_session` is the no-session refusal (D8): the pane has not reported a
+/// session yet, so there is no store to read at all.
 const NOT_YET_CODES: [&str; 4] = [
     "no_result",
     "transcript_not_found",
     "transcript_unreadable",
     "no_agent_session",
+];
+
+/// `worktree.kill` refusals that mean "the checkout is not there to remove".
+///
+/// A path that is already gone, or that is no longer a linked worktree, is what
+/// a reap wanted to achieve — so these are success, not a failure to report.
+const ALREADY_GONE_CODES: [&str; 3] = [
+    "not_linked_worktree",
+    "not_git_worktree",
+    "workspace_not_found",
 ];
 
 pub(super) fn run_delegate_command(args: &[String]) -> io::Result<i32> {
@@ -194,12 +219,12 @@ fn print_delegate_help() {
 /// Every refusal in this module goes through here so that no parse failure can
 /// print on stdout — with or without `--json`, a caller piping stdout gets either
 /// the object it asked for or nothing at all, never a diagnostic.
-fn usage(reason: impl std::fmt::Display) -> i32 {
+fn usage(reason: impl fmt::Display) -> i32 {
     eprintln!("{reason}");
     exit::USAGE
 }
 
-fn fail(reason: impl std::fmt::Display) -> i32 {
+fn fail(reason: impl fmt::Display) -> i32 {
     eprintln!("{reason}");
     1
 }
@@ -222,10 +247,28 @@ struct Entry {
     name: String,
     terminal_id: String,
     pane_id: String,
+    /// The shell pane `workspace.create` opened, before the delegate closed it.
+    ///
+    /// Recorded because it is the only identity a cwd-mode workspace still has
+    /// when the agent's own pane is gone: a start whose harness died at launch has
+    /// no agent pane, and the root pane is what was created with the workspace.
+    root_pane: String,
     workspace_id: String,
     mode: String,
     worktree: Option<String>,
     branch: Option<String>,
+    /// The repository-root workspace `worktree.create` opened as the new
+    /// checkout's parent, when it opened one.
+    ///
+    /// Recorded rather than re-derived, because the alternative is a list diff
+    /// across a window in which the operator may open a workspace of their own —
+    /// and a rollback that closes a list diff closes whatever appeared in it.
+    #[serde(default)]
+    parent_workspace_id: Option<String>,
+    #[serde(default)]
+    repo_root: Option<String>,
+    #[serde(default)]
+    repo_key: Option<String>,
     harness: String,
     model: Option<String>,
     round: u64,
@@ -279,13 +322,17 @@ fn read_entry(name: &str) -> Option<Entry> {
     serde_json::from_str(&body).ok()
 }
 
-/// Write the entry atomically at mode 0600.
+/// Write the entry atomically, and never leave a temp file behind.
 ///
-/// The mode is set before the rename, so the file is never briefly world-readable
-/// — a registry entry names a checkout and a session. The rename is what makes
-/// the update atomic: a `delegate status` running against a half-written file
-/// reads the previous round, not a prefix of the next one.
+/// Mode 0600 at CREATION rather than by a later `set_permissions`: the window
+/// between the two is a window in which a registry entry — which names a
+/// checkout and a session — is world-readable. The rename is what makes the
+/// update atomic: a `delegate status` running against a half-written file reads
+/// the previous round, not a prefix of the next one.
 fn write_entry(entry: &Entry) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let path = entry_path(&entry.name);
     let dir = path.parent().expect("the entry path always has a parent");
     std::fs::create_dir_all(dir)?;
@@ -293,14 +340,27 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
     let body = serde_json::to_vec(entry).map_err(|err| {
         io::Error::other(format!("could not serialize the registry entry: {err}"))
     })?;
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&temp)?;
+
+    let written = (|| -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)?;
         file.write_all(&body)?;
         file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
     }
-    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&temp, &path)
+    if let Err(err) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// The exclusive lock one round at a time is enforced with.
@@ -323,18 +383,21 @@ fn take_lock(name: &str) -> Result<Lock, &'static str> {
         return Err("the lock path has no parent");
     };
     std::fs::create_dir_all(dir).map_err(|_| "could not create the delegate registry directory")?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|_| "could not open the delegate lock")?;
+    let file = open_lock_file(&path).map_err(|_| "could not open the delegate lock")?;
     match file.try_lock() {
         Ok(()) => Ok(Lock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err("busy"),
         Err(std::fs::TryLockError::Error(_)) => Err("could not lock"),
     }
+}
+
+fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 // ------------------------------------------------------------------ flags
@@ -627,12 +690,17 @@ fn validate_worktree_flags(flags: &StartFlags) -> Result<(), String> {
     Ok(())
 }
 
-/// The brief path, made absolute, checked, and returned as the one sentence to
-/// type.
+/// The brief path, made absolute, checked, readable, and returned as the one
+/// sentence to type.
 ///
 /// Absolute without resolving symlinks: the sentence names the path the caller
 /// wrote, and canonicalizing it would type a path nobody asked for on a machine
 /// where the two differ.
+///
+/// Opened for reading, and the handle dropped, here — before the lock and before
+/// any request. `metadata` says a file exists and is regular; it does not say the
+/// caller can read it, and a brief that cannot be opened is a refusal, not a
+/// failure three requests later with a workspace already created.
 fn prepare_brief(path: &str) -> Result<(String, String), String> {
     let absolute = std::path::absolute(Path::new(path))
         .map_err(|err| format!("brief path {path:?} could not be made absolute: {err}"))?;
@@ -655,24 +723,59 @@ fn prepare_brief(path: &str) -> Result<(String, String), String> {
     if !metadata.is_file() {
         return Err(format!("brief {text} is not a regular file"));
     }
+    drop(
+        std::fs::File::open(&absolute)
+            .map_err(|err| format!("brief {text} cannot be opened for reading: {err}"))?,
+    );
     let sentence = format!("Read {text} and execute it exactly.");
     Ok((text, sentence))
 }
 
 // --------------------------------------------------------------- requests
 
-fn request(method: Method) -> io::Result<serde_json::Value> {
-    let id = "cli:delegate";
-    super::send_request(&Request {
-        id: id.into(),
-        method,
-    })
+/// One socket request, bounded by whatever clock the caller has.
+///
+/// `min(REQUEST_TIMEOUT, time left)`, and nothing at all is sent once the deadline
+/// has passed — a delegate handed an expired clock reports the timeout rather than
+/// blocking on a socket it can no longer afford to read.
+fn request(method: Method, deadline: Option<Instant>) -> io::Result<serde_json::Value> {
+    let timeout = match deadline {
+        None => REQUEST_TIMEOUT,
+        Some(deadline) => {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            left.min(REQUEST_TIMEOUT)
+        }
+    };
+    ApiClient::local()
+        .request_value_with_timeout(
+            &Request {
+                id: "cli:delegate".into(),
+                method,
+            },
+            timeout,
+        )
+        .map_err(super::api_client_error_to_io)
 }
 
-fn agent_record(target: &str) -> Option<serde_json::Value> {
-    let response = request(Method::AgentGet(AgentTarget {
-        target: target.to_string(),
-    }))
+/// Has the caller's deadline passed?
+///
+/// Re-checked after every response: a reply that lands after the deadline is a
+/// timeout whichever way it went, so a command that has run out of clock does not
+/// then act on what it read on the way past.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn agent_record(target: &str, deadline: Option<Instant>) -> Option<serde_json::Value> {
+    let response = request(
+        Method::AgentGet(AgentTarget {
+            target: target.to_string(),
+        }),
+        deadline,
+    )
     .ok()?;
     response
         .pointer("/result/agent")
@@ -690,12 +793,17 @@ fn at<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
     value.pointer(pointer).and_then(serde_json::Value::as_str)
 }
 
-fn workspace_exists(workspace_id: &str) -> bool {
-    request(Method::WorkspaceGet(WorkspaceTarget {
-        workspace_id: workspace_id.to_string(),
-    }))
-    .map(|response| response.get("error").is_none())
-    .unwrap_or(false)
+/// Two paths that name the same place, compared as paths rather than as strings.
+///
+/// The registry records what the server sent; a later check compares it against
+/// what the server sends now. Comparing the raw strings would refuse to recognise
+/// the same checkout after the caller and the server spell a relative component
+/// differently, and a refused identity check here means never cleaning up.
+fn same_path(left: &str, right: &str) -> bool {
+    let absolute = |value: &str| {
+        std::path::absolute(Path::new(value)).unwrap_or_else(|_| PathBuf::from(value))
+    };
+    absolute(left) == absolute(right)
 }
 
 // ------------------------------------------------------------------ start
@@ -713,6 +821,14 @@ impl Mode {
             Self::Cwd => "cwd",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "worktree" => Some(Self::Worktree),
+            "cwd" => Some(Self::Cwd),
+            _ => None,
+        }
+    }
 }
 
 /// The workspace a delegate start created, before any agent is in it.
@@ -723,168 +839,594 @@ struct Placement {
     worktree: Option<String>,
     branch: Option<String>,
     root_pane: String,
+    parent_workspace_id: Option<String>,
+    repo_root: Option<String>,
+    repo_key: Option<String>,
 }
 
-fn place(flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
+impl Placement {
+    /// Everything a teardown is allowed to touch.
+    ///
+    /// Derived from the placement rather than from the registry, because a start
+    /// that fails before the entry is written still has to clean up after itself,
+    /// and because a registry entry can be stale in a way a live placement is not.
+    fn cleanup(&self, name: &str, mode: Mode, pane_id: &str, terminal_id: &str) -> Cleanup {
+        Cleanup {
+            workspace_id: self.workspace_id.clone(),
+            pane_id: pane_id.to_string(),
+            root_pane: self.root_pane.clone(),
+            terminal_id: terminal_id.to_string(),
+            mode,
+            worktree: self.worktree.clone(),
+            parent_workspace_id: self.parent_workspace_id.clone(),
+            repo_root: self.repo_root.clone(),
+            repo_key: self.repo_key.clone(),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Every workspace the server lists, as records.
+fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
+    request(Method::WorkspaceList(EmptyParams::default()), deadline)
+        .ok()
+        .and_then(|response| {
+            response
+                .pointer("/result/workspaces")
+                .and_then(|workspaces| workspaces.as_array())
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+fn workspace_ids(deadline: Option<Instant>) -> Vec<String> {
+    workspace_records(deadline)
+        .iter()
+        .filter_map(|workspace| field(workspace, "workspace_id").map(str::to_string))
+        .collect()
+}
+
+/// The repository-root workspace `worktree.create` opened, identified exactly.
+///
+/// Three conditions, all of them necessary:
+/// - it is new compared with the list taken immediately before the call, so a
+///   repository root that was already open is never adopted as a parent;
+/// - it is not itself a linked worktree, which is what separates the repository
+///   root from the checkout the delegate asked for;
+/// - its checkout path is the repo root the new checkout reported, so a
+///   workspace opened for some other repository in the same window is not it.
+///
+/// Exactly one match, or nothing is recorded: an ambiguous parent is a parent this
+/// code cannot close safely, and "cannot" has to mean "does not".
+fn identify_parent(
+    ids_before: &[String],
+    repo_root: &str,
+    deadline: Option<Instant>,
+) -> Option<String> {
+    let mut found: Option<String> = None;
+    for record in workspace_records(deadline) {
+        let Some(id) = field(&record, "workspace_id") else {
+            continue;
+        };
+        if ids_before.iter().any(|before| before == id) {
+            continue;
+        }
+        if record
+            .pointer("/worktree/is_linked_worktree")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        {
+            continue;
+        }
+        let Some(checkout) = record
+            .pointer("/worktree/checkout_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !same_path(checkout, repo_root) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id.to_string());
+    }
+    found
+}
+
+/// Create the delegate's workspace, and say what it created.
+///
+/// On any failure after the create request has gone out, this cleans up through
+/// the same routine `reap` runs and returns the exit code with the cause already
+/// on stderr — so there is no path where a start has asked the server to create
+/// something and then walked away from the answer.
+fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
+    let ids_before = workspace_ids(None);
     let response = match mode {
         Mode::Worktree => {
             let repo = match &flags.repo {
                 Some(repo) => repo.clone(),
-                None => std::env::current_dir()
-                    .map(|cwd| cwd.display().to_string())
-                    .map_err(|err| fail(format!("could not read the current directory: {err}")))?,
+                None => match std::env::current_dir() {
+                    Ok(cwd) => cwd.display().to_string(),
+                    Err(err) => {
+                        return Err(usage(format!(
+                            "could not read the current directory: {err}"
+                        )))
+                    }
+                },
             };
-            request(Method::WorktreeCreate(WorktreeCreateParams {
-                cwd: Some(repo),
-                branch: flags.branch.clone(),
-                base: flags.base.clone(),
-                focus: false,
-                ..WorktreeCreateParams::default()
-            }))
+            request(
+                Method::WorktreeCreate(WorktreeCreateParams {
+                    cwd: Some(repo),
+                    branch: flags.branch.clone(),
+                    base: flags.base.clone(),
+                    focus: false,
+                    ..WorktreeCreateParams::default()
+                }),
+                None,
+            )
         }
         Mode::Cwd => {
             let cwd = flags
                 .cwd
                 .clone()
                 .expect("placement was validated before anything was created");
-            request(Method::WorkspaceCreate(WorkspaceCreateParams {
-                cwd: Some(cwd),
-                focus: false,
-                label: None,
-            }))
+            request(
+                Method::WorkspaceCreate(WorkspaceCreateParams {
+                    cwd: Some(cwd),
+                    focus: false,
+                    label: None,
+                }),
+                None,
+            )
         }
     };
-    let response = response.map_err(fail)?;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => return Err(teardown_after_place_failure(name, &ids_before, mode, err)),
+    };
     if let Some(error) = response.get("error") {
-        return Err(fail(server_error(error)));
+        let reason = server_error(error);
+        return Err(teardown_after_place_failure(
+            name,
+            &ids_before,
+            mode,
+            reason,
+        ));
     }
-    let Some(workspace_id) = at(&response, "/result/workspace/workspace_id").map(str::to_string)
-    else {
-        return Err(fail(
-            "the server created the workspace but named no workspace_id",
-        ));
-    };
-    let Some(root_pane) = at(&response, "/result/root_pane/pane_id").map(str::to_string) else {
-        return Err(fail(
-            "the server created the workspace but named no root pane",
-        ));
-    };
+
+    let workspace_id = at(&response, "/result/workspace/workspace_id").map(str::to_string);
+    let root_pane = at(&response, "/result/root_pane/pane_id").map(str::to_string);
     let worktree = at(&response, "/result/worktree/path").map(str::to_string);
-    let branch = flags.branch.clone();
-    let cwd = worktree.clone().unwrap_or_else(|| {
-        flags
-            .cwd
-            .clone()
-            .expect("cwd mode always carries the path it was given")
-    });
+    // The branch is what the server decided, not what was asked for: `--branch`
+    // is optional, and a server that generated one has recorded a name the
+    // operator would never have guessed.
+    let branch = at(&response, "/result/worktree/branch").map(str::to_string);
+    let repo_root = at(&response, "/result/workspace/worktree/repo_root").map(str::to_string);
+    let repo_key = at(&response, "/result/workspace/worktree/repo_key").map(str::to_string);
+    let parent_workspace_id = repo_root
+        .as_deref()
+        .and_then(|root| identify_parent(&ids_before, root, None));
+
+    let (Some(workspace_id), Some(root_pane)) = (workspace_id, root_pane) else {
+        let reason = "the server created the workspace but named no workspace id or root pane";
+        return Err(teardown_after_place_failure(
+            name,
+            &ids_before,
+            mode,
+            reason.to_string(),
+        ));
+    };
+
+    let cwd = worktree
+        .clone()
+        .unwrap_or_else(|| flags.cwd.clone().unwrap_or_default());
     Ok(Placement {
         workspace_id,
         cwd,
         worktree,
         branch,
         root_pane,
+        parent_workspace_id,
+        repo_root,
+        repo_key,
     })
 }
 
-/// Every workspace the server currently lists, by id.
-fn workspace_ids() -> Vec<String> {
-    request(Method::WorkspaceList(
-        crate::api::schema::EmptyParams::default(),
-    ))
-    .ok()
-    .and_then(|response| {
-        response
-            .pointer("/result/workspaces")
-            .and_then(|workspaces| workspaces.as_array())
-            .cloned()
-    })
-    .map(|workspaces| {
-        workspaces
-            .iter()
-            .filter_map(|workspace| field(workspace, "workspace_id").map(str::to_string))
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Undo a start, and put the workspace list back the way it was.
+/// Undo a create whose answer could not be used, and hand back the exit code.
 ///
-/// Two steps, because `worktree.create` may open a workspace besides the one the
-/// delegate asked for: it creates a workspace for the repository root when no
-/// workspace has that repository open, so that the new checkout has a parent to
-/// belong to. Killing the delegate's own workspace leaves that parent behind, and
-/// a failed start that leaves a workspace behind is a start that half happened.
-///
-/// Closing is restricted to workspaces that appeared AFTER the delegate's
-/// placement call and are not the one it created — so it can only ever close
-/// something its own start brought into being, never a workspace the operator
-/// opened while the delegate was starting.
-fn rollback(name: &str, placement: &Placement, before: &[String]) {
-    if let Err(err) = tear_down(placement, true) {
+/// The parent is re-identified here even though the placement never completed: a
+/// `worktree.create` that opened a repository root and then failed to answer is
+/// exactly the case where leaving the parent behind is most visible.
+fn teardown_after_place_failure(
+    name: &str,
+    ids_before: &[String],
+    mode: Mode,
+    reason: impl fmt::Display,
+) -> i32 {
+    let parent_workspace_id = if mode == Mode::Worktree {
+        // No repo root is known from a failed create, so the parent is found by
+        // shape alone: new, and not a linked worktree. Recorded only if that is
+        // unambiguous, which is the same rule the successful path uses.
+        identify_unlinked_parent(ids_before)
+    } else {
+        None
+    };
+    let cleanup = Cleanup {
+        workspace_id: String::new(),
+        pane_id: String::new(),
+        root_pane: String::new(),
+        terminal_id: String::new(),
+        mode,
+        worktree: None,
+        parent_workspace_id,
+        repo_root: None,
+        repo_key: None,
+        name: name.to_string(),
+    };
+    // The delegate's own workspace id is unknown, so only the parent can be
+    // closed. Anything the create made beyond that is not addressable, which the
+    // reason on stderr already says.
+    if let Err(err) = tear_down(&cleanup, true) {
         eprintln!("delegate {name}: rollback also failed: {err}");
     }
-    let own = &placement.workspace_id;
-    let extra: Vec<String> = workspace_ids()
-        .into_iter()
-        .filter(|id| id != own && !before.contains(id))
-        .collect();
-    for workspace_id in extra {
-        let _ = request(Method::WorkspaceClose(WorkspaceTarget { workspace_id }));
+    fail(reason)
+}
+
+fn identify_unlinked_parent(ids_before: &[String]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for record in workspace_records(None) {
+        let Some(id) = field(&record, "workspace_id") else {
+            continue;
+        };
+        if ids_before.iter().any(|before| before == id) {
+            continue;
+        }
+        if record
+            .pointer("/worktree/is_linked_worktree")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id.to_string());
+    }
+    found
+}
+
+// ---------------------------------------------------------------- teardown
+
+/// A server refusal, kept as code and message so a caller can map the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerError {
+    code: String,
+    message: String,
+}
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
     }
 }
 
-/// Everything a failed start created, torn down through one routine.
+/// A transport failure carries no server code, so it becomes one — named
+/// `delegate_unreachable`, and mapped by `worktree.kill`'s exit table to 1, which
+/// is what every other non-server failure in this command already exits with.
 ///
-/// The same routine `delegate reap` runs, deliberately (D1): a rollback and a
-/// reap ask the same question — remove the workspace this delegate owns, and its
-/// checkout if it made one — so two copies of it would be two answers to it, and
-/// the one that mattered is the one nobody ran by hand.
-fn tear_down(placement: &Placement, force: bool) -> io::Result<()> {
-    match placement.worktree.clone() {
-        Some(path) => {
-            let kill = |workspace_id: Option<&str>, path: Option<&str>| {
-                request(Method::WorktreeKill(WorktreeKillParams {
-                    workspace_id: workspace_id.map(str::to_string),
-                    path: path.map(str::to_string),
-                    force,
-                    caller_pid: Some(std::process::id()),
-                    ..WorktreeKillParams::default()
-                }))
-            };
-            let response = kill(Some(&placement.workspace_id), None)?;
-            // The workspace may already be gone — the harness died and took it,
-            // or the operator closed it. The checkout is still ours to remove,
-            // and `worktree.kill` reaches it by path.
-            if is_error_code(&response, "workspace_not_found") {
-                let _ = kill(None, Some(&path));
-            }
-        }
-        None => {
-            let _ = request(Method::WorkspaceClose(WorkspaceTarget {
-                workspace_id: placement.workspace_id.clone(),
-            }));
+/// Without it the routine could not return a single error type, and the refusal
+/// it is built to stop swallowing (a server that answered `dirty_worktree_
+/// requires_force`) would be lost in a transport failure's place.
+impl From<io::Error> for ServerError {
+    fn from(err: io::Error) -> Self {
+        Self {
+            code: "delegate_unreachable".to_string(),
+            message: err.to_string(),
         }
     }
-    Ok(())
-}
-
-fn is_error_code(response: &serde_json::Value, code: &str) -> bool {
-    response
-        .pointer("/error/code")
-        .and_then(serde_json::Value::as_str)
-        == Some(code)
 }
 
 fn server_error(error: &serde_json::Value) -> String {
-    let code = error
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("error");
-    let message = error
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("the server refused the request");
-    format!("{code}: {message}")
+    let error = parse_server_error(error);
+    format!("{error}")
+}
+
+fn parse_server_error(error: &serde_json::Value) -> ServerError {
+    ServerError {
+        code: error
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error")
+            .to_string(),
+        message: error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the server refused the request")
+            .to_string(),
+    }
+}
+
+/// The error a response carries, if it is an error at all.
+fn refusal(response: &serde_json::Value) -> Option<ServerError> {
+    response.get("error").map(parse_server_error)
+}
+
+/// What a teardown may touch, and what it removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cleanup {
+    name: String,
+    workspace_id: String,
+    pane_id: String,
+    root_pane: String,
+    terminal_id: String,
+    mode: Mode,
+    worktree: Option<String>,
+    parent_workspace_id: Option<String>,
+    repo_root: Option<String>,
+    repo_key: Option<String>,
+}
+
+impl Cleanup {
+    fn from_entry(entry: &Entry) -> Option<Self> {
+        Some(Self {
+            name: entry.name.clone(),
+            workspace_id: entry.workspace_id.clone(),
+            pane_id: entry.pane_id.clone(),
+            root_pane: entry.root_pane.clone(),
+            terminal_id: entry.terminal_id.clone(),
+            mode: Mode::parse(&entry.mode)?,
+            worktree: entry.worktree.clone(),
+            parent_workspace_id: entry.parent_workspace_id.clone(),
+            repo_root: entry.repo_root.clone(),
+            repo_key: entry.repo_key.clone(),
+        })
+    }
+}
+
+/// What a teardown actually removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TearDown {
+    workspace_closed: bool,
+    checkout_removed: bool,
+    parent_closed: bool,
+}
+
+/// THE cleanup routine: a failed start's rollback and `delegate reap`'s removal,
+/// and nothing else (D-B).
+///
+/// Three properties, each of them a thing the two callers used to get wrong
+/// separately:
+///
+/// * **A server refusal is never ignored.** A kill that answered `dirty_worktree_
+///   requires_force` and was dropped on the floor left a start reporting "rolled
+///   back" over a checkout still on disk. So a refusal is returned, and each
+///   caller decides what it means: a reap prints it and maps the code through
+///   `kill_error_exit_code`, a rollback prints it beside its cause and keeps exit
+///   1.
+/// * **Nothing is destroyed before its identity is re-checked** (D-C). A
+///   workspace id is a name, and a server restart can hand the same name to a
+///   different workspace. In worktree mode the check is that the workspace still
+///   holds the recorded checkout; in cwd mode, that it still holds the recorded
+///   agent's pane. A mismatch is treated as gone — the checkout is reached by
+///   path instead, and the workspace is left alone.
+/// * **The parent workspace is only closed when it is still the parent.** It is
+///   closed only if it exists, still holds the recorded repository root, holds a
+///   single pane, and no other open workspace is a linked worktree of the same
+///   repository. Any of those failing leaves it open: a repository-root workspace
+///   the operator has since put panes in is not a leftover.
+fn tear_down(target: &Cleanup, force: bool) -> Result<TearDown, ServerError> {
+    let mut done = TearDown::default();
+
+    if !target.workspace_id.is_empty() && workspace_is_ours(target) {
+        match target.mode {
+            Mode::Worktree => {
+                let response = kill(Some(&target.workspace_id), None, force)?;
+                if let Some(err) = refusal(&response) {
+                    if err.code != "workspace_not_found" {
+                        return Err(err);
+                    }
+                } else {
+                    // The kill closes the workspace and removes the checkout with
+                    // it, so both are accounted for.
+                    done.workspace_closed = true;
+                    done.checkout_removed = true;
+                }
+            }
+            Mode::Cwd => {
+                let response = close_workspace(&target.workspace_id)?;
+                if let Some(err) = refusal(&response) {
+                    if err.code != "workspace_not_found" {
+                        return Err(err);
+                    }
+                } else {
+                    done.workspace_closed = true;
+                }
+            }
+        }
+    }
+
+    // The checkout the delegate made is still there when the workspace was gone
+    // (or was never ours), and `worktree.kill` reaches it by path.
+    if let Some(checkout) = target.worktree.clone() {
+        if !done.checkout_removed {
+            let response = kill(None, Some(&checkout), force)?;
+            if let Some(err) = refusal(&response) {
+                let already_gone = ALREADY_GONE_CODES.contains(&err.code.as_str())
+                    || !Path::new(&checkout).exists();
+                if !already_gone {
+                    return Err(err);
+                }
+            } else {
+                done.checkout_removed = true;
+            }
+        }
+    }
+
+    if let Some(parent) = parent_to_close(target)? {
+        let response = close_workspace(&parent)?;
+        if let Some(err) = refusal(&response) {
+            if err.code != "workspace_not_found" {
+                return Err(err);
+            }
+        } else {
+            done.parent_closed = true;
+        }
+    }
+
+    Ok(done)
+}
+
+/// Is the recorded workspace still the one this delegate created?
+///
+/// The two modes can only be checked against different things, because they were
+/// recorded differently. A worktree workspace is identified by its CHECKOUT — the
+/// thing that was actually created. A cwd workspace has no checkout of its own, so
+/// it is identified by a PANE it still holds: the agent's, or the shell it was
+/// created with. A public pane id is never reused within a server's life, so
+/// either is a stronger claim than the workspace id alone.
+///
+/// A workspace that does not resolve is gone, and so is one that does not match:
+/// both mean the same thing to a caller, which is that there is nothing here to
+/// close.
+fn workspace_is_ours(target: &Cleanup) -> bool {
+    let Some(record) = workspace_record(&target.workspace_id) else {
+        return false;
+    };
+    match target.mode {
+        Mode::Worktree => {
+            let Some(checkout) = target.worktree.as_deref() else {
+                return false;
+            };
+            let current = at(&record, "/worktree/checkout_path").unwrap_or_default();
+            !current.is_empty() && same_path(current, checkout)
+        }
+        Mode::Cwd => {
+            // Either pane counts: the agent's own, or the root pane the
+            // workspace was created with. The root one is what is left when a
+            // start dies at launch and there is no agent to have a pane.
+            [target.pane_id.as_str(), target.root_pane.as_str()]
+                .into_iter()
+                .filter(|pane_id| !pane_id.is_empty())
+                .any(|pane_id| workspace_has_pane(&target.workspace_id, pane_id))
+        }
+    }
+}
+
+fn workspace_record(workspace_id: &str) -> Option<serde_json::Value> {
+    let response = request(
+        Method::WorkspaceGet(WorkspaceTarget {
+            workspace_id: workspace_id.to_string(),
+        }),
+        None,
+    )
+    .ok()?;
+    response
+        .pointer("/result/workspace")
+        .filter(|record| record.is_object())
+        .cloned()
+}
+
+fn workspace_has_pane(workspace_id: &str, pane_id: &str) -> bool {
+    let Ok(response) = request(
+        Method::PaneList(PaneListParams {
+            workspace_id: Some(workspace_id.to_string()),
+        }),
+        None,
+    ) else {
+        return false;
+    };
+    response
+        .pointer("/result/panes")
+        .and_then(|panes| panes.as_array())
+        .is_some_and(|panes| {
+            panes
+                .iter()
+                .any(|pane| field(pane, "pane_id") == Some(pane_id))
+        })
+}
+
+/// The parent workspace to close, or `None` to leave it alone.
+///
+/// All four conditions, and the last one is the expensive one: while another
+/// workspace still holds a linked worktree of the same repository, the
+/// repository-root workspace is that checkout's parent and closing it would take
+/// an operator's work with it.
+fn parent_to_close(target: &Cleanup) -> Result<Option<String>, ServerError> {
+    let Some(parent_id) = target.parent_workspace_id.clone() else {
+        return Ok(None);
+    };
+    let Some(record) = workspace_record(&parent_id) else {
+        return Ok(None);
+    };
+    let Some(repo_root) = target.repo_root.as_deref() else {
+        return Ok(None);
+    };
+    let checkout = at(&record, "/worktree/checkout_path").unwrap_or_default();
+    if checkout.is_empty() || !same_path(checkout, repo_root) {
+        return Ok(None);
+    }
+    if record
+        .get("pane_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        != 1
+    {
+        return Ok(None);
+    }
+    let repo_key = target.repo_key.as_deref();
+    let ours = target.workspace_id.as_str();
+    let parent = parent_id.as_str();
+    for other in workspace_records(None) {
+        let Some(id) = field(&other, "workspace_id") else {
+            continue;
+        };
+        if id == ours || id == parent {
+            continue;
+        }
+        let linked = other
+            .pointer("/worktree/is_linked_worktree")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let same_repo = repo_key.is_none()
+            || other
+                .pointer("/worktree/repo_key")
+                .and_then(serde_json::Value::as_str)
+                == repo_key;
+        if linked && same_repo {
+            return Ok(None);
+        }
+    }
+    Ok(Some(parent_id))
+}
+
+fn kill(
+    workspace_id: Option<&str>,
+    path: Option<&str>,
+    force: bool,
+) -> io::Result<serde_json::Value> {
+    request(
+        Method::WorktreeKill(WorktreeKillParams {
+            workspace_id: workspace_id.map(str::to_string),
+            path: path.map(str::to_string),
+            force,
+            caller_pid: Some(std::process::id()),
+            ..WorktreeKillParams::default()
+        }),
+        None,
+    )
+}
+
+fn close_workspace(workspace_id: &str) -> io::Result<serde_json::Value> {
+    request(
+        Method::WorkspaceClose(WorkspaceTarget {
+            workspace_id: workspace_id.to_string(),
+        }),
+        None,
+    )
 }
 
 fn delegate_start(args: &[String]) -> io::Result<i32> {
@@ -931,19 +1473,28 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
 
-    if agent_record(name).is_some() {
+    if agent_record(name, None).is_some() {
         return Ok(fail(format!("agent_name_taken: {name}")));
     }
     if let Some(existing) = read_entry(name) {
-        if workspace_exists(&existing.workspace_id) {
-            return Ok(fail(format!("delegate {name} exists; reap it first")));
+        if let Some(cleanup) = Cleanup::from_entry(&existing) {
+            if workspace_is_ours(&cleanup) {
+                return Ok(fail(format!("delegate {name} exists; reap it first")));
+            }
+            // The workspace is gone. A checkout that is still on disk is not: it
+            // belongs to this name, and a second start would leave it with no
+            // delegate and no way to address it.
+            if let Some(checkout) = existing.worktree.as_deref() {
+                if Path::new(checkout).exists() {
+                    return Ok(fail(format!(
+                        "delegate {name} has a leftover checkout at {checkout}; reap it first"
+                    )));
+                }
+            }
         }
     }
 
-    // Every workspace on the server before the delegate creates anything, so a
-    // failed start can put the list back exactly.
-    let before = workspace_ids();
-    let placement = match place(&flags, mode) {
+    let placement = match place(name, &flags, mode) {
         Ok(placement) => placement,
         Err(code) => return Ok(code),
     };
@@ -951,19 +1502,25 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let agent = match started {
         Ok(agent) => agent,
         Err(reason) => {
-            rollback(name, &placement, &before);
+            rollback(&placement.cleanup(name, mode, "", ""));
             return Ok(fail(reason));
         }
     };
+    let terminal_id = field(&agent, "terminal_id").unwrap_or_default().to_string();
+    let pane_id = field(&agent, "pane_id").unwrap_or_default().to_string();
+    let cleanup = placement.cleanup(name, mode, &pane_id, &terminal_id);
 
     // The workspace the delegate created came with a shell in it. Leaving that
     // shell there would mean the operator's "where is my agent" question has two
     // panes in the answer, and an idle wake or a manual type would land in a pane
     // nobody is watching.
-    if let Err(err) = request(Method::PaneClose(PaneTarget {
-        pane_id: placement.root_pane.clone(),
-    })) {
-        rollback(name, &placement, &before);
+    if let Err(err) = request(
+        Method::PaneClose(PaneTarget {
+            pane_id: placement.root_pane.clone(),
+        }),
+        None,
+    ) {
+        rollback(&cleanup);
         return Ok(fail(format!(
             "could not close the workspace's root pane: {err}"
         )));
@@ -973,17 +1530,21 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         .ready_timeout_ms
         .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
     let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
-    if let Err(reason) = await_ready(name, &agent, ready_deadline) {
-        rollback(name, &placement, &before);
-        return Ok(fail(reason));
-    }
-
-    let terminal_id = field(&agent, "terminal_id").unwrap_or_default().to_string();
-    let pane_id = field(&agent, "pane_id").unwrap_or_default().to_string();
-    let cursor = match cursor_of(&agent) {
+    // The gate returns the FINAL record it saw, and the cursor is taken from
+    // THAT. Captured earlier it would be a cursor from before the last idle, and
+    // a settle would then accept the quiet that preceded the brief instead of
+    // waiting for the turn the brief caused (D-D).
+    let settled_record = match await_ready(name, &agent, ready_deadline) {
+        Ok(record) => record,
+        Err(reason) => {
+            rollback(&cleanup);
+            return Ok(fail(reason));
+        }
+    };
+    let cursor = match cursor_of(&settled_record) {
         Ok(cursor) => cursor,
         Err(reason) => {
-            rollback(name, &placement, &before);
+            rollback(&cleanup);
             return Ok(fail(reason));
         }
     };
@@ -993,10 +1554,14 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         name: name.to_string(),
         terminal_id: terminal_id.clone(),
         pane_id: pane_id.clone(),
+        root_pane: placement.root_pane.clone(),
         workspace_id: placement.workspace_id.clone(),
         mode: mode.as_str().to_string(),
         worktree: placement.worktree.clone(),
         branch: placement.branch.clone(),
+        parent_workspace_id: placement.parent_workspace_id.clone(),
+        repo_root: placement.repo_root.clone(),
+        repo_key: placement.repo_key.clone(),
         harness: harness.to_string(),
         model: flags.model.clone(),
         round: 1,
@@ -1006,12 +1571,16 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         created_at_ms: now_ms(),
     };
     if let Err(err) = write_entry(&entry) {
-        rollback(name, &placement, &before);
+        let _ = std::fs::remove_file(entry_path(name));
+        rollback(&cleanup);
         return Ok(fail(format!(
             "could not write the delegate registry entry: {err}"
         )));
     }
 
+    // No request between persisting the cursor and typing the brief: the whole
+    // point of capturing it last is that it is the cursor of the turn this
+    // submit starts.
     match super::pane::submit_sequence(&pane_id, &sentence) {
         Ok(0) => {}
         Ok(_) | Err(_) => {
@@ -1019,7 +1588,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             // rather than leave a workspace, a checkout and a registry entry
             // describing a round nobody is running.
             let _ = std::fs::remove_file(entry_path(name));
-            rollback(name, &placement, &before);
+            rollback(&cleanup);
             return Ok(fail(format!(
                 "delegate {name}: the brief was not submitted"
             )));
@@ -1046,6 +1615,17 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     .run()
 }
 
+/// Undo a start that failed after its workspace existed.
+///
+/// The one call, and the exit stays 1 whatever it says: a rollback that partly
+/// failed is still a failed start, and the reason it could not finish is on
+/// stderr beside the cause.
+fn rollback(cleanup: &Cleanup) {
+    if let Err(err) = tear_down(cleanup, true) {
+        eprintln!("delegate {}: rollback also failed: {err}", cleanup.name);
+    }
+}
+
 fn start_the_agent(
     name: &str,
     placement: &Placement,
@@ -1057,18 +1637,21 @@ fn start_the_agent(
         argv.push("--model".to_string());
         argv.push(model.to_string());
     }
-    let response = request(Method::AgentStart(AgentStartParams {
-        name: name.to_string(),
-        cwd: Some(placement.cwd.clone()),
-        workspace_id: Some(placement.workspace_id.clone()),
-        tab_id: None,
-        split: None,
-        active: false,
-        here: false,
-        // The delegate's whole premise is that it lands BESIDE the operator.
-        focus: false,
-        argv,
-    }))
+    let response = request(
+        Method::AgentStart(AgentStartParams {
+            name: name.to_string(),
+            cwd: Some(placement.cwd.clone()),
+            workspace_id: Some(placement.workspace_id.clone()),
+            tab_id: None,
+            split: None,
+            active: false,
+            here: false,
+            // The delegate's whole premise is that it lands BESIDE the operator.
+            focus: false,
+            argv,
+        }),
+        None,
+    )
     .map_err(|err| format!("delegate {name}: could not start the agent: {err}"))?;
     if let Some(error) = response.get("error") {
         return Err(format!("delegate {name}: {}", server_error(error)));
@@ -1080,15 +1663,24 @@ fn start_the_agent(
         .ok_or_else(|| format!("delegate {name}: the start answered with no agent record"))
 }
 
-/// Block until the agent is up AND at its prompt, under one deadline.
+/// Block until the agent is up AND at its prompt, under one deadline, and hand
+/// back the record that proved it.
 ///
 /// Two questions, one budget. A pane that has painted nothing yet is `unknown`
 /// and must not be typed into; a pane sitting on a permission prompt is `blocked`
 /// and must not be typed into either — a brief typed at a dialog is a brief that
-/// answers the dialog. Readiness is `unknown`-clear, the prompt is
-/// `idle`/`done`, and both are waited for here so no caller has to know that
-/// they are different questions.
-fn await_ready(name: &str, agent: &serde_json::Value, deadline: Instant) -> Result<(), String> {
+/// answers the dialog. Readiness is `unknown`-clear, the prompt is `idle`/`done`,
+/// and both are waited for here so no caller has to know that they are different
+/// questions.
+///
+/// The returned record is the LAST one sampled, not merely the first that
+/// qualified: the cursor taken from it has to be the cursor of the turn the brief
+/// is about to start.
+fn await_ready(
+    name: &str,
+    agent: &serde_json::Value,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
     let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
     let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
     let ready_ms = u64::try_from(
@@ -1096,7 +1688,7 @@ fn await_ready(name: &str, agent: &serde_json::Value, deadline: Instant) -> Resu
             .saturating_duration_since(Instant::now())
             .as_millis(),
     )
-    .unwrap_or(u64::MAX);
+    .unwrap_or(0);
 
     match super::ready::wait_for_ready(name, &pane_id, ready_ms) {
         Ok(super::ready::ReadyOutcome::Ready(_)) => {}
@@ -1116,16 +1708,16 @@ fn await_ready(name: &str, agent: &serde_json::Value, deadline: Instant) -> Resu
     }
 
     loop {
-        let Some(record) = agent_record(&terminal_id) else {
+        let Some(record) = agent_record(&terminal_id, None) else {
             return Err(format!("delegate {name}: the agent no longer resolves"));
         };
         let status = field(&record, "agent_status")
             .unwrap_or("unknown")
             .to_string();
         if matches!(status.as_str(), "idle" | "done") {
-            return Ok(());
+            return Ok(record);
         }
-        if Instant::now() >= deadline {
+        if expired(Some(deadline)) {
             return Err(format!("delegate {name} is {status}"));
         }
         sleep_bounded(deadline, READY_POLL);
@@ -1156,28 +1748,31 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
 
-    let mut entry = match require_delegate(name) {
-        Ok(entry) => entry,
-        Err(code) => return Ok(code),
-    };
+    // The lock BEFORE the entry (D-F). Loading the entry first means reading a
+    // file another round is in the middle of replacing, and validating against
+    // that is validating against a snapshot of a delegate that has moved on.
     let _lock = match take_lock(name) {
         Ok(lock) => lock,
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
+    let mut entry = match require_delegate(name, None) {
+        Ok(entry) => entry,
+        Err(code) => return Ok(code),
+    };
+    // The whole entry, kept. A round that fails to submit has to put the file
+    // back the way it found it, and decrementing one field of a mutated copy is
+    // how a brief path from the failed round ends up recorded as the live one.
+    let original = entry.clone();
 
     let ready_timeout = flags
         .ready_timeout_ms
         .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
     let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
-    let Some(record) = agent_record(&entry.terminal_id) else {
-        return Ok(fail(format!(
-            "delegate {name}: the agent no longer resolves"
-        )));
+    let record = match await_prompt(name, &entry, ready_deadline) {
+        Ok(record) => record,
+        Err(reason) => return Ok(fail(reason)),
     };
-    if let Err(reason) = await_prompt(name, &record, ready_deadline) {
-        return Ok(fail(reason));
-    }
 
     let cursor = match cursor_of(&record) {
         Ok(cursor) => cursor,
@@ -1197,10 +1792,16 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     match super::pane::submit_sequence(&entry.pane_id, &sentence) {
         Ok(0) => {}
         Ok(_) | Err(_) => {
-            // This round did not start, so it is not counted. The entry goes back
-            // to the round that did.
-            entry.round -= 1;
-            let _ = write_entry(&entry);
+            // This round did not start, so the whole entry goes back, and a
+            // write-back that itself fails is said rather than swallowed: a
+            // registry that now claims a round nobody is running is worse than
+            // the failed send that caused it.
+            if let Err(err) = write_entry(&original) {
+                eprintln!(
+                    "delegate {name}: the brief was not submitted and the registry could not be \
+                     restored: {err}"
+                );
+            }
             return Ok(fail(format!(
                 "delegate {name}: the brief was not submitted"
             )));
@@ -1227,26 +1828,28 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     .run()
 }
 
-/// Wait for the agent to be at its prompt, which is where a brief may be typed.
+/// Wait for the agent to be at its prompt, which is where a brief may be typed,
+/// and hand back the record that proved it.
 ///
 /// Not the readiness wait: the agent is already up, and what is being asked here
-/// is narrower — it is not sitting on a dialog.
-fn await_prompt(name: &str, agent: &serde_json::Value, deadline: Instant) -> Result<(), String> {
-    let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
-    let mut record = agent.clone();
+/// is narrower — it is not sitting on a dialog. The returned record is the last
+/// one sampled, for the same reason as [`await_ready`]: the cursor has to be the
+/// one this round starts from.
+fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_json::Value, String> {
     loop {
+        let Some(record) = agent_record(&entry.terminal_id, None) else {
+            return Err(format!("delegate {name}: the agent no longer resolves"));
+        };
         let status = field(&record, "agent_status")
             .unwrap_or("unknown")
             .to_string();
         if matches!(status.as_str(), "idle" | "done") {
-            return Ok(());
+            return Ok(record);
         }
-        if Instant::now() >= deadline {
+        if expired(Some(deadline)) {
             return Err(format!("delegate {name} is {status}"));
         }
         sleep_bounded(deadline, READY_POLL);
-        record = agent_record(&terminal_id)
-            .ok_or_else(|| format!("delegate {name}: the agent no longer resolves"))?;
     }
 }
 
@@ -1269,8 +1872,14 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
     let flags = as_wait(&flags);
+    // The clock starts HERE, before the entry is even read (D-E). A wait that
+    // spent its budget finding out what it is waiting for, and then reported a
+    // timeout it had already earned, is the failure this ordering exists to stop.
+    let deadline = flags
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
 
-    let entry = match require_delegate(name) {
+    let entry = match require_delegate(name, deadline) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
@@ -1278,9 +1887,6 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
     // freshness is judged against when that round was submitted — so both come
     // from the entry, and `--after` only replaces the cursor.
     let after = flags.after.clone().or_else(|| Some(entry.cursor.clone()));
-    let deadline = flags
-        .timeout_ms
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
     Await {
         entry: &entry,
         after,
@@ -1301,16 +1907,19 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate(name) {
+    let entry = match require_delegate(name, None) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
 
-    let response = match request(Method::AgentResult(AgentResultParams {
-        target: entry.terminal_id.clone(),
-        max_chars: flags.max_chars,
-        offset: None,
-    })) {
+    let response = match request(
+        Method::AgentResult(AgentResultParams {
+            target: entry.terminal_id.clone(),
+            max_chars: flags.max_chars,
+            offset: None,
+        }),
+        None,
+    ) {
         Ok(response) => response,
         Err(err) => return Ok(fail(err)),
     };
@@ -1323,7 +1932,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         // statement about the TURN rather than an error: the live status is what
         // says whether that turn is still running.
         if code == "no_result" {
-            let status = agent_record(&entry.terminal_id)
+            let status = agent_record(&entry.terminal_id, None)
                 .and_then(|record| field(&record, "agent_status").map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string());
             let running = matches!(status.as_str(), "working" | "blocked" | "unknown");
@@ -1370,11 +1979,11 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate(name) {
+    let entry = match require_delegate(name, None) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
-    let status = agent_record(&entry.terminal_id)
+    let status = agent_record(&entry.terminal_id, None)
         .and_then(|record| field(&record, "agent_status").map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
     if flags.json {
@@ -1413,7 +2022,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
 /// The terminal check is what makes a rename visible. An agent renamed away from
 /// its delegate name is no longer addressable as that delegate, and a `send`
 /// that still worked would type into whatever inherited the name.
-fn require_delegate(name: &str) -> Result<Entry, i32> {
+fn require_delegate(name: &str, _deadline: Option<Instant>) -> Result<Entry, i32> {
     if let Err(reason) = validate_name(name) {
         return Err(usage(reason));
     }
@@ -1421,7 +2030,7 @@ fn require_delegate(name: &str) -> Result<Entry, i32> {
     let Some(entry) = read_entry(name) else {
         return Err(refuse());
     };
-    let Some(record) = agent_record(name) else {
+    let Some(record) = agent_record(name, None) else {
         return Err(refuse());
     };
     if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
@@ -1446,85 +2055,41 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
     if let Err(reason) = validate_name(name) {
         return Ok(usage(reason));
     }
-    let Some(entry) = read_entry(name) else {
-        return Ok(usage(format!("not a delegate: {name}")));
-    };
-    // The lock is still taken unless forced: a reap that ran under a start
-    // would remove the workspace the start is about to submit into.
+    // The lock BEFORE the entry, for the same reason as `send`: the entry a reap
+    // acts on must be the one the lock protects.
     let _lock = match take_lock(name) {
         Ok(lock) => lock,
         Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
-        Err("busy") => match std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path(name))
-        {
+        Err("busy") => match open_lock_file(&lock_path(name)) {
             Ok(file) => Lock { _file: file },
             Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
         },
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-
-    let placement = Placement {
-        workspace_id: entry.workspace_id.clone(),
-        cwd: entry.worktree.clone().unwrap_or_default(),
-        worktree: entry.worktree.clone(),
-        branch: entry.branch.clone(),
-        root_pane: String::new(),
+    let Some(entry) = read_entry(name) else {
+        return Ok(usage(format!("not a delegate: {name}")));
+    };
+    let Some(cleanup) = Cleanup::from_entry(&entry) else {
+        return Ok(fail(format!(
+            "delegate {name}: the registry entry names a mode this build does not know: {}",
+            entry.mode
+        )));
     };
 
-    if let Some(worktree) = &entry.worktree {
-        let kill = |workspace_id: Option<&str>, path: Option<&str>| {
-            request(Method::WorktreeKill(WorktreeKillParams {
-                workspace_id: workspace_id.map(str::to_string),
-                path: path.map(str::to_string),
-                force: flags.force,
-                caller_pid: Some(std::process::id()),
-                ..WorktreeKillParams::default()
-            }))
-        };
-        let response = kill(Some(&entry.workspace_id), None)?;
-        let response = if is_error_code(&response, "workspace_not_found") {
-            // The workspace is gone but the checkout may not be. The recorded
-            // path is what a reap is allowed to touch, so it is what it uses.
-            match kill(None, Some(worktree)) {
-                Ok(second) => second,
-                Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
-            }
-        } else {
-            response
-        };
-        if let Some(error) = response.get("error") {
-            // A path that is already gone, or no longer a linked worktree, means
-            // the checkout is not there to remove — which is what reap wanted.
-            let code = error
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let gone = matches!(code, "not_linked_worktree" | "workspace_not_found")
-                || !Path::new(worktree).exists();
-            if !gone {
-                return Ok(super::worktree::kill_error_exit_code(error));
-            }
+    // A refusal is reported and the entry KEPT: a reap that could not finish must
+    // be retryable, and an entry removed on a refusal is a checkout nobody has an
+    // address for any more. The exit code is `flk worktree kill`'s own mapping,
+    // through the one function both verbs call.
+    let removed = match tear_down(&cleanup, flags.force) {
+        Ok(removed) => removed,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(super::worktree::kill_error_exit_code(&serde_json::json!({
+                "code": err.code,
+            })));
         }
-    } else {
-        let response = request(Method::WorkspaceClose(WorkspaceTarget {
-            workspace_id: entry.workspace_id.clone(),
-        }));
-        if let Ok(response) = &response {
-            if let Some(error) = response.get("error") {
-                if !is_error_code(response, "workspace_not_found") {
-                    return Ok(fail(server_error(error)));
-                }
-            }
-        }
-    }
+    };
 
-    // The entry goes only once the thing it described is gone. A reap that
-    // refused must be retryable, and an entry removed on a refusal is a checkout
-    // nobody has an address for any more.
     if let Err(err) = std::fs::remove_file(entry_path(name)) {
         if err.kind() != io::ErrorKind::NotFound {
             return Ok(fail(format!(
@@ -1543,9 +2108,11 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
             })
         );
     } else {
-        println!("delegate {name}: reaped");
+        println!(
+            "delegate {name}: reaped (workspace {}, checkout {}, parent {})",
+            removed.workspace_closed, removed.checkout_removed, removed.parent_closed
+        );
     }
-    let _ = &placement;
     Ok(exit::OK)
 }
 
@@ -1555,7 +2122,9 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
 ///
 /// Named rather than reused as a string everywhere, because the exit code is a
 /// property of the outcome and a script reads it — the two must not be two
-/// tables that drift.
+/// tables that drift. There is deliberately no "failed" arm: an `agent.result`
+/// that the server refuses during the grace is a command that exits 1 with the
+/// server's own words, not an outcome a caller can read (R7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Done,
@@ -1566,7 +2135,6 @@ enum Outcome {
     NoResult,
     AgentBlocked,
     Timeout,
-    Failed,
 }
 
 impl Outcome {
@@ -1580,7 +2148,6 @@ impl Outcome {
             Self::NoResult => "no_result",
             Self::AgentBlocked => "agent_blocked",
             Self::Timeout => "timeout",
-            Self::Failed => "failed",
         }
     }
 
@@ -1592,30 +2159,40 @@ impl Outcome {
             Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
-            Self::Failed => 1,
         }
     }
 }
 
 /// What one poll of the result store said.
 enum ResultPoll {
-    /// A reply from THIS round, with its sentinel read.
-    Fresh(serde_json::Value),
+    /// A reply from THIS round, with its sentinel read. The reply is CARRIED, not
+    /// re-read at print time (R6): a second read can be a different reply, and an
+    /// outcome whose text is not the reply it was decided from is a lie with the
+    /// right shape.
+    Fresh {
+        outcome: Outcome,
+        info: serde_json::Value,
+    },
     /// The store has no reply yet, no session to read one from, or a reply from
     /// an earlier turn. All three mean the same thing to a caller: not now.
     NotYet,
     /// The agent is gone.
     Gone,
     /// The server refused for a reason that is not "not yet".
-    Failed,
+    Refused(String),
 }
 
 /// What the reply grace concluded.
 enum Grace {
-    /// A reply from this round, mapped to its outcome.
-    Reply(Outcome),
+    /// A reply from this round, with the reply itself.
+    Reply {
+        outcome: Outcome,
+        info: serde_json::Value,
+    },
     Gone,
-    Failed,
+    /// A refusal the caller turns into exit 1: the server's words on stderr and
+    /// nothing on stdout.
+    Refused(String),
     /// The agent started another turn, so the round has to settle again.
     NewTurn,
     /// The grace ran out with no reply. The caller decides timeout vs no_result.
@@ -1625,7 +2202,10 @@ enum Grace {
 /// What a settled outcome means for the delegate.
 enum SettledDecision {
     /// Report this outcome and exit with its code.
-    Report(Outcome),
+    Report {
+        outcome: Outcome,
+        info: Option<serde_json::Value>,
+    },
     /// A refused cursor: exit 2, with the reason on stderr and no object.
     Usage(String),
     /// A fatal failure: exit 1, with the server's own words.
@@ -1650,11 +2230,11 @@ struct Await<'a> {
 impl Await<'_> {
     /// Settle, then wait for the reply, and report the round.
     ///
-    /// The outer loop exists for one case: the agent takes ANOTHER turn while
-    /// the reply grace is running. The reply that answers the round the caller
-    /// asked about is then not the reply that arrives next, so rather than
-    /// report somebody else's turn the await settles again from the cursor it
-    /// just settled on. Every other outcome ends it.
+    /// The outer loop exists for one case: the agent takes ANOTHER turn while the
+    /// reply grace is running. The reply that answers the round the caller asked
+    /// about is then not the reply that arrives next, so rather than report
+    /// somebody else's turn the await settles again from the cursor it just
+    /// settled on. Every other outcome ends it.
     fn run(self) -> io::Result<i32> {
         // The cursor this await STARTED from, reported in every outcome. A caller
         // that timed out resumes with `--after <turn_cursor>` and gets the same
@@ -1676,10 +2256,9 @@ impl Await<'_> {
             )?;
 
             let settled_cursor = settled.turn_cursor().unwrap_or_default().to_string();
-            match self.after_settle(settled, &settled_cursor)? {
-                SettledDecision::Report(outcome) => {
+            match self.after_settle(settled, &settled_cursor) {
+                SettledDecision::Report { outcome, info } => {
                     let code = outcome.exit_code();
-                    let info = self.reported_info(outcome);
                     emit_outcome(
                         self.entry,
                         outcome.as_str(),
@@ -1729,25 +2308,43 @@ impl Await<'_> {
         &self,
         settled: super::settled::SettledOutcome,
         settled_cursor: &str,
-    ) -> io::Result<SettledDecision> {
+    ) -> SettledDecision {
         use super::settled::SettledOutcome;
         match settled {
             // A held `blocked` is a human question, not a turn that finished.
-            SettledOutcome::Blocked { .. } => Ok(SettledDecision::Report(Outcome::AgentBlocked)),
-            SettledOutcome::Gone { .. } => Ok(SettledDecision::Report(Outcome::Gone)),
-            SettledOutcome::TimedOut => Ok(SettledDecision::Report(Outcome::Timeout)),
+            SettledOutcome::Blocked { .. } => SettledDecision::Report {
+                outcome: Outcome::AgentBlocked,
+                info: None,
+            },
+            SettledOutcome::Gone { .. } => SettledDecision::Report {
+                outcome: Outcome::Gone,
+                info: None,
+            },
+            SettledOutcome::TimedOut => SettledDecision::Report {
+                outcome: Outcome::Timeout,
+                info: None,
+            },
             // A refused cursor is the caller's mistake rather than an outcome:
             // exit 2 and no object, so nothing downstream can read it as a turn
             // that ran.
-            SettledOutcome::Refused(reason) => Ok(SettledDecision::Usage(reason)),
-            SettledOutcome::Error(reason) => Ok(SettledDecision::Failed(reason)),
-            SettledOutcome::Settled { .. } => match self.await_reply(settled_cursor)? {
-                Grace::Reply(outcome) => Ok(SettledDecision::Report(outcome)),
-                Grace::Gone => Ok(SettledDecision::Report(Outcome::Gone)),
-                Grace::Failed => Ok(SettledDecision::Report(Outcome::Failed)),
-                Grace::NewTurn => Ok(SettledDecision::WaitAgain),
-                Grace::Exhausted => Ok(SettledDecision::Report(
-                    if self
+            SettledOutcome::Refused(reason) => SettledDecision::Usage(reason),
+            // The server's own refusal to the INITIAL resolve, which the two wait
+            // verbs print verbatim. The delegate has no reason to reword it.
+            SettledOutcome::ServerRefused(body) => SettledDecision::Failed(body),
+            SettledOutcome::Error(reason) => SettledDecision::Failed(reason),
+            SettledOutcome::Settled { .. } => match self.await_reply(settled_cursor) {
+                Grace::Reply { outcome, info } => SettledDecision::Report {
+                    outcome,
+                    info: Some(info),
+                },
+                Grace::Gone => SettledDecision::Report {
+                    outcome: Outcome::Gone,
+                    info: None,
+                },
+                Grace::Refused(reason) => SettledDecision::Failed(reason),
+                Grace::NewTurn => SettledDecision::WaitAgain,
+                Grace::Exhausted => SettledDecision::Report {
+                    outcome: if self
                         .deadline
                         .is_some_and(|deadline| Instant::now() >= deadline)
                     {
@@ -1757,7 +2354,8 @@ impl Await<'_> {
                     } else {
                         Outcome::NoResult
                     },
-                )),
+                    info: None,
+                },
             },
         }
     }
@@ -1768,31 +2366,31 @@ impl Await<'_> {
     /// transcript is ordinary — opencode clears its spinner first — so a grace
     /// that reported `no_result` the instant the agent went idle would call every
     /// normal turn a failure.
-    fn await_reply(&self, settled_cursor: &str) -> io::Result<Grace> {
+    fn await_reply(&self, settled_cursor: &str) -> Grace {
         let grace_end = match self.deadline {
             Some(deadline) => deadline.min(Instant::now() + RESULT_GRACE),
             None => Instant::now() + RESULT_GRACE,
         };
         loop {
             if Instant::now() >= grace_end {
-                return Ok(Grace::Exhausted);
+                return Grace::Exhausted;
             }
             match self.poll_result() {
-                ResultPoll::Fresh(info) => return Ok(Grace::Reply(self.sentinelled(&info))),
-                ResultPoll::Gone => return Ok(Grace::Gone),
-                ResultPoll::Failed => return Ok(Grace::Failed),
+                ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
+                ResultPoll::Gone => return Grace::Gone,
+                ResultPoll::Refused(reason) => return Grace::Refused(reason),
                 ResultPoll::NotYet => {}
             }
             // The agent took another turn, so the reply that answers THIS round
             // is not the next one to land. Settle again instead.
             if self.started_another_turn(settled_cursor) {
-                return Ok(Grace::NewTurn);
+                return Grace::NewTurn;
             }
             sleep_bounded(grace_end, RESULT_POLL);
         }
     }
 
-    /// A cursor from a turn that started after the one that settled.
+    /// Has a turn started since the cursor that settled?
     ///
     /// Compared the way the settle core compares `--after`, because it is the
     /// same question: has a new turn started since the cursor I waited past? A
@@ -1802,7 +2400,7 @@ impl Await<'_> {
         if settled_cursor.is_empty() {
             return false;
         }
-        let Some(record) = agent_record(&self.entry.terminal_id) else {
+        let Some(record) = agent_record(&self.entry.terminal_id, None) else {
             return false;
         };
         let Some(raw) = record
@@ -1837,16 +2435,16 @@ impl Await<'_> {
 
     /// Ask the store for the newest reply, and say whether it is this round's.
     fn poll_result(&self) -> ResultPoll {
-        let response = match request(Method::AgentResult(AgentResultParams {
-            target: self.entry.terminal_id.clone(),
-            max_chars: self.max_chars,
-            offset: None,
-        })) {
+        let response = match request(
+            Method::AgentResult(AgentResultParams {
+                target: self.entry.terminal_id.clone(),
+                max_chars: self.max_chars,
+                offset: None,
+            }),
+            self.deadline,
+        ) {
             Ok(response) => response,
-            Err(err) => {
-                eprintln!("delegate: {err}");
-                return ResultPoll::Failed;
-            }
+            Err(err) => return ResultPoll::Refused(err.to_string()),
         };
         if let Some(error) = response.get("error") {
             let code = error
@@ -1861,11 +2459,13 @@ impl Await<'_> {
             if NOT_YET_CODES.contains(&code) {
                 return ResultPoll::NotYet;
             }
-            eprintln!("delegate: {}", server_error(error));
-            return ResultPoll::Failed;
+            return ResultPoll::Refused(server_error(error));
         }
         match response.pointer("/result/result") {
-            Some(info) if self.is_fresh(info) => ResultPoll::Fresh(info.clone()),
+            Some(info) if self.is_fresh(info) => ResultPoll::Fresh {
+                outcome: self.sentinelled(info),
+                info: info.clone(),
+            },
             // A finished reply from an EARLIER turn is "not yet" rather than an
             // answer: reporting it would attribute the last round's work to this
             // one, which is the confusion `agent result` documents for its own
@@ -1881,28 +2481,6 @@ impl Await<'_> {
             Some("blocked") => Outcome::Blocked,
             _ => Outcome::NoSentinel,
         }
-    }
-
-    /// The reply an outcome reports, for the cases that carry one.
-    ///
-    /// Re-read at print time so the text on stdout is the reply the outcome was
-    /// decided from, and `None` for the outcomes that have no result to report —
-    /// which is most of them.
-    fn reported_info(&self, outcome: Outcome) -> Option<serde_json::Value> {
-        if !matches!(
-            outcome,
-            Outcome::Done | Outcome::Verdict | Outcome::Blocked | Outcome::NoSentinel
-        ) {
-            return None;
-        }
-        let response = request(Method::AgentResult(AgentResultParams {
-            target: self.entry.terminal_id.clone(),
-            max_chars: self.max_chars,
-            offset: None,
-        }))
-        .ok()?;
-        let info = response.pointer("/result/result")?.clone();
-        self.is_fresh(&info).then_some(info)
     }
 }
 
@@ -1927,11 +2505,12 @@ fn emit_submit(entry: &Entry, json: bool) {
     }
 }
 
-/// The one object every outcome prints under `--json`.
+/// The one object every OUTCOME prints under `--json`.
 ///
-/// The same shape for every exit, including the failures: a caller polling in a
-/// loop reads the same three fields whatever happened, and a missing key is a
-/// shape change rather than an absence.
+/// Only outcomes. A usage error, a refused cursor and a refused server call print
+/// nothing on stdout at all, so a caller piping stdout gets either an outcome it
+/// can branch on or an empty stream — never a diagnostic where it expected a
+/// shape, and never a shape standing in for a failure.
 fn emit_outcome(
     entry: &Entry,
     outcome: &str,
@@ -2059,6 +2638,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A file that exists and is regular but cannot be OPENED is refused here,
+    /// where nothing has been created yet — rather than three requests later,
+    /// with a workspace and a checkout already on disk.
+    ///
+    /// Root reads a mode-000 file, so there is nothing to assert there; the skip
+    /// is the honest one rather than a `Permissions::set_mode` that only pretends.
+    #[test]
+    fn a_brief_that_cannot_be_opened_is_refused_before_anything_is_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY-adjacent note: this test only reads its own temp file.
+        if std::fs::metadata("/proc/self")
+            .map(|_| ())
+            .and_then(|_| -> std::io::Result<()> {
+                // Effective uid 0 opens a mode-000 file, so the case is
+                // unreachable as root.
+                let uid = std::fs::read_to_string("/proc/self/status").ok();
+                let root = uid
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find(|line| line.starts_with("Uid:"))
+                            .and_then(|line| line.split_whitespace().nth(1).map(str::to_string))
+                    })
+                    .is_some_and(|uid| uid == "0");
+                if root {
+                    Err(std::io::Error::other("running as root"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("flk-578-unreadable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("task.md");
+        std::fs::write(&path, "x\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = prepare_brief(&path.display().to_string())
+            .expect_err("a file nobody can open is not a brief");
+        assert!(
+            err.contains("cannot be opened for reading"),
+            "the refusal must name the open, not the stat: {err}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The reason `--repo` is refused with `--cwd`: there is no checkout to
     /// branch, so accepting the flag would be accepting one that cannot be
     /// honoured.
@@ -2183,5 +2813,37 @@ mod tests {
             0,
             "delegate.rs must hold an even number of double-quote bytes"
         );
+    }
+
+    /// The `no_result` codes the grace treats as "not yet" include the
+    /// no-session refusal, which is the one D8 names: an agent that has not
+    /// reported its session yet has no store to read, and the plugin reports it
+    /// asynchronously — so this is the ordinary first poll of a turn, not a fault.
+    #[test]
+    fn the_no_session_refusal_is_one_of_the_not_yet_codes() {
+        assert!(NOT_YET_CODES.contains(&"no_agent_session"));
+        assert!(NOT_YET_CODES.contains(&"no_result"));
+        assert!(NOT_YET_CODES.contains(&"transcript_not_found"));
+        assert!(NOT_YET_CODES.contains(&"transcript_unreadable"));
+        assert!(
+            !NOT_YET_CODES.contains(&"permission_denied"),
+            "a real refusal must still be an error"
+        );
+    }
+
+    /// A refusal the teardown treats as "already gone" rather than as a failure.
+    #[test]
+    fn an_absent_checkout_is_a_removal_that_already_happened() {
+        for code in [
+            "not_linked_worktree",
+            "not_git_worktree",
+            "workspace_not_found",
+        ] {
+            assert!(
+                ALREADY_GONE_CODES.contains(&code),
+                "{code} means the checkout is not there to remove"
+            );
+        }
+        assert!(!ALREADY_GONE_CODES.contains(&"dirty_worktree_requires_force"));
     }
 }

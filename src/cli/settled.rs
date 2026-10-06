@@ -191,6 +191,15 @@ pub(super) enum SettledOutcome {
     Refused(String),
     /// The deadline arrived first, on any phase.
     TimedOut,
+    /// The server REFUSED the initial resolve, and its response is carried whole.
+    ///
+    /// Its own arm, not a string inside [`Self::Error`], because at the base this
+    /// printed `eprintln!("{response}")` — the raw server reply with no verb
+    /// prefix — while every other failure printed `{verb}: {reason}`. Folding the
+    /// two together put a `wait agent-status: ` in front of a line that had never
+    /// carried one, and the two verbs' refusals were no longer the bytes a caller
+    /// had been matching on (R5).
+    ServerRefused(String),
     /// The server answered with something this client cannot act on.
     Error(String),
 }
@@ -202,7 +211,7 @@ impl SettledOutcome {
             Self::Settled { last, .. } | Self::Blocked { last, .. } | Self::Gone { last, .. } => {
                 Some(last)
             }
-            Self::Refused(_) | Self::TimedOut | Self::Error(_) => None,
+            Self::Refused(_) | Self::TimedOut | Self::ServerRefused(_) | Self::Error(_) => None,
         }
     }
 
@@ -222,7 +231,7 @@ impl SettledOutcome {
             Self::Gone { .. } => exit::GONE,
             Self::Refused(_) => 2,
             Self::TimedOut => exit::TIMEOUT,
-            Self::Error(_) => 1,
+            Self::ServerRefused(_) | Self::Error(_) => 1,
         }
     }
 }
@@ -633,6 +642,8 @@ pub(super) fn print_settled(verb: &str, outcome: &SettledOutcome) {
         }
         SettledOutcome::Refused(reason) => eprintln!("{verb}: {reason}"),
         SettledOutcome::TimedOut => eprintln!("timed out waiting for the agent to settle"),
+        // Verbatim, with no verb prefix: the bytes at the base.
+        SettledOutcome::ServerRefused(response) => eprintln!("{response}"),
         SettledOutcome::Error(reason) => eprintln!("{verb}: {reason}"),
     }
 }
@@ -673,6 +684,10 @@ pub(super) fn settled_result_line(
 /// delegate's own outcome object (P17), which is what keeps a delegate's `gone`
 /// and its `agent_blocked` decided by this state machine rather than by a
 /// second, subtly different loop beside it.
+///
+/// One outcome carries the server's response VERBATIM, because two of the verbs
+/// that used to do this work printed it that way and a caller matching on those
+/// bytes is still matching on them.
 ///
 /// Only a transport failure escapes, because that is the one thing a caller
 /// cannot turn into an outcome: the two existing verbs have always propagated
@@ -728,7 +743,7 @@ pub(super) fn settled_wait(
                     Ok(rec) => rec,
                     Err(InitialFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
                     Err(InitialFailure::Refused(response)) => {
-                        return Ok(SettledOutcome::Error(response))
+                        return Ok(SettledOutcome::ServerRefused(response))
                     }
                     Err(InitialFailure::Unusable(reason)) => {
                         return Ok(SettledOutcome::Error(reason))
