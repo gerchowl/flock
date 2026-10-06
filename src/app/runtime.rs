@@ -286,6 +286,9 @@ impl App {
         self.expire_uplink();
         // ADR-0018 §2: mail that became wakeable since it was queued.
         self.tick_idle_wakes(now);
+        // #540: an armed self-compaction's turn boundary, its Enter, or its
+        // timeout — mirrored in the headless loop (#25).
+        self.tick_self_compacts(now);
         for update in &settled {
             self.emit_pane_state_update(update);
         }
@@ -701,6 +704,9 @@ impl App {
             // ADR-0018 §2: a settle, quiet window or mute that lifts, or the
             // Enter of a typed idle wake, must not wait for unrelated traffic.
             self.idle_wake.next_deadline(),
+            // #540: the same, for an armed self-compaction — the Enter of a
+            // typed write, a settle that lifts, or a timeout coming due.
+            self.self_compact_deadline,
             // #36: a notification held behind `[ui.toast] delay_seconds` must
             // wake an otherwise quiet loop, or it lands only on the next
             // unrelated tick.

@@ -4,8 +4,8 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 use crate::api::schema::{
-    Method, PaneAgentState, PaneClearHeaderFieldParams, PaneListParams, PaneMoveDestination,
-    PaneMoveParams, PaneReadParams, PaneRenameParams, PaneReportAgentParams,
+    Method, PaneAgentState, PaneArmSelfCompactParams, PaneClearHeaderFieldParams, PaneListParams,
+    PaneMoveDestination, PaneMoveParams, PaneReadParams, PaneRenameParams, PaneReportAgentParams,
     PaneReportMetadataParams, PaneReportRecapParams, PaneReportReplyParams, PaneSendInputParams,
     PaneSendKeysParams, PaneSendTextParams, PaneSetHeaderFieldParams, PaneSplitParams, PaneTarget,
     ReadFormat, ReadSource, Request, SplitDirection,
@@ -27,6 +27,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "close" => pane_close(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
+        "arm-self-compact" => pane_arm_self_compact(&args[1..]),
         "report-agent" => pane_report_agent(&args[1..]),
         "report-metadata" => pane_report_metadata(&args[1..]),
         "report-recap" => pane_report_recap(&args[1..]),
@@ -467,6 +468,86 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     let pane_id = super::normalize_pane_id(&args[0]);
     let keys = args[1..].to_vec();
     super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+}
+
+/// Arm a self-compaction of the calling agent's own session (#540).
+///
+/// The CLI twin of the `flock_self_compact` MCP tool, and it exists because
+/// the `flock` skill an agent is given is CLI-shaped: an agent reading that
+/// skill has no MCP tools at all, so without this the feature would be
+/// unreachable for exactly the audience the skill is written for.
+///
+/// `pane_id` is optional and omitted by default so the common case is just the
+/// continuation prompt — an agent compacting itself should not have to look up
+/// its own id first, which is one more step between "context is full" and
+/// acting on it.
+fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_arm_self_compact(args) {
+        Ok(params) => params,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return Ok(2);
+        }
+    };
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:arm-self-compact".into(),
+        method: Method::PaneArmSelfCompact(params),
+    })?)
+}
+
+/// Pure: the flags and the trailing text of `arm-self-compact` to the params
+/// the verb takes, or the usage line to print. Split out from the command so
+/// the parsing — which is where the interesting refusals live — is testable
+/// without a socket.
+fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, String> {
+    const USAGE: &str =
+        "usage: flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>";
+    let mut pane = None;
+    let mut continuation: Option<String> = None;
+    let mut abort = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pane" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--pane needs a pane id".to_string());
+                };
+                pane = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
+            "--abort" => {
+                abort = true;
+                index += 1;
+            }
+            text => {
+                let mut rest = vec![text.to_string()];
+                rest.extend_from_slice(&args[index + 1..]);
+                continuation = Some(rest.join(" "));
+                break;
+            }
+        }
+    }
+
+    if continuation
+        .as_ref()
+        .is_some_and(|text| text.trim().is_empty())
+    {
+        return Err(
+            "the handoff prompt must not be empty: it is what you get back on the \
+             other side of the compaction"
+                .to_string(),
+        );
+    }
+    if !abort && continuation.is_none() {
+        return Err(USAGE.to_string());
+    }
+
+    Ok(PaneArmSelfCompactParams {
+        pane,
+        continuation,
+        abort,
+    })
 }
 
 /// How long `pane run` leaves between typing the command and pressing Enter
@@ -1247,6 +1328,10 @@ fn pane_help_text() -> String {
     let _ = writeln!(out, "  flk pane close <pane_id>");
     let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
     let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
+    let _ = writeln!(
+        out,
+        "  flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>"
+    );
     let _ = writeln!(out, "  flk pane report-agent [<pane_id>] --source ID --agent LABEL --state idle|working|blocked|unknown [--pane <pane_id>] [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     let _ = writeln!(out, "  flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
     let _ = writeln!(
@@ -1352,6 +1437,50 @@ mod tests {
     /// The wire-level proof of this lives in `tests/cli_wrapper.rs`, which is
     /// compiled out on macOS. This one runs everywhere, so the ordering is
     /// still pinned on the platform where the other test is not evidence.
+    /// The CLI twin of `flock_self_compact`, so an agent reading the `flock`
+    /// skill — which is entirely CLI, and hands the agent no MCP tools — can
+    /// still compact its own context instead of waiting for a human.
+    #[test]
+    fn arm_self_compact_defaults_to_my_own_pane_and_keeps_the_whole_prompt() {
+        let params = super::parse_arm_self_compact(&argv(&["open", "the", "PR,", "--watch", "CI"]))
+            .expect("arms");
+        assert_eq!(
+            params.pane, None,
+            "an agent compacting itself should not have to look up its own id"
+        );
+        assert_eq!(
+            params.continuation.as_deref(),
+            Some("open the PR, --watch CI"),
+            "like `send-text`, everything from the first non-flag on is the \
+             prompt — a flag in there is content, not a flag"
+        );
+        assert!(!params.abort);
+    }
+
+    /// An arming with nothing to resume behind it would shorten the context
+    /// and then hand back no thread to hold — strictly worse than not
+    /// compacting, so the CLI refuses it before the socket does.
+    #[test]
+    fn arm_self_compact_refuses_a_missing_or_empty_prompt() {
+        for words in [vec![], vec!["", "  "]] {
+            let err = super::parse_arm_self_compact(&argv(&words))
+                .expect_err("an arming with no prompt is refused");
+            assert!(!err.is_empty(), "a refusal must say something");
+        }
+    }
+
+    #[test]
+    fn arm_self_compact_abort_needs_no_prompt() {
+        let params = super::parse_arm_self_compact(&argv(&["--abort"])).expect("aborts");
+        assert!(params.abort);
+        assert_eq!(params.continuation, None);
+
+        let named = super::parse_arm_self_compact(&argv(&["--pane", "w2:p1", "--abort"]))
+            .expect("aborts a named pane");
+        assert!(named.abort);
+        assert_eq!(named.pane.as_deref(), Some("w2:p1"));
+    }
+
     #[test]
     fn pane_run_types_then_settles_then_submits() {
         let steps = pane_run_steps("1:p2", "cargo test");

@@ -205,6 +205,11 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("pane", "send-keys", "flk pane send-keys <pane_id> <key> [key ...]"),
     (
         "pane",
+        "arm-self-compact",
+        "flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>",
+    ),
+    (
+        "pane",
         "report-agent",
         "flk pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]",
     ),
@@ -318,6 +323,7 @@ const LITERAL_TEXT: &[(&str, &str)] = &[
     ("agent", "rename"),
     ("pane", "send-text"),
     ("pane", "run"),
+    ("pane", "arm-self-compact"),
     ("pane", "rename"),
     ("tab", "rename"),
     ("workspace", "rename"),
@@ -741,6 +747,7 @@ mod tests {
             "pane run",
             "pane send-text",
             "pane send-keys",
+            "pane arm-self-compact",
             "session delete",
         ] {
             let (group, verb) = invocation.split_once(' ').expect("group verb");

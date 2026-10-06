@@ -1,0 +1,212 @@
+# #540 end-to-end: does flock actually complete a self-compaction on a live
+# pane — type `/compact`, wait for the harness to report the compaction back,
+# then type the agent's own handoff prompt in as its next turn?
+#
+# The link this runbook exists for is the one no unit test can reach: bytes
+# leaving flock, crossing a real PTY into a process, and a completion signal
+# coming back over the socket to release the second write. Everything below
+# that boundary is exercised by `src/app/self_compact_tests.rs`; this drives it
+# through the shipped binary, the shipped socket API and the shipped hooks.
+#
+# ## The stand-in harness
+#
+# The pane command is not Claude Code; it is a process that behaves the way a
+# harness does. Four behaviours matter, and each is load-bearing:
+#
+#   - it draws Claude's prompt box, because flock's empty-prompt-box gate reads
+#     the SCREEN — two rules around a `❯`, per `claude_code::prompt_input`. A
+#     pane whose screen cannot be read is never typed into, by design, so a
+#     stand-in that skipped this would prove nothing about the real thing.
+#   - it arms its OWN compaction, because `arm-self-compact` resolves the
+#     caller's pane by process ancestry. An agent needs no pane id; neither does
+#     this, and guessing a public id would be the #25-class mistake.
+#   - it answers `/compact` with the hook Claude Code posts. That hook is the
+#     ONLY thing that tells flock the compaction happened, so if the final
+#     assertion passes, the signal really is what released the second write.
+#   - it never clears the screen, so markers accumulate. A repainting `box`
+#     would erase earlier markers and make the assertions below race the
+#     sequence's own progress.
+#
+# ## Why the stub is written before flock starts
+#
+# It is written by the session command, not typed into the pane. Typed in, the
+# heredoc echoes the stub's own source onto the screen, and a marker like
+# `PROBE_CONTINUATION` then matches that echo — a false pass that looks exactly
+# like success. That is the #514 lesson, and it is why an earlier draft of this
+# runbook reported 15/16 green while the sequence had never run at all. Writing
+# it up front makes a false match structurally impossible: no pane has ever
+# contained the stub's text.
+#
+# ## A/B
+#
+# Against origin/main, `flk pane arm-self-compact` does not exist, so the stub's
+# arming fails and it prints `PROBE_ARM_REFUSED`. The runbook waits for
+# `PROBE_ARMED`, which that build cannot produce, and dies there — before the
+# compaction, the hook report, or the continuation. Every assertion is on a
+# string the unfixed build cannot put on this screen.
+#
+# Sockets live in a SHORT dir: unix sun_path caps at ~104 bytes. FLOCK_* are
+# unset so a nested flk does not refuse to start.
+[session]
+command = ["/bin/sh", "-c", '''
+mkdir -p "$XDG_CONFIG_HOME"
+printf 'onboarding = false\n' > "$FLOCK_CONFIG_PATH"
+cat > "$XDG_CONFIG_HOME/fake-claude" <<'PROBE_STUB'
+#!/bin/sh
+# Stand-in for Claude Code, for tests/probes/agent-self-compact.toml.
+#
+# Behaviours that matter, and why each is here rather than in the runbook:
+#   - draws Claude's prompt box, because flock's empty-prompt-box gate reads
+#     the SCREEN (two rules around a `❯`, per claude_code::prompt_input). A
+#     pane whose screen cannot be read is never typed into, by design.
+#   - arms its own compaction, because `arm-self-compact` resolves the caller's
+#     pane by process ancestry. An agent needs no pane id, and neither does
+#     this.
+#   - answers `/compact` with the hook Claude Code posts, because that hook is
+#     the ONLY thing that tells flock the compaction happened. If the probe's
+#     final assertion passes, the signal really is what released the second
+#     write.
+#   - never clears the screen, so markers accumulate. A `box` that repainted
+#     would erase the earlier ones and make the runbook's assertions race the
+#     sequence's own progress.
+# Redrawn after every line the stub echoes, and never cleared. Both matter and
+# they pull against each other: the box must be the LAST thing on screen for
+# flock's empty-prompt-box gate (which reads the VISIBLE screen, not the
+# scrollback — so anything printed after the box pushes it up and the gate
+# reads `no_prompt_box` forever), and the screen must not be cleared or the
+# markers above it would be erased and the runbook's assertions would race the
+# sequence's own progress.
+# The rules MUST be U+2500 (─), not ASCII hyphens. `is_horizontal_rule` counts
+# leading `─` and nothing else, so a row of `-` is not a rule: the box renders
+# as four plausible lines, `claude_prompt_box_top_border_index` finds zero
+# borders, `prompt_input` returns None, and the gate refuses with
+# `no_prompt_box` on every single tick. That is what an earlier draft of this
+# runbook did, and it is invisible — the screen looks right.
+box() {
+  printf 'Task complete.\n'
+  printf '%s\n' '────────────────────────────────────────'
+  printf '%s \n' "$(printf '\342\235\257')"
+  printf '%s\n' '────────────────────────────────────────'
+}
+
+# What flock thinks this pane is, before asking it to do anything. If the agent
+# is not `claude` the arming is refused by name, and this line is the difference
+# between "refused for a reason" and "refused mysteriously".
+echo "PROBE""_SEES: $("$FLOCK_BIN" agent list 2>&1 | tr -d '\n' | cut -c1-200)"
+
+if "$FLOCK_BIN" pane arm-self-compact \
+  'pick up at step 3: the refactor is done, run just check, then open the PR' \
+  >"$XDG_CONFIG_HOME/arm.json" 2>&1
+then
+  echo "PROBE""_ARMED"
+else
+  # The refusal verbatim, so a failed run says WHICH refusal rather than only
+  # that one happened. Diagnosable beats merely red.
+  # One line, truncated. A build without the verb answers with the whole `flk
+  # pane` usage — fifteen wrapped lines that push this marker off the visible
+  # pane, so the run fails on SCROLL rather than on the missing verb, and the
+  # A/B stops being legible about what it proved.
+  echo "PROBE""_ARM_REFUSED: $(head -c 70 "$XDG_CONFIG_HOME/arm.json" | tr -d '\n')"
+fi
+
+box
+
+while IFS= read -r line
+do
+  case "$line" in
+    /compact)
+      printf '%s' \
+        '{"hook_event_name":"SessionStart","session_id":"probe-self-compact","source":"compact"}' \
+        | "$FLOCK_BIN" hook claude session
+      echo "PROBE""_COMPACT_REPORTED_BACK"
+      box
+      ;;
+    *)
+      echo "PROBE""_CONTINUATION: $line"
+      box
+      ;;
+  esac
+done
+PROBE_STUB
+chmod +x "$XDG_CONFIG_HOME/fake-claude"
+exec "$1"
+''', "flockprobe", "${bin}"]
+cols = 160
+rows = 44
+startup_wait = 12
+timeout = 400
+env = { HOME = "${home}", XDG_CONFIG_HOME = "${xdg}", XDG_STATE_HOME = "${state}", SHELL = "/bin/sh", FLOCK_CONFIG_PATH = "${xdg}/probe-config.toml" }
+env_unset = ["FLOCK_ENV", "FLOCK_PANE_ID", "FLOCK_SOCKET_PATH", "FLOCK_BIN"]
+
+[[step]]
+wait_for = "No workspaces yet"
+
+# A workspace with a shell pane. `exec` replaces the shell in place, so the stub
+# keeps this pane's id and its process ancestry — which is what lets it arm its
+# own compaction without being told which pane it is.
+[[step]]
+keys = "C-b N"
+sleep = 5
+[[step]]
+wait_for = "\\$"
+
+# The pane is a Claude session that has finished its turn.
+#
+# `custom:probe`, NOT `flock:claude`: `(flock:claude, claude)` is a RESERVED
+# native state source (`agent_resume::is_reserved_native_state_source`), so flock
+# deliberately ignores hook-reported state for Claude and records only the session
+# ref — otherwise a Notification hook, or a subagent's, could drive the parent
+# pane's state directly. An earlier draft of this runbook used `flock:claude`,
+# was silently ignored, and the arming came back `self_compact_unavailable` with
+# nothing on screen to explain it. So the probe steps around the guard with a
+# custom source rather than through it, and the runbook says why.
+#
+# A real Claude Code pane does not need this: its screen is distinctive, so the
+# detector classifies it. The reservation only means hook STATE reports cannot
+# stand in for detection.
+[[step]]
+type = "\"$FLOCK_BIN\" pane report-agent \"$FLOCK_PANE_ID\" --source custom:probe --agent claude --state idle && echo PROBE_REPORTED_AGENT"
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 3
+[[step]]
+wait_for = "PROBE_REPORTED_AGENT"
+
+# Become the harness. It draws the prompt box, arms its own compaction, and
+# waits for flock to type into it.
+[[step]]
+type = "exec \"$XDG_CONFIG_HOME/fake-claude\""
+sleep = 2
+[[step]]
+keys = "Enter"
+sleep = 5
+
+# Armed, and refused by name on a build without the verb.
+[[step]]
+wait_for = "PROBE_(ARMED|_ARM_REFUSED)"
+sleep = 1
+[[step]]
+capture = "pane"
+assert_text = "PROBE_ARMED"
+
+# flock typed `/compact` into the pane and submitted it as its own write a gap
+# later; the stub saw the line and reported the compaction back through the
+# session hook.
+[[step]]
+wait_for = "PROBE_COMPACT_REPORTED_BACK"
+timeout = 90
+sleep = 2
+[[step]]
+capture = "pane"
+assert_text = "/compact"
+
+# And the continuation came back as the stub's next line of input: the agent's
+# own handoff prompt, verbatim, on a context that has just been compacted.
+[[step]]
+wait_for = "PROBE_CONTINUATION: pick up at step 3"
+timeout = 60
+sleep = 2
+[[step]]
+capture = "pane"
+assert_text = "PROBE_CONTINUATION: pick up at step 3: the refactor is done"

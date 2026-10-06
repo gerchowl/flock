@@ -501,6 +501,93 @@ pub(crate) fn idle_wake_abandoned(pane: &str, reason: &str) {
     );
 }
 
+/// An agent armed a self-compaction of its own context (#540). `bytes` is the
+/// handoff prompt's length: it is the agent's own text, so it is counted and
+/// never logged.
+pub(crate) fn self_compact_armed(pane: &str, bytes: usize) {
+    tracing::info!(
+        event = "agent.self_compact.armed",
+        subsystem = "agent",
+        outcome = "ok",
+        pane,
+        bytes,
+        "agent armed a self-compaction"
+    );
+}
+
+/// Flock typed `/compact` into a pane to start a compaction the agent asked
+/// for. INFO rather than DEBUG for the idle wake's reason: this is flock
+/// typing into a pane on its own initiative, and an operator has to be able to
+/// find afterwards that it happened.
+pub(crate) fn self_compact_typed(pane: &str) {
+    tracing::info!(
+        event = "agent.self_compact.typed",
+        subsystem = "agent",
+        outcome = "ok",
+        pane,
+        "self-compaction requested from the harness"
+    );
+}
+
+/// The harness reported the compaction back, so the agent's own handoff prompt
+/// was delivered as its next turn. INFO: the agent is now working on a
+/// different context than the one it was on, which is the single most
+/// surprising thing flock can do to a pane.
+pub(crate) fn self_compact_continued(pane: &str, bytes: usize) {
+    tracing::info!(
+        event = "agent.self_compact.continued",
+        subsystem = "agent",
+        outcome = "ok",
+        pane,
+        bytes,
+        "agent resumed on a compacted context with its own handoff prompt"
+    );
+}
+
+/// The agent resumed on a compacted context: the continuation's Enter went out,
+/// so the sequence is over. INFO for the same reason as `continued` — the pane
+/// is now on a different context than it was, and this is the last line that
+/// says so.
+pub(crate) fn self_compact_completed(pane: &str, bytes: usize) {
+    tracing::info!(
+        event = "agent.self_compact.completed",
+        subsystem = "agent",
+        outcome = "ok",
+        pane,
+        bytes,
+        "self-compaction finished"
+    );
+}
+
+/// An armed self-compaction was dropped without completing. `reason` is a
+/// [`crate::agent_self_compact::SelfCompactAbort`] name. INFO: whatever flock
+/// may have typed is now sitting in that pane's prompt box, and the operator
+/// is the one who can clear it.
+pub(crate) fn self_compact_abandoned(pane: &str, reason: &str) {
+    tracing::info!(
+        event = "agent.self_compact.abandoned",
+        subsystem = "agent",
+        outcome = "skipped",
+        pane,
+        reason,
+        "armed self-compaction dropped before completing"
+    );
+}
+
+/// An armed self-compaction decided not to type. DEBUG, and emitted only when
+/// the reason CHANGES, for the idle wake's reason: a settle or quiet window
+/// can hold for as long as an agent works, and the tick runs every loop.
+pub(crate) fn self_compact_suppressed(pane: &str, reason: &str) {
+    tracing::debug!(
+        event = "agent.self_compact.suppressed",
+        subsystem = "agent",
+        outcome = "skipped",
+        pane,
+        reason,
+        "self-compaction suppressed"
+    );
+}
+
 /// `flk mcp serve` pushed one message into its session as a channel event
 /// (#438). `attested` says whether the body rode along or only a doorbell.
 pub(crate) fn mcp_channel_pushed(correlation_id: &str, attested: bool) {

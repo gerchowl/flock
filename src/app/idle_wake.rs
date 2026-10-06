@@ -73,9 +73,36 @@ struct InFlight {
     count: usize,
 }
 
+/// Test-only: mark `pane` as having a typed sentence whose Enter has not gone
+/// out. Used by `app::self_compact`'s tests, which must prove the two features
+/// never submit into the same gap — a case that cannot be produced by sending
+/// real mail, because the mailbox gates would keep both out of it.
+#[cfg(test)]
+pub(crate) fn test_arm_in_flight(tracker: &mut IdleWakeTracker, pane: &str) {
+    let entry = tracker.panes.entry(pane.to_string()).or_default();
+    entry.in_flight = Some(InFlight {
+        typed_at: Instant::now(),
+        submit_at: Some(Instant::now() + Duration::from_secs(30)),
+        count: 1,
+    });
+}
+
 impl IdleWakeTracker {
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.next_deadline
+    }
+
+    /// Whether a typed sentence is in flight for `pane`, Enter due or not.
+    ///
+    /// Read by `app::self_compact` before it types anything. Both features type
+    /// flock-authored text and then press Enter one `pane run` gap later, and a
+    /// gap is the same length for both — so two writes in the same window are
+    /// two submissions the pane's reader cannot tell apart, and they go in as
+    /// one line. One of them has to wait.
+    pub(crate) fn in_flight(&self, pane: &str) -> bool {
+        self.panes
+            .get(pane)
+            .is_some_and(|entry| entry.in_flight.is_some())
     }
 
     fn note_deadline(&mut self, at: Instant) {
@@ -418,7 +445,10 @@ impl App {
         Decision::Submitted
     }
 
-    fn terminal_for_pane(
+    /// `pub(crate)` rather than private because `app::self_compact` walks the
+    /// same pane tree to the same terminal, and a second copy of this lookup
+    /// would be a second thing to keep correct.
+    pub(crate) fn terminal_for_pane(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,

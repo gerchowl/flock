@@ -1,12 +1,12 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneListParams,
-    PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult, PaneReadParams,
-    PaneReadResult, PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams,
-    PaneReportAgentSessionParams, PaneReportMetadataParams, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget, ReadFormat, ReadSource,
-    ResponseResult,
+    EventData, EventEnvelope, EventKind, PaneArmSelfCompactParams, PaneClearAgentAuthorityParams,
+    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
+    PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
+    PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget,
+    ReadFormat, ReadSource, ResponseResult, SelfCompactState,
 };
 use crate::app::{App, Mode};
 
@@ -706,7 +706,7 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) =
+        let Some((ws_idx, pane_id)) =
             self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
         else {
             return pane_not_found(id, &params.pane_id);
@@ -714,6 +714,20 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        // Normalize once and use it twice: the identity event below, and the
+        // self-compaction (#540), whose whole completion signal IS this field.
+        let session_start_source =
+            crate::agent_resume::normalize_claude_session_start_source(params.session_start_source);
+        if let Some(pane) = self.public_pane_id(ws_idx, pane_id) {
+            // Done here rather than on the queued event, because the
+            // continuation is a keystroke into a pane and this is the one
+            // moment we know the harness finished compacting.
+            self.self_compact_on_session_start(
+                &pane,
+                session_start_source.as_deref(),
+                std::time::Instant::now(),
+            );
+        }
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -725,9 +739,7 @@ impl App {
             source: params.source,
             agent_label,
             seq: params.seq,
-            session_start_source: crate::agent_resume::normalize_claude_session_start_source(
-                params.session_start_source,
-            ),
+            session_start_source,
         });
 
         encode_success(id, ResponseResult::Ok {})
@@ -993,6 +1005,143 @@ impl App {
         }
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// `pane.arm_self_compact` — an agent asking to shorten its own context
+    /// and carry on (#540).
+    ///
+    /// Resolved by socket-peer ancestry like every other `pane.report_*`, so a
+    /// caller with a stale `FLOCK_PANE_ID` still finds its own pane. The
+    /// answer distinguishes armed from pending from aborted so a caller can
+    /// branch on it without parsing prose — and `detail` never claims a
+    /// compaction happened, because at the moment this returns none has.
+    pub(super) fn handle_pane_arm_self_compact(
+        &mut self,
+        id: String,
+        params: PaneArmSelfCompactParams,
+    ) -> String {
+        let requested = params.pane.clone().unwrap_or_default();
+        let Some((ws_idx, pane_id)) =
+            self.parse_pane_id_or_peer(&requested, self.current_api_peer_pid)
+        else {
+            return pane_not_found(id, &requested);
+        };
+        let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &requested);
+        };
+        let answer = |state: SelfCompactState, detail: String| {
+            encode_success(
+                id.clone(),
+                ResponseResult::PaneSelfCompact {
+                    pane: pane.clone(),
+                    state,
+                    detail,
+                },
+            )
+        };
+
+        if params.abort {
+            let had = self.clear_self_compact(&pane);
+            return answer(
+                SelfCompactState::Aborted,
+                if had {
+                    "dropped the armed self-compaction. Nothing was typed into \
+                     your prompt box."
+                        .to_string()
+                } else {
+                    "nothing was armed, so there was nothing to drop.".to_string()
+                },
+            );
+        }
+
+        // An empty handoff prompt would compact the context and then resume
+        // with nothing, which is worse than not compacting: the agent loses
+        // the thread and gets no instructions back. Refuse before the cap so
+        // the two errors stay distinct.
+        let Some(continuation) = params.continuation.filter(|text| !text.trim().is_empty()) else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "`continuation` is required and must not be empty: it is the \
+                 handoff prompt you want to be given once the compaction lands. \
+                 Pass `abort: true` to drop an armed self-compaction instead.",
+            );
+        };
+        // B4: the prompt reaches a real PTY, and `encode_api_text` does not
+        // escape what it wraps — so this is the boundary that decides whether
+        // the verb is an arming or a send-text. Refused, not scrubbed: a
+        // scrubbed success would tell the agent it saved a plan it silently
+        // lost part of.
+        if let Err(problem) = crate::agent_self_compact::check_continuation(&continuation) {
+            return encode_error(
+                id,
+                "invalid_params",
+                match problem {
+                    crate::agent_self_compact::ContinuationProblem::Control => {
+                        "`continuation` must be plain text: a control byte or escape \
+                         sequence would either end the paste early and be read as \
+                         keystrokes, or be sent raw. Write what you mean instead."
+                    }
+                    crate::agent_self_compact::ContinuationProblem::LineBreak => {
+                        "`continuation` must be one line. An embedded newline submits \
+                         the prompt early, and a submit nobody gated is exactly what \
+                         the empty-prompt-box gate exists to prevent. Put the long \
+                         version in a file and name the file."
+                    }
+                    crate::agent_self_compact::ContinuationProblem::HarnessCommand => {
+                        "`continuation` must not start with `/` or `!`: the harness \
+                         executes those as a command rather than reading them as \
+                         your instructions. Rephrase it as a sentence."
+                    }
+                },
+            );
+        }
+        if continuation.len() > super::super::self_compact::CONTINUATION_CAP {
+            return encode_error(
+                id,
+                "invalid_params",
+                format!(
+                    "`continuation` is {} bytes, over the {} byte cap. Write the \
+                     long version to a file and name the file.",
+                    continuation.len(),
+                    super::super::self_compact::CONTINUATION_CAP
+                ),
+            );
+        }
+        if let Some(reason) = self.self_compact_refusal(&pane) {
+            return encode_error(
+                id,
+                "self_compact_unavailable",
+                match reason {
+                    "disabled" => {
+                        "self-compaction is turned off in this workspace's \
+                                   `[session] self_compact`."
+                    }
+                    _ => {
+                        "this agent's harness cannot be asked to compact its own \
+                          context, so a self-compaction would never complete. Claude \
+                          Code can; the others cannot yet."
+                    }
+                },
+            );
+        }
+        if !self.arm_self_compact(&pane, continuation, std::time::Instant::now()) {
+            return answer(
+                SelfCompactState::Pending,
+                "a self-compaction is already armed for this pane, so yours was \
+                 NOT stored — the handoff prompt already there is untouched. Abort \
+                 it first if you meant to replace it."
+                    .to_string(),
+            );
+        }
+        answer(
+            SelfCompactState::Armed,
+            "armed. Nothing has been typed yet and nothing has been compacted: \
+             flock waits for your current turn to end, then asks the harness to \
+             compact, then sends your continuation prompt back as your next turn. \
+             Finish this turn normally."
+                .to_string(),
+        )
     }
 
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {

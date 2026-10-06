@@ -11,6 +11,7 @@ mod api;
 pub(crate) mod fleet_pause;
 pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
+pub(crate) mod self_compact;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 mod api_helpers;
@@ -144,6 +145,10 @@ pub struct App {
     pub(crate) uplink: crate::app::uplink::Uplink,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// When the next armed self-compaction needs looking at (#540): the Enter
+    /// of a typed write, a settle that lifts, or the timeout. `None` when
+    /// nothing is armed anywhere, which is the state the loop is quiet in.
+    pub(crate) self_compact_deadline: Option<Instant>,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -888,6 +893,7 @@ impl App {
             },
             uplink: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            self_compact_deadline: None,
             event_hub,
             last_focus,
             no_session,
