@@ -200,6 +200,26 @@ flk pane run <pane_id> <command>
 
 `pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
+Arm a self-compaction of your own context:
+
+```bash
+flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>
+```
+
+The one thing flock types into a pane on an agent's own instruction, and the reason it is a verb rather than a `send-text` is that it is not typing *at* the agent — it is the agent asking to be allowed to shorten its context and carry on. The prompt is the agent's own handoff to its next self: the text an operator otherwise copies out of the transcript and pastes back in.
+
+The call **arms** and returns. Nothing is typed, because an agent calling it is mid-turn and its harness cannot compact inside a turn. Then, in order: the agent finishes the turn; once its pane is idle, settled and untouched by a human, flock types `/compact` and submits it; when the harness reports the compaction back through the session hook, flock types the handoff prompt in and submits it as the next turn. A harness that compacts on its own first — Claude Code does, exactly when the context fills up — is not a special case: the report still counts, and flock does not then compact a context that was just compacted.
+
+Two writes and a signal, and the signal is a hook report rather than a timer — `session_start_source: compact` is the harness saying in its own words that the compaction happened. So the wait is bounded: `[session] self_compact_timeout_ms` (default 120 s), `self_compact_settle_ms` and `self_compact_fresh_ms` drop an arming the harness never confirms, naming in the log which half was lost. An arming that has not typed anything is never timed out, because an agent may legitimately be mid-turn for minutes. Flock never types over an operator: a quiet window, an empty prompt box, and a re-check immediately before each keystroke all stand between the arming and the pane.
+
+If a compaction is already armed, a second arming is **refused** with `state: "pending"` rather than replacing the stored prompt — two written handoffs, and silently keeping one discards work the agent believed it had saved. `--abort` drops one. Claude Code only: `/compact` is a harness affordance, and another agent is refused by name instead of being armed into a no-op. Off `[session] self_compact` forbids it outright.
+
+The continuation is checked before anything is typed. A prompt carrying a control or escape byte, an embedded line break, or a leading `/` or `!` is **refused with a reason** rather than scrubbed: the encoder wraps text between the bracketed-paste markers without escaping, so a prompt containing the closing marker would end the paste early and be read as keystrokes, and a leading `/` or `!` is a command the harness runs instead of instructions it reads. A scrub would report success for a plan that is silently missing part of itself.
+
+Both writes go through the same gates. Claude Code auto-compacts mid-turn, so a confirmation can arrive with the agent still working and a human part-way into a prompt; an occupied prompt box is never typed into, because submitting it would submit the human's draft too.
+
+Over MCP the same thing is `flock_self_compact`, which is the only way an agent can affect its own pane — `pane.send_*` stays off the closed MCP table, and this is an allowlisted exception rather than an unlock.
+
 Report agent state from custom hooks:
 
 ```bash
@@ -381,7 +401,7 @@ Replies need no addressing at all: `flock_msg_reply` carries the incoming `corre
 
 A cross-host send is refused, never dropped, and a refusal names the hop that failed: `msg_target_not_found` (no such agent anywhere in the fleet — on a spoke with no hub attached, the message says so), `peer_not_configured` (found it, but this server has no edge to its host and no hub holds a relay to hand it up to), `peer_unreachable` (a hop's ssh dial failed — the message reads `hopper cannot reach node-b (auth refused): …`, and `data.hop` / `data.reason` carry the same as `connect_refused`, `auth_refused`, `host_key`, `timeout`, `jump_hop_refused`, …), `uplink_timeout` (handed up, but the hub never answered within `[msg] uplink_timeout_secs`; `data.taken_by_hub` says whether a hub ever took it, and a retry with the same `correlation_id` cannot deliver twice), `msg_not_allowed` (the receiver's `[msg] allow_from` declines), `sender_unresolved` (the caller has no attestable identity — a cross-host send must come from inside a pane, which is where an MCP client normally runs).
 
-The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
+The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, pane `send_*` other than the single allowlisted `flock_self_compact`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
 Exposed tools:
 
@@ -390,13 +410,14 @@ Exposed tools:
 | `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
 | `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
 | `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
-| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. Claude only. |
+| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude only. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
 | `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
 | `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
+| `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
