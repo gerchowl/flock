@@ -51,7 +51,21 @@ impl Drop for Server {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Bounded reap, as `tests/cli_wrapper.rs` does: a blocking
+        // `child.wait()` here never returns on macOS, and every test in the
+        // binary then hangs at teardown until CI cancels the job.
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let mut status = 0;
+                let result =
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if result == pid as libc::pid_t || result == -1 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
     }
