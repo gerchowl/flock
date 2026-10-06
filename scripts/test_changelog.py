@@ -568,21 +568,17 @@ class CheckedInManifestTests(unittest.TestCase):
         manifest = load_json(DEFAULT_LATEST_JSON_PATH)
         ensure_manifest_assets_belong_to_repo(manifest, DEFAULT_RELEASE_REPO, str(DEFAULT_LATEST_JSON_PATH))
 
-    def test_checked_in_latest_json_advertises_no_installable_version_yet(self) -> None:
-        # Until the first release is cut, the stable manifest is a sentinel: a
-        # `flk update` must find nothing to install, and remote bootstrap must say
-        # the manifest has no entry for the running version rather than fetch a
-        # binary. Cutting the first release replaces this file, and this test with
-        # it — that is the transition being made explicit, not a failure to fix.
+    def test_checked_in_latest_json_advertises_a_published_release(self) -> None:
+        # v0.7.0 was the first release, and it replaced the no-release sentinel
+        # this file used to be; the sentinel builder keeps its own test above.
+        # From here on the checked-in manifest names a real version, and every
+        # asset it advertises is that version's download, never another's.
         manifest = load_json(DEFAULT_LATEST_JSON_PATH)
-        self.assertEqual(manifest["version"], NO_STABLE_RELEASE_VERSION)
-        self.assertEqual(manifest["protocol"], read_protocol_version())
-
-    def test_no_release_manifest_is_script_output(self) -> None:
-        self.assertEqual(
-            load_json(DEFAULT_LATEST_JSON_PATH),
-            json.loads(build_no_release_manifest()),
-        )
+        version = manifest["version"]
+        self.assertNotEqual(version, NO_STABLE_RELEASE_VERSION)
+        self.assertTrue(manifest["assets"])
+        for name, url in manifest["assets"].items():
+            self.assertIn(f"/releases/download/v{version}/", url, name)
 
 
 class ReleasePlanTests(unittest.TestCase):
