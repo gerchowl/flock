@@ -1193,34 +1193,13 @@ impl App {
         if source.workspace_idx.is_none() {
             source.workspace_idx = self.find_parent_workspace_by_key(&source.repo_key);
         }
+        let mut created_parent = false;
         if source.workspace_idx.is_none() {
             let ws_idx = self
                 .create_workspace_with_options(source.source_checkout_path.clone(), false)
                 .map_err(|err| ApiFailure::new("worktree_open_failed", err.to_string()))?;
             source.workspace_idx = Some(ws_idx);
-            if let Some(ws_idx) = source.workspace_idx {
-                // #124 branch-from-here: a source that is itself a flock-managed
-                // linked worktree keeps its own membership. Stamping the parent
-                // shape over it would demote the row out of its worktree group
-                // for having been branched from — the TUI path preserves it, and
-                // this one has to agree.
-                let existing_linked = self
-                    .state
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|ws| ws.worktree_space_here())
-                    .is_some_and(|space| space.is_linked_worktree);
-                let membership = if existing_linked {
-                    worktree_membership(source, source.source_checkout_path.clone(), true)
-                } else {
-                    worktree_membership(source, source.source_checkout_path.clone(), false)
-                };
-                self.set_worktree_membership(ws_idx, membership, true);
-                if emit_created_event {
-                    self.emit_workspace_open_events(ws_idx);
-                }
-                return Ok(Some(ws_idx));
-            }
+            created_parent = true;
         }
         if let Some(ws_idx) = source.workspace_idx {
             // #124 branch-from-here: a source that is itself a flock-managed
@@ -1239,12 +1218,12 @@ impl App {
             } else {
                 worktree_membership(source, source.source_checkout_path.clone(), false)
             };
-            self.set_worktree_membership(ws_idx, membership, false);
-            if emit_created_event {
+            self.set_worktree_membership(ws_idx, membership, !created_parent);
+            if created_parent && emit_created_event {
                 self.emit_workspace_open_events(ws_idx);
             }
         }
-        Ok(None)
+        Ok(source.workspace_idx.filter(|_| created_parent))
     }
 
     fn find_parent_workspace_for_space(
