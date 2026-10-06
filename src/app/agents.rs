@@ -1056,6 +1056,7 @@ impl App {
             seen: pane.seen,
             status_age_secs: pane.status_age_secs,
             run_id: terminal.run_id.clone(),
+            turn_cursor: pane.turn_cursor,
             revision: pane.revision,
         })
     }
