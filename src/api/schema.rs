@@ -2601,12 +2601,16 @@ pub struct AgentInfo {
     /// the one on the pane record.
     ///
     /// `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`,
-    /// where the three counters are monotonic and change only when the status
-    /// the API reports changes, and `w`/`i` says whether the agent was working
-    /// at the moment the cursor was minted. Opaque: capture it before
-    /// prompting and hand it to `agent wait --status settled --after`, which
-    /// reads it as "did this agent start work after I said so?". Absent on
-    /// remote, peer and fleet summaries, and on servers predating #553.
+    /// where the three counters are monotonic, and `w`/`i` says whether the
+    /// agent was working at the moment the cursor was minted. `state_seq` moves
+    /// on every change of the terminal's effective state plus hibernation entry
+    /// and exit; `idle` and `done` are ONE state to it, told apart by the
+    /// record's `seen` flag, so looking at a pane does not move the cursor.
+    ///
+    /// Opaque: capture it before prompting and hand it to
+    /// `agent wait --status settled --after`, which reads it as "did this agent
+    /// start work after I said so?". Absent on remote, peer and fleet
+    /// summaries, and on servers predating #553.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_cursor: Option<String>,
     pub revision: u64,
@@ -2649,9 +2653,14 @@ pub struct PaneInfo {
     /// `agent get` reports for the agent in this pane.
     ///
     /// `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`.
-    /// Monotonic counters that move only when the reported status changes, plus
-    /// a `w`/`i` flag for whether the agent was working when the cursor was
-    /// minted. Opaque to callers; pass it to `--after` on a settled wait.
+    /// The three counters are monotonic; `state_seq` moves on every change of
+    /// the terminal's effective state plus hibernation entry and exit, and
+    /// `idle` and `done` are ONE state to it — they are the same effective idle,
+    /// separated by this record's `seen` flag, so an operator looking at the
+    /// pane does not move the cursor. `w`/`i` says whether the agent was
+    /// working when the cursor was minted.
+    ///
+    /// Opaque to callers; pass it to `--after` on a settled wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_cursor: Option<String>,
     pub revision: u64,

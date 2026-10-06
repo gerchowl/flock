@@ -65,8 +65,10 @@ pub(super) const WAIT_AGENT_STATUS_USAGE: &str = concat!(
     "> [--after CURSOR] [--settle MS] [--timeout MS]\n",
     "  the same signal as `flk agent wait --status settled`: one cursor, one result line, one exit code\n",
     "  --after CURSOR  a turn_cursor from `flk agent get` or `flk pane get`, captured BEFORE you prompted\n",
-    "  --settle MS     how long the agent's quiet must hold, default 5000\n",
-    "  `flk agent wait --help` explains the whole settle contract, including what settled does not promise",
+    "  --settle MS     how long the agent's quiet must hold, default 5000; 0 settles on the sample\n",
+    "           after the first qualifying one\n",
+    "  `flk agent wait --help` explains the whole settle contract, including what settled does not\n",
+    "  promise, and why the turn's output is `flk agent result` (once #575 lands) rather than this wait",
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,7 +807,7 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
     };
 
     let pane_id = normalize_pane_id(raw_pane_id);
-    let mut timeout_ms = None;
+    let mut raw_timeout: Option<String> = None;
     let mut desired_status = None;
     let mut settle_flags = settled::SettleFlags::default();
 
@@ -831,7 +833,10 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --timeout");
                     return Ok(2);
                 };
-                timeout_ms = Some(parse_u64_flag("--timeout", value)?);
+                // Kept raw until the target is known: with `--status settled` a
+                // bad value is a usage error (exit 2, before anything is waited
+                // on), and the other statuses keep their historical behaviour.
+                raw_timeout = Some(value.clone());
                 index += 2;
             }
             "--after" => {
@@ -873,9 +878,25 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{reason}");
         return Ok(2);
     }
+    // Resolved here rather than in the parse loop because what a bad `--timeout`
+    // means depends on the target: with `--status settled` it is a usage error
+    // (exit 2, before anything is waited on), and every other status keeps its
+    // historical behaviour of reporting it as an io error.
+    let timeout_ms = match (raw_timeout, target == settled::WaitTarget::Settled) {
+        (None, _) => None,
+        (Some(raw), false) => Some(parse_u64_flag("--timeout", &raw)?),
+        (Some(raw), true) => Some(match raw.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                eprintln!("invalid value for --timeout: {raw} (expected milliseconds)");
+                return Ok(2);
+            }
+        }),
+    };
 
     match target {
         settled::WaitTarget::Settled => settled::run_settled_wait(
+            "wait agent-status",
             settled::InitialTarget::Pane(&pane_id),
             settle_flags.after.as_deref(),
             settle_flags.settle_ms.unwrap_or(settled::DEFAULT_SETTLE_MS),

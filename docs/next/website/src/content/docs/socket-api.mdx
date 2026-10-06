@@ -404,7 +404,7 @@ Agent waits observe semantic state, not arbitrary command completion.
 quiet as `done`, which is an effective idle, so that is the status to wait for
 when nobody is watching the pane. `--status done` matches exactly `done`. The
 `--status settled` wait goes further and is documented under
-[Waiting for an agent to go quiet](/docs/preview/cli-reference/#waiting-for-an-agent-to-go-quiet);
+[Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
 
@@ -424,7 +424,7 @@ by shape (and from the right) rather than interpret:
 | `term_…` | the terminal id, the same string as `terminal_id` on the record |
 | `execution_epoch` | bumped when the pane's child was replaced. The terminal id is **reused** on a shell respawn, so this is what tells a continuing agent from a fresh one in the same place |
 | `working_entries` | how many times this terminal has been observed entering `working` |
-| `state_seq` | bumped on every change of the status the API reports for this terminal, plus on hibernation entry and exit |
+| `state_seq` | bumped on every change of the terminal's effective state, plus on hibernation entry and exit. `idle` and `done` are ONE state to it — they are the same effective idle, told apart by the record's `seen` flag — so an operator looking at a pane does not move the cursor |
 | `w` / `i` | whether the agent was working when the cursor was minted |
 
 Capture a cursor before you prompt an agent, and hand it back to
@@ -438,7 +438,9 @@ entries, not submitted prompts — Flock samples a native agent's screen every
 300-500 ms, so a turn whose working phase is shorter than one sample is never
 seen. And `state_seq` moves on an `idle -> blocked -> idle` excursion even
 though the status ends where it started, which is what makes a settle window
-anchored on it survive a mid-turn blip.
+anchored on it survive a mid-turn blip — including one that happened entirely
+between two polls, where both samples read `idle` and only the counter says
+otherwise.
 
 `turn_cursor` is absent on remote, peer and fleet summaries (there is no local
 terminal to describe) and on servers older than #553. Handle it as optional.

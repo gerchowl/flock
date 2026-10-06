@@ -262,6 +262,16 @@ pub(super) enum Sample {
         status: AgentStatus,
         cursor: Cursor,
     },
+    /// The agent is hibernated.
+    ///
+    /// Its own arm rather than a `Record` with a cursor, because a hibernated
+    /// agent reports from the stashed resume plan and there is no live turn to
+    /// have a cursor for — and the ordering matters: "is it hibernated" is
+    /// decided BEFORE the record is required to carry one, so a hibernated agent
+    /// is `gone` rather than a parse error about a missing field.
+    Hibernated {
+        pane_id: String,
+    },
     Gone(GoneReason),
 }
 
@@ -310,8 +320,17 @@ pub(super) struct SettledWait {
     /// different terminal after a close, so every later sample is checked
     /// against this rather than trusted by position.
     pinned_terminal: String,
-    /// The most recent record, for the result line.
-    last: Option<(String, AgentStatus, String)>,
+    /// The execution epoch of the first record this wait saw.
+    ///
+    /// A later sample from a HIGHER epoch is a different child behind the same
+    /// terminal id — a respawn — and is `gone: restarted` whether or not the
+    /// caller passed `--after`. Without this, a wait with no cursor would sit
+    /// through a restart and settle on whatever the new child happened to do.
+    observed_epoch: Option<u64>,
+    /// The most recent record, for the result line. The cursor is optional
+    /// because a hibernated sample knows its pane and its status but has no
+    /// cursor, and the result line says so rather than inventing one.
+    last: Option<(String, AgentStatus, Option<String>)>,
 }
 
 impl SettledWait {
@@ -328,6 +347,7 @@ impl SettledWait {
             deadline: timeout.and_then(|timeout| now.checked_add(timeout)),
             anchor: None,
             pinned_terminal,
+            observed_epoch: None,
             last: None,
         }
     }
@@ -356,7 +376,10 @@ impl SettledWait {
             Some((pane_id, agent_status, cursor)) => (
                 serde_json::Value::String(pane_id.clone()),
                 serde_json::Value::String(reported_status_name(*agent_status).to_string()),
-                serde_json::Value::String(cursor.clone()),
+                match cursor {
+                    Some(cursor) => serde_json::Value::String(cursor.clone()),
+                    None => serde_json::Value::Null,
+                },
             ),
             None => (
                 serde_json::Value::Null,
@@ -391,14 +414,27 @@ impl SettledWait {
                 status,
                 cursor,
             } => (pane_id, status, cursor),
+            Sample::Hibernated { pane_id } => {
+                // A hibernated agent has no live child, so there is no turn left
+                // to observe and nothing can settle. Decided before the record
+                // was asked for a cursor.
+                self.last = Some((pane_id, AgentStatus::Hibernated, None));
+                return Step::Gone(GoneReason::Hibernated);
+            }
             Sample::Gone(reason) => return Step::Gone(reason),
         };
         // Follow the pane: a terminal keeps its id when the pane moves, so the
         // pinned id is the identity and this is only where to find it now.
-        self.last = Some((pane_id, status, cursor.raw.clone()));
+        self.last = Some((pane_id, status, Some(cursor.raw.clone())));
 
-        if status == AgentStatus::Hibernated {
-            return Step::Gone(GoneReason::Hibernated);
+        // The execution this wait is watching, remembered from the first record
+        // it saw. A respawn reuses the terminal id and moves the epoch, so a
+        // higher epoch is a different child — `gone`, never a settle, and with
+        // or without `--after`.
+        match self.observed_epoch {
+            None => self.observed_epoch = Some(cursor.epoch),
+            Some(watched) if cursor.epoch > watched => return Step::Gone(GoneReason::Restarted),
+            Some(_) => {}
         }
 
         if let Some(after) = &self.after {
@@ -469,7 +505,12 @@ impl SettledWait {
 
 /// Run the settled wait. One implementation; `flk agent wait --status settled`
 /// and `flk wait agent-status --status settled` both land here.
+///
+/// `verb` is the caller's own name, because every message this prints is read
+/// by someone who typed one command or the other and must not have to work out
+/// which one produced it.
 pub(super) fn run_settled_wait(
+    verb: &str,
     target: InitialTarget<'_>,
     after: Option<&str>,
     settle_ms: u64,
@@ -484,14 +525,14 @@ pub(super) fn run_settled_wait(
         Some(raw) => match Cursor::parse(raw) {
             Ok(cursor) => Some(cursor),
             Err(reason) => {
-                eprintln!("agent wait: {reason}");
+                eprintln!("{verb}: {reason}");
                 return Ok(2);
             }
         },
         None => None,
     };
 
-    let rec0 = match resolve_initial(&client, target, deadline) {
+    let rec0 = match resolve_initial(&client, target, deadline, verb) {
         Ok(rec) => rec,
         Err(InitialFailure::TimedOut) => {
             eprintln!("timed out waiting for the agent to settle");
@@ -502,7 +543,7 @@ pub(super) fn run_settled_wait(
             return Ok(1);
         }
         Err(InitialFailure::Unusable(reason)) => {
-            eprintln!("agent wait: {reason}");
+            eprintln!("{verb}: {reason}");
             return Ok(1);
         }
     };
@@ -513,13 +554,13 @@ pub(super) fn run_settled_wait(
         .unwrap_or_default()
         .to_string();
     if terminal_id.is_empty() {
-        eprintln!("agent wait: the server's record named no terminal");
+        eprintln!("{verb}: the server's record named no terminal");
         return Ok(1);
     }
     if let Some(after) = &after {
         if after.terminal_id != terminal_id {
             eprintln!(
-                "agent wait: turn cursor belongs to another terminal \
+                "{verb}: turn cursor belongs to another terminal \
                  ({} is not {terminal_id})",
                 after.terminal_id
             );
@@ -541,30 +582,41 @@ pub(super) fn run_settled_wait(
     let sample = match sample_from_record(&rec0) {
         Ok(sample) => sample,
         Err(reason) => {
-            eprintln!("agent wait: {reason}");
+            eprintln!("{verb}: {reason}");
             return Ok(1);
         }
     };
     let step = wait.observe(sample, Instant::now());
-    if let Some(code) = finish(&wait, step) {
+    if let Some(code) = finish(verb, &wait, step) {
         return Ok(code);
     }
 
+    let mut requests = SocketRequests { client: &client };
+    let mut reported_unreachable = false;
     loop {
-        let Some(request_timeout) = request_timeout(deadline) else {
-            eprintln!("timed out waiting for the agent to settle");
-            return Ok(exit::TIMEOUT);
-        };
-        match sample_pinned(&client, &wait, request_timeout) {
+        match sample_pinned(&mut requests, &wait, deadline) {
             Ok(sample) => {
                 let step = wait.observe(sample, Instant::now());
-                if let Some(code) = finish(&wait, step) {
+                if let Some(code) = finish(verb, &wait, step) {
                     return Ok(code);
                 }
             }
-            Err(PinnedFailure::Retry) => {}
+            // Retried rather than reported: the same live handoff that replaces
+            // the socket mid-wait can land between two polls. Said ONCE, though
+            // — a wait that cannot reach the server is otherwise silent for as
+            // long as its timeout, which reads as a hang.
+            Err(PinnedFailure::Retry) => {
+                if !reported_unreachable {
+                    reported_unreachable = true;
+                    eprintln!("{verb}: server unreachable, retrying until the deadline");
+                }
+            }
+            Err(PinnedFailure::TimedOut) => {
+                eprintln!("timed out waiting for the agent to settle");
+                return Ok(exit::TIMEOUT);
+            }
             Err(PinnedFailure::Fatal(reason)) => {
-                eprintln!("agent wait: {reason}");
+                eprintln!("{verb}: {reason}");
                 return Ok(1);
             }
         }
@@ -573,7 +625,7 @@ pub(super) fn run_settled_wait(
 }
 
 /// Print a terminal step's outcome and turn it into an exit code.
-fn finish(wait: &SettledWait, step: Step) -> Option<i32> {
+fn finish(verb: &str, wait: &SettledWait, step: Step) -> Option<i32> {
     match step {
         Step::Continue => None,
         Step::Settled { held } => {
@@ -595,7 +647,7 @@ fn finish(wait: &SettledWait, step: Step) -> Option<i32> {
             Some(exit::GONE)
         }
         Step::Refused(reason) => {
-            eprintln!("agent wait: {reason}");
+            eprintln!("{verb}: {reason}");
             Some(2)
         }
         Step::TimedOut => {
@@ -620,8 +672,10 @@ fn resolve_initial(
     client: &ApiClient,
     target: InitialTarget<'_>,
     deadline: Option<Instant>,
+    verb: &str,
 ) -> Result<serde_json::Value, InitialFailure> {
     let request = initial_request(target);
+    let mut reported_unreachable = false;
     loop {
         let Some(timeout) = request_timeout(deadline) else {
             return Err(InitialFailure::TimedOut);
@@ -638,7 +692,14 @@ fn resolve_initial(
             // A transport failure at the initial resolve is retried rather than
             // reported: the same live handoff that interrupts a wait can land in
             // the window between this process starting and its first request.
-            Err(_) => sleep_bounded(deadline),
+            // Said once, so a wait against a dead socket says so.
+            Err(_) => {
+                if !reported_unreachable {
+                    reported_unreachable = true;
+                    eprintln!("{verb}: server unreachable, retrying until the deadline");
+                }
+                sleep_bounded(deadline)
+            }
         }
     }
 }
@@ -677,9 +738,59 @@ enum PinnedFailure {
     /// socket mid-wait, and a transport error is not an answer — the next tick
     /// finds the new server, or the deadline takes the wait.
     Retry,
+    /// A reply arrived after the deadline. Reported as 124 rather than as the
+    /// error or the settle it happened to carry: a wait that ran out of clock
+    /// does not get to reinterpret what it read on the way past.
+    TimedOut,
     /// The server answered with something this client cannot act on. Exit 1,
     /// carrying the server's own words rather than a paraphrase.
     Fatal(String),
+}
+
+/// The two requests a pinned sample needs, behind one seam.
+///
+/// The seam exists so the fetch decisions — which fallback error means `gone`,
+/// which means fatal, and whether the second request is still inside the
+/// deadline — are reachable from a test without a server or a live socket.
+trait PinnedRequests {
+    /// `Err` is a transport failure: not an answer.
+    fn agent_get(&mut self, terminal_id: &str, timeout: Duration) -> Result<serde_json::Value, ()>;
+
+    fn pane_get(&mut self, pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()>;
+}
+
+struct SocketRequests<'a> {
+    client: &'a ApiClient,
+}
+
+impl PinnedRequests for SocketRequests<'_> {
+    fn agent_get(&mut self, terminal_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+        self.client
+            .request_value_with_timeout(
+                &Request {
+                    id: "cli:settled:sample".into(),
+                    method: Method::AgentGet(AgentTarget {
+                        target: terminal_id.to_string(),
+                    }),
+                },
+                timeout,
+            )
+            .map_err(|_| ())
+    }
+
+    fn pane_get(&mut self, pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+        self.client
+            .request_value_with_timeout(
+                &Request {
+                    id: "cli:settled:sample:pane".into(),
+                    method: Method::PaneGet(PaneTarget {
+                        pane_id: pane_id.to_string(),
+                    }),
+                },
+                timeout,
+            )
+            .map_err(|_| ())
+    }
 }
 
 /// One sample from the pinned terminal, from whatever the two requests said.
@@ -691,16 +802,13 @@ enum PinnedFailure {
 /// back to the pane record rather than reading as "the pane is gone". The
 /// fallback is also what turns a respawn into `restarted` rather than `closed`:
 /// the respawn keeps the terminal id and moves the execution epoch inside it.
-///
-/// Split from the socket work so the whole decision, including the respawn, is
-/// reachable from a test without a running server.
 fn classify_pinned(
     terminal_id: &str,
     agent: &serde_json::Value,
     pane: Option<&serde_json::Value>,
 ) -> Result<Sample, PinnedFailure> {
     if agent.get("error").is_some() {
-        if !is_not_found(agent) {
+        if !is_agent_not_found(agent) {
             return Err(PinnedFailure::Fatal(agent.to_string()));
         }
         let pane = match pane {
@@ -708,11 +816,22 @@ fn classify_pinned(
             // server still catching up. Not an answer.
             None => return Err(PinnedFailure::Retry),
             Some(pane) if pane.get("error").is_some() => {
-                return Ok(Sample::Gone(GoneReason::Closed))
+                // Only `pane_not_found` is an answer about the pane. Anything
+                // else the fallback says is a problem with the server, and
+                // reporting it as "your pane closed" would turn a flock-side
+                // fault into a lie about the agent.
+                return if is_pane_not_found(pane) {
+                    Ok(Sample::Gone(GoneReason::Closed))
+                } else {
+                    Err(PinnedFailure::Fatal(pane.to_string()))
+                };
             }
             Some(pane) => pane,
         };
-        let record = &pane["result"]["pane"];
+        let record = match pane_record(pane) {
+            Some(record) => record,
+            None => return Err(PinnedFailure::Fatal(NO_PANE_RECORD.into())),
+        };
         return if record_terminal(record) == Some(terminal_id) {
             sample_from_record(record).map_err(PinnedFailure::Fatal)
         } else {
@@ -720,47 +839,60 @@ fn classify_pinned(
         };
     }
 
-    let record = &agent["result"]["agent"];
-    if record_terminal(record) != Some(terminal_id) {
-        return Ok(Sample::Gone(GoneReason::Restarted));
+    let record = match agent.get("result").and_then(|result| result.get("agent")) {
+        Some(record) => record,
+        None => return Err(PinnedFailure::Fatal(NO_AGENT_RECORD.into())),
+    };
+    match record_terminal(record) {
+        // A record naming a DIFFERENT terminal is a respawn or a reassignment:
+        // either way the child this wait pinned is not the one answering.
+        Some(other) if other != terminal_id => Ok(Sample::Gone(GoneReason::Restarted)),
+        Some(_) => sample_from_record(record).map_err(PinnedFailure::Fatal),
+        // A success with no terminal id is a malformed record, not a
+        // different terminal. Calling it `restarted` would report an agent as
+        // replaced when the server simply answered wrong.
+        None => Err(PinnedFailure::Fatal(NO_AGENT_RECORD.into())),
     }
-    sample_from_record(record).map_err(PinnedFailure::Fatal)
 }
 
-/// Fetch the pinned terminal's record and the pane fallback it may need.
+/// Fetch the pinned terminal's record, and the pane fallback it may need.
+///
+/// The request timeout is recomputed from the absolute deadline before EACH
+/// request: the fallback is a second round trip, and giving it the first
+/// request's remaining budget would let the pair run to twice the deadline.
+/// And a reply that lands after the deadline is `TimedOut` whichever way it went
+/// — a record is not a settle, and an error is not a fault.
 fn sample_pinned(
-    client: &ApiClient,
+    requests: &mut dyn PinnedRequests,
     wait: &SettledWait,
-    timeout: Duration,
+    deadline: Option<Instant>,
 ) -> Result<Sample, PinnedFailure> {
     let terminal_id = wait.pinned_terminal().to_string();
-    let agent = Request {
-        id: "cli:settled:sample".into(),
-        method: Method::AgentGet(AgentTarget {
-            target: terminal_id.clone(),
-        }),
-    };
-    let pane_id = wait.last_pane_id().unwrap_or_default().to_string();
+    let agent_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
+    let agent_value = requests
+        .agent_get(&terminal_id, agent_timeout)
+        .map_err(|()| PinnedFailure::Retry)?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(PinnedFailure::TimedOut);
+    }
 
-    let agent_value = match client.request_value_with_timeout(&agent, timeout) {
-        Ok(value) => value,
-        Err(_) => return Err(PinnedFailure::Retry),
-    };
     // The pane lookup only happens on the miss path, so the ordinary case stays
     // one request per poll.
-    let pane_value = if agent_value.get("error").is_some() && is_not_found(&agent_value) {
-        let pane = Request {
-            id: "cli:settled:sample:pane".into(),
-            method: Method::PaneGet(PaneTarget {
-                pane_id: pane_id.clone(),
-            }),
-        };
-        client.request_value_with_timeout(&pane, timeout).ok()
-    } else {
-        None
-    };
+    if !(agent_value.get("error").is_some() && is_agent_not_found(&agent_value)) {
+        return classify_pinned(&terminal_id, &agent_value, None);
+    }
+    let pane_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
+    let pane_value = requests
+        .pane_get(wait.last_pane_id().unwrap_or_default(), pane_timeout)
+        .ok();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(PinnedFailure::TimedOut);
+    }
     classify_pinned(&terminal_id, &agent_value, pane_value.as_ref())
 }
+
+const NO_AGENT_RECORD: &str = "server sent no agent record";
+const NO_PANE_RECORD: &str = "server sent no pane record";
 
 fn record_terminal(record: &serde_json::Value) -> Option<&str> {
     record
@@ -768,11 +900,29 @@ fn record_terminal(record: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-fn is_not_found(value: &serde_json::Value) -> bool {
+/// `agent.get` reporting that the terminal is not (or is no longer) an agent
+/// terminal. `pane_not_found` is accepted too: a server that answered about the
+/// pane has still said the agent is not addressable there, and the pane fallback
+/// will say whether it is really gone.
+fn is_agent_not_found(value: &serde_json::Value) -> bool {
     matches!(
         value["error"]["code"].as_str(),
         Some("agent_not_found") | Some("pane_not_found")
     )
+}
+
+/// `pane.get` reporting that the pane is gone. The ONLY error that means
+/// `gone: closed`.
+fn is_pane_not_found(value: &serde_json::Value) -> bool {
+    matches!(value["error"]["code"].as_str(), Some("pane_not_found"))
+}
+
+/// The record inside a `pane_info` response, if the response carries one.
+fn pane_record(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("result")
+        .and_then(|result| result.get("pane"))
+        .filter(|record| record.is_object())
 }
 
 fn sample_from_record(record: &serde_json::Value) -> Result<Sample, String> {
@@ -785,13 +935,21 @@ fn sample_from_record(record: &serde_json::Value) -> Result<Sample, String> {
         .get("agent_status")
         .and_then(serde_json::Value::as_str)
         .ok_or("the server's record named no agent_status")?;
+    let status = parse_reported_status(status)?;
+    // Hibernation is answered BEFORE the cursor is asked for. The status is
+    // derived from the stashed resume plan rather than from a live turn, so
+    // demanding a cursor first would turn "this agent is parked" into a parse
+    // error about a field that has nothing to say here.
+    if status == AgentStatus::Hibernated {
+        return Ok(Sample::Hibernated { pane_id });
+    }
     let cursor = record
         .get("turn_cursor")
         .and_then(serde_json::Value::as_str)
         .ok_or("the server sent no turn cursor; it predates #553")?;
     Ok(Sample::Record {
         pane_id,
-        status: parse_reported_status(status)?,
+        status,
         cursor: Cursor::parse(cursor)?,
     })
 }
@@ -1095,6 +1253,57 @@ mod tests {
         );
     }
 
+    /// The case a status-only dwell cannot see coming: consecutive samples that
+    /// all report `idle`, with the transition counter moving between them.
+    ///
+    /// Something happened between two polls that the poll itself never caught —
+    /// `idle -> blocked -> idle`, a sub-sample flicker, a `working` phase the
+    /// detector missed — and by the time this wait looks again the pane reads
+    /// exactly as it did before. Three agreeing samples are not one unbroken
+    /// quiet, and the window has to start at the last `state_seq` it saw.
+    #[test]
+    fn an_unseen_excursion_between_two_idle_samples_restarts_the_window() {
+        let mut settle = wait(None, 500, Some(30_000));
+        let start = Instant::now();
+        // seq 7 idle, then seq 8 idle: identical status, moved counter.
+        assert_eq!(
+            settle.observe(sample(AgentStatus::Idle, cursor(0, 0, 7, false)), start),
+            Step::Continue
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(0, 0, 7, false)),
+                start + Duration::from_millis(400)
+            ),
+            Step::Continue
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(0, 0, 8, false)),
+                start + Duration::from_millis(410)
+            ),
+            Step::Continue,
+            "a moved state_seq is a transition nobody sampled, so the dwell restarts here"
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(0, 0, 8, false)),
+                start + Duration::from_millis(850)
+            ),
+            Step::Continue,
+            "490 ms since the change is not a full window"
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(0, 0, 8, false)),
+                start + Duration::from_millis(910)
+            ),
+            Step::Settled {
+                held: Duration::from_millis(500)
+            }
+        );
+    }
+
     /// A `done` is an effective idle — the same quiescence as `idle`, reached by
     /// an agent nobody is watching. It must settle, and must be reachable from
     /// either spelling.
@@ -1145,20 +1354,6 @@ mod tests {
         );
     }
 
-    /// A hibernate is `gone`, not settled. Its child is gone and a resume plan
-    /// is stashed, so no further turn can be observed on it — and a wait that
-    /// ran to its timeout instead would have told the caller the agent went
-    /// quiet, which is the opposite of what happened.
-    #[test]
-    fn a_hibernated_agent_is_gone_not_settled() {
-        let mut settle = wait(None, 500, Some(30_000));
-        let step = settle.observe(
-            sample(AgentStatus::Hibernated, cursor(1, 0, 2, false)),
-            Instant::now(),
-        );
-        assert_eq!(step, Step::Gone(GoneReason::Hibernated));
-    }
-
     /// `--settle 0` settles on the first qualifying sample's successor: the
     /// anchor has to be observed once before there is a window to have elapsed.
     #[test]
@@ -1199,6 +1394,60 @@ mod tests {
                 "{bad:?} is ahead of the server"
             );
         }
+    }
+
+    /// #553 round 1: a respawn must end the wait even with NO cursor.
+    ///
+    /// The epoch comparison against `--after` cannot catch this: without a cursor
+    /// there is nothing to compare, so a wait would settle on whatever the NEW
+    /// child happened to do and report a turn nobody asked it to run. The
+    /// execution this wait started watching is remembered instead.
+    #[test]
+    fn a_respawn_is_gone_restarted_even_without_a_cursor() {
+        let mut settle = wait(None, 500, Some(30_000));
+        let start = Instant::now();
+        // First sample establishes the execution at epoch 0.
+        assert_eq!(
+            settle.observe(sample(AgentStatus::Idle, cursor(0, 0, 1, false)), start),
+            Step::Continue
+        );
+        // A higher epoch later is a different child behind the same terminal id.
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(1, 0, 0, false)),
+                start + Duration::from_millis(200)
+            ),
+            Step::Gone(GoneReason::Restarted)
+        );
+    }
+
+    /// The remembered epoch must not fire on a LOWER one, and an unchanged epoch
+    /// must keep the dwell running — otherwise the check above would replace a
+    /// timeout with a false `restarted`.
+    #[test]
+    fn an_unchanged_epoch_leaves_the_dwell_alone() {
+        let mut settle = wait(None, 500, Some(30_000));
+        let start = Instant::now();
+        assert_eq!(
+            settle.observe(sample(AgentStatus::Idle, cursor(4, 0, 1, false)), start),
+            Step::Continue
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(4, 0, 1, false)),
+                start + Duration::from_millis(300)
+            ),
+            Step::Continue
+        );
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Idle, cursor(4, 0, 1, false)),
+                start + Duration::from_millis(500)
+            ),
+            Step::Settled {
+                held: Duration::from_millis(500)
+            }
+        );
     }
 
     /// The other direction: a cursor from before a respawn names an execution
@@ -1415,5 +1664,309 @@ mod tests {
             }
             other => panic!("a permission error is not a sample: {other:?}"),
         }
+    }
+
+    /// #553 round 1: only `pane_not_found` is the pane's own answer. Any other
+    /// error from the fallback is a flock-side fault, and reporting it as
+    /// `gone: closed` would tell the caller its agent vanished when what
+    /// actually happened is that flock could not answer.
+    #[test]
+    fn only_pane_not_found_from_the_fallback_means_the_pane_is_closed() {
+        let agent = response(r#"{"error":{"code":"agent_not_found","message":"no agent here"}}"#);
+        for code in [
+            "permission_denied",
+            "internal_error",
+            "rate_limited",
+            "protocol_mismatch",
+        ] {
+            let pane = response(&format!(
+                r#"{{"error":{{"code":"{code}","message":"flock could not answer"}}}}"#
+            ));
+            match classify_pinned(TERM, &agent, Some(&pane)) {
+                Err(PinnedFailure::Fatal(reason)) => {
+                    assert!(
+                        reason.contains(code),
+                        "{code} must be reported, got {reason}"
+                    )
+                }
+                other => panic!("{code} must not read as a gone pane: {other:?}"),
+            }
+        }
+
+        // The one that does mean it.
+        let missing = response(r#"{"error":{"code":"pane_not_found","message":"gone"}}"#);
+        assert_eq!(
+            classify_pinned(TERM, &agent, Some(&missing)).expect("the pane really is gone"),
+            Sample::Gone(GoneReason::Closed)
+        );
+    }
+
+    /// #553 round 1: a success response that carries no agent record, or one
+    /// whose record names no terminal, is a MALFORMED reply. Only a record that
+    /// positively names a different terminal means the child was replaced;
+    /// calling either case `restarted` would report an agent as replaced when
+    /// the server simply answered wrong.
+    #[test]
+    fn a_malformed_success_is_fatal_not_restarted() {
+        for reply in [
+            r#"{"result":{}}"#,
+            r#"{"result":{"agent":null}}"#,
+            r#"{"result":{"agent":{}}}"#,
+            r#"{"result":{"agent":{"pane_id":"w1:p1"}}}"#,
+        ] {
+            let agent = response(reply);
+            match classify_pinned(TERM, &agent, None) {
+                Err(PinnedFailure::Fatal(reason)) => assert_eq!(reason, NO_AGENT_RECORD, "{reply}"),
+                other => panic!("{reply} is not a restart: {other:?}"),
+            }
+        }
+
+        // The one case that IS a restart: a record naming another terminal.
+        let other = response(
+            r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_elsewhere",
+                "agent_status":"idle","turn_cursor":"term_elsewhere:0:0:1:i"}}}"#,
+        );
+        assert_eq!(
+            classify_pinned(TERM, &other, None).expect("a positive mismatch is a restart"),
+            Sample::Gone(GoneReason::Restarted)
+        );
+    }
+
+    /// #553 round 1: hibernation is answered BEFORE the cursor is required. The
+    /// record below carries no `turn_cursor` at all — a hibernated agent is
+    /// reported from the stashed plan and has no live turn — and demanding one
+    /// first would have turned "your agent is parked" into a parse error about a
+    /// field that has nothing to say here.
+    #[test]
+    fn a_hibernated_agent_needs_no_turn_cursor_to_be_reported_as_gone() {
+        let agent = response(
+            r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                "agent_status":"hibernated"}}}"#,
+        );
+        let fetched = classify_pinned(TERM, &agent, None).expect("a hibernated record is a sample");
+        assert_eq!(
+            fetched,
+            Sample::Hibernated {
+                pane_id: "w1:p1".into()
+            }
+        );
+
+        let mut settle = wait(None, 500, Some(30_000));
+        assert_eq!(
+            settle.observe(fetched, Instant::now()),
+            Step::Gone(GoneReason::Hibernated)
+        );
+        // The result line names the pane and says the cursor is unknown, rather
+        // than reporting the wait as if it had never seen anything.
+        let line: serde_json::Value =
+            serde_json::from_str(&settle.result_line("gone", 0, Some(GoneReason::Hibernated)))
+                .unwrap();
+        assert_eq!(line["pane_id"], "w1:p1");
+        assert_eq!(line["agent_status"], "hibernated");
+        assert!(line["turn_cursor"].is_null());
+        assert_eq!(line["held_ms"], 0);
+    }
+
+    /// A scripted transport, so the two-request sequence is reachable without a
+    /// server. `cost` is slept per reply, which is what makes the deadline tests
+    /// real rather than simulated.
+    struct Scripted {
+        replies: std::collections::VecDeque<Result<serde_json::Value, ()>>,
+        cost: Duration,
+        /// The timeout each request was actually granted, in order.
+        granted: Vec<Duration>,
+    }
+
+    impl Scripted {
+        fn new(replies: Vec<Result<serde_json::Value, ()>>, cost: Duration) -> Self {
+            Self {
+                replies: replies.into(),
+                cost,
+                granted: Vec::new(),
+            }
+        }
+
+        fn next(&mut self, timeout: Duration) -> Result<serde_json::Value, ()> {
+            self.granted.push(timeout);
+            std::thread::sleep(self.cost);
+            self.replies
+                .pop_front()
+                .expect("a scripted reply for every request the wait makes")
+        }
+    }
+
+    impl PinnedRequests for Scripted {
+        fn agent_get(
+            &mut self,
+            _terminal_id: &str,
+            timeout: Duration,
+        ) -> Result<serde_json::Value, ()> {
+            self.next(timeout)
+        }
+
+        fn pane_get(&mut self, _pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+            self.next(timeout)
+        }
+    }
+
+    /// #553 round 1: the respawn path, through `sample_pinned` rather than the
+    /// classifier — so the fallback REQUEST is part of what is under test.
+    ///
+    /// A respawn clears the pane's agent identity, so `agent.get` answers
+    /// `agent_not_found` and the wait has to fall back to `pane.get` for a
+    /// record that names the SAME terminal id at a HIGHER epoch. Reading that as
+    /// "the pane closed" would be a lie: the pane is right there, with a new
+    /// child in it. This is the only reason the pane fallback exists.
+    #[test]
+    fn a_respawn_is_restarted_through_the_pinned_fetch_itself() {
+        let mut settle = wait(None, 500, Some(30_000));
+        // Seed the remembered pane id the fallback looks up.
+        settle.observe(
+            sample(AgentStatus::Idle, cursor(0, 0, 1, false)),
+            Instant::now(),
+        );
+
+        let mut requests = Scripted::new(
+            vec![
+                Ok(response(
+                    r#"{"error":{"code":"agent_not_found","message":"no agent here"}}"#,
+                )),
+                Ok(response(
+                    r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                        "agent_status":"unknown","turn_cursor":"term_1f2e3:1:0:0:i"}}}"#,
+                )),
+            ],
+            Duration::ZERO,
+        );
+        let fetched = sample_pinned(
+            &mut requests,
+            &settle,
+            Some(Instant::now() + Duration::from_secs(5)),
+        )
+        .expect("the pane fallback answers");
+
+        // The record arrived intact — it is the EPOCH, not a missing field, that
+        // says the child was replaced.
+        match &fetched {
+            Sample::Record {
+                status,
+                cursor: seen,
+                ..
+            } => {
+                assert_eq!(*status, AgentStatus::Unknown);
+                assert_eq!(seen.epoch, 1);
+            }
+            other => panic!("expected a record, got {other:?}"),
+        }
+        assert_eq!(
+            settle.observe(fetched, Instant::now()),
+            Step::Gone(GoneReason::Restarted),
+            "same terminal id, new execution: gone, not closed and not settled"
+        );
+        assert_eq!(requests.granted.len(), 2, "the respawn costs both requests");
+    }
+
+    /// #553 round 1: the fallback is a SECOND round trip, so it must be given
+    /// what is left of the budget rather than the first request's budget — and a
+    /// reply that lands after the deadline is a timeout whichever way it went.
+    ///
+    /// Two replies that each eat most of the remaining time is the only way to
+    /// tell "recomputed before each request" apart from "reused the first
+    /// request's timeout": under the latter the second request would be granted a
+    /// budget that had already expired, and this would settle instead of timing
+    /// out.
+    #[test]
+    fn the_deadline_covers_both_requests_and_outranks_the_second_reply() {
+        let mut settle = wait(None, 500, Some(30_000));
+        settle.observe(
+            sample(AgentStatus::Idle, cursor(0, 0, 1, false)),
+            Instant::now(),
+        );
+
+        // 120 ms of budget, 80 ms per reply: the first fits, the pair does not.
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let mut requests = Scripted::new(
+            vec![
+                Ok(response(
+                    r#"{"error":{"code":"agent_not_found","message":"no agent here"}}"#,
+                )),
+                Ok(response(
+                    r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                        "agent_status":"idle","turn_cursor":"term_1f2e3:0:0:1:i"}}}"#,
+                )),
+            ],
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            sample_pinned(&mut requests, &settle, Some(deadline))
+                .expect_err("both replies land past the deadline"),
+            PinnedFailure::TimedOut,
+            "a record that arrives too late is a timeout, not a settle"
+        );
+        assert_eq!(requests.granted.len(), 2, "both requests were issued");
+        assert!(
+            requests.granted[1] < requests.granted[0],
+            "the fallback must be given what is LEFT, not the first request's budget: {:?}",
+            requests.granted
+        );
+        assert!(
+            requests.granted[1] <= Duration::from_millis(60),
+            "and what is left is under the 80 ms the first reply cost: {:?}",
+            requests.granted
+        );
+    }
+
+    /// The same precedence for the ERROR direction: a server error arriving after
+    /// the deadline is a timeout, because by then nothing has been established
+    /// about the agent.
+    #[test]
+    fn an_error_arriving_after_the_deadline_is_a_timeout_not_a_fatal() {
+        let mut settle = wait(None, 500, Some(30_000));
+        settle.observe(
+            sample(AgentStatus::Idle, cursor(0, 0, 1, false)),
+            Instant::now(),
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"error":{"code":"permission_denied","message":"nope"}}"#,
+            ))],
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            sample_pinned(&mut requests, &settle, Some(deadline)).expect_err("the reply is late"),
+            PinnedFailure::TimedOut
+        );
+        assert_eq!(
+            requests.granted.len(),
+            1,
+            "an error short-circuits the fallback"
+        );
+    }
+
+    /// No time left at all: the request is skipped rather than issued with a
+    /// nonsense timeout, so the wait takes the timeout path instead of blocking
+    /// on a socket it cannot afford to read.
+    #[test]
+    fn an_exhausted_deadline_skips_the_request_entirely() {
+        let settle = wait(None, 500, Some(30_000));
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                    "agent_status":"idle","turn_cursor":"term_1f2e3:0:0:1:i"}}}"#,
+            ))],
+            Duration::ZERO,
+        );
+        let past = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            sample_pinned(&mut requests, &settle, Some(past)).expect_err("no budget left"),
+            PinnedFailure::TimedOut
+        );
+        assert!(
+            requests.granted.is_empty(),
+            "nothing was sent: {:?}",
+            requests.granted
+        );
     }
 }

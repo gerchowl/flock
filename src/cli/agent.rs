@@ -55,9 +55,10 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "  done     exactly done: idle, plus a finished pane you have not looked at\n",
     "  settled  observed quiescence: after --after, the server saw this agent enter working and then\n",
     "           saw its status hold idle/done with NO state transition at all for --settle\n",
-    "  --after CURSOR  a turn_cursor from `flk agent get`, captured BEFORE you prompted. Without it\n",
-    "                 any quiet counts, so an agent that was already idle settles immediately.\n",
-    "  --settle MS  how long that quiet must hold. Default 5000; --settle 0 settles on the first sample.\n",
+    "  --after CURSOR  a turn_cursor from `flk agent get`, captured BEFORE you prompted.\n",
+    "           Without it any quiet counts: an agent already idle settles after one settle window.\n",
+    "  --settle MS  how long that quiet must hold. Default 5000; --settle 0 settles on the sample\n",
+    "           after the first qualifying one.\n",
     "  --timeout MS  give up after this long. Absent means wait forever.\n",
     "  prints one JSON line on stdout:\n",
     "           {\"status\":\"settled\"|\"blocked\"|\"gone\",\"pane_id\":…,\"agent_status\":…,\n",
@@ -65,10 +66,11 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           a gone line adds \"reason\":\"closed\"|\"hibernated\"|\"restarted\".\n",
     "  exit 0 settled · 3 blocked · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
     "           · 1 every other error. A timeout is 1 for the non-settled statuses above.\n",
-    "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's output\n",
-    "  use `flk agent result`. Native agents are read from the screen every 300-500 ms, so a working\n",
-    "  phase shorter than one sample is never observed — a cursor taken before one waits for the next\n",
-    "  turn instead. A turn cursor never satisfies a wait on another terminal or another execution.",
+    "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
+    "  output use `flk agent result` (once #575 lands). Native agents are read from the screen every\n",
+    "  300-500 ms, so a working phase shorter than one sample is never observed — a cursor taken\n",
+    "  before one waits for the next turn instead. A turn cursor never satisfies a wait on another\n",
+    "  terminal or another execution.",
 );
 
 /// Everything `agent start` accepts between the name and the `--` terminator.
@@ -454,7 +456,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    let mut timeout_ms = None;
+    let mut raw_timeout: Option<String> = None;
     let mut desired_status = None;
     let mut ready = false;
     let mut settle_flags = super::settled::SettleFlags::default();
@@ -485,7 +487,11 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --timeout");
                     return Ok(2);
                 };
-                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
+                // Kept raw until the target is known: with `--status settled` a
+                // bad value is a usage error (exit 2, before anything is
+                // waited on), and the other statuses keep their historical
+                // behaviour of reporting it as an io error.
+                raw_timeout = Some(value.clone());
                 index += 2;
             }
             "--after" => {
@@ -538,6 +544,22 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{reason}");
         return Ok(2);
     }
+    // Resolved here rather than in the parse loop because what a bad `--timeout`
+    // means depends on the target: with `--status settled` it is a usage error
+    // (exit 2, before anything is waited on), and every other status keeps its
+    // historical behaviour of reporting it as an io error.
+    let settled = desired_status == Some(super::settled::WaitTarget::Settled);
+    let timeout_ms = match (raw_timeout, settled) {
+        (None, _) => None,
+        (Some(raw), false) => Some(super::parse_u64_flag("--timeout", &raw)?),
+        (Some(raw), true) => Some(match raw.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                eprintln!("invalid value for --timeout: {raw} (expected milliseconds)");
+                return Ok(2);
+            }
+        }),
+    };
     if ready {
         let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
         if response.get("error").is_some() {
@@ -562,6 +584,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 
     if target_status == super::settled::WaitTarget::Settled {
         return super::settled::run_settled_wait(
+            "agent wait",
             super::settled::InitialTarget::Agent(target),
             settle_flags.after.as_deref(),
             settle_flags
@@ -774,7 +797,10 @@ fn print_agent_help() {
         "    (`done` too: an unattended agent goes quiet as `done`, which is an effective idle)."
     );
     eprintln!("    `done` on its own means exactly that effective state, not a UI-only marker:");
-    eprintln!("    --status settled waits for the agent to go quiet, with `flk agent result` for the output.");
+    eprintln!(
+        "    --status settled waits for the agent to go quiet; `flk agent result` (once #575 lands) is"
+    );
+    eprintln!("    the turn's output, which settled does not promise.");
 }
 
 #[cfg(test)]

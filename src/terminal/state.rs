@@ -260,11 +260,11 @@ pub struct TerminalState {
     pub armed_self_compact: Option<crate::agent_self_compact::ArmedSelfCompact>,
     /// When this pane last COMPLETED a self-compaction, kept after the arming
     /// is dropped. Ephemeral like the arming itself, for the same reason: a rate
-    /// limit that outlived the session would refuse a legitimate compaction on a
+    /// limit that outlives the session would refuse a legitimate compaction on a
     /// pane an operator reopened days later.
     pub last_self_compact_completed: Option<std::time::Instant>,
-    /// Monotonic counter of every change to the status the API reports for this
-    /// terminal (#553).
+    /// Monotonic counter of every change of the terminal's effective state, plus
+    /// hibernation entry and exit (#553).
     ///
     /// The three bumps are the arbitration block in
     /// [`Self::recompute_effective_state`], `clear_agent_runtime_identity_after_respawn`,
@@ -274,6 +274,12 @@ pub struct TerminalState {
     /// change the reported status without going through it, so a counter that
     /// only watched the block would let a caller believe a pane was unchanged
     /// across either.
+    ///
+    /// `idle` and `done` are ONE state here and do not move this counter: they
+    /// are the same effective idle, told apart by the pane's `seen` flag, which
+    /// lives beside the terminal rather than in it. A counter that moved on
+    /// `seen` would be counting operator attention, not agent transitions —
+    /// and it would reset a settle window every time somebody glanced at a pane.
     state_seq: u64,
     /// How many times this terminal has been observed entering `working`
     /// (#553). Not "turns submitted" — a working phase shorter than one
@@ -1242,7 +1248,12 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.pending_agent_resume_plan = None;
-        self.set_hibernated_resume_plan(None);
+        // Direct assignment rather than `set_hibernated_resume_plan`: this
+        // method already bumps both counters for the respawn itself, and
+        // routing through the setter would charge a hibernation transition that
+        // the caller is not making — `state_seq` must move ONCE for a respawn,
+        // not once for the respawn and again for the unpark.
+        self.hibernated_resume_plan = None;
         self.clear_agent_name();
         // A respawn replaces the pane's child without going through the
         // arbitration block, so it moves the reported status twice over: the
@@ -1798,6 +1809,41 @@ mod tests {
             terminal.working_entries, 1,
             "history before the respawn is still counted; the epoch separates it"
         );
+    }
+
+    /// #553: a respawn of a terminal that was *parked* must still move
+    /// `state_seq` exactly once. It is the one place where the two rules meet —
+    /// the respawn clears the stashed plan, which is a reported-status change in
+    /// its own right — and charging both would move the counter twice for one
+    /// event, so a settle wait anchored on it would reset its dwell for a
+    /// transition the server only made once.
+    #[test]
+    fn respawning_a_parked_terminal_costs_exactly_one_state_seq() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let plan = crate::agent_resume::plan(
+            "flock:pi",
+            "pi",
+            &crate::agent_resume::AgentSessionRef::id("s-1").expect("valid id"),
+        )
+        .expect("pi has a resume plan");
+        terminal.set_hibernated_resume_plan(Some(plan));
+        let parked_epoch = terminal.execution_epoch;
+        let parked_seq = terminal.state_seq;
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert_eq!(
+            terminal.execution_epoch,
+            parked_epoch + 1,
+            "the respawn is one new execution"
+        );
+        assert_eq!(
+            terminal.state_seq,
+            parked_seq + 1,
+            "and ONE transition: the unpark rides the respawn, it is not a second event"
+        );
+        assert!(terminal.hibernated_resume_plan.is_none());
     }
 
     /// Hibernation is the same shape of hazard (#553): the API reports

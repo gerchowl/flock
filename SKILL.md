@@ -173,10 +173,10 @@ the same meanings.
 `settled` is **observed quiescence**: after a turn cursor, the agent entered
 `working` and then held `idle`/`done` with no state transition at all for the
 settle window (5000 ms by default). it is not proof the turn produced a result —
-for the turn's output use `flk agent result`.
+for the turn's output use `flk agent result` (once #575 lands).
 
-capture the cursor **before** you prompt, or an agent that was already idle
-settles immediately:
+capture the cursor **before** you prompt. without it any quiet counts, so an
+agent that is already idle settles after one settle window:
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)
@@ -185,7 +185,7 @@ flk pane send-keys 1-2 Enter
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
-`--settle MS` sets the window and `--after CURSOR` comes from `flk agent get`,
+`--settle MS` sets the window (default 5000; `--settle 0` settles on the sample after the first qualifying one) and `--after CURSOR` comes from `flk agent get`,
 `flk agent list` or `flk pane get` (all the same string). `flk wait agent-status
 1-1 --status settled` is the same signal if that is the verb you already have.
 

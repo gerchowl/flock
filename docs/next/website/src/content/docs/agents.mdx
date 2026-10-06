@@ -251,7 +251,7 @@ agent instead of hanging on it.
 For a supervisor, `--status settled` is the more precise question: after a turn
 cursor, the agent entered `working`, and then held `idle`/`done` with no state
 transition at all for the settle window (5000 ms by default, `--settle` to
-change it).
+change it; `--settle 0` settles on the sample after the first qualifying one).
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
@@ -260,11 +260,11 @@ flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
 `settled` is **observed quiescence**, not a turn result — for the turn's output
-use `flk agent result`. It exits `0` when settled, `3` when the agent is
+use `flk agent result` (once #575 lands). It exits `0` when settled, `3` when the agent is
 blocked, `4` when the pane went away (`"reason":"closed"|"hibernated"|"restarted"`),
 `124` on timeout and `2` on a usage error or a refused cursor. Without `--after`
-any quiet counts, so an agent that was already idle settles immediately; capture
-the cursor first. A `done` answer can be reached without ever observing
+any quiet counts, so an agent that is already idle settles after one settle
+window; capture the cursor first. A `done` answer can be reached without ever observing
 `working` at all: Flock samples a native agent's screen every 300-500 ms, so a
 turn shorter than one sample is never seen working, and a cursor taken before it
 waits for the next turn instead.

@@ -340,9 +340,9 @@ flk agent send worker "..." && flk pane send-keys <pane> Enter
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
-`settled` means: after that cursor, the server saw this agent enter `working` (or the cursor was captured while it was already working), and then saw its reported status hold `idle`/`done` with **no state transition at all** for the settle window. Anything in between resets the dwell — including `idle -> blocked -> idle`, which is why the dwell is anchored on a transition counter rather than on the status alone. `--settle MS` sets that window and defaults to `5000`; `--settle 0` settles on the first qualifying sample.
+`settled` means: after that cursor, the server saw this agent enter `working` (or the cursor was captured while it was already working), and then saw its reported status hold `idle`/`done` with **no state transition at all** for the settle window. Anything in between resets the dwell — including `idle -> blocked -> idle`, which is why the dwell is anchored on a transition counter rather than on the status alone. `--settle MS` sets that window and defaults to `5000`; `--settle 0` settles on the sample after the first qualifying one. Without `--after`, any quiet counts — an agent that is already idle settles after one settle window, so capture the cursor before you prompt.
 
-**It is not proof that a turn produced a result.** It says what Flock observed; for the turn's output use `flk agent result`. Two consequences follow. Native Claude and opencode agents are read from the screen every 300-500 ms, so a working phase shorter than one sample is never observed — a cursor captured before one waits for the *next* turn instead. And `working_entries` counts *observed* entries, not submitted prompts: capture the cursor after the agent is at its prompt and before you prompt it.
+**It is not proof that a turn produced a result.** It says what Flock observed; for the turn's output use `flk agent result` (once #575 lands). Two consequences follow. Native Claude and opencode agents are read from the screen every 300-500 ms, so a working phase shorter than one sample is never observed — a cursor captured before one waits for the *next* turn instead. And `working_entries` counts *observed* entries, not submitted prompts: capture the cursor after the agent is at its prompt and before you prompt it.
 
 The cursor itself is the `turn_cursor` field on `agent get`, `agent list` and `pane get` — `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`, opaque to callers. It never satisfies a wait on another terminal or another execution, and one whose counters the server has not reached is refused rather than waited out, so a typo cannot read as "it already worked".
 
@@ -354,7 +354,7 @@ On success `settled` prints one JSON object on stdout:
 
 `flk wait agent-status <pane> --status settled` is the same signal with the same result line — a supervisor can use whichever verb fits the command it already has. Exit codes for `--status settled`: **0** settled · **3** blocked (a human has to look) · **4** gone, with `"reason":"closed"|"hibernated"|"restarted"` on the line · **124** timeout · **2** a usage error or a refused cursor · **1** any other error. The non-settled statuses keep their historical codes, including `1` for a timeout.
 
-`--after` and `--settle` mean nothing without `--status settled`, and a non-numeric `--settle` is a usage error: all three exit `2` before any request is sent, so a typo does not cost you the wait.
+`--after` and `--settle` mean nothing without `--status settled`, and a non-numeric `--settle` or `--timeout` is a usage error: all of these exit `2` before any request is sent, so a typo does not cost you the wait.
 
 ## Notifications
 
