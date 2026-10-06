@@ -1382,6 +1382,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["workspace", "list"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
@@ -1390,6 +1391,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "install", "pi"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_install.status.code(), Some(0));
@@ -1402,6 +1404,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "status"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
@@ -1413,6 +1416,7 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "uninstall", "pi"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_uninstall.status.code(), Some(0));
