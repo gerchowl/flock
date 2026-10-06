@@ -20,6 +20,7 @@ the full archive.
 | Worktrees | Merge-gated kill, fleet sweep, workspace-as-unit | Shipped | — | #2, #4, #81, #83 |
 | Config | Twelve-factor config: four layers, env convention, settings pane as shim, fleet-source write target (planned) | Shipped | ADR-0002 | #108, #112, docs/PRs |
 | Governance | guardrails gates, clippy print funnel, trace-field debt registry; plus the ADR status sweep that records which designs are decided and names what each acceptance does **not** cover | Shipped | ADR-0024 | #21, #22, docs/DEBT.md, #544 |
+| Version identity | Restarted version line: first release **`0.7.0`** (not the `1.0.0` the ADR argued for), which `just release-plan`'s `minor` recommendation independently agrees with; deterministic `just release` path; release manifest may advertise only assets this repository published | Shipped | ADR-0025 | #506, #507, #509, #548 |
 | Observability | JSONL logging spine, named-facade schema surface (raw trace-field debt census: 0) | Shipped | — | #87, docs/DEBT.md |
 | Fleet control | `agent.fork` + `flk agent fork`, durable event log, `flk lineage` ancestry, pane-to-pane messaging | Shipping (#175 phases) | ADR-0005, ADR-0006 | #175, #177, #183 |
 | Agent messaging | Inbox over MCP; cross-host by `agent_id`; `fyi` / `needs_reply` / `blocking` intents; idle-agent wake; mute that answers with a deferral; operator escalation on disagreement | Building | ADR-0008, ADR-0018 | #316, #320, #280, #408 |

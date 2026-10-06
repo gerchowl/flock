@@ -19,25 +19,6 @@ workspaces, tabs, panes. mouse-native: click, drag, split. every agent at a glan
 
 ---
 
-## Installing this fork (Nix)
-
-This fork ships via its Nix flake — no separate releases.
-
-```nix
-# newest CI-green build (recommended)
-flock.url = "github:gerchowl/flock/latest";
-
-# bleeding edge (integration branch, may be mid-flight)
-flock.url = "github:gerchowl/flock/feat/sidebar-row-gap";
-
-# immutable pin
-flock.url = "github:gerchowl/flock/<rev>";
-```
-
-Or try it directly: `nix run github:gerchowl/flock/latest`.
-`nix flake update flock` pulls the newest green build whenever you choose.
-The `latest` branch only advances after the flake package builds in CI.
-
 ## install
 
 ```bash
@@ -164,7 +145,7 @@ states:
 - 🔵 **done** — work finished, you have not looked at it yet
 - 🟢 **idle** — done and seen
 
-detection works by reading foreground process and terminal output. zero config, no hooks required. official claude code, codex, and opencode integrations provide session restore identity; pi, omp, github copilot cli, hermes, qodercli, and custom socket integrations can report their own state.
+detection works by reading foreground process and terminal output. zero config, no hooks required. official claude code, codex, and opencode integrations provide session restore identity; pi, omp, github copilot cli, kimi code cli, hermes, qodercli, and custom socket integrations can report their own state.
 
 ## lives in your terminal
 
@@ -211,7 +192,7 @@ for agents outside the built-in list, flock still works as a terminal multiplexe
 
 ### direct integrations
 
-official integrations have two roles. claude code, codex, and opencode report session identity for native restore, while their state still comes from screen detection. pi, github copilot cli, and hermes report both semantic state and session identity. omp and qodercli report semantic state without native session restore. install with:
+official integrations have two roles. claude code, codex, and opencode report session identity for native restore, while their state still comes from screen detection. pi, github copilot cli, and hermes report both semantic state and session identity. omp, kimi code cli, and qodercli report semantic state without native session restore. install with:
 
 ```bash
 flk integration install pi
@@ -219,6 +200,7 @@ flk integration install omp
 flk integration install claude
 flk integration install codex
 flk integration install copilot
+flk integration install kimi
 flk integration install opencode
 flk integration install hermes
 flk integration install qodercli
@@ -267,7 +249,7 @@ In-app settings cover theme, sound, and toast preferences. Flock writes logs und
 - [install](https://flock.dev/docs/install/) — install, update, Homebrew, mise, and Nix
 - [session state](https://flock.dev/docs/session-state/) — detach, restart restore, agent restore, and live handoff
 - [configuration](https://flock.dev/docs/configuration/) — keybindings, themes, notifications, environment variables
-- [integrations](https://flock.dev/docs/integrations/) — pi, omp, claude code, codex, github copilot cli, opencode, hermes, qodercli integrations
+- [integrations](https://flock.dev/docs/integrations/) — pi, omp, claude code, codex, github copilot cli, kimi code cli, opencode, hermes, qodercli integrations
 - [`SKILL.md`](./SKILL.md) — reusable agent skill
 - [socket api](https://flock.dev/docs/socket-api/) — socket protocol and cli reference
 
@@ -281,7 +263,7 @@ if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS
 git clone https://github.com/gerchowl/flock
 cd flock
 cargo build --release
-./target/release/flock
+./target/release/flk
 
 just test        # unit tests
 just check       # formatting, tests, and maintenance checks
