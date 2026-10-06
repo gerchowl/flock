@@ -305,14 +305,24 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
+      # main is protected (PRs only, required checks, enforced for admins), so
+      # the manifest lands through a PR. It is opened with an App token, not
+      # GITHUB_TOKEN: a PR opened with GITHUB_TOKEN triggers no workflows, so
+      # its required checks would never run and auto-merge would wait forever.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
-          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Update website latest manifest
         env:
@@ -338,11 +348,25 @@ jobs:
             echo "::warning::docs/next/product-announcement.json changed after $GITHUB_REF_NAME; leaving it unchanged."
           fi
 
-      - name: Commit website latest manifest
+      - name: Open the website latest manifest PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          BRANCH="release/latest-json-v$VERSION"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add website/latest.json docs/next/product-announcement.json
-          git diff --cached --quiet || git commit -m "docs: update website manifest for v$VERSION"
-          git push origin main
+          if git diff --cached --quiet; then
+            echo "website manifest already matches v$VERSION"
+            exit 0
+          fi
+          git switch -c "$BRANCH"
+          git commit -m "docs: update website manifest for v$VERSION"
+          git push --force origin "$BRANCH"
+          if ! gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "docs: update website manifest for v$VERSION" \
+              --body "Advertises the v$VERSION release in website/latest.json. Opened by the Release workflow; merges itself once the required checks pass."
+          fi
+          gh pr merge "$BRANCH" --squash --auto --delete-branch
