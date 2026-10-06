@@ -532,6 +532,26 @@ stop_transcript_poll_ms = 50
 
 If the reply has not landed by then, the hook does not ask for a recap. Set `stop_transcript_wait_ms = 0` to read once and never wait. The wait is capped at Claude's 10-second hook timeout, and a poll interval below 1 ms is treated as 1 ms. Current Claude Code never uses these keys.
 
+### Agent self-compaction
+
+An agent can compact its own context and carry on unattended with `flk pane arm-self-compact` or the `flock_self_compact` MCP tool (see the [CLI reference](/docs/cli-reference/)). It is on by default, and these keys bound how it waits:
+
+```toml
+[session]
+self_compact = true
+self_compact_settle_ms = 2000
+self_compact_fresh_ms = 2500
+self_compact_operator_quiet_ms = 15000
+self_compact_timeout_ms = 120000
+self_compact_min_interval_secs = 300
+```
+
+`self_compact = false` makes the verb refuse: nothing is typed and no continuation is delivered. Arming is per-pane and not persisted, so turning it back on has no queue to drain.
+
+Before typing `/compact`, flock waits for the agent's turn to end and the pane to stay idle for `self_compact_settle_ms`, and requires a screen read no older than `self_compact_fresh_ms`. A human typing in the pane holds it off until they have been quiet for `self_compact_operator_quiet_ms`. Flock never types over an operator.
+
+`self_compact_timeout_ms` bounds the wait for the harness to report the compaction (`session_start_source: compact`). On expiry the arming is dropped and the agent is told nothing was typed, so its handoff prompt is still in the transcript. `self_compact_min_interval_secs` is the minimum gap between one finished self-compaction and the next arming on the same pane. It stops a compact-and-resume loop that has no work in between, not a session that fills its context twice.
+
 ## IME cursor tracking
 
 When the focused pane hides its cursor and paints its own — common in AI-agent TUIs like Claude Code, pi, and codex — macOS native input methods stop tracking the candidate window position because the outer terminal stops reporting the cursor.
