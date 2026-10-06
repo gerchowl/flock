@@ -2043,8 +2043,10 @@ mod tests {
             Instant::now(),
         );
 
-        // 120 ms of budget, 80 ms per reply: the first fits, the pair does not.
-        let deadline = Instant::now() + Duration::from_millis(120);
+        // 1000 ms of budget, 600 ms per reply: the first fits, the pair does not.
+        // The margins are wide so a loaded CI runner's oversleeping (macOS
+        // overshoots tens of ms) cannot push the first reply past the deadline.
+        let deadline = Instant::now() + Duration::from_millis(1000);
         let mut requests = Scripted::new(
             vec![
                 Ok(response(
@@ -2055,7 +2057,7 @@ mod tests {
                         "agent_status":"idle","turn_cursor":"term_1f2e3:0:0:1:i"}}}"#,
                 )),
             ],
-            Duration::from_millis(80),
+            Duration::from_millis(600),
         );
         assert_eq!(
             sample_pinned(&mut requests, &settle, Some(deadline))
@@ -2070,8 +2072,8 @@ mod tests {
             requests.granted
         );
         assert!(
-            requests.granted[1] <= Duration::from_millis(60),
-            "and what is left is under the 80 ms the first reply cost: {:?}",
+            requests.granted[1] <= Duration::from_millis(400),
+            "and what is left is under the 600 ms the first reply cost: {:?}",
             requests.granted
         );
     }
