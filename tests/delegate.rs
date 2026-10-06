@@ -1481,3 +1481,95 @@ fn a17_reap_after_the_workspace_was_closed_removes_the_checkout() {
         "the registry entry is removed"
     );
 }
+
+/// E18: the brief is typed only into an idle agent: a start whose agent
+/// shows a permission prompt waits, and so does a send.
+#[test]
+fn a18_brief_waits_for_an_idle_agent() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("screen"), screen_for("blocked")).unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(
+        &server,
+        "d1",
+        &b,
+        &["--await", "--timeout", "30000", "--json"],
+    );
+    let pane = delegate_pane(&server, "d1");
+    report_session(&server, &pane);
+    report(&server, &pane, "blocked");
+    thread::sleep(Duration::from_millis(4 * SETTLE_MS));
+    assert!(typed(&server).is_empty(), "nothing is typed into a prompt");
+    report(&server, &pane, "idle");
+    assert_eq!(wait_typed(&server, 1), vec![expected_line(&b)]);
+    play_turn(&server, &pane, "t1", "DONE: one");
+    let status = exited_within(&mut child, WITHIN).expect("round 1 returns");
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&finish(child)));
+
+    report(&server, &pane, "blocked");
+    let r1 = brief(&server, "r1.md", "y\n");
+    let mut sender = cli_spawn(
+        &server,
+        &["delegate", "send", "d1", "--brief", &r1, "--json"],
+    );
+    thread::sleep(Duration::from_millis(4 * SETTLE_MS));
+    assert_eq!(
+        typed(&server).len(),
+        1,
+        "a send does not type into a prompt"
+    );
+    report(&server, &pane, "idle");
+    let status = exited_within(&mut sender, WITHIN).expect("the send returns");
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&finish(sender)));
+    assert_eq!(wait_typed(&server, 2)[1], expected_line(&r1));
+}
+
+/// E19: a failed start in worktree mode removes the checkout it created.
+#[test]
+fn a19_failed_worktree_start_removes_its_checkout() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    fs::write(server.base.join("die"), "").unwrap();
+    let before = workspaces(&server).len();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w1",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/p578-w3",
+            "--ready-timeout",
+            "5000",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN).expect("start gives up");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    assert_eq!(read_lines(&server.base.join("argv.log")).len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while workspaces(&server).len() != before && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(workspaces(&server).len(), before, "the workspace is gone");
+    let leftovers = walk(&server.base.join("wt"));
+    assert!(
+        leftovers.is_empty(),
+        "no checkout is left behind: {leftovers:?}"
+    );
+    assert!(
+        !walk(&server.base.join("state"))
+            .iter()
+            .any(|p| p.ends_with("w1.json")),
+        "no registry entry"
+    );
+}
