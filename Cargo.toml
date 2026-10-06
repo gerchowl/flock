@@ -59,3 +59,4 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
 sysinfo = "0.39.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -95,6 +95,9 @@ pub enum Method {
     /// the history to resume.
     #[serde(rename = "agent.history")]
     AgentHistory(AgentHistoryParams),
+    /// #575: the reply an agent's last turn ended on, and its sentinel.
+    #[serde(rename = "agent.result")]
+    AgentResult(AgentResultParams),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
     /// #329 / ADR-0014: agent-initiated spawn of a FRESH agent.
@@ -731,6 +734,52 @@ pub struct AgentHistoryParams {
     /// Maximum turns to return. Clamped to [`AGENT_HISTORY_MAX_TURNS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Params for `agent.result` (#575): the final reply of an agent's newest
+/// turn, paged by characters so a long report needs no second query shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResultParams {
+    pub target: String,
+    /// Characters of the reply to return. Defaults to
+    /// [`AGENT_RESULT_DEFAULT_CHARS`], clamped to [`AGENT_RESULT_MAX_CHARS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<u32>,
+    /// Character offset to start at, from a previous `next_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+pub const AGENT_RESULT_DEFAULT_CHARS: u32 = 4000;
+pub const AGENT_RESULT_MAX_CHARS: u32 = 64 * 1024;
+
+/// What `agent.result` found (#575).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResultInfo {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// `claude` or `opencode`: whose store the reply was read from.
+    pub agent: String,
+    pub session_id: String,
+    /// The newest turn has finished. False means the agent is still working
+    /// (or a prompt is pending), and `text` is the reply of an EARLIER turn.
+    pub finished: bool,
+    /// From the reply's final `DONE:` / `BLOCKED:` / `VERDICT:` line,
+    /// lower-cased; absent when it ends on none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The rest of that sentinel line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    /// This page of the reply: `max_chars` characters from `offset`.
+    pub text: String,
+    pub offset: u32,
+    pub total_chars: u32,
+    /// Hand back as `offset` for the rest; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
 }
 
 /// Turns returned by `agent.history` when the caller names no `limit`.
@@ -2198,6 +2247,9 @@ pub enum ResponseResult {
     AgentHistory {
         history: AgentHistoryResult,
     },
+    AgentResult {
+        result: AgentResultInfo,
+    },
     Lineage {
         chain: Vec<LineageEdge>,
     },
@@ -2722,10 +2774,12 @@ pub struct AgentHistoryResult {
     /// stored response knows what it is holding.
     pub detail: crate::agent_transcript::TranscriptDetail,
     pub turns: Vec<HistoryTurnInfo>,
-    /// Byte offset the first returned turn was parsed from.
+    /// Where the first returned turn starts: a byte offset into a Claude
+    /// transcript, or a message time in ms for opencode (#575). Opaque to
+    /// the caller either way — hand it back, never compute with it.
     pub cursor: u64,
-    /// Byte offset to send as `cursor` next time. A poll that hands this back
-    /// parses only what was appended since.
+    /// The `cursor` to send next time. A poll that hands this back reads
+    /// only what was written since.
     pub next_cursor: u64,
     /// More transcript already sits after `next_cursor` — page again rather
     /// than wait.

@@ -291,9 +291,23 @@ flk agent history reviewer --detail full --cursor "$next"
 
 `agent history` reads the agent's own session transcript, one entry per turn,
 unwrapped, with a cursor so a poll reads only what was appended. It touches no
-pane state, so polling it is safe. It is Claude-only today, because Claude's is
-the transcript format Flock parses; for any other agent it refuses with
+pane state, so polling it is safe. It reads Claude's session transcript and
+opencode's session database (read-only); for any other agent it refuses with
 `unsupported_for_agent` rather than inventing an answer.
+
+**To learn how a delegated task went, read its result:**
+
+```bash
+flk agent result reviewer
+```
+
+`agent result` returns the reply the agent's newest turn ended on, plus the
+status of a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line
+(`status: "verdict"`, `status_text: "approve"`), and `finished`, which is false
+while the agent is still working (the text is then the previous turn's reply).
+A long report pages with `--offset`, using the `next_offset` it returns. Ask the
+agents you delegate to to end on one of those three lines, and the supervisor's
+check is one call.
 
 One more difference between the sources: `pane read --source visible` follows the
 operator's scroll position, so a human who has scrolled a pane back changes what

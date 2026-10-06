@@ -630,18 +630,8 @@ fn await_settled_transcript(path: &str, budget: Duration, poll: Duration) -> boo
 /// leading `**`, `- ` and `> ` are peeled (and a closing `**` with them)
 /// before matching `※ recap:` itself; any other `※` line is not a recap.
 fn recap_line(line: &str) -> Option<&str> {
-    let mut line = line.trim();
-    while let Some(rest) = ["**", "- ", "> "]
-        .iter()
-        .find_map(|prefix| line.strip_prefix(prefix))
-    {
-        line = rest.trim_start();
-    }
-    if !line.starts_with(RECAP_SENTINEL) {
-        return None;
-    }
-    let line = line.trim_end();
-    Some(line.strip_suffix("**").map_or(line, str::trim_end))
+    Some(crate::agent_transcript::undecorated_line(line))
+        .filter(|line| line.starts_with(RECAP_SENTINEL))
 }
 
 /// What a transcript read found.

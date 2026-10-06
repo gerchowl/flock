@@ -310,6 +310,15 @@ flk wait output 1-3 --match "test result" --timeout 60000
 flk pane read 1-3 --source recent --lines 30
 ```
 
+### get the result of a delegated task
+
+```bash
+flk agent result reviewer            # the reply its newest turn ended on
+flk agent result reviewer --offset 4000   # the next page of a long report
+```
+
+works for claude and opencode agents. `status` is `done` / `blocked` / `verdict` when the reply's last line is `DONE: …` / `BLOCKED: …` / `VERDICT: …` (with the rest in `status_text`), so ask delegated agents to end that way. `finished: false` means it is still working and the text is its previous reply.
+
 ### check what another agent is working on
 
 ```bash

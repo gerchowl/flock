@@ -1315,10 +1315,21 @@ impl TerminalState {
     /// `crate::app::creation::terminal_agent_session_info` already resolves the
     /// pane's session the same way.
     pub fn claude_session_id(&self) -> Option<String> {
+        self.hooked_session_id(CLAUDE_HOOK_SOURCE)
+    }
+
+    /// The opencode session id for this pane (#575), under the same rule as
+    /// [`Self::claude_session_id`]: a hook must have confirmed it, so a
+    /// session restored from a snapshot does not authorise a read.
+    pub fn opencode_session_id(&self) -> Option<String> {
+        self.hooked_session_id(crate::agent_resume::OPENCODE_HOOK_SOURCE)
+    }
+
+    fn hooked_session_id(&self, source: &str) -> Option<String> {
         if let Some(session_ref) = self
             .hook_authority
             .as_ref()
-            .filter(|authority| authority.source == CLAUDE_HOOK_SOURCE)
+            .filter(|authority| authority.source == source)
             .and_then(|authority| authority.session_ref.as_ref())
         {
             return Some(session_ref.value.clone());
@@ -1328,7 +1339,7 @@ impl TerminalState {
         }
         self.persisted_agent_session
             .as_ref()
-            .filter(|session| session.source == CLAUDE_HOOK_SOURCE)
+            .filter(|session| session.source == source)
             .map(|session| session.session_ref.value.clone())
     }
 
