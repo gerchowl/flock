@@ -115,7 +115,7 @@ impl App {
         let workspace_id = self.public_workspace_id(ws_idx);
 
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.hibernated_resume_plan = Some(plan.clone());
+            terminal.set_hibernated_resume_plan(Some(plan.clone()));
             terminal.respawn_shell_on_exit = false;
         }
         // Graceful release + shutdown of the runtime — the same seam
@@ -186,7 +186,7 @@ impl App {
         // next focus.
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = Some(plan);
-            terminal.hibernated_resume_plan = None;
+            terminal.set_hibernated_resume_plan(None);
         }
         let (rows, cols) = self.state.estimate_pane_size();
         let launched = self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true);
@@ -196,7 +196,7 @@ impl App {
             // no runtime.
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 if let Some(plan) = terminal.pending_agent_resume_plan.take() {
-                    terminal.hibernated_resume_plan = Some(plan);
+                    terminal.set_hibernated_resume_plan(Some(plan));
                 }
             }
             return Err(HibernationError::Unsupported {

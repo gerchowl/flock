@@ -2714,6 +2714,22 @@ pub struct AgentInfo {
     /// `cwd`. `flk revert-run <id>` consumes the same value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The opaque turn cursor for this agent's terminal (#553), identical to
+    /// the one on the pane record.
+    ///
+    /// `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`,
+    /// where the three counters are monotonic, and `w`/`i` says whether the
+    /// agent was working at the moment the cursor was minted. `state_seq` moves
+    /// on every change of the terminal's effective state plus hibernation entry
+    /// and exit; `idle` and `done` are ONE state to it, told apart by the
+    /// record's `seen` flag, so looking at a pane does not move the cursor.
+    ///
+    /// Opaque: capture it before prompting and hand it to
+    /// `agent wait --status settled --after`, which reads it as "did this agent
+    /// start work after I said so?". Absent on remote, peer and fleet
+    /// summaries, and on servers predating #553.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_cursor: Option<String>,
     pub revision: u64,
 }
 
@@ -2750,6 +2766,20 @@ pub struct PaneInfo {
     /// Seconds since the pane's semantic agent state last changed (#175 F3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// The opaque turn cursor for the pane's terminal (#553), the same string
+    /// `agent get` reports for the agent in this pane.
+    ///
+    /// `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`.
+    /// The three counters are monotonic; `state_seq` moves on every change of
+    /// the terminal's effective state plus hibernation entry and exit, and
+    /// `idle` and `done` are ONE state to it — they are the same effective idle,
+    /// separated by this record's `seen` flag, so an operator looking at the
+    /// pane does not move the cursor. `w`/`i` says whether the agent was
+    /// working when the cursor was minted.
+    ///
+    /// Opaque to callers; pass it to `--after` on a settled wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_cursor: Option<String>,
     pub revision: u64,
 }
 
@@ -4130,6 +4160,7 @@ mod tests {
                     agent_session: None,
                     seen: true,
                     status_age_secs: None,
+                    turn_cursor: None,
                     revision: 0,
                 },
                 worktree: WorktreeInfo {
@@ -4186,6 +4217,7 @@ mod tests {
                     agent_session: None,
                     seen: true,
                     status_age_secs: None,
+                    turn_cursor: None,
                     revision: 0,
                 },
             },
@@ -4341,6 +4373,7 @@ mod tests {
             agent_session: None,
             seen: false,
             status_age_secs: Some(1800),
+            turn_cursor: None,
             revision: 7,
         };
         let json = serde_json::to_string(&pane).unwrap();
@@ -4358,6 +4391,90 @@ mod tests {
         .unwrap();
         assert!(legacy.seen);
         assert_eq!(legacy.status_age_secs, None);
+    }
+
+    /// #553: the turn cursor rides both local records, and a record from a
+    /// server predating it must parse rather than fail — a client waiting on a
+    /// cursor needs "this server cannot tell me" to be a missing field, not a
+    /// broken response.
+    #[test]
+    fn turn_cursor_round_trips_and_is_optional() {
+        let mut pane = pane_record_fixture();
+        pane.turn_cursor = Some("term_1f2e3:0:2:7:i".into());
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(
+            json.contains(r#""turn_cursor":"term_1f2e3:0:2:7:i""#),
+            "{json}"
+        );
+        let restored: PaneInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, pane);
+
+        let agent = agent_record_fixture();
+        let json = serde_json::to_string(&agent).unwrap();
+        let restored: AgentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, agent);
+
+        // Absent rather than null: a remote or fleet summary has no cursor to
+        // report, and a client must not have to distinguish "none" from "old
+        // server" to know there is nothing to wait past.
+        let without = serde_json::to_string(&pane_record_fixture()).unwrap();
+        assert!(!without.contains("turn_cursor"), "{without}");
+        let legacy: PaneInfo = serde_json::from_str(
+            r#"{"pane_id":"w_1-1","terminal_id":"term_1","workspace_id":"w_1",
+                "tab_id":"w_1:1","focused":false,"agent_status":"idle","revision":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.turn_cursor, None);
+    }
+
+    fn pane_record_fixture() -> PaneInfo {
+        PaneInfo {
+            pane_id: "w_1-1".into(),
+            terminal_id: "term_1".into(),
+            workspace_id: "w_1".into(),
+            tab_id: "w_1:1".into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: Some("claude".into()),
+            title: None,
+            display_agent: None,
+            agent_status: AgentStatus::Idle,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            seen: true,
+            status_age_secs: None,
+            turn_cursor: None,
+            revision: 1,
+        }
+    }
+
+    fn agent_record_fixture() -> AgentInfo {
+        AgentInfo {
+            agent_id: "agent_1".into(),
+            terminal_id: "term_1".into(),
+            name: Some("worker".into()),
+            agent: Some("claude".into()),
+            title: None,
+            display_agent: None,
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "w_1".into(),
+            tab_id: "w_1:1".into(),
+            pane_id: "w_1-1".into(),
+            focused: true,
+            cwd: None,
+            foreground_cwd: None,
+            seen: true,
+            status_age_secs: None,
+            run_id: None,
+            turn_cursor: Some("term_1:0:3:9:w".into()),
+            revision: 4,
+        }
     }
 
     #[test]

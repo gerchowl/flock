@@ -3,9 +3,10 @@
     clippy::print_stderr,
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
+use super::wait_status_vocab;
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams,
-    AgentStatus, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, SplitDirection,
+    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, SplitDirection,
     Subscription,
 };
 
@@ -49,8 +50,31 @@ pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] 
 
 pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
 
-pub(super) const AGENT_WAIT_USAGE: &str =
-    "flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]";
+pub(super) const AGENT_WAIT_USAGE: &str = concat!(
+    "flk agent wait <target> --status <",
+    wait_status_vocab!(),
+    "> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]\n",
+    "  idle     ready for input: an agent that is idle, or done — done means it went quiet while unseen\n",
+    "  done     exactly done: idle, plus a finished pane you have not looked at\n",
+    "  settled  observed quiescence: after --after, the server saw this agent enter working and then\n",
+    "           saw its status hold idle/done with NO state transition at all for --settle\n",
+    "  --after CURSOR  a turn_cursor from `flk agent get`, captured BEFORE you prompted.\n",
+    "           Without it any quiet counts: an agent already idle settles after one settle window.\n",
+    "  --settle MS  how long that quiet must hold. Default 5000; --settle 0 settles on the sample\n",
+    "           after the first qualifying one.\n",
+    "  --timeout MS  give up after this long. Absent means wait forever.\n",
+    "  prints one JSON line on stdout:\n",
+    "           {\"status\":\"settled\"|\"blocked\"|\"gone\",\"pane_id\":…,\"agent_status\":…,\n",
+    "            \"turn_cursor\":…,\"held_ms\":N}\n",
+    "           a gone line adds \"reason\":\"closed\"|\"hibernated\"|\"restarted\".\n",
+    "  exit 0 settled · 3 blocked · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
+    "           · 1 every other error. A timeout is 1 for the non-settled statuses above.\n",
+    "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
+    "  output use `flk agent result` (once #575 lands). Native agents are read from the screen every\n",
+    "  300-500 ms, so a working phase shorter than one sample is never observed — a cursor taken\n",
+    "  before one waits for the next turn instead. A turn cursor never satisfies a wait on another\n",
+    "  terminal or another execution.",
+);
 
 /// Everything `agent start` accepts between the name and the `--` terminator.
 ///
@@ -435,9 +459,10 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    let mut timeout_ms = None;
+    let mut raw_timeout: Option<String> = None;
     let mut desired_status = None;
     let mut ready = false;
+    let mut settle_flags = super::settled::SettleFlags::default();
 
     let mut index = 1;
     while index < args.len() {
@@ -451,7 +476,13 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --status");
                     return Ok(2);
                 };
-                desired_status = Some(parse_agent_wait_status(value)?);
+                desired_status = Some(match super::settled::WaitTarget::parse(value) {
+                    Ok(target) => target,
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return Ok(2);
+                    }
+                });
                 index += 2;
             }
             "--timeout" => {
@@ -459,7 +490,35 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --timeout");
                     return Ok(2);
                 };
-                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
+                // Kept raw until the target is known: with `--status settled` a
+                // bad value is a usage error (exit 2, before anything is
+                // waited on), and the other statuses keep their historical
+                // behaviour of reporting it as an io error.
+                raw_timeout = Some(value.clone());
+                index += 2;
+            }
+            "--after" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --after");
+                    return Ok(2);
+                };
+                settle_flags.after = Some(value.clone());
+                index += 2;
+            }
+            "--settle" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --settle");
+                    return Ok(2);
+                };
+                match value.parse::<u64>() {
+                    Ok(settle_ms) => settle_flags.settle_ms = Some(settle_ms),
+                    // A usage error, not a request error: this is a typo, and it
+                    // has to say so before anything is waited on.
+                    Err(_) => {
+                        eprintln!("invalid value for --settle: {value} (expected milliseconds)");
+                        return Ok(2);
+                    }
+                }
                 index += 2;
             }
             "help" | "--help" | "-h" => {
@@ -481,6 +540,29 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         eprintln!("--ready and --status ask different questions; pass one");
         return Ok(2);
     }
+    // `--after` and `--settle` are questions only a settle can answer. A `--ready`
+    // wait with either is the same refusal as a plain-status wait with either:
+    // the flags name a turn that this mode never looks at.
+    if let Err(reason) = super::settled::check_settle_flags(desired_status, &settle_flags) {
+        eprintln!("{reason}");
+        return Ok(2);
+    }
+    // Resolved here rather than in the parse loop because what a bad `--timeout`
+    // means depends on the target: with `--status settled` it is a usage error
+    // (exit 2, before anything is waited on), and every other status keeps its
+    // historical behaviour of reporting it as an io error.
+    let settled = desired_status == Some(super::settled::WaitTarget::Settled);
+    let timeout_ms = match (raw_timeout, settled) {
+        (None, _) => None,
+        (Some(raw), false) => Some(super::parse_u64_flag("--timeout", &raw)?),
+        (Some(raw), true) => Some(match raw.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                eprintln!("invalid value for --timeout: {raw} (expected milliseconds)");
+                return Ok(2);
+            }
+        }),
+    };
     if ready {
         let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
         if response.get("error").is_some() {
@@ -498,46 +580,50 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         );
     }
 
-    let Some(agent_status) = desired_status else {
+    let Some(target_status) = desired_status else {
         eprintln!("missing required --status or --ready");
         return Ok(2);
     };
+
+    if target_status == super::settled::WaitTarget::Settled {
+        return super::settled::run_settled_wait(
+            "agent wait",
+            super::settled::InitialTarget::Agent(target),
+            settle_flags.after.as_deref(),
+            settle_flags
+                .settle_ms
+                .unwrap_or(super::settled::DEFAULT_SETTLE_MS),
+            timeout_ms,
+        );
+    }
 
     let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(&response).unwrap());
         return Ok(1);
     }
+    let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
+        eprintln!("agent wait failed: response did not include pane_id");
+        return Ok(1);
+    };
     if response["result"]["agent"]["agent_status"]
         .as_str()
-        .is_some_and(|current| agent_wait_status_satisfied(agent_status, current))
+        .is_some_and(|current| target_status.satisfied_by(current))
     {
         println!("{}", serde_json::to_string(&response).unwrap());
         return Ok(0);
     }
 
-    let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
-        eprintln!("agent wait failed: response did not include pane_id");
-        return Ok(1);
-    };
-
-    let subscriptions = if agent_status == AgentStatus::Idle {
-        vec![
-            Subscription::PaneAgentStatusChanged {
-                pane_id: pane_id.to_owned(),
-                agent_status: Some(AgentStatus::Idle),
-            },
-            Subscription::PaneAgentStatusChanged {
-                pane_id: pane_id.to_owned(),
-                agent_status: Some(AgentStatus::Done),
-            },
-        ]
-    } else {
-        vec![Subscription::PaneAgentStatusChanged {
+    // `idle` is "ready for input", so it watches `done` as well: an unattended
+    // agent goes quiet as `done`, which is an effective idle (#553).
+    let subscriptions = target_status
+        .watched_statuses()
+        .into_iter()
+        .map(|agent_status| Subscription::PaneAgentStatusChanged {
             pane_id: pane_id.to_owned(),
             agent_status: Some(agent_status),
-        }]
-    };
+        })
+        .collect();
 
     super::wait_for_agent_change(
         Request {
@@ -705,34 +791,6 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_wait_status_satisfied(desired: AgentStatus, current: &str) -> bool {
-    match desired {
-        AgentStatus::Idle => matches!(current, "idle" | "done"),
-        AgentStatus::Working => current == "working",
-        AgentStatus::Blocked => current == "blocked",
-        AgentStatus::Unknown => current == "unknown",
-        AgentStatus::Done => false,
-        // #175 C3: `hibernated` is a valid wait target so operators can
-        // block until a pane finishes going away.
-        AgentStatus::Hibernated => current == "hibernated",
-    }
-}
-
-fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
-    match value {
-        "idle" => Ok(AgentStatus::Idle),
-        "working" => Ok(AgentStatus::Working),
-        "blocked" => Ok(AgentStatus::Blocked),
-        "unknown" => Ok(AgentStatus::Unknown),
-        "done" => Err(std::io::Error::other(
-            "done is a UI attention state; use idle for CLI agent completion waits",
-        )),
-        _ => Err(std::io::Error::other(format!(
-            "invalid agent status: {value} (expected idle, working, blocked, or unknown)"
-        ))),
-    }
-}
-
 fn print_agent_help() {
     eprintln!("flk agent commands:");
     eprintln!("  flk agent list");
@@ -785,6 +843,17 @@ fn print_agent_help() {
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
     eprintln!("    working or blocked is a real answer rather than flock not being able to tell");
+    eprintln!(
+        "  both wait verbs take the same seven statuses, and `idle` means ready for input in both"
+    );
+    eprintln!(
+        "    (`done` too: an unattended agent goes quiet as `done`, which is an effective idle)."
+    );
+    eprintln!("    `done` on its own means exactly that effective state, not a UI-only marker:");
+    eprintln!(
+        "    --status settled waits for the agent to go quiet; `flk agent result` (once #575 lands) is"
+    );
+    eprintln!("    the turn's output, which settled does not promise.");
 }
 
 #[cfg(test)]
