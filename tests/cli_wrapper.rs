@@ -3412,6 +3412,9 @@ fn msg_send_await_prints_only_the_answer() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "all green\n");
+    cleanup_spawned_flock(flock, base);
+}
+
 /// #575 end to end: an opencode session reported the way the opencode plugin
 /// reports it (`pane.report_agent_session`), its database under an isolated
 /// `XDG_DATA_HOME`, read back through the real `flk` by `agent result` and
