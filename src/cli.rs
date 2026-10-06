@@ -9,8 +9,8 @@ use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentStatus, Method, OutputMatch, PaneAgentState, PaneWaitForOutputParams, ReadFormat,
-    ReadSource, Request, SplitDirection, Subscription,
+    Method, OutputMatch, PaneAgentState, PaneWaitForOutputParams, ReadFormat, ReadSource, Request,
+    SplitDirection, Subscription,
 };
 
 mod agent;
@@ -32,10 +32,44 @@ mod ready;
 mod report;
 mod revert;
 mod server;
+mod settled;
 pub(crate) mod status;
 mod tab;
 mod workspace;
 mod worktree;
+
+/// The one status vocabulary both wait verbs accept (#553).
+///
+/// A macro rather than a `const` because every help surface is a `&'static str`
+/// in a static table, and `concat!` cannot take a `const`. Naming the
+/// vocabulary once is the point: `agent wait`, `wait agent-status`, their two
+/// help answers and their two parse errors all read the same seven words, so a
+/// status one verb accepts and the other rejects is not expressible.
+macro_rules! wait_status_vocab {
+    () => {
+        "idle|working|blocked|done|unknown|hibernated|settled"
+    };
+}
+
+pub(crate) use wait_status_vocab;
+
+/// The `wait agent-status` usage line and its two pointers.
+///
+/// Short by design: the settle contract is one screen of prose and it already
+/// exists once, on `agent wait` (#553). This answers the question a reader of
+/// the short command actually has — is this the same signal, and what do these
+/// two flags do — and then says where the rest lives.
+pub(super) const WAIT_AGENT_STATUS_USAGE: &str = concat!(
+    "flk wait agent-status <pane_id> --status <",
+    wait_status_vocab!(),
+    "> [--after CURSOR] [--settle MS] [--timeout MS]\n",
+    "  the same signal as `flk agent wait --status settled`: one cursor, one result line, one exit code\n",
+    "  --after CURSOR  a turn_cursor from `flk agent get` or `flk pane get`, captured BEFORE you prompted\n",
+    "  --settle MS     how long the agent's quiet must hold, default 5000; 0 settles on the sample\n",
+    "           after the first qualifying one\n",
+    "  `flk agent wait --help` explains the whole settle contract, including what settled does not\n",
+    "  promise, and why the turn's output is `flk agent result` (once #575 lands) rather than this wait",
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
@@ -769,13 +803,14 @@ fn wait_output(args: &[String]) -> std::io::Result<i32> {
 
 fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]");
+        eprintln!("usage: {WAIT_AGENT_STATUS_USAGE}");
         return Ok(2);
     };
 
     let pane_id = normalize_pane_id(raw_pane_id);
-    let mut timeout_ms = None;
+    let mut raw_timeout: Option<String> = None;
     let mut desired_status = None;
+    let mut settle_flags = settled::SettleFlags::default();
 
     let mut index = 1;
     while index < args.len() {
@@ -785,7 +820,13 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --status");
                     return Ok(2);
                 };
-                desired_status = Some(parse_agent_status(value)?);
+                desired_status = Some(match settled::WaitTarget::parse(value) {
+                    Ok(target) => target,
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return Ok(2);
+                    }
+                });
                 index += 2;
             }
             "--timeout" => {
@@ -793,7 +834,34 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --timeout");
                     return Ok(2);
                 };
-                timeout_ms = Some(parse_u64_flag("--timeout", value)?);
+                // Kept raw until the target is known: with `--status settled` a
+                // bad value is a usage error (exit 2, before anything is waited
+                // on), and the other statuses keep their historical behaviour.
+                raw_timeout = Some(value.clone());
+                index += 2;
+            }
+            "--after" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --after");
+                    return Ok(2);
+                };
+                settle_flags.after = Some(value.clone());
+                index += 2;
+            }
+            "--settle" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --settle");
+                    return Ok(2);
+                };
+                match value.parse::<u64>() {
+                    Ok(settle_ms) => settle_flags.settle_ms = Some(settle_ms),
+                    // A usage error, not a request error: this is a typo, and it
+                    // has to say so before anything is waited on.
+                    Err(_) => {
+                        eprintln!("invalid value for --settle: {value} (expected milliseconds)");
+                        return Ok(2);
+                    }
+                }
                 index += 2;
             }
             other => {
@@ -803,24 +871,60 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    let Some(agent_status) = desired_status else {
+    let Some(target) = desired_status else {
         eprintln!("missing required --status");
         return Ok(2);
     };
+    if let Err(reason) = settled::check_settle_flags(Some(target), &settle_flags) {
+        eprintln!("{reason}");
+        return Ok(2);
+    }
+    // Resolved here rather than in the parse loop because what a bad `--timeout`
+    // means depends on the target: with `--status settled` it is a usage error
+    // (exit 2, before anything is waited on), and every other status keeps its
+    // historical behaviour of reporting it as an io error.
+    let timeout_ms = match (raw_timeout, target == settled::WaitTarget::Settled) {
+        (None, _) => None,
+        (Some(raw), false) => Some(parse_u64_flag("--timeout", &raw)?),
+        (Some(raw), true) => Some(match raw.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                eprintln!("invalid value for --timeout: {raw} (expected milliseconds)");
+                return Ok(2);
+            }
+        }),
+    };
 
-    wait_for_agent_change(
-        Request {
-            id: "cli:wait:agent-status".into(),
-            method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
-                subscriptions: vec![Subscription::PaneAgentStatusChanged {
-                    pane_id,
-                    agent_status: Some(agent_status),
-                }],
-            }),
-        },
-        timeout_ms,
-        "timed out waiting for agent status change",
-    )
+    match target {
+        settled::WaitTarget::Settled => settled::run_settled_wait(
+            "wait agent-status",
+            settled::InitialTarget::Pane(&pane_id),
+            settle_flags.after.as_deref(),
+            settle_flags.settle_ms.unwrap_or(settled::DEFAULT_SETTLE_MS),
+            timeout_ms,
+        ),
+        settled::WaitTarget::Status(_) => wait_for_agent_change(
+            Request {
+                id: "cli:wait:agent-status".into(),
+                method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                    // `idle` is "ready for input", so it watches `done` too.
+                    // Without the pair this verb hung on every unattended
+                    // agent — an agent nobody is looking at goes quiet as
+                    // `done`, which is an effective idle (#553).
+                    subscriptions: target
+                        .watched_statuses()
+                        .into_iter()
+                        .map(|agent_status| Subscription::PaneAgentStatusChanged {
+                            pane_id: pane_id.clone(),
+                            agent_status: Some(agent_status),
+                        })
+                        .collect(),
+                }),
+            },
+            timeout_ms,
+            "timed out waiting for agent status change",
+        ),
+    }
 }
 
 pub(super) fn wait_for_agent_change(
@@ -944,19 +1048,6 @@ pub(super) fn parse_read_format(value: &str) -> std::io::Result<ReadFormat> {
     }
 }
 
-fn parse_agent_status(value: &str) -> std::io::Result<AgentStatus> {
-    match value {
-        "idle" => Ok(AgentStatus::Idle),
-        "working" => Ok(AgentStatus::Working),
-        "blocked" => Ok(AgentStatus::Blocked),
-        "done" => Ok(AgentStatus::Done),
-        "unknown" => Ok(AgentStatus::Unknown),
-        _ => Err(std::io::Error::other(format!(
-            "invalid agent status: {value} (expected idle, working, blocked, done, or unknown)"
-        ))),
-    }
-}
-
 pub(super) fn parse_pane_agent_state(value: &str) -> std::io::Result<PaneAgentState> {
     match value {
         "idle" => Ok(PaneAgentState::Idle),
@@ -1062,9 +1153,7 @@ fn print_terminal_help() {
 fn print_wait_help() {
     eprintln!("flk wait commands:");
     eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
-    eprintln!(
-        "  flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]"
-    );
+    eprintln!("  {WAIT_AGENT_STATUS_USAGE}");
     eprintln!("  flk wait reply <correlation_id> [--timeout MS] [--json]");
     eprintln!(
         "    waits for the answer to a message you sent (msg send --intent needs-reply): \

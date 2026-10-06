@@ -431,6 +431,50 @@ flk msg send 1-1 "which branch?" --intent needs-reply --await   # the same, in o
 ```
 
 `msg.wait_reply` (`{"correlation_id": "...", "timeout_ms": N}`) is held on the socket thread and woken by the event hub, not a poll, until the message is answered (`outcome: "replied"`), a muted recipient defers it (`deferred`), it is dropped unread (`expired`), or `timeout_ms` passes (`timeout`, with the message's last delivery `state`, so "read but unanswered" shows). It needs no inbox: the answer is read from the server's event window by correlation id, so a reply held for an ssh-originated send reaches the waiter. When a message has several answers, a real reply outranks a mute's deferral (so a question deferred and later answered shows the answer from then on), and the first reply stands. The window is the in-memory ring `msg.status` reads (the newest 4096 events), so the two never disagree; a message older than that is refused with `message_not_found`, as an unknown correlation id is. The default and maximum wait is 24 hours, the age at which an unread message is dropped anyway. The reply's `from_agent`/`from_pane` are the sender stamp: routing and audit metadata, never authorization — any process on the server can answer a message with `msg.send --reply-to`. `flk wait reply` exits 0 when replied, 3 when deferred or expired, 124 on timeout, and 1 on an error; it prints the reply body on stdout and the reply's metadata on stderr, or the whole result with `--json`. `flk msg send --await [--timeout MS]` (needs `--intent needs-reply` or `blocking`) sends and then waits the same way, with the send's own result on stderr, so a harness that runs it as a background task is handed the answer alone.
+`--status idle` matches `idle` **or** `done`: an agent nobody has looked at goes
+quiet as `done`, which is an effective idle, so that is the status to wait for
+when nobody is watching the pane. `--status done` matches exactly `done`. The
+`--status settled` wait goes further and is documented under
+[Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
+it is a CLI concept and has no socket method of its own — the server publishes
+the states it observes, and the settle window is applied by the client.
+
+## The turn cursor
+
+Local `pane_info` and `agent_info` records carry a `turn_cursor`:
+
+```json
+"turn_cursor": "term_abc123:0:2:7:i"
+```
+
+It is an opaque string of five colon-separated fields, which callers should read
+by shape (and from the right) rather than interpret:
+
+| Field | Meaning |
+| --- | --- |
+| `term_…` | the terminal id, the same string as `terminal_id` on the record |
+| `execution_epoch` | bumped when the pane's child was replaced. The terminal id is **reused** on a shell respawn, so this is what tells a continuing agent from a fresh one in the same place |
+| `working_entries` | how many times this terminal has been observed entering `working` |
+| `state_seq` | bumped on every change of the terminal's effective state, plus on hibernation entry and exit. `idle` and `done` are ONE state to it — they are the same effective idle, told apart by the record's `seen` flag — so an operator looking at a pane does not move the cursor |
+| `w` / `i` | whether the agent was working when the cursor was minted |
+
+Capture a cursor before you prompt an agent, and hand it back to
+`flk agent wait --status settled --after <cursor>`: it is then a statement about
+work that started after you said so, rather than about any quiet at all. A
+cursor never satisfies a wait on another terminal or another execution, and
+counters the server has not reached are refused rather than waited out.
+
+Two properties are worth stating plainly. `working_entries` counts **observed**
+entries, not submitted prompts — Flock samples a native agent's screen every
+300-500 ms, so a turn whose working phase is shorter than one sample is never
+seen. And `state_seq` moves on an `idle -> blocked -> idle` excursion even
+though the status ends where it started, which is what makes a settle window
+anchored on it survive a mid-turn blip — including one that happened entirely
+between two polls, where both samples read `idle` and only the counter says
+otherwise.
+
+`turn_cursor` is absent on remote, peer and fleet summaries (there is no local
+terminal to describe) and on servers older than #553. Handle it as optional.
 
 ## Response shapes
 

@@ -241,6 +241,35 @@ whole window and then time out, however healthy it is. For those, drop
 already refuses a child that dies inside its first moments, and
 `pane_exited` events report the rest.
 
+### Waiting for an agent to go quiet
+
+`--status idle` is *ready for input*, and it matches `done` as well — an agent
+nobody is watching goes quiet as `done`, which is an effective idle. Both wait
+verbs mean it that way now, which is what makes one usable for an unattended
+agent instead of hanging on it.
+
+For a supervisor, `--status settled` is the more precise question: after a turn
+cursor, the agent entered `working`, and then held `idle`/`done` with no state
+transition at all for the settle window (5000 ms by default, `--settle` to
+change it; `--settle 0` settles on the sample after the first qualifying one).
+
+```bash
+c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
+flk agent send worker "review the auth module" && flk pane send-keys 1-2 Enter
+flk agent wait worker --status settled --after "$c" --timeout 3600000
+```
+
+`settled` is **observed quiescence**, not a turn result — for the turn's
+output use `flk agent result` (once #575 lands). It exits `0` when settled,
+`3` when the agent is blocked, `4` when the pane went away
+(`"reason":"closed"|"hibernated"|"restarted"`), `124` on timeout and `2` on a
+usage error or a refused cursor. Without `--after` any quiet counts, so an
+agent that is already idle settles after one settle window; capture the
+cursor first. A `done` answer can be reached without ever observing
+`working` at all: Flock samples a native agent's screen every 300-500 ms, so a
+turn shorter than one sample is never seen working, and a cursor taken before it
+waits for the next turn instead.
+
 ### The name a start returns is registered immediately
 
 The `name` in the `agent_started` result is the agent's name at the moment the
