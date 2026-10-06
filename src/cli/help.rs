@@ -162,10 +162,11 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("agent", "fork", super::agent::AGENT_FORK_USAGE),
     ("agent", "hibernate", "flk agent hibernate <target>"),
     ("agent", "resume", "flk agent resume <target>"),
+    ("agent", "result", super::agent::AGENT_RESULT_USAGE),
     (
         "msg",
         "send",
-        "flk msg send (<target> | --agent ID) <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] [-- <text starting with dashes>]",
+        "flk msg send (<target> | --agent ID) <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--from-agent ID] [--await [--timeout MS]] [-- <text starting with dashes>]",
     ),
     (
         "msg",
@@ -271,7 +272,12 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "wait",
         "agent-status",
-        "flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]",
+        super::WAIT_AGENT_STATUS_USAGE,
+    ),
+    (
+        "wait",
+        "reply",
+        "flk wait reply <correlation_id> [--timeout MS] [--json]",
     ),
     (
         "integration",

@@ -133,8 +133,8 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
         return Err(McpError::not_exposed(name));
     };
 
-    let method = (tool.build)(arguments)?;
-    let flock_result = call_flock(method, flock)?;
+    let method = (tool.build)(arguments.clone())?;
+    let flock_result = tools::annotate(name, &arguments, call_flock(method, flock)?);
 
     // MCP's tool-call result shape: `content` is an array of blocks. We JSON-
     // encode the flock result and hand it back as a single text block so the

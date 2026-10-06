@@ -76,8 +76,8 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove`, `worktree.kill` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
-| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wake`, `msg.mute` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
+| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
@@ -110,7 +110,7 @@ Remove a linked checkout:
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
 
-`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — sent, not delivered: a deferral to another host counts once it is queued for its ssh hop, and a hop that fails is retried by the next mute — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent`/`from_host` must be shaped like an agent id / host name, or the send is refused with `invalid_request`. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. A relayed intent the receiving build does not recognise is read as `needs_reply` and logged, so version skew fails toward the recipient hearing about it. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, `message_not_found`, and `no_reply_address`. A message addressed to an agent on another host is relayed to the server that owns it, and the two ways that can fail are kept apart because they want opposite responses: `peer_unreachable` is transient and worth retrying, while `peer_refused_message` means the peer read the command and rejected it — typically a flag its build predates — and is terminal. Both carry `data.retryable`, `data.peer` and `data.detail`, the last being the far side's own words unedited.
+`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — sent, not delivered: a deferral to another host counts once it is queued for its ssh hop, and a hop that fails is retried by the next mute — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent`/`from_host` must be shaped like an agent id / host name, or the send is refused with `invalid_request`. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. A relayed intent the receiving build does not recognise is read as `needs_reply` and logged, so version skew fails toward the recipient hearing about it. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded on its durable `message_replied` event, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. A message addressed to an agent on another host is relayed to the server that owns it, and the two ways that can fail are kept apart because they want opposite responses: `peer_unreachable` is transient and worth retrying, while `peer_refused_message` means the peer read the command and rejected it — typically a flag its build predates — and is terminal. Both carry `data.retryable`, `data.peer` and `data.detail`, the last being the far side's own words unedited.
 
 ```json
 {"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1","intent":"needs_reply"}}
@@ -247,7 +247,7 @@ If no native session reference is stored, the field is omitted.
 
 ## Reading an agent's conversation
 
-`agent.read` reads a **pane**: terminal output, wrapped at the width it was drawn at. `agent.history` reads the **conversation** — the agent's own session transcript, unwrapped, one entry per turn. Claude only, since that is the transcript format Flock parses.
+`agent.read` reads a **pane**: terminal output, wrapped at the width it was drawn at. `agent.history` reads the **conversation** — the agent's own session transcript, unwrapped, one entry per turn. Claude (its JSONL session transcript) and opencode (its session database, read-only) are read; other agents refuse.
 
 For a TUI agent the distinction is the whole point. A pane read is a screen scrape, so against an agent TUI it returns the chrome that TUI draws rather than the conversation, and it changes shape as the TUI repaints. Poll `agent.history` to learn what an agent said.
 
@@ -283,11 +283,33 @@ The result carries the turns plus the cursor that resumes after them:
 }
 ```
 
-`cursor` and `next_cursor` are byte offsets into the transcript, valid only for the `session_id` the same response reports — a restarted agent writes a new session, and a cursor from the old one means nothing in the new one. Handing `next_cursor` back reads only what has been appended since; that is what makes the method cheap enough to poll, since a call never parses more than 1 MiB of transcript. `more` means further turns are already on disk, so page again rather than wait. `truncated` means turns older than `cursor` exist and were not returned.
+`cursor` and `next_cursor` are opaque: byte offsets into a Claude transcript, message times in ms for an opencode session. Hand them back, never compute with them. They are valid only for the `session_id` the same response reports — a restarted agent writes a new session, and a cursor from the old one means nothing in the new one. Handing `next_cursor` back reads only what has been appended since; that is what makes the method cheap enough to poll, since a call never parses more than 1 MiB of transcript. `more` means further turns are already on disk, so page again rather than wait. `truncated` means turns older than `cursor` exist and were not returned.
 
 Two properties are deliberate. `agent.history` touches **no pane state** — it does not mark the pane seen and does not move the operator's attention ordering, which is what makes polling it safe. And it renders at the `detail` the *caller* asked for, never at whatever level the operator's prompt-history panel happens to be showing.
 
-Refusals: `unsupported_for_agent` (the pane's agent writes no transcript Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet), `transcript_unreadable`.
+Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet, or no opencode database under `$XDG_DATA_HOME/opencode` / `~/.local/share/opencode`), `transcript_unreadable`.
+
+### The result of a turn
+
+`agent.result` answers the most common supervision question, "how did that task go", without paging history: the reply the agent's newest turn ended on, plus the status of its final line.
+
+```json
+{"id":"req_10","method":"agent.result","params":{"target":"reviewer","max_chars":4000}}
+```
+
+```json
+{
+  "type": "agent_result",
+  "result": {
+    "pane_id": "1-2", "workspace_id": "1", "agent": "opencode", "session_id": "ses_...",
+    "finished": true, "status": "verdict", "status_text": "approve",
+    "text": "Read the diff; the tests cover it.\nVERDICT: approve",
+    "offset": 0, "total_chars": 52, "at_ms": 1756300000000
+  }
+}
+```
+
+`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, while the newest transcript entry is not assistant text (the Stop hook's "settled" rule); for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet.
 
 ## Reading a handed-over file
 
@@ -399,6 +421,60 @@ flk wait agent-status 1-1 --status blocked
 ```
 
 Agent waits observe semantic state, not arbitrary command completion.
+
+A sender can wait for the answer to its own message:
+
+```bash
+id=$(flk msg send 1-1 "which branch?" --intent needs-reply | jq -r .result.correlation_id)
+flk wait reply "$id" --timeout 600000     # prints the reply body
+flk msg send 1-1 "which branch?" --intent needs-reply --await   # the same, in one command
+```
+
+`msg.wait_reply` (`{"correlation_id": "...", "timeout_ms": N}`) is held on the socket thread and woken by the event hub, not a poll, until the message is answered (`outcome: "replied"`), a muted recipient defers it (`deferred`), it is dropped unread (`expired`), or `timeout_ms` passes (`timeout`, with the message's last delivery `state`, so "read but unanswered" shows). It needs no inbox: the answer is read from the server's event window by correlation id, so a reply held for an ssh-originated send reaches the waiter. When a message has several answers, a real reply outranks a mute's deferral (so a question deferred and later answered shows the answer from then on), and the first reply stands. The window is the in-memory ring `msg.status` reads (the newest 4096 events), so the two never disagree; a message older than that is refused with `message_not_found`, as an unknown correlation id is. The default and maximum wait is 24 hours, the age at which an unread message is dropped anyway. The reply's `from_agent`/`from_pane` are the sender stamp: routing and audit metadata, never authorization — any process on the server can answer a message with `msg.send --reply-to`. `flk wait reply` exits 0 when replied, 3 when deferred or expired, 124 on timeout, and 1 on an error; it prints the reply body on stdout and the reply's metadata on stderr, or the whole result with `--json`. `flk msg send --await [--timeout MS]` (needs `--intent needs-reply` or `blocking`) sends and then waits the same way, with the send's own result on stderr, so a harness that runs it as a background task is handed the answer alone.
+`--status idle` matches `idle` **or** `done`: an agent nobody has looked at goes
+quiet as `done`, which is an effective idle, so that is the status to wait for
+when nobody is watching the pane. `--status done` matches exactly `done`. The
+`--status settled` wait goes further and is documented under
+[Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
+it is a CLI concept and has no socket method of its own — the server publishes
+the states it observes, and the settle window is applied by the client.
+
+## The turn cursor
+
+Local `pane_info` and `agent_info` records carry a `turn_cursor`:
+
+```json
+"turn_cursor": "term_abc123:0:2:7:i"
+```
+
+It is an opaque string of five colon-separated fields, which callers should read
+by shape (and from the right) rather than interpret:
+
+| Field | Meaning |
+| --- | --- |
+| `term_…` | the terminal id, the same string as `terminal_id` on the record |
+| `execution_epoch` | bumped when the pane's child was replaced. The terminal id is **reused** on a shell respawn, so this is what tells a continuing agent from a fresh one in the same place |
+| `working_entries` | how many times this terminal has been observed entering `working` |
+| `state_seq` | bumped on every change of the terminal's effective state, plus on hibernation entry and exit. `idle` and `done` are ONE state to it — they are the same effective idle, told apart by the record's `seen` flag — so an operator looking at a pane does not move the cursor |
+| `w` / `i` | whether the agent was working when the cursor was minted |
+
+Capture a cursor before you prompt an agent, and hand it back to
+`flk agent wait --status settled --after <cursor>`: it is then a statement about
+work that started after you said so, rather than about any quiet at all. A
+cursor never satisfies a wait on another terminal or another execution, and
+counters the server has not reached are refused rather than waited out.
+
+Two properties are worth stating plainly. `working_entries` counts **observed**
+entries, not submitted prompts — Flock samples a native agent's screen every
+300-500 ms, so a turn whose working phase is shorter than one sample is never
+seen. And `state_seq` moves on an `idle -> blocked -> idle` excursion even
+though the status ends where it started, which is what makes a settle window
+anchored on it survive a mid-turn blip — including one that happened entirely
+between two polls, where both samples read `idle` and only the counter says
+otherwise.
+
+`turn_cursor` is absent on remote, peer and fleet summaries (there is no local
+terminal to describe) and on servers older than #553. Handle it as optional.
 
 ## Response shapes
 

@@ -1376,6 +1376,7 @@ impl App {
             }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
+            Method::AgentResult(params) => return self.handle_agent_result(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),

@@ -361,6 +361,10 @@ impl App {
             status_age_secs: terminal
                 .state_changed_at
                 .map(|changed| changed.elapsed().as_secs()),
+            // #553: every local pane's terminal has a cursor, and it is the
+            // same string the agent record carries — a caller that reads one
+            // must be able to hand it straight to the other.
+            turn_cursor: Some(terminal.turn_cursor()),
             revision: terminal.revision,
         })
     }

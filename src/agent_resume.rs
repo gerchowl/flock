@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// feature silently reads the empty one, which is exactly how the
 /// prompt-history panel shipped dead (#328).
 pub const CLAUDE_HOOK_SOURCE: &str = "flock:claude";
+pub const OPENCODE_HOOK_SOURCE: &str = "flock:opencode";
 
 const MAX_SESSION_ID_LEN: usize = 512;
 const MAX_SESSION_PATH_LEN: usize = 4096;
@@ -92,7 +93,9 @@ pub fn normalize_claude_session_start_source(value: Option<String>) -> Option<St
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        (CLAUDE_HOOK_SOURCE, "claude") | ("flock:codex", "codex") | ("flock:opencode", "opencode")
+        (CLAUDE_HOOK_SOURCE, "claude")
+            | ("flock:codex", "codex")
+            | (OPENCODE_HOOK_SOURCE, "opencode")
     )
 }
 

@@ -1,5 +1,6 @@
 pub mod client;
 mod event_hub;
+mod reply_wait;
 pub mod schema;
 mod server;
 mod status;
@@ -7,6 +8,7 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
+pub(crate) use reply_wait::{best_answer, Answer};
 pub use server::{start_server, start_server_with_capabilities, ServerHandle};
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
