@@ -126,11 +126,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-15, not macos-latest: macos-latest is now the macOS 26 image, whose
+          # SDK zig 0.15.2 can't link against (undefined libSystem symbols). Same pin
+          # and reason as ci.yml's check matrix.
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: flock-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: flock-macos-aarch64
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
