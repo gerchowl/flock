@@ -102,6 +102,21 @@ Grouped worktrees still behave like normal Flock workspaces: they can be focused
 
 Deleting a worktree checkout is explicit. Use `Delete worktree checkout...` on a grouped child workspace to run `git worktree remove`. Flock first asks Git to remove safely. If Git refuses because the checkout has modified or untracked files, Flock asks again before running the forced remove. Branches are not deleted.
 
+### Which branch counts as merged
+
+Killing a worktree deletes its local branch too, but only when Flock can find positive evidence that the branch's work has landed somewhere. It asks GitHub first (`gh pr view`), then falls back to local git: whether the branch is an ancestor of a **landing branch**, whether some pushed remote ref contains it, whether it holds no commits of its own, and — for squash and rebase merges, which leave no ancestry to find — whether its content is already in a landing branch.
+
+The landing set is the repo's detected default branch plus `dev`, `main` and `master`, whichever exist. It is deliberately more than one branch: `refs/remotes/origin/HEAD` is written once at clone time and git never updates it, so after a GitHub default-branch change it names a branch that no longer receives PRs. A repo that squash-merges into `dev` while its symref still says `main` would otherwise report fully landed work as unmerged whenever `gh` cannot be reached.
+
+If your PRs land on a branch with a different name, name it:
+
+```toml
+[worktrees]
+integration_branches = ["staging"]
+```
+
+Each entry is also protected from auto-deletion, as is every branch in the landing set — a branch work lands into is never something the sweep should remove. Branches named in `[worktrees] protected_branches` are kept for the same reason, on top of the hardcoded `main`/`master` floor that applies with no config at all.
+
 ## Remote attach
 
 Remote attach manages its SSH bridge with a temporary keepalive fallback by default.

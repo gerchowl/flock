@@ -794,6 +794,7 @@ impl App {
             &target.repo_root,
             &target.checkout,
             &self.state.config.worktrees.protected_branches,
+            &self.state.config.worktrees.integration_branches,
         );
         let would_delete_branch = verdict.would_delete_branch(params.keep_branch);
 
@@ -1445,6 +1446,7 @@ impl App {
         let verdicts = crate::worktree::resolve_kill_verdicts_bounded(
             &jobs,
             &self.state.config.worktrees.protected_branches,
+            &self.state.config.worktrees.integration_branches,
         );
         for (index, (verdict, timed_out)) in targets.into_iter().zip(verdicts) {
             worktrees[index].kill_verdict = Some(crate::api::schema::KillVerdictInfo {
