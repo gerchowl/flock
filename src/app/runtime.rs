@@ -1111,7 +1111,12 @@ impl App {
             let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
             let merged = branch.as_deref().map(|b| {
                 matches!(
-                    crate::worktree::branch_merge_gate(&space.repo_root, &space.checkout_path, b),
+                    crate::worktree::branch_merge_gate(
+                        &space.repo_root,
+                        &space.checkout_path,
+                        b,
+                        &self.state.config.worktrees.integration_branches,
+                    ),
                     crate::worktree::WorktreeMergeGate::Merged { .. }
                 )
             });
