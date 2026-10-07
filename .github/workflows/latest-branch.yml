@@ -1,17 +1,17 @@
-# Fork-only: maintain the `latest` distribution channel for Nix users.
+# Maintain the `latest` distribution channel for Nix users.
 #
 # Every push to the integration branch builds the flake packages — exactly
 # what `github:gerchowl/flock/latest` consumers will get — and fast-forwards
-# `latest` only on success. Pin `latest` for newest-green, a tag/rev for
-# immutable, or the integration branch for bleeding edge.
+# `latest` only on success. Pin `latest` for newest-green, `stable` (or a
+# v* tag) for the last release, or `dev` itself for bleeding edge.
 #
-# The integration branch is `main` (graduated from feat/sidebar-row-gap,
-# PR #86).
+# The integration branch is `dev`. `main` moves only when a release is cut
+# (promote.yml), and `stable` follows each release (release.yml).
 name: latest-branch
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   workflow_dispatch:
 
 permissions:

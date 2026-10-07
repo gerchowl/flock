@@ -180,6 +180,44 @@ decision about the name, the `publish` metadata, and what a `cargo install` of
 this tree is supposed to mean for a product that ships as a tarball, a Homebrew
 formula and a Nix flake.
 
+## Amendment (2026-10-07): `dev` integrates, `main` holds releases, versions are plain
+
+The operator changed two things after v0.8.0, and both follow from one fact:
+`gerchowl/flock` is not a fork (see Context), so nothing should say it is.
+
+**Builds report the plain version.** The Nix flake no longer sets
+`buildChannel = "fork"`, so a build reports `0.8.0`, not `0.8.0-fork.<sha>`.
+§1 kept the `-fork.<sha>` suffix as a runtime marker. It distinguished builds,
+but it named a relationship that does not exist, and it never parsed
+(`Version::parse` rejects it, as §1 itself argues). The commit is still
+recorded: the flake passes the full rev as `FLOCK_BUILD_COMMIT`, which the
+report provenance block shows (`build_info::commit`). The `preview` channel
+keeps its `-preview.<id>` suffix, because those builds really are not a release.
+
+**A plain version is only true if `main` is a release.** So `main` no longer
+integrates. Every PR targets `dev`. `main` moves only when a release is cut,
+and only as a fast-forward to a `release: vX.Y.Z` commit that already passed
+its required checks on `dev`. A ruleset restricts updates to `main` to the
+release GitHub App. The path is:
+
+1. `just release [X.Y.Z]` dispatches `promote.yml` on `dev`. It promotes
+   `docs/next`, prepares the changelog section, bumps `Cargo.toml` and
+   `Cargo.lock`, and opens `release: vX.Y.Z` as a self-merging PR into `dev`.
+2. `release-follow-up.yml` runs on each `dev` push. For a release commit it
+   waits for that commit's checks, fast-forwards `main`, and pushes the
+   `vX.Y.Z` tag with the App token, so the tag triggers `release.yml`.
+3. `release.yml` publishes, moves the `stable` branch (the fleet's Nix pin) to
+   the released commit, and opens the `latest.json` PR into `dev`.
+
+This supersedes §2's `just release` mechanics, which pushed to `main` and could
+not pass branch protection (#598). It keeps §2's reasons for not adopting
+release-plz: two channels, a curated changelog, and the version stays a human's
+decision (§4 still computes the recommendation). One property moves: §2 counted
+`release-prepare` running `just check` as the gate. Now the gate is the release
+PR's required checks. Those do not yet run the maintenance-script unittests,
+which #597 adds. `just release-prepare` remains as the local dry run, and it
+still runs `just check`.
+
 ## What this record does not do
 
 - It does not set the version. `Cargo.toml` still says `0.6.8` and the first

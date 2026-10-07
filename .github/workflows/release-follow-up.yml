@@ -1,0 +1,137 @@
+# guardrails-ok(ci-shim): repo-automation: waits on check runs and moves refs, no build logic to shim
+#
+# The second half of cutting a release (promote.yml is the first). When a
+# `release: vX.Y.Z` commit lands on `dev`, wait for that exact commit to pass
+# its checks there, then fast-forward `main` to it and tag it `vX.Y.Z`. The
+# tag starts release.yml.
+#
+# `main` moves ONLY here. A ruleset restricts updates to `main` to the release
+# App, which is why both pushes use the App's token. Using it for the tag also
+# matters on its own: a tag pushed with GITHUB_TOKEN triggers no workflows, so
+# release.yml would never start.
+#
+# It is a fast-forward, never a merge: `main` is always an ancestor of `dev`, so
+# nothing has to be merged back.
+name: Release follow-up
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: The release commit on dev to promote (re-run after its checks were retried)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: release-follow-up
+  cancel-in-progress: false
+
+jobs:
+  promote-main:
+    runs-on: ubuntu-latest
+    # The macOS check leg alone may take its full 25-minute budget.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Is this a release commit?
+        id: release
+        env:
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          sha="${REQUESTED_SHA:-$GITHUB_SHA}"
+          sha="$(git rev-parse "$sha^{commit}")"
+          if ! git merge-base --is-ancestor "$sha" origin/dev; then
+            echo "::error::$sha is not on dev"
+            exit 1
+          fi
+          subject="$(git log -1 --format=%s "$sha")"
+          version="$(printf '%s\n' "$subject" | sed -nE 's/^release: v([0-9]+\.[0-9]+\.[0-9]+)( \(#[0-9]+\))?$/\1/p')"
+          if [ -z "$version" ]; then
+            echo "not a release commit: $subject"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cargo_version="$(git show "$sha:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::subject says v$version but Cargo.toml at $sha is $cargo_version"
+            exit 1
+          fi
+          git fetch origin main --tags
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "::error::tag v$version already exists"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor origin/main "$sha"; then
+            echo "::error::main is not an ancestor of $sha; refusing anything but a fast-forward"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the release commit's checks on dev
+        if: steps.release.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # The required contexts that run on a push to dev. `tracker hosts`
+          # runs on pull requests only, so it never reports on a pushed commit.
+          required=("conventional-commits" "check (ubuntu-latest)" "check (macos-15)" "flake check")
+          while true; do
+            runs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?per_page=100" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')"
+            pending=0
+            for name in "${required[@]}"; do
+              line="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n' | tail -1)"
+              status="$(printf '%s' "$line" | cut -f2)"
+              conclusion="$(printf '%s' "$line" | cut -f3)"
+              if [ "$status" != "completed" ]; then
+                pending=1
+              elif [ "$conclusion" != "success" ]; then
+                echo "::error::$name concluded '$conclusion' on $SHA; re-run it, then dispatch this workflow with sha=$SHA"
+                exit 1
+              fi
+            done
+            if [ "$pending" = 0 ]; then
+              echo "all required checks passed on $SHA"
+              break
+            fi
+            sleep 30
+          done
+
+      - uses: actions/create-github-app-token@v2
+        if: steps.release.outputs.release == 'true'
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Fast-forward main and tag the release
+        if: steps.release.outputs.release == 'true'
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ steps.release.outputs.sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # No --force: the push is refused unless it is a fast-forward.
+          git push "$remote" "$SHA:refs/heads/main"
+          git tag -a "v$VERSION" -m "v$VERSION" "$SHA"
+          git push "$remote" "v$VERSION"

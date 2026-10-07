@@ -28,26 +28,31 @@ Do all code edits, tests, and validation inside the task worktree.
 
 Commit on the task branch in that worktree.
 
-When the change is ready, fast-forward the shared checkout at `../flock` to the merge commit, then continue from `main`. The task branch is never the final landing branch.
+When the change is ready, fast-forward the shared checkout at `../flock` to the merge commit, then continue from `dev`. The task branch is never the final landing branch.
 
 ### Fork fleet flow (gerchowl/flock)
 
-Every change lands through a PR against `main`. Multiple agent sessions develop
-on this fork concurrently, so direct pushes cause pin races and skip review.
+Every change lands through a PR against `dev`. Multiple agent sessions develop
+here concurrently, so direct pushes cause pin races and skip review.
 
-**The landing branch is `main`.** It was briefly documented here as
-`feat/sidebar-row-gap`; that branch does not exist, and every PR since has
-targeted `main`. Check `gh pr list --base main` before assuming anything else.
+**The landing branch is `dev`; `main` holds releases only.** `main` moves only
+when a release is cut (`just release`, see Release Channels): a ruleset lets
+nothing but the release App update it, and only as a fast-forward to a
+`release: vX.Y.Z` commit that already passed its checks on `dev`. So a build of
+`main` is exactly a published version. Never open a PR against `main`.
 
 1. Isolate in a worktree (flock's `branch_session` keybind, `flock worktree`
    CLI, or `git worktree add`). External worktrees are auto-adopted.
-2. Commit on the task branch; push; `gh pr create --base main` with
+2. Commit on the task branch; push; `gh pr create --base dev` with
    test/probe evidence in the description.
 3. Merge via the PR — **squash**, matching every recent merge — then
    `git pull --ff-only` in the shared checkout.
-4. Deploying: bump the dotfiles flake (`nix flake update flock`), VERIFY the
-   pinned rev in flake.lock (pin races happen), `home-manager switch`, then
-   `flock server live-handoff`. Commit the dotfiles pin.
+4. Deploying: the fleet pins `github:gerchowl/flock/stable` (the last
+   release; release.yml moves it) or `.../latest` (the newest green `dev`
+   commit; latest-branch.yml moves it). Bump the dotfiles flake
+   (`nix flake update flock`), VERIFY the pinned rev in flake.lock (pin races
+   happen), `home-manager switch`, then `flock server live-handoff`. Commit the
+   dotfiles pin.
 5. Clean up with the merge-gated kill (`kill_worktree` keybind,
    `flock worktree kill`, or the `/clean-ws` skill) — never delete branches
    by hand.
@@ -57,7 +62,7 @@ Doc-only changes still take a PR, but skip step 4.
 **The queue is serial, and that is structural.** This is a user-owned repo, so
 GitHub's merge queue cannot be enabled (`owner.type == "User"` rejects the
 `merge_queue` rule with 422, and `required_merge_queue` is silently ignored).
-With `strict: true` on `main`, every merge moves `main` and puts every other open
+With `strict: true` on `dev`, every merge moves `dev` and puts every other open
 PR into `BEHIND`, so one PR is landed at a time: update-branch, wait for the
 **new** CI run, merge, re-inventory. `--auto` will not update a `BEHIND` branch
 and will stall the queue after the first merge.
@@ -186,18 +191,18 @@ fix: handle pane focus
 refs #82
 ```
 
-Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `main` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
+Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `dev` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
 
 ## Code Conventions
 
 - Rust: no `unwrap()` in production code. Use `tracing` for logging. Use `#[allow]` only with a comment explaining why.
 - Don't add dependencies without a reason. Check whether existing dependencies cover the need first.
-- Integration asset versions (`FLOCK_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `main`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
+- Integration asset versions (`FLOCK_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `dev`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
 - When changing the server/client wire protocol, compare `src/protocol/wire.rs::PROTOCOL_VERSION` against the latest released tag. Bump it only if the current source protocol is not already greater than the latest released protocol. Update hardcoded protocol expectations and manual protocol fixtures in tests.
 
 ## Release Channels
 
-Flock has one main branch and two update channels. Stable and preview both build from `main`; there is no long-lived preview branch.
+Flock has two long-lived branches and two update channels. `dev` is where every change lands; `main` holds released code only and moves when a release is cut. Stable releases are cut from `dev` and fast-forward `main`; preview builds come from `dev`; there is no long-lived preview branch.
 
 Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.
 
@@ -220,14 +225,14 @@ Preview releases are GitHub prereleases produced by `.github/workflows/preview.y
 Stable releases use:
 
 ```bash
-just check
 just release-plan          # what landed since the last release, and the bump it calls for
-just release 0.x.y
+just release-prepare 0.x.y # optional local dry run of the release commit (runs just check)
+just release 0.x.y         # or `just release` to take the recommended bump
 ```
 
 The version number is a human's decision, and `just release-plan` is the input to it rather than a replacement for it: it reports the commits since the last `v*` tag grouped by conventional type and recommends major (`!` or a `BREAKING CHANGE` footer), minor (a `feat`) or patch (anything else that ships). `just release-prepare` refuses a version that is not greater than the last release, or that is below the recommended bump; pass `--allow-not-greater` or `--allow-below-recommended` when you mean it. With no `v*` tag the plan reads the whole history and reports the first release as yours to number — the version line is a product decision, recorded in [ADR-0025](docs/adr/0025-version-identity-and-release-automation.md).
 
-Before stable release, run `/pre-release-audit`, finalize `docs/next`, copy approved docs into the stable docs/root files, and let `just release-docs-check` verify the sync. `just release` prepares the release commit, tags it, pushes the tag, and GitHub Actions builds binaries, creates the GitHub release, closes released issues, and opens a self-merging PR that updates `website/latest.json` (main is protected, so it cannot push directly).
+Before stable release, run `/pre-release-audit` and finalize `docs/next`: check that every entry since the last release sits under `## Unreleased` in `docs/next/CHANGELOG.md` (a merge can drop it into an older version's section) and that the next docs describe what shipped. `just release` dispatches `.github/workflows/promote.yml` on `dev`, which copies `docs/next` onto the stable docs, moves `Unreleased` into the version section, bumps `Cargo.toml`/`Cargo.lock`, and opens a self-merging `release: vX.Y.Z` PR into `dev`. When it merges, `.github/workflows/release-follow-up.yml` waits for that commit's checks on `dev`, fast-forwards `main` to it and tags it `vX.Y.Z`. The tag starts `.github/workflows/release.yml`, which builds the binaries, creates the GitHub release, closes released issues, moves the `stable` branch, and opens a self-merging PR into `dev` that updates `website/latest.json`. The PRs and the tag use the `gerchowl-flock-release` App's token, because anything GITHUB_TOKEN opens or pushes triggers no workflows.
 
 A release manifest is a promise about what a user can install, so it may only advertise assets this repository published. `scripts/changelog.py` refuses to write or verify a manifest whose assets are not `DEFAULT_RELEASE_REPO`'s, and drops foreign archived entries on the way past — an entry left in the archive is an entry re-published on every release. Before this repository has published a release, `website/latest.json` is a sentinel that advertises no installable version; regenerate it with `python3 scripts/changelog.py neutralize-latest-json` rather than by hand.
 

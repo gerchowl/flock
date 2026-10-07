@@ -5,7 +5,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [dev, main]
     paths-ignore:
       - "website/**"
   # Required for the merge queue. GitHub runs required checks against the

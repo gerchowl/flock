@@ -11,13 +11,14 @@
   git,
   apple-sdk ? null,
   cctools ? null,
-  # Build identity baked into `flock status` / federation summaries:
-  # version renders as "<base>-<channel>.<id>" (src/build_info.rs). The
-  # flake passes the fork channel + short rev so every deployed build
-  # self-identifies — two fork builds are otherwise indistinguishable
-  # ("0.6.8" / proto N). null keeps the plain upstream version string.
+  # Build identity (src/build_info.rs). With no channel the version is the
+  # plain Cargo version: `main` only moves on a release, so a build of it is
+  # exactly that release. A non-null channel renders "<base>-<channel>.<id>".
+  # buildCommit is the full rev, recorded as provenance (report blocks)
+  # without changing the version string.
   buildChannel ? null,
   buildId ? null,
+  buildCommit ? null,
   # Build the `web` cargo feature (the `flk web` xterm bridge, gerchowl/flock#131).
   # Off by default so the standard build stays lean (no axum/rust-embed); the
   # flake exposes a `flock-web` package with this on. The binary is still
@@ -105,6 +106,9 @@ rustPlatform.buildRustPackage {
   }
   // lib.optionalAttrs (buildId != null) {
     FLOCK_BUILD_ID = buildId;
+  }
+  // lib.optionalAttrs (buildCommit != null) {
+    FLOCK_BUILD_COMMIT = buildCommit;
   }
   // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
     SDKROOT = darwinSdkRoot;

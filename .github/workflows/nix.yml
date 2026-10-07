@@ -9,7 +9,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [dev, main]
     paths:
       - ".github/workflows/nix.yml"
       # ci.yml produces two required contexts (`check (macos-15)`,
