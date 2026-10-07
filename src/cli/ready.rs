@@ -178,15 +178,54 @@ fn current_status(target: &str) -> Option<(serde_json::Value, String)> {
 
 /// Block until `target`'s pane reports a status flock can name, then print the
 /// agent exactly as `agent get` would.
-///
-/// `pane_id` is passed rather than re-resolved because the caller already has
-/// it, and because a start whose agent dies mid-wait must still be reportable
-/// after `agent get` has stopped answering for it.
 pub(super) fn wait_until_ready(
     target: &str,
     pane_id: &str,
     timeout_ms: u64,
 ) -> std::io::Result<i32> {
+    match wait_for_ready(target, pane_id, timeout_ms)? {
+        ReadyOutcome::Ready(response) => super::print_response(&response),
+        ReadyOutcome::Refused { code, message } => Ok(refuse(&code, &message)),
+        ReadyOutcome::SubscribeRefused(body) => {
+            eprintln!("{body}");
+            Ok(1)
+        }
+    }
+}
+
+/// What a readiness wait concluded, before anything is printed (#578 P3).
+///
+/// `agent start --wait-ready` prints the record through [`wait_until_ready`]; the
+/// delegate reads it, because a delegate that is about to TYPE into a pane needs
+/// to know the agent is up before it types rather than only after — and because
+/// a readiness answer phrased for a human (`agent_not_ready` plus a quote of the
+/// last line the pane printed) is not the same thing as a readiness answer a
+/// start needs to roll itself back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReadyOutcome {
+    /// The pane reports a status flock can name. The response is the whole
+    /// `agent.get` reply, so a caller can report it exactly as `agent get` would.
+    Ready(serde_json::Value),
+    /// The wait gave up, or the pane exited first. Both carry the server's own
+    /// code so `wait_until_ready` prints the same refusal it always has.
+    Refused { code: String, message: String },
+    /// The SUBSCRIPTION itself was refused, so there is no wait to report a
+    /// readiness for. Its body is the server's verbatim reply, kept verbatim
+    /// because that is what the subscribe failure has always printed.
+    SubscribeRefused(String),
+}
+
+/// The readiness core: block until the pane reports a status flock can name, or
+/// say why it never did.
+///
+/// `pane_id` is passed rather than re-resolved because the caller already has
+/// it, and because a start whose agent dies mid-wait must still be reportable
+/// after `agent get` has stopped answering for it.
+pub(super) fn wait_for_ready(
+    target: &str,
+    pane_id: &str,
+    timeout_ms: u64,
+) -> std::io::Result<ReadyOutcome> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     // Subscribe FIRST, then snapshot. The subscription's own probe fixes the
@@ -215,43 +254,46 @@ pub(super) fn wait_until_ready(
         .map_err(super::api_client_error_to_io)?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
         if let ApiClientError::ErrorResponse(response) = err {
-            eprintln!("{}", serde_json::to_string(&response).unwrap());
-            return Ok(1);
+            return Ok(ReadyOutcome::SubscribeRefused(
+                serde_json::to_string(&response).unwrap(),
+            ));
         }
         return Err(super::api_client_error_to_io(err));
     }
 
     if let Some((response, status)) = current_status(target) {
         if status_is_ready(&status) {
-            return super::print_response(&response);
+            return Ok(ReadyOutcome::Ready(response));
         }
     }
+
+    let not_ready = |pane_id: &str| ReadyOutcome::Refused {
+        code: "agent_not_ready".to_string(),
+        message: format!(
+            "agent {target} did not become ready within {timeout_ms}ms; {}",
+            describe(target, pane_id)
+        ),
+    };
 
     loop {
         let Some(remaining) = deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
         else {
-            return Ok(refuse(
-                "agent_not_ready",
-                &format!(
-                    "agent {target} did not become ready within {timeout_ms}ms; {}",
-                    describe(target, pane_id)
-                ),
-            ));
+            return Ok(not_ready(pane_id));
         };
         stream.set_read_timeout(Some(remaining))?;
 
         match stream.next_value() {
             Ok(None) => {
-                return Ok(refuse(
-                    "agent_not_ready",
-                    &format!(
+                return Ok(ReadyOutcome::Refused {
+                    code: "agent_not_ready".to_string(),
+                    message: format!(
                         "the readiness subscription for agent {target} closed before it became \
                          ready; {}",
                         describe(target, pane_id)
                     ),
-                ));
+                });
             }
             Ok(Some(event)) => match classify_ready_event(&event, pane_id) {
                 ReadySignal::Ready(_) => {
@@ -259,11 +301,11 @@ pub(super) fn wait_until_ready(
                     // the same object `agent get` returns, so one branch reads
                     // both a wait and a poll.
                     return match current_status(target) {
-                        Some((response, _)) => super::print_response(&response),
-                        None => Ok(refuse(
-                            "agent_not_ready",
-                            &format!("agent {target} became ready and then disappeared"),
-                        )),
+                        Some((response, _)) => Ok(ReadyOutcome::Ready(response)),
+                        None => Ok(ReadyOutcome::Refused {
+                            code: "agent_not_ready".to_string(),
+                            message: format!("agent {target} became ready and then disappeared"),
+                        }),
                     };
                 }
                 ReadySignal::Exited => {
@@ -275,23 +317,17 @@ pub(super) fn wait_until_ready(
                     // the words — a child that dies inside its first 250ms is
                     // refused by the start itself, carrying its exit code and
                     // last line (#178).
-                    return Ok(refuse(
-                        "agent_exited_before_ready",
-                        &format!(
+                    return Ok(ReadyOutcome::Refused {
+                        code: "agent_exited_before_ready".to_string(),
+                        message: format!(
                             "agent {target} exited before it became ready; its pane went with it,                              so there is nothing left to read — run the agent's own command in a                              pane to see why it will not stay up"
                         ),
-                    ));
+                    });
                 }
                 ReadySignal::KeepWaiting => continue,
             },
             Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
-                return Ok(refuse(
-                    "agent_not_ready",
-                    &format!(
-                        "agent {target} did not become ready within {timeout_ms}ms; {}",
-                        describe(target, pane_id)
-                    ),
-                ));
+                return Ok(not_ready(pane_id));
             }
             Err(err) => return Err(super::api_client_error_to_io(err)),
         }

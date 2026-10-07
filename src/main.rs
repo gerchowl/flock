@@ -508,6 +508,7 @@ fn main() -> io::Result<()> {
         println!("       flk tab <subcommand> ...");
         println!("       flk notification <subcommand> ...");
         println!("       flk agent <subcommand> ...");
+        println!("       flk delegate <subcommand> ...");
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
         println!("       flk session <subcommand> ...");
@@ -563,6 +564,10 @@ fn main() -> io::Result<()> {
             (
                 "flk agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
+            ),
+            (
+                "flk delegate <subcommand>",
+                "Hand a task to an agent: start, send, wait, result, status, reap",
             ),
             (
                 "flk pane <subcommand>",

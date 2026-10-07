@@ -338,6 +338,15 @@ A long report pages with `--offset`, using the `next_offset` it returns. Ask the
 agents you delegate to to end on one of those three lines, and the supervisor's
 check is one call.
 
+When the whole sequence is the same every time, `flk delegate` is the one command. It makes the space, starts the harness in it, waits until it is at its prompt, types the brief, and with `--await` waits for the round's outcome — in a workspace it created, without ever taking your focus, and in its own worktree so the task cannot touch the checkout you are working in:
+
+```bash
+flk delegate start reviewer --brief ./briefs/review.md --worktree --branch review/spike --await
+flk delegate send reviewer --brief ./briefs/follow-ups.md --await
+```
+
+The brief is a file and exactly one sentence is typed into the agent: `Read <absolute path> and execute it exactly.` Settling is not finishing, so the await reports a round only when the agent actually worked on it and wrote a reply after the brief was submitted — `send` cannot report the previous round's answer as this one's. `flk delegate reap` removes what was recorded; `flk delegate status` and `flk delegate result` read without waiting. See the CLI reference for the flags and exit codes.
+
 One more difference between the sources: `pane read --source visible` follows the
 operator's scroll position, so a human who has scrolled a pane back changes what
 a script sees. `--source recent` does not — it reads the bottom of the screen,

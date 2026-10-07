@@ -612,13 +612,7 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 
     if let Some(error) = response.get("error") {
         println!("{response}");
-        let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        return Ok(match code {
-            "not_linked_worktree" | "workspace_not_found" => 2,
-            // 4 is the retryable class: the same call with --force clears it.
-            "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => 4,
-            _ => 1,
-        });
+        return Ok(kill_error_exit_code(error));
     }
 
     let result = response.pointer("/result").cloned().unwrap_or_default();
@@ -636,6 +630,23 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         return Ok(if merged { 0 } else { 3 });
     }
     Ok(0)
+}
+
+/// What a `worktree.kill` refusal means as a process exit code.
+///
+/// One function rather than a `match` at each call site, because there are now
+/// two callers and they must not disagree (#578 P5): `flk worktree kill` prints
+/// the response and maps the code, and `flk delegate reap` destroys what the
+/// registry recorded through the same method. A delegate that answered a refusal
+/// with a different code than `worktree kill` would send a script to a different
+/// remedy for the same refusal.
+pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
+    match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
+        "not_linked_worktree" | "workspace_not_found" => 2,
+        // 4 is the retryable class: the same call with --force clears it.
+        "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => 4,
+        _ => 1,
+    }
 }
 
 /// How many pids one line names before it stops counting. The measured case

@@ -2136,6 +2136,10 @@ pub enum ResponseResult {
         tab: TabInfo,
         root_pane: PaneInfo,
         worktree: WorktreeInfo,
+        /// The public id of the parent workspace when THIS call created it, and
+        /// `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_workspace_id: Option<String>,
     },
     WorktreeOpened {
         workspace: WorkspaceInfo,
@@ -4176,6 +4180,7 @@ mod tests {
                     last_commit_at: None,
                     kill_verdict: None,
                 },
+                parent_workspace_id: None,
             },
         };
         let json = serde_json::to_string(&response).unwrap();

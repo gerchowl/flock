@@ -157,9 +157,10 @@ impl App {
                 crate::worktree::explain_worktree_add_failure(&base, &err),
             );
         }
-        if let Err(err) = self.ensure_source_parent_membership(&mut source, true) {
-            return encode_error(id, err.code, err.message);
-        }
+        let parent_ws_idx = match self.ensure_source_parent_membership(&mut source, true) {
+            Ok(idx) => idx,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
 
         let ws_idx = match self.create_workspace_with_options(checkout_path.clone(), params.focus) {
             Ok(ws_idx) => ws_idx,
@@ -183,6 +184,7 @@ impl App {
         let worktree = self
             .worktree_info_for_checkout(&source, ws_idx)
             .expect("created worktree workspace should have worktree info");
+        let parent_workspace_id = parent_ws_idx.map(|idx| self.state.workspaces[idx].id.clone());
         encode_success(
             id,
             ResponseResult::WorktreeCreated {
@@ -194,6 +196,7 @@ impl App {
                     .root_pane_info(ws_idx, 0)
                     .expect("new worktree workspace should have an initial root pane"),
                 worktree,
+                parent_workspace_id,
             },
         )
     }
@@ -604,7 +607,7 @@ impl App {
             if params.focus {
                 self.state.switch_workspace(ws_idx);
             }
-            (ws_idx, created_source_workspace)
+            (ws_idx, created_source_workspace.is_some())
         } else {
             match self.create_workspace_with_options(entry.path.clone(), params.focus) {
                 Ok(ws_idx) => (ws_idx, true),
@@ -1186,7 +1189,7 @@ impl App {
         &mut self,
         source: &mut WorktreeSource,
         emit_created_event: bool,
-    ) -> Result<bool, ApiFailure> {
+    ) -> Result<Option<usize>, ApiFailure> {
         if source.workspace_idx.is_none() {
             source.workspace_idx = self.find_parent_workspace_by_key(&source.repo_key);
         }
@@ -1220,7 +1223,7 @@ impl App {
                 self.emit_workspace_open_events(ws_idx);
             }
         }
-        Ok(created_parent)
+        Ok(source.workspace_idx.filter(|_| created_parent))
     }
 
     fn find_parent_workspace_for_space(
@@ -1695,6 +1698,7 @@ mod tests {
             tab,
             root_pane,
             worktree,
+            parent_workspace_id: _,
         } = success.result
         else {
             panic!("expected worktree_created response");
@@ -4202,6 +4206,101 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "no_agent_session");
         assert_eq!(app.state.workspaces.len(), 1);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_returns_parent_workspace_id_when_created() {
+        // A create from a repo with no open workspace → Some(id), and that
+        // workspace is listed.
+        let repo = create_committed_repo("api-parent-id-created-repo");
+        let worktree_root = unique_temp_path("api-parent-id-created-root");
+        let mut app = test_app();
+        app.state.worktree_directory = worktree_root.clone();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                cwd: Some(repo.display().to_string()),
+                branch: Some("worktree/api-parent-id-created".into()),
+                ..WorktreeCreateParams::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated {
+            workspace,
+            parent_workspace_id,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_created response: {response}");
+        };
+
+        assert!(
+            parent_workspace_id.is_some(),
+            "parent_workspace_id should be Some when a parent was created"
+        );
+        let parent_id = parent_workspace_id.unwrap();
+        // The parent workspace should be listed in the app's workspaces
+        assert!(
+            app.state.workspaces.iter().any(|ws| ws.id == parent_id),
+            "parent workspace {parent_id} should be in the app's workspaces"
+        );
+        // The parent should be the repo-root workspace (not a linked worktree)
+        let parent_ws = app
+            .state
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == parent_id)
+            .unwrap();
+        assert!(
+            !parent_ws.worktree_space().unwrap().is_linked_worktree,
+            "parent workspace should be the repo-root workspace"
+        );
+
+        let remove = crate::worktree::build_worktree_remove_command(
+            &repo,
+            Path::new(&workspace.worktree.unwrap().checkout_path),
+            false,
+        );
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(worktree_root);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_create_returns_none_when_parent_already_open() {
+        // A create while the repo root is already open → None.
+        let repo = create_committed_repo("api-parent-id-none-repo");
+        let worktree_root = unique_temp_path("api-parent-id-none-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = worktree_root.clone();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                branch: Some("worktree/api-parent-id-none".into()),
+                ..WorktreeCreateParams::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeCreated {
+            parent_workspace_id,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_created response: {response}");
+        };
+
+        assert!(
+            parent_workspace_id.is_none(),
+            "parent_workspace_id should be None when parent was already open"
+        );
+
+        let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
     }
 }

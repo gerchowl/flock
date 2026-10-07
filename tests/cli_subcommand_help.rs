@@ -38,6 +38,9 @@ const ALLOCATING_VERBS: &[&[&str]] = &[
     &["workspace", "create"],
     &["tab", "create"],
     &["pane", "split"],
+    &["delegate", "start"],
+    &["delegate", "send"],
+    &["delegate", "reap"],
 ];
 
 /// Identity and config overrides for every git call this file makes.

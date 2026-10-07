@@ -606,7 +606,28 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::normalize_pane_id(&args[0]);
     let text = args[1..].join(" ");
-    for step in pane_run_steps(&pane_id, &text) {
+    submit_sequence(&pane_id, &text)
+}
+
+/// Type `text` into `pane_id` and press Enter, as the same two separate writes
+/// `flk pane run` has always made, and report what the server said (#578 P18).
+///
+/// The executor beside the existing value: `pane_run_steps` is the ordering
+/// contract and stays a value a test can assert on, while this walks it and
+/// issues the requests. The delegate deliberately MIRRORS this sequence —
+/// same type-then-Enter, same `PANE_RUN_SUBMIT_GAP` — on BOUNDED requests
+/// (see `delegate::submit_brief`): sharing `pane_run_steps` would hand the
+/// delegate the unbounded `send_ok_request` through this executor, and a
+/// server that goes quiet mid-type would then hang `start`/`send` forever
+/// (P578 r4-4 W2). The gap value is the single source of truth; the walking
+/// code is split by whether a stall must be bounded.
+///
+/// The exit code is what [`super::send_ok_request`] returns — 0, or 1 after
+/// printing the server's refusal to stderr as it does — so `pane run`'s
+/// observable behaviour is unchanged, and a caller that only wants to know
+/// whether the submit landed reads it as non-zero.
+pub(super) fn submit_sequence(pane_id: &str, text: &str) -> std::io::Result<i32> {
+    for step in pane_run_steps(pane_id, text) {
         let method = match step {
             PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
                 pane_id,

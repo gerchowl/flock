@@ -15,6 +15,7 @@ use crate::api::schema::{
 
 mod agent;
 mod checks;
+mod delegate;
 mod digest;
 mod fleet;
 mod help;
@@ -111,6 +112,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
+        "delegate" => delegate::run_delegate_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,

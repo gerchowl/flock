@@ -56,10 +56,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// four outcomes apart without parsing prose: it settled, it needs a human, the
 /// pane went away, or it ran out of time.
 pub(super) mod exit {
-    pub(super) const SETTLED: i32 = 0;
-    pub(super) const BLOCKED: i32 = 3;
-    pub(super) const GONE: i32 = 4;
-    pub(super) const TIMEOUT: i32 = 124;
+    // `pub(crate)` rather than `pub(super)`: #578's `flk delegate` reports the
+    // same four outcomes with the same codes, and a delegate that answered
+    // `blocked` with a code of its own would send a supervisor to a different
+    // remedy for the same signal. The codes themselves are unchanged, and 5 and
+    // 6 (the delegate's own) deliberately live in `cli::delegate` instead.
+    pub(crate) const SETTLED: i32 = 0;
+    pub(crate) const BLOCKED: i32 = 3;
+    pub(crate) const GONE: i32 = 4;
+    pub(crate) const TIMEOUT: i32 = 124;
 }
 
 /// What a `--status` value means. CLI-only: `Settled` has no server-side
@@ -128,6 +133,107 @@ pub(super) enum InitialTarget<'a> {
     Agent(&'a str),
     /// `wait agent-status <pane_id>` — a pane, which need not be an agent.
     Pane(&'a str),
+}
+
+/// A target the caller has ALREADY pinned, so there is nothing to resolve.
+///
+/// The delegate owns a terminal id and a pane id it captured at start, and the
+/// pane may well be gone by the time it polls. Resolving a name here would
+/// answer about whatever holds the name NOW, which for a delegate is not the
+/// thing being waited on: it is the difference between a pane that closed
+/// (exit 4) and a new agent that inherited a recycled pane id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PinnedTarget {
+    pub(super) terminal_id: String,
+    /// Only used for the `pane.get` fallback and for the initial `last`, so a
+    /// closed pane can still be asked about by id once.
+    pub(super) pane_id: String,
+}
+
+/// Where a settled core starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SettleTarget<'a> {
+    /// Resolve a name or pane id first (the two existing wait verbs).
+    Resolve(InitialTarget<'a>),
+    /// The caller already knows the terminal, and a miss is `gone` rather than
+    /// a resolve failure.
+    Pinned(PinnedTarget),
+}
+
+/// The most recent record a settle saw, carried on every outcome so a terminal
+/// answer can still name what it saw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct LastRecord {
+    pub(super) pane_id: Option<String>,
+    pub(super) agent_status: Option<String>,
+    pub(super) turn_cursor: Option<String>,
+}
+
+/// What a settled core concluded, before anything is printed (#578 P17).
+///
+/// The two wait verbs print this through [`print_settled`]; the delegate maps it
+/// into its own outcome object. Keeping the decision and the rendering apart is
+/// what lets three verbs share one settle loop without any of them re-deciding
+/// an outcome in its own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SettledOutcome {
+    /// Quiescence held. The cursor is the one that settled, which is what a
+    /// caller resuming from it must wait past.
+    Settled { held_ms: u64, last: LastRecord },
+    /// A held `blocked`: a human has to look, so it never settles.
+    Blocked { held_ms: u64, last: LastRecord },
+    /// The pane, the agent or the execution is over.
+    Gone {
+        reason: GoneReason,
+        last: LastRecord,
+    },
+    /// A cursor the server has not reached, or one naming another terminal.
+    Refused(String),
+    /// The deadline arrived first, on any phase.
+    TimedOut,
+    /// The server REFUSED the initial resolve, and its response is carried whole.
+    ///
+    /// Its own arm, not a string inside [`Self::Error`], because at the base this
+    /// printed `eprintln!("{response}")` — the raw server reply with no verb
+    /// prefix — while every other failure printed `{verb}: {reason}`. Folding the
+    /// two together put a `wait agent-status: ` in front of a line that had never
+    /// carried one, and the two verbs' refusals were no longer the bytes a caller
+    /// had been matching on (R5).
+    ServerRefused(String),
+    /// The server answered with something this client cannot act on.
+    Error(String),
+}
+
+impl SettledOutcome {
+    /// The record the wait last saw.
+    pub(super) fn last(&self) -> Option<&LastRecord> {
+        match self {
+            Self::Settled { last, .. } | Self::Blocked { last, .. } | Self::Gone { last, .. } => {
+                Some(last)
+            }
+            Self::Refused(_) | Self::TimedOut | Self::ServerRefused(_) | Self::Error(_) => None,
+        }
+    }
+
+    /// The cursor the wait ended on. `None` when it never saw a record.
+    pub(super) fn turn_cursor(&self) -> Option<&str> {
+        self.last().and_then(|last| last.turn_cursor.as_deref())
+    }
+
+    /// The settled core's own exit code, for the two existing verbs.
+    ///
+    /// `print_settled` uses this so their behaviour cannot drift: every arm
+    /// below is the mapping those verbs had before the split.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Settled { .. } => exit::SETTLED,
+            Self::Blocked { .. } => exit::BLOCKED,
+            Self::Gone { .. } => exit::GONE,
+            Self::Refused(_) => 2,
+            Self::TimedOut => exit::TIMEOUT,
+            Self::ServerRefused(_) | Self::Error(_) => 1,
+        }
+    }
 }
 
 /// The flags that only mean something with `--status settled`.
@@ -362,43 +468,27 @@ impl SettledWait {
         self.last.as_ref().map(|(pane_id, _, _)| pane_id.as_str())
     }
 
-    /// The one JSON object both verbs print on exit 0, 3 and 4.
+    /// Give the wait a pane id to fall back on before it has seen any record.
     ///
-    /// `agent_status` and `turn_cursor` are null when nothing was ever seen,
-    /// rather than invented: a `gone` answer about a pane that never resolved
-    /// has to be able to say so.
-    pub(super) fn result_line(
-        &self,
-        status: &str,
-        held_ms: u64,
-        reason: Option<GoneReason>,
-    ) -> String {
-        let (pane_id, agent_status, turn_cursor) = match &self.last {
-            Some((pane_id, agent_status, cursor)) => (
-                serde_json::Value::String(pane_id.clone()),
-                serde_json::Value::String(reported_status_name(*agent_status).to_string()),
-                match cursor {
-                    Some(cursor) => serde_json::Value::String(cursor.clone()),
-                    None => serde_json::Value::Null,
-                },
-            ),
-            None => (
-                serde_json::Value::Null,
-                serde_json::Value::Null,
-                serde_json::Value::Null,
-            ),
-        };
-        let mut line = serde_json::json!({
-            "status": status,
-            "pane_id": pane_id,
-            "agent_status": agent_status,
-            "turn_cursor": turn_cursor,
-            "held_ms": held_ms,
-        });
-        if let Some(reason) = reason {
-            line["reason"] = serde_json::Value::String(reason.as_str().to_string());
+    /// A pinned caller (the delegate) already knows the pane; without this the
+    /// first `pane.get` fallback would ask about the empty string and read a
+    /// handoff as `gone: closed`.
+    pub(super) fn seed_pane(&mut self, pane_id: &str) {
+        if self.last.is_none() && !pane_id.is_empty() {
+            self.last = Some((pane_id.to_string(), AgentStatus::Unknown, None));
         }
-        line.to_string()
+    }
+
+    /// The last record in the shape the result line takes.
+    pub(super) fn last_record(&self) -> LastRecord {
+        match &self.last {
+            Some((pane_id, agent_status, cursor)) => LastRecord {
+                pane_id: Some(pane_id.clone()),
+                agent_status: Some(reported_status_name(*agent_status).to_string()),
+                turn_cursor: cursor.clone(),
+            },
+            None => LastRecord::default(),
+        }
     }
 
     /// Fold one sample in and say what to do.
@@ -510,8 +600,8 @@ impl SettledWait {
     }
 }
 
-/// Run the settled wait. One implementation; `flk agent wait --status settled`
-/// and `flk wait agent-status --status settled` both land here.
+/// Run the settled wait for `flk agent wait` and `flk wait agent-status`.
+/// One implementation; both verbs land here.
 ///
 /// `verb` is the caller's own name, because every message this prints is read
 /// by someone who typed one command or the other and must not have to work out
@@ -523,6 +613,92 @@ pub(super) fn run_settled_wait(
     settle_ms: u64,
     timeout_ms: Option<u64>,
 ) -> std::io::Result<i32> {
+    let outcome = settled_wait(
+        verb,
+        SettleTarget::Resolve(target),
+        after,
+        settle_ms,
+        timeout_ms,
+    )?;
+    print_settled(verb, &outcome);
+    Ok(outcome.exit_code())
+}
+
+/// Print a settled outcome the way both settled wait verbs always have.
+///
+/// The rendering half of the split: the words, the stream and the exit code are
+/// decided here and nowhere else, so the delegate (which prints its own object
+/// instead) cannot change what either existing verb says.
+pub(super) fn print_settled(verb: &str, outcome: &SettledOutcome) {
+    match outcome {
+        SettledOutcome::Settled { held_ms, last } => {
+            println!("{}", settled_result_line("settled", *held_ms, None, last));
+        }
+        SettledOutcome::Blocked { held_ms, last } => {
+            println!("{}", settled_result_line("blocked", *held_ms, None, last));
+        }
+        SettledOutcome::Gone { reason, last } => {
+            println!("{}", settled_result_line("gone", 0, Some(*reason), last));
+        }
+        SettledOutcome::Refused(reason) => eprintln!("{verb}: {reason}"),
+        SettledOutcome::TimedOut => eprintln!("timed out waiting for the agent to settle"),
+        // Verbatim, with no verb prefix: the bytes at the base.
+        SettledOutcome::ServerRefused(response) => eprintln!("{response}"),
+        SettledOutcome::Error(reason) => eprintln!("{verb}: {reason}"),
+    }
+}
+
+/// The one JSON object both settled verbs print on exit 0, 3 and 4.
+///
+/// Taken off [`SettledWait`] because the outcome outlives the state machine: a
+/// caller that resumes from a settle needs the line, not the machine that
+/// produced it. `SettledWait::result_line` is the same object over a live wait,
+/// and both call this so one shape cannot drift from the other.
+///
+/// `agent_status` and `turn_cursor` are null when nothing was ever seen, rather
+/// than invented: a `gone` answer about a pane that never resolved has to be
+/// able to say so.
+pub(super) fn settled_result_line(
+    status: &str,
+    held_ms: u64,
+    reason: Option<GoneReason>,
+    last: &LastRecord,
+) -> String {
+    let mut line = serde_json::json!({
+        "status": status,
+        "pane_id": last.pane_id,
+        "agent_status": last.agent_status,
+        "turn_cursor": last.turn_cursor,
+        "held_ms": held_ms,
+    });
+    if let Some(reason) = reason {
+        line["reason"] = serde_json::Value::String(reason.as_str().to_string());
+    }
+    line.to_string()
+}
+
+/// The settled core: run the wait and say what concluded, printing nothing.
+///
+/// The single place the settle decision is made. `run_settled_wait` prints it
+/// for the two existing verbs; `delegate` reads it and maps it into the
+/// delegate's own outcome object (P17), which is what keeps a delegate's `gone`
+/// and its `agent_blocked` decided by this state machine rather than by a
+/// second, subtly different loop beside it.
+///
+/// One outcome carries the server's response VERBATIM, because two of the verbs
+/// that used to do this work printed it that way and a caller matching on those
+/// bytes is still matching on them.
+///
+/// Only a transport failure escapes, because that is the one thing a caller
+/// cannot turn into an outcome: the two existing verbs have always propagated
+/// it as an io error and keep doing so.
+pub(super) fn settled_wait(
+    verb: &str,
+    target: SettleTarget<'_>,
+    after: Option<&str>,
+    settle_ms: u64,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<SettledOutcome> {
     let client = ApiClient::local();
     let mut requests = SocketRequests { client: &client };
     let mut interrupted = Interrupted { said: false };
@@ -533,79 +709,94 @@ pub(super) fn run_settled_wait(
     let after = match after {
         Some(raw) => match Cursor::parse(raw) {
             Ok(cursor) => Some(cursor),
-            Err(reason) => {
-                eprintln!("{verb}: {reason}");
-                return Ok(2);
-            }
+            Err(reason) => return Ok(SettledOutcome::Refused(reason)),
         },
         None => None,
     };
 
-    let rec0 = match resolve_initial(&mut requests, target, deadline, verb, &mut interrupted) {
-        Ok(rec) => rec,
-        Err(InitialFailure::TimedOut) => {
-            eprintln!("timed out waiting for the agent to settle");
-            return Ok(exit::TIMEOUT);
-        }
-        Err(InitialFailure::Refused(response)) => {
-            eprintln!("{response}");
-            return Ok(1);
-        }
-        Err(InitialFailure::Unusable(reason)) => {
-            eprintln!("{verb}: {reason}");
-            return Ok(1);
-        }
-    };
-
-    let terminal_id = rec0
-        .get("terminal_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if terminal_id.is_empty() {
-        eprintln!("{verb}: the server's record named no terminal");
-        return Ok(1);
-    }
-    if let Some(after) = &after {
-        if after.terminal_id != terminal_id {
-            eprintln!(
-                "{verb}: turn cursor belongs to another terminal \
-                 ({} is not {terminal_id})",
-                after.terminal_id
+    let mut wait = match &target {
+        SettleTarget::Pinned(pinned) => {
+            if let Some(after) = &after {
+                if after.terminal_id != pinned.terminal_id {
+                    return Ok(SettledOutcome::Refused(format!(
+                        "turn cursor belongs to another terminal \
+                         ({} is not {})",
+                        after.terminal_id, pinned.terminal_id
+                    )));
+                }
+            }
+            let mut wait = SettledWait::new(
+                after,
+                Duration::from_millis(settle_ms),
+                timeout,
+                pinned.terminal_id.clone(),
+                now,
             );
-            return Ok(2);
+            // Seeded so the first `pane.get` fallback has an id to ask about
+            // even if no record has been seen yet.
+            wait.seed_pane(&pinned.pane_id);
+            wait
         }
-    }
+        SettleTarget::Resolve(target) => {
+            let rec0 =
+                match resolve_initial(&mut requests, *target, deadline, verb, &mut interrupted) {
+                    Ok(rec) => rec,
+                    Err(InitialFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
+                    Err(InitialFailure::Refused(response)) => {
+                        return Ok(SettledOutcome::ServerRefused(response))
+                    }
+                    Err(InitialFailure::Unusable(reason)) => {
+                        return Ok(SettledOutcome::Error(reason))
+                    }
+                };
 
-    let mut wait = SettledWait::new(
-        after,
-        Duration::from_millis(settle_ms),
-        timeout,
-        terminal_id,
-        now,
-    );
+            let terminal_id = rec0
+                .get("terminal_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if terminal_id.is_empty() {
+                return Ok(SettledOutcome::Error(
+                    "the server's record named no terminal".into(),
+                ));
+            }
+            if let Some(after) = &after {
+                if after.terminal_id != terminal_id {
+                    return Ok(SettledOutcome::Refused(format!(
+                        "turn cursor belongs to another terminal \
+                         ({} is not {terminal_id})",
+                        after.terminal_id
+                    )));
+                }
+            }
 
-    // The initial record is a sample like any other: folding it in here means
-    // the cursor checks, the epoch comparison and a `--settle 0` quiescence all
-    // behave the same on the first read as on the hundredth.
-    let sample = match sample_from_record(&rec0) {
-        Ok(sample) => sample,
-        Err(reason) => {
-            eprintln!("{verb}: {reason}");
-            return Ok(1);
+            let mut wait = SettledWait::new(
+                after,
+                Duration::from_millis(settle_ms),
+                timeout,
+                terminal_id,
+                now,
+            );
+            // The resolved record is a sample like any other: folding it in here
+            // means the cursor checks, the epoch comparison and a `--settle 0`
+            // quiescence all behave the same on the first read as on the
+            // hundredth.
+            let sample = match sample_from_record(&rec0) {
+                Ok(sample) => sample,
+                Err(reason) => return Ok(SettledOutcome::Error(reason)),
+            };
+            if let Some(outcome) = settle(&mut wait, sample) {
+                return Ok(outcome);
+            }
+            wait
         }
     };
-    let step = wait.observe(sample, Instant::now());
-    if let Some(code) = finish(verb, &wait, step) {
-        return Ok(code);
-    }
 
     loop {
         match sample_pinned(&mut requests, &wait, deadline) {
             Ok(sample) => {
-                let step = wait.observe(sample, Instant::now());
-                if let Some(code) = finish(verb, &wait, step) {
-                    return Ok(code);
+                if let Some(outcome) = settle(&mut wait, sample) {
+                    return Ok(outcome);
                 }
             }
             // Retried rather than reported: a live handoff that replaces the
@@ -614,49 +805,32 @@ pub(super) fn run_settled_wait(
             // otherwise silent for as long as its timeout, which reads as a
             // hang.
             Err(PinnedFailure::Retry) => interrupted.note(verb),
-            Err(PinnedFailure::TimedOut) => {
-                eprintln!("timed out waiting for the agent to settle");
-                return Ok(exit::TIMEOUT);
-            }
-            Err(PinnedFailure::Fatal(reason)) => {
-                eprintln!("{verb}: {reason}");
-                return Ok(1);
-            }
+            Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
+            Err(PinnedFailure::Fatal(reason)) => return Ok(SettledOutcome::Error(reason)),
         }
         sleep_bounded(deadline);
     }
 }
 
-/// Print a terminal step's outcome and turn it into an exit code.
-fn finish(verb: &str, wait: &SettledWait, step: Step) -> Option<i32> {
+/// Fold one sample in and turn a terminal step into an outcome.
+///
+/// `None` means keep polling, which is the only case the loop does not act on.
+fn settle(wait: &mut SettledWait, sample: Sample) -> Option<SettledOutcome> {
+    let step = wait.observe(sample, Instant::now());
+    let last = wait.last_record();
     match step {
         Step::Continue => None,
-        Step::Settled { held } => {
-            println!(
-                "{}",
-                wait.result_line("settled", held.as_millis() as u64, None)
-            );
-            Some(exit::SETTLED)
-        }
-        Step::Blocked { held } => {
-            println!(
-                "{}",
-                wait.result_line("blocked", held.as_millis() as u64, None)
-            );
-            Some(exit::BLOCKED)
-        }
-        Step::Gone(reason) => {
-            println!("{}", wait.result_line("gone", 0, Some(reason)));
-            Some(exit::GONE)
-        }
-        Step::Refused(reason) => {
-            eprintln!("{verb}: {reason}");
-            Some(2)
-        }
-        Step::TimedOut => {
-            eprintln!("timed out waiting for the agent to settle");
-            Some(exit::TIMEOUT)
-        }
+        Step::Settled { held } => Some(SettledOutcome::Settled {
+            held_ms: held.as_millis() as u64,
+            last,
+        }),
+        Step::Blocked { held } => Some(SettledOutcome::Blocked {
+            held_ms: held.as_millis() as u64,
+            last,
+        }),
+        Step::Gone(reason) => Some(SettledOutcome::Gone { reason, last }),
+        Step::Refused(reason) => Some(SettledOutcome::Refused(reason)),
+        Step::TimedOut => Some(SettledOutcome::TimedOut),
     }
 }
 
@@ -1501,9 +1675,13 @@ mod tests {
         let mut settle = wait(None, 500, Some(30_000));
         let seen = sample(AgentStatus::Idle, cursor(0, 0, 1, false));
         settle.observe(seen, Instant::now());
-        let line: serde_json::Value =
-            serde_json::from_str(&settle.result_line("gone", 0, Some(GoneReason::Restarted)))
-                .unwrap();
+        let line: serde_json::Value = serde_json::from_str(&settled_result_line(
+            "gone",
+            0,
+            Some(GoneReason::Restarted),
+            &settle.last_record(),
+        ))
+        .unwrap();
         assert_eq!(line["status"], "gone");
         assert_eq!(line["pane_id"], "w1:p1");
         assert_eq!(line["agent_status"], "idle");
@@ -1513,8 +1691,13 @@ mod tests {
 
         // Never having seen a record, the line says so rather than inventing one.
         let unseen = wait(None, 500, Some(30_000));
-        let line: serde_json::Value =
-            serde_json::from_str(&unseen.result_line("gone", 0, Some(GoneReason::Closed))).unwrap();
+        let line: serde_json::Value = serde_json::from_str(&settled_result_line(
+            "gone",
+            0,
+            Some(GoneReason::Closed),
+            &unseen.last_record(),
+        ))
+        .unwrap();
         assert!(line["agent_status"].is_null());
         assert!(line["turn_cursor"].is_null());
     }
@@ -1918,9 +2101,13 @@ mod tests {
         );
         // The result line names the pane and says the cursor is unknown, rather
         // than reporting the wait as if it had never seen anything.
-        let line: serde_json::Value =
-            serde_json::from_str(&settle.result_line("gone", 0, Some(GoneReason::Hibernated)))
-                .unwrap();
+        let line: serde_json::Value = serde_json::from_str(&settled_result_line(
+            "gone",
+            0,
+            Some(GoneReason::Hibernated),
+            &settle.last_record(),
+        ))
+        .unwrap();
         assert_eq!(line["pane_id"], "w1:p1");
         assert_eq!(line["agent_status"], "hibernated");
         assert!(line["turn_cursor"].is_null());
