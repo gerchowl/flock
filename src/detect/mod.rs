@@ -294,6 +294,18 @@ pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool>
     }
 }
 
+/// Whether this screen is Claude Code's folder-trust dialog and nothing else.
+///
+/// The public seam for the `delegate` readiness gate (#612): a caller that has
+/// read a pane's bottom buffer asks the DETECTOR rather than carrying its own
+/// copy of the pattern, because a second copy is a second rule to keep scoped
+/// to the live region and it would drift from this one the first time the
+/// dialog's wording moved. `false` for any other screen, including one where
+/// the dialog's text is quoted in scrollback.
+pub fn claude_waiting_on_folder_trust(screen_content: &str) -> bool {
+    agents::claude_code::has_folder_trust_dialog(screen_content)
+}
+
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
     agent.is_some_and(|agent| agents::should_skip_state_update(agent, screen_content))
 }

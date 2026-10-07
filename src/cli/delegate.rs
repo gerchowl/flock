@@ -325,6 +325,24 @@ const UNSAFE_PATH_CHARS: [char; 6] = ['!', '$', '`', '\u{22}', '\'', '\\'];
 
 // ------------------------------------------------------------- harnesses
 
+/// Claude Code's folder-trust dialog as a reader sees it: the box on screen and
+/// nothing under it, which is what a pane looks like while the dialog is up.
+#[cfg(test)]
+const TRUST_DIALOG_SCREEN: &str = concat!(
+    "\u{256d}\u{2500} Accessing workspace: \u{2500}\u{2500}\u{2500}\u{256e}\n",
+    "\u{2502} /repo/.worktrees/builder\n",
+    "\u{2502}\n",
+    "\u{2502} Quick safety check: Is this a project you created or one you\n",
+    " trust?\n",
+    "\u{2502} Claude Code'll be able to read, edit, and execute files here.\n",
+    "\u{2502}\n",
+    "\u{276f} No, exit\n",
+    "\u{2502}   Yes, I trust this folder\n",
+    "\u{2502}\n",
+    "\u{2502} Enter to confirm \u{b7} Esc to cancel\n",
+    "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+);
+
 /// Who tells flock which session a pane's transcript belongs to.
 ///
 /// Both harnesses report through the same `pane.report_agent_session` method,
@@ -346,6 +364,20 @@ impl SessionSource {
         match self {
             Self::Plugin => "opencode's plugin",
             Self::Hook => "Claude's SessionStart hook",
+        }
+    }
+}
+
+impl HarnessSpec {
+    /// Whether this harness's session report can still be in flight while the
+    /// pane already looks ready.
+    ///
+    /// True of every source there is, which is the point: it is a property of
+    /// the row rather than a branch this module writes per harness, so a source
+    /// that reports synchronously states it once in the table.
+    fn reports_session_asynchronously(&self) -> bool {
+        match self.session_source {
+            SessionSource::Plugin | SessionSource::Hook => true,
         }
     }
 }
@@ -373,20 +405,24 @@ struct HarnessSpec {
     session_source: SessionSource,
     /// How long after a settle the delegate keeps looking for the reply.
     result_grace: Duration,
-    /// A dialog this harness puts up before it will take input, matched on
+    /// A dialog this harness puts up before it will take input, recognised on
     /// screen so readiness can name it instead of reporting a bare `blocked`.
     ///
-    /// `None` for a harness with no such dialog. The marker is matched against
-    /// the pane's recent lines (ANSI stripped), so it must be text the dialog
-    /// itself prints rather than incidental text from the transcript above it.
+    /// `None` for a harness with no such dialog.
     startup_dialog: Option<StartupDialog>,
 }
 
 /// A known blocking dialog, and the refusal that names it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct StartupDialog {
-    /// Lowercase text the dialog itself draws, and nothing else on screen.
-    marker: &'static str,
+    /// Whether the pane's bottom buffer is showing that dialog.
+    ///
+    /// The DETECTOR's own predicate rather than a marker string restated here.
+    /// A second copy of the pattern is a second rule to keep scoped to the live
+    /// region — the box the dialog is painted in, not the pane's whole text —
+    /// and it would drift from the first the moment the wording or the frame
+    /// moved (#612).
+    shows: fn(&str) -> bool,
     /// What the delegate says when readiness finds it.
     refusal: &'static str,
 }
@@ -429,7 +465,7 @@ const HARNESSES: [HarnessSpec; 2] = [
         // for opencode: the store, not the screen, is the slow side.
         result_grace: Duration::from_secs(10),
         startup_dialog: Some(StartupDialog {
-            marker: "quick safety check:",
+            shows: crate::detect::claude_waiting_on_folder_trust,
             refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
         }),
     },
@@ -463,16 +499,15 @@ fn harness_argv(program: &str, model: Option<&str>) -> Vec<String> {
 
 /// The `agent.result` codes that mean "not yet" for THIS harness.
 ///
-/// `no_agent_session` is included per harness rather than once for all of them:
-/// both current harnesses report their session asynchronously, so both need it,
-/// and a harness that reported synchronously must not spend a grace treating a
-/// missing session as a transient.
+/// `no_agent_session` is listed per harness rather than once for all of them,
+/// because it means "not yet" only while that harness's session report is still
+/// on its way — and every harness in the table reports asynchronously (see
+/// [`SessionSource`]), so every row carries it today. A harness that learned to
+/// report synchronously drops this code rather than inheriting it, which is why
+/// the list is built here and not folded into the shared one.
 fn not_yet_codes(harness: &HarnessSpec) -> Vec<&'static str> {
     let mut codes = STORE_NOT_YET_CODES.to_vec();
-    if matches!(
-        harness.session_source,
-        SessionSource::Plugin | SessionSource::Hook
-    ) {
+    if harness.reports_session_asynchronously() {
         codes.push(NO_SESSION_CODE);
     }
     codes
@@ -2699,12 +2734,12 @@ fn startup_dialog_refusal(
     pane_id: &str,
     deadline: Instant,
 ) -> Option<String> {
-    let dialog = harness.startup_dialog?;
-    pane_shows_startup_dialog(pane_id, &dialog, deadline)
+    let dialog = harness.startup_dialog.as_ref()?;
+    pane_shows_startup_dialog(pane_id, dialog, deadline)
         .then(|| format!("delegate {name}: {}", dialog.refusal))
 }
 
-/// Does the pane's recent buffer carry this dialog's marker?
+/// Whether the pane's bottom buffer is showing this dialog.
 ///
 /// `pane.read` rather than the agent record, because the dialog is screen
 /// chrome and the record carries no screen. Bounded by the caller's deadline
@@ -2729,7 +2764,7 @@ fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: In
     response
         .pointer("/result/read/text")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|text| text.to_lowercase().contains(dialog.marker))
+        .is_some_and(|text| (dialog.shows)(text))
 }
 
 fn sleep_bounded(deadline: Instant, interval: Duration) {
@@ -4179,11 +4214,16 @@ mod tests {
         let claude = validate_harness(Some("claude")).expect("in the table");
         let dialog = claude
             .startup_dialog
+            .as_ref()
             .expect("claude asks for folder trust on a fresh worktree");
         assert!(dialog.refusal.contains("#605"), "{}", dialog.refusal);
         assert!(
-            !dialog.marker.is_empty() && dialog.marker == dialog.marker.to_lowercase(),
-            "the marker is matched against a lowercased screen"
+            (dialog.shows)(TRUST_DIALOG_SCREEN),
+            "the row's predicate recognises the dialog the refusal is written for"
+        );
+        assert!(
+            !(dialog.shows)("Yes, I trust this folder\n"),
+            "and not a bare mention of it"
         );
         let opencode = validate_harness(Some("opencode")).expect("in the table");
         assert!(opencode.startup_dialog.is_none());
