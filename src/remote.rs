@@ -1850,31 +1850,59 @@ pub(crate) struct SshStdioBridge {
 struct BridgeHealth {
     consecutive_failures: u32,
     last_reason: Option<crate::peers::SshFailureReason>,
+    /// The newest connection that has carried bytes, by the accept-order number
+    /// the accept loop gave it when it was accepted.
+    latest_success: u64,
+    /// The newest connection whose failure was recorded, in the same
+    /// accept-order numbering.
+    latest_failure_seq: u64,
 }
 
 impl BridgeHealth {
     /// Record a failed connection; returns its attempt number in the current
-    /// run and whether this is the one that makes the run persistent. A tunnel
-    /// that worked before it died starts a fresh run: it is a drop, not a
-    /// dial that never got through.
+    /// run and whether this is the one that makes the run persistent, or `None`
+    /// when the failure is older than a later success and so describes nothing
+    /// the bridge is doing now. A tunnel that worked before it died starts a
+    /// fresh run: it is a drop, not a dial that never got through.
     fn record_failure(
         &mut self,
+        seq: u64,
         established: bool,
         reason: crate::peers::SshFailureReason,
-    ) -> (u32, bool) {
+    ) -> Option<(u32, bool)> {
+        // The client reads a dead tunnel's EOF before this thread has read ssh's
+        // stderr, so the redial's success is free to land first and this
+        // failure after it. A connection older than that success has been
+        // redialed past — the newer one carried bytes, the only evidence a
+        // tunnel works — so its failure neither reopens nor extends the run. It
+        // is still logged: that dial did fail, and ssh's stderr is the
+        // operator's only record of why (#621).
+        if seq < self.latest_success {
+            return None;
+        }
         if established {
             self.consecutive_failures = 0;
         }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_reason = Some(reason);
-        (
+        self.latest_failure_seq = self.latest_failure_seq.max(seq);
+        Some((
             self.consecutive_failures,
             self.consecutive_failures == crate::peers::DIAL_FAILURE_PERSISTS_AFTER,
-        )
+        ))
     }
 
-    fn record_success(&mut self) {
-        *self = Self::default();
+    /// Record a connection that worked. The run of failures closes only for a
+    /// success at least as new as the newest recorded failure: the mirror of
+    /// the guard above, since a connection that exits cleanly long after the
+    /// bridge has redialed past it cannot report on the tunnel in use (#621).
+    fn record_success(&mut self, seq: u64) {
+        self.latest_success = self.latest_success.max(seq);
+        if seq < self.latest_failure_seq {
+            return;
+        }
+        self.consecutive_failures = 0;
+        self.last_reason = None;
     }
 
     /// The classified reason the latest connection failed with, while the
@@ -2666,7 +2694,7 @@ fn bridge_connection(
     let download = thread::spawn(move || {
         let delivered = copy_flush_marking_first(&mut child_stdout, &mut child_to_stream, || {
             if let Ok(mut health) = through_health.lock() {
-                health.record_success();
+                health.record_success(connection);
             }
         })
         .unwrap_or(0);
@@ -2719,7 +2747,7 @@ fn bridge_connection(
     crate::logging::remote_bridge_exited(target, status.code(), intentional_teardown);
     if status.success() {
         if let Ok(mut health) = dial.health.lock() {
-            health.record_success();
+            health.record_success(connection);
         }
         return Ok(());
     }
@@ -2739,10 +2767,14 @@ fn bridge_connection(
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
         .and_then(|text| crate::process::shape_stderr_tail(text.as_bytes()));
     let reason = crate::peers::SshFailureReason::classify(stderr_tail.as_deref().unwrap_or(""));
+    // A failure the bookkeeping declined, because a newer connection had already
+    // succeeded: its run stays closed, so it logs as attempt 1 and can never be
+    // the persistent one (#621).
     let (attempt, persistent) = dial
         .health
         .lock()
-        .map(|mut health| health.record_failure(delivered > 0, reason))
+        .ok()
+        .and_then(|mut health| health.record_failure(connection, delivered > 0, reason))
         .unwrap_or((1, false));
     crate::logging::remote_bridge_failed(
         target,
@@ -2782,7 +2814,11 @@ impl BridgeFailureLog<'_> {
     }
 }
 
-/// [`copy_flush`], calling `on_first` once the first bytes have been written.
+/// [`copy_flush`], calling `on_first` once the first bytes have arrived, before
+/// they are written onward. The mark comes first on purpose: the client reads
+/// these bytes as proof the tunnel works, so a client that looked at the
+/// bridge's bookkeeping in between would still see the previous connection's
+/// failure (#621).
 fn copy_flush_marking_first<R: io::Read, W: io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -2797,9 +2833,9 @@ fn copy_flush_marking_first<R: io::Read, W: io::Write>(
             Err(err) => return Err(err),
         }
     };
+    on_first();
     writer.write_all(&buffer[..first])?;
     writer.flush()?;
-    on_first();
     Ok(first as u64 + copy_flush(reader, writer)?)
 }
 
@@ -3769,6 +3805,109 @@ mod tests {
             warns[0]
         );
         assert!(warns[0].contains("stderr_tail="), "{}", warns[0]);
+    }
+
+    /// #621: the bookkeeping on its own, with no threads to race. A redial's
+    /// success can be recorded before the first attempt's late failure, and
+    /// that failure must not reopen the run while the newer tunnel is live — a
+    /// failure newer than the last success still opens it, at attempt 1.
+    #[test]
+    fn a_failure_older_than_a_later_success_does_not_open_the_run() {
+        let mut health = BridgeHealth::default();
+        health.record_success(2);
+        assert_eq!(
+            health.record_failure(1, false, crate::peers::SshFailureReason::ConnectRefused),
+            None,
+            "a failure from before the newest success is not the bridge's state"
+        );
+        assert_eq!(health.failing_reason(), None);
+        assert_eq!(
+            health.record_failure(3, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false)),
+            "a newer failure still opens a run, and never as the persistent one"
+        );
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
+        );
+    }
+
+    /// #621: the mirror of that guard, on the other side of the ordering. A
+    /// connection 1 whose clean exit is recorded after connection 2 has failed
+    /// cannot close the run connection 2 opened; a success at least as new
+    /// still closes it.
+    #[test]
+    fn a_late_success_from_an_older_connection_does_not_close_a_newer_failure() {
+        let mut health = BridgeHealth::default();
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
+        );
+        health.record_success(1);
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused),
+            "a connection the bridge has redialed past cannot close the newer failure's run"
+        );
+        health.record_success(3);
+        assert_eq!(health.failing_reason(), None);
+    }
+
+    /// #621: the decline is `<`, not `<=`. A connection that carried bytes and
+    /// then died is the bridge's current state, so its own failure is recorded.
+    #[test]
+    fn a_failure_from_the_newest_successful_connection_is_still_recorded() {
+        let mut health = BridgeHealth::default();
+        health.record_success(2);
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
+        );
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
+        );
+    }
+
+    /// A writer that records whether the tunnel's first bytes had already been
+    /// marked as a success when they reached it.
+    struct WitnessWriter {
+        marked: Arc<std::sync::atomic::AtomicBool>,
+        marked_before_write: bool,
+    }
+
+    impl io::Write for WitnessWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.marked_before_write = self.marked.load(Ordering::Acquire);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #621: the run closes when the tunnel delivers, not once the client has
+    /// been handed the bytes. A mark taken after the write leaves a window the
+    /// client can read an earlier connection's failure through, which is how a
+    /// redial's live tunnel could still be labelled with the attempt before it.
+    #[test]
+    fn first_delivered_bytes_mark_the_success_before_they_are_written_onward() {
+        let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reader = io::Cursor::new(b"ping".to_vec());
+        let mut writer = WitnessWriter {
+            marked: Arc::clone(&marked),
+            marked_before_write: false,
+        };
+        let delivered = copy_flush_marking_first(&mut reader, &mut writer, || {
+            marked.store(true, Ordering::Release);
+        })
+        .expect("copy");
+        assert_eq!(delivered, 4);
+        assert!(
+            writer.marked_before_write,
+            "the client must not be able to read the bridge's state before the mark"
+        );
     }
 
     /// Does the bridge currently hold a live ssh child pid? Used to prove the
