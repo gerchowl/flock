@@ -21,7 +21,7 @@ const MISSING: &str = "/nonexistent/p578-h1/checkout";
 fn h1_a_timeout_or_transport_failure_is_never_already_gone() {
     // The checkout path is absent locally, but the request never got an answer:
     // nothing is known about the server side, so this is not "gone".
-    for code in ["timeout", "transport"] {
+    for code in ["timeout", "transport", "delegate_unreachable"] {
         assert!(
             !is_already_gone(&server_error(code), Some(MISSING)),
             "{code} with a missing path must not read as gone"
@@ -70,6 +70,8 @@ fn h3_no_result_with_a_gone_agent_is_gone_not_running() {
         no_result_verdict(&AgentFetch::Missing),
         NoResultVerdict::Gone
     );
+    let hibernated = AgentFetch::Found(json!({"agent_status": "hibernated"}));
+    assert_eq!(no_result_verdict(&hibernated), NoResultVerdict::Gone);
 }
 
 #[test]

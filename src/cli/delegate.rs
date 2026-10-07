@@ -1444,12 +1444,6 @@ impl CreateFailure {
     }
 }
 
-/// Find a checkout that appeared after the create call, matching on --branch if given.
-///
-/// The checkout is identified by its path, compared through `same_path` so a
-/// pre-existing checkout respelled by the server (relative vs absolute,
-/// trailing slash) is not treated as "new" and force-killed (W13 / G12). We
-/// use `worktree.list` to find checkouts, filtering by branch if given.
 /// Was `path` absent from the pre-create `worktree.list`? Compared with
 /// `same_path`, never as raw strings: a respelled pre-existing checkout must
 /// never read as new, because "new" authorises a force kill (G12, rr5 H2).
@@ -1461,6 +1455,12 @@ fn checkout_is_new(worktrees_before: &[serde_json::Value], path: &str) -> bool {
     })
 }
 
+/// Find a checkout that appeared after the create call, matching on --branch if given.
+///
+/// The checkout is identified by its path, compared through `same_path` so a
+/// pre-existing checkout respelled by the server (relative vs absolute,
+/// trailing slash) is not treated as "new" and force-killed (W13 / G12). We
+/// use `worktree.list` to find checkouts, filtering by branch if given.
 fn find_new_checkout(
     worktrees_before: &[serde_json::Value],
     worktrees_after: &[serde_json::Value],
@@ -1726,7 +1726,10 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
 fn is_already_gone(err: &ServerError, checkout: Option<&str>) -> bool {
     // No answer means nothing is known about the server side: a missing local
     // path is not evidence that the server-side removal happened (rr5 H1).
-    if matches!(err.code.as_str(), "timeout" | "transport") {
+    if matches!(
+        err.code.as_str(),
+        "timeout" | "transport" | "delegate_unreachable"
+    ) {
         return false;
     }
     if ALREADY_GONE_CODES.contains(&err.code.as_str()) {
@@ -2828,6 +2831,8 @@ fn no_result_verdict(fetched: &AgentFetch) -> NoResultVerdict {
     match fetched {
         AgentFetch::Found(record) => match field(record, "agent_status").unwrap_or("unknown") {
             "working" | "blocked" | "unknown" => NoResultVerdict::Running,
+            // Hibernated: its child is gone, as `delegate wait` reports it.
+            "hibernated" => NoResultVerdict::Gone,
             _ => NoResultVerdict::NoResult,
         },
         AgentFetch::Missing => NoResultVerdict::Gone,
