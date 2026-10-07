@@ -1774,6 +1774,30 @@ pub(crate) fn handoff_owned_ack_read_failed(err: &str) {
     );
 }
 
+/// The import process refused the manifest. Its stderr is `/dev/null`, so this
+/// line is the only durable record of why (#600).
+pub(crate) fn handoff_import_refused(err: &str) {
+    tracing::error!(
+        event = "handoff.import.refused",
+        subsystem = "handoff",
+        outcome = "error",
+        import_version = %crate::build_info::version(),
+        import_protocol = crate::protocol::PROTOCOL_VERSION,
+        err,
+        "handoff import refused the manifest"
+    );
+}
+
+pub(crate) fn handoff_refusal_report_failed(err: &str) {
+    tracing::warn!(
+        event = "handoff.import.refusal_report_failed",
+        subsystem = "handoff",
+        outcome = "error",
+        err,
+        "failed to report the handoff import refusal back to the exporter"
+    );
+}
+
 // --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
 
 pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {

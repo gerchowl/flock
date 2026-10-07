@@ -9,6 +9,7 @@ identity, hooks, signing keys, or `init.defaultBranch`.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from pathlib import Path
 FIXTURE_NAME = "Flock Script Tests"
 FIXTURE_EMAIL = "flock-script-tests@example.invalid"
 
+# PATH is kept because `env=` replaces the child environment, and without it git
+# is resolved via os.defpath (/bin:/usr/bin), which lacks git on NixOS.
 GIT_ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_SYSTEM": "/dev/null",
@@ -24,6 +27,7 @@ GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "HOME": "/nonexistent",
     "XDG_CONFIG_HOME": "/nonexistent",
+    "PATH": os.environ.get("PATH", os.defpath),
 }
 
 

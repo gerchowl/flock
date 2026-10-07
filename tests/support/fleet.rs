@@ -528,6 +528,36 @@ pub fn wait_for_screen_matching(
     ))
 }
 
+/// Like [`wait_for_row`], but for a row whose index can still move. Waits for
+/// one frame holding every needle in `ready`, then keeps draining until a
+/// quiet window passes with no frame (or the screen stops changing), and
+/// returns where `row_needle` sits on the latest screen. Clicking an index
+/// taken from the first frame that merely contains the row races any later
+/// re-layout above it, and the click then lands on the wrong row.
+pub fn wait_for_settled_row(
+    stream: &mut UnixStream,
+    ready: &[&str],
+    row_needle: &str,
+    timeout: Duration,
+) -> Result<usize, String> {
+    let mut rows = wait_for_screen_matching(stream, ready, timeout)?;
+    for _ in 0..20 {
+        let next = latest_screen(stream, Duration::from_millis(500));
+        if next.is_empty() || next == rows {
+            break;
+        }
+        rows = next;
+    }
+    rows.iter()
+        .position(|row| row.contains(row_needle))
+        .ok_or_else(|| {
+            format!(
+                "{row_needle:?} left the screen while settling:\n{}",
+                rows.join("\n")
+            )
+        })
+}
+
 /// The most recent frame drained within `settle`, as rows. Use for negative
 /// assertions ("this must NOT be on screen") where waiting proves nothing.
 pub fn latest_screen(stream: &mut UnixStream, settle: Duration) -> Vec<String> {
@@ -551,6 +581,10 @@ pub fn wait_for_switch_server(
     timeout: Duration,
 ) -> Result<(String, Vec<u8>), String> {
     let deadline = Instant::now() + timeout;
+    // What arrived instead, so a timeout reads like a screenshot of what the
+    // server did with the click rather than a bare "timed out".
+    let mut variants: Vec<u32> = Vec::new();
+    let mut last_screen = String::new();
     while Instant::now() < deadline {
         match read_server_message(stream) {
             Ok((VARIANT_SWITCH_SERVER, payload)) => {
@@ -562,11 +596,20 @@ pub fn wait_for_switch_server(
                 let target = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
                 return Ok((target, payload[end..].to_vec()));
             }
-            Ok(_) => continue,
+            Ok((VARIANT_FRAME, payload)) => {
+                variants.push(VARIANT_FRAME);
+                if let Some(frame) = decode_frame_payload(&payload) {
+                    last_screen = frame_rows(&frame).join("\n");
+                }
+            }
+            Ok((variant, _)) => variants.push(variant),
             Err(_) => continue,
         }
     }
-    Err("timed out waiting for SwitchServer".into())
+    Err(format!(
+        "timed out waiting for SwitchServer; {} messages seen (variants {variants:?}); last screen:\n{last_screen}",
+        variants.len()
+    ))
 }
 
 /// Send `ClientMessage::FocusWorkspace { workspace_id }` (#80). The

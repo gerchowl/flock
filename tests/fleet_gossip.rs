@@ -58,8 +58,17 @@ fn selecting_a_remote_space_carries_it_through_the_switch() {
 
     let mut stream = fleet.node("nodea").attach_sized(120, 50);
     let beta = fleet::Fleet::project_needle("beta");
-    let row = fleet::wait_for_row(&mut stream, &beta, Duration::from_secs(30))
-        .expect("nodeb's space should fold into nodea's sidebar");
+    // The local space grows its branch row ("nodea:main") once git info
+    // resolves, which pushes every row below it down. Clicking the row index
+    // from a frame drawn before that lands on a spacer, so wait for the layout
+    // to be complete and then to stop moving.
+    let row = fleet::wait_for_settled_row(
+        &mut stream,
+        &["nodea:main", &beta],
+        &beta,
+        Duration::from_secs(30),
+    )
+    .expect("nodeb's space should fold into nodea's sidebar");
 
     fleet::click_row(&mut stream, row, 3);
     let (target, tail) = fleet::wait_for_switch_server(&mut stream, Duration::from_secs(10))
