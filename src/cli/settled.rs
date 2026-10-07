@@ -49,6 +49,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// poll rather than the whole wait.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the wait keeps retrying a server it cannot REACH, measured across
+/// back-to-back transport failures and separate from `--timeout`.
+///
+/// The retry exists for a live handoff, whose gap is a few seconds, so 30 s is
+/// generous enough to ride out any of them and short enough that a supervisor
+/// waiting without `--timeout` on a server that died gets an answer instead of
+/// retrying forever (#614).
+const UNREACHABLE_LIMIT: Duration = Duration::from_secs(30);
+
 /// `flk agent wait` / `flk wait agent-status` settled exit codes.
 ///
 /// Distinct from the plain-status waits (which keep their historical codes,
@@ -691,7 +700,8 @@ pub(super) fn settled_result_line(
 ///
 /// Only a transport failure escapes, because that is the one thing a caller
 /// cannot turn into an outcome: the two existing verbs have always propagated
-/// it as an io error and keep doing so.
+/// it as an io error and keep doing so. A transport failure that never recovers
+/// is not an escape, though — see [`UNREACHABLE_LIMIT`].
 pub(super) fn settled_wait(
     verb: &str,
     target: SettleTarget<'_>,
@@ -701,7 +711,35 @@ pub(super) fn settled_wait(
 ) -> std::io::Result<SettledOutcome> {
     let client = ApiClient::local();
     let mut requests = SocketRequests { client: &client };
-    let mut interrupted = Interrupted { said: false };
+    settled_core(
+        &mut requests,
+        verb,
+        target,
+        after,
+        settle_ms,
+        timeout_ms,
+        UNREACHABLE_LIMIT,
+    )
+}
+
+/// The wait itself, over an injected transport and an injected unreachable
+/// window.
+///
+/// Both exist for the same reason and follow [`PinnedRequests`]: the loop's
+/// decisions — when to give up on a server, whether a deadline got there first —
+/// are decisions about a transport, so testing them through a real socket would
+/// mean waiting 30 s for the answer. The shipped window is
+/// [`UNREACHABLE_LIMIT`].
+fn settled_core(
+    requests: &mut dyn PinnedRequests,
+    verb: &str,
+    target: SettleTarget<'_>,
+    after: Option<&str>,
+    settle_ms: u64,
+    timeout_ms: Option<u64>,
+    unreachable: Duration,
+) -> std::io::Result<SettledOutcome> {
+    let mut interrupted = Interrupted::new(unreachable);
     let now = Instant::now();
     let timeout = timeout_ms.map(Duration::from_millis);
     let deadline = timeout.and_then(|timeout| now.checked_add(timeout));
@@ -738,17 +776,20 @@ pub(super) fn settled_wait(
             wait
         }
         SettleTarget::Resolve(target) => {
-            let rec0 =
-                match resolve_initial(&mut requests, *target, deadline, verb, &mut interrupted) {
-                    Ok(rec) => rec,
-                    Err(InitialFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
-                    Err(InitialFailure::Refused(response)) => {
-                        return Ok(SettledOutcome::ServerRefused(response))
-                    }
-                    Err(InitialFailure::Unusable(reason)) => {
-                        return Ok(SettledOutcome::Error(reason))
-                    }
-                };
+            let rec0 = match resolve_initial(requests, *target, deadline, verb, &mut interrupted) {
+                Ok(rec) => rec,
+                Err(InitialFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
+                Err(InitialFailure::Refused(response)) => {
+                    return Ok(SettledOutcome::ServerRefused(response))
+                }
+                Err(InitialFailure::Unusable(reason)) => return Ok(SettledOutcome::Error(reason)),
+                // #614: the server never answered at all. Exit 1 rather than
+                // 124, because nothing has been established about the agent
+                // — but the wait is over, not out of time.
+                Err(InitialFailure::Unreachable(reason)) => {
+                    return Ok(SettledOutcome::Error(reason))
+                }
+            };
 
             let terminal_id = rec0
                 .get("terminal_id")
@@ -793,8 +834,11 @@ pub(super) fn settled_wait(
     };
 
     loop {
-        match sample_pinned(&mut requests, &wait, deadline) {
+        match sample_pinned(requests, &wait, deadline) {
             Ok(sample) => {
+                // The server answered, so the run of failures this wait was
+                // surviving is over however long it had lasted.
+                interrupted.reached();
                 if let Some(outcome) = settle(&mut wait, sample) {
                     return Ok(outcome);
                 }
@@ -803,8 +847,15 @@ pub(super) fn settled_wait(
             // socket mid-wait can land between two polls. Said once per
             // invocation, though — a wait that cannot reach the server is
             // otherwise silent for as long as its timeout, which reads as a
-            // hang.
-            Err(PinnedFailure::Retry) => interrupted.note(verb),
+            // hang. And retried for a WINDOW, not forever: with no `--timeout`
+            // to end it, a server that has stopped answering entirely would
+            // otherwise keep a supervisor waiting on it indefinitely (#614).
+            Err(PinnedFailure::Retry) => {
+                interrupted.note(verb, deadline);
+                if interrupted.exhausted() {
+                    return Ok(SettledOutcome::Error(interrupted.unreachable()));
+                }
+            }
             Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
             Err(PinnedFailure::Fatal(reason)) => return Ok(SettledOutcome::Error(reason)),
         }
@@ -844,26 +895,89 @@ enum InitialFailure {
     Refused(String),
     /// The server answered, but the record cannot be waited on.
     Unusable(String),
+    /// The server could not be reached at all for the whole unreachable window,
+    /// so nothing was ever established about the agent (#614).
+    Unreachable(String),
 }
 
-/// Says the connection is interrupted, once per invocation.
+/// Says the connection is interrupted, once per invocation, and times the run.
 ///
 /// One latch for the whole wait rather than one per phase: a live handoff that
 /// interrupts the initial resolve is very often the same one that interrupts the
 /// polls after it, and a caller who sees the line twice learns nothing the first
 /// line did not say. Worded as an interruption rather than a fault because the
 /// overwhelmingly common cause recovers on its own.
+///
+/// The clock is the second half of the same problem (#614). A retry is right for
+/// a handoff and wrong forever, so this measures the run of failures from the
+/// FIRST one and any answer clears it: a wait that recovers and later drops gets
+/// a whole window again rather than the remainder of one that ended minutes ago.
 struct Interrupted {
     said: bool,
+    /// When the current run of transport failures began.
+    since: Option<Instant>,
+    /// How long that run may last before the wait stops retrying.
+    limit: Duration,
 }
 
 impl Interrupted {
-    fn note(&mut self, verb: &str) {
-        if !self.said {
-            self.said = true;
-            eprintln!("{verb}: connection to the server interrupted, retrying until the deadline");
+    fn new(limit: Duration) -> Self {
+        Self {
+            said: false,
+            since: None,
+            limit,
         }
     }
+
+    /// Record one transport failure, and say so the first time.
+    fn note(&mut self, verb: &str, deadline: Option<Instant>) {
+        // Stamped once per run and never re-stamped: measuring from the LATEST
+        // failure instead is what would make the window a sliding one, and a
+        // server that fails every 199 ms would then never reach it.
+        if self.since.is_none() {
+            self.since = Some(Instant::now());
+        }
+        if self.said {
+            return;
+        }
+        self.said = true;
+        eprintln!("{}", interrupted_notice(verb, deadline, self.limit));
+    }
+
+    /// The server answered: the run of failures is over, latch or no latch.
+    fn reached(&mut self) {
+        self.since = None;
+    }
+
+    /// Whether the current run of failures has outlasted the window.
+    fn exhausted(&self) -> bool {
+        self.since
+            .is_some_and(|since| since.elapsed() >= self.limit)
+    }
+
+    /// The reason to end on, naming the window that was waited out — in the same
+    /// number the notice used, so a caller reading both is not told two waits.
+    fn unreachable(&self) -> String {
+        format!(
+            "server unreachable for {}s; giving up",
+            self.limit.as_secs()
+        )
+    }
+}
+
+/// The one interruption notice, worded by whether there is a deadline left to
+/// retry until.
+///
+/// Without `--timeout` there is no deadline, and saying there is was the other
+/// half of this bug: a wait that will not end printed the words of one that
+/// will (#614). So the window is named instead, from the same constant that ends
+/// it.
+fn interrupted_notice(verb: &str, deadline: Option<Instant>, limit: Duration) -> String {
+    let tail = match deadline {
+        Some(_) => "retrying until the deadline".to_string(),
+        None => format!("retrying for up to {}s", limit.as_secs()),
+    };
+    format!("{verb}: connection to the server interrupted, {tail}")
 }
 
 /// Resolve the target to the record the wait will pin itself to.
@@ -892,13 +1006,21 @@ fn resolve_initial(
             Err(()) => {
                 // Retried rather than reported: the same live handoff that
                 // interrupts a wait can land between this process starting and
-                // its first request.
-                interrupted.note(verb);
+                // its first request. Bounded by the same unreachable window, so
+                // a server that is not there at all does not leave a caller who
+                // passed no `--timeout` waiting in the resolve forever (#614).
+                interrupted.note(verb, deadline);
+                if interrupted.exhausted() {
+                    return Err(InitialFailure::Unreachable(interrupted.unreachable()));
+                }
                 sleep_bounded(deadline);
                 continue;
             }
             Ok(value) => value,
         };
+        // An answer of any kind ends the run: whatever else is decided from
+        // here, this server was reachable a moment ago.
+        interrupted.reached();
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(InitialFailure::TimedOut);
         }
@@ -1966,7 +2088,7 @@ mod tests {
             Duration::from_millis(80),
         );
         let deadline = Instant::now() + Duration::from_millis(40);
-        let mut interrupted = Interrupted { said: false };
+        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
         assert!(matches!(
             resolve_initial(
                 &mut requests,
@@ -2028,7 +2150,7 @@ mod tests {
             ))],
             Duration::ZERO,
         );
-        let mut interrupted = Interrupted { said: false };
+        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
         match resolve_initial(
             &mut requests,
             InitialTarget::Agent("ghost"),
@@ -2050,11 +2172,209 @@ mod tests {
     /// the first one did not say.
     #[test]
     fn the_interruption_line_is_said_once_per_invocation() {
-        let mut interrupted = Interrupted { said: false };
-        interrupted.note("agent wait");
-        interrupted.note("agent wait");
-        interrupted.note("agent wait");
+        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
+        interrupted.note("agent wait", None);
+        interrupted.note("agent wait", None);
+        interrupted.note("agent wait", None);
         assert!(interrupted.said);
+    }
+
+    /// #614: the notice says what the wait is going to DO, which depends on
+    /// whether it has a deadline to retry until. Without `--timeout` there is
+    /// none, and promising one was half the bug — so the window is named
+    /// instead, from the same constant that ends the wait.
+    ///
+    /// Both wordings are pinned to [`UNREACHABLE_LIMIT`] on purpose: the help
+    /// text says "30 s" in a literal, and a test that read the number from
+    /// anything but this constant would let the two drift apart silently.
+    #[test]
+    fn the_interruption_notice_names_the_window_when_there_is_no_deadline() {
+        assert_eq!(
+            interrupted_notice("agent wait", None, UNREACHABLE_LIMIT),
+            "agent wait: connection to the server interrupted, retrying for up to 30s"
+        );
+        assert_eq!(
+            interrupted_notice(
+                "agent wait",
+                Some(Instant::now() + Duration::from_secs(5)),
+                UNREACHABLE_LIMIT
+            ),
+            "agent wait: connection to the server interrupted, retrying until the deadline"
+        );
+    }
+
+    /// #614: the window is measured from the FIRST failure of a run, and any
+    /// answer clears it — so a wait that recovers and later drops is given a
+    /// whole window rather than the remainder of one that ended minutes ago.
+    ///
+    /// A zero window stands in for the reached limit without sleeping 30 s, and
+    /// `Instant` has no fake here: the point is that the run's clock starts once
+    /// and stops on an answer, neither of which needs time to have passed.
+    #[test]
+    fn a_run_of_failures_is_timed_from_its_first_and_cleared_by_an_answer() {
+        let mut interrupted = Interrupted::new(Duration::ZERO);
+        assert!(!interrupted.exhausted(), "no failure is no run");
+        interrupted.note("agent wait", None);
+        let first = interrupted.since.expect("a failure starts the run");
+        assert!(interrupted.exhausted(), "a zero window is already spent");
+        interrupted.note("agent wait", None);
+        assert_eq!(
+            interrupted.since,
+            Some(first),
+            "measured from the FIRST failure, not the last one noticed"
+        );
+        interrupted.reached();
+        assert!(interrupted.since.is_none(), "an answer ends the run");
+        assert!(!interrupted.exhausted(), "and the next drop starts over");
+    }
+
+    /// A window a test can wait out: one whole second, which at the 200 ms poll
+    /// interval is five retries before it is spent. Still whole seconds, so the
+    /// reason it produces is formatted exactly as the shipped 30 s one is.
+    const TEST_UNREACHABLE: Duration = Duration::from_secs(1);
+
+    /// The resolve's one answer: an agent working, mid-turn.
+    fn working_agent() -> serde_json::Value {
+        response(
+            r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                "agent_status":"working","turn_cursor":"term_1f2e3:0:0:1:w"}}}"#,
+        )
+    }
+
+    /// The same agent one turn later, quiet — what a settle waits for.
+    fn idle_agent() -> serde_json::Value {
+        response(
+            r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                "agent_status":"idle","turn_cursor":"term_1f2e3:0:1:2:i"}}}"#,
+        )
+    }
+
+    /// The whole wait, over a scripted transport — plus how long it took and how
+    /// many requests it made.
+    ///
+    /// The elapsed clock is returned because every test below is about a wait
+    /// that has to END: `Scripted` panics rather than inventing a reply, so a
+    /// regression that keeps polling fails the test rather than hanging it, and
+    /// the bound catches the case where the wait is slow rather than endless.
+    fn wait_over_script(
+        replies: Vec<Result<serde_json::Value, ()>>,
+        settle_ms: u64,
+        timeout_ms: Option<u64>,
+        unreachable: Duration,
+    ) -> (SettledOutcome, Duration, usize) {
+        let mut requests = Scripted::new(replies, Duration::ZERO);
+        let started = Instant::now();
+        let outcome = settled_core(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Resolve(InitialTarget::Agent("worker")),
+            None,
+            settle_ms,
+            timeout_ms,
+            unreachable,
+        )
+        .expect("the wait core does no io of its own");
+        (outcome, started.elapsed(), requests.granted.len())
+    }
+
+    /// How long any of these waits may take before it is a hang rather than a
+    /// window: the shipped one is 30 s, and none of these comes near it.
+    const TEST_CEILING: Duration = Duration::from_secs(5);
+
+    /// #614, the bug itself. With no `--timeout` and a server that answers one
+    /// `agent.get` and then fails at the transport level, the wait used to retry
+    /// forever — the reported shape was a `delegate wait` a `timeout` wrapper had
+    /// to kill. It ends on the unreachable window instead, as the error outcome
+    /// both wait verbs and the delegate already map to exit 1.
+    #[test]
+    fn a_wait_with_no_timeout_gives_up_on_a_server_that_stays_unreachable() {
+        // One answer, then nothing at all for the rest of the run. The scripted
+        // budget is more than the window can spend, so a regression that keeps
+        // polling runs out of replies and fails rather than hanging.
+        let mut replies = vec![Ok(working_agent())];
+        replies.extend(vec![Err(()); 8]);
+
+        let (outcome, elapsed, asked) = wait_over_script(replies, 0, None, TEST_UNREACHABLE);
+        match outcome {
+            SettledOutcome::Error(reason) => assert_eq!(
+                reason, "server unreachable for 1s; giving up",
+                "the window is named from the limit the wait was given"
+            ),
+            other => panic!("a server that stopped answering is not a settle: {other:?}"),
+        }
+        assert!(
+            asked >= 2,
+            "the retry is kept: giving up takes more than the one request that failed"
+        );
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// The same bound in the phase before it. A server that is not there at all
+    /// never answers the resolve, and a caller who passed no `--timeout` used to
+    /// sit in that loop forever having learned nothing about the agent — the
+    /// commonest shape of "the server died", and the one phase a test that only
+    /// answers once could miss entirely.
+    #[test]
+    fn a_resolve_that_never_answers_ends_on_the_window_too() {
+        let (outcome, elapsed, asked) =
+            wait_over_script(vec![Err(()); 8], 0, None, TEST_UNREACHABLE);
+        match outcome {
+            SettledOutcome::Error(reason) => assert_eq!(
+                reason, "server unreachable for 1s; giving up",
+                "the resolve ends the wait the same way the polls do"
+            ),
+            // A timeout here would mean the unreachable window answered for a
+            // deadline nobody set, which is the bug with the sign flipped.
+            other => panic!("no deadline was set, so this is not a timeout: {other:?}"),
+        }
+        assert!(asked >= 2, "the resolve retries before it gives up");
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// #614: the window bounds a RUN of failures, not the whole wait. Two
+    /// failures and then an answer — a live handoff, which is what the retry
+    /// exists for — carries on and settles normally.
+    ///
+    /// This is the half the fix must not break. A window that ended the wait on
+    /// its second failed request would break the handoff it exists to survive,
+    /// and `wait agent-status` on a server being restarted would fail.
+    #[test]
+    fn failures_that_stop_before_the_window_do_not_end_the_wait() {
+        let (outcome, elapsed, _) = wait_over_script(
+            vec![
+                Ok(working_agent()),
+                Err(()),
+                Err(()),
+                Ok(idle_agent()),
+                Ok(idle_agent()),
+            ],
+            0,
+            None,
+            UNREACHABLE_LIMIT,
+        );
+        match outcome {
+            SettledOutcome::Settled { last, .. } => assert_eq!(
+                last.agent_status.as_deref(),
+                Some("idle"),
+                "the settle is reported from the record that answered, not from the failures"
+            ),
+            other => panic!("the agent went quiet and the wait settled: {other:?}"),
+        }
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// #614: the window does not take `--timeout`'s job. A deadline shorter than
+    /// the unreachable window arrives first and is still the timeout it has
+    /// always been — exit 124, which a caller reads as "out of time" rather than
+    /// "the server is gone", and which is the answer this wait has always given.
+    #[test]
+    fn a_timeout_shorter_than_the_window_is_still_a_timeout() {
+        let mut replies = vec![Ok(working_agent())];
+        replies.extend(vec![Err(()); 3]);
+
+        let (outcome, elapsed, _) = wait_over_script(replies, 0, Some(40), UNREACHABLE_LIMIT);
+        assert_eq!(outcome, SettledOutcome::TimedOut);
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
     }
 
     /// #553 round 2: defence in depth. `sample_from_record` already answers
