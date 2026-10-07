@@ -166,6 +166,14 @@ impl PrefixInputSource for RealPrefixInputSource {
     }
 }
 
+/// Kill a probe and its descendants sharing the probe's dedicated process group.
+pub(crate) fn kill_process_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        // SAFETY: kill takes a numeric process group and does not access memory.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

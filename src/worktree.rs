@@ -450,6 +450,42 @@ fn run_command_capture_with_cadence(
         command.current_dir(cwd);
     }
     let output = command.output_traced().map_err(|err| err.to_string())?;
+    finished_output(program, output)
+}
+
+/// `run_command_capture` under a wall-clock deadline, for the ONE call in this
+/// module that reaches the network on its own account ([`fetch_merge_head`]).
+///
+/// The merge gate bounds itself at the batch level instead — a worker that
+/// overruns is orphaned and the caller degrades to the safe `NotMerged` — but
+/// that is the wrong shape for a subprocess this code STARTS AND WAITS ON
+/// itself: `git fetch` opens a socket and nothing bounds its transport (#302),
+/// so an unreachable remote would hold this thread for git's own retry schedule
+/// while the caller had long since given up on the answer.
+fn run_command_capture_with_timeout(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut command = crate::process::TracedCommand::new(program, "worktree");
+    command.args(args);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
+        .output_traced_with_timeout(timeout)
+        .map_err(|err| err.to_string())?;
+    finished_output(program, output)
+}
+
+/// Turn a finished child into this module's `Result<String, String>`: stderr on
+/// failure, trimmed stdout on success.
+fn finished_output(program: &str, output: std::process::Output) -> Result<String, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -1155,6 +1191,15 @@ fn gh_pr_merged_evidence(
 /// commit can carry conflict resolutions of its own. Reachability cannot prove
 /// that costs nothing, so it does not try — a manual `--force` is the cheaper
 /// mistake.
+///
+/// The ancestry question has to be ASKED against an object this clone holds,
+/// which is not guaranteed (#646). `gh pr update-branch` rewrites a PR's head
+/// on GitHub, so the commit a PR was merged at can be a merge commit the local
+/// clone never fetched; `merge-base --is-ancestor` exits 128 on an object it
+/// does not have, which reads as "not merged" and left every auto-merged PR's
+/// branch behind on reap. One bounded fetch of that head turns the answer
+/// back into a real one — and only when the object is genuinely absent, so a
+/// branch with work the PR never saw never pays for a network round trip.
 fn merged_pr_evidence(
     value: &serde_json::Value,
     root: &str,
@@ -1164,6 +1209,10 @@ fn merged_pr_evidence(
         return None;
     }
     let head_oid = value.get("headRefOid").and_then(|v| v.as_str())?;
+    if !valid_commit_oid(head_oid) {
+        tracing::debug!("invalid merged PR head oid: keeping the branch");
+        return None;
+    }
     let number = value.get("number").and_then(|v| v.as_u64());
     let named = |suffix: &str| {
         Some(match number {
@@ -1174,10 +1223,135 @@ fn merged_pr_evidence(
     if local_tip == Some(head_oid) {
         return named("");
     }
-    if !commit_is_ancestor_of(root, local_tip?, head_oid) {
+    let local_tip = local_tip?;
+    if !tip_inside_head(root, local_tip, head_oid, number) {
         return None;
     }
     named(" (local tip is inside the merged head)")
+}
+
+/// Is `local_tip` reachable from the merged PR head, fetching that head first if
+/// this clone does not have it (#646)?
+///
+/// The fetch is asked for only after the plain answer came back false AND the
+/// head object is confirmed missing, which keeps two things true at once: a
+/// branch holding commits the PR never merged stays kept without a network
+/// round trip, and an answer git CAN give is never second-guessed by one that
+/// needs a socket. A head this clone does have but does not contain is the
+/// "branch is ahead of the PR" case, which is a real `false` and is left alone.
+fn tip_inside_head(root: &str, local_tip: &str, head_oid: &str, number: Option<u64>) -> bool {
+    if commit_is_ancestor_of(root, local_tip, head_oid) {
+        return true;
+    }
+    if commit_object_exists(root, head_oid) {
+        return false;
+    }
+    if !fetch_merge_head(root, head_oid, number) {
+        // Absence of evidence, kept as absence: today's reading was "keep the
+        // branch", and a fetch that could not answer leaves us no better off
+        // than before it. The reason goes to the log because the user-visible
+        // result is indistinguishable from "not merged".
+        tracing::debug!(
+            "could not fetch merged PR head {head_oid}: keeping the branch without evidence"
+        );
+        return false;
+    }
+    commit_is_ancestor_of(root, local_tip, head_oid)
+}
+
+fn valid_commit_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Does this clone hold `oid` as a commit?
+///
+/// Asked before spending a fetch on it (#646), and about a commit rather than
+/// any object so a blob or tag oid from `headRefOid` cannot read as present.
+/// `^{commit}` is the peel git already knows how to do, which keeps this one
+/// cheap process rather than a `cat-file -t` plus a parse.
+fn commit_object_exists(root: &str, oid: &str) -> bool {
+    if !valid_commit_oid(oid) {
+        return false;
+    }
+    run_command_capture(
+        "git",
+        &["-C", root, "cat-file", "-e", &format!("{oid}^{{commit}}")],
+        None,
+    )
+    .is_ok()
+}
+
+/// What to ask `git fetch` for, in order: the raw oid GitHub serves for any
+/// commit its refs reach, then the PR's own ref for a server that refuses a
+/// bare SHA.
+///
+/// `refs/pull/<n>/head` is the ref GitHub keeps for every PR ever opened, and
+/// it points at the head a merged PR was merged at — the same object, asked for
+/// by a name the server advertises. A PR gh reported without a number has only
+/// the oid to try.
+fn merge_head_fetch_refspecs(head_oid: &str, number: Option<u64>) -> Vec<String> {
+    let mut refspecs = vec![head_oid.to_string()];
+    if let Some(number) = number {
+        refspecs.push(format!("refs/pull/{number}/head"));
+    }
+    refspecs
+}
+
+/// Fetch a merged PR's head commit into this clone under
+/// [`MERGE_GATE_TIMEOUT`], and report whether it arrived.
+///
+/// Bounded twice over, because two refspecs means two chances to hang: each
+/// fetch gets the time the whole attempt has LEFT, not a fresh budget, so the
+/// pair cannot cost more than the single deadline the gate already publishes.
+/// A timeout is a failed fetch, which keeps the branch.
+///
+/// `--no-write-fetch-head` because nothing here wants a `FETCH_HEAD` left
+/// behind: the object is the whole point, the ref is a side effect on the
+/// user's next `git merge FETCH_HEAD`, and skipping it also means a fleet sweep
+/// judging twenty checkouts at once does not have twenty of them racing for
+/// `.git/FETCH_HEAD.lock` — losers of that race would keep a branch that is
+/// provably merged. No ref is updated either way: a raw oid and a `refs/pull`
+/// source both land in the object store alone.
+fn fetch_merge_head(root: &str, head_oid: &str, number: Option<u64>) -> bool {
+    if !valid_commit_oid(head_oid) {
+        tracing::debug!("invalid merged PR head oid: skipping fetch");
+        return false;
+    }
+    fetch_merge_head_refspecs(root, head_oid, merge_head_fetch_refspecs(head_oid, number))
+}
+
+fn fetch_merge_head_refspecs(root: &str, head_oid: &str, refspecs: Vec<String>) -> bool {
+    let deadline = std::time::Instant::now() + MERGE_GATE_TIMEOUT;
+    for refspec in refspecs {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        if let Err(err) = run_command_capture_with_timeout(
+            "git",
+            &[
+                "-C",
+                root,
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--",
+                "origin",
+                &refspec,
+            ],
+            None,
+            remaining,
+        ) {
+            tracing::debug!("fetch of {refspec} for merged PR head failed: {err}");
+            continue;
+        }
+        if commit_object_exists(root, head_oid) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Is `ancestor` reachable from `descendant`?
@@ -1191,6 +1365,11 @@ fn merged_pr_evidence(
 /// Both arguments are raw object ids here, not refnames: one comes from gh and
 /// one from `rev-parse`, so there is no ref to be shadowed by a same-named tag
 /// and no [`branch_ref`] to apply.
+///
+/// A descendant this clone does not have is the error case, not the "no" case,
+/// and it is the one that made a merged PR's branch un-deletable (#646) — so
+/// callers on the gh path ask through [`tip_inside_head`], which fetches that
+/// head before accepting the error for an answer.
 fn commit_is_ancestor_of(root: &str, ancestor: &str, descendant: &str) -> bool {
     run_command_capture(
         "git",
@@ -1267,7 +1446,9 @@ fn branch_ref(branch: &str) -> String {
 
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
 /// 1. `gh pr view` with gh's own repo resolution, then pinned to the origin
-///    remote's repo (multi-remote checkouts resolve to upstream otherwise).
+///    remote's repo (multi-remote checkouts resolve to upstream otherwise). The
+///    merged head is FETCHED when this clone does not have it (#646), under the
+///    same [`MERGE_GATE_TIMEOUT`] as everything else here.
 /// 2. `git branch --merged <target>`, asked of EVERY branch in the landing set
 ///    ([`integration_targets`]) rather than of one detected default — see #633
 ///    for why `origin/HEAD` alone is the wrong single question.
@@ -2496,6 +2677,163 @@ mod tests {
         (repo, origin)
     }
 
+    /// A repo whose PR was brought up to date ON GITHUB, which is #646's shape:
+    /// the commit `headRefOid` names is a merge commit GitHub built and this
+    /// clone never fetched, and it reaches the bare origin ONLY under that
+    /// PR's own ref — no branch of the origin holds it, so nothing an ordinary
+    /// fetch would pull in brings it either.
+    ///
+    /// The merge commit is built in a separate clone of the origin so the
+    /// object cannot land in the local repo by accident: the whole point of the
+    /// fixture is a clone that does not have the head, and a fixture that
+    /// quietly does have it would pass the fix and prove nothing. The local
+    /// branch tip is the commit that merge brought in, so reachability is the
+    /// ONLY thing standing between this and "merged".
+    fn repo_with_a_github_side_merge_head(name: &str) -> GithubSidePr {
+        let (repo, origin) = create_repo_with_bare_origin(name);
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["push", "--quiet", "-u", "origin", &default]);
+
+        let checkout = unique_temp_path(&format!("{name}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/updated-on-github",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(checkout.join("new.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "new.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "first"]);
+        let local_tip = head_oid_of(&checkout);
+        run_git(
+            &repo,
+            &[
+                "push",
+                "--quiet",
+                "-u",
+                "origin",
+                "feature/updated-on-github",
+            ],
+        );
+
+        // The base branch moves on while the PR is open — the commits
+        // `update-branch` exists to absorb. Without them the merge below finds
+        // nothing to do and the "merged head" comes out as the branch tip this
+        // clone already had, which is a different fixture entirely.
+        std::fs::write(repo.join("base.txt"), "base moved on\n").unwrap();
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "base moves on"]);
+        run_git(&repo, &["push", "--quiet", "origin", &default]);
+
+        // GitHub's side of `pr update-branch`: the base branch merged INTO the
+        // PR head, in a clone of the origin that is not the repo under test.
+        let server = unique_temp_path(&format!("{name}-gh"));
+        let clone_from = unique_temp_path(&format!("{name}-clone-from"));
+        std::fs::create_dir_all(&clone_from).unwrap();
+        run_git(
+            &clone_from,
+            &[
+                "clone",
+                "--quiet",
+                &origin.display().to_string(),
+                &server.display().to_string(),
+            ],
+        );
+        run_git(&server, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&server, &["config", "user.name", "Flock Test"]);
+        run_git(
+            &server,
+            &[
+                "checkout",
+                "--quiet",
+                "-B",
+                "pr-head",
+                "refs/remotes/origin/feature/updated-on-github",
+            ],
+        );
+        run_git(
+            &server,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "merge the base branch into the pr head",
+                &format!("refs/remotes/origin/{default}"),
+            ],
+        );
+        let merged_head = head_oid_of(&server);
+        run_git(
+            &server,
+            &[
+                "push",
+                "--quiet",
+                &origin.display().to_string(),
+                "HEAD:refs/pull/7/head",
+            ],
+        );
+        std::fs::remove_dir_all(&clone_from).unwrap();
+
+        GithubSidePr {
+            repo,
+            origin,
+            checkout,
+            local_tip,
+            merged_head,
+            server,
+        }
+    }
+
+    struct GithubSidePr {
+        repo: PathBuf,
+        origin: PathBuf,
+        checkout: PathBuf,
+        local_tip: String,
+        merged_head: String,
+        server: PathBuf,
+    }
+
+    impl GithubSidePr {
+        fn root(&self) -> String {
+            self.repo.display().to_string()
+        }
+
+        /// Take the origin away entirely, the way an offline machine, a dropped
+        /// VPN, or a server launched without credentials finds it.
+        ///
+        /// Deleted rather than repointed, so the fetch fails at the transport —
+        /// the failure that has to stay survivable — while the remote name still
+        /// resolves and the rest of the gate keeps running.
+        fn lose_the_origin(&self) {
+            std::fs::remove_dir_all(&self.origin).unwrap();
+        }
+
+        /// A commit on the local branch that no merge can be holding: the
+        /// dangerous neighbour for a gate that has just learned to fetch.
+        fn commit_work_the_pr_never_saw(&self) -> String {
+            std::fs::write(self.checkout.join("later.txt"), "unmerged\n").unwrap();
+            run_git(&self.checkout, &["add", "later.txt"]);
+            run_git(
+                &self.checkout,
+                &["commit", "--quiet", "-m", "after the update-branch merge"],
+            );
+            head_oid_of(&self.checkout)
+        }
+
+        fn cleanup(self) {
+            let _ = std::fs::remove_dir_all(&self.checkout);
+            let _ = std::fs::remove_dir_all(&self.server);
+            let _ = std::fs::remove_dir_all(&self.repo);
+            let _ = std::fs::remove_dir_all(&self.origin);
+        }
+    }
+
     /// Absolute path of `program` as this process's PATH resolves it, so a
     /// fixture can build a PATH that keeps one tool and drops the rest.
     fn resolve_on_path(program: &str) -> Option<PathBuf> {
@@ -3668,6 +4006,185 @@ prunable stale
                 Some(&remerged),
             ),
             None
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_fetches_a_merged_head_this_clone_never_had() {
+        // The live miss (#646): `gh pr update-branch` rewrote the PR head ON
+        // GITHUB, so the commit the PR was merged at is a merge commit this
+        // clone never fetched. `merge-base --is-ancestor` exits 128 on it, every
+        // non-zero exit read as "keep", and the branch of a squash-merged,
+        // auto-merged PR survived every reap until someone ran `git branch -D`.
+        let pr = repo_with_a_github_side_merge_head("merge-gate-github-side-head");
+        assert!(
+            !commit_object_exists(&pr.root(), &pr.merged_head),
+            "the fixture must be a clone that does NOT have the merged head, or it proves nothing"
+        );
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&pr.local_tip),
+            ),
+            Some("PR #7 merged (local tip is inside the merged head)".to_string())
+        );
+        assert!(
+            commit_object_exists(&pr.root(), &pr.merged_head),
+            "the fetch, not a coincidence, is what answered the question"
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_keeps_the_branch_when_that_fetch_cannot_happen() {
+        // The other half of #646's contract: a fetch that cannot answer leaves
+        // the gate exactly where it was before it learned to fetch — no
+        // evidence, branch kept — rather than turning an unreachable remote into
+        // a delete. Absence of the object is not evidence of anything, and the
+        // reading that keeps a branch is the one that survives being wrong.
+        let pr = repo_with_a_github_side_merge_head("merge-gate-unreachable-origin");
+        pr.lose_the_origin();
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&pr.local_tip),
+            ),
+            None
+        );
+        assert!(
+            !commit_object_exists(&pr.root(), &pr.merged_head),
+            "nothing should have arrived from an origin that is not there"
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_keeps_a_tip_the_fetched_head_never_saw() {
+        // A fetch makes the gate BETTER at deleting branches, which is exactly
+        // why this arm has to be re-proved rather than assumed: a commit made on
+        // the branch after the update-branch merge is in no merged head, and
+        // reachability has to keep saying no whether the head was already here
+        // or arrived a moment ago.
+        let pr = repo_with_a_github_side_merge_head("merge-gate-fetched-tip-ahead");
+        let ahead = pr.commit_work_the_pr_never_saw();
+
+        assert_eq!(
+            merged_pr_evidence(
+                &merged_pr_json(7, &pr.merged_head),
+                &pr.root(),
+                Some(&ahead)
+            ),
+            None,
+            "a commit no merge is holding must keep the branch"
+        );
+        assert!(
+            commit_object_exists(&pr.root(), &pr.merged_head),
+            "the fetch DID succeed here — keeping the branch is reachability's answer, not the fetch's"
+        );
+
+        pr.cleanup();
+    }
+
+    #[test]
+    fn the_merge_head_fetch_asks_for_the_oid_then_the_prs_own_ref() {
+        // A server is free to refuse a bare SHA, and GitHub keeps every PR ever
+        // opened under `refs/pull/<n>/head` pointing at the same commit. The
+        // order is the cheap one first and the fallback second, and a PR gh
+        // reported with no number leaves only the oid to try.
+        assert_eq!(
+            merge_head_fetch_refspecs("d1e2f3", Some(7)),
+            vec!["d1e2f3".to_string(), "refs/pull/7/head".to_string()]
+        );
+        assert_eq!(
+            merge_head_fetch_refspecs("d1e2f3", None),
+            vec!["d1e2f3".to_string()]
+        );
+    }
+
+    #[test]
+    fn worktree_fetch_hanging_remote_returns_within_budget() {
+        let pr = repo_with_a_github_side_merge_head("merge-gate-hanging-remote");
+        let started = std::time::Instant::now();
+        let result = run_command_capture_with_timeout(
+            "git",
+            &[
+                "-C",
+                &pr.root(),
+                "-c",
+                "protocol.ext.allow=always",
+                "fetch",
+                "--",
+                "ext::/bin/sh -c sleep% 30",
+                "refs/pull/7/head",
+            ],
+            None,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_rejects_invalid_oids_before_git() {
+        for oid in [
+            "--upload-pack=touch /tmp/pwn",
+            "g".repeat(40).as_str(),
+            "abc",
+        ] {
+            assert!(!valid_commit_oid(oid));
+            assert_eq!(
+                merged_pr_evidence(&merged_pr_json(7, oid), "", Some(oid)),
+                None
+            );
+            assert!(!fetch_merge_head("", oid, Some(7)));
+            assert!(!commit_object_exists("", oid));
+        }
+        assert!(valid_commit_oid(&"a".repeat(40)));
+        assert!(valid_commit_oid(&"0".repeat(64)));
+    }
+
+    #[test]
+    fn merge_head_fetch_falls_back_after_oid_fetch_fails() {
+        let pr = repo_with_a_github_side_merge_head("merge-gate-ref-fallback");
+        // A deliberately absent oid forces the first fetch to fail, then the ref arrives.
+        assert!(fetch_merge_head_refspecs(
+            &pr.root(),
+            &pr.merged_head,
+            vec!["0".repeat(40), "refs/pull/7/head".to_string()],
+        ));
+        assert!(commit_object_exists(&pr.root(), &pr.merged_head));
+        pr.cleanup();
+    }
+
+    #[test]
+    fn fetching_a_merged_head_moves_no_ref() {
+        // The gate runs on the request path against a live repo. A fetch that
+        // rewrote `FETCH_HEAD` would change what the user's next `git merge
+        // FETCH_HEAD` means, and a fleet sweep judging twenty checkouts at once
+        // would have twenty of them racing for that one file's lock — losers
+        // keeping provably-merged branches, which is the bug being fixed.
+        let pr = repo_with_a_github_side_merge_head("merge-gate-fetch-moves-no-ref");
+        let refs_before = local_and_origin_refs(&pr.root());
+
+        assert!(fetch_merge_head(&pr.root(), &pr.merged_head, Some(7)));
+        assert!(commit_object_exists(&pr.root(), &pr.merged_head));
+        assert_eq!(
+            local_and_origin_refs(&pr.root()),
+            refs_before,
+            "the object is the whole point; no ref should have moved"
+        );
+        assert!(
+            !pr.repo.join(".git/FETCH_HEAD").exists(),
+            "FETCH_HEAD is the user's next `git merge`, not this gate's scratch space"
         );
 
         pr.cleanup();
