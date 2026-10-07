@@ -130,6 +130,13 @@ pub(crate) fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Prefix the importer writes before closing the handoff stream when it
+/// refuses the manifest, so the exporter can tell the operator WHY instead of
+/// seeing a closed stream. Deliberately a bytes constant so both sides refer
+/// to the same string.
+#[cfg(unix)]
+pub(crate) const IMPORT_REFUSAL_PREFIX: &str = "error: ";
+
 #[cfg(unix)]
 pub(crate) fn accept_and_validate_on(
     listener: UnixListener,
@@ -154,12 +161,56 @@ pub(crate) fn accept_and_validate_on(
     stream.flush()?;
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let validated = read_line_unbuffered(&mut stream)?;
-    if validated.trim_end() != "validated" {
-        return Err(io::Error::other("handoff import did not validate manifest"));
-    }
+    expect_line(
+        &mut stream,
+        "validated",
+        "handoff import did not validate manifest",
+    )?;
     let _ = std::fs::remove_file(socket_path);
     Ok(stream)
+}
+
+/// Read one line from the importer and require it to be `expected`. A line
+/// carrying [`IMPORT_REFUSAL_PREFIX`] is the importer naming why it refused,
+/// and surfaces as `handoff import refused: <reason>` at whichever step the
+/// exporter was waiting on. Any other line is reported under `what`.
+#[cfg(unix)]
+fn expect_line(stream: &mut UnixStream, expected: &str, what: &str) -> io::Result<()> {
+    let line = read_line_unbuffered(&mut *stream)?;
+    let trimmed = line.trim_end();
+    if trimmed == expected {
+        return Ok(());
+    }
+    if let Some(reason) = trimmed.strip_prefix(IMPORT_REFUSAL_PREFIX) {
+        return Err(io::Error::other(format!(
+            "handoff import refused: {reason}"
+        )));
+    }
+    Err(io::Error::other(format!(
+        "{what}: unexpected response {trimmed:?}"
+    )))
+}
+
+/// Write a one-line `error: <reason>` back to the handoff stream before the
+/// import process exits. The exporter's `accept_and_validate_on` recognises
+/// the prefix and lifts the reason into the `handoff_failed` message so an
+/// operator sees WHY the import refused, instead of the opaque "handoff
+/// stream closed while reading line" that is all it saw before this call
+/// existed. Best-effort — if the exporter has already moved on, the write
+/// drops.
+#[cfg(unix)]
+pub(crate) fn report_import_refusal(stream: &mut UnixStream, reason: &str) -> io::Result<()> {
+    // One line out of a possibly multi-line error message: embedded newlines
+    // would terminate the line reader at the wrong place.
+    let single_line: String = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    stream.write_all(IMPORT_REFUSAL_PREFIX.as_bytes())?;
+    stream.write_all(single_line.trim().as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
 }
 
 #[cfg(unix)]
@@ -173,23 +224,17 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
     send_fds(stream, fds)?;
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let restored = read_line_unbuffered(&mut *stream)?;
-    if restored.trim_end() != "restored" {
-        return Err(io::Error::other(
-            "handoff import did not report restored runtimes",
-        ));
-    }
-    Ok(())
+    expect_line(
+        stream,
+        "restored",
+        "handoff import did not report restored runtimes",
+    )
 }
 
 #[cfg(unix)]
 pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let ready = read_line_unbuffered(&mut *stream)?;
-    if ready.trim_end() != "ready" {
-        return Err(io::Error::other("handoff import did not report ready"));
-    }
-    Ok(())
+    expect_line(stream, "ready", "handoff import did not report ready")
 }
 
 #[cfg(unix)]
@@ -222,9 +267,38 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     stream.write_all(b"\n")?;
     stream.flush()?;
 
-    let manifest_line = read_line_unbuffered(&mut stream)?;
-    let manifest: HandoffManifest =
-        serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
+    match receive_after_token(&mut stream) {
+        Ok((manifest, fds)) => Ok(ReceivedHandoff {
+            manifest,
+            fds,
+            stream,
+        }),
+        Err(err) => {
+            // Log first: a pre-fix exporter SIGKILLs this process the moment
+            // it sees the closed stream, so anything after the write may never
+            // run. Stderr is `/dev/null`, so this is the only durable record.
+            crate::logging::handoff_import_refused(&err.to_string());
+            // Tell the exporter WHY before dropping the stream. Without this
+            // line the exporter sees only "handoff stream closed while reading
+            // line" and the import's stderr goes to /dev/null, so the real
+            // reason — version mismatch, manifest shape, fd exchange — was
+            // unobservable from either side.
+            if let Err(report_err) = report_import_refusal(&mut stream, &err.to_string()) {
+                crate::logging::handoff_refusal_report_failed(&report_err.to_string());
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Everything after the token write that may fail without the exporter
+/// learning why. Split out so the error-reporting path in [`receive`] has
+/// one place to intercept.
+#[cfg(unix)]
+fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, Vec<RawFd>)> {
+    let manifest_line = read_line_unbuffered(stream)?;
+    let manifest: HandoffManifest = serde_json::from_str(&manifest_line)
+        .map_err(|err| io::Error::other(format!("handoff manifest deserialize failed: {err}")))?;
     if manifest.version != HANDOFF_VERSION {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
@@ -254,12 +328,8 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
-    Ok(ReceivedHandoff {
-        manifest,
-        fds,
-        stream,
-    })
+    let fds = recv_fds(stream, manifest.panes.len())?;
+    Ok((manifest, fds))
 }
 
 #[cfg(unix)]
@@ -455,4 +525,163 @@ fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
 #[cfg(unix)]
 pub(crate) fn log_import_result(panes: usize) {
     info!(panes, "handoff import ready");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+
+    /// A paired manifest JSON written by `0.6.8-fork.<rev>` for a two-pane
+    /// handoff, captured off the wire from an isolated server. The hostnames
+    /// in `agent_id` have been replaced with a declared fictional host so
+    /// `scripts/fixture_hosts.py` does not blow this up — the shape is what
+    /// matters, not the specific id.
+    const OLD_SHAPE_MANIFEST: &str = r#"{"version":1,"source_version":"0.6.8-fork.old","source_protocol":25,"expected_version":null,"expected_protocol":null,"snapshot":{"version":3,"workspaces":[{"id":"w1","custom_name":null,"identity_cwd":"/tmp","public_pane_numbers":{"1":1},"next_public_pane_number":2,"public_tab_numbers":[1],"next_public_tab_number":2,"tabs":[{"custom_name":null,"layout":{"Pane":1},"panes":{"1":{"cwd":"/tmp","agent_id":"agent_atlas_old0001","header_reserved":true,"agent_session":{"source":"flock:claude","agent":"claude","kind":"id","value":"abc-123"}}},"zoomed":false,"focused":1,"root_pane":1}],"active_tab":0}],"active":0,"selected":0,"agent_panel_scope":"AllWorkspaces","servers_panel_scope":"All","spaces_panel_scope":"All","sidebar_width":26,"sidebar_section_split":0.5,"collapsed_space_keys":[]},"panes":[{"pane_id":1,"child_pid":4321,"rows":20,"cols":52,"cell_width_px":0,"cell_height_px":0,"keyboard_protocol_flags":0,"input_state":{"alternate_screen":false,"application_cursor":false,"bracketed_paste":false,"focus_reporting":false,"mouse_protocol_mode":"none","mouse_protocol_encoding":"default","mouse_alternate_scroll":true,"modify_other_keys":true}}]}"#;
+
+    #[test]
+    fn captured_old_shape_manifest_deserializes_here() {
+        // The regression this guards against is the one #600 looked like: a
+        // nested type on either side renaming or dropping a field so the
+        // import's `serde_json::from_str` fails on a manifest a running old
+        // server produced. If that happens again, this test fails with the
+        // serde error path pointing at the field — a long way from the
+        // opaque "handoff stream closed while reading line" the operator
+        // sees today.
+        let manifest: HandoffManifest = serde_json::from_str(OLD_SHAPE_MANIFEST)
+            .expect("old-shape handoff manifest must deserialize");
+        assert_eq!(manifest.version, HANDOFF_VERSION);
+        assert_eq!(manifest.source_protocol, 25);
+        assert_eq!(manifest.panes.len(), 1);
+        assert_eq!(manifest.snapshot.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn pinned_version_mismatch_reaches_the_exporter_as_a_named_refusal() {
+        // The #600 shape: a remote attach pins `--expected-version` to the
+        // CLIENT'S build, and the binary at the import path is another build.
+        // The importer refuses before `validated`, so the exporter used to see
+        // only "handoff stream closed while reading line". Driven through the
+        // real exporter and importer halves over a real listener.
+        let mut manifest: HandoffManifest = serde_json::from_str(OLD_SHAPE_MANIFEST)
+            .expect("old-shape handoff manifest must deserialize");
+        manifest.expected_version = Some("0.0.0-pinned-elsewhere".to_string());
+        let socket = std::env::temp_dir().join(format!("flk-h600-{}.sock", std::process::id()));
+        let listener = bind_listener(&socket).expect("bind handoff listener");
+        let token = "tok-600";
+        let importer_socket = socket.clone();
+        let importer = thread::spawn(move || receive(&importer_socket, token).map(|_| ()));
+
+        let err = accept_and_validate_on(listener, &socket, token, &manifest)
+            .expect_err("a pinned version that is not this build must be refused");
+        let importer_err = importer
+            .join()
+            .expect("importer thread does not panic")
+            .expect_err("importer refuses the pinned version");
+        let _ = std::fs::remove_file(&socket);
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("handoff import refused: "),
+            "exporter must name the refusal, got {message:?}"
+        );
+        assert!(
+            message.contains("0.0.0-pinned-elsewhere"),
+            "refusal must carry the pinned version, got {message:?}"
+        );
+        assert!(importer_err.to_string().contains("expected flock v"));
+    }
+
+    #[test]
+    fn refusal_where_restored_is_expected_surfaces_as_a_named_refusal() {
+        let (mut importer_side, mut exporter_side) =
+            UnixStream::pair().expect("socketpair available");
+        report_import_refusal(&mut importer_side, "pane restore failed")
+            .expect("refusal line writes");
+        exporter_side
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout settable");
+        let err = expect_line(&mut exporter_side, "restored", "did not restore")
+            .expect_err("a refusal is not `restored`");
+        assert_eq!(
+            err.to_string(),
+            "handoff import refused: pane restore failed"
+        );
+
+        let (mut importer_side, mut exporter_side) =
+            UnixStream::pair().expect("socketpair available");
+        importer_side.write_all(b"bogus\n").expect("write");
+        let err = expect_line(&mut exporter_side, "restored", "did not restore")
+            .expect_err("an unexpected line is an error");
+        assert_eq!(
+            err.to_string(),
+            "did not restore: unexpected response \"bogus\""
+        );
+    }
+
+    #[test]
+    fn importer_refusal_is_reported_to_exporter_as_handoff_import_refused() {
+        // Simulates what the exporter sees when the importer refuses. The
+        // importer-side writes `error: <reason>` back on the stream before
+        // dropping it; the exporter's wait for "validated" must lift that
+        // reason into the final error. Without this round trip the operator
+        // sees only "handoff stream closed while reading line" (#600).
+        let (mut importer_side, exporter_side) =
+            UnixStream::pair().expect("socketpair available in test");
+        let importer = thread::spawn(move || {
+            report_import_refusal(&mut importer_side, "expected flock v0.8.0 but got v0.6.8")
+                .expect("refusal line writes to the stream");
+        });
+
+        let mut exporter_side = exporter_side;
+        exporter_side
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout settable on a socketpair");
+        let mut received = String::new();
+        exporter_side
+            .read_to_string(&mut received)
+            .expect("exporter reads the refusal line before EOF");
+        importer.join().expect("importer thread exits cleanly");
+
+        assert!(
+            received.starts_with(IMPORT_REFUSAL_PREFIX),
+            "exporter should see the refusal prefix, got {received:?}"
+        );
+        let reason = received
+            .trim_end()
+            .strip_prefix(IMPORT_REFUSAL_PREFIX)
+            .expect("prefix present");
+        assert_eq!(reason, "expected flock v0.8.0 but got v0.6.8");
+    }
+
+    #[test]
+    fn importer_refusal_single_lines_newlines_in_reason() {
+        // serde_json error messages ride onto the same read-line protocol as
+        // "validated" / "restored" / "committed", so an embedded `\n` would
+        // terminate the line early and the exporter would read half the
+        // reason. The refusal writer collapses newlines to spaces for that
+        // reason, and this is where that collapse is pinned.
+        let (mut importer_side, mut exporter_side) =
+            UnixStream::pair().expect("socketpair available");
+        exporter_side
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout settable before peer closes");
+        report_import_refusal(
+            &mut importer_side,
+            "line one\nline two with\r\nembedded newlines",
+        )
+        .expect("refusal line writes");
+        drop(importer_side);
+
+        let mut received = String::new();
+        exporter_side
+            .read_to_string(&mut received)
+            .expect("exporter reads the refusal line");
+        // Exactly one trailing newline, no embedded CR/LF inside the reason.
+        assert_eq!(received.matches('\n').count(), 1);
+        assert!(received.ends_with('\n'));
+        assert!(!received[..received.len() - 1].contains('\n'));
+    }
 }
