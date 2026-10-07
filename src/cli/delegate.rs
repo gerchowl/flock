@@ -62,22 +62,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::api::client::ApiClient;
 use crate::api::schema::{
     AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, Method, PaneListParams,
-    PaneTarget, Request, WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams,
-    WorktreeKillParams, WorktreeListParams,
+    PaneSendInputParams, PaneSendKeysParams, PaneTarget, Request, WorkspaceCreateParams,
+    WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams, WorktreeListParams,
 };
 
+use super::pane::PANE_RUN_SUBMIT_GAP;
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
 
 /// `delegate start`'s usage. A `pub(super) const` rather than a literal in the
 /// help table so `flk delegate start --help` and `flk delegate --help` cannot
 /// answer two different things.
 pub(super) const START_USAGE: &str = concat!(
-    "flk delegate start <name> --brief FILE (--cwd PATH | --worktree [--repo PATH] [--branch B] [--base REF])\n",
+    "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
     "                     [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]\n",
     "                     [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
-    "  --worktree          run in a fresh linked worktree: --repo, --branch, --base\n",
+    "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
     "  --settle MS         how long the agent's quiet must hold, default 5000\n",
@@ -219,17 +220,39 @@ impl fmt::Display for BoundedError {
         }
     }
 }
-/// Make a socket request bounded by a deadline.
+/// The one cap table: how long THIS module waits for each method on a quiet
+/// socket. The actual socket timeout is `cap.min(remaining deadline)` — a
+/// caller with a shorter deadline wins (K5). A cap handed in by hand would be
+/// a second table drifting from this one; `bounded` reads it, nothing else.
 ///
-/// The request timeout is the minimum of the given cap and the time remaining
-/// until the deadline. After the response, if the deadline has passed, the
-/// result is `TimedOut` regardless of the response content.
-/// Returns the raw response; caller must check for server errors.
-fn bounded(
-    method: Method,
-    deadline: Option<Instant>,
-    cap: Duration,
-) -> Result<serde_json::Value, BoundedError> {
+/// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
+///   on filesystem work the operator sees.
+/// - 10 s: `PaneSendInput` — the brief submit is a human-latency write and
+///   must not stall the whole command if the socket goes quiet mid-type.
+/// - 2 s: every poll, get, and list.
+fn cap_for(method: &Method) -> Duration {
+    match method {
+        Method::WorktreeCreate(_)
+        | Method::WorktreeKill(_)
+        | Method::WorkspaceCreate(_)
+        | Method::WorkspaceClose(_)
+        | Method::AgentStart(_) => Duration::from_secs(60),
+        Method::PaneSendInput(_) => Duration::from_secs(10),
+        _ => REQUEST_TIMEOUT,
+    }
+}
+
+/// Make a socket request bounded by its cap and the caller's deadline.
+///
+/// The socket timeout is `cap_for(method).min(deadline - now)`; past the
+/// deadline, nothing is sent. On the way back the deadline is re-checked —
+/// a reply that lands late is a `TimedOut` regardless of its content, so a
+/// caller that has run out of clock does not act on what it read on the way
+/// past.
+///
+/// Returns the raw response; the caller checks for a server-level `error`.
+fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Value, BoundedError> {
+    let cap = cap_for(&method);
     // Check if deadline has already passed.
     if let Some(deadline) = deadline {
         if Instant::now() >= deadline {
@@ -885,21 +908,14 @@ fn prepare_brief(path: &str) -> Result<(String, String), String> {
 
 // --------------------------------------------------------------- requests
 
-/// One socket request, bounded by whatever clock the caller has.
+/// One socket request, as an `io::Result` for callers that read it that way.
 ///
-/// For write operations (worktree.create, worktree.kill, workspace.create,
-/// workspace.close) the base timeout is 60 s; for polls it is 2 s. The actual
-/// timeout is the minimum of that base and the time left on the caller's
-/// deadline. Once the deadline has passed, nothing is sent.
+/// A thin wrapper over `bounded`: the cap is `cap_for(method)` (one table),
+/// a server refusal becomes `io::Error::other(server_error(..))`, a timeout
+/// becomes `ErrorKind::TimedOut`, a transport error unwraps to its original
+/// `io::Error`. Nothing in this module passes a cap by hand (W2).
 fn request(method: Method, deadline: Option<Instant>) -> io::Result<serde_json::Value> {
-    let base_timeout = match &method {
-        Method::WorktreeCreate(_)
-        | Method::WorktreeKill(_)
-        | Method::WorkspaceCreate(_)
-        | Method::WorkspaceClose(_) => Duration::from_secs(60),
-        _ => REQUEST_TIMEOUT,
-    };
-    let response = match bounded(method, deadline, base_timeout) {
+    let response = match bounded(method, deadline) {
         Ok(response) => response,
         Err(BoundedError::TimedOut) => return Err(io::Error::from(io::ErrorKind::TimedOut)),
         Err(BoundedError::Transport(e)) => return Err(e),
@@ -929,44 +945,78 @@ fn expired(deadline: Option<Instant>) -> bool {
 enum AgentFetch {
     /// The server named an agent; the record is the body.
     Found(serde_json::Value),
-    /// The server did not name an agent, or the response was unusable.
+    /// The server answered that no such agent exists (an identity failure, not
+    /// a transport one): a reap or status call reads this as "not a delegate".
     Missing,
     /// The caller's deadline passed on the way to or during this request.
     TimedOut,
+    /// A transport error that is NOT a deadline event — a dead socket, a
+    /// closed connection. Collapsing this into `Missing` (as earlier revisions
+    /// did) made an unreachable server look like "not a delegate" (W4). The
+    /// reason is carried so the caller can print it.
+    Failed(String),
 }
 
+/// How often `agent_record` polls when a `NotYet` fires before the deadline.
+///
+/// Short enough that a slow transport does not keep a caller waiting past its
+/// cap; long enough that a frozen server does not get bombarded.
+const AGENT_POLL: Duration = Duration::from_millis(200);
+
 /// Look up the agent record bounded by the caller's deadline. Classifies the
-/// outcome via `await_failure`: `Timeout` → `TimedOut`, `NotYet`/`Fail` →
-/// `Missing` (treated like "no such agent", because an identity we cannot
-/// prove is never positive evidence — the K-rules' governing principle).
+/// outcome via `await_failure`: `Timeout` → `TimedOut`, `Fail` → `Failed`,
+/// `NotYet` → poll again until the deadline. Without a deadline a `NotYet`
+/// is treated as `Failed`: there is no clock to retry against.
 fn agent_record(target: &str, deadline: Option<Instant>) -> AgentFetch {
-    let bounded_res = bounded(
-        Method::AgentGet(AgentTarget {
-            target: target.to_string(),
-        }),
-        deadline,
-        REQUEST_TIMEOUT,
-    );
-    let response = match bounded_res {
-        Ok(response) => response,
-        Err(err) => {
-            return match await_failure(&err, deadline, Instant::now()) {
-                AwaitFailure::Timeout => AgentFetch::TimedOut,
-                AwaitFailure::NotYet | AwaitFailure::Fail(_) => AgentFetch::Missing,
-            };
+    loop {
+        let bounded_res = bounded(
+            Method::AgentGet(AgentTarget {
+                target: target.to_string(),
+            }),
+            deadline,
+        );
+        let response = match bounded_res {
+            Ok(response) => response,
+            Err(err) => {
+                return match await_failure(&err, deadline, Instant::now()) {
+                    AwaitFailure::Timeout => AgentFetch::TimedOut,
+                    AwaitFailure::Fail(reason) => AgentFetch::Failed(reason),
+                    AwaitFailure::NotYet => {
+                        // No deadline → nothing to retry against; a persistent
+                        // transport blip must not be a silent "not a delegate".
+                        if let Some(d) = deadline {
+                            if Instant::now() >= d {
+                                return AgentFetch::TimedOut;
+                            }
+                            sleep_bounded(d, AGENT_POLL);
+                            continue;
+                        }
+                        return AgentFetch::Failed(err.to_string());
+                    }
+                };
+            }
+        };
+        if let Some(error) = response.get("error") {
+            let err = parse_server_error(error);
+            // `agent_not_found` and friends are what the server says when the
+            // agent is gone — NotOurs for identity, Missing here.
+            if err.code == "agent_not_found" || err.code == "pane_not_found" {
+                return AgentFetch::Missing;
+            }
+            return AgentFetch::Failed(err.to_string());
         }
-    };
-    match response
-        .pointer("/result/agent")
-        .filter(|record| record.is_object())
-        .cloned()
-    {
-        Some(record) => AgentFetch::Found(record),
-        None => AgentFetch::Missing,
+        return match response
+            .pointer("/result/agent")
+            .filter(|record| record.is_object())
+            .cloned()
+        {
+            Some(record) => AgentFetch::Found(record),
+            None => AgentFetch::Missing,
+        };
     }
 }
 
-/// Shortcut for callers that cannot tell timeout from "missing" apart.
+/// Shortcut for callers that cannot tell timeout from "missing"/"failed" apart.
 ///
 /// Most callers of `agent_record` want the record if it exists and nothing if
 /// it doesn't — the deadline distinction is only interesting to the one caller
@@ -974,7 +1024,7 @@ fn agent_record(target: &str, deadline: Option<Instant>) -> AgentFetch {
 fn agent_record_opt(target: &str, deadline: Option<Instant>) -> Option<serde_json::Value> {
     match agent_record(target, deadline) {
         AgentFetch::Found(record) => Some(record),
-        AgentFetch::Missing | AgentFetch::TimedOut => None,
+        AgentFetch::Missing | AgentFetch::TimedOut | AgentFetch::Failed(_) => None,
     }
 }
 
@@ -1067,11 +1117,8 @@ impl Placement {
 
 /// Every workspace the server lists, as records. Returns `None` if the request failed.
 fn workspace_records(deadline: Option<Instant>) -> Option<Vec<serde_json::Value>> {
-    let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
-        Method::WorkspaceList(EmptyParams::default()),
-        deadline,
-        REQUEST_TIMEOUT,
-    );
+    let bounded_res: Result<serde_json::Value, BoundedError> =
+        bounded(Method::WorkspaceList(EmptyParams::default()), deadline);
     match bounded_res {
         Ok(response) => response
             .pointer("/result/workspaces")
@@ -1119,7 +1166,6 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 ..WorktreeCreateParams::default()
             }),
             None,
-            Duration::from_secs(60),
         ),
         Mode::Cwd => {
             let cwd = flags
@@ -1133,7 +1179,6 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                     label: None,
                 }),
                 None,
-                REQUEST_TIMEOUT,
             )
         }
     };
@@ -1199,9 +1244,56 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     let (Some(workspace_id), Some(root_pane), Some(root_pane_terminal_id)) =
         (workspace_id, root_pane, root_pane_terminal_id)
     else {
-        // Malformed success response: server said OK but missing required fields.
-        // Cannot establish what was created, so do nothing destructive (K2).
+        // Malformed success response: server said OK but missing required
+        // fields. The one piece of evidence we do have is `/result/worktree/
+        // path`: if the pre-create list said it was not there and now it is
+        // named, kill it by path with force — the response IS the evidence
+        // (W6). Otherwise print that a checkout may be left behind.
         let reason = "the server created the workspace but named no workspace id, root pane, or root pane terminal id";
+        if mode == Mode::Worktree {
+            if let (Some(path), Some(before)) = (worktree.as_deref(), worktrees_before.as_ref()) {
+                let in_before = before
+                    .iter()
+                    .any(|w| w.get("path").and_then(|v| v.as_str()) == Some(path));
+                if !in_before {
+                    match kill(None, Some(path), true) {
+                        Ok(response) => {
+                            if let Some(err) = refusal(&response) {
+                                if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
+                                    eprintln!(
+                                        "delegate {name}: rollback also failed: {}",
+                                        err.message
+                                    );
+                                }
+                            } else {
+                                eprintln!(
+                                    "delegate {name}: rollback removed stray checkout at {path}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("delegate {name}: rollback also failed: {}", err.message);
+                        }
+                    }
+                    return Err(fail(reason.to_string()));
+                }
+                eprintln!(
+                    "delegate {name}: the create succeeded but was malformed; the response named {path}, which was present before — may be left behind"
+                );
+            } else if let Some(path) = worktree.as_deref() {
+                eprintln!(
+                    "delegate {name}: the create succeeded but was malformed; a checkout at {path} may be left behind"
+                );
+            } else {
+                eprintln!(
+                    "delegate {name}: the create succeeded but was malformed; a checkout may be left behind"
+                );
+            }
+        } else {
+            eprintln!(
+                "delegate {name}: the create succeeded but was malformed; a workspace may be left behind"
+            );
+        }
         return Err(fail(reason.to_string()));
     };
 
@@ -1242,10 +1334,56 @@ fn teardown_after_place_failure(
     repo: &str,
     failure: CreateFailure,
 ) -> i32 {
+    teardown_after_place_failure_with(
+        name,
+        worktrees_before,
+        mode,
+        flags,
+        failure,
+        |deadline| worktree_list_plain(repo, deadline),
+        |path| kill(None, Some(path), true),
+    )
+}
+
+/// The decision half of `teardown_after_place_failure`, with its two
+/// side-effecting steps handed in as closures. Pure given those, so the
+/// call-site tests (W7) can drive it with fakes.
+///
+/// On a place failure there is no placement, so nothing here closes a parent
+/// workspace (K2's governing rule: with no positive evidence of what the
+/// server created, destroy nothing). The one destructive branch is for a
+/// transport failure whose pre-create inventory succeeded: that is the only
+/// shape in which "a new checkout appeared after our timed-out create" has
+/// a sound definition. Every other shape prints what might be left behind
+/// and exits without touching the server.
+///
+/// `worktrees_before` is `None` when the pre-create `worktree.list` failed,
+/// never defaulted to empty: a `[]` default would make every checkout look
+/// new and the force-kill would hit the operator's work.
+fn teardown_after_place_failure_with(
+    name: &str,
+    worktrees_before: Option<&[serde_json::Value]>,
+    mode: Mode,
+    flags: &StartFlags,
+    failure: CreateFailure,
+    list_after: impl FnOnce(Option<Instant>) -> Option<Vec<serde_json::Value>>,
+    kill_path: impl FnOnce(&str) -> Result<serde_json::Value, ServerError>,
+) -> i32 {
     let reason = failure.describe();
-    // In cwd mode the create was workspace.create: nothing on disk belongs to
-    // the delegate yet, so there is no leftover to look for.
     if mode == Mode::Cwd {
+        // workspace.create: nothing on disk belongs to the delegate yet, so
+        // there is no leftover to kill (W3). Say so on stderr for a transport
+        // or timeout failure — the server may have created a workspace we
+        // cannot see — and destroy nothing.
+        if matches!(
+            failure,
+            CreateFailure::TimedOut | CreateFailure::Transport(_)
+        ) {
+            let cwd = flags.cwd.as_deref().unwrap_or("<unknown>");
+            eprintln!(
+                "delegate {name}: workspace.create did not answer; a workspace for {cwd} may be left open"
+            );
+        }
         return fail(reason);
     }
     let branch_label = flags.branch.as_deref().unwrap_or("<unknown>");
@@ -1257,7 +1395,7 @@ fn teardown_after_place_failure(
         }
         LeftoverCheck::Look => {
             let before = worktrees_before.expect("Look implies the pre-create list succeeded");
-            let worktrees_after = match worktree_list_plain(repo, None) {
+            let worktrees_after = match list_after(None) {
                 Some(list) => list,
                 None => {
                     // A failed post-create list is "cannot check": print and
@@ -1270,11 +1408,11 @@ fn teardown_after_place_failure(
             };
             let new_checkout = find_new_checkout(before, &worktrees_after, flags.branch.as_deref());
             if let Some(checkout) = new_checkout {
-                match kill(None, Some(&checkout), true) {
+                match kill_path(&checkout) {
                     Ok(response) => {
                         if let Some(err) = refusal(&response) {
                             if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
-                                eprintln!("delegate {name}: rollback also failed: {err}");
+                                eprintln!("delegate {name}: rollback also failed: {}", err.message);
                             }
                         } else {
                             eprintln!(
@@ -1283,7 +1421,7 @@ fn teardown_after_place_failure(
                         }
                     }
                     Err(err) => {
-                        eprintln!("delegate {name}: rollback also failed: {err}");
+                        eprintln!("delegate {name}: rollback also failed: {}", err.message);
                     }
                 }
             } else {
@@ -1352,7 +1490,6 @@ fn worktree_list_plain(repo: &str, deadline: Option<Instant>) -> Option<Vec<serd
             scan: false,
         }),
         deadline,
-        REQUEST_TIMEOUT,
     ) {
         Ok(response) => response,
         Err(_) => return None,
@@ -1488,29 +1625,55 @@ struct TearDown {
 fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDown, ServerError> {
     let mut done = TearDown::default();
 
-    if !target.workspace_id.is_empty() && workspace_is_ours(target) {
-        match target.mode {
-            Mode::Worktree => {
-                let response = kill(Some(&target.workspace_id), None, force)?;
-                if let Some(err) = refusal(&response) {
-                    if err.code != "workspace_not_found" {
-                        return Err(err);
+    if !target.workspace_id.is_empty() {
+        match identity(target) {
+            Identity::Ours => match target.mode {
+                Mode::Worktree => {
+                    let response = kill(Some(&target.workspace_id), None, force)?;
+                    if let Some(err) = refusal(&response) {
+                        if err.code != "workspace_not_found" {
+                            return Err(err);
+                        }
+                    } else {
+                        // The kill closes the workspace and removes the checkout
+                        // with it, so both are accounted for.
+                        done.workspace_closed = true;
+                        done.checkout_removed = true;
                     }
-                } else {
-                    // The kill closes the workspace and removes the checkout with
-                    // it, so both are accounted for.
-                    done.workspace_closed = true;
-                    done.checkout_removed = true;
                 }
-            }
-            Mode::Cwd => {
-                let response = close_workspace(&target.workspace_id)?;
-                if let Some(err) = refusal(&response) {
-                    if err.code != "workspace_not_found" {
-                        return Err(err);
+                Mode::Cwd => {
+                    let response = close_workspace(&target.workspace_id)?;
+                    if let Some(err) = refusal(&response) {
+                        if err.code != "workspace_not_found" {
+                            return Err(err);
+                        }
+                    } else {
+                        done.workspace_closed = true;
                     }
-                } else {
-                    done.workspace_closed = true;
+                }
+            },
+            Identity::NotOurs => {
+                // The server answered and the evidence is against us: the id
+                // belongs to someone else now, or the recorded panes are gone.
+                // Leave the workspace alone. In worktree mode, the recorded
+                // checkout path is still evidence we may act on — fall through
+                // to the path kill below.
+            }
+            Identity::Unknown(reason) => {
+                // The request failed or the answer was malformed. In cwd mode
+                // there is no fallback evidence to act on, so refuse the whole
+                // operation — nothing is destroyed, nothing is forgotten (W1).
+                // In worktree mode the recorded checkout path is the evidence
+                // we fall through to below as a path kill — a failure there
+                // is already reported as an error.
+                if target.mode == Mode::Cwd {
+                    return Err(ServerError {
+                        code: "identity_unknown".to_string(),
+                        message: format!(
+                            "could not establish whether workspace {} is still delegate {}'s: {reason}",
+                            target.workspace_id, target.name
+                        ),
+                    });
                 }
             }
         }
@@ -1572,71 +1735,164 @@ fn holds_recorded_terminal(panes: Option<&[serde_json::Value]>, recorded: &[&str
     false
 }
 
-/// The two modes can only be checked against different things, because they were
-/// recorded differently. A worktree workspace is identified by its CHECKOUT — the
-/// thing that was actually created. A cwd workspace has no checkout of its own, so
-/// it is identified by a PANE it still holds: the agent's, or the shell it was
-/// created with. A public pane id is never reused within a server's life, so
-/// either is a stronger claim than the workspace id alone.
+/// What `identity` concluded, with the three answers kept apart (W1).
 ///
-/// A workspace that does not resolve is gone, and so is one that does not match:
-/// both mean the same thing to a caller, which is that there is nothing here to
-/// close.
-fn workspace_is_ours(target: &Cleanup) -> bool {
-    let Some(record) = workspace_record(&target.workspace_id) else {
-        return false;
-    };
-    match target.mode {
-        Mode::Worktree => {
-            let Some(checkout) = target.worktree.as_deref() else {
-                return false;
-            };
-            let current = at(&record, "/worktree/checkout_path").unwrap_or_default();
-            !current.is_empty() && same_path(current, checkout)
-        }
-        Mode::Cwd => {
-            // A cwd-mode workspace is ours only if it still holds a pane whose
-            // terminal_id matches one we recorded (either the agent's terminal_id
-            // or the root pane's terminal_id). This handles both the case where
-            // the agent is running and the case where the agent died at launch.
-            let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
-                Method::PaneList(PaneListParams {
-                    workspace_id: Some(target.workspace_id.clone()),
-                }),
-                None,
-                REQUEST_TIMEOUT,
-            );
-            match bounded_res {
-                Ok(response) => {
-                    let panes = response
-                        .pointer("/result/panes")
-                        .and_then(|panes| panes.as_array());
-                    holds_recorded_terminal(
-                        panes.map(Vec::as_slice),
-                        &[&target.terminal_id, &target.root_pane_terminal_id],
-                    )
-                }
-                Err(_) => false,
-            }
-        }
-    }
+/// `Ours` is the only case a destructive step may act on. `NotOurs` means the
+/// server ANSWERED and the evidence is against us (the id has been reused, or
+/// the workspace lost the pane we recorded). `Unknown` is "the question could
+/// not be asked" — a failed request, a malformed answer — and `tear_down`
+/// treats it as a reason to refuse the operation entirely (K-rule: when in
+/// doubt, destroy nothing; also, when in doubt, forget nothing either).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Identity {
+    Ours,
+    NotOurs,
+    Unknown(String),
 }
 
-fn workspace_record(workspace_id: &str) -> Option<serde_json::Value> {
-    let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
+/// How a `workspace.get` for the identity check turned out.
+///
+/// The three outcomes are kept apart because `identity` routes them to three
+/// different `Identity` answers: a healthy response → the record itself, a
+/// server-level `workspace_not_found` → NotOurs, every other failure (request
+/// error, malformed response, any other refusal) → Unknown(reason).
+enum WorkspaceLookup {
+    Found(serde_json::Value),
+    NotFound,
+    Failed(String),
+}
+
+fn workspace_lookup(workspace_id: &str) -> WorkspaceLookup {
+    let bounded_res = bounded(
         Method::WorkspaceGet(WorkspaceTarget {
             workspace_id: workspace_id.to_string(),
         }),
         None,
-        Duration::from_secs(60),
     );
-    match bounded_res {
-        Ok(response) => response
-            .pointer("/result/workspace")
-            .filter(|record| record.is_object())
-            .cloned(),
-        Err(_) => None,
+    let response = match bounded_res {
+        Ok(response) => response,
+        Err(err) => return WorkspaceLookup::Failed(err.to_string()),
+    };
+    if let Some(error) = response.get("error") {
+        let err = parse_server_error(error);
+        if err.code == "workspace_not_found" {
+            return WorkspaceLookup::NotFound;
+        }
+        return WorkspaceLookup::Failed(err.to_string());
     }
+    match response.pointer("/result/workspace") {
+        Some(record) if record.is_object() => WorkspaceLookup::Found(record.clone()),
+        _ => WorkspaceLookup::Failed(
+            "workspace.get: the server's answer carried no workspace record".to_string(),
+        ),
+    }
+}
+
+/// Which pane list the identity check should use.
+///
+/// The three outcomes mirror `WorkspaceLookup`: a listed workspace with a
+/// pane array, a `workspace_not_found` (server answered the delete already
+/// happened — NotOurs), or any other failure/malformed answer (Unknown with
+/// its reason).
+enum PaneLookup {
+    Found(Vec<serde_json::Value>),
+    NotFound,
+    Failed(String),
+}
+
+fn pane_lookup(workspace_id: &str) -> PaneLookup {
+    let bounded_res = bounded(
+        Method::PaneList(PaneListParams {
+            workspace_id: Some(workspace_id.to_string()),
+        }),
+        None,
+    );
+    let response = match bounded_res {
+        Ok(response) => response,
+        Err(err) => return PaneLookup::Failed(err.to_string()),
+    };
+    if let Some(error) = response.get("error") {
+        let err = parse_server_error(error);
+        if err.code == "workspace_not_found" {
+            return PaneLookup::NotFound;
+        }
+        return PaneLookup::Failed(err.to_string());
+    }
+    match response.pointer("/result/panes").and_then(|v| v.as_array()) {
+        Some(panes) => PaneLookup::Found(panes.clone()),
+        None => {
+            PaneLookup::Failed("pane.list: the server's answer carried no pane array".to_string())
+        }
+    }
+}
+
+/// Pure function to classify the identity of a would-be delegate workspace
+/// from the two server answers that could prove it.
+///
+/// The two modes can only be checked against different things, because they
+/// were recorded differently. A worktree workspace is identified by its
+/// CHECKOUT — the thing that was actually created. A cwd workspace has no
+/// checkout of its own, so it is identified by a PANE it still holds: the
+/// agent's, or the shell it was created with. A public pane id is never
+/// reused within a server's life, so either is a stronger claim than the
+/// workspace id alone.
+fn identity_from(
+    mode: Mode,
+    workspace: WorkspaceLookup,
+    recorded_checkout: Option<&str>,
+    recorded_panes: &[&str],
+    cwd_panes: impl FnOnce() -> PaneLookup,
+) -> Identity {
+    let record = match workspace {
+        WorkspaceLookup::Found(r) => r,
+        WorkspaceLookup::NotFound => return Identity::NotOurs,
+        WorkspaceLookup::Failed(reason) => return Identity::Unknown(reason),
+    };
+    match mode {
+        Mode::Worktree => {
+            let Some(checkout) = recorded_checkout else {
+                return Identity::NotOurs;
+            };
+            let current = at(&record, "/worktree/checkout_path").unwrap_or_default();
+            if !current.is_empty() && same_path(current, checkout) {
+                Identity::Ours
+            } else {
+                Identity::NotOurs
+            }
+        }
+        Mode::Cwd => match cwd_panes() {
+            PaneLookup::Found(panes) => {
+                if holds_recorded_terminal(Some(&panes), recorded_panes) {
+                    Identity::Ours
+                } else {
+                    Identity::NotOurs
+                }
+            }
+            PaneLookup::NotFound => Identity::NotOurs,
+            PaneLookup::Failed(reason) => Identity::Unknown(reason),
+        },
+    }
+}
+
+/// What a destructive step gets to know about the workspace it was asked to
+/// close. Three answers (W1): `Ours` acts, `NotOurs` leaves the workspace
+/// alone (the checkout may still be killed by path in worktree mode), and
+/// `Unknown` refuses the operation.
+fn identity(target: &Cleanup) -> Identity {
+    if target.workspace_id.is_empty() {
+        return Identity::NotOurs;
+    }
+    let recorded = [
+        target.terminal_id.as_str(),
+        target.root_pane_terminal_id.as_str(),
+    ];
+    identity_from(
+        target.mode,
+        workspace_lookup(&target.workspace_id),
+        target.worktree.as_deref(),
+        &recorded,
+        || pane_lookup(&target.workspace_id),
+    )
 }
 
 /// The parent workspace to close, or `None` to leave it alone.
@@ -1684,13 +1940,16 @@ fn parent_closable(
         return false;
     }
     for other in others {
+        // A row with no `workspace_id` is a malformed list, not an empty slot:
+        // the list itself is evidence of trouble, so refuse to close the
+        // parent on it (W6).
         let Some(id) = field(other, "workspace_id") else {
-            continue;
+            return false;
         };
         if id == ours {
             continue;
         }
-        // Also skip the parent itself
+        // Also skip the parent itself.
         if let Some(parent_id) = parent
             .get("workspace_id")
             .and_then(serde_json::Value::as_str)
@@ -1699,10 +1958,21 @@ fn parent_closable(
                 continue;
             }
         }
-        let linked = other
-            .pointer("/worktree/is_linked_worktree")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
+        // Two shapes a row carries:
+        // 1. No `worktree` block at all — a workspace that is not a worktree
+        //    workspace. `is_linked_worktree` is `false` by absence of the
+        //    containing object, so the row does not block the parent close.
+        // 2. A `worktree` block IS present — then `is_linked_worktree` MUST
+        //    be a boolean. A missing or non-boolean field is a malformed
+        //    row and keeps the parent OPEN (W6: ambiguity never permits).
+        let worktree_block = other.get("worktree");
+        let linked = match worktree_block {
+            None | Some(serde_json::Value::Null) => false,
+            Some(block) => match block.get("is_linked_worktree") {
+                Some(serde_json::Value::Bool(b)) => *b,
+                _ => return false,
+            },
+        };
         let same_repo = repo_key.is_none()
             || other
                 .pointer("/worktree/repo_key")
@@ -1720,12 +1990,30 @@ fn parent_closable(
 /// repository-root workspace is that checkout's parent and closing it would take
 /// an operator's work with it.
 fn parent_to_close(target: &Cleanup) -> Result<Option<String>, ServerError> {
+    parent_to_close_with(
+        target,
+        |id| match workspace_lookup(id) {
+            WorkspaceLookup::Found(record) => Some(record),
+            WorkspaceLookup::NotFound | WorkspaceLookup::Failed(_) => None,
+        },
+        || workspace_records(None),
+    )
+}
+
+/// The decision half of `parent_to_close`, with its two inventory requests
+/// handed in: a parent-record fetch and a workspace list. Pure given those,
+/// so the call-site tests (W7) can drive it with fakes.
+fn parent_to_close_with(
+    target: &Cleanup,
+    fetch_parent: impl FnOnce(&str) -> Option<serde_json::Value>,
+    list_others: impl FnOnce() -> Option<Vec<serde_json::Value>>,
+) -> Result<Option<String>, ServerError> {
     let Some(parent_id) = target.parent_workspace_id.clone() else {
         return Ok(None);
     };
-    let parent = workspace_record(&parent_id);
+    let parent = fetch_parent(&parent_id);
     let repo_root = target.repo_root.as_deref();
-    let others = workspace_records(None);
+    let others = list_others();
     let ours = target.workspace_id.as_str();
     let repo_key = target.repo_key.as_deref();
     if parent_closable(
@@ -1755,7 +2043,6 @@ fn kill(
             ..WorktreeKillParams::default()
         }),
         None,
-        Duration::from_secs(60),
     ) {
         Ok(response) => response,
         Err(BoundedError::TimedOut) => {
@@ -1783,7 +2070,6 @@ fn close_workspace(workspace_id: &str) -> Result<serde_json::Value, ServerError>
             workspace_id: workspace_id.to_string(),
         }),
         None,
-        Duration::from_secs(60),
     ) {
         Ok(response) => response,
         Err(BoundedError::TimedOut) => {
@@ -1854,17 +2140,32 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     }
     if let Some(existing) = read_entry(name) {
         if let Some(cleanup) = Cleanup::from_entry(&existing) {
-            if workspace_is_ours(&cleanup) {
-                return Ok(fail(format!("delegate {name} exists; reap it first")));
-            }
-            // The workspace is gone. A checkout that is still on disk is not: it
-            // belongs to this name, and a second start would leave it with no
-            // delegate and no way to address it.
-            if let Some(checkout) = existing.worktree.as_deref() {
-                if Path::new(checkout).exists() {
+            match identity(&cleanup) {
+                Identity::Ours => {
+                    return Ok(fail(format!("delegate {name} exists; reap it first")));
+                }
+                Identity::Unknown(reason) => {
+                    // We cannot establish whether the workspace is still this
+                    // name's — the server did not answer, or the answer was
+                    // malformed. Refuse rather than start a second delegate
+                    // over one that may still be running (W1 governing rule:
+                    // when in doubt, destroy nothing — AND forget nothing).
                     return Ok(fail(format!(
-                        "delegate {name} has a leftover checkout at {checkout}; reap it first"
+                        "delegate {name}: could not check whether it is already running: {reason}"
                     )));
+                }
+                Identity::NotOurs => {
+                    // The server answered: the workspace is gone or belongs
+                    // to someone else. A checkout that is still on disk is
+                    // not: it belongs to this name, and a second start would
+                    // leave it with no delegate and no way to address it.
+                    if let Some(checkout) = existing.worktree.as_deref() {
+                        if Path::new(checkout).exists() {
+                            return Ok(fail(format!(
+                                "delegate {name} has a leftover checkout at {checkout}; reap it first"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -1955,21 +2256,19 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         )));
     }
 
-    // No request between persisting the cursor and typing the brief: the whole
-    // point of capturing it last is that it is the cursor of the turn this
-    // submit starts.
-    match super::pane::submit_sequence(&pane_id, &sentence) {
-        Ok(0) => {}
-        Ok(_) | Err(_) => {
-            // The sentence did not land, so this start did not happen. Undo it
-            // rather than leave a workspace, a checkout and a registry entry
-            // describing a round nobody is running.
-            let _ = std::fs::remove_file(entry_path(name));
-            rollback(&cleanup);
-            return Ok(fail(format!(
-                "delegate {name}: the brief was not submitted"
-            )));
-        }
+    // No request between persisting the cursor and typing the brief: the
+    // whole point of capturing it last is that it is the cursor of the turn
+    // this submit starts. The submit is bounded (W2); a server that goes
+    // quiet mid-type does not hang start.
+    if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
+        // The sentence did not land, so this start did not happen. Undo it
+        // rather than leave a workspace, a checkout and a registry entry
+        // describing a round nobody is running.
+        let _ = std::fs::remove_file(entry_path(name));
+        rollback(&cleanup);
+        return Ok(fail(format!(
+            "delegate {name}: the brief was not submitted: {reason}"
+        )));
     }
 
     if !flags.await_result {
@@ -1999,8 +2298,60 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
 /// stderr beside the cause.
 fn rollback(cleanup: &Cleanup) {
     if let Err(err) = tear_down(cleanup, true, true) {
-        eprintln!("delegate {}: rollback also failed: {err}", cleanup.name);
+        eprintln!(
+            "delegate {}: rollback also failed: {}",
+            cleanup.name, err.message
+        );
     }
+}
+
+/// Type the brief into the agent's pane, then press Enter, each as its own
+/// bounded request (W2).
+///
+/// The `pane` module has a helper that does the same ordered writes, but it
+/// routes through the untimed socket helpers upstairs: a server that goes
+/// quiet mid-type can hang the whole command forever (F2). This helper takes
+/// the same two steps — type, then Enter — through `bounded`, so both halves
+/// inherit the 10 s `PaneSendInput` cap and the caller's deadline (if any).
+/// A failure returns the server's own words; a timeout returns `TimedOut` so
+/// the caller can print "the brief was not submitted: timed out".
+fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), String> {
+    // 1) Type the sentence. No keys ride along: that is the whole point.
+    bounded_submit(
+        Method::PaneSendInput(PaneSendInputParams {
+            pane_id: pane_id.to_string(),
+            text: text.to_string(),
+            keys: Vec::new(),
+        }),
+        deadline,
+    )?;
+    // 2) Let the pane's reader come back round before the Enter — the same
+    //    gap `pane run` uses, so the submit lands at the same cadence.
+    std::thread::sleep(PANE_RUN_SUBMIT_GAP);
+    // 3) Press Enter, on its own, as its own write.
+    bounded_submit(
+        Method::PaneSendKeys(PaneSendKeysParams {
+            pane_id: pane_id.to_string(),
+            keys: vec!["Enter".to_string()],
+        }),
+        deadline,
+    )?;
+    Ok(())
+}
+
+/// Make a `bounded` request, map a timeout to a readable "timed out" string,
+/// a transport error to its own message, and a server refusal to its code and
+/// message. Shared by both halves of `submit_brief`.
+fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), String> {
+    let response = match bounded(method, deadline) {
+        Ok(response) => response,
+        Err(BoundedError::TimedOut) => return Err("timed out".to_string()),
+        Err(BoundedError::Transport(err)) => return Err(err.to_string()),
+    };
+    if let Some(error) = response.get("error") {
+        return Err(server_error(error));
+    }
+    Ok(())
 }
 
 fn start_the_agent(
@@ -2030,9 +2381,8 @@ fn start_the_agent(
         None,
     )
     .map_err(|err| format!("delegate {name}: could not start the agent: {err}"))?;
-    if let Some(error) = response.get("error") {
-        return Err(format!("delegate {name}: {}", server_error(error)));
-    }
+    // `request` returns Err on a server-level error already (see its impl),
+    // so a response here is a success envelope: no second `error` check (F12).
     response
         .pointer("/result/agent")
         .filter(|record| record.is_object())
@@ -2084,20 +2434,41 @@ fn await_ready(
         }
     }
 
+    let mut last_status: Option<String> = None;
     loop {
-        let Some(record) = agent_record_opt(&terminal_id, None) else {
-            return Err(format!("delegate {name}: the agent no longer resolves"));
-        };
-        let status = field(&record, "agent_status")
-            .unwrap_or("unknown")
-            .to_string();
-        if matches!(status.as_str(), "idle" | "done") {
-            return Ok(record);
+        match agent_record(&terminal_id, Some(deadline)) {
+            AgentFetch::Found(record) => {
+                let status = field(&record, "agent_status")
+                    .unwrap_or("unknown")
+                    .to_string();
+                if matches!(status.as_str(), "idle" | "done") {
+                    return Ok(record);
+                }
+                if expired(Some(deadline)) {
+                    // The agent is up but sitting on a status that is not a
+                    // prompt (`blocked`, `working`, `unknown`). Name the
+                    // status, not the clock — that is what tells the caller
+                    // what to look at.
+                    return Err(format!("delegate {name} is {status}"));
+                }
+                last_status = Some(status);
+                sleep_bounded(deadline, READY_POLL);
+            }
+            AgentFetch::Missing => {
+                return Err(format!("delegate {name}: the agent no longer resolves"))
+            }
+            AgentFetch::TimedOut => {
+                // The next request refused to send because the deadline had
+                // passed. Report the last status we DID see, so a readiness
+                // that ran out while the agent was `blocked` says `blocked`
+                // rather than hiding the status behind the clock.
+                return Err(match last_status {
+                    Some(status) => format!("delegate {name} is {status}"),
+                    None => format!("delegate {name} is not ready: timed out"),
+                });
+            }
+            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
         }
-        if expired(Some(deadline)) {
-            return Err(format!("delegate {name} is {status}"));
-        }
-        sleep_bounded(deadline, READY_POLL);
     }
 }
 
@@ -2166,23 +2537,20 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         )));
     }
 
-    match super::pane::submit_sequence(&entry.pane_id, &sentence) {
-        Ok(0) => {}
-        Ok(_) | Err(_) => {
-            // This round did not start, so the whole entry goes back, and a
-            // write-back that itself fails is said rather than swallowed: a
-            // registry that now claims a round nobody is running is worse than
-            // the failed send that caused it.
-            if let Err(err) = write_entry(&original) {
-                eprintln!(
-                    "delegate {name}: the brief was not submitted and the registry could not be \
-                     restored: {err}"
-                );
-            }
-            return Ok(fail(format!(
-                "delegate {name}: the brief was not submitted"
-            )));
+    if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
+        // This round did not start, so the whole entry goes back, and a
+        // write-back that itself fails is said rather than swallowed: a
+        // registry that now claims a round nobody is running is worse than
+        // the failed send that caused it.
+        if let Err(err) = write_entry(&original) {
+            eprintln!(
+                "delegate {name}: the brief was not submitted and the registry could not be \
+                 restored: {err}"
+            );
         }
+        return Ok(fail(format!(
+            "delegate {name}: the brief was not submitted: {reason}"
+        )));
     }
 
     if !flags.await_result {
@@ -2213,20 +2581,33 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
 /// one sampled, for the same reason as [`await_ready`]: the cursor has to be the
 /// one this round starts from.
 fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_json::Value, String> {
+    let mut last_status: Option<String> = None;
     loop {
-        let Some(record) = agent_record_opt(&entry.terminal_id, None) else {
-            return Err(format!("delegate {name}: the agent no longer resolves"));
-        };
-        let status = field(&record, "agent_status")
-            .unwrap_or("unknown")
-            .to_string();
-        if matches!(status.as_str(), "idle" | "done") {
-            return Ok(record);
+        match agent_record(&entry.terminal_id, Some(deadline)) {
+            AgentFetch::Found(record) => {
+                let status = field(&record, "agent_status")
+                    .unwrap_or("unknown")
+                    .to_string();
+                if matches!(status.as_str(), "idle" | "done") {
+                    return Ok(record);
+                }
+                if expired(Some(deadline)) {
+                    return Err(format!("delegate {name} is {status}"));
+                }
+                last_status = Some(status);
+                sleep_bounded(deadline, READY_POLL);
+            }
+            AgentFetch::Missing => {
+                return Err(format!("delegate {name}: the agent no longer resolves"))
+            }
+            AgentFetch::TimedOut => {
+                return Err(match last_status {
+                    Some(status) => format!("delegate {name} is {status}"),
+                    None => format!("delegate {name} is not ready: timed out"),
+                });
+            }
+            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
         }
-        if expired(Some(deadline)) {
-            return Err(format!("delegate {name} is {status}"));
-        }
-        sleep_bounded(deadline, READY_POLL);
     }
 }
 
@@ -2259,6 +2640,12 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
     let entry = match require_delegate(name, deadline) {
         Ok(entry) => entry,
         Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
+        Err(RequireFailure::Failed(reason)) => {
+            // The server was unreachable. Never "not a delegate" (W4): a
+            // transport failure has not proved the name is gone. Exit 1 with
+            // the error on stderr and nothing on stdout.
+            return Ok(fail(format!("delegate {name}: {reason}")));
+        }
         Err(RequireFailure::TimedOut(boxed)) => {
             // The agent lookup burned the budget. Emit the timeout outcome
             // against the registry entry we read before the clock ran out, so
@@ -2312,7 +2699,6 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             offset: None,
         }),
         None,
-        REQUEST_TIMEOUT,
     );
     let response = match bounded_res {
         Ok(response) => response,
@@ -2424,18 +2810,22 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
 /// `NotDelegate` is a usage error (exit 2) with "not a delegate: {name}", and
 /// `TimedOut` carries the entry so the one caller that cares (`delegate wait`
 /// / `send --await`) can emit a `timeout` outcome object and exit 124 (K5).
+#[derive(Debug)]
 enum RequireFailure {
-    /// The name does not resolve to this process's delegate right now: no
-    /// registry entry, no agent, the agent is a different one, or a transport
-    /// failure that could not prove identity. All five mean the same thing to
-    /// a caller: this is not a delegate.
+    /// The server answered: the name is not this process's delegate right now
+    /// (no registry entry, agent not found, or the agent is a different one).
+    /// Caller exits 2 with `not a delegate: <name>` on stderr.
     NotDelegate,
     /// The caller's deadline passed while looking up the agent record. The
-    /// entry we found before that is handed back so the caller can emit a
-    /// timeout outcome object naming the delegate (K5). Boxed so this
-    /// variant does not inflate every `NotDelegate` return by hundreds of
-    /// bytes (clippy::result_large_err).
+    /// entry we found before that is handed back so `delegate wait` /
+    /// `send --await` can emit a `timeout` outcome object naming the delegate
+    /// (K5). Boxed so this variant does not inflate every `NotDelegate`
+    /// return by hundreds of bytes (clippy::result_large_err).
     TimedOut(Box<Entry>),
+    /// The server was unreachable (dead socket, closed connection). This is
+    /// never `NotDelegate` — a server that cannot answer has not proved the
+    /// name is gone (W4). Caller exits 1 with the reason on stderr.
+    Failed(String),
 }
 
 fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, RequireFailure> {
@@ -2446,7 +2836,13 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, Requ
     let Some(entry) = read_entry(name) else {
         return Err(RequireFailure::NotDelegate);
     };
-    match agent_record(name, deadline) {
+    require_decide(entry, agent_record(name, deadline))
+}
+
+/// The pure decision half of `require_delegate`, given the entry already read
+/// and the agent-lookup outcome. The call-site tests (W7) exercise this.
+fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailure> {
+    match fetch {
         AgentFetch::Found(record) => {
             if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
                 Err(RequireFailure::NotDelegate)
@@ -2456,12 +2852,13 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, Requ
         }
         AgentFetch::Missing => Err(RequireFailure::NotDelegate),
         AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
+        AgentFetch::Failed(reason) => Err(RequireFailure::Failed(reason)),
     }
 }
 
-/// Map the two "no entry" `RequireFailure` cases for callers that pass a `None`
-/// deadline and so never see `TimedOut`. A `TimedOut` from one of those is a
-/// bug in this module — the deadline would have had to come from somewhere.
+/// Map a `RequireFailure` into an exit code for callers that do not want to
+/// emit a `timeout` outcome object: `NotDelegate` is a usage error (exit 2),
+/// `TimedOut`/`Failed` print on stderr and exit 1.
 fn require_delegate_no_deadline(name: &str) -> Result<Entry, i32> {
     match require_delegate(name, None) {
         Ok(entry) => Ok(entry),
@@ -2469,6 +2866,7 @@ fn require_delegate_no_deadline(name: &str) -> Result<Entry, i32> {
         Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
             "delegate {name}: timed out resolving the agent"
         ))),
+        Err(RequireFailure::Failed(reason)) => Err(fail(format!("delegate {name}: {reason}"))),
     }
 }
 
@@ -2488,8 +2886,17 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
     if let Err(reason) = validate_name(name) {
         return Ok(usage(reason));
     }
-    // The lock BEFORE the entry, for the same reason as `send`: the entry a reap
-    // acts on must be the one the lock protects.
+    // The lock BEFORE the entry, for the same reason as `send`: the entry a
+    // reap acts on must be the one the lock protects.
+    //
+    // `--force` proceeds without the lock. The teardown is already idempotent
+    // (each step confirms the id is still ours, treats `workspace_not_found`
+    // and the already-gone kill codes as "nothing to do", and derives
+    // `removed` from what actually happened). Two concurrent forced reaps of
+    // the same delegate therefore each succeed with the same observable
+    // outcome: the entry gone, and whichever one lost the race reporting
+    // `removed: false` for every field — the serialisation we gave up by
+    // skipping the lock is replaced by that record of who did what (F13).
     let _lock = match take_lock(name) {
         Ok(lock) => lock,
         Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
@@ -2530,6 +2937,12 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
             )));
         }
     }
+    // `removed` tells a script what the reap actually did, not what it was
+    // asked to do: hardcoding `true` here (as earlier revisions did) made a
+    // reap that destroyed nothing — identity unknown, server down — look
+    // indistinguishable from one that closed the workspace. The field is now
+    // derived from `TearDown`: true iff anything the reap owns is gone (W1).
+    let any_removed = removed.workspace_closed || removed.checkout_removed || removed.parent_closed;
     if flags.json {
         println!(
             "{}",
@@ -2537,7 +2950,10 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
                 "name": entry.name,
                 "workspace_id": entry.workspace_id,
                 "worktree": entry.worktree,
-                "removed": true,
+                "removed": any_removed,
+                "workspace_closed": removed.workspace_closed,
+                "checkout_removed": removed.checkout_removed,
+                "parent_closed": removed.parent_closed,
             })
         );
     } else {
@@ -2654,6 +3070,20 @@ enum SettledDecision {
     Failed(String),
     /// Settle again from the cursor that just settled.
     WaitAgain,
+}
+
+/// What `started_another_turn` concluded (W4).
+///
+/// Four answers: a new turn ends the grace with `Grace::NewTurn`, no new
+/// turn keeps polling, a timeout ends the whole await as `Outcome::Timeout`,
+/// and a transport failure ends it as exit 1. Earlier revisions returned
+/// `bool`, which collapsed `Failed` into "no new turn" and spun silently
+/// against a dead server.
+enum TurnCheck {
+    NewTurn,
+    NoNewTurn,
+    Timeout,
+    Failed(String),
 }
 
 struct Await<'a> {
@@ -2829,9 +3259,13 @@ impl Await<'_> {
                 ResultPoll::NotYet => {}
             }
             // The agent took another turn, so the reply that answers THIS round
-            // is not the next one to land. Settle again instead.
-            if self.started_another_turn(settled_cursor) {
-                return Grace::NewTurn;
+            // is not the next one to land. Settle again instead. A transport
+            // failure here is a FAILURE, not "no new turn" (W4).
+            match self.started_another_turn(settled_cursor) {
+                TurnCheck::NewTurn => return Grace::NewTurn,
+                TurnCheck::NoNewTurn => {}
+                TurnCheck::Timeout => return Grace::Timeout,
+                TurnCheck::Failed(reason) => return Grace::Refused(reason),
             }
             sleep_bounded(grace_end, RESULT_POLL);
         }
@@ -2843,31 +3277,45 @@ impl Await<'_> {
     /// same question: has a new turn started since the cursor I waited past? A
     /// higher `working_entries` says yes, and so does a cursor that settled
     /// mid-turn whose `state_seq` has moved since.
-    fn started_another_turn(&self, settled_cursor: &str) -> bool {
+    ///
+    /// Returns a `TurnCheck`: `NewTurn` ends the grace, `NoNewTurn` keeps
+    /// polling, `Timeout` ends the whole await as `Outcome::Timeout`, and
+    /// `Failed` ends it as exit 1 with the reason on stderr. Collapsing a
+    /// `Fail` into `NoNewTurn` (the behaviour before W4) made an unreachable
+    /// server look like a stable "no new turn" and the await spun silently.
+    fn started_another_turn(&self, settled_cursor: &str) -> TurnCheck {
         if settled_cursor.is_empty() {
-            return false;
+            return TurnCheck::NoNewTurn;
         }
-        // The deadline is `self.deadline`: this call lives inside an await, so
-        // any failure here is already routed through `await_failure`
-        // (`agent_record` does it). A timeout here is treated like "no new turn"
-        // — the clock will drive the outer loop to Outcome::Timeout anyway, and
-        // positive evidence for a new turn requires a successful response.
-        let Some(record) = agent_record_opt(&self.entry.terminal_id, self.deadline) else {
-            return false;
+        let record = match agent_record(&self.entry.terminal_id, self.deadline) {
+            AgentFetch::Found(record) => record,
+            // The agent is gone — not a new turn, but the next `poll_result`
+            // will see the gone-ness and return `Grace::Gone`.
+            AgentFetch::Missing => return TurnCheck::NoNewTurn,
+            AgentFetch::TimedOut => return TurnCheck::Timeout,
+            AgentFetch::Failed(reason) => return TurnCheck::Failed(reason),
         };
         let Some(raw) = record
             .get("turn_cursor")
             .and_then(serde_json::Value::as_str)
         else {
-            return false;
+            return TurnCheck::NoNewTurn;
         };
         let (Ok(now), Ok(before)) = (Cursor::parse(raw), Cursor::parse(settled_cursor)) else {
-            return false;
+            return TurnCheck::NoNewTurn;
         };
         if now.epoch != before.epoch {
-            return now.epoch > before.epoch;
+            return if now.epoch > before.epoch {
+                TurnCheck::NewTurn
+            } else {
+                TurnCheck::NoNewTurn
+            };
         }
-        now.entries > before.entries || (before.working && now.seq > before.seq)
+        if now.entries > before.entries || (before.working && now.seq > before.seq) {
+            TurnCheck::NewTurn
+        } else {
+            TurnCheck::NoNewTurn
+        }
     }
 
     /// Is the newest reply this round's?
@@ -2894,7 +3342,6 @@ impl Await<'_> {
                 offset: None,
             }),
             self.deadline,
-            REQUEST_TIMEOUT,
         );
         let response = match bounded_res {
             Ok(response) => response,
@@ -3305,6 +3752,10 @@ mod tests {
         assert!(!ALREADY_GONE_CODES.contains(&"dirty_worktree_requires_force"));
     }
 }
+
+#[cfg(test)]
+#[path = "delegate_callsite_tests.rs"]
+mod callsite_tests;
 
 #[cfg(test)]
 #[path = "delegate_decisions_tests.rs"]

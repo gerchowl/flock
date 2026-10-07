@@ -1024,6 +1024,75 @@ fn s5_settled_wait_refusals_are_byte_for_byte() {
     }
 }
 
+/// W2 (P578 r4-3): every request `delegate send` makes is bounded. A `send`
+/// against a frozen server ends well within `cap + 5 s` (not forever),
+/// exits 1 naming the delegate, and leaves the registry entry's `round`
+/// unchanged — a submit failing must look to a retry like the round that
+/// failed had never been written.
+///
+/// This is the call-site mirror of the brief's W2: the frozen-server read
+/// (`require_delegate` → `agent.get`) and the brief submit itself (now
+/// bounded through `delegate.rs`, not through the untimed `pane` helpers)
+/// both honour the cap. Either path is proof that no request is unbounded;
+/// what the test rules out is the F2 behaviour of hanging forever.
+#[test]
+fn s6_send_against_a_frozen_server_ends_within_cap() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    finish(child);
+    // Capture round BEFORE the frozen send so a retry would see the same
+    // round number — a failed submit must not mutate the entry.
+    let round_before: u64 = {
+        let body = fs::read_to_string(registry_entry_path(&server, "d1")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&body).unwrap();
+        entry["round"].as_u64().unwrap()
+    };
+
+    let pid = server.child.process_id().expect("server pid") as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let b2 = brief(&server, "task2.md", "y\n");
+    let started = Instant::now();
+    let mut send = cli_spawn(&server, &["delegate", "send", "d1", "--brief", &b2]);
+    // 10 s PaneSendInput cap + 5 s slack: that is the brief's budget.
+    let status = exited_within(&mut send, Duration::from_secs(15));
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let status = status.expect("the send must end on its own, not stall against a frozen server");
+    let elapsed = started.elapsed();
+    let out = finish(send);
+    assert_eq!(status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "ended within cap + 5 s: {elapsed:?}"
+    );
+    assert!(
+        stderr(&out).contains("delegate d1"),
+        "stderr names the delegate: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("not a delegate"),
+        "an unreachable server is never 'not a delegate': {}",
+        stderr(&out)
+    );
+
+    let round_after: u64 = {
+        let body = fs::read_to_string(registry_entry_path(&server, "d1")).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&body).unwrap();
+        entry["round"].as_u64().unwrap()
+    };
+    assert_eq!(
+        round_before, round_after,
+        "a failed submit leaves the entry unchanged"
+    );
+}
+
 /// R18 (gerchowl/flock#556): `flk --help` must mention `delegate` so a supervising
 /// agent can discover the verb.
 #[test]
