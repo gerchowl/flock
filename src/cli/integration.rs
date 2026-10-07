@@ -177,11 +177,17 @@ fn print_integration_manifest_summary(manifest: &serde_json::Value) {
 }
 
 fn integration_install(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = parse_integration_target(args, "install")? else {
+    let trust_hooks = !args.iter().any(|arg| arg == "--no-trust-hooks");
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--no-trust-hooks")
+        .cloned()
+        .collect();
+    let Some(target) = parse_integration_target(&rest, "install")? else {
         return Ok(2);
     };
 
-    match crate::integration::install_target(target) {
+    match crate::integration::install_target_with_hook_trust(target, trust_hooks) {
         Ok(messages) => {
             print_integration_messages(messages);
             Ok(0)
@@ -260,7 +266,7 @@ fn print_integration_help() {
     eprintln!("  flk integration install pi");
     eprintln!("  flk integration install omp");
     eprintln!("  flk integration install claude");
-    eprintln!("  flk integration install codex");
+    eprintln!("  flk integration install codex [--no-trust-hooks]");
     eprintln!("  flk integration install copilot");
     eprintln!("  flk integration install kimi");
     eprintln!("  flk integration install opencode");

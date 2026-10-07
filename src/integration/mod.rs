@@ -1,3 +1,4 @@
+mod codex_hook_trust;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -508,6 +509,13 @@ fn take_pending_run_id() -> Option<String> {
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
 ) -> io::Result<Vec<String>> {
+    install_target_with_hook_trust(target, true)
+}
+
+pub(crate) fn install_target_with_hook_trust(
+    target: crate::api::schema::IntegrationTarget,
+    trust_hooks: bool,
+) -> io::Result<Vec<String>> {
     let messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
@@ -551,7 +559,7 @@ pub(crate) fn install_target(
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
-            let installed = install_codex()?;
+            let installed = install_codex_with_trust(trust_hooks)?;
             vec![
                 format!(
                     "installed codex integration hook to {}",
@@ -1497,7 +1505,12 @@ pub(crate) fn integration_manifest(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
+    install_codex_with_trust(true)
+}
+
+fn install_codex_with_trust(trust_hooks: bool) -> io::Result<CodexInstallPaths> {
     let dir = codex_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1563,7 +1576,15 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     } else {
         String::new()
     };
-    let new_config = build_codex_config_with_hooks(&existing_config);
+    let mut new_config = build_codex_config_with_hooks(&existing_config);
+    if trust_hooks {
+        new_config = codex_hook_trust::trust_flock_hook(
+            &new_config,
+            &hooks_path,
+            &hooks_file,
+            &format!("bash {quoted_hook_path} session"),
+        )?;
+    }
     if new_config != existing_config {
         fs::write(&config_path, new_config)?;
     }
@@ -4412,6 +4433,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_install_trusts_only_its_hook_and_can_opt_out() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        fs::write(
+            base.join("config.toml"),
+            "[hooks.state.other]\nenabled = false\ntrusted_hash = \"keep\"\n",
+        )
+        .unwrap();
+        fs::write(base.join("hooks.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo unrelated","timeout":10}]}]}}"#).unwrap();
+        install_codex_with_trust(false).unwrap();
+        let before = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(!before.contains("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        let after = fs::read_to_string(base.join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&after).unwrap();
+        let states = config["hooks"]["state"].as_table().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states["other"]["trusted_hash"].as_str(), Some("keep"));
+        assert_eq!(states["other"]["enabled"].as_bool(), Some(false));
+        let key = format!(
+            "{}:session_start:1:0",
+            base.join("hooks.json").canonicalize().unwrap().display()
+        );
+        assert!(states[&key]["trusted_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        assert_eq!(after, fs::read_to_string(base.join("config.toml")).unwrap());
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn install_codex_uses_codex_home_env() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -4483,8 +4540,17 @@ mod tests {
 
         let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
-        assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
-        assert!(config.contains("[features]\nhooks = true\nother = true"));
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        assert_eq!(
+            config["profiles"]["work"]["features"]["hooks"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            config["profiles"]["work"]["features"]["codex_hooks"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(config["features"]["other"].as_bool(), Some(true));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
