@@ -275,7 +275,7 @@ fn parse_entry(value: &serde_json::Value) -> TranscriptEvent {
 /// A full date library would be a dependency for one field; this accepts only
 /// the exact UTC form observed and returns `None` for anything else, so a
 /// format change costs the age label, never the content.
-fn parse_rfc3339_utc(raw: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<SystemTime> {
     let (date, rest) = raw.split_once('T')?;
     let time = rest.strip_suffix('Z')?;
     let time = time.split_once('.').map_or(time, |(head, _frac)| head);
