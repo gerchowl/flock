@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- **A healthy remote bridge is no longer labelled with an earlier attempt's failure** (#621, #616). A bridge connection now carries the number the accept loop gave it, the run of failures closes the moment the tunnel *delivers* rather than once the client has been handed the bytes, and a failure from a connection older than the newest one that delivered is still logged but no longer reopens the run. The client sees a dead tunnel's EOF *before* the bridge's connection thread has read ssh's stderr and recorded why, so a redial's success could land first and the earlier attempt's failure land after it — leaving `failing_reason` naming that stale reason (and the launcher's fallback notice quoting it) while a working tunnel was live, which also made `remote::tests::a_first_attempt_failure_the_retry_fixes_is_not_a_warning` flake on macOS and Linux CI. A failure from a connection *newer* than the last success still opens or extends the run, and the log line, its attempt number and its DEBUG/WARN edge are unchanged.
+
 ## [0.9.0] - 2026-10-07
 
 ### Fixed
