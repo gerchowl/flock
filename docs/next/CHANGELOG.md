@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- **A remote live handoff pins the import binary's version, not the client's** (#600). `flk --remote <host> --handoff` sent `--expected-version <this client's build>` next to `--import-exe <the remote's binary>`, and the importer checks that pin against **its own** `build_info::version()` — so the pin asserted a fact about a binary on the far side of an ssh connection that only the client believed. #606 made such a refusal legible (`handoff import refused: handoff expected flock vX, but this server is vY`); this stops the launcher from manufacturing one. The handoff now asks the binary at `--import-exe` what it is (`<binary> --version`, one extra ssh round trip on a path that already spends several) and pins that answer. **A probe that fails drops the version pin rather than guessing**: the handoff runs anyway, `--expected-protocol` is still pinned to this client's protocol — the wire is what the client has to match, and it was never the pin at fault — and an unpinned import is the state a hand-run `flk server live-handoff` is already in. The launcher normally makes the two version strings agree by itself (`prepare_remote_flock` will not use a remote binary whose `--version` does not match the client's, and re-checks after installing one), so this covers what that gate cannot: a remote binary replaced *after* the probe — a Nix profile switch or a home-manager run landing between the two ssh calls — where the refusal cost a rollback and then a stop-the-server prompt on a host with live panes in it.
+
 ## [0.9.0] - 2026-10-07
 
 ### Fixed
