@@ -1295,18 +1295,20 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
+/// #600: the importer validates `expected_version` against its OWN
+/// `build_info::version()` (`handoff::receive_after_token`), so a pin naming
+/// this client's build is a claim about a binary that lives on the far side of
+/// the ssh connection. Ask the binary at `--import-exe` what it is and pin
+/// that. The protocol pin stays this client's — the wire is what the client
+/// actually needs to match, and `remote_binary_matches` already confirmed the
+/// remote binary speaks it.
 fn live_handoff_remote_server(
     target: &str,
     remote_flock: &RemoteFlock,
     context: LaunchContext,
 ) -> io::Result<()> {
-    let command = format!(
-        "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
-        remote_flock.shell_path,
-        remote_flock.shell_path,
-        CURRENT_PROTOCOL,
-        current_version()
-    );
+    let import_version = remote_import_binary_version(target, remote_flock);
+    let command = live_handoff_command(remote_flock, import_version.as_deref());
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
@@ -1320,6 +1322,49 @@ fn live_handoff_remote_server(
         ),
     );
     Ok(())
+}
+
+/// The remote handoff command, with the version the importer will check.
+///
+/// `expected_version` of `None` drops `--expected-version` from the command
+/// entirely rather than pinning a guess: an unpinned import is the state a
+/// hand-run `flk server live-handoff` is already in, and it relaxes only the
+/// version half of the importer's validation.
+fn live_handoff_command(remote_flock: &RemoteFlock, expected_version: Option<&str>) -> String {
+    let expected_version = expected_version
+        .map(|version| format!(" --expected-version {}", shell_quote(version)))
+        .unwrap_or_default();
+    format!(
+        "{0} server live-handoff --import-exe {0} --expected-protocol {CURRENT_PROTOCOL}{expected_version}",
+        remote_flock.shell_path,
+    )
+}
+
+/// What the binary that will run the import reports as its version, which is
+/// the only version the importer can agree with.
+///
+/// One extra ssh round trip on a path that already spends several, and it
+/// answers with `None` rather than an error: a failed probe drops the version
+/// pin and the handoff still runs.
+fn remote_import_binary_version(target: &str, remote_flock: &RemoteFlock) -> Option<String> {
+    let command = format!("{} --version", remote_flock.shell_path);
+    let output = ssh_sh_output(target, &command).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_flk_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `flk --version` prints one line, `flk <version>` (`main`). Anything else —
+/// a shell error, a wrapper, a build that prints nothing — yields no pin: a
+/// version read out of unexpected output is the refusal this replaced, and a
+/// missing pin costs nothing but the check.
+fn parse_flk_version(stdout: &str) -> Option<String> {
+    let version = stdout.lines().next()?.trim().strip_prefix("flk ")?.trim();
+    if version.is_empty() || version.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 fn stop_remote_server(
@@ -4202,6 +4247,135 @@ mod tests {
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/flk\" remote-client-bridge"
         );
+    }
+
+    /// #600: the importer checks `expected_version` against its own build, so
+    /// the pin has to name the binary at `--import-exe` — the one this command
+    /// probed — and never this client's build.
+    #[test]
+    fn live_handoff_pins_the_import_binarys_own_version() {
+        let probed = parse_flk_version("flk 0.8.0-fork.629bd3d\n").expect("probe reply");
+        assert_eq!(
+            live_handoff_command(&test_remote_flock(), Some(&probed)),
+            format!(
+                r#""$HOME/.local/bin/flk" server live-handoff --import-exe "$HOME/.local/bin/flk" --expected-protocol {CURRENT_PROTOCOL} --expected-version 0.8.0-fork.629bd3d"#
+            )
+        );
+        assert!(
+            !current_version().is_empty(),
+            "the client's version is what this pin must NOT carry"
+        );
+    }
+
+    /// #600: a probe that answers with anything but `flk <version>` — a shell
+    /// error, a wrapper script, a build that prints nothing — must leave the
+    /// handoff unpinned rather than pinned to a guess, and must not stop it.
+    #[test]
+    fn live_handoff_drops_the_version_pin_when_the_probe_found_none() {
+        let remote_flock = test_remote_flock();
+        assert_eq!(parse_flk_version("sh: flk: not found\n"), None);
+        assert_eq!(parse_flk_version(""), None);
+        assert_eq!(parse_flk_version("flk \n"), None);
+        assert_eq!(parse_flk_version("flk 0.9.0 extra\n"), None);
+        assert_eq!(
+            live_handoff_command(&remote_flock, None),
+            format!(
+                r#""$HOME/.local/bin/flk" server live-handoff --import-exe "$HOME/.local/bin/flk" --expected-protocol {CURRENT_PROTOCOL}"#
+            )
+        );
+    }
+
+    /// The pin is only worth anything if it names the binary that will run the
+    /// import, so drive the whole call against a stub remote and read the
+    /// command it was actually handed. A pin carrying this client's version is
+    /// the refusal #600 reported: the importer is a different build.
+    #[test]
+    fn a_remote_live_handoff_asks_the_import_binary_and_pins_its_answer() {
+        let stub = r#"#!/bin/sh
+script=$(cat)
+printf '%s\n' "$script" >> "$(dirname "$0")/scripts.log"
+case "$script" in
+  *--version*)
+    printf '%s\n' 'flk 0.8.0-fork.629bd3d'
+    ;;
+esac
+exit 0
+"#;
+        let stub_dir = install_stub_ssh("handoff-pin", stub);
+        let handoff = handoff_script_run_against_stub(&stub_dir);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert!(
+            handoff.contains("--expected-version 0.8.0-fork.629bd3d"),
+            "the pin must be the probed import binary's own version: {handoff}"
+        );
+        assert!(
+            !handoff.contains(&current_version()),
+            "this client's version must never be pinned for a remote import: {handoff}"
+        );
+        assert!(
+            handoff.contains(&format!("--expected-protocol {CURRENT_PROTOCOL}")),
+            "the protocol pin is the one this client needs to match: {handoff}"
+        );
+    }
+
+    /// The same call against a remote whose `--version` fails: the handoff
+    /// still runs, still pins the protocol, and carries no version pin.
+    #[test]
+    fn a_remote_live_handoff_runs_unpinned_when_the_probe_failed() {
+        let stub = r#"#!/bin/sh
+script=$(cat)
+printf '%s\n' "$script" >> "$(dirname "$0")/scripts.log"
+case "$script" in
+  *--version*)
+    printf 'no version here\n' >&2
+    exit 3
+    ;;
+esac
+exit 0
+"#;
+        let stub_dir = install_stub_ssh("handoff-probe-failed", stub);
+        let handoff = handoff_script_run_against_stub(&stub_dir);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert!(
+            !handoff.contains("--expected-version"),
+            "a failed probe must drop the version pin, not guess one: {handoff}"
+        );
+        assert!(
+            handoff.contains(&format!("--expected-protocol {CURRENT_PROTOCOL}")),
+            "the protocol pin survives a failed version probe: {handoff}"
+        );
+    }
+
+    /// Run one remote live handoff with `ssh` resolved to `stub_dir`, and
+    /// return the script the launcher sent for the handoff itself. `ssh_sh_output`
+    /// feeds the remote script on stdin, so the stub's log is what the remote
+    /// would have run.
+    fn handoff_script_run_against_stub(stub_dir: &Path) -> String {
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: nextest runs each test in its own process, so no other thread
+        // in this process is reading PATH while it is swapped, the same reason
+        // the bridge tests above give.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
+        }
+        let result = live_handoff_remote_server(
+            "stub-handoff-target",
+            &test_remote_flock(),
+            LaunchContext::FederationSwitch,
+        );
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        result.expect("live handoff against the stub remote");
+
+        let recorded = std::fs::read_to_string(stub_dir.join("scripts.log")).expect("stub log");
+        recorded
+            .lines()
+            .find(|line| line.contains("server live-handoff"))
+            .unwrap_or_else(|| panic!("the stub never saw the handoff: {recorded}"))
+            .to_string()
     }
 
     #[test]
