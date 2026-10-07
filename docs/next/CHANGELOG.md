@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.0] - 2026-10-07
+
 ### Fixed
 - **A live handoff the import binary refuses now says why** (#600). `flk server live-handoff` from a 0.6.8-fork server to a 0.8.0-fork binary failed in ~30 ms with only `handoff stream closed while reading line`. The two versions hand off fine (verified old server to new binary on macOS and Linux with a 25-pane session and the real config); what failed was the importer *refusing* the handoff, typically because the exporter pinned `--expected-version`/`--expected-protocol` (a remote attach pins the client's build) and the binary at the import path is a different build. The importer closed the stream without a word and its stderr is `/dev/null`, so the refusal looked like a crash. The import process now writes `error: <reason>` back on the handoff stream before it closes, the exporter lifts it into the `handoff_failed` message at any step up to `ready` (validation, restore, or the final wait) (`handoff import refused: handoff expected flock v... but this server is v...`), and the import logs `handoff.import.refused` to `flock-server.log`. Needs no change on the exporter: an old exporter reading the refusal line fails cleanly on `did not validate manifest`.
 
