@@ -1379,6 +1379,23 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         failed.get("error").is_some(),
         "bad protocol handoff should fail: {failed}"
     );
+    // #600: the exporter must surface WHY the import refused, not an opaque
+    // "handoff stream closed while reading line". Both sides are post-fix in
+    // this test, so the importer's `error: <reason>` round-trips into
+    // `handoff import refused: <reason>` here.
+    let error_message = failed
+        .get("error")
+        .and_then(|err| err.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    assert!(
+        error_message.starts_with("handoff import refused:"),
+        "exporter must surface the refusal reason, got: {error_message:?}"
+    );
+    assert!(
+        error_message.contains("protocol"),
+        "refusal reason must name the protocol mismatch, got: {error_message:?}"
+    );
     wait_for_api(&api_socket, Duration::from_secs(5));
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
 
