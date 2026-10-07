@@ -21,6 +21,10 @@ enum ConversationStore {
         session_id: String,
         path: std::path::PathBuf,
     },
+    Codex {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
     Opencode {
         session_id: String,
         db: std::path::PathBuf,
@@ -30,7 +34,9 @@ enum ConversationStore {
 impl ConversationStore {
     fn session_id(&self) -> &str {
         match self {
-            Self::Claude { session_id, .. } | Self::Opencode { session_id, .. } => session_id,
+            Self::Claude { session_id, .. }
+            | Self::Opencode { session_id, .. }
+            | Self::Codex { session_id, .. } => session_id,
         }
     }
 
@@ -38,6 +44,7 @@ impl ConversationStore {
         match self {
             Self::Claude { .. } => "claude",
             Self::Opencode { .. } => "opencode",
+            Self::Codex { .. } => "codex",
         }
     }
 
@@ -253,6 +260,13 @@ impl App {
             ConversationStore::Claude { path, .. } => {
                 crate::agent_transcript::read_history(path, params.detail, params.cursor, limit)
             }
+            ConversationStore::Codex { .. } => {
+                return encode_error(
+                    id,
+                    "unsupported_for_agent",
+                    "Codex supports agent.result, but agent.history is not supported",
+                );
+            }
             ConversationStore::Opencode { db, session_id } => {
                 opencode_history(db, session_id, params.detail, params.cursor, limit)
             }
@@ -321,6 +335,7 @@ impl App {
             Some(crate::detect::AgentState::Working | crate::detect::AgentState::Blocked)
         );
         let read = match &store {
+            ConversationStore::Codex { path, .. } => crate::codex_transcript::read_tail(path),
             ConversationStore::Claude { path, .. } => {
                 crate::agent_transcript::read_tail(path).map(|read| {
                     let over = crate::agent_transcript::finished(&read.events);
@@ -455,14 +470,42 @@ impl App {
             };
             return Ok((resolved, ConversationStore::Opencode { session_id, db }));
         }
-        // A pane with a session flock cannot read is a different answer from
-        // a pane with no session at all: telling a codex operator to check
-        // their hooks would send them after the wrong thing.
         if let Some(info) = terminal.and_then(super::super::creation::terminal_agent_session_info) {
+            if info.agent == "codex" && info.source == "flock:codex" {
+                let codex_home = std::env::var_os("CODEX_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| home.map(|home| home.join(".codex")));
+                let path = codex_home
+                    .map(|home| crate::codex_transcript::rollout_path(&home, &info.value))
+                    .transpose()
+                    .map_err(|_| {
+                        refuse(
+                            "transcript_unreadable",
+                            format!(
+                                "Codex rollouts for session {} could not be read",
+                                info.value
+                            ),
+                        )
+                    })?
+                    .flatten();
+                let Some(path) = path else {
+                    return Err(refuse(
+                        "transcript_not_found",
+                        format!("no Codex rollout on disk for session {}", info.value),
+                    ));
+                };
+                return Ok((
+                    resolved,
+                    ConversationStore::Codex {
+                        session_id: info.value,
+                        path,
+                    },
+                ));
+            }
             return Err(refuse(
                 "unsupported_for_agent",
                 format!(
-                    "{} ({}) has no conversation flock can read: only claude's transcript \
+                    "{} ({}) has no conversation flock can read: only claude and codex transcripts \
                      and opencode's session database are read",
                     info.agent, info.source
                 ),
@@ -558,7 +601,8 @@ fn unix_ms(at: std::time::SystemTime) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{
-        AgentHistoryParams, ErrorResponse, Method, Request, ResponseResult, SuccessResponse,
+        AgentHistoryParams, AgentResultParams, ErrorResponse, Method, Request, ResponseResult,
+        SuccessResponse,
     };
     use crate::app::App;
 
@@ -795,17 +839,78 @@ mod tests {
     #[test]
     fn agent_history_refuses_an_agent_with_no_transcript_flock_can_read() {
         let mut app = test_app();
-        let target = stamp_session(&mut app, "flock:codex", "codex", "sess-codex");
+        let target = stamp_session(&mut app, "flock:kimi", "kimi", "sess-kimi");
 
         let response = history(&mut app, params(&target));
 
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "unsupported_for_agent");
         assert!(
-            error.error.message.contains("codex"),
+            error.error.message.contains("kimi"),
             "{}",
             error.error.message
         );
+    }
+
+    #[test]
+    fn codex_result_reports_not_yet_codes_and_reads_the_reported_session() {
+        let mut app = test_app();
+        let home = std::env::temp_dir().join(format!("flock-codex-api-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CODEX_HOME", &home);
+        let target = focused_terminal_id(&app).to_string();
+        let read = |app: &mut App| {
+            app.handle_agent_result(
+                "req".into(),
+                AgentResultParams {
+                    target: target.clone(),
+                    max_chars: None,
+                    offset: None,
+                },
+            )
+        };
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "no_agent_session");
+        stamp_session(&mut app, "flock:codex", "codex", "sess-codex");
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "transcript_not_found");
+        let dir = home.join("sessions/2026/01/01");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-01-01T00-00-00-sess-codex.jsonl");
+        std::fs::write(&path, "invalid JSON\n").unwrap();
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "transcript_unreadable");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/codex/in-progress.jsonl"),
+        )
+        .unwrap();
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "no_result");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
+        let result = &response["result"]["result"];
+        assert_eq!(result["agent"], "codex", "{response}");
+        assert_eq!(result["text"], "The fixture is sound.\nDONE: checked");
+        assert_eq!(result["finished"], true);
+        assert_eq!(result["at_ms"], 1_767_225_603_125_u64);
+        std::fs::write(
+            &path,
+            concat!(
+                include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+                include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
+            ),
+        )
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(response["result"]["result"]["finished"], false);
+        assert_eq!(response["result"]["result"]["at_ms"], 1_767_225_603_125_u64);
+        std::env::remove_var("CODEX_HOME");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
