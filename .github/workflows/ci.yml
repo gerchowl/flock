@@ -109,3 +109,11 @@ jobs:
 
       - name: Run checks
         run: just ci '${{ matrix.nextest_filter }}'
+
+      # Maintenance-script unittests and the platform test-gap ratchet, which
+      # previously ran only under `just check` (#597). Ubuntu only: pure
+      # Python plus git fixtures, so one platform is enough and the seconds
+      # of cost are not paid on every matrix leg.
+      - name: Run maintenance script tests
+        if: runner.os == 'Linux'
+        run: just script-tests
