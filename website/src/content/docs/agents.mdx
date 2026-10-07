@@ -241,6 +241,35 @@ whole window and then time out, however healthy it is. For those, drop
 already refuses a child that dies inside its first moments, and
 `pane_exited` events report the rest.
 
+### Waiting for an agent to go quiet
+
+`--status idle` is *ready for input*, and it matches `done` as well — an agent
+nobody is watching goes quiet as `done`, which is an effective idle. Both wait
+verbs mean it that way now, which is what makes one usable for an unattended
+agent instead of hanging on it.
+
+For a supervisor, `--status settled` is the more precise question: after a turn
+cursor, the agent entered `working`, and then held `idle`/`done` with no state
+transition at all for the settle window (5000 ms by default, `--settle` to
+change it; `--settle 0` settles on the sample after the first qualifying one).
+
+```bash
+c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
+flk agent send worker "review the auth module" && flk pane send-keys 1-2 Enter
+flk agent wait worker --status settled --after "$c" --timeout 3600000
+```
+
+`settled` is **observed quiescence**, not a turn result — for the turn's
+output use `flk agent result` (once #575 lands). It exits `0` when settled,
+`3` when the agent is blocked, `4` when the pane went away
+(`"reason":"closed"|"hibernated"|"restarted"`), `124` on timeout and `2` on a
+usage error or a refused cursor. Without `--after` any quiet counts, so an
+agent that is already idle settles after one settle window; capture the
+cursor first. A `done` answer can be reached without ever observing
+`working` at all: Flock samples a native agent's screen every 300-500 ms, so a
+turn shorter than one sample is never seen working, and a cursor taken before it
+waits for the next turn instead.
+
 ### The name a start returns is registered immediately
 
 The `name` in the `agent_started` result is the agent's name at the moment the
@@ -291,9 +320,32 @@ flk agent history reviewer --detail full --cursor "$next"
 
 `agent history` reads the agent's own session transcript, one entry per turn,
 unwrapped, with a cursor so a poll reads only what was appended. It touches no
-pane state, so polling it is safe. It is Claude-only today, because Claude's is
-the transcript format Flock parses; for any other agent it refuses with
+pane state, so polling it is safe. It reads Claude's session transcript and
+opencode's session database (read-only); for any other agent it refuses with
 `unsupported_for_agent` rather than inventing an answer.
+
+**To learn how a delegated task went, read its result:**
+
+```bash
+flk agent result reviewer
+```
+
+`agent result` returns the reply the agent's newest turn ended on, plus the
+status of a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line
+(`status: "verdict"`, `status_text: "approve"`), and `finished`, which is false
+while the agent is still working (the text is then the previous turn's reply).
+A long report pages with `--offset`, using the `next_offset` it returns. Ask the
+agents you delegate to to end on one of those three lines, and the supervisor's
+check is one call.
+
+When the whole sequence is the same every time, `flk delegate` is the one command. It makes the space, starts the harness in it, waits until it is at its prompt, types the brief, and with `--await` waits for the round's outcome — in a workspace it created, without ever taking your focus, and in its own worktree so the task cannot touch the checkout you are working in:
+
+```bash
+flk delegate start reviewer --brief ./briefs/review.md --worktree --branch review/spike --await
+flk delegate send reviewer --brief ./briefs/follow-ups.md --await
+```
+
+The brief is a file and exactly one sentence is typed into the agent: `Read <absolute path> and execute it exactly.` Settling is not finishing, so the await reports a round only when the agent actually worked on it and wrote a reply after the brief was submitted — `send` cannot report the previous round's answer as this one's. `flk delegate reap` removes what was recorded; `flk delegate status` and `flk delegate result` read without waiting. See the CLI reference for the flags and exit codes.
 
 One more difference between the sources: `pane read --source visible` follows the
 operator's scroll position, so a human who has scrolled a pane back changes what

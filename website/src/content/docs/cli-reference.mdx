@@ -265,19 +265,21 @@ flk pane report-metadata <pane_id> \
 flk agent list
 flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
+flk agent result <target> [--max-chars N] [--offset N]
 flk agent send <target> <text>
 flk agent rename <target> <name>|--clear
 flk agent focus <target>
-flk agent wait <target> --status <idle|working|blocked|unknown> | --ready [--timeout MS]
+flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
 flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
 flk agent hibernate <target>
 flk agent resume <target>
 flk lineage <target> [--json]
-flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [-- <text starting with dashes>]
+flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--await [--timeout MS]] [-- <text starting with dashes>]
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
 flk msg list [--pane TARGET]
+flk msg status <correlation_id>
 flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
 flk checks list
 flk checks ack <name>
@@ -323,10 +325,73 @@ flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapp
 Wait for pane agent state:
 
 ```bash
-flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown> [--timeout MS]
+flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS]
 ```
 
-Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents.
+Wait for the answer to a message you sent:
+
+```bash
+flk wait reply <correlation_id> [--timeout MS] [--json]
+```
+
+Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after a `msg send --intent needs-reply`: it prints the reply's body (metadata on stderr, or everything with `--json`) and exits 0 replied, 3 deferred by a muted recipient or dropped unread, 124 timed out. It works for a sender outside any pane, whose reply is held for it under the correlation id. `msg send --await` sends and waits in one command.
+
+### Waiting for an agent to go quiet
+
+Both wait verbs take the same seven statuses and mean the same things by them. `idle` is **ready for input**, and it matches `done` as well — an agent nobody is watching goes quiet as `done`, which is an effective idle, so `--status idle` is the way to wait for an unattended agent in either verb. `--status done` means exactly `done`. (`flk wait agent-status --status idle` used to match only a literal `idle` and therefore hung on every unattended agent, which is the hang #553 reports.)
+
+`--status settled` is the one to reach for from a supervisor. It is **observed quiescence**, and the distinction is the whole point:
+
+```bash
+c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
+flk agent send worker "..." && flk pane send-keys <pane> Enter
+flk agent wait worker --status settled --after "$c" --timeout 3600000
+```
+
+`settled` means: after that cursor, the server saw this agent enter `working` (or the cursor was captured while it was already working), and then saw its reported status hold `idle`/`done` with **no state transition at all** for the settle window. Anything in between resets the dwell — including `idle -> blocked -> idle`, which is why the dwell is anchored on a transition counter rather than on the status alone. `--settle MS` sets that window and defaults to `5000`; `--settle 0` settles on the sample after the first qualifying one. Without `--after`, any quiet counts — an agent that is already idle settles after one settle window, so capture the cursor before you prompt.
+
+**It is not proof that a turn produced a result.** It says what Flock observed; for the turn's output use `flk agent result` (once #575 lands). Two consequences follow. Native Claude and opencode agents are read from the screen every 300-500 ms, so a working phase shorter than one sample is never observed — a cursor captured before one waits for the *next* turn instead. And `working_entries` counts *observed* entries, not submitted prompts: capture the cursor after the agent is at its prompt and before you prompt it.
+
+The cursor itself is the `turn_cursor` field on `agent get`, `agent list` and `pane get` — `"{terminal_id}:{execution_epoch}:{working_entries}:{state_seq}:{w|i}"`, opaque to callers. It never satisfies a wait on another terminal or another execution, and one whose counters the server has not reached is refused rather than waited out, so a typo cannot read as "it already worked".
+
+On success `settled` prints one JSON object on stdout:
+
+```json
+{"status":"settled","pane_id":"1-1","agent_status":"idle","turn_cursor":"term_1f2e3:0:2:7:i","held_ms":5003}
+```
+
+`flk wait agent-status <pane> --status settled` is the same signal with the same result line — a supervisor can use whichever verb fits the command it already has. Exit codes for `--status settled`: **0** settled · **3** blocked (a human has to look) · **4** gone, with `"reason":"closed"|"hibernated"|"restarted"` on the line · **124** timeout · **2** a usage error or a refused cursor · **1** any other error. The non-settled statuses keep their historical codes, including `1` for a timeout.
+
+`--after` and `--settle` mean nothing without `--status settled`, and a non-numeric `--settle` or `--timeout` is a usage error: all of these exit `2` before any request is sent, so a typo does not cost you the wait.
+
+### Delegating a task
+
+```bash
+flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])
+                    [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]
+                    [--ready-timeout MS] [--max-chars N] [--json]
+flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]
+flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]
+flk delegate result <name> [--max-chars N] [--json]
+flk delegate status <name> [--json]
+flk delegate reap <name> [--force] [--json]
+```
+
+`delegate` is the sequence above run as one command: create the space, start the harness in it, wait until it is actually up, type the brief, and — with `--await` — wait for the round's outcome and print it. It is composed from socket methods that already existed, so it adds no new protocol; what it adds is the bookkeeping that was previously in somebody's shell history.
+
+The brief is a file, and exactly one sentence is ever typed into the agent: `Read <absolute path> and execute it exactly.` The path is made absolute without resolving symlinks, and is refused if it contains whitespace, a control character, or any of `` ! $ ` " ' \ `` — the path crosses the agent's shell, and a quote that survives that hop names a different file by the time the agent reads it. Put the instructions in the file; the typed text carries nothing else.
+
+The delegate runs in a workspace it created and **never requests focus**, so your focus is unchanged by any of these verbs and a delegate never lands in the workspace you are looking at. With `--worktree` it makes a linked checkout (`--repo`, `--branch`, `--base`; those three mean nothing with `--cwd` and are refused there) and the agent's cwd is that checkout.
+
+**The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash.
+
+`--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
+
+Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6 and 124 print the same object (a usage error, exit 2, and any other failure, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
+
+`send` runs another round on the same delegate; one round at a time, so a `send` while a round is being awaited exits 1 and types nothing. `wait` without `--after` waits from the cursor the delegate recorded with its latest submit. `result` and `status` read without waiting; a `result` for a round with no reply whose agent no longer exists or is hibernated reports `gone` (exit 4), as `wait` does. `reap` removes only the workspace and checkout recorded at start, reads just the registry so it works even when the agent is gone or the workspace was closed by hand, and leaves the branch decision to `worktree kill`'s merge gate — use that when you want to see the gate first.
+
+`reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
 
 ## Notifications
 
@@ -410,14 +475,16 @@ Exposed tools:
 | `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
 | `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
 | `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
-| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude only. |
+| `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude and opencode. |
+| `flock_agent_result` | `agent.result` | The reply an agent's newest turn ended on — how a delegated task went — with `status`/`status_text` from a final `DONE:`/`BLOCKED:`/`VERDICT:` line and `finished` saying whether that turn is over. Paged by `offset`/`max_chars`. Claude and opencode; read-only. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
 | `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
-| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. |
+| `flock_msg_reply` | `msg.reply` | Routes back to the original sender by identity, across hosts included. `intent` is optional here and defaults to `fyi`. A sender with no inbox gets the reply held for it (`state: "held"`). |
 | `flock_msg_list` | `msg.list` | Undelivered messages. |
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
+| `flock_msg_wait_reply` | `msg.wait_reply` | Block until a message you sent is answered: `outcome` `replied`/`deferred`/`expired`/`timeout`, with the answer in `reply`. Holds the MCP session for up to `timeout_ms` (default 60 s, at most 10 min); run `flk wait reply <id>` as a background task to wait longer. `flock_msg_send` with `await: true` returns the id and that command. |
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
