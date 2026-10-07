@@ -748,3 +748,162 @@ fn a24_reap_closes_a_live_cwd_delegates_own_workspace() {
         "the operator's workspace {operator} survived"
     );
 }
+
+/// The registry entry file for `name`, wherever the state dir keys it.
+fn entry_file(server: &Server, name: &str) -> Option<PathBuf> {
+    let want = format!("{name}.json");
+    walk(&server.base.join("state"))
+        .into_iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some(want.as_str()))
+}
+
+/// The repo-root (non-linked) workspace whose checkout is `repo`, if one is open.
+fn repo_root_workspace(server: &Server, repo: &Path) -> Option<String> {
+    let want = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    workspaces(server).iter().find_map(|ws| {
+        let wt = &ws["worktree"];
+        let path = wt["checkout_path"].as_str()?;
+        let same = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)) == want;
+        (same && wt["is_linked_worktree"] == false)
+            .then(|| ws["workspace_id"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// a25 (P578 r4-3, K1): `reap` NEVER closes the parent workspace, even the one
+/// `worktree.create` opened for this delegate. No repo-root workspace is open
+/// before the start, so the server opens (and reports) a parent.
+#[test]
+fn a25_reap_never_closes_the_parent_the_create_opened() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    assert!(
+        repo_root_workspace(&server, &repo).is_none(),
+        "precondition: no repo-root workspace before the start"
+    );
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w1",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/a25",
+            "--json",
+        ],
+    );
+    make_ready(&server, "w1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let parent = repo_root_workspace(&server, &repo)
+        .expect("precondition: worktree.create opened a repo-root parent workspace");
+
+    let reaped = cli(&server, &["delegate", "reap", "w1", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    assert!(
+        workspaces(&server)
+            .iter()
+            .any(|ws| ws["workspace_id"] == parent.as_str()),
+        "reap left the parent workspace {parent} open"
+    );
+}
+
+/// a26 (P578 r4-3): an UNREACHABLE server is never "not a delegate" and never
+/// permission. With the server dead, `reap` of a cwd delegate exits 1 and KEEPS
+/// the entry (nothing could be shown to be ours, so nothing is forgotten), and
+/// `status` / `wait` exit 1 with the transport error, not 2.
+#[test]
+fn a26_a_dead_server_is_a_failure_not_a_verdict() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    finish(child);
+    assert!(
+        entry_file(&server, "d1").is_some(),
+        "precondition: entry written"
+    );
+
+    let pid = server.child.process_id().expect("server pid") as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    thread::sleep(Duration::from_millis(300));
+
+    let reaped = cli(&server, &["delegate", "reap", "d1", "--json"]);
+    assert_eq!(reaped.status.code(), Some(1), "reap: {}", stderr(&reaped));
+    assert_eq!(
+        stdout(&reaped),
+        "",
+        "an exit-1 reap prints nothing on stdout"
+    );
+    assert!(
+        entry_file(&server, "d1").is_some(),
+        "the entry is KEPT, so the reap can be retried"
+    );
+    for args in [
+        vec!["delegate", "status", "d1"],
+        vec!["delegate", "wait", "d1", "--timeout", "3000", "--json"],
+    ] {
+        let out = cli(&server, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("not a delegate"),
+            "{args:?} names the transport failure, not 'not a delegate': {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "{args:?} prints nothing on stdout");
+    }
+}
+
+/// a27 (P578 r4-3): a reap against a FROZEN server ends on its own, refuses
+/// (exit 1), keeps the entry, and succeeds once the server answers again.
+#[test]
+fn a27_a_frozen_server_reap_refuses_then_retries() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let started = stdout_json(&finish(child));
+    assert_eq!(status.code(), Some(0));
+    let delegate_ws = started["workspace_id"].as_str().unwrap().to_string();
+
+    let pid = server.child.process_id().expect("server pid") as libc::pid_t;
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let mut reap = cli_spawn(&server, &["delegate", "reap", "d1", "--json"]);
+    let status = exited_within(&mut reap, Duration::from_secs(15));
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let status = status.expect("a reap against a frozen server must end on its own");
+    let out = finish(reap);
+    assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    assert!(entry_file(&server, "d1").is_some(), "the entry is kept");
+
+    let retried = cli(&server, &["delegate", "reap", "d1", "--json"]);
+    assert_eq!(
+        retried.status.code(),
+        Some(0),
+        "retry: {}",
+        stderr(&retried)
+    );
+    assert!(
+        workspaces(&server)
+            .iter()
+            .all(|ws| ws["workspace_id"] != delegate_ws.as_str()),
+        "the retried reap closed the delegate's workspace"
+    );
+    assert!(entry_file(&server, "d1").is_none(), "and removed the entry");
+}
