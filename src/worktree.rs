@@ -470,6 +470,10 @@ fn run_command_capture_with_timeout(
 ) -> Result<String, String> {
     let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -1205,6 +1209,10 @@ fn merged_pr_evidence(
         return None;
     }
     let head_oid = value.get("headRefOid").and_then(|v| v.as_str())?;
+    if !valid_commit_oid(head_oid) {
+        tracing::debug!("invalid merged PR head oid: keeping the branch");
+        return None;
+    }
     let number = value.get("number").and_then(|v| v.as_u64());
     let named = |suffix: &str| {
         Some(match number {
@@ -1251,6 +1259,13 @@ fn tip_inside_head(root: &str, local_tip: &str, head_oid: &str, number: Option<u
     commit_is_ancestor_of(root, local_tip, head_oid)
 }
 
+fn valid_commit_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Does this clone hold `oid` as a commit?
 ///
 /// Asked before spending a fetch on it (#646), and about a commit rather than
@@ -1258,6 +1273,9 @@ fn tip_inside_head(root: &str, local_tip: &str, head_oid: &str, number: Option<u
 /// `^{commit}` is the peel git already knows how to do, which keeps this one
 /// cheap process rather than a `cat-file -t` plus a parse.
 fn commit_object_exists(root: &str, oid: &str) -> bool {
+    if !valid_commit_oid(oid) {
+        return false;
+    }
     run_command_capture(
         "git",
         &["-C", root, "cat-file", "-e", &format!("{oid}^{{commit}}")],
@@ -1298,8 +1316,16 @@ fn merge_head_fetch_refspecs(head_oid: &str, number: Option<u64>) -> Vec<String>
 /// provably merged. No ref is updated either way: a raw oid and a `refs/pull`
 /// source both land in the object store alone.
 fn fetch_merge_head(root: &str, head_oid: &str, number: Option<u64>) -> bool {
+    if !valid_commit_oid(head_oid) {
+        tracing::debug!("invalid merged PR head oid: skipping fetch");
+        return false;
+    }
+    fetch_merge_head_refspecs(root, head_oid, merge_head_fetch_refspecs(head_oid, number))
+}
+
+fn fetch_merge_head_refspecs(root: &str, head_oid: &str, refspecs: Vec<String>) -> bool {
     let deadline = std::time::Instant::now() + MERGE_GATE_TIMEOUT;
-    for refspec in merge_head_fetch_refspecs(head_oid, number) {
+    for refspec in refspecs {
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
@@ -1311,6 +1337,7 @@ fn fetch_merge_head(root: &str, head_oid: &str, number: Option<u64>) -> bool {
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
+                "--",
                 "origin",
                 &refspec,
             ],
@@ -4080,6 +4107,62 @@ prunable stale
             merge_head_fetch_refspecs("d1e2f3", None),
             vec!["d1e2f3".to_string()]
         );
+    }
+
+    #[test]
+    fn worktree_fetch_hanging_remote_returns_within_budget() {
+        let pr = repo_with_a_github_side_merge_head("merge-gate-hanging-remote");
+        let started = std::time::Instant::now();
+        let result = run_command_capture_with_timeout(
+            "git",
+            &[
+                "-C",
+                &pr.root(),
+                "-c",
+                "protocol.ext.allow=always",
+                "fetch",
+                "--",
+                "ext::/bin/sh -c sleep% 30",
+                "refs/pull/7/head",
+            ],
+            None,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        pr.cleanup();
+    }
+
+    #[test]
+    fn merged_pr_evidence_rejects_invalid_oids_before_git() {
+        for oid in [
+            "--upload-pack=touch /tmp/pwn",
+            "g".repeat(40).as_str(),
+            "abc",
+        ] {
+            assert!(!valid_commit_oid(oid));
+            assert_eq!(
+                merged_pr_evidence(&merged_pr_json(7, oid), "", Some(oid)),
+                None
+            );
+            assert!(!fetch_merge_head("", oid, Some(7)));
+            assert!(!commit_object_exists("", oid));
+        }
+        assert!(valid_commit_oid(&"a".repeat(40)));
+        assert!(valid_commit_oid(&"0".repeat(64)));
+    }
+
+    #[test]
+    fn merge_head_fetch_falls_back_after_oid_fetch_fails() {
+        let pr = repo_with_a_github_side_merge_head("merge-gate-ref-fallback");
+        // A deliberately absent oid forces the first fetch to fail, then the ref arrives.
+        assert!(fetch_merge_head_refspecs(
+            &pr.root(),
+            &pr.merged_head,
+            vec!["0".repeat(40), "refs/pull/7/head".to_string()],
+        ));
+        assert!(commit_object_exists(&pr.root(), &pr.merged_head));
+        pr.cleanup();
     }
 
     #[test]
