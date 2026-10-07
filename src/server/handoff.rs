@@ -161,20 +161,34 @@ pub(crate) fn accept_and_validate_on(
     stream.flush()?;
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let response = read_line_unbuffered(&mut stream)?;
-    let trimmed = response.trim_end();
+    expect_line(
+        &mut stream,
+        "validated",
+        "handoff import did not validate manifest",
+    )?;
+    let _ = std::fs::remove_file(socket_path);
+    Ok(stream)
+}
+
+/// Read one line from the importer and require it to be `expected`. A line
+/// carrying [`IMPORT_REFUSAL_PREFIX`] is the importer naming why it refused,
+/// and surfaces as `handoff import refused: <reason>` at whichever step the
+/// exporter was waiting on. Any other line is reported under `what`.
+#[cfg(unix)]
+fn expect_line(stream: &mut UnixStream, expected: &str, what: &str) -> io::Result<()> {
+    let line = read_line_unbuffered(&mut *stream)?;
+    let trimmed = line.trim_end();
+    if trimmed == expected {
+        return Ok(());
+    }
     if let Some(reason) = trimmed.strip_prefix(IMPORT_REFUSAL_PREFIX) {
         return Err(io::Error::other(format!(
             "handoff import refused: {reason}"
         )));
     }
-    if trimmed != "validated" {
-        return Err(io::Error::other(format!(
-            "handoff import did not validate manifest: unexpected response {trimmed:?}"
-        )));
-    }
-    let _ = std::fs::remove_file(socket_path);
-    Ok(stream)
+    Err(io::Error::other(format!(
+        "{what}: unexpected response {trimmed:?}"
+    )))
 }
 
 /// Write a one-line `error: <reason>` back to the handoff stream before the
@@ -210,23 +224,17 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
     send_fds(stream, fds)?;
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let restored = read_line_unbuffered(&mut *stream)?;
-    if restored.trim_end() != "restored" {
-        return Err(io::Error::other(
-            "handoff import did not report restored runtimes",
-        ));
-    }
-    Ok(())
+    expect_line(
+        stream,
+        "restored",
+        "handoff import did not report restored runtimes",
+    )
 }
 
 #[cfg(unix)]
 pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let ready = read_line_unbuffered(&mut *stream)?;
-    if ready.trim_end() != "ready" {
-        return Err(io::Error::other("handoff import did not report ready"));
-    }
-    Ok(())
+    expect_line(stream, "ready", "handoff import did not report ready")
 }
 
 #[cfg(unix)]
@@ -545,7 +553,7 @@ mod tests {
         let manifest: HandoffManifest = serde_json::from_str(OLD_SHAPE_MANIFEST)
             .expect("old-shape handoff manifest must deserialize");
         assert_eq!(manifest.version, HANDOFF_VERSION);
-        assert_eq!(manifest.source_protocol, crate::protocol::PROTOCOL_VERSION);
+        assert_eq!(manifest.source_protocol, 25);
         assert_eq!(manifest.panes.len(), 1);
         assert_eq!(manifest.snapshot.workspaces.len(), 1);
     }
@@ -584,6 +592,33 @@ mod tests {
             "refusal must carry the pinned version, got {message:?}"
         );
         assert!(importer_err.to_string().contains("expected flock v"));
+    }
+
+    #[test]
+    fn refusal_where_restored_is_expected_surfaces_as_a_named_refusal() {
+        let (mut importer_side, mut exporter_side) =
+            UnixStream::pair().expect("socketpair available");
+        report_import_refusal(&mut importer_side, "pane restore failed")
+            .expect("refusal line writes");
+        exporter_side
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout settable");
+        let err = expect_line(&mut exporter_side, "restored", "did not restore")
+            .expect_err("a refusal is not `restored`");
+        assert_eq!(
+            err.to_string(),
+            "handoff import refused: pane restore failed"
+        );
+
+        let (mut importer_side, mut exporter_side) =
+            UnixStream::pair().expect("socketpair available");
+        importer_side.write_all(b"bogus\n").expect("write");
+        let err = expect_line(&mut exporter_side, "restored", "did not restore")
+            .expect_err("an unexpected line is an error");
+        assert_eq!(
+            err.to_string(),
+            "did not restore: unexpected response \"bogus\""
+        );
     }
 
     #[test]

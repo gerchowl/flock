@@ -3847,14 +3847,27 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        let mut app = app::App::new_from_handoff(
+        let mut app = match app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub.clone(),
             &received.manifest.snapshot,
             &mut imports,
-        )?;
+        ) {
+            Ok(app) => app,
+            Err(err) => {
+                // Same as `receive`: tell the exporter why before the stream drops.
+                crate::logging::handoff_import_refused(&err.to_string());
+                if let Err(report_err) = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                ) {
+                    crate::logging::handoff_refusal_report_failed(&report_err.to_string());
+                }
+                return Err(err);
+            }
+        };
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         crate::server::handoff::report_restored(&mut received.stream)?;
