@@ -266,6 +266,7 @@ impl TracedCommand {
 
         let args = shape_args(&self.inner);
         let start = Instant::now();
+        self.process_group(0);
         self.inner.stdout(std::process::Stdio::piped());
         self.inner.stderr(std::process::Stdio::piped());
         let result = (|| -> io::Result<Output> {
@@ -274,19 +275,21 @@ impl TracedCommand {
             let mut child = self.inner.spawn()?;
             let mut stdout_pipe = child.stdout.take();
             let mut stderr_pipe = child.stderr.take();
-            let stdout_reader = std::thread::spawn(move || {
+            let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 if let Some(pipe) = stdout_pipe.as_mut() {
                     let _ = pipe.read_to_end(&mut buf);
                 }
-                buf
+                let _ = stdout_tx.send(buf);
             });
-            let stderr_reader = std::thread::spawn(move || {
+            let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 if let Some(pipe) = stderr_pipe.as_mut() {
                     let _ = pipe.read_to_end(&mut buf);
                 }
-                buf
+                let _ = stderr_tx.send(buf);
             });
 
             let deadline = start + timeout;
@@ -297,6 +300,7 @@ impl TracedCommand {
                         // SIGKILL, not SIGTERM: this is a probe we already gave
                         // its full budget, and a child ignoring TERM would just
                         // extend the stall we are here to bound.
+                        crate::platform::kill_process_group(child.id());
                         let _ = child.kill();
                         let _ = child.wait();
                         break None;
@@ -305,9 +309,21 @@ impl TracedCommand {
                 }
             };
 
-            // Joins return once the pipes close, which the kill above forces.
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
+            if status.is_none() {
+                // Descendants can escape the group and retain pipes. Never join
+                // their readers after the deadline.
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
+            }
+            let read_output = |reader: std::sync::mpsc::Receiver<Vec<u8>>| {
+                reader
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| {
+                        crate::platform::kill_process_group(child.id());
+                        io::Error::new(io::ErrorKind::TimedOut, "output pipes timed out")
+                    })
+            };
+            let stdout = read_output(stdout_rx)?;
+            let stderr = read_output(stderr_rx)?;
             match status {
                 Some(status) => Ok(Output {
                     status,
