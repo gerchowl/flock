@@ -22,8 +22,10 @@ const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/gerchowl/flock/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/gerchowl/flock/dev/website/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "FLOCK_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "FLOCK_REATTACH_COMMAND";
 
@@ -1394,6 +1396,7 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
     let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
+    crate::update::ensure_release_asset_origin(&asset.url).map_err(io::Error::other)?;
 
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("flock.tmp");

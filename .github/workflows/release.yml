@@ -329,7 +329,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       # The manifest lands on dev through a PR like any other change, and reaches
@@ -371,6 +371,16 @@ jobs:
           else
             echo "::warning::docs/next/product-announcement.json changed after $GITHUB_REF_NAME; leaving it unchanged."
           fi
+
+      # The client reads this asset: https://github.com/gerchowl/flock/releases/latest/download/latest.json
+      # redirects to the newest non-prerelease release. The in-repo copy below
+      # is only the reviewed record of it.
+      - name: Upload latest.json as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "v$VERSION" website/latest.json --clobber
 
       - name: Open the website latest manifest PR
         env:

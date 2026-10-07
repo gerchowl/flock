@@ -26,7 +26,7 @@ except ImportError:  # executed directly as scripts/changelog.py
         recommended_bump,
     )
 
-DEFAULT_LIVE_MANIFEST_URL = "https://flock.dev/latest.json"
+DEFAULT_LIVE_MANIFEST_URL = "https://github.com/gerchowl/flock/releases/latest/download/latest.json"
 
 SECTION_RE = re.compile(r"^##\s+(?:\[(?P<bracketed>[^\]]+)\]|(?P<plain>.+?))\s*$", re.MULTILINE)
 VERSION_WITH_DATE_RE = re.compile(r"^(?P<version>.+?)\s+-\s+\d{4}-\d{2}-\d{2}$")

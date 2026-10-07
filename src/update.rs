@@ -1,6 +1,6 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted flock.dev update manifest for newer versions.
+//! Checks the update manifest published with each GitHub release for newer versions.
 //! Manual `flk update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -18,8 +18,26 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/gerchowl/flock/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/gerchowl/flock/dev/website/preview.json";
+/// The only origin a release binary may be downloaded from. A manifest is
+/// fetched over the network, so its asset URLs are data, not trust (ADR-0025).
+pub(crate) const RELEASE_ASSET_URL_PREFIX: &str =
+    "https://github.com/gerchowl/flock/releases/download/";
+
+/// Refuse an asset URL that is not one of this repository's release downloads.
+pub(crate) fn ensure_release_asset_origin(url: &str) -> Result<(), String> {
+    if url.starts_with(RELEASE_ASSET_URL_PREFIX) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to download {url}: update assets must come from {RELEASE_ASSET_URL_PREFIX}"
+        ))
+    }
+}
+
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/flock.json";
 const FLOCK_UPDATE_COMMAND: &str = "flk update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade flock";
@@ -553,6 +571,8 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
 
     // Unique temp file (avoids races with concurrent instances)
     let tmp_path = parent.join(format!(".flock-update-{}.tmp", std::process::id()));
+
+    ensure_release_asset_origin(&release.download_url)?;
 
     // Download the exact asset URL (pinned to the release we checked)
     let status = TracedCommand::new("curl", "update")
@@ -2130,6 +2150,25 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_asset_origin_accepts_only_this_repository() {
+        assert!(super::ensure_release_asset_origin(
+            "https://github.com/gerchowl/flock/releases/download/v0.8.0/flock-linux-x86_64"
+        )
+        .is_ok());
+        for foreign in [
+            "https://example.com/flock",
+            "https://flock.dev/flock-linux-x86_64",
+            "https://github.com/other/flock/releases/download/v1/flock",
+            "http://github.com/gerchowl/flock/releases/download/v1/flock",
+        ] {
+            assert!(
+                super::ensure_release_asset_origin(foreign).is_err(),
+                "{foreign}"
+            );
+        }
+    }
+
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::{
