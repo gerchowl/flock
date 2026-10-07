@@ -1270,10 +1270,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
         let reason = "the server created the workspace but its answer was malformed";
         if mode == Mode::Worktree {
             if let (Some(path), Some(before)) = (worktree.as_deref(), worktrees_before.as_ref()) {
-                let in_before = before
-                    .iter()
-                    .any(|w| w.get("path").and_then(|v| v.as_str()) == Some(path));
-                if !in_before {
+                if checkout_is_new(before, path) {
                     match kill(None, Some(path), true) {
                         Ok(_) => {
                             eprintln!("delegate {name}: rollback removed stray checkout at {path}");
@@ -1453,21 +1450,27 @@ impl CreateFailure {
 /// pre-existing checkout respelled by the server (relative vs absolute,
 /// trailing slash) is not treated as "new" and force-killed (W13 / G12). We
 /// use `worktree.list` to find checkouts, filtering by branch if given.
+/// Was `path` absent from the pre-create `worktree.list`? Compared with
+/// `same_path`, never as raw strings: a respelled pre-existing checkout must
+/// never read as new, because "new" authorises a force kill (G12, rr5 H2).
+fn checkout_is_new(worktrees_before: &[serde_json::Value], path: &str) -> bool {
+    !worktrees_before.iter().any(|w| {
+        w.get("path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|before| same_path(before, path))
+    })
+}
+
 fn find_new_checkout(
     worktrees_before: &[serde_json::Value],
     worktrees_after: &[serde_json::Value],
     branch: Option<&str>,
 ) -> Option<String> {
-    let before_paths: Vec<String> = worktrees_before
-        .iter()
-        .filter_map(|w| w.get("path").and_then(|v| v.as_str()).map(str::to_string))
-        .collect();
-
     for worktree in worktrees_after {
         let Some(path) = worktree.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if before_paths.iter().any(|p| same_path(p, path)) {
+        if !checkout_is_new(worktrees_before, path) {
             continue;
         }
         if let Some(branch_name) = branch {
@@ -1721,6 +1724,11 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
 /// when a checkout path is handed in — the filesystem: a path that no longer
 /// exists cannot be killed, and the server's wording may vary.
 fn is_already_gone(err: &ServerError, checkout: Option<&str>) -> bool {
+    // No answer means nothing is known about the server side: a missing local
+    // path is not evidence that the server-side removal happened (rr5 H1).
+    if matches!(err.code.as_str(), "timeout" | "transport") {
+        return false;
+    }
     if ALREADY_GONE_CODES.contains(&err.code.as_str()) {
         return true;
     }
@@ -2805,6 +2813,29 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
     .run()
 }
 
+/// What `delegate result` reports when the store has no reply yet: the live
+/// agent decides. A gone agent is `gone` (exit 4), as `delegate wait` says; a
+/// failed lookup is a failure, never a verdict.
+#[derive(Debug, PartialEq, Eq)]
+enum NoResultVerdict {
+    Running,
+    NoResult,
+    Gone,
+    Fail(String),
+}
+
+fn no_result_verdict(fetched: &AgentFetch) -> NoResultVerdict {
+    match fetched {
+        AgentFetch::Found(record) => match field(record, "agent_status").unwrap_or("unknown") {
+            "working" | "blocked" | "unknown" => NoResultVerdict::Running,
+            _ => NoResultVerdict::NoResult,
+        },
+        AgentFetch::Missing => NoResultVerdict::Gone,
+        AgentFetch::TimedOut => NoResultVerdict::Fail("timed out".to_string()),
+        AgentFetch::Failed(reason) => NoResultVerdict::Fail(reason.clone()),
+    }
+}
+
 fn delegate_result(args: &[String]) -> io::Result<i32> {
     let Some(name) = args.first() else {
         return Ok(usage(format!("usage: {}", RESULT_USAGE)));
@@ -2844,22 +2875,18 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             // turn is still running. An unreachable server here is a FAILURE
             // (W13 / G5): "running"/"unknown" at exit 0 would make a dead
             // socket indistinguishable from a healthy running turn.
-            let status = match agent_record(&entry.terminal_id, None) {
-                AgentFetch::Found(record) => field(&record, "agent_status")
-                    .unwrap_or("unknown")
-                    .to_string(),
-                AgentFetch::Missing => "unknown".to_string(),
-                AgentFetch::TimedOut => {
-                    return Ok(fail(format!("delegate {}: timed out", entry.name)))
-                }
-                AgentFetch::Failed(reason) => {
+            let fetched = agent_record(&entry.terminal_id, None);
+            let (outcome, code) = match no_result_verdict(&fetched) {
+                NoResultVerdict::Running => ("running", exit::OK),
+                NoResultVerdict::NoResult => ("no_result", exit::OK),
+                // The same answer `delegate wait` gives for a gone agent (rr5 H3).
+                NoResultVerdict::Gone => ("gone", super::settled::exit::GONE),
+                NoResultVerdict::Fail(reason) => {
                     return Ok(fail(format!("delegate {}: {reason}", entry.name)))
                 }
             };
-            let running = matches!(status.as_str(), "working" | "blocked" | "unknown");
-            let outcome = if running { "running" } else { "no_result" };
             emit_outcome(&entry, outcome, None, flags.json, &entry.cursor);
-            return Ok(exit::OK);
+            return Ok(code);
         }
         return Ok(fail(server_error(error)));
     }
@@ -3904,6 +3931,10 @@ mod tests {
 #[cfg(test)]
 #[path = "delegate_callsite_tests.rs"]
 mod callsite_tests;
+
+#[cfg(test)]
+#[path = "delegate_final_tests.rs"]
+mod final_tests;
 
 #[cfg(test)]
 #[path = "delegate_decisions_tests.rs"]
