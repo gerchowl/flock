@@ -729,7 +729,8 @@ pub(super) fn settled_wait(
 /// decisions — when to give up on a server, whether a deadline got there first —
 /// are decisions about a transport, so testing them through a real socket would
 /// mean waiting 30 s for the answer. The shipped window is
-/// [`UNREACHABLE_LIMIT`].
+/// [`UNREACHABLE_LIMIT`], and it applies only when the caller passed no
+/// `--timeout` (see [`Interrupted`]).
 fn settled_core(
     requests: &mut dyn PinnedRequests,
     verb: &str,
@@ -737,12 +738,20 @@ fn settled_core(
     after: Option<&str>,
     settle_ms: u64,
     timeout_ms: Option<u64>,
-    unreachable: Duration,
+    unreachable_window: Duration,
 ) -> std::io::Result<SettledOutcome> {
-    let mut interrupted = Interrupted::new(unreachable);
     let now = Instant::now();
     let timeout = timeout_ms.map(Duration::from_millis);
     let deadline = timeout.and_then(|timeout| now.checked_add(timeout));
+    // The window bounds a wait the caller left UNBOUNDED. Given a `--timeout`,
+    // they chose the bound themselves and a supervisor keys on 124, so that wait
+    // retries to its deadline exactly as it always did — a shorter window here
+    // would trade a code a caller already handles for one it does not (#614).
+    let window = match deadline {
+        Some(_) => None,
+        None => Some(unreachable_window),
+    };
+    let mut interrupted = Interrupted::new(window);
 
     let after = match after {
         Some(raw) => match Cursor::parse(raw) {
@@ -847,13 +856,14 @@ fn settled_core(
             // socket mid-wait can land between two polls. Said once per
             // invocation, though — a wait that cannot reach the server is
             // otherwise silent for as long as its timeout, which reads as a
-            // hang. And retried for a WINDOW, not forever: with no `--timeout`
-            // to end it, a server that has stopped answering entirely would
-            // otherwise keep a supervisor waiting on it indefinitely (#614).
+            // hang. And retried for a WINDOW rather than forever when the caller
+            // set no `--timeout`: without one, a server that has stopped
+            // answering entirely would keep a supervisor waiting indefinitely
+            // (#614). With one, the deadline is the bound and it keeps that.
             Err(PinnedFailure::Retry) => {
-                interrupted.note(verb, deadline);
-                if interrupted.exhausted() {
-                    return Ok(SettledOutcome::Error(interrupted.unreachable()));
+                interrupted.note(verb);
+                if let Some(window) = interrupted.spent_window() {
+                    return Ok(SettledOutcome::Error(unreachable_reason(window)));
                 }
             }
             Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
@@ -911,26 +921,31 @@ enum InitialFailure {
 /// The clock is the second half of the same problem (#614). A retry is right for
 /// a handoff and wrong forever, so this measures the run of failures from the
 /// FIRST one and any answer clears it: a wait that recovers and later drops gets
-/// a whole window again rather than the remainder of one that ended minutes ago.
+/// a whole window rather than the remainder of one that ended minutes ago.
+///
+/// The window is present only when the caller gave no `--timeout`, the one case
+/// where the wait had no bound of its own. `None` here is not "no limit": it is
+/// the deadline doing that job, and the deadline's answer is `124`.
 struct Interrupted {
     said: bool,
     /// When the current run of transport failures began.
     since: Option<Instant>,
-    /// How long that run may last before the wait stops retrying.
-    limit: Duration,
+    /// How long that run may last before the wait gives up, or `None` when a
+    /// `--timeout` bounds the wait instead.
+    window: Option<Duration>,
 }
 
 impl Interrupted {
-    fn new(limit: Duration) -> Self {
+    fn new(window: Option<Duration>) -> Self {
         Self {
             said: false,
             since: None,
-            limit,
+            window,
         }
     }
 
     /// Record one transport failure, and say so the first time.
-    fn note(&mut self, verb: &str, deadline: Option<Instant>) {
+    fn note(&mut self, verb: &str) {
         // Stamped once per run and never re-stamped: measuring from the LATEST
         // failure instead is what would make the window a sliding one, and a
         // server that fails every 199 ms would then never reach it.
@@ -941,7 +956,7 @@ impl Interrupted {
             return;
         }
         self.said = true;
-        eprintln!("{}", interrupted_notice(verb, deadline, self.limit));
+        eprintln!("{}", interrupted_notice(verb, self.window));
     }
 
     /// The server answered: the run of failures is over, latch or no latch.
@@ -949,33 +964,37 @@ impl Interrupted {
         self.since = None;
     }
 
-    /// Whether the current run of failures has outlasted the window.
-    fn exhausted(&self) -> bool {
+    /// The window, once a run of failures has outlasted it.
+    ///
+    /// `None` covers both "no failures yet" and "the caller gave a `--timeout`,
+    /// so the deadline is the bound" — and in both cases the wait must go on
+    /// retrying. Returning the window rather than a bool is what lets the
+    /// message name the one number the notice already printed.
+    fn spent_window(&self) -> Option<Duration> {
+        let window = self.window?;
         self.since
-            .is_some_and(|since| since.elapsed() >= self.limit)
-    }
-
-    /// The reason to end on, naming the window that was waited out — in the same
-    /// number the notice used, so a caller reading both is not told two waits.
-    fn unreachable(&self) -> String {
-        format!(
-            "server unreachable for {}s; giving up",
-            self.limit.as_secs()
-        )
+            .filter(|since| since.elapsed() >= window)
+            .map(|_| window)
     }
 }
 
-/// The one interruption notice, worded by whether there is a deadline left to
-/// retry until.
+/// The reason a wait ends on once it has given up on the server, naming the
+/// window in the same number the notice used.
+fn unreachable_reason(window: Duration) -> String {
+    format!("server unreachable for {}s; giving up", window.as_secs())
+}
+
+/// The one interruption notice, worded by the bound this wait will stop at.
 ///
-/// Without `--timeout` there is no deadline, and saying there is was the other
-/// half of this bug: a wait that will not end printed the words of one that
-/// will (#614). So the window is named instead, from the same constant that ends
-/// it.
-fn interrupted_notice(verb: &str, deadline: Option<Instant>, limit: Duration) -> String {
-    let tail = match deadline {
-        Some(_) => "retrying until the deadline".to_string(),
-        None => format!("retrying for up to {}s", limit.as_secs()),
+/// The window and the deadline are two answers to one question, and exactly one
+/// of them is ever present — so the notice names the one that is. Without a
+/// `--timeout` there was nothing to name, and saying there was a deadline is the
+/// other half of this bug: a wait that could not end described itself as one that
+/// would (#614).
+fn interrupted_notice(verb: &str, window: Option<Duration>) -> String {
+    let tail = match window {
+        Some(window) => format!("retrying for up to {}s", window.as_secs()),
+        None => "retrying until the deadline".to_string(),
     };
     format!("{verb}: connection to the server interrupted, {tail}")
 }
@@ -1006,12 +1025,12 @@ fn resolve_initial(
             Err(()) => {
                 // Retried rather than reported: the same live handoff that
                 // interrupts a wait can land between this process starting and
-                // its first request. Bounded by the same unreachable window, so
-                // a server that is not there at all does not leave a caller who
-                // passed no `--timeout` waiting in the resolve forever (#614).
-                interrupted.note(verb, deadline);
-                if interrupted.exhausted() {
-                    return Err(InitialFailure::Unreachable(interrupted.unreachable()));
+                // its first request. Bounded by the same window when the caller
+                // set no `--timeout`, so a server that is not there at all does
+                // not leave them waiting in the resolve forever (#614).
+                interrupted.note(verb);
+                if let Some(window) = interrupted.spent_window() {
+                    return Err(InitialFailure::Unreachable(unreachable_reason(window)));
                 }
                 sleep_bounded(deadline);
                 continue;
@@ -2088,7 +2107,7 @@ mod tests {
             Duration::from_millis(80),
         );
         let deadline = Instant::now() + Duration::from_millis(40);
-        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
+        let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
         assert!(matches!(
             resolve_initial(
                 &mut requests,
@@ -2150,7 +2169,7 @@ mod tests {
             ))],
             Duration::ZERO,
         );
-        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
+        let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
         match resolve_initial(
             &mut requests,
             InitialTarget::Agent("ghost"),
@@ -2172,17 +2191,17 @@ mod tests {
     /// the first one did not say.
     #[test]
     fn the_interruption_line_is_said_once_per_invocation() {
-        let mut interrupted = Interrupted::new(UNREACHABLE_LIMIT);
-        interrupted.note("agent wait", None);
-        interrupted.note("agent wait", None);
-        interrupted.note("agent wait", None);
+        let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
+        interrupted.note("agent wait");
+        interrupted.note("agent wait");
+        interrupted.note("agent wait");
         assert!(interrupted.said);
     }
 
     /// #614: the notice says what the wait is going to DO, which depends on
-    /// whether it has a deadline to retry until. Without `--timeout` there is
-    /// none, and promising one was half the bug — so the window is named
-    /// instead, from the same constant that ends the wait.
+    /// whether the caller gave a `--timeout` to stop at. A window names itself,
+    /// and without one there is only the deadline to name — which is why a wait
+    /// with no `--timeout` used to promise a deadline it did not have.
     ///
     /// Both wordings are pinned to [`UNREACHABLE_LIMIT`] on purpose: the help
     /// text says "30 s" in a literal, and a test that read the number from
@@ -2190,15 +2209,11 @@ mod tests {
     #[test]
     fn the_interruption_notice_names_the_window_when_there_is_no_deadline() {
         assert_eq!(
-            interrupted_notice("agent wait", None, UNREACHABLE_LIMIT),
+            interrupted_notice("agent wait", Some(UNREACHABLE_LIMIT)),
             "agent wait: connection to the server interrupted, retrying for up to 30s"
         );
         assert_eq!(
-            interrupted_notice(
-                "agent wait",
-                Some(Instant::now() + Duration::from_secs(5)),
-                UNREACHABLE_LIMIT
-            ),
+            interrupted_notice("agent wait", None),
             "agent wait: connection to the server interrupted, retrying until the deadline"
         );
     }
@@ -2212,12 +2227,15 @@ mod tests {
     /// and stops on an answer, neither of which needs time to have passed.
     #[test]
     fn a_run_of_failures_is_timed_from_its_first_and_cleared_by_an_answer() {
-        let mut interrupted = Interrupted::new(Duration::ZERO);
-        assert!(!interrupted.exhausted(), "no failure is no run");
-        interrupted.note("agent wait", None);
+        let mut interrupted = Interrupted::new(Some(Duration::ZERO));
+        assert!(interrupted.spent_window().is_none(), "no failure is no run");
+        interrupted.note("agent wait");
         let first = interrupted.since.expect("a failure starts the run");
-        assert!(interrupted.exhausted(), "a zero window is already spent");
-        interrupted.note("agent wait", None);
+        assert!(
+            interrupted.spent_window().is_some(),
+            "a zero window is already spent"
+        );
+        interrupted.note("agent wait");
         assert_eq!(
             interrupted.since,
             Some(first),
@@ -2225,7 +2243,21 @@ mod tests {
         );
         interrupted.reached();
         assert!(interrupted.since.is_none(), "an answer ends the run");
-        assert!(!interrupted.exhausted(), "and the next drop starts over");
+        assert!(
+            interrupted.spent_window().is_none(),
+            "so the next drop starts over"
+        );
+
+        // No window at all, which is what a `--timeout` gets: the run is still
+        // measured, and never spent, because the deadline is the bound that ends
+        // this wait — with 124, which a supervisor is written to read.
+        let mut bounded = Interrupted::new(None);
+        bounded.note("agent wait");
+        assert!(bounded.since.is_some(), "the failure is still recorded");
+        assert!(
+            bounded.spent_window().is_none(),
+            "with a --timeout the window does not apply at all"
+        );
     }
 
     /// A window a test can wait out: one whole second, which at the 200 ms poll
@@ -2363,10 +2395,29 @@ mod tests {
         assert!(elapsed < TEST_CEILING, "{elapsed:?}");
     }
 
-    /// #614: the window does not take `--timeout`'s job. A deadline shorter than
-    /// the unreachable window arrives first and is still the timeout it has
-    /// always been — exit 124, which a caller reads as "out of time" rather than
-    /// "the server is gone", and which is the answer this wait has always given.
+    /// #614: the window does not take a `--timeout`'s job in either direction.
+    /// A deadline LONGER than the window arrives second, and the wait still ends
+    /// on that deadline with exit 124 — the answer a supervisor is written to
+    /// read. Applying the window here would trade a code every caller already
+    /// handles for one it does not, on a wait whose bound the caller chose.
+    #[test]
+    fn a_timeout_longer_than_the_window_is_still_a_timeout() {
+        let mut replies = vec![Ok(working_agent())];
+        replies.extend(vec![Err(()); 4]);
+
+        // 60 ms of window under a 250 ms deadline: under the old rule the run is
+        // spent at the first poll (200 ms in), and this would report the
+        // unreachable error instead of the timeout the caller asked for.
+        let (outcome, elapsed, _) =
+            wait_over_script(replies, 0, Some(250), Duration::from_millis(60));
+        assert_eq!(outcome, SettledOutcome::TimedOut);
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// #614: a `--timeout` shorter than the shipped window is the same rule from
+    /// the other side, and the case the first version of this fix got wrong: the
+    /// window was reaching in and answering with exit 1 for a wait that had a
+    /// deadline of its own.
     #[test]
     fn a_timeout_shorter_than_the_window_is_still_a_timeout() {
         let mut replies = vec![Ok(working_agent())];
