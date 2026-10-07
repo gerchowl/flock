@@ -907,3 +907,137 @@ fn a27_a_frozen_server_reap_refuses_then_retries() {
     );
     assert!(entry_file(&server, "d1").is_none(), "and removed the entry");
 }
+
+/// a28 (P578 r4-4): a server that freezes during READINESS cannot hold `start`.
+/// The agent has launched but never reported ready; with the server stopped,
+/// `start` must end on its own (`--ready-timeout` plus one 2 s cap plus slack)
+/// with exit 1, and write no registry entry.
+#[test]
+fn a28_a_frozen_server_cannot_hold_start_in_readiness() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--ready-timeout", "3000"]);
+    let appeared = Instant::now() + WITHIN;
+    while agent_get(&server, "d1").is_none() {
+        assert!(
+            Instant::now() < appeared,
+            "the delegate's agent never appeared"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let pid = server.child.process_id().expect("server pid") as libc::pid_t;
+    let frozen = Instant::now();
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let status = exited_within(&mut child, Duration::from_secs(20));
+    let elapsed = frozen.elapsed();
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let status = status.expect("start must end on its own while the server is frozen");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "start ended within ready-timeout + one cap + slack: {elapsed:?}"
+    );
+    assert!(
+        entry_file(&server, "d1").is_none(),
+        "no registry entry was written"
+    );
+}
+
+/// a29 (P578 r4-4): a worktree delegate whose workspace AND checkout are already
+/// gone (killed by hand) reaps cleanly: "already gone" is the goal, not an error.
+#[test]
+fn a29_reap_after_the_checkout_is_already_gone_succeeds() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w1",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/a29",
+            "--json",
+        ],
+    );
+    make_ready(&server, "w1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let started = stdout_json(&out);
+    let ws = started["workspace_id"].as_str().unwrap().to_string();
+    let checkout = started["worktree"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start --json names its checkout: {started}"))
+        .to_string();
+
+    let killed = request(
+        &server,
+        &format!(
+            r#"{{"id":"k","method":"worktree.kill","params":{{"workspace_id":"{ws}","force":true}}}}"#
+        ),
+    );
+    assert!(killed.get("error").is_none(), "worktree.kill: {killed}");
+    assert!(
+        !Path::new(&checkout).exists(),
+        "precondition: the checkout is gone"
+    );
+
+    let reaped = cli(&server, &["delegate", "reap", "w1", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    assert!(entry_file(&server, "w1").is_none(), "the entry is removed");
+}
+
+/// a30 (P578 r4-4): forget nothing. A start whose registry write FAILS must not
+/// delete an entry it did not write. The old entry is stale (its workspace was
+/// closed by hand), so the start proceeds; the write is made to fail by
+/// occupying its temp path with a directory.
+#[test]
+fn a30_a_failed_registry_write_keeps_the_existing_entry() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let started = stdout_json(&finish(child));
+    assert_eq!(status.code(), Some(0));
+    let ws = started["workspace_id"].as_str().unwrap().to_string();
+    let closed = request(
+        &server,
+        &format!(r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{ws}"}}}}"#),
+    );
+    assert!(closed.get("error").is_none(), "workspace.close: {closed}");
+
+    let entry = entry_file(&server, "d1").expect("precondition: the old entry exists");
+    let before = fs::read(&entry).unwrap();
+    fs::create_dir_all(entry.parent().unwrap().join(".d1.json.tmp")).unwrap();
+
+    let mut again = start_cwd(&server, "d1", &b, &["--json"]);
+    let ready_by = Instant::now() + WITHIN;
+    while agent_get(&server, "d1").is_none() && Instant::now() < ready_by {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if agent_get(&server, "d1").is_some() {
+        make_ready(&server, "d1");
+    }
+    let status = exited_within(&mut again, WITHIN).expect("the second start returns");
+    let out = finish(again);
+    assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    assert_eq!(
+        fs::read(&entry).ok(),
+        Some(before),
+        "the entry this start did not write is still there, unchanged"
+    );
+}
