@@ -27,14 +27,29 @@ const PREVIEW_UPDATE_MANIFEST_URL: &str =
 pub(crate) const RELEASE_ASSET_URL_PREFIX: &str =
     "https://github.com/gerchowl/flock/releases/download/";
 
-/// Refuse an asset URL that is not one of this repository's release downloads.
+/// Refuse an asset URL that is not exactly `<prefix><tag>/<asset>`. A bare
+/// prefix check is not enough: curl normalises `..` segments, so a URL that
+/// starts with the prefix can still fetch from another repository.
 pub(crate) fn ensure_release_asset_origin(url: &str) -> Result<(), String> {
-    if url.starts_with(RELEASE_ASSET_URL_PREFIX) {
-        Ok(())
-    } else {
+    let refuse = || {
         Err(format!(
-            "refusing to download {url}: update assets must come from {RELEASE_ASSET_URL_PREFIX}"
+            "refusing to download {url}: update assets must be <tag>/<asset> under {RELEASE_ASSET_URL_PREFIX}"
         ))
+    };
+    let Some(rest) = url.strip_prefix(RELEASE_ASSET_URL_PREFIX) else {
+        return refuse();
+    };
+    let segment_ok = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    };
+    match rest.split_once('/') {
+        Some((tag, asset)) if segment_ok(tag) && segment_ok(asset) => Ok(()),
+        _ => refuse(),
     }
 }
 
@@ -304,6 +319,8 @@ where
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
@@ -516,6 +533,8 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "2",
             "--connect-timeout",
@@ -576,7 +595,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
 
     // Download the exact asset URL (pinned to the release we checked)
     let status = TracedCommand::new("curl", "update")
-        .args(["-sfL", "--max-time", "120", "-o"])
+        .args(["-sfL", "--proto-redir", "=https", "--max-time", "120", "-o"])
         .arg(&tmp_path)
         .arg(&release.download_url)
         .status_traced()
@@ -2161,6 +2180,19 @@ mod tests {
             "https://flock.dev/flock-linux-x86_64",
             "https://github.com/other/flock/releases/download/v1/flock",
             "http://github.com/gerchowl/flock/releases/download/v1/flock",
+            "https://github.com/gerchowl/flock/releases/download/../../../attacker/repo/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/%2e%2e/%2e%2e/attacker/x",
+            "https://github.com/gerchowl/flock/releases/download.evil.com/v1/x",
+            "https://github.com/gerchowl/flockfork/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/@evil.com/x",
+            "https://GITHUB.com/gerchowl/flock/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/v1/x?a=b",
+            "https://github.com/gerchowl/flock/releases/download/v1/x#frag",
+            "https://github.com/gerchowl/flock/releases/download/v1/x/y",
+            "https://github.com/gerchowl/flock/releases/download/v1/",
+            "https://github.com/gerchowl/flock/releases/download/v1",
+            "https://github.com/gerchowl/flock/releases/download/v1/..",
+            "https://github.com/gerchowl/flock/releases/download/v1\\x",
         ] {
             assert!(
                 super::ensure_release_asset_origin(foreign).is_err(),

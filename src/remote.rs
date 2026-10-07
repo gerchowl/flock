@@ -1401,7 +1401,7 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("flock.tmp");
     let status = TracedCommand::new("curl", "remote")
-        .args(["-sfL", "--max-time", "120", "-o"])
+        .args(["-sfL", "--proto-redir", "=https", "--max-time", "120", "-o"])
         .arg(&path)
         .arg(&asset.url)
         .status_traced()
@@ -1427,6 +1427,8 @@ fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
     let output = TracedCommand::new("curl", "remote")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
