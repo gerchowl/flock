@@ -1,6 +1,6 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted flock.dev update manifest for newer versions.
+//! Checks the update manifest published with each GitHub release for newer versions.
 //! Manual `flk update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -18,8 +18,41 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/gerchowl/flock/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/gerchowl/flock/dev/website/preview.json";
+/// The only origin a release binary may be downloaded from. A manifest is
+/// fetched over the network, so its asset URLs are data, not trust (ADR-0025).
+pub(crate) const RELEASE_ASSET_URL_PREFIX: &str =
+    "https://github.com/gerchowl/flock/releases/download/";
+
+/// Refuse an asset URL that is not exactly `<prefix><tag>/<asset>`. A bare
+/// prefix check is not enough: curl normalises `..` segments, so a URL that
+/// starts with the prefix can still fetch from another repository.
+pub(crate) fn ensure_release_asset_origin(url: &str) -> Result<(), String> {
+    let refuse = || {
+        Err(format!(
+            "refusing to download {url}: update assets must be <tag>/<asset> under {RELEASE_ASSET_URL_PREFIX}"
+        ))
+    };
+    let Some(rest) = url.strip_prefix(RELEASE_ASSET_URL_PREFIX) else {
+        return refuse();
+    };
+    let segment_ok = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    };
+    match rest.split_once('/') {
+        Some((tag, asset)) if segment_ok(tag) && segment_ok(asset) => Ok(()),
+        _ => refuse(),
+    }
+}
+
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/flock.json";
 const FLOCK_UPDATE_COMMAND: &str = "flk update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade flock";
@@ -286,6 +319,8 @@ where
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
@@ -498,6 +533,8 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "2",
             "--connect-timeout",
@@ -554,9 +591,11 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     // Unique temp file (avoids races with concurrent instances)
     let tmp_path = parent.join(format!(".flock-update-{}.tmp", std::process::id()));
 
+    ensure_release_asset_origin(&release.download_url)?;
+
     // Download the exact asset URL (pinned to the release we checked)
     let status = TracedCommand::new("curl", "update")
-        .args(["-sfL", "--max-time", "120", "-o"])
+        .args(["-sfL", "--proto-redir", "=https", "--max-time", "120", "-o"])
         .arg(&tmp_path)
         .arg(&release.download_url)
         .status_traced()
@@ -2130,6 +2169,38 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_asset_origin_accepts_only_this_repository() {
+        assert!(super::ensure_release_asset_origin(
+            "https://github.com/gerchowl/flock/releases/download/v0.8.0/flock-linux-x86_64"
+        )
+        .is_ok());
+        for foreign in [
+            "https://example.com/flock",
+            "https://flock.dev/flock-linux-x86_64",
+            "https://github.com/other/flock/releases/download/v1/flock",
+            "http://github.com/gerchowl/flock/releases/download/v1/flock",
+            "https://github.com/gerchowl/flock/releases/download/../../../attacker/repo/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/%2e%2e/%2e%2e/attacker/x",
+            "https://github.com/gerchowl/flock/releases/download.evil.com/v1/x",
+            "https://github.com/gerchowl/flockfork/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/@evil.com/x",
+            "https://GITHUB.com/gerchowl/flock/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/v1/x?a=b",
+            "https://github.com/gerchowl/flock/releases/download/v1/x#frag",
+            "https://github.com/gerchowl/flock/releases/download/v1/x/y",
+            "https://github.com/gerchowl/flock/releases/download/v1/",
+            "https://github.com/gerchowl/flock/releases/download/v1",
+            "https://github.com/gerchowl/flock/releases/download/v1/..",
+            "https://github.com/gerchowl/flock/releases/download/v1\\x",
+        ] {
+            assert!(
+                super::ensure_release_asset_origin(foreign).is_err(),
+                "{foreign}"
+            );
+        }
+    }
+
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::{

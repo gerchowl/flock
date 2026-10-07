@@ -124,11 +124,14 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: flock-linux-aarch64
+          # macos-15, not macos-latest: macos-latest is the macOS 26 image, whose
+          # SDK zig 0.15.2 cannot link against (undefined libSystem symbols).
+          # Same pin and reason as release.yml and ci.yml.
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: flock-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             name: flock-macos-aarch64
     runs-on: ${{ matrix.os }}
     env:
@@ -235,11 +238,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The manifest lands on dev through a PR like any other change. It is
+      # opened with an App token, not GITHUB_TOKEN: a PR opened with
+      # GITHUB_TOKEN triggers no workflows, so its required checks would never
+      # run and auto-merge would wait forever.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v7
         with:
           ref: dev
           fetch-depth: 0
-          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -295,15 +308,30 @@ jobs:
             --sha-file preview-sha256.json \
             --retain 30
 
-      - name: Commit preview manifest
+      - name: Open the preview manifest PR
         env:
-          KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHORT_SHA: ${{ needs.preflight.outputs.short_sha }}
+          BUILD_ID: ${{ needs.preflight.outputs.build_id }}
         run: |
-          git config user.name "kangal-bot"
-          git config user.email "285672167+kangal-bot@users.noreply.github.com"
+          set -euo pipefail
+          BRANCH="preview/manifest-$SHORT_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add website/preview.json
-          git diff --cached --quiet || git commit -m "docs: update preview manifest"
-          git push "https://x-access-token:${KANGAL_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          if git diff --cached --quiet; then
+            echo "website/preview.json already matches $BUILD_ID"
+            exit 0
+          fi
+          git switch -c "$BRANCH"
+          git commit -m "docs: update preview manifest for $BUILD_ID"
+          git push --force origin "$BRANCH"
+          if ! gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            gh pr create --base dev --head "$BRANCH" \
+              --title "docs: update preview manifest for $BUILD_ID" \
+              --body "Advertises preview build $BUILD_ID in website/preview.json. Opened by the Preview workflow; merges itself once the required checks pass."
+          fi
+          gh pr merge "$BRANCH" --squash --auto --delete-branch
 
       - name: Prune old preview prereleases
         env:
