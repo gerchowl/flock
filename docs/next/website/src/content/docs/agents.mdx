@@ -330,6 +330,8 @@ opencode's session database (read-only); for any other agent it refuses with
 flk agent result reviewer
 ```
 
+Codex results are read from `$CODEX_HOME/sessions` (default `~/.codex/sessions`) using the session ID reported by its SessionStart hook. The reader checks the newest 1 MiB of a rollout and requires a recorded turn completion. An active turn returns the previous completed reply with `finished: false`. Codex history and delegate support are separate follow-ups.
+
 `agent result` returns the reply the agent's newest turn ended on, plus the
 status of a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line
 (`status: "verdict"`, `status_text: "approve"`), and `finished`, which is false

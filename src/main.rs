@@ -34,6 +34,7 @@ mod checks;
 mod checksum;
 mod cli;
 mod client;
+mod codex_transcript;
 mod config;
 mod opencode_transcript;
 // #348 / ADR-0014 §4: one definition of "terminal control sequence",
