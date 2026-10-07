@@ -65,9 +65,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
     AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, EventsSubscribeParams, Method,
-    PaneListParams, PaneSendInputParams, PaneSendKeysParams, PaneTarget, Request, Subscription,
-    WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
-    WorktreeListParams,
+    PaneListParams, PaneReadParams, PaneSendInputParams, PaneSendKeysParams, PaneTarget,
+    ReadFormat, ReadSource, Request, Subscription, WorkspaceCreateParams, WorkspaceTarget,
+    WorktreeCreateParams, WorktreeKillParams, WorktreeListParams,
 };
 
 use super::pane::PANE_RUN_SUBMIT_GAP;
@@ -79,10 +79,12 @@ use super::settled::{Cursor, PinnedTarget, SettleTarget};
 /// answer two different things.
 pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
-    "                     [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]\n",
-    "                     [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "                     [--harness opencode|claude] [--model M] [--await] [--timeout MS]\n",
+    "                     [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
+    "  --harness NAME      the agent to run, default opencode; claude's folder-trust dialog is\n",
+    "                      named rather than typed into (see #605)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
@@ -114,12 +116,6 @@ pub(super) const REAP_USAGE: &str = concat!(
     "                      lock; two concurrent forced reaps of the same delegate are\n",
     "                      idempotent (each sees the same end state)",
 );
-
-/// How long after a settle the delegate keeps looking for the reply.
-///
-/// The gap between "the agent went quiet" and "opencode has written the reply":
-/// the TUI clears its spinner first and the plugin commits the transcript after.
-const RESULT_GRACE: Duration = Duration::from_secs(10);
 
 /// How often the grace asks for the reply.
 const RESULT_POLL: Duration = Duration::from_millis(250);
@@ -327,23 +323,169 @@ mod exit {
 /// of those two hops is a different string by the time the agent reads it (#566).
 const UNSAFE_PATH_CHARS: [char; 6] = ['!', '$', '`', '\u{22}', '\'', '\\'];
 
-/// `agent.result` errors that mean "the reply is not written yet".
+// ------------------------------------------------------------- harnesses
+
+/// Who tells flock which session a pane's transcript belongs to.
 ///
-/// Every one of these is a statement about the store rather than about the
+/// Both harnesses report through the same `pane.report_agent_session` method,
+/// but they report it from different places, and that is the whole reason the
+/// delegate cannot assume a session exists the moment a pane looks ready: the
+/// opencode plugin reports asynchronously (mid-turn, when it commits), and a
+/// Claude `SessionStart` hook reports from inside the process, so by the time
+/// the TUI is up the report is merely in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSource {
+    /// opencode's plugin, reporting the session mid-turn as it commits it.
+    Plugin,
+    /// Claude Code's `SessionStart` hook, reporting from inside the harness.
+    Hook,
+}
+
+impl SessionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plugin => "opencode's plugin",
+            Self::Hook => "Claude's SessionStart hook",
+        }
+    }
+}
+
+/// Everything `delegate` needs to know about one agent harness.
+///
+/// The delegate is harness-agnostic by design (#578) and this is where that
+/// claim is kept honest: the argv, the session source, the grace, the not-yet
+/// codes and the startup dialog all arrive from ONE row, so adding a harness is
+/// a row here rather than a `match harness` in the argv builder, the grace, the
+/// result poll and the readiness gate at once (#612).
+#[derive(Debug)]
+struct HarnessSpec {
+    /// What `--harness` accepts and what the registry records.
+    name: &'static str,
+    /// The argv this harness starts with, given the `--model` the caller passed.
+    ///
+    /// A function rather than a name because the flag is not the same
+    /// everywhere: both current harnesses take `--model`, and a third one that
+    /// spelled it `--model-id` should not need this module to learn a second
+    /// flag name.
+    argv: fn(Option<&str>) -> Vec<String>,
+    /// Where the session id comes from — read for what the operator has to be
+    /// told when a turn produces no reply at all.
+    session_source: SessionSource,
+    /// How long after a settle the delegate keeps looking for the reply.
+    result_grace: Duration,
+    /// A dialog this harness puts up before it will take input, matched on
+    /// screen so readiness can name it instead of reporting a bare `blocked`.
+    ///
+    /// `None` for a harness with no such dialog. The marker is matched against
+    /// the pane's recent lines (ANSI stripped), so it must be text the dialog
+    /// itself prints rather than incidental text from the transcript above it.
+    startup_dialog: Option<StartupDialog>,
+}
+
+/// A known blocking dialog, and the refusal that names it.
+#[derive(Debug, Clone, Copy)]
+struct StartupDialog {
+    /// Lowercase text the dialog itself draws, and nothing else on screen.
+    marker: &'static str,
+    /// What the delegate says when readiness finds it.
+    refusal: &'static str,
+}
+
+/// The `agent.result` refusals that are ordinary whichever harness asked.
+///
+/// Every one of these is a statement about the STORE rather than about the
 /// turn, and all of them are ordinary in the seconds between the agent going
-/// quiet and its plugin committing the transcript. Treating any of them as a
-/// failure would make a normal turn a `result` error; treating a real refusal as
-/// "not yet" would make the grace hang until the deadline and then report
+/// quiet and the transcript being committed. Treating any of them as a failure
+/// would make a normal turn a `result` error; treating a real refusal as "not
+/// yet" would make the grace hang until the deadline and then report
 /// `no_result`, which is a lie about a server that answered.
 ///
-/// `no_agent_session` is the no-session refusal (D8): the pane has not reported a
-/// session yet, so there is no store to read at all.
-const NOT_YET_CODES: [&str; 4] = [
-    "no_result",
-    "transcript_not_found",
-    "transcript_unreadable",
-    "no_agent_session",
+/// A harness that gained a store of its own would add its own codes here rather
+/// than widen this list for everyone.
+const STORE_NOT_YET_CODES: [&str; 3] =
+    ["no_result", "transcript_not_found", "transcript_unreadable"];
+
+/// The no-session refusal: the pane has not reported a session yet, so there is
+/// no store to read at all. Ordinary for both current harnesses, and listed per
+/// harness rather than globally because a harness whose session is known
+/// synchronously must not have this treated as a transient.
+const NO_SESSION_CODE: &str = "no_agent_session";
+
+/// The harnesses this build drives, in the order `--harness` help lists them.
+const HARNESSES: [HarnessSpec; 2] = [
+    HarnessSpec {
+        name: "opencode",
+        argv: opencode_argv,
+        session_source: SessionSource::Plugin,
+        result_grace: Duration::from_secs(10),
+        startup_dialog: None,
+    },
+    HarnessSpec {
+        name: "claude",
+        argv: claude_argv,
+        session_source: SessionSource::Hook,
+        // The TUI clears its spinner before Claude has flushed its last
+        // transcript entry, so the gap this covers is the same one it covers
+        // for opencode: the store, not the screen, is the slow side.
+        result_grace: Duration::from_secs(10),
+        startup_dialog: Some(StartupDialog {
+            marker: "quick safety check:",
+            refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
+        }),
+    },
 ];
+
+/// `opencode [--model M]`.
+///
+/// The model string is passed through exactly as the caller wrote it — it is
+/// `provider/model` for opencode and nothing in this module should second-guess
+/// a name it does not resolve.
+fn opencode_argv(model: Option<&str>) -> Vec<String> {
+    harness_argv("opencode", model)
+}
+
+/// `claude [--model M]`.
+///
+/// Claude Code takes the same `--model M` shape as opencode does (#612), which
+/// is why `argv` is one shared builder rather than two hand-written vectors.
+fn claude_argv(model: Option<&str>) -> Vec<String> {
+    harness_argv("claude", model)
+}
+
+fn harness_argv(program: &str, model: Option<&str>) -> Vec<String> {
+    let mut argv = vec![program.to_string()];
+    if let Some(model) = model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    argv
+}
+
+/// The `agent.result` codes that mean "not yet" for THIS harness.
+///
+/// `no_agent_session` is included per harness rather than once for all of them:
+/// both current harnesses report their session asynchronously, so both need it,
+/// and a harness that reported synchronously must not spend a grace treating a
+/// missing session as a transient.
+fn not_yet_codes(harness: &HarnessSpec) -> Vec<&'static str> {
+    let mut codes = STORE_NOT_YET_CODES.to_vec();
+    if matches!(
+        harness.session_source,
+        SessionSource::Plugin | SessionSource::Hook
+    ) {
+        codes.push(NO_SESSION_CODE);
+    }
+    codes
+}
+
+/// The harness table as it would be printed back to a caller.
+fn harness_names() -> String {
+    HARNESSES
+        .iter()
+        .map(|harness| harness.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
 
 /// `worktree.kill` refusals that mean "the checkout is not there to remove".
 ///
@@ -829,12 +971,26 @@ fn validate_name(name: &str) -> Result<(), String> {
     ))
 }
 
-/// The only harness this build drives.
-fn validate_harness(harness: Option<&str>) -> Result<&'static str, String> {
-    match harness {
-        None | Some("opencode") => Ok("opencode"),
-        Some(other) => Err(format!("harness {other} is not supported yet")),
-    }
+/// The one harness this build drives when `--harness` is absent.
+///
+/// opencode, as it has always been: a default that moved would silently change
+/// what an unqualified `delegate start` runs.
+const DEFAULT_HARNESS: &str = "opencode";
+
+/// Resolve `--harness` against the table, naming the refusal with the harnesses
+/// this build does drive — a caller who typed `codex` learns what does exist,
+/// rather than only that their word was rejected.
+fn validate_harness(harness: Option<&str>) -> Result<&'static HarnessSpec, String> {
+    let asked = harness.unwrap_or(DEFAULT_HARNESS);
+    HARNESSES
+        .iter()
+        .find(|spec| spec.name == asked)
+        .ok_or_else(|| {
+            format!(
+                "harness {asked} is not supported yet (this build drives {})",
+                harness_names()
+            )
+        })
 }
 
 /// Check the placement flags say exactly one thing.
@@ -2242,7 +2398,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // THAT. Captured earlier it would be a cursor from before the last idle, and
     // a settle would then accept the quiet that preceded the brief instead of
     // waiting for the turn the brief caused (D-D).
-    let settled_record = match await_ready(name, &agent, ready_deadline) {
+    let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
             rollback(&cleanup);
@@ -2270,7 +2426,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         parent_workspace_id: placement.parent_workspace_id.clone(),
         repo_root: placement.repo_root.clone(),
         repo_key: placement.repo_key.clone(),
-        harness: harness.to_string(),
+        harness: harness.name.to_string(),
         model: flags.model.clone(),
         round: 1,
         brief: brief.clone(),
@@ -2316,6 +2472,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         .timeout_ms
         .map(|ms| Instant::now() + Duration::from_millis(ms));
     Await {
+        harness,
         entry: &entry,
         after: Some(cursor),
         submitted_at_ms,
@@ -2393,14 +2550,10 @@ fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), Strin
 fn start_the_agent(
     name: &str,
     placement: &Placement,
-    harness: &str,
+    harness: &HarnessSpec,
     model: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let mut argv = vec![harness.to_string()];
-    if let Some(model) = model {
-        argv.push("--model".to_string());
-        argv.push(model.to_string());
-    }
+    let argv = (harness.argv)(model);
     let response = request(
         Method::AgentStart(AgentStartParams {
             name: name.to_string(),
@@ -2426,6 +2579,28 @@ fn start_the_agent(
         .ok_or_else(|| format!("delegate {name}: the start answered with no agent record"))
 }
 
+/// Lines of a pane's recent buffer the startup-dialog scan reads.
+///
+/// A dialog is drawn at the bottom of the screen, so a tail this long holds it
+/// whole without reading a transcript that may be thousands of lines of
+/// unrelated output.
+const STARTUP_DIALOG_LINES: u32 = 40;
+
+/// Resolve the harness an entry recorded, for a verb that only has the entry.
+///
+/// A name this build does not drive — an entry written by a newer flock, or a
+/// harness dropped from the table — falls back to the default rather than
+/// failing: the verb has a live delegate to wait on, and refusing it because
+/// its registry names a harness we no longer have would be a worse answer than
+/// waiting with the default's grace and not-yet codes.
+fn harness_for(entry: &Entry) -> &'static HarnessSpec {
+    HARNESSES
+        .iter()
+        .find(|spec| spec.name == entry.harness)
+        .or_else(|| validate_harness(None).ok())
+        .expect("the default harness is always in the table")
+}
+
 /// Block until the agent is up AND at its prompt, under one deadline, and hand
 /// back the record that proved it.
 ///
@@ -2442,6 +2617,7 @@ fn start_the_agent(
 fn await_ready(
     name: &str,
     agent: &serde_json::Value,
+    harness: &HarnessSpec,
     deadline: Instant,
 ) -> Result<serde_json::Value, String> {
     let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
@@ -2456,6 +2632,11 @@ fn await_ready(
     delegate_wait_for_ready(name, &terminal_id, &pane_id, deadline)?;
 
     let mut last_status: Option<String> = None;
+    // Asked at most once per wait. `blocked` is derived from the pane's own
+    // painted screen, so the dialog is already on it by the time the status
+    // says so, and re-reading every poll would cost one request per 200 ms for
+    // the whole `--ready-timeout`.
+    let mut startup_dialog_asked = false;
     loop {
         match agent_record(&terminal_id, Some(deadline)) {
             AgentFetch::Found(record) => {
@@ -2464,6 +2645,13 @@ fn await_ready(
                     .to_string();
                 if matches!(status.as_str(), "idle" | "done") {
                     return Ok(record);
+                }
+                if status == "blocked" && !startup_dialog_asked {
+                    startup_dialog_asked = true;
+                    if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
+                    {
+                        return Err(refusal);
+                    }
                 }
                 if expired(Some(deadline)) {
                     // The agent is up but sitting on a status that is not a
@@ -2491,6 +2679,57 @@ fn await_ready(
             AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
         }
     }
+}
+
+/// Name the harness's known startup dialog, if this pane is sitting on it.
+///
+/// Claude Code asks "Quick safety check: is this a project you created or one
+/// you trust?" the first time it starts in a directory it has no trust record
+/// for, and a `--worktree` checkout is always such a directory (#605). That
+/// dialog has no text box, so a bare `blocked` tells an operator nothing they
+/// can act on, and a brief typed at it would be answering the dialog rather
+/// than the brief.
+///
+/// Only consulted while the pane has never reported ready, which is what makes
+/// it safe: after readiness a `blocked` is a permission prompt, and by then the
+/// trust text is only scrollback above the prompt box.
+fn startup_dialog_refusal(
+    name: &str,
+    harness: &HarnessSpec,
+    pane_id: &str,
+    deadline: Instant,
+) -> Option<String> {
+    let dialog = harness.startup_dialog?;
+    pane_shows_startup_dialog(pane_id, &dialog, deadline)
+        .then(|| format!("delegate {name}: {}", dialog.refusal))
+}
+
+/// Does the pane's recent buffer carry this dialog's marker?
+///
+/// `pane.read` rather than the agent record, because the dialog is screen
+/// chrome and the record carries no screen. Bounded by the caller's deadline
+/// like every other request here: an unbounded read against a stalled server
+/// would freeze `start` rather than report it (G1). A read that fails answers
+/// `false`, so a flaky socket degrades to the plain `blocked` refusal rather
+/// than inventing a diagnosis.
+fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: Instant) -> bool {
+    let response = match bounded(
+        Method::PaneRead(PaneReadParams {
+            pane_id: pane_id.to_owned(),
+            source: ReadSource::Recent,
+            lines: Some(STARTUP_DIALOG_LINES),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        }),
+        Some(deadline),
+    ) {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+    response
+        .pointer("/result/read/text")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| text.to_lowercase().contains(dialog.marker))
 }
 
 fn sleep_bounded(deadline: Instant, interval: Duration) {
@@ -2699,6 +2938,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         .timeout_ms
         .map(|ms| Instant::now() + Duration::from_millis(ms));
     Await {
+        harness: harness_for(&entry),
         entry: &entry,
         after: Some(cursor),
         submitted_at_ms,
@@ -2805,6 +3045,7 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
     // from the entry, and `--after` only replaces the cursor.
     let after = flags.after.clone().or_else(|| Some(entry.cursor.clone()));
     Await {
+        harness: harness_for(&entry),
         entry: &entry,
         after,
         submitted_at_ms: entry.submitted_at_ms,
@@ -3267,6 +3508,12 @@ enum TurnCheck {
 }
 
 struct Await<'a> {
+    /// The harness whose store this await polls and whose grace it waits out.
+    ///
+    /// From the table rather than from a field on the entry, so a `--harness`
+    /// this build no longer drives still gets a usable grace and not-yet set
+    /// instead of a refusal (see [`harness_for`]).
+    harness: &'static HarnessSpec,
     entry: &'a Entry,
     /// The cursor this await started from. Reported as `turn_cursor` in every
     /// outcome so a caller that timed out can resume with `--after` on exactly
@@ -3418,14 +3665,15 @@ impl Await<'_> {
 
     /// The grace: a settle is not a reply, so keep asking until one is written.
     ///
-    /// The gap between the TUI going quiet and the plugin committing the
-    /// transcript is ordinary — opencode clears its spinner first — so a grace
-    /// that reported `no_result` the instant the agent went idle would call every
-    /// normal turn a failure.
+    /// The gap between the TUI going quiet and the transcript being committed is
+    /// ordinary — the harness clears its spinner first — so a grace that
+    /// reported `no_result` the instant the agent went idle would call every
+    /// normal turn a failure. How long that gap is, is the harness's row.
     fn await_reply(&self, settled_cursor: &str) -> Grace {
+        let grace = self.harness.result_grace;
         let grace_end = match self.deadline {
-            Some(deadline) => deadline.min(Instant::now() + RESULT_GRACE),
-            None => Instant::now() + RESULT_GRACE,
+            Some(deadline) => deadline.min(Instant::now() + grace),
+            None => Instant::now() + grace,
         };
         loop {
             if Instant::now() >= grace_end {
@@ -3541,7 +3789,7 @@ impl Await<'_> {
             if code == "agent_not_found" || code == "pane_not_found" {
                 return ResultPoll::Gone;
             }
-            if NOT_YET_CODES.contains(&code) {
+            if not_yet_codes(self.harness).contains(&code) {
                 return ResultPoll::NotYet;
             }
             return ResultPoll::Refused(server_error(error));
@@ -3641,6 +3889,17 @@ fn emit_outcome(
         match status_text {
             Some(status_text) => eprintln!("delegate {}: {outcome}: {status_text}", entry.name),
             None => eprintln!("delegate {}: {outcome}", entry.name),
+        }
+        // `no_result` is the one outcome whose usual cause is a session nobody
+        // reported, so it says which channel should have reported one: a
+        // supervisor reading this knows whether to look at the opencode plugin
+        // or at Claude's `SessionStart` hook.
+        if outcome == Outcome::NoResult.as_str() {
+            eprintln!(
+                "  nothing was written to {} this round, and its session comes from {}",
+                entry.harness,
+                harness_for(entry).session_source.as_str(),
+            );
         }
     }
 }
@@ -3876,15 +4135,58 @@ mod tests {
         }
     }
 
-    /// The one harness this build drives, named in the refusal rather than a
-    /// list of the ones it does not.
+    /// The table, read through the flag: both harnesses resolve, an absent
+    /// `--harness` is still opencode, and a refusal names what this build does
+    /// drive rather than only rejecting what it does not.
     #[test]
-    fn only_opencode_is_supported_yet() {
-        assert_eq!(validate_harness(None), Ok("opencode"));
-        assert_eq!(validate_harness(Some("opencode")), Ok("opencode"));
-        assert!(validate_harness(Some("claude"))
-            .expect_err("claude is not wired")
-            .contains("not supported"));
+    fn the_harness_table_is_what_the_flag_accepts() {
+        for name in ["opencode", "claude"] {
+            assert_eq!(
+                validate_harness(Some(name)).map(|spec| spec.name),
+                Ok(name),
+                "{name} is in the table"
+            );
+        }
+        assert_eq!(validate_harness(None).map(|spec| spec.name), Ok("opencode"));
+        let refused = validate_harness(Some("codex")).expect_err("not in the table");
+        assert!(refused.contains("not supported"), "{refused}");
+        assert!(
+            refused.contains("opencode|claude"),
+            "the refusal lists what exists: {refused}"
+        );
+    }
+
+    /// The argv each row starts. Both harnesses take `--model M`, so the same
+    /// shape covers both today — and the test says so per harness, so a change
+    /// to one is a change to a row rather than to the builder.
+    #[test]
+    fn each_harness_builds_its_own_argv() {
+        for (name, expected_with, expected_without) in [
+            ("opencode", "opencode --model m1", "opencode"),
+            ("claude", "claude --model m1", "claude"),
+        ] {
+            let spec = validate_harness(Some(name)).expect("in the table");
+            assert_eq!((spec.argv)(Some("m1")).join(" "), expected_with);
+            assert_eq!((spec.argv)(None).join(" "), expected_without);
+        }
+    }
+
+    /// Claude's row carries the folder-trust dialog and opencode's carries
+    /// none: the refusal is what stops a delegate typing a brief into it, so a
+    /// row that lost the marker would be a silent regression.
+    #[test]
+    fn only_claude_declares_a_startup_dialog() {
+        let claude = validate_harness(Some("claude")).expect("in the table");
+        let dialog = claude
+            .startup_dialog
+            .expect("claude asks for folder trust on a fresh worktree");
+        assert!(dialog.refusal.contains("#605"), "{}", dialog.refusal);
+        assert!(
+            !dialog.marker.is_empty() && dialog.marker == dialog.marker.to_lowercase(),
+            "the marker is matched against a lowercased screen"
+        );
+        let opencode = validate_harness(Some("opencode")).expect("in the table");
+        assert!(opencode.startup_dialog.is_none());
     }
 
     /// A quoted character in the file would break the help table's flag scan,
@@ -3900,20 +4202,46 @@ mod tests {
         );
     }
 
-    /// The `no_result` codes the grace treats as "not yet" include the
-    /// no-session refusal, which is the one D8 names: an agent that has not
-    /// reported its session yet has no store to read, and the plugin reports it
-    /// asynchronously — so this is the ordinary first poll of a turn, not a fault.
+    /// The codes the grace treats as "not yet" include the no-session refusal
+    /// (D8), for every harness that reports its session asynchronously — which
+    /// is both of them today: opencode's plugin commits it mid-turn and Claude's
+    /// `SessionStart` hook reports it from inside the harness, so the ordinary
+    /// first poll of a turn has no store to read yet.
     #[test]
     fn the_no_session_refusal_is_one_of_the_not_yet_codes() {
-        assert!(NOT_YET_CODES.contains(&"no_agent_session"));
-        assert!(NOT_YET_CODES.contains(&"no_result"));
-        assert!(NOT_YET_CODES.contains(&"transcript_not_found"));
-        assert!(NOT_YET_CODES.contains(&"transcript_unreadable"));
-        assert!(
-            !NOT_YET_CODES.contains(&"permission_denied"),
-            "a real refusal must still be an error"
-        );
+        for harness in &HARNESSES {
+            let codes = not_yet_codes(harness);
+            for code in [
+                NO_SESSION_CODE,
+                "no_result",
+                "transcript_not_found",
+                "transcript_unreadable",
+            ] {
+                assert!(codes.contains(&code), "{}: {code} is not yet", harness.name);
+            }
+            assert!(
+                !codes.contains(&"permission_denied"),
+                "{}: a real refusal must still be an error",
+                harness.name
+            );
+        }
+    }
+
+    /// Each store refusal is named once, from the source that emits it, so a
+    /// code cannot be quietly dropped by editing a harness row instead of the
+    /// table. `agents.rs` refuses `no_result` when the store has no reply,
+    /// `transcript_not_found` when a session has no transcript on disk,
+    /// `transcript_unreadable` when a store exists and could not be read, and
+    /// `no_agent_session` when the pane has reported no session at all.
+    #[test]
+    fn every_not_yet_code_is_one_agent_result_emits() {
+        let source = include_str!("../app/api/agents.rs");
+        for code in STORE_NOT_YET_CODES.iter().chain([NO_SESSION_CODE].iter()) {
+            assert!(
+                source.contains(&format!("\"{code}\"")),
+                "agent.result no longer refuses {code}"
+            );
+        }
     }
 
     /// A refusal the teardown treats as "already gone" rather than as a failure.

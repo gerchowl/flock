@@ -42,7 +42,7 @@ pub(super) fn detect_structural(content: &str) -> Option<AgentState> {
         return Some(AgentState::Idle);
     }
 
-    if has_live_blocked_form(content) {
+    if has_live_blocked_form(content) || has_folder_trust_dialog(content) {
         return Some(AgentState::Blocked);
     }
 
@@ -64,6 +64,7 @@ pub(super) fn detect_structural(content: &str) -> Option<AgentState> {
 pub(super) fn has_visible_blocker(content: &str) -> bool {
     let lower = content.to_lowercase();
     has_live_blocked_form(content)
+        || has_folder_trust_dialog(content)
         || lower.contains("do you want to proceed?")
             && has_claude_yes_no_choice(content)
             && (lower.contains("bash command")
@@ -149,6 +150,68 @@ fn has_claude_blocked_prompt(content: &str, lower_content: &str) -> bool {
         || lower_content.contains("review your answers")
         || lower_content.contains("skip interview and plan immediately")
         || (has_selection_prompt(content) && has_claude_yes_no_choice(content))
+}
+
+/// Claude Code's folder-trust dialogs, as 2.1.285 and 2.1.289 draw them: a box
+/// asking whether a folder is one the user trusts, offering "Yes, I trust this
+/// folder" against a refusal.
+///
+/// Each entry is `(question, affirmative option)`, both flattened by
+/// [`flat_words`] — the first is what a session's FIRST start in a directory
+/// shows, the second what `/cd` shows when it moves one into a folder carrying
+/// gated grants.
+///
+/// Both halves of a pair are required, because neither is safe alone. The
+/// question is prose that could appear in a reply or in a diff the agent is
+/// reading; the affirmative label is Claude's own and appears on these dialogs
+/// only. Together they are a dialog rather than a coincidence — and without
+/// them a delegate's readiness gate has nothing to report but a bare `blocked`,
+/// because the dialog has no input box for the prompt-box matcher and its
+/// confirm footer reads "Enter to confirm" where `has_live_blocked_form` wants
+/// "Enter to select". #605 is the pre-trust half; this is the half that makes
+/// the failure legible instead of a timeout.
+///
+/// The cancel label is deliberately not part of the gate: it is "No, exit"
+/// normally and "No, continue without these permissions" when the folder also
+/// carries gated grants, and the affirmative label above it does not change.
+fn has_folder_trust_dialog(content: &str) -> bool {
+    let flat = flat_words(content);
+    TRUST_DIALOGS
+        .iter()
+        .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
+}
+
+/// The trust dialogs as (question, affirmative option), flattened.
+const TRUST_DIALOGS: [(&str, &str); 2] = [
+    (
+        "quick safety check is this a project you created or one you trust",
+        "yes i trust this folder",
+    ),
+    (
+        "is this a directory you created or one you trust",
+        "yes trust it and apply them",
+    ),
+];
+
+/// The screen as lowercase words separated by single spaces.
+///
+/// A phrase matcher that reads raw lines cannot be trusted on a dialog: Claude
+/// word-wraps its body inside the box, so on an 80-column pane "one you trust?"
+/// lands on the line after "...or", and the box's own `│` and `❯` characters sit
+/// between the words that belong together. Flattening removes both problems and
+/// costs nothing else, because every needle here is prose rather than a glyph.
+fn flat_words(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for word in content.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(word.chars().flat_map(char::to_lowercase));
+    }
+    out
 }
 
 fn has_live_blocked_form(content: &str) -> bool {
@@ -609,6 +672,130 @@ mod tests {
         );
         assert!(!has_working_chrome(screen), "so no working chrome is found");
         assert_eq!(detect_structural(screen), Some(AgentState::Idle));
+    }
+
+    /// The first-run folder-trust dialog, reconstructed from the component
+    /// Claude Code 2.1.285 and 2.1.289 both render: a bordered box titled
+    /// "Accessing workspace:", the safety-check question, the cwd in bold, and
+    /// a confirm widget offering the refusal FIRST and focused (the dialog's
+    /// `cancelFirst` is true, so "No, exit" is what the arrow sits on) with its
+    /// own two chord hints rather than the select prompt's navigation line.
+    ///
+    /// This is what a `delegate start --worktree --harness claude` finds on
+    /// every fresh worktree (#605), and it is why the pattern exists: the box
+    /// has no ── borders for `has_prompt_box`, its footer says "Enter to
+    /// confirm" where `has_live_blocked_form` requires "Enter to select", and
+    /// its options carry no indexes, so every existing matcher walked past it
+    /// and reported no state at all.
+    #[test]
+    fn the_folder_trust_dialog_is_blocked() {
+        let screen = concat!(
+            "\u{256d}\u{2500} Accessing workspace: \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\n",
+            "\u{2502} /Users/dev/flock/.worktrees/builder-8ef0136f\n",
+            "\u{2502}\n",
+            "\u{2502} Quick safety check: Is this a project you created or one you trust?\n",
+            "\u{2502} Claude Code'll be able to read, edit, and execute files here.\n",
+            "\u{2502}\n",
+            "\u{276f} No, exit\n",
+            "\u{2502}   Yes, I trust this folder\n",
+            "\u{2502}\n",
+            "\u{2502} Enter to confirm \u{b7} Esc to cancel\n",
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+        );
+        assert!(
+            has_folder_trust_dialog(screen),
+            "the dialog's own question and its affirmative option are both on screen"
+        );
+        assert_eq!(detect(screen), AgentState::Blocked);
+        assert_eq!(detect_structural(screen), Some(AgentState::Blocked));
+        // A strong blocker, so it may overrule a hook report: Claude does not
+        // load its hooks until trust is accepted, so nothing hook-reported can
+        // speak for this pane.
+        assert!(has_visible_blocker(screen));
+        assert!(
+            !has_prompt_box(screen),
+            "and it has no prompt box to type into"
+        );
+    }
+
+    /// A dialog on an 80-column pane. Claude word-wraps the question inside the
+    /// box, so "one you trust?" is on the line after "...created or" and the
+    /// frame above it is its own horizontal rule — a raw-line matcher reads this
+    /// as a torn frame and reports nothing, which is how the whole screen went
+    /// unnoticed until #612 needed it.
+    #[test]
+    fn the_trust_dialog_survives_the_wrap_a_narrow_pane_gives_it() {
+        let wrapped = concat!(
+            "\u{256d}\u{2500} Accessing workspace: \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\n",
+            "\u{2502} /repo/.worktrees/builder\n",
+            "\u{2502}\n",
+            "\u{2502} Quick safety check: Is this a project you created or\n",
+            " one you trust?\n",
+            "\u{2502} Claude Code'll be able to read, edit, and execute fi\n",
+            "les here.\n",
+            "\u{2502}\n",
+            "\u{276f} No, exit\n",
+            "\u{2502}   Yes, I trust this folder\n",
+            "\u{2502}\n",
+            "\u{2502} Enter to confirm \u{b7} Esc to cancel\n",
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        );
+        assert!(has_folder_trust_dialog(wrapped));
+        assert_eq!(detect_structural(wrapped), Some(AgentState::Blocked));
+    }
+
+    /// `/cd` asks the same question with the same two answers, so it is the
+    /// same gate rather than a second one.
+    #[test]
+    fn the_relocate_trust_prompt_is_the_same_dialog() {
+        let screen = concat!(
+            "Now in a new directory:\n",
+            "This session hasn't worked here before. Is this a directory you created or one you trust?\n",
+            "Yes, trust it and apply them\n",
+            "No, keep them off\n",
+        );
+        assert!(has_folder_trust_dialog(screen));
+        assert_eq!(detect_structural(screen), Some(AgentState::Blocked));
+    }
+
+    /// The gate is two controls, so each half on its own must not match: the
+    /// question is prose an agent can quote, and the option is ordinary UI.
+    #[test]
+    fn the_trust_pattern_needs_both_halves() {
+        let question_only = concat!(
+            "Quick safety check: Is this a project you created or one you trust?\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        );
+        assert!(!has_folder_trust_dialog(question_only));
+
+        let option_only = prompt_box_below("\u{276f} Yes, I trust this folder\n");
+        assert!(!has_folder_trust_dialog(&option_only));
+        assert_eq!(
+            detect_structural(&option_only),
+            Some(AgentState::Idle),
+            "and ordinary prompt chrome is still idle"
+        );
+    }
+
+    /// The alternative cancel label is deliberate: a folder that also carries
+    /// gated grants draws "No, continue without these permissions" instead of
+    /// "No, exit", and the dialog is still the dialog.
+    #[test]
+    fn the_trust_dialog_with_gated_grants_is_still_blocked() {
+        let screen = concat!(
+            "Quick safety check: Is this a project you created or one you trust?\n",
+            "This folder pre-approves 3 tool permissions in .claude/settings.json:\n",
+            "  Bash(npm run test)\n",
+            "  Yes, I trust this folder\n",
+            "No, continue without these permissions\n",
+        );
+        assert!(has_folder_trust_dialog(screen));
+        assert_eq!(detect_structural(screen), Some(AgentState::Blocked));
     }
 
     /// How narrow the still-running matcher is: one comma defeats it.
