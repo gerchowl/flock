@@ -704,3 +704,47 @@ fn a23_a_frozen_server_cannot_hold_the_result_grace_past_the_deadline() {
     );
     assert_eq!(stdout_json(&out)["outcome"], "timeout");
 }
+
+/// a24 (P578 r4-2): reaping a LIVE cwd delegate closes its own workspace.
+///
+/// The delegate's workspace is still open and its agent still runs, so the
+/// identity check has positive evidence (the recorded terminal ids) and the
+/// reap must act on it. The operator's workspace is untouched.
+#[test]
+fn a24_reap_closes_a_live_cwd_delegates_own_workspace() {
+    let server = start_server();
+    let operator = operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let started = stdout_json(&out);
+    let delegate_ws = started["workspace_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start --json names its workspace: {started}"))
+        .to_string();
+    assert!(
+        workspaces(&server)
+            .iter()
+            .any(|ws| ws["workspace_id"] == delegate_ws.as_str()),
+        "precondition: the delegate's workspace {delegate_ws} is open before the reap"
+    );
+
+    let reaped = cli(&server, &["delegate", "reap", "d1", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    let after = workspaces(&server);
+    assert!(
+        after
+            .iter()
+            .all(|ws| ws["workspace_id"] != delegate_ws.as_str()),
+        "the reap closed the delegate's own workspace {delegate_ws}: {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|ws| ws["workspace_id"] == operator.as_str()),
+        "the operator's workspace {operator} survived"
+    );
+}

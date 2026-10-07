@@ -742,13 +742,6 @@ fn s2_reap_leaves_a_reused_id_alone() {
         operator_panes,
         "and so did its pane"
     );
-    // The delegate's own recorded workspace must be gone.
-    assert!(
-        workspaces(&server)
-            .iter()
-            .all(|ws| ws["workspace_id"] != delegate_ws.as_str()),
-        "the delegate's own workspace was removed"
-    );
     assert!(
         !registry_entry_path(&server, "d1").exists(),
         "the entry is still removed"

@@ -134,11 +134,91 @@ enum BoundedError {
     Transport(io::Error),
 }
 
-/// Make a socket request bounded by a deadline.
+/// Classification of a worktree.create failure.
+#[derive(Debug)]
+enum CreateFailure {
+    /// Server refused the request (e.g., branch already exists).
+    Refused(ServerError),
+    /// Deadline was exceeded.
+    TimedOut,
+    /// Transport-level failure (connection error, etc.).
+    Transport(io::ErrorKind),
+}
+
+/// Result of the leftover checkout check decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftoverCheck {
+    /// Do nothing; server created nothing.
+    Nothing,
+    /// The pre-create list failed; cannot determine leftovers.
+    CannotCheck,
+    /// Look for a new checkout and remove it.
+    Look,
+}
+
+/// Decide whether to check for a leftover checkout based on the failure type
+/// and whether the pre-create list succeeded.
+fn leftover_check(failure: &CreateFailure, listed_before: bool) -> LeftoverCheck {
+    match failure {
+        CreateFailure::Refused(_) => LeftoverCheck::Nothing,
+        CreateFailure::TimedOut | CreateFailure::Transport(_) => {
+            if listed_before {
+                LeftoverCheck::Look
+            } else {
+                LeftoverCheck::CannotCheck
+            }
+        }
+    }
+}
+
+/// Result of a failed request inside an await.
 ///
-/// The request timeout is the minimum of the given cap and the time remaining
-/// until the deadline. After the response, if the deadline has passed, the
-/// result is `TimedOut` regardless of the response content.
+/// The three cases a caller inside an await must distinguish: the deadline has
+/// passed (become a `Timeout` outcome, exit 124), the transport blipped before
+/// it did (`NotYet`, poll again), or the request failed for a reason that is
+/// not a slow socket (`Fail`, exit 1 with the error on stderr).
+#[derive(Debug, PartialEq, Eq)]
+enum AwaitFailure {
+    /// The deadline was exceeded, either on the clock or by a transport error
+    /// whose deadline has already passed.
+    Timeout,
+    /// A `TimedOut`/`WouldBlock` transport error, with the deadline still in
+    /// the future: a slow poll, not a failure.
+    NotYet,
+    /// Any other transport error: exit 1 with the message on stderr.
+    Fail(String),
+}
+
+/// Classify a request error inside an await.
+///
+/// Mapping (per the P578 r4-2 brief, V4):
+/// - `TimedOut` → `Timeout`;
+/// - any `Transport` with `deadline <= now` → `Timeout`;
+/// - else `TimedOut`/`WouldBlock` kinds → `NotYet`;
+/// - else `Fail(err.to_string())`.
+fn await_failure(err: &BoundedError, deadline: Option<Instant>, now: Instant) -> AwaitFailure {
+    match err {
+        BoundedError::TimedOut => AwaitFailure::Timeout,
+        BoundedError::Transport(transport) => {
+            if deadline.is_some_and(|d| d <= now) {
+                return AwaitFailure::Timeout;
+            }
+            match transport.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => AwaitFailure::NotYet,
+                _ => AwaitFailure::Fail(err.to_string()),
+            }
+        }
+    }
+}
+
+impl fmt::Display for BoundedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "request timed out"),
+            Self::Transport(err) => write!(f, "{err}"),
+        }
+    }
+}
 /// Make a socket request bounded by a deadline.
 ///
 /// The request timeout is the minimum of the given cap and the time remaining
@@ -343,6 +423,10 @@ struct Entry {
     /// from it and cannot double-count the turn it already waited for.
     cursor: String,
     created_at_ms: u64,
+    /// The terminal_id of the root pane (from workspace.create or worktree.create response).
+    /// Used for positive identity in cwd-mode reap/rollback.
+    #[serde(default)]
+    root_pane_terminal_id: String,
 }
 
 /// The directory holding this server's delegates: one file per name, under the
@@ -835,27 +919,63 @@ fn expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
-fn agent_record(target: &str, deadline: Option<Instant>) -> Option<serde_json::Value> {
-    let response = match bounded(
+/// How the one `agent.get` for identity resolution ended.
+///
+/// Three outcomes, kept apart for the one caller that cares — `require_delegate`
+/// routes `TimedOut` to `Outcome::Timeout` when a `delegate wait` or `send
+/// --await` has a deadline, and treats a transport failure like a missing agent
+/// (`None`): we can't prove the delegate is still the one running, so we say
+/// "not a delegate" rather than close over an uncertain identity.
+enum AgentFetch {
+    /// The server named an agent; the record is the body.
+    Found(serde_json::Value),
+    /// The server did not name an agent, or the response was unusable.
+    Missing,
+    /// The caller's deadline passed on the way to or during this request.
+    TimedOut,
+}
+
+/// Look up the agent record bounded by the caller's deadline. Classifies the
+/// outcome via `await_failure`: `Timeout` → `TimedOut`, `NotYet`/`Fail` →
+/// `Missing` (treated like "no such agent", because an identity we cannot
+/// prove is never positive evidence — the K-rules' governing principle).
+fn agent_record(target: &str, deadline: Option<Instant>) -> AgentFetch {
+    let bounded_res = bounded(
         Method::AgentGet(AgentTarget {
             target: target.to_string(),
         }),
         deadline,
         REQUEST_TIMEOUT,
-    ) {
+    );
+    let response = match bounded_res {
         Ok(response) => response,
-        Err(BoundedError::TimedOut) => return None,
-        Err(BoundedError::Transport(_)) => {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return None;
-            }
-            return None;
+        Err(err) => {
+            return match await_failure(&err, deadline, Instant::now()) {
+                AwaitFailure::Timeout => AgentFetch::TimedOut,
+                AwaitFailure::NotYet | AwaitFailure::Fail(_) => AgentFetch::Missing,
+            };
         }
     };
-    response
+    match response
         .pointer("/result/agent")
         .filter(|record| record.is_object())
         .cloned()
+    {
+        Some(record) => AgentFetch::Found(record),
+        None => AgentFetch::Missing,
+    }
+}
+
+/// Shortcut for callers that cannot tell timeout from "missing" apart.
+///
+/// Most callers of `agent_record` want the record if it exists and nothing if
+/// it doesn't — the deadline distinction is only interesting to the one caller
+/// that routes it to `Outcome::Timeout`. This helper keeps those sites short.
+fn agent_record_opt(target: &str, deadline: Option<Instant>) -> Option<serde_json::Value> {
+    match agent_record(target, deadline) {
+        AgentFetch::Found(record) => Some(record),
+        AgentFetch::Missing | AgentFetch::TimedOut => None,
+    }
 }
 
 fn field<'a>(record: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -945,9 +1065,8 @@ impl Placement {
     }
 }
 
-/// Every workspace the server lists, as records.
-#[allow(dead_code)]
-fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
+/// Every workspace the server lists, as records. Returns `None` if the request failed.
+fn workspace_records(deadline: Option<Instant>) -> Option<Vec<serde_json::Value>> {
     let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
         Method::WorkspaceList(EmptyParams::default()),
         deadline,
@@ -957,9 +1076,8 @@ fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
         Ok(response) => response
             .pointer("/result/workspaces")
             .and_then(|workspaces| workspaces.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
+            .cloned(),
+        Err(_) => None,
     }
 }
 
@@ -970,7 +1088,10 @@ fn workspace_records(deadline: Option<Instant>) -> Vec<serde_json::Value> {
 /// on stderr — so there is no path where a start has asked the server to create
 /// something and then walked away from the answer.
 fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
-    let (repo, worktrees_before) = match mode {
+    // The pre-create list is `None` if the LIST request failed, never defaulted to
+    // empty: a `[]` default would make every post-create checkout look new and
+    // force-kill it. In cwd mode we never list — there is no worktree to compare.
+    let (repo, worktrees_before): (String, Option<Vec<serde_json::Value>>) = match mode {
         Mode::Worktree => {
             let repo = match &flags.repo {
                 Some(repo) => repo.clone(),
@@ -983,57 +1104,83 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                     }
                 },
             };
-            let worktrees_before = worktree_list_plain(&repo, None).unwrap_or_default();
+            let worktrees_before = worktree_list_plain(&repo, None);
             (repo, worktrees_before)
         }
-        Mode::Cwd => (String::new(), Vec::new()),
+        Mode::Cwd => (String::new(), None),
     };
-    let response = match mode {
-        Mode::Worktree => request(
+    let bounded_res = match mode {
+        Mode::Worktree => bounded(
             Method::WorktreeCreate(WorktreeCreateParams {
-                cwd: Some(repo),
+                cwd: Some(repo.clone()),
                 branch: flags.branch.clone(),
                 base: flags.base.clone(),
                 focus: false,
                 ..WorktreeCreateParams::default()
             }),
             None,
+            Duration::from_secs(60),
         ),
         Mode::Cwd => {
             let cwd = flags
                 .cwd
                 .clone()
                 .expect("placement was validated before anything was created");
-            request(
+            bounded(
                 Method::WorkspaceCreate(WorkspaceCreateParams {
                     cwd: Some(cwd),
                     focus: false,
                     label: None,
                 }),
                 None,
+                REQUEST_TIMEOUT,
             )
         }
     };
 
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            // Transport/timeout failure: the server may have created a checkout
-            // but couldn't report it. Run place-failure cleanup.
+    // Classify the failure, with the pre-create list carried through: a `None`
+    // means the inventory failed, so no destructive check is safe (K2).
+    let response = match bounded_res {
+        Ok(response) => {
+            if let Some(error) = response.get("error") {
+                // A server refusal means the server CREATED nothing, so
+                // leftover_check(Refused, _) is always Nothing: do not touch
+                // the inventory, just report the refusal. Wrapping the error
+                // in CreateFailure keeps the two sides of place's decision
+                // table in one shape — the pure function proves the policy.
+                let failure = CreateFailure::Refused(parse_server_error(error));
+                return Err(teardown_after_place_failure(
+                    name,
+                    worktrees_before.as_deref(),
+                    mode,
+                    flags,
+                    &repo,
+                    failure,
+                ));
+            }
+            response
+        }
+        Err(BoundedError::TimedOut) => {
             return Err(teardown_after_place_failure(
                 name,
-                &worktrees_before,
+                worktrees_before.as_deref(),
                 mode,
                 flags,
-                err.to_string(),
-            ));
+                &repo,
+                CreateFailure::TimedOut,
+            ))
+        }
+        Err(BoundedError::Transport(e)) => {
+            return Err(teardown_after_place_failure(
+                name,
+                worktrees_before.as_deref(),
+                mode,
+                flags,
+                &repo,
+                CreateFailure::Transport(e.kind()),
+            ))
         }
     };
-    if let Some(error) = response.get("error") {
-        // Server refusal: the server created nothing. Do NOT clean up.
-        let reason = server_error(error);
-        return Err(fail(reason));
-    }
 
     let workspace_id = at(&response, "/result/workspace/workspace_id").map(str::to_string);
     let root_pane = at(&response, "/result/root_pane/pane_id").map(str::to_string);
@@ -1076,61 +1223,93 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
 
 /// Undo a create whose answer could not be used, and hand back the exit code.
 ///
-/// For worktree mode, if the create failed after the request was sent, we may have
-/// a checkout on disk that the server created but couldn't report. We find it by
-/// comparing the worktree list before and after the call, matching on --branch if
-/// given, and kill it with force. The parent workspace (if any) is recorded from the
-/// server's response and cleaned up through the shared `tear_down` routine; see #595.
+/// On a place failure there is no placement, so nothing here closes a parent
+/// workspace (K2's governing rule: with no positive evidence of what the server
+/// created, destroy nothing). The one destructive branch is for a transport
+/// failure whose pre-create inventory succeeded: that is the only shape in
+/// which "a new checkout appeared after our timed-out create" has a sound
+/// definition. Every other shape prints what might be left behind and exits
+/// without touching the server.
+///
+/// `worktrees_before` is `None` when the pre-create `worktree.list` failed,
+/// never defaulted to empty: a `[]` default would make every checkout look
+/// new and the force-kill would hit the operator's work.
 fn teardown_after_place_failure(
     name: &str,
-    worktrees_before: &[serde_json::Value],
+    worktrees_before: Option<&[serde_json::Value]>,
     mode: Mode,
     flags: &StartFlags,
-    reason: impl fmt::Display,
+    repo: &str,
+    failure: CreateFailure,
 ) -> i32 {
-    // For worktree mode, the create may have left a checkout behind. We find it
-    // by diffing the worktree list before and after, matching on --branch if given.
-    if mode == Mode::Worktree {
-        let repo = flags.repo.clone().unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|c| c.display().to_string())
-                .unwrap_or_default()
-        });
-        let worktrees_after = match worktree_list_plain(&repo, None) {
-            Ok(list) => list,
-            Err(err) => {
-                eprintln!(
-                    "delegate {name}: could not check for a leftover checkout of {}: {err}",
-                    flags.branch.as_deref().unwrap_or("<unknown>")
-                );
-                return fail(reason);
-            }
-        };
-        let branch = flags.branch.as_deref();
-        let new_checkout = find_new_checkout(worktrees_before, &worktrees_after, branch);
-        if let Some(checkout) = new_checkout {
-            let response = kill(None, Some(&checkout), true);
-            let response = match response {
-                Ok(r) => r,
-                Err(err) => {
-                    eprintln!("delegate {name}: rollback also failed: {err}");
+    let reason = failure.describe();
+    // In cwd mode the create was workspace.create: nothing on disk belongs to
+    // the delegate yet, so there is no leftover to look for.
+    if mode == Mode::Cwd {
+        return fail(reason);
+    }
+    let branch_label = flags.branch.as_deref().unwrap_or("<unknown>");
+    match leftover_check(&failure, worktrees_before.is_some()) {
+        LeftoverCheck::Nothing => fail(reason),
+        LeftoverCheck::CannotCheck => {
+            eprintln!("delegate {name}: could not check for a leftover checkout of {branch_label}");
+            fail(reason)
+        }
+        LeftoverCheck::Look => {
+            let before = worktrees_before.expect("Look implies the pre-create list succeeded");
+            let worktrees_after = match worktree_list_plain(repo, None) {
+                Some(list) => list,
+                None => {
+                    // A failed post-create list is "cannot check": print and
+                    // destroy nothing (K2).
+                    eprintln!(
+                        "delegate {name}: could not check for a leftover checkout of {branch_label}"
+                    );
                     return fail(reason);
                 }
             };
-            if let Some(err) = refusal(&response) {
-                if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
-                    eprintln!("delegate {name}: rollback also failed: {err}");
+            let new_checkout = find_new_checkout(before, &worktrees_after, flags.branch.as_deref());
+            if let Some(checkout) = new_checkout {
+                match kill(None, Some(&checkout), true) {
+                    Ok(response) => {
+                        if let Some(err) = refusal(&response) {
+                            if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
+                                eprintln!("delegate {name}: rollback also failed: {err}");
+                            }
+                        } else {
+                            eprintln!(
+                                "delegate {name}: rollback removed stray checkout at {checkout}"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("delegate {name}: rollback also failed: {err}");
+                    }
                 }
             } else {
-                eprintln!("delegate {name}: rollback removed stray checkout at {checkout}");
+                eprintln!(
+                    "delegate {name}: rollback found no new checkout to remove (branch filter: {:?})",
+                    flags.branch.as_deref()
+                );
             }
-        } else {
-            eprintln!("delegate {name}: rollback found no new checkout to remove (branch filter: {branch:?})");
+            fail(reason)
         }
     }
-    // The parent workspace (if any) was recorded from the server's response and
-    // will be cleaned up through the shared `tear_down` routine.
-    fail(reason)
+}
+
+impl CreateFailure {
+    /// A human-readable description of the failure, for stderr. Reads both
+    /// variant fields so a transport error names its kind and a refusal names
+    /// the server's own code and message — the dead_code lint is a consequence
+    /// of that, not a reason to allow unused fields (R6: no `allow(dead_code)`
+    /// in this module).
+    fn describe(&self) -> String {
+        match self {
+            Self::Refused(err) => err.to_string(),
+            Self::TimedOut => "create request timed out".to_string(),
+            Self::Transport(kind) => format!("create failed: transport error ({kind:?})"),
+        }
+    }
 }
 
 /// Find a checkout that appeared after the create call, matching on --branch if given.
@@ -1165,29 +1344,23 @@ fn find_new_checkout(
     }
     None
 }
-fn worktree_list_plain(
-    repo: &str,
-    deadline: Option<Instant>,
-) -> Result<Vec<serde_json::Value>, String> {
-    request(
+fn worktree_list_plain(repo: &str, deadline: Option<Instant>) -> Option<Vec<serde_json::Value>> {
+    let response = match bounded(
         Method::WorktreeList(WorktreeListParams {
             workspace_id: None,
             cwd: Some(repo.to_string()),
             scan: false,
         }),
         deadline,
-    )
-    .map_err(|err| err.to_string())
-    .and_then(|response| {
-        if let Some(error) = response.get("error") {
-            return Err(server_error(error));
-        }
-        response
-            .pointer("/result/worktrees")
-            .and_then(|worktrees| worktrees.as_array())
-            .cloned()
-            .ok_or_else(|| "server returned no worktrees".to_string())
-    })
+        REQUEST_TIMEOUT,
+    ) {
+        Ok(response) => response,
+        Err(_) => return None,
+    };
+    response
+        .pointer("/result/worktrees")
+        .and_then(|worktrees| worktrees.as_array())
+        .cloned()
 }
 
 // ---------------------------------------------------------------- teardown
@@ -1269,7 +1442,7 @@ impl Cleanup {
             workspace_id: entry.workspace_id.clone(),
             pane_id: entry.pane_id.clone(),
             root_pane: entry.root_pane.clone(),
-            root_pane_terminal_id: String::new(), // Not stored in registry; only available in-process
+            root_pane_terminal_id: entry.root_pane_terminal_id.clone(),
             terminal_id: entry.terminal_id.clone(),
             mode: Mode::parse(&entry.mode)?,
             worktree: entry.worktree.clone(),
@@ -1303,9 +1476,10 @@ struct TearDown {
 /// * **Nothing is destroyed before its identity is re-checked** (D-C). A
 ///   workspace id is a name, and a server restart can hand the same name to a
 ///   different workspace. In worktree mode the check is that the workspace still
-///   holds the recorded checkout; in cwd mode, that it still holds the recorded
-///   agent's pane. A mismatch is treated as gone — the checkout is reached by
-///   path instead, and the workspace is left alone.
+///   holds the recorded checkout; in cwd mode, that it still holds a pane whose
+///   terminal_id matches one we recorded (the agent's terminal_id or the root
+///   pane's terminal_id). A mismatch is treated as gone — the checkout is reached
+///   by path instead, and the workspace is left alone.
 /// * **The parent workspace is only closed when it is still the parent.** It is
 ///   closed only if it exists, still holds the recorded repository root, holds a
 ///   single pane, and no other open workspace is a linked worktree of the same
@@ -1377,6 +1551,27 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
 
 /// Is the recorded workspace still the one this delegate created?
 ///
+/// Check if any pane in the workspace holds one of the recorded terminal IDs.
+/// Returns true when any pane's terminal_id equals a NON-EMPTY recorded id.
+/// A `None` (failed `pane.list`) or no non-empty recorded id returns false.
+fn holds_recorded_terminal(panes: Option<&[serde_json::Value]>, recorded: &[&str]) -> bool {
+    let panes = match panes {
+        Some(p) => p,
+        None => return false,
+    };
+    for recorded_id in recorded {
+        if recorded_id.is_empty() {
+            continue;
+        }
+        for pane in panes {
+            if pane.get("terminal_id").and_then(serde_json::Value::as_str) == Some(*recorded_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The two modes can only be checked against different things, because they were
 /// recorded differently. A worktree workspace is identified by its CHECKOUT — the
 /// thing that was actually created. A cwd workspace has no checkout of its own, so
@@ -1400,22 +1595,29 @@ fn workspace_is_ours(target: &Cleanup) -> bool {
             !current.is_empty() && same_path(current, checkout)
         }
         Mode::Cwd => {
-            // A cwd-mode workspace is ours only if it still holds the root pane
-            // (the shell pane created with the workspace) with the terminal_id
-            // we recorded at creation time. This terminal_id is stable across
-            // restarts and uniquely identifies the root pane.
-            //
-            // If the root pane's terminal is gone, the workspace is not ours to
-            // close. This also covers the case where the agent died at launch:
-            // the root pane still exists and has its terminal_id.
-            let root_pane_terminal_id = &target.root_pane_terminal_id;
-            if root_pane_terminal_id.is_empty() {
-                // Should not happen for in-process rollbacks, but for registry
-                // entries created before this field existed, we can't establish
-                // positive identity.
-                return false;
+            // A cwd-mode workspace is ours only if it still holds a pane whose
+            // terminal_id matches one we recorded (either the agent's terminal_id
+            // or the root pane's terminal_id). This handles both the case where
+            // the agent is running and the case where the agent died at launch.
+            let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
+                Method::PaneList(PaneListParams {
+                    workspace_id: Some(target.workspace_id.clone()),
+                }),
+                None,
+                REQUEST_TIMEOUT,
+            );
+            match bounded_res {
+                Ok(response) => {
+                    let panes = response
+                        .pointer("/result/panes")
+                        .and_then(|panes| panes.as_array());
+                    holds_recorded_terminal(
+                        panes.map(Vec::as_slice),
+                        &[&target.terminal_id, &target.root_pane_terminal_id],
+                    )
+                }
+                Err(_) => false,
             }
-            workspace_has_terminal(&target.workspace_id, root_pane_terminal_id)
         }
     }
 }
@@ -1437,65 +1639,65 @@ fn workspace_record(workspace_id: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// Check if a workspace holds a pane with the given terminal_id.
-fn workspace_has_terminal(workspace_id: &str, terminal_id: &str) -> bool {
-    let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
-        Method::PaneList(PaneListParams {
-            workspace_id: Some(workspace_id.to_string()),
-        }),
-        None,
-        REQUEST_TIMEOUT,
-    );
-    match bounded_res {
-        Ok(response) => response
-            .pointer("/result/panes")
-            .and_then(|panes| panes.as_array())
-            .is_some_and(|panes| {
-                panes
-                    .iter()
-                    .any(|pane| field(pane, "terminal_id") == Some(terminal_id))
-            }),
-        Err(_) => false,
-    }
-}
-
 /// The parent workspace to close, or `None` to leave it alone.
 ///
-/// All four conditions, and the last one is the expensive one: while another
-/// workspace still holds a linked worktree of the same repository, the
-/// repository-root workspace is that checkout's parent and closing it would take
-/// an operator's work with it.
-fn parent_to_close(target: &Cleanup) -> Result<Option<String>, ServerError> {
-    let Some(parent_id) = target.parent_workspace_id.clone() else {
-        return Ok(None);
+/// Pure function to decide whether a parent workspace is closable.
+///
+/// Returns true only when ALL of these hold:
+/// - parent and repo_root are present;
+/// - the parent's worktree.checkout_path equals repo_root (same_path);
+/// - its pane_count is exactly 1 (missing -> false);
+/// - the list is present;
+/// - no row other than ours and the parent itself is a linked worktree of repo_key
+///   (with no recorded key, ANY other linked worktree counts).
+fn parent_closable(
+    parent: Option<&serde_json::Value>,
+    repo_root: Option<&str>,
+    others: Option<&[serde_json::Value]>,
+    ours: &str,
+    repo_key: Option<&str>,
+) -> bool {
+    let parent = match parent {
+        Some(p) => p,
+        None => return false,
     };
-    let Some(record) = workspace_record(&parent_id) else {
-        return Ok(None);
+    let repo_root = match repo_root {
+        Some(r) => r,
+        None => return false,
     };
-    let Some(repo_root) = target.repo_root.as_deref() else {
-        return Ok(None);
+    let others = match others {
+        Some(o) => o,
+        None => return false,
     };
-    let checkout = at(&record, "/worktree/checkout_path").unwrap_or_default();
+    let checkout = parent
+        .pointer("/worktree/checkout_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     if checkout.is_empty() || !same_path(checkout, repo_root) {
-        return Ok(None);
+        return false;
     }
-    if record
+    let pane_count = parent
         .get("pane_count")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        != 1
-    {
-        return Ok(None);
+        .unwrap_or(0);
+    if pane_count != 1 {
+        return false;
     }
-    let repo_key = target.repo_key.as_deref();
-    let ours = target.workspace_id.as_str();
-    let parent = parent_id.as_str();
-    for other in workspace_records(None) {
-        let Some(id) = field(&other, "workspace_id") else {
+    for other in others {
+        let Some(id) = field(other, "workspace_id") else {
             continue;
         };
-        if id == ours || id == parent {
+        if id == ours {
             continue;
+        }
+        // Also skip the parent itself
+        if let Some(parent_id) = parent
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if id == parent_id {
+                continue;
+            }
         }
         let linked = other
             .pointer("/worktree/is_linked_worktree")
@@ -1507,10 +1709,36 @@ fn parent_to_close(target: &Cleanup) -> Result<Option<String>, ServerError> {
                 .and_then(serde_json::Value::as_str)
                 == repo_key;
         if linked && same_repo {
-            return Ok(None);
+            return false;
         }
     }
-    Ok(Some(parent_id))
+    true
+}
+
+/// All four conditions, and the last one is the expensive one: while another
+/// workspace still holds a linked worktree of the same repository, the
+/// repository-root workspace is that checkout's parent and closing it would take
+/// an operator's work with it.
+fn parent_to_close(target: &Cleanup) -> Result<Option<String>, ServerError> {
+    let Some(parent_id) = target.parent_workspace_id.clone() else {
+        return Ok(None);
+    };
+    let parent = workspace_record(&parent_id);
+    let repo_root = target.repo_root.as_deref();
+    let others = workspace_records(None);
+    let ours = target.workspace_id.as_str();
+    let repo_key = target.repo_key.as_deref();
+    if parent_closable(
+        parent.as_ref(),
+        repo_root,
+        others.as_deref(),
+        ours,
+        repo_key,
+    ) {
+        Ok(Some(parent_id))
+    } else {
+        Ok(None)
+    }
 }
 
 fn kill(
@@ -1621,7 +1849,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
 
-    if agent_record(name, None).is_some() {
+    if agent_record_opt(name, None).is_some() {
         return Ok(fail(format!("agent_name_taken: {name}")));
     }
     if let Some(existing) = read_entry(name) {
@@ -1717,6 +1945,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         submitted_at_ms,
         cursor: cursor.clone(),
         created_at_ms: now_ms(),
+        root_pane_terminal_id: placement.root_pane_terminal_id.clone(),
     };
     if let Err(err) = write_entry(&entry) {
         let _ = std::fs::remove_file(entry_path(name));
@@ -1856,7 +2085,7 @@ fn await_ready(
     }
 
     loop {
-        let Some(record) = agent_record(&terminal_id, None) else {
+        let Some(record) = agent_record_opt(&terminal_id, None) else {
             return Err(format!("delegate {name}: the agent no longer resolves"));
         };
         let status = field(&record, "agent_status")
@@ -1904,7 +2133,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-    let mut entry = match require_delegate(name, None) {
+    let mut entry = match require_delegate_no_deadline(name) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
@@ -1985,7 +2214,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
 /// one this round starts from.
 fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_json::Value, String> {
     loop {
-        let Some(record) = agent_record(&entry.terminal_id, None) else {
+        let Some(record) = agent_record_opt(&entry.terminal_id, None) else {
             return Err(format!("delegate {name}: the agent no longer resolves"));
         };
         let status = field(&record, "agent_status")
@@ -2029,7 +2258,23 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
 
     let entry = match require_delegate(name, deadline) {
         Ok(entry) => entry,
-        Err(code) => return Ok(code),
+        Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
+        Err(RequireFailure::TimedOut(boxed)) => {
+            // The agent lookup burned the budget. Emit the timeout outcome
+            // against the registry entry we read before the clock ran out, so
+            // a `--json` caller still gets the one object every outcome prints
+            // (K5): exit 124 with the timeout outcome.
+            let entry = *boxed;
+            let reported_cursor = flags.after.clone().unwrap_or_else(|| entry.cursor.clone());
+            emit_outcome(
+                &entry,
+                Outcome::Timeout.as_str(),
+                None,
+                flags.json,
+                &reported_cursor,
+            );
+            return Ok(Outcome::Timeout.exit_code());
+        }
     };
     // A caller resuming after a timeout needs to wait for the SAME round, and
     // freshness is judged against when that round was submitted — so both come
@@ -2055,7 +2300,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate(name, None) {
+    let entry = match require_delegate_no_deadline(name) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
@@ -2083,7 +2328,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         // statement about the TURN rather than an error: the live status is what
         // says whether that turn is still running.
         if code == "no_result" {
-            let status = agent_record(&entry.terminal_id, None)
+            let status = agent_record_opt(&entry.terminal_id, None)
                 .and_then(|record| field(&record, "agent_status").map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string());
             let running = matches!(status.as_str(), "working" | "blocked" | "unknown");
@@ -2130,11 +2375,11 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate(name, None) {
+    let entry = match require_delegate_no_deadline(name) {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
-    let status = agent_record(&entry.terminal_id, None)
+    let status = agent_record_opt(&entry.terminal_id, None)
         .and_then(|record| field(&record, "agent_status").map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
     if flags.json {
@@ -2173,21 +2418,58 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
 /// The terminal check is what makes a rename visible. An agent renamed away from
 /// its delegate name is no longer addressable as that delegate, and a `send`
 /// that still worked would type into whatever inherited the name.
-fn require_delegate(name: &str, _deadline: Option<Instant>) -> Result<Entry, i32> {
+/// Why `require_delegate` returned, when it did not return an `Entry`.
+///
+/// The two failures are kept apart because they go to different exit codes:
+/// `NotDelegate` is a usage error (exit 2) with "not a delegate: {name}", and
+/// `TimedOut` carries the entry so the one caller that cares (`delegate wait`
+/// / `send --await`) can emit a `timeout` outcome object and exit 124 (K5).
+enum RequireFailure {
+    /// The name does not resolve to this process's delegate right now: no
+    /// registry entry, no agent, the agent is a different one, or a transport
+    /// failure that could not prove identity. All five mean the same thing to
+    /// a caller: this is not a delegate.
+    NotDelegate,
+    /// The caller's deadline passed while looking up the agent record. The
+    /// entry we found before that is handed back so the caller can emit a
+    /// timeout outcome object naming the delegate (K5). Boxed so this
+    /// variant does not inflate every `NotDelegate` return by hundreds of
+    /// bytes (clippy::result_large_err).
+    TimedOut(Box<Entry>),
+}
+
+fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, RequireFailure> {
     if let Err(reason) = validate_name(name) {
-        return Err(usage(reason));
+        eprintln!("{reason}");
+        return Err(RequireFailure::NotDelegate);
     }
-    let refuse = || usage(format!("not a delegate: {name}"));
     let Some(entry) = read_entry(name) else {
-        return Err(refuse());
+        return Err(RequireFailure::NotDelegate);
     };
-    let Some(record) = agent_record(name, None) else {
-        return Err(refuse());
-    };
-    if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
-        return Err(refuse());
+    match agent_record(name, deadline) {
+        AgentFetch::Found(record) => {
+            if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
+                Err(RequireFailure::NotDelegate)
+            } else {
+                Ok(entry)
+            }
+        }
+        AgentFetch::Missing => Err(RequireFailure::NotDelegate),
+        AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
     }
-    Ok(entry)
+}
+
+/// Map the two "no entry" `RequireFailure` cases for callers that pass a `None`
+/// deadline and so never see `TimedOut`. A `TimedOut` from one of those is a
+/// bug in this module — the deadline would have had to come from somewhere.
+fn require_delegate_no_deadline(name: &str) -> Result<Entry, i32> {
+    match require_delegate(name, None) {
+        Ok(entry) => Ok(entry),
+        Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
+        Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
+            "delegate {name}: timed out resolving the agent"
+        ))),
+    }
 }
 
 // ------------------------------------------------------------------- reap
@@ -2331,6 +2613,10 @@ enum ResultPoll {
     Gone,
     /// The server refused for a reason that is not "not yet".
     Refused(String),
+    /// The caller's deadline has passed, or the request errored once it had.
+    /// Routed to `Outcome::Timeout` (exit 124), not to `Refused` which would be
+    /// exit 1 (K5).
+    Timeout,
 }
 
 /// What the reply grace concluded.
@@ -2348,6 +2634,11 @@ enum Grace {
     NewTurn,
     /// The grace ran out with no reply. The caller decides timeout vs no_result.
     Exhausted,
+    /// A deadline-driven timeout from inside the grace: always `Outcome::Timeout`
+    /// (exit 124), never `Refused`. Kept separate from `Exhausted` so a caller
+    /// that reads `Grace::Timeout` cannot confuse "no reply yet" with "clock
+    /// ran out mid-poll" (K5).
+    Timeout,
 }
 
 /// What a settled outcome means for the delegate.
@@ -2494,6 +2785,10 @@ impl Await<'_> {
                 },
                 Grace::Refused(reason) => SettledDecision::Failed(reason),
                 Grace::NewTurn => SettledDecision::WaitAgain,
+                Grace::Timeout => SettledDecision::Report {
+                    outcome: Outcome::Timeout,
+                    info: None,
+                },
                 Grace::Exhausted => SettledDecision::Report {
                     outcome: if self
                         .deadline
@@ -2530,6 +2825,7 @@ impl Await<'_> {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
                 ResultPoll::Gone => return Grace::Gone,
                 ResultPoll::Refused(reason) => return Grace::Refused(reason),
+                ResultPoll::Timeout => return Grace::Timeout,
                 ResultPoll::NotYet => {}
             }
             // The agent took another turn, so the reply that answers THIS round
@@ -2551,7 +2847,12 @@ impl Await<'_> {
         if settled_cursor.is_empty() {
             return false;
         }
-        let Some(record) = agent_record(&self.entry.terminal_id, None) else {
+        // The deadline is `self.deadline`: this call lives inside an await, so
+        // any failure here is already routed through `await_failure`
+        // (`agent_record` does it). A timeout here is treated like "no new turn"
+        // — the clock will drive the outer loop to Outcome::Timeout anyway, and
+        // positive evidence for a new turn requires a successful response.
+        let Some(record) = agent_record_opt(&self.entry.terminal_id, self.deadline) else {
             return false;
         };
         let Some(raw) = record
@@ -2597,19 +2898,11 @@ impl Await<'_> {
         );
         let response = match bounded_res {
             Ok(response) => response,
-            Err(BoundedError::TimedOut) => {
-                return ResultPoll::Refused("deadline passed".to_string())
-            }
-            Err(BoundedError::Transport(_)) => {
-                // Transport error: if deadline passed, it's a timeout; otherwise "not yet" and retry.
-                if self
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
-                    return ResultPoll::Refused("deadline passed".to_string());
-                }
-                return ResultPoll::NotYet;
-            }
+            Err(err) => match await_failure(&err, self.deadline, Instant::now()) {
+                AwaitFailure::Timeout => return ResultPoll::Timeout,
+                AwaitFailure::NotYet => return ResultPoll::NotYet,
+                AwaitFailure::Fail(reason) => return ResultPoll::Refused(reason),
+            },
         };
         if let Some(error) = response.get("error") {
             let code = error
@@ -3012,3 +3305,7 @@ mod tests {
         assert!(!ALREADY_GONE_CODES.contains(&"dirty_worktree_requires_force"));
     }
 }
+
+#[cfg(test)]
+#[path = "delegate_decisions_tests.rs"]
+mod decisions_tests;
