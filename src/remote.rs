@@ -1808,6 +1808,9 @@ struct BridgeHealth {
     /// The newest connection that has carried bytes, by the accept-order number
     /// the accept loop gave it when it was accepted.
     latest_success: u64,
+    /// The newest connection whose failure was recorded, in the same
+    /// accept-order numbering.
+    latest_failure_seq: u64,
 }
 
 impl BridgeHealth {
@@ -1837,14 +1840,22 @@ impl BridgeHealth {
         }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_reason = Some(reason);
+        self.latest_failure_seq = self.latest_failure_seq.max(seq);
         Some((
             self.consecutive_failures,
             self.consecutive_failures == crate::peers::DIAL_FAILURE_PERSISTS_AFTER,
         ))
     }
 
+    /// Record a connection that worked. The run of failures closes only for a
+    /// success at least as new as the newest recorded failure: the mirror of
+    /// the guard above, since a connection that exits cleanly long after the
+    /// bridge has redialed past it cannot report on the tunnel in use (#621).
     fn record_success(&mut self, seq: u64) {
         self.latest_success = self.latest_success.max(seq);
+        if seq < self.latest_failure_seq {
+            return;
+        }
         self.consecutive_failures = 0;
         self.last_reason = None;
     }
@@ -3769,6 +3780,43 @@ mod tests {
             health.record_failure(3, false, crate::peers::SshFailureReason::ConnectRefused),
             Some((1, false)),
             "a newer failure still opens a run, and never as the persistent one"
+        );
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
+        );
+    }
+
+    /// #621: the mirror of that guard, on the other side of the ordering. A
+    /// connection 1 whose clean exit is recorded after connection 2 has failed
+    /// cannot close the run connection 2 opened; a success at least as new
+    /// still closes it.
+    #[test]
+    fn a_late_success_from_an_older_connection_does_not_close_a_newer_failure() {
+        let mut health = BridgeHealth::default();
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
+        );
+        health.record_success(1);
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused),
+            "a connection the bridge has redialed past cannot close the newer failure's run"
+        );
+        health.record_success(3);
+        assert_eq!(health.failing_reason(), None);
+    }
+
+    /// #621: the decline is `<`, not `<=`. A connection that carried bytes and
+    /// then died is the bridge's current state, so its own failure is recorded.
+    #[test]
+    fn a_failure_from_the_newest_successful_connection_is_still_recorded() {
+        let mut health = BridgeHealth::default();
+        health.record_success(2);
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
         );
         assert_eq!(
             health.failing_reason(),
