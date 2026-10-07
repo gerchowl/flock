@@ -630,7 +630,7 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
             "--cwd",
             &work,
             "--harness",
-            "claude",
+            "codex",
         ],
         vec![
             "delegate", "start", "u1", "--brief", &missing_s, "--cwd", &work,
@@ -676,6 +676,8 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
             stderr(&out)
         );
     }
+    // A harness this build does not drive. `claude` was the refusal here while
+    // it was the only one (#612); the row moved to a name the table still lacks.
     let harness = cli(
         &server,
         &[
@@ -687,7 +689,7 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
             "--cwd",
             &work,
             "--harness",
-            "claude",
+            "codex",
         ],
     );
     assert!(

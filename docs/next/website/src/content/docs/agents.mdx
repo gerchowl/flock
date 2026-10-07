@@ -345,6 +345,8 @@ flk delegate start reviewer --brief ./briefs/review.md --worktree --branch revie
 flk delegate send reviewer --brief ./briefs/follow-ups.md --await
 ```
 
+`--harness` picks the agent, `opencode` (the default) or `claude`; `--model M` is passed through to it as `--model M`. With `claude`, a fresh worktree is a folder Claude has no trust record for, so it stops on its folder-trust dialog — the delegate names that dialog and refuses rather than typing the brief at it (#605), and `flk delegate` cannot pre-trust the folder for you.
+
 The brief is a file and exactly one sentence is typed into the agent: `Read <absolute path> and execute it exactly.` Settling is not finishing, so the await reports a round only when the agent actually worked on it and wrote a reply after the brief was submitted — `send` cannot report the previous round's answer as this one's. `flk delegate reap` removes what was recorded; `flk delegate status` and `flk delegate result` read without waiting. See the CLI reference for the flags and exit codes.
 
 One more difference between the sources: `pane read --source visible` follows the

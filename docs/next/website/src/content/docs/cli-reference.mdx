@@ -368,7 +368,7 @@ On success `settled` prints one JSON object on stdout:
 
 ```bash
 flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])
-                    [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]
+                    [--harness opencode|claude] [--model M] [--await] [--timeout MS] [--settle MS]
                     [--ready-timeout MS] [--max-chars N] [--json]
 flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]
 flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]
@@ -383,7 +383,9 @@ The brief is a file, and exactly one sentence is ever typed into the agent: `Rea
 
 The delegate runs in a workspace it created and **never requests focus**, so your focus is unchanged by any of these verbs and a delegate never lands in the workspace you are looking at. With `--worktree` it makes a linked checkout (`--repo`, `--branch`, `--base`; those three mean nothing with `--cwd` and are refused there) and the agent's cwd is that checkout.
 
-**The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash.
+`--harness` is `opencode` (the default) or `claude`, and `--model M` is handed to it as `--model M`. The two differ in where the session comes from, which is what `no_result` reports: opencode's plugin names it mid-turn, Claude's `SessionStart` hook names it from inside the harness.
+
+**The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash. Claude Code asks `Quick safety check: Is this a project you created or one you trust?` the first time it starts in a directory, and a `--worktree` checkout is always such a directory: that dialog has no input box, so the delegate names it (`delegate <name>: Claude Code is waiting on its folder-trust dialog (see #605)`) and refuses instead of typing at it. Accepting it is a human action — #605 is the pre-trust proposal, not a default.
 
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
