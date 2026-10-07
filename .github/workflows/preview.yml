@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Optional main commit SHA to publish
+        description: Optional dev commit SHA to publish
         required: false
         type: string
   schedule:
@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: dev
           fetch-depth: 0
           persist-credentials: false
 
@@ -47,16 +47,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin main --tags
+          git fetch origin dev --tags
           requested="${{ github.event.inputs.commit || '' }}"
           if [ -n "$requested" ]; then
             commit="$(git rev-parse "$requested^{commit}")"
-            if ! git merge-base --is-ancestor "$commit" origin/main; then
-              echo "error: requested commit $commit is not reachable from origin/main" >&2
+            if ! git merge-base --is-ancestor "$commit" origin/dev; then
+              echo "error: requested commit $commit is not reachable from origin/dev" >&2
               exit 1
             fi
           else
-            commit="$(python3 scripts/preview.py select-commit --ref origin/main)"
+            commit="$(python3 scripts/preview.py select-commit --ref origin/dev)"
           fi
           current_preview="$(python3 scripts/preview.py current-commit --manifest website/preview.json || true)"
           if [ "$current_preview" = "$commit" ]; then
@@ -237,7 +237,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: dev
           fetch-depth: 0
           persist-credentials: false
 

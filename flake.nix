@@ -30,15 +30,13 @@
         let
           pkgs = pkgsFor system;
           flock = pkgs.callPackage ./nix/package.nix {
-            buildChannel = "fork";
-            buildId = self.shortRev or self.dirtyShortRev or null;
+            buildCommit = self.rev or self.dirtyRev or null;
           };
           # Same binary plus the `web` feature (the `flk web` xterm bridge,
           # gerchowl/flock#131). Kept out of `default` so a stock build stays
           # lean; hosts that serve the web terminal pin this output.
           flock-web = pkgs.callPackage ./nix/package.nix {
-            buildChannel = "fork";
-            buildId = self.shortRev or self.dirtyShortRev or null;
+            buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
           };
         in
@@ -141,8 +139,7 @@
 
       overlays.default = final: _prev: {
         flock = final.callPackage ./nix/package.nix {
-          buildChannel = "fork";
-          buildId = self.shortRev or self.dirtyShortRev or null;
+          buildCommit = self.rev or self.dirtyRev or null;
         };
       };
     };

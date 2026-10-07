@@ -1,0 +1,127 @@
+# guardrails-ok(ci-shim): repo-automation: release-branch preparation and PR plumbing, no build logic to shim
+#
+# Cut a release. The first half of the only path that moves `main`.
+#
+# `dev` is the integration branch; every PR lands there. `main` holds released
+# code only, so a build of `main` is exactly a published version and the plain
+# version string it reports is true. This workflow prepares the
+# `release: vX.Y.Z` commit on top of `dev` and opens it as an ordinary PR into
+# `dev`, so it gets the same required checks as any change. When it merges,
+# release-follow-up.yml waits for that commit's checks on `dev`, fast-forwards
+# `main` to it and tags it, and the tag starts release.yml. `main` is therefore
+# always an ancestor of `dev` and never needs merging back.
+#
+# The PR is opened with the release App's token, not GITHUB_TOKEN: a PR opened
+# with GITHUB_TOKEN triggers no workflows, so its required checks would never
+# run and auto-merge would wait forever.
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (X.Y.Z). Empty takes the bump `just release-plan` recommends.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Choose the version
+        id: version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          python3 scripts/changelog.py plan | tee "$RUNNER_TEMP/plan.txt"
+          if [ -n "$REQUESTED" ]; then
+            version="$REQUESTED"
+          else
+            version="$(sed -n 's/^ *next version: *//p' "$RUNNER_TEMP/plan.txt")"
+          fi
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::no releasable version (got '$version'); pass one explicitly"
+            exit 1
+          fi
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "::error::tag v$version already exists"
+            exit 1
+          fi
+          python3 scripts/changelog.py check-version --version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the release commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Promote the reviewed docs/next copies onto the published ones.
+          cp docs/next/README.md README.md
+          cp docs/next/CHANGELOG.md CHANGELOG.md
+          cp -R docs/next/website/src/content/docs/. website/src/content/docs/
+          python3 scripts/changelog.py validate-product-announcement
+          python3 scripts/changelog.py prepare --version "$VERSION"
+          cp CHANGELOG.md docs/next/CHANGELOG.md
+          sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+          python3 - "$VERSION" <<'EOF'
+          import re, sys
+          path = "Cargo.lock"
+          text = open(path).read()
+          new, count = re.subn(
+              r'(\[\[package\]\]\nname = "flock-ai"\nversion = ")[^"]*(")',
+              lambda m: m.group(1) + sys.argv[1] + m.group(2),
+              text,
+          )
+          if count != 1:
+              sys.exit(f"expected one flock-ai entry in {path}, found {count}")
+          open(path, "w").write(new)
+          EOF
+          for file in README.md CHANGELOG.md; do
+            diff -u "$file" "docs/next/$file"
+          done
+          python3 scripts/changelog.py extract --version "$VERSION" --output /dev/null
+
+      - name: Open the release PR into dev
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="release/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A
+          git commit -m "release: v$VERSION"
+          git push --force origin "$branch"
+          if ! gh pr view "$branch" --json number >/dev/null 2>&1; then
+            python3 scripts/changelog.py extract --version "$VERSION" --output "$RUNNER_TEMP/notes.md"
+            {
+              printf 'Prepares v%s on `dev`. Opened by the Promote workflow.\n\n' "$VERSION"
+              printf 'When this merges, release-follow-up.yml waits for the merged commit to pass its checks on `dev`, then fast-forwards `main` to it and tags it `v%s`, which starts the Release workflow.\n\n' "$VERSION"
+              cat "$RUNNER_TEMP/notes.md"
+            } > "$RUNNER_TEMP/body.md"
+            gh pr create --base dev --head "$branch" --title "release: v$VERSION" --body-file "$RUNNER_TEMP/body.md"
+          fi
+          gh pr merge "$branch" --squash --auto --delete-branch

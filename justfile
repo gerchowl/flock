@@ -136,54 +136,22 @@ release-prepare version *flags:
     just check
     git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
-    @echo "v{{version}} release commit prepared. Review it, then run: just release-publish {{version}}"
+    @echo "v{{version}} release commit prepared locally as a dry run. Cut the real release with: just release {{version}}"
 
-# Tag and push an already-prepared release commit (usage: just release-publish 0.1.1)
-release-publish version:
-    @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
-        echo "error: version must look like 1.0.0 without a v prefix"; \
-        exit 1; \
-    }
-    @if [ -n "$(git status --porcelain)" ]; then \
-        echo "error: working tree must be clean before publishing"; \
-        exit 1; \
+# Promote opens the `release: vX.Y.Z` PR into dev; once that merges and passes its checks,
+# release-follow-up.yml fast-forwards main to it and tags it. `main` moves no other way.
+# `just release-prepare` is the local dry run of the same commit.
+# Cut a release by dispatching the Promote workflow on dev (usage: just release, or just release 0.9.0)
+release version='':
+    @if [ -n '{{version}}' ]; then \
+        printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
+            echo "error: version must look like 1.0.0 without a v prefix"; \
+            exit 1; \
+        }; \
     fi
-    @branch="$(git branch --show-current)"; \
-    if [ "$branch" != "main" ]; then \
-        echo "error: release-publish must run from main, got $branch"; \
-        exit 1; \
-    fi
-    @git fetch origin main --tags
-    @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
-        echo "error: tag v{{version}} already exists"; \
-        exit 1; \
-    fi
-    @cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"; \
-    if [ "$cargo_version" != "{{version}}" ]; then \
-        echo "error: Cargo.toml version $cargo_version does not match {{version}}"; \
-        exit 1; \
-    fi
-    just release-docs-check
-    python3 scripts/changelog.py extract --version {{version}} --output /tmp/flock-release-notes-check.md
-    rm -f /tmp/flock-release-notes-check.md
-    @local_head="$(git rev-parse HEAD)"; \
-    remote_head="$(git rev-parse origin/main)"; \
-    if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \
-        echo "error: origin/main is not an ancestor of HEAD; pull or rebase before publishing"; \
-        exit 1; \
-    fi; \
-    if [ "$local_head" != "$remote_head" ]; then \
-        echo "pushing release commit to origin/main"; \
-        git push origin HEAD:main; \
-    fi
-    git tag -a v{{version}} -m "v{{version}}"
-    git push origin v{{version}}
-    @echo "v{{version}} released — GitHub Actions building binaries and updating website/latest.json"
-
-# Prepare, verify, tag, push, and trigger the GitHub Release workflow (usage: just release 0.1.1)
-release version:
-    just release-prepare {{version}}
-    just release-publish {{version}}
+    just release-plan
+    gh workflow run promote.yml --ref dev{{if version != "" { " -f version=" + version } else { "" }}}
+    @echo "promote.yml dispatched; follow it with: gh run list --workflow promote.yml --limit 1"
 
 # Print default config
 default-config:

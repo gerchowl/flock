@@ -307,6 +307,24 @@ jobs:
             fi
           done
 
+  # `stable` is the fleet's Nix pin (github:gerchowl/flock/stable). It used to
+  # be moved by hand and sat a release behind; now it follows each published
+  # release. It is a plain unprotected branch, so GITHUB_TOKEN can move it, and
+  # nothing triggers on it.
+  advance-stable:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Point stable at the released commit
+        run: git push --force origin "${GITHUB_SHA}:refs/heads/stable"
+
   update-latest-json:
     needs: release
     runs-on: ubuntu-latest
@@ -314,8 +332,8 @@ jobs:
       contents: read
 
     steps:
-      # main is protected (PRs only, required checks, enforced for admins), so
-      # the manifest lands through a PR. It is opened with an App token, not
+      # The manifest lands on dev through a PR like any other change, and reaches
+      # main with the next release. It is opened with an App token, not
       # GITHUB_TOKEN: a PR opened with GITHUB_TOKEN triggers no workflows, so
       # its required checks would never run and auto-merge would wait forever.
       - uses: actions/create-github-app-token@v2
@@ -326,7 +344,7 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: dev
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
@@ -371,7 +389,7 @@ jobs:
           git commit -m "docs: update website manifest for v$VERSION"
           git push --force origin "$BRANCH"
           if ! gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
-            gh pr create --base main --head "$BRANCH" \
+            gh pr create --base dev --head "$BRANCH" \
               --title "docs: update website manifest for v$VERSION" \
               --body "Advertises the v$VERSION release in website/latest.json. Opened by the Release workflow; merges itself once the required checks pass."
           fi
