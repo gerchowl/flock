@@ -187,6 +187,10 @@ fn integration_install(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    if !trust_hooks && target != IntegrationTarget::Codex {
+        eprintln!("--no-trust-hooks is only supported for codex");
+        return Ok(2);
+    }
     match crate::integration::install_target_with_hook_trust(target, trust_hooks) {
         Ok(messages) => {
             print_integration_messages(messages);
@@ -284,4 +288,15 @@ fn print_integration_help() {
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
     eprintln!("  flk integration verify");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hook_trust_opt_out_is_rejected_for_other_integrations() {
+        assert_eq!(
+            super::integration_install(&["claude".into(), "--no-trust-hooks".into()]).unwrap(),
+            2
+        );
+    }
 }

@@ -3,6 +3,8 @@ use std::{io, path::Path};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+// https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/hooks/src/engine/discovery.rs
+// https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/config/src/fingerprint.rs
 // Codex 0.160.1 hashes the canonical JSON of its normalized TOML identity.
 // Optional unset fields disappear in TOML, while async defaults to false.
 pub(super) fn trust_flock_hook(
@@ -11,8 +13,16 @@ pub(super) fn trust_flock_hook(
     hooks_file: &Value,
     command: &str,
 ) -> io::Result<String> {
-    let source = source.canonicalize()?;
-    let mut config: toml::Value = toml::from_str(config).map_err(io::Error::other)?;
+    let source = source
+        .parent()
+        .ok_or_else(|| io::Error::other("missing hook directory"))?
+        .canonicalize()?
+        .join(
+            source
+                .file_name()
+                .ok_or_else(|| io::Error::other("missing hook filename"))?,
+        );
+    let mut config: toml_edit::DocumentMut = config.parse().map_err(io::Error::other)?;
     let Some(groups) = hooks_file["hooks"]["SessionStart"].as_array() else {
         return Err(io::Error::other("missing Codex SessionStart hooks"));
     };
@@ -52,30 +62,30 @@ pub(super) fn trust_flock_hook(
                 "{}:session_start:{group_index}:{handler_index}",
                 source.display()
             );
-            let table = config
-                .as_table_mut()
-                .ok_or_else(|| io::Error::other("invalid Codex config"))?;
-            let hooks = table
-                .entry("hooks")
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            let hooks = hooks
-                .as_table_mut()
-                .ok_or_else(|| io::Error::other("invalid Codex hooks table"))?;
-            let state = hooks
-                .entry("state")
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            let state = state
-                .as_table_mut()
-                .ok_or_else(|| io::Error::other("invalid Codex hook state"))?;
-            let hook = state
-                .entry(key)
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            hook.as_table_mut()
-                .ok_or_else(|| io::Error::other("invalid Codex hook trust"))?
-                .insert("trusted_hash".into(), toml::Value::String(hash));
+            let mut table = config.as_table_mut();
+            for part in ["hooks", "state", key.as_str()] {
+                let item = table.entry(part).or_insert_with(|| {
+                    let mut fresh = toml_edit::Table::new();
+                    fresh.set_implicit(part != key.as_str());
+                    toml_edit::Item::Table(fresh)
+                });
+                table = item
+                    .as_table_mut()
+                    .ok_or_else(|| io::Error::other("invalid Codex hook trust table"))?;
+            }
+            if table.get("trusted_hash").and_then(toml_edit::Item::as_str) != Some(hash.as_str()) {
+                let mut value = toml_edit::Value::from(hash);
+                if let Some(previous) = table
+                    .get("trusted_hash")
+                    .and_then(toml_edit::Item::as_value)
+                {
+                    *value.decor_mut() = previous.decor().clone();
+                }
+                table.insert("trusted_hash", toml_edit::Item::Value(value));
+            }
         }
     }
-    toml::to_string_pretty(&config).map_err(io::Error::other)
+    Ok(config.to_string())
 }
 
 #[cfg(test)]
