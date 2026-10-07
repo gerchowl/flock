@@ -1019,6 +1019,13 @@ fn a30_a_failed_registry_write_keeps_the_existing_entry() {
         &format!(r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{ws}"}}}}"#),
     );
     assert!(closed.get("error").is_none(), "workspace.close: {closed}");
+    // The old agent must be gone before the second start, or a slow runner
+    // marks the dying pane ready instead of the new one.
+    let gone_by = Instant::now() + WITHIN;
+    while agent_get(&server, "d1").is_some() {
+        assert!(Instant::now() < gone_by, "the old agent never went away");
+        thread::sleep(Duration::from_millis(50));
+    }
 
     let entry = entry_file(&server, "d1").expect("precondition: the old entry exists");
     let before = fs::read(&entry).unwrap();
