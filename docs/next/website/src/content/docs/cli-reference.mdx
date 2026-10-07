@@ -368,7 +368,7 @@ On success `settled` prints one JSON object on stdout:
 
 ```bash
 flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])
-                    [--harness opencode|claude|codex] [--model M] [--await] [--timeout MS] [--settle MS]
+                    [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS] [--settle MS]
                     [--ready-timeout MS] [--max-chars N] [--json]
 flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]
 flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]
@@ -376,6 +376,8 @@ flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
 flk delegate reap <name> [--force] [--json]
 ```
+
+Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspace-write blocks the network, so a delegate that must `git push` or use `gh` needs `--sandbox danger-full-access`, deliberately chosen by the caller. `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access` for Codex only; opencode and Claude reject it with exit 2.
 
 `delegate` is the sequence above run as one command: create the space, start the harness in it, wait until it is actually up, type the brief, and — with `--await` — wait for the round's outcome and print it. It is composed from socket methods that already existed, so it adds no new protocol; what it adds is the bookkeeping that was previously in somebody's shell history.
 

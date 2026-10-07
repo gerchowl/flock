@@ -486,7 +486,7 @@ fn codex_delegate_start_ready_submit_settled_and_result() {
     assert_eq!(agent_get(&server, "d1").unwrap()["agent"], "codex");
     assert_eq!(
         read_lines(&server.base.join("argv.log")),
-        vec!["--model m1 --ask-for-approval never --sandbox danger-full-access"]
+        vec!["--ask-for-approval never --sandbox workspace-write --model m1"]
     );
     let read = cli(&server, &["delegate", "result", "d1", "--json"]);
     assert!(read.status.success(), "{}", stderr(&read));
@@ -501,7 +501,6 @@ fn codex_delegate_hook_review_is_refused_without_typing_the_brief() {
     let server = start_server();
     operator_workspace(&server);
     let before = workspaces(&server).len();
-    fs::write(server.base.join("screen"), HOOK_REVIEW).unwrap();
     let b = brief(&server, "task.md", "do it\n");
     let mut child = start_codex(
         &server,
@@ -509,6 +508,11 @@ fn codex_delegate_hook_review_is_refused_without_typing_the_brief() {
         &b,
         &["--ready-timeout", "20000", "--json"],
     );
+    let pane = delegate_pane(&server, "blocked");
+    // Wait for the fake harness's first paint before presenting its dialog,
+    // matching the startup sequence instead of racing initial PTY geometry.
+    report(&server, &pane, "working");
+    fs::write(server.base.join("screen"), HOOK_REVIEW).unwrap();
     let status = exited_within(&mut child, WITHIN).expect("hook review refusal");
     let out = finish(child);
     if status.success() {
@@ -550,7 +554,14 @@ fn codex_delegate_session_hook_can_arrive_after_submit() {
         &server,
         "d1",
         &b,
-        &["--await", "--timeout", "30000", "--json"],
+        &[
+            "--sandbox",
+            "danger-full-access",
+            "--await",
+            "--timeout",
+            "30000",
+            "--json",
+        ],
     );
     let pane = delegate_pane(&server, "d1");
     report(&server, &pane, "idle");
@@ -570,4 +581,31 @@ fn codex_delegate_session_hook_can_arrive_after_submit() {
     assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
     let out = finish(child);
     assert_eq!(stdout_json(&out)["status_text"], "session reported");
+    assert_eq!(
+        read_lines(&server.base.join("argv.log")),
+        vec!["--ask-for-approval never --sandbox danger-full-access"]
+    );
+}
+
+#[test]
+fn codex_delegate_sandbox_requires_explicit_supported_choice() {
+    let server = start_server();
+    for harness in ["opencode", "claude"] {
+        let out = cli(
+            &server,
+            &[
+                "delegate",
+                "start",
+                "refused",
+                "--harness",
+                harness,
+                "--sandbox",
+                "danger-full-access",
+                "--cwd",
+                server.base.join("work").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stderr(&out).contains("--sandbox is not supported"));
+    }
 }

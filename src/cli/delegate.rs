@@ -79,17 +79,19 @@ use super::settled::{Cursor, PinnedTarget, SettleTarget};
 /// answer two different things.
 pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
-    "                     [--harness opencode|claude|codex] [--model M] [--await] [--timeout MS]\n",
+    "                     [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS]\n",
     "                     [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; claude's folder-trust dialog is\n",
     "                      named rather than typed into (see #605)\n",
-    "                      codex uses never approvals and danger-full-access sandbox policy for builds and network access\n",
+    "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
     "  --settle MS         how long the agent's quiet must hold, default 5000\n",
+    "  --sandbox MODE      codex only: read-only|workspace-write|danger-full-access\n",
+    "                      git push and gh need explicit --sandbox danger-full-access\n",
     "  --ready-timeout MS  how long the agent may take to become ready and reach its prompt, default 60000\n",
     "  --max-chars N       characters of the reply to print, default 4000\n",
     "  the delegate runs in a workspace it created, never in the focused one, and never asks for focus",
@@ -383,6 +385,12 @@ impl HarnessSpec {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct HarnessOptions<'a> {
+    model: Option<&'a str>,
+    sandbox: Option<&'a str>,
+}
+
 /// Everything `delegate` needs to know about one agent harness.
 ///
 /// The delegate is harness-agnostic by design (#578) and this is where that
@@ -394,13 +402,14 @@ impl HarnessSpec {
 struct HarnessSpec {
     /// What `--harness` accepts and what the registry records.
     name: &'static str,
-    /// The argv this harness starts with, given the `--model` the caller passed.
+    /// The argv this harness starts with, given the model and sandbox options the caller passed.
     ///
     /// A function rather than a name because the flag is not the same
     /// everywhere: all current harnesses take `--model`, and a future one that
     /// spelled it `--model-id` should not need this module to learn a second
     /// flag name.
-    argv: fn(Option<&str>) -> Vec<String>,
+    argv: fn(HarnessOptions<'_>) -> Vec<String>,
+    supports_sandbox: bool,
     /// Where the session id comes from — read for what the operator has to be
     /// told when a turn produces no reply at all.
     session_source: SessionSource,
@@ -453,6 +462,7 @@ const HARNESSES: [HarnessSpec; 3] = [
     HarnessSpec {
         name: "opencode",
         argv: opencode_argv,
+        supports_sandbox: false,
         session_source: SessionSource::Plugin,
         result_grace: Duration::from_secs(10),
         startup_dialog: None,
@@ -460,6 +470,7 @@ const HARNESSES: [HarnessSpec; 3] = [
     HarnessSpec {
         name: "claude",
         argv: claude_argv,
+        supports_sandbox: false,
         session_source: SessionSource::Hook,
         // The TUI clears its spinner before Claude has flushed its last
         // transcript entry, so the gap this covers is the same one it covers
@@ -473,6 +484,7 @@ const HARNESSES: [HarnessSpec; 3] = [
     HarnessSpec {
         name: "codex",
         argv: codex_argv,
+        supports_sandbox: true,
         session_source: SessionSource::Hook,
         result_grace: Duration::from_secs(10),
         startup_dialog: Some(StartupDialog {
@@ -487,32 +499,52 @@ const HARNESSES: [HarnessSpec; 3] = [
 /// The model string is passed through exactly as the caller wrote it — it is
 /// `provider/model` for opencode and nothing in this module should second-guess
 /// a name it does not resolve.
-fn opencode_argv(model: Option<&str>) -> Vec<String> {
-    harness_argv("opencode", model)
+fn opencode_argv(options: HarnessOptions<'_>) -> Vec<String> {
+    harness_argv("opencode", options.model)
 }
 
 /// `claude [--model M]`.
 ///
 /// Claude Code takes the same `--model M` shape as opencode does (#612), which
 /// is why `argv` is one shared builder rather than two hand-written vectors.
-fn claude_argv(model: Option<&str>) -> Vec<String> {
-    harness_argv("claude", model)
+fn claude_argv(options: HarnessOptions<'_>) -> Vec<String> {
+    harness_argv("claude", options.model)
 }
 
-/// Delegates need unattended builds and networked git/gh operations.
-/// The explicit full-access policy is documented in delegate help and docs.
-fn codex_argv(model: Option<&str>) -> Vec<String> {
-    let mut argv = harness_argv("codex", model);
+/// Codex keeps unattended work inside its workspace by default.
+/// Networked git/gh operations require an explicit full-access opt-in.
+fn codex_argv(options: HarnessOptions<'_>) -> Vec<String> {
+    let mut argv = vec!["codex".to_string()];
     argv.extend(
         [
             "--ask-for-approval",
             "never",
             "--sandbox",
-            "danger-full-access",
+            options.sandbox.unwrap_or("workspace-write"),
         ]
         .map(str::to_string),
     );
+    if let Some(model) = options.model {
+        argv.extend(["--model".to_string(), model.to_string()]);
+    }
     argv
+}
+
+fn validate_sandbox(harness: &HarnessSpec, sandbox: Option<&str>) -> Result<(), String> {
+    if let Some(sandbox) = sandbox {
+        if !harness.supports_sandbox {
+            return Err(format!("--sandbox is not supported by {}", harness.name));
+        }
+        if !matches!(
+            sandbox,
+            "read-only" | "workspace-write" | "danger-full-access"
+        ) {
+            return Err(
+                "--sandbox must be read-only, workspace-write, or danger-full-access".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn harness_argv(program: &str, model: Option<&str>) -> Vec<String> {
@@ -796,6 +828,7 @@ struct StartFlags {
     base: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    sandbox: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
@@ -860,9 +893,8 @@ impl Verb {
             "--settle" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--ready-timeout" => matches!(self, Self::Start | Self::Send),
             "--brief" => matches!(self, Self::Start | Self::Send),
-            "--cwd" | "--worktree" | "--repo" | "--branch" | "--base" | "--harness" | "--model" => {
-                self == Self::Start
-            }
+            "--cwd" | "--worktree" | "--repo" | "--branch" | "--base" | "--harness" | "--model"
+            | "--sandbox" => self == Self::Start,
             "--after" => self == Self::Wait,
             "--force" => self == Self::Reap,
             _ => false,
@@ -922,6 +954,7 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             "--base" => flags.base = Some(value(&mut index)?),
             "--harness" => flags.harness = Some(value(&mut index)?),
             "--model" => flags.model = Some(value(&mut index)?),
+            "--sandbox" => flags.sandbox = Some(value(&mut index)?),
             "--after" => flags.after = Some(value(&mut index)?),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -959,6 +992,7 @@ struct Parsed {
     base: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    sandbox: Option<String>,
     after: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
@@ -979,6 +1013,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
         base: flags.base.clone(),
         harness: flags.harness.clone(),
         model: flags.model.clone(),
+        sandbox: flags.sandbox.clone(),
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
@@ -2367,6 +2402,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(harness) => harness,
         Err(reason) => return Ok(usage(reason)),
     };
+    if let Err(reason) = validate_sandbox(harness, flags.sandbox.as_deref()) {
+        return Ok(usage(reason));
+    }
     let Some(brief_path) = flags.brief.clone() else {
         return Ok(usage(format!(
             "--brief is required\nusage: {}",
@@ -2424,7 +2462,15 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(placement) => placement,
         Err(code) => return Ok(code),
     };
-    let started = start_the_agent(name, &placement, harness, flags.model.as_deref());
+    let started = start_the_agent(
+        name,
+        &placement,
+        harness,
+        HarnessOptions {
+            model: flags.model.as_deref(),
+            sandbox: flags.sandbox.as_deref(),
+        },
+    );
     let agent = match started {
         Ok(agent) => agent,
         Err(reason) => {
@@ -2613,9 +2659,9 @@ fn start_the_agent(
     name: &str,
     placement: &Placement,
     harness: &HarnessSpec,
-    model: Option<&str>,
+    options: HarnessOptions<'_>,
 ) -> Result<serde_json::Value, String> {
-    let argv = (harness.argv)(model);
+    let argv = (harness.argv)(options);
     let response = request(
         Method::AgentStart(AgentStartParams {
             name: name.to_string(),
@@ -4245,14 +4291,40 @@ mod tests {
             ("claude", "claude --model m1", "claude"),
             (
                 "codex",
-                "codex --model m1 --ask-for-approval never --sandbox danger-full-access",
-                "codex --ask-for-approval never --sandbox danger-full-access",
+                "codex --ask-for-approval never --sandbox workspace-write --model m1",
+                "codex --ask-for-approval never --sandbox workspace-write",
             ),
         ] {
             let spec = validate_harness(Some(name)).expect("in the table");
-            assert_eq!((spec.argv)(Some("m1")).join(" "), expected_with);
-            assert_eq!((spec.argv)(None).join(" "), expected_without);
+            assert_eq!(
+                (spec.argv)(HarnessOptions {
+                    model: Some("m1"),
+                    sandbox: None
+                })
+                .join(" "),
+                expected_with
+            );
+            assert_eq!(
+                (spec.argv)(HarnessOptions::default()).join(" "),
+                expected_without
+            );
         }
+    }
+
+    #[test]
+    fn delegate_sandbox_choices_are_validated_and_passed_through() {
+        let codex = validate_harness(Some("codex")).expect("Codex harness");
+        for sandbox in ["read-only", "workspace-write", "danger-full-access"] {
+            assert!(validate_sandbox(codex, Some(sandbox)).is_ok());
+            assert_eq!(
+                (codex.argv)(HarnessOptions {
+                    model: None,
+                    sandbox: Some(sandbox)
+                }),
+                vec!["codex", "--ask-for-approval", "never", "--sandbox", sandbox]
+            );
+        }
+        assert!(validate_sandbox(codex, Some("full")).is_err());
     }
 
     /// Claude's row carries the folder-trust dialog and opencode's carries
