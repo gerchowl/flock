@@ -79,12 +79,13 @@ use super::settled::{Cursor, PinnedTarget, SettleTarget};
 /// answer two different things.
 pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
-    "                     [--harness opencode|claude] [--model M] [--await] [--timeout MS]\n",
+    "                     [--harness opencode|claude|codex] [--model M] [--await] [--timeout MS]\n",
     "                     [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; claude's folder-trust dialog is\n",
     "                      named rather than typed into (see #605)\n",
+    "                      codex uses never approvals and danger-full-access sandbox policy for builds and network access\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
@@ -345,17 +346,17 @@ const TRUST_DIALOG_SCREEN: &str = concat!(
 
 /// Who tells flock which session a pane's transcript belongs to.
 ///
-/// Both harnesses report through the same `pane.report_agent_session` method,
+/// All harnesses report through the same `pane.report_agent_session` method,
 /// but they report it from different places, and that is the whole reason the
 /// delegate cannot assume a session exists the moment a pane looks ready: the
 /// opencode plugin reports asynchronously (mid-turn, when it commits), and a
-/// Claude `SessionStart` hook reports from inside the process, so by the time
+/// Claude or Codex `SessionStart` hook reports from inside the process, so by the time
 /// the TUI is up the report is merely in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionSource {
     /// opencode's plugin, reporting the session mid-turn as it commits it.
     Plugin,
-    /// Claude Code's `SessionStart` hook, reporting from inside the harness.
+    /// The agent's `SessionStart` hook, reporting from inside the harness.
     Hook,
 }
 
@@ -363,7 +364,7 @@ impl SessionSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Plugin => "opencode's plugin",
-            Self::Hook => "Claude's SessionStart hook",
+            Self::Hook => "the harness's SessionStart hook",
         }
     }
 }
@@ -396,7 +397,7 @@ struct HarnessSpec {
     /// The argv this harness starts with, given the `--model` the caller passed.
     ///
     /// A function rather than a name because the flag is not the same
-    /// everywhere: both current harnesses take `--model`, and a third one that
+    /// everywhere: all current harnesses take `--model`, and a future one that
     /// spelled it `--model-id` should not need this module to learn a second
     /// flag name.
     argv: fn(Option<&str>) -> Vec<String>,
@@ -442,13 +443,13 @@ const STORE_NOT_YET_CODES: [&str; 3] =
     ["no_result", "transcript_not_found", "transcript_unreadable"];
 
 /// The no-session refusal: the pane has not reported a session yet, so there is
-/// no store to read at all. Ordinary for both current harnesses, and listed per
+/// no store to read at all. Ordinary for all current harnesses, and listed per
 /// harness rather than globally because a harness whose session is known
 /// synchronously must not have this treated as a transient.
 const NO_SESSION_CODE: &str = "no_agent_session";
 
 /// The harnesses this build drives, in the order `--harness` help lists them.
-const HARNESSES: [HarnessSpec; 2] = [
+const HARNESSES: [HarnessSpec; 3] = [
     HarnessSpec {
         name: "opencode",
         argv: opencode_argv,
@@ -469,6 +470,16 @@ const HARNESSES: [HarnessSpec; 2] = [
             refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
         }),
     },
+    HarnessSpec {
+        name: "codex",
+        argv: codex_argv,
+        session_source: SessionSource::Hook,
+        result_grace: Duration::from_secs(10),
+        startup_dialog: Some(StartupDialog {
+            shows: crate::detect::codex_waiting_on_hook_review,
+            refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
+        }),
+    },
 ];
 
 /// `opencode [--model M]`.
@@ -486,6 +497,22 @@ fn opencode_argv(model: Option<&str>) -> Vec<String> {
 /// is why `argv` is one shared builder rather than two hand-written vectors.
 fn claude_argv(model: Option<&str>) -> Vec<String> {
     harness_argv("claude", model)
+}
+
+/// Delegates need unattended builds and networked git/gh operations.
+/// The explicit full-access policy is documented in delegate help and docs.
+fn codex_argv(model: Option<&str>) -> Vec<String> {
+    let mut argv = harness_argv("codex", model);
+    argv.extend(
+        [
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "danger-full-access",
+        ]
+        .map(str::to_string),
+    );
+    argv
 }
 
 fn harness_argv(program: &str, model: Option<&str>) -> Vec<String> {
@@ -1013,7 +1040,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 const DEFAULT_HARNESS: &str = "opencode";
 
 /// Resolve `--harness` against the table, naming the refusal with the harnesses
-/// this build does drive — a caller who typed `codex` learns what does exist,
+/// this build does drive — a caller who typed `aider` learns what does exist,
 /// rather than only that their word was rejected.
 fn validate_harness(harness: Option<&str>) -> Result<&'static HarnessSpec, String> {
     let asked = harness.unwrap_or(DEFAULT_HARNESS);
@@ -2672,6 +2699,7 @@ fn await_ready(
     // says so, and re-reading every poll would cost one request per 200 ms for
     // the whole `--ready-timeout`.
     let mut startup_dialog_asked = false;
+    let mut prompt_observed = false;
     loop {
         match agent_record(&terminal_id, Some(deadline)) {
             AgentFetch::Found(record) => {
@@ -2679,8 +2707,24 @@ fn await_ready(
                     .unwrap_or("unknown")
                     .to_string();
                 if matches!(status.as_str(), "idle" | "done") {
+                    if harness.startup_dialog.is_some() {
+                        if let Some(refusal) =
+                            startup_dialog_refusal(name, harness, &pane_id, deadline)
+                        {
+                            return Err(refusal);
+                        }
+                        // A dialog's prompt can arrive before its footer in a
+                        // separate PTY read. Confirm readiness on the next poll
+                        // so a partly painted dialog cannot receive the brief.
+                        if !prompt_observed && !expired(Some(deadline)) {
+                            prompt_observed = true;
+                            sleep_bounded(deadline, READY_POLL);
+                            continue;
+                        }
+                    }
                     return Ok(record);
                 }
+                prompt_observed = false;
                 if status == "blocked" && !startup_dialog_asked {
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
@@ -4170,12 +4214,12 @@ mod tests {
         }
     }
 
-    /// The table, read through the flag: both harnesses resolve, an absent
+    /// The table, read through the flag: all harnesses resolve, an absent
     /// `--harness` is still opencode, and a refusal names what this build does
     /// drive rather than only rejecting what it does not.
     #[test]
     fn the_harness_table_is_what_the_flag_accepts() {
-        for name in ["opencode", "claude"] {
+        for name in ["opencode", "claude", "codex"] {
             assert_eq!(
                 validate_harness(Some(name)).map(|spec| spec.name),
                 Ok(name),
@@ -4183,15 +4227,15 @@ mod tests {
             );
         }
         assert_eq!(validate_harness(None).map(|spec| spec.name), Ok("opencode"));
-        let refused = validate_harness(Some("codex")).expect_err("not in the table");
+        let refused = validate_harness(Some("aider")).expect_err("not in the table");
         assert!(refused.contains("not supported"), "{refused}");
         assert!(
-            refused.contains("opencode|claude"),
+            refused.contains("opencode|claude|codex"),
             "the refusal lists what exists: {refused}"
         );
     }
 
-    /// The argv each row starts. Both harnesses take `--model M`, so the same
+    /// The argv each row starts. All harnesses take `--model M`, so the same
     /// shape covers both today — and the test says so per harness, so a change
     /// to one is a change to a row rather than to the builder.
     #[test]
@@ -4199,6 +4243,11 @@ mod tests {
         for (name, expected_with, expected_without) in [
             ("opencode", "opencode --model m1", "opencode"),
             ("claude", "claude --model m1", "claude"),
+            (
+                "codex",
+                "codex --model m1 --ask-for-approval never --sandbox danger-full-access",
+                "codex --ask-for-approval never --sandbox danger-full-access",
+            ),
         ] {
             let spec = validate_harness(Some(name)).expect("in the table");
             assert_eq!((spec.argv)(Some("m1")).join(" "), expected_with);
@@ -4210,7 +4259,7 @@ mod tests {
     /// none: the refusal is what stops a delegate typing a brief into it, so a
     /// row that lost the marker would be a silent regression.
     #[test]
-    fn only_claude_declares_a_startup_dialog() {
+    fn hook_and_folder_trust_dialogs_are_declared_by_their_harnesses() {
         let claude = validate_harness(Some("claude")).expect("in the table");
         let dialog = claude
             .startup_dialog
@@ -4225,6 +4274,12 @@ mod tests {
             !(dialog.shows)("Yes, I trust this folder\n"),
             "and not a bare mention of it"
         );
+        let codex = validate_harness(Some("codex")).expect("in the table");
+        let dialog = codex.startup_dialog.as_ref().expect("Codex hook review");
+        let screen = "Hooks need review\n› 1. Review hooks\nenter confirm · esc skip";
+        assert!((dialog.shows)(screen));
+        assert!(!(dialog.shows)(&format!("{screen}\n› ")));
+        assert!(dialog.refusal.contains("#626"));
         let opencode = validate_harness(Some("opencode")).expect("in the table");
         assert!(opencode.startup_dialog.is_none());
     }
@@ -4244,7 +4299,7 @@ mod tests {
 
     /// The codes the grace treats as "not yet" include the no-session refusal
     /// (D8), for every harness that reports its session asynchronously — which
-    /// is both of them today: opencode's plugin commits it mid-turn and Claude's
+    /// is all of them today: opencode's plugin commits it mid-turn and Claude/Codex
     /// `SessionStart` hook reports it from inside the harness, so the ordinary
     /// first poll of a turn has no store to read yet.
     #[test]
