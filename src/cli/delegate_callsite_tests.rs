@@ -372,3 +372,101 @@ fn w7_require_decide_a_timeout_hands_the_entry_back() {
         other => panic!("expected TimedOut(entry), got {other:?}"),
     }
 }
+
+// ---------- W10: "already gone" is reachable ---------------------------------
+
+#[test]
+fn w10_a_close_that_answers_workspace_not_found_is_done() {
+    // The scenario the P578 r4-4 brief names: a race between two reaps.
+    // One wins; the loser's `close_workspace` returns `workspace_not_found`.
+    // `is_already_gone` must treat that as the state we wanted, not an error.
+    let not_found = ServerError {
+        code: "workspace_not_found".to_string(),
+        message: "workspace w42 not found".to_string(),
+    };
+    assert!(is_already_gone(&not_found, None));
+}
+
+#[test]
+fn w10_a_kill_that_answers_not_git_worktree_is_done() {
+    let not_git = ServerError {
+        code: "not_git_worktree".to_string(),
+        message: "path is not a git worktree".to_string(),
+    };
+    assert!(is_already_gone(&not_git, Some("/some/path")));
+}
+
+#[test]
+fn w10_an_unknown_code_without_a_vanished_path_is_still_an_error() {
+    let other = ServerError {
+        code: "dirty_worktree_requires_force".to_string(),
+        message: "the worktree is dirty".to_string(),
+    };
+    // Root (/) always exists, so the path-not-exists fallback does not fire
+    // here, and `dirty_worktree_requires_force` is not in ALREADY_GONE_CODES.
+    assert!(!is_already_gone(&other, Some("/")));
+    assert!(!is_already_gone(&other, None));
+}
+
+#[test]
+fn w10_an_unknown_code_with_a_vanished_path_is_already_gone() {
+    let other = ServerError {
+        code: "some_other_refusal".to_string(),
+        message: "whatever".to_string(),
+    };
+    // A path that does not exist IS evidence the checkout is gone; the
+    // server's wording does not have to match our code list.
+    assert!(is_already_gone(
+        &other,
+        Some("/this/path/surely/does/not/exist/under/claude/flock")
+    ));
+}
+
+// ---------- W12: cap_for caps PaneSendInput / PaneSendKeys at 10 s -----------
+
+#[test]
+fn w12_cap_for_submit_methods_is_at_most_10_seconds() {
+    use crate::api::schema::{PaneSendInputParams, PaneSendKeysParams};
+    use std::time::Duration;
+    let input = Method::PaneSendInput(PaneSendInputParams {
+        pane_id: "p".to_string(),
+        text: "x".to_string(),
+        keys: Vec::new(),
+    });
+    let keys = Method::PaneSendKeys(PaneSendKeysParams {
+        pane_id: "p".to_string(),
+        keys: vec!["Enter".to_string()],
+    });
+    assert!(
+        cap_for(&input) <= Duration::from_secs(10),
+        "{:?}",
+        cap_for(&input)
+    );
+    assert!(
+        cap_for(&keys) <= Duration::from_secs(10),
+        "{:?}",
+        cap_for(&keys)
+    );
+}
+
+// ---------- G12: find_new_checkout uses same_path, not raw strings -----------
+
+#[test]
+fn w13_find_new_checkout_treats_two_spellings_of_one_path_as_the_same() {
+    // Pre-existing checkout spelled with a trailing slash in `before`, same
+    // path without one in `after`: a raw-string comparison would call the
+    // second entry "new" and force-kill it. `same_path` canonicalises.
+    let before = vec![json!({"path": "/repo/wt/x/", "branch": "feat/x"})];
+    let after = vec![
+        json!({"path": "/repo/wt/x", "branch": "feat/x"}),
+        json!({"path": "/repo/wt/y", "branch": "feat/y"}),
+    ];
+    let new = find_new_checkout(&before, &after, Some("feat/x"));
+    assert_eq!(
+        new, None,
+        "a respelled pre-existing checkout must not be force-killed: {new:?}"
+    );
+    // And when there IS a new one, filtering by branch still finds it.
+    let new = find_new_checkout(&before, &after, Some("feat/y"));
+    assert_eq!(new.as_deref(), Some("/repo/wt/y"));
+}

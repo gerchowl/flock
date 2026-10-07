@@ -1024,19 +1024,19 @@ fn s5_settled_wait_refusals_are_byte_for_byte() {
     }
 }
 
-/// W2 (P578 r4-3): every request `delegate send` makes is bounded. A `send`
-/// against a frozen server ends well within `cap + 5 s` (not forever),
-/// exits 1 naming the delegate, and leaves the registry entry's `round`
-/// unchanged — a submit failing must look to a retry like the round that
-/// failed had never been written.
+/// W12 (P578 r4-4): `send` against a frozen server ends bounded, exit 1,
+/// and the registry entry's `round` is unchanged.
 ///
-/// This is the call-site mirror of the brief's W2: the frozen-server read
-/// (`require_delegate` → `agent.get`) and the brief submit itself (now
-/// bounded through `delegate.rs`, not through the untimed `pane` helpers)
-/// both honour the cap. Either path is proof that no request is unbounded;
-/// what the test rules out is the F2 behaviour of hanging forever.
+/// This test cannot reliably freeze the server DURING the submit step —
+/// `require_delegate`'s `agent.get` fires first, so the SIGSTOP catches
+/// the prompt gate instead. What it DOES prove is call-site boundedness
+/// end to end: no request from `delegate send` can hang forever, exit 1
+/// is the result, and a failed submit does not mutate the entry. The
+/// `PaneSendInput`/`PaneSendKeys` caps that would be hit if the freeze
+/// landed on the submit itself are pinned by the `cap_for` unit test
+/// (`src/cli/delegate_callsite_tests.rs::w12_cap_for_submit_methods`).
 #[test]
-fn s6_send_against_a_frozen_server_ends_within_cap() {
+fn s6_send_against_a_frozen_server_ends_bounded_at_prompt_gate() {
     let server = start_server();
     operator_workspace(&server);
     let b = brief(&server, "task.md", "x\n");

@@ -614,10 +614,13 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 ///
 /// The executor beside the existing value: `pane_run_steps` is the ordering
 /// contract and stays a value a test can assert on, while this walks it and
-/// issues the requests. The delegate has to type into an agent's input box
-/// rather than run a shell command, and re-implementing the gap and the Enter
-/// beside [`PANE_RUN_SUBMIT_GAP`] would give the two callers different answers
-/// to the pasted-bracket problem #362 is about.
+/// issues the requests. The delegate deliberately MIRRORS this sequence —
+/// same type-then-Enter, same `PANE_RUN_SUBMIT_GAP` — on BOUNDED requests
+/// (see `delegate::submit_brief`): sharing `pane_run_steps` would hand the
+/// delegate the unbounded `send_ok_request` through this executor, and a
+/// server that goes quiet mid-type would then hang `start`/`send` forever
+/// (P578 r4-4 W2). The gap value is the single source of truth; the walking
+/// code is split by whether a stall must be bounded.
 ///
 /// The exit code is what [`super::send_ok_request`] returns — 0, or 1 after
 /// printing the server's refusal to stderr as it does — so `pane run`'s

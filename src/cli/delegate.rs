@@ -14,13 +14,16 @@
 //! remembered cursor between each pair. That is a script, and the script was
 //! living in somebody's shell history.
 //!
-//! `flk delegate` is that script, composed client-side out of the socket methods
-//! that already exist. No new socket method, no server change, no new
-//! dependency: every claim in the docs is checkable against a method `flk agent
-//! wait` or `flk worktree kill` already used. What the composition adds is the
-//! part that was never written down anywhere — which cursor belongs to which
-//! round, which errors mean "not yet", what a bare `idle` does and does not say,
-//! and what has to be cleaned up if the start fails halfway.
+//! `flk delegate` is that script, composed client-side out of the socket
+//! methods that already exist. No new socket method, no new dependency, and
+//! exactly ONE additive server change: `worktree.create`'s response now
+//! carries `parent_workspace_id` so the rollback knows which parent workspace
+//! IT opened and must not close somebody else's (#595). Every other claim in
+//! the docs is checkable against a method `flk agent wait` or `flk worktree
+//! kill` already used. What the composition adds is the part that was never
+//! written down anywhere — which cursor belongs to which round, which errors
+//! mean "not yet", what a bare `idle` does and does not say, and what has to
+//! be cleaned up if the start fails halfway.
 //!
 //! ## Why `delegate start`, not `delegate <name>`
 //!
@@ -59,14 +62,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, Method, PaneListParams,
-    PaneSendInputParams, PaneSendKeysParams, PaneTarget, Request, WorkspaceCreateParams,
-    WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams, WorktreeListParams,
+    AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, EventsSubscribeParams, Method,
+    PaneListParams, PaneSendInputParams, PaneSendKeysParams, PaneTarget, Request, Subscription,
+    WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
+    WorktreeListParams,
 };
 
 use super::pane::PANE_RUN_SUBMIT_GAP;
+use super::ready::{classify_ready_event, status_is_ready, ReadySignal};
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
 
 /// `delegate start`'s usage. A `pub(super) const` rather than a literal in the
@@ -104,7 +109,10 @@ pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N
 pub(super) const STATUS_USAGE: &str = "flk delegate status <name> [--json]";
 pub(super) const REAP_USAGE: &str = concat!(
     "flk delegate reap <name> [--force] [--json]\n",
-    "  removes only the workspace and checkout recorded at start; needs no live agent",
+    "  removes only the workspace and checkout recorded at start; needs no live agent\n",
+    "  --force             clears the dirty-checkout refusal and proceeds through a busy\n",
+    "                      lock; two concurrent forced reaps of the same delegate are\n",
+    "                      idempotent (each sees the same end state)",
 );
 
 /// How long after a settle the delegate keeps looking for the reply.
@@ -1005,13 +1013,18 @@ fn agent_record(target: &str, deadline: Option<Instant>) -> AgentFetch {
             }
             return AgentFetch::Failed(err.to_string());
         }
+        // A success envelope without a `/result/agent` object is malformed:
+        // the server did not say "no such agent" (that would be an error
+        // code, handled above) and it did not say "here is the agent" either.
+        // Collapsing this into `Missing` would make the delegate report "not
+        // a delegate" against a buggy or old server (W13 / G6).
         return match response
             .pointer("/result/agent")
             .filter(|record| record.is_object())
             .cloned()
         {
             Some(record) => AgentFetch::Found(record),
-            None => AgentFetch::Missing,
+            None => AgentFetch::Failed("malformed agent.get answer".to_string()),
         };
     }
 }
@@ -1241,15 +1254,20 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     // exactly what the server says — no list diffs, no heuristics.
     let parent_workspace_id = at(&response, "/result/parent_workspace_id").map(str::to_string);
 
-    let (Some(workspace_id), Some(root_pane), Some(root_pane_terminal_id)) =
-        (workspace_id, root_pane, root_pane_terminal_id)
-    else {
-        // Malformed success response: server said OK but missing required
-        // fields. The one piece of evidence we do have is `/result/worktree/
-        // path`: if the pre-create list said it was not there and now it is
-        // named, kill it by path with force — the response IS the evidence
-        // (W6). Otherwise print that a checkout may be left behind.
-        let reason = "the server created the workspace but named no workspace id, root pane, or root pane terminal id";
+    // Catch the two malformed-success shapes before building a Placement
+    // that would be a lie (W13 / G7). A worktree-mode success that names no
+    // checkout path is just as malformed as one with no workspace id: an
+    // entry with `worktree: None` written to the registry in worktree mode
+    // would never be reapable, because the recorded path is the evidence.
+    let has_core_fields = workspace_id.is_some()
+        && root_pane.is_some()
+        && root_pane_terminal_id.is_some()
+        && (mode == Mode::Cwd || worktree.is_some());
+    if !has_core_fields {
+        // Malformed success response: server said OK but one of the fields
+        // we need is missing. Destroy ONLY what the response actually
+        // names: a worktree path that the pre-create list did not have.
+        let reason = "the server created the workspace but its answer was malformed";
         if mode == Mode::Worktree {
             if let (Some(path), Some(before)) = (worktree.as_deref(), worktrees_before.as_ref()) {
                 let in_before = before
@@ -1257,19 +1275,11 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                     .any(|w| w.get("path").and_then(|v| v.as_str()) == Some(path));
                 if !in_before {
                     match kill(None, Some(path), true) {
-                        Ok(response) => {
-                            if let Some(err) = refusal(&response) {
-                                if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
-                                    eprintln!(
-                                        "delegate {name}: rollback also failed: {}",
-                                        err.message
-                                    );
-                                }
-                            } else {
-                                eprintln!(
-                                    "delegate {name}: rollback removed stray checkout at {path}"
-                                );
-                            }
+                        Ok(_) => {
+                            eprintln!("delegate {name}: rollback removed stray checkout at {path}");
+                        }
+                        Err(err) if is_already_gone(&err, Some(path)) => {
+                            // Already gone — the state we wanted.
                         }
                         Err(err) => {
                             eprintln!("delegate {name}: rollback also failed: {}", err.message);
@@ -1295,7 +1305,10 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
             );
         }
         return Err(fail(reason.to_string()));
-    };
+    }
+    let workspace_id = workspace_id.expect("checked above");
+    let root_pane = root_pane.expect("checked above");
+    let root_pane_terminal_id = root_pane_terminal_id.expect("checked above");
 
     let cwd = worktree
         .clone()
@@ -1316,12 +1329,12 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
 /// Undo a create whose answer could not be used, and hand back the exit code.
 ///
 /// On a place failure there is no placement, so nothing here closes a parent
-/// workspace (K2's governing rule: with no positive evidence of what the server
-/// created, destroy nothing). The one destructive branch is for a transport
-/// failure whose pre-create inventory succeeded: that is the only shape in
-/// which "a new checkout appeared after our timed-out create" has a sound
-/// definition. Every other shape prints what might be left behind and exits
-/// without touching the server.
+/// workspace (K2's governing rule: with no positive evidence of what the
+/// server created, destroy nothing). The one destructive branch is for a
+/// transport failure whose pre-create inventory succeeded: that is the only
+/// shape in which "a new checkout appeared after our timed-out create" has
+/// a sound definition. Every other shape prints what might be left behind
+/// and exits without touching the server.
 ///
 /// `worktrees_before` is `None` when the pre-create `worktree.list` failed,
 /// never defaulted to empty: a `[]` default would make every checkout look
@@ -1345,21 +1358,10 @@ fn teardown_after_place_failure(
     )
 }
 
-/// The decision half of `teardown_after_place_failure`, with its two
+/// The decision half of [`teardown_after_place_failure`], with its two
 /// side-effecting steps handed in as closures. Pure given those, so the
-/// call-site tests (W7) can drive it with fakes.
-///
-/// On a place failure there is no placement, so nothing here closes a parent
-/// workspace (K2's governing rule: with no positive evidence of what the
-/// server created, destroy nothing). The one destructive branch is for a
-/// transport failure whose pre-create inventory succeeded: that is the only
-/// shape in which "a new checkout appeared after our timed-out create" has
-/// a sound definition. Every other shape prints what might be left behind
-/// and exits without touching the server.
-///
-/// `worktrees_before` is `None` when the pre-create `worktree.list` failed,
-/// never defaulted to empty: a `[]` default would make every checkout look
-/// new and the force-kill would hit the operator's work.
+/// call-site tests (W7) can drive it with fakes. See the wrapper above for
+/// what the policy is.
 fn teardown_after_place_failure_with(
     name: &str,
     worktrees_before: Option<&[serde_json::Value]>,
@@ -1409,16 +1411,11 @@ fn teardown_after_place_failure_with(
             let new_checkout = find_new_checkout(before, &worktrees_after, flags.branch.as_deref());
             if let Some(checkout) = new_checkout {
                 match kill_path(&checkout) {
-                    Ok(response) => {
-                        if let Some(err) = refusal(&response) {
-                            if !ALREADY_GONE_CODES.contains(&err.code.as_str()) {
-                                eprintln!("delegate {name}: rollback also failed: {}", err.message);
-                            }
-                        } else {
-                            eprintln!(
-                                "delegate {name}: rollback removed stray checkout at {checkout}"
-                            );
-                        }
+                    Ok(_) => {
+                        eprintln!("delegate {name}: rollback removed stray checkout at {checkout}");
+                    }
+                    Err(err) if is_already_gone(&err, Some(&checkout)) => {
+                        // Already gone — the state we wanted.
                     }
                     Err(err) => {
                         eprintln!("delegate {name}: rollback also failed: {}", err.message);
@@ -1452,15 +1449,16 @@ impl CreateFailure {
 
 /// Find a checkout that appeared after the create call, matching on --branch if given.
 ///
-/// The checkout is identified by its path, which must not have been present in
-/// the `worktree.list` taken before the create. We use `worktree.list` to find
-/// checkouts, filtering by branch if given.
+/// The checkout is identified by its path, compared through `same_path` so a
+/// pre-existing checkout respelled by the server (relative vs absolute,
+/// trailing slash) is not treated as "new" and force-killed (W13 / G12). We
+/// use `worktree.list` to find checkouts, filtering by branch if given.
 fn find_new_checkout(
     worktrees_before: &[serde_json::Value],
     worktrees_after: &[serde_json::Value],
     branch: Option<&str>,
 ) -> Option<String> {
-    let before_paths: std::collections::HashSet<String> = worktrees_before
+    let before_paths: Vec<String> = worktrees_before
         .iter()
         .filter_map(|w| w.get("path").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
@@ -1469,7 +1467,7 @@ fn find_new_checkout(
         let Some(path) = worktree.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if before_paths.contains(path) {
+        if before_paths.iter().any(|p| same_path(p, path)) {
             continue;
         }
         if let Some(branch_name) = branch {
@@ -1551,11 +1549,6 @@ fn parse_server_error(error: &serde_json::Value) -> ServerError {
     }
 }
 
-/// The error a response carries, if it is an error at all.
-fn refusal(response: &serde_json::Value) -> Option<ServerError> {
-    response.get("error").map(parse_server_error)
-}
-
 /// What a teardown may touch, and what it removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cleanup {
@@ -1629,28 +1622,35 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
         match identity(target) {
             Identity::Ours => match target.mode {
                 Mode::Worktree => {
-                    let response = kill(Some(&target.workspace_id), None, force)?;
-                    if let Some(err) = refusal(&response) {
-                        if err.code != "workspace_not_found" {
-                            return Err(err);
+                    // `kill` turns a server error into `Err`. "Already gone"
+                    // IS the state we wanted, so match on the error rather
+                    // than inspecting a response that is only ever a
+                    // success envelope (W10).
+                    match kill(Some(&target.workspace_id), None, force) {
+                        Ok(_) => {
+                            // The kill closes the workspace and removes the
+                            // checkout with it, so both are accounted for.
+                            done.workspace_closed = true;
+                            done.checkout_removed = true;
                         }
-                    } else {
-                        // The kill closes the workspace and removes the checkout
-                        // with it, so both are accounted for.
-                        done.workspace_closed = true;
-                        done.checkout_removed = true;
+                        Err(err) if is_already_gone(&err, None) => {
+                            // The workspace is gone; the checkout might
+                            // still be there and the path kill below will
+                            // handle it.
+                            done.workspace_closed = true;
+                        }
+                        Err(err) => return Err(err),
                     }
                 }
-                Mode::Cwd => {
-                    let response = close_workspace(&target.workspace_id)?;
-                    if let Some(err) = refusal(&response) {
-                        if err.code != "workspace_not_found" {
-                            return Err(err);
-                        }
-                    } else {
+                Mode::Cwd => match close_workspace(&target.workspace_id) {
+                    Ok(_) => {
                         done.workspace_closed = true;
                     }
-                }
+                    Err(err) if err.code == "workspace_not_found" => {
+                        done.workspace_closed = true;
+                    }
+                    Err(err) => return Err(err),
+                },
             },
             Identity::NotOurs => {
                 // The server answered and the evidence is against us: the id
@@ -1679,37 +1679,57 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
         }
     }
 
-    // The checkout the delegate made is still there when the workspace was gone
-    // (or was never ours), and `worktree.kill` reaches it by path.
+    // The checkout the delegate made is still there when the workspace was
+    // gone (or was never ours), and `worktree.kill` reaches it by path.
+    // "Already gone" is the goal, not an error (W10 / a29).
     if let Some(checkout) = target.worktree.clone() {
         if !done.checkout_removed {
-            let response = kill(None, Some(&checkout), force)?;
-            if let Some(err) = refusal(&response) {
-                let already_gone = ALREADY_GONE_CODES.contains(&err.code.as_str())
-                    || !Path::new(&checkout).exists();
-                if !already_gone {
-                    return Err(err);
+            match kill(None, Some(&checkout), force) {
+                Ok(_) => {
+                    done.checkout_removed = true;
                 }
-            } else {
-                done.checkout_removed = true;
+                Err(err) if is_already_gone(&err, Some(&checkout)) => {
+                    done.checkout_removed = true;
+                }
+                Err(err) => return Err(err),
             }
         }
     }
 
     if close_parent {
         if let Some(parent) = parent_to_close(target)? {
-            let response = close_workspace(&parent)?;
-            if let Some(err) = refusal(&response) {
-                if err.code != "workspace_not_found" {
-                    return Err(err);
+            match close_workspace(&parent) {
+                Ok(_) => {
+                    done.parent_closed = true;
                 }
-            } else {
-                done.parent_closed = true;
+                Err(err) if err.code == "workspace_not_found" => {
+                    // The parent is already gone; the end state we wanted.
+                    done.parent_closed = true;
+                }
+                Err(err) => return Err(err),
             }
         }
     }
 
     Ok(done)
+}
+
+/// Does this error from `kill` or `close_workspace` mean the target was
+/// already not there to remove?
+///
+/// Checks both the server-reported code (one of `ALREADY_GONE_CODES`) and —
+/// when a checkout path is handed in — the filesystem: a path that no longer
+/// exists cannot be killed, and the server's wording may vary.
+fn is_already_gone(err: &ServerError, checkout: Option<&str>) -> bool {
+    if ALREADY_GONE_CODES.contains(&err.code.as_str()) {
+        return true;
+    }
+    if let Some(path) = checkout {
+        if !Path::new(path).exists() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Is the recorded workspace still the one this delegate created?
@@ -2249,7 +2269,11 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         root_pane_terminal_id: placement.root_pane_terminal_id.clone(),
     };
     if let Err(err) = write_entry(&entry) {
-        let _ = std::fs::remove_file(entry_path(name));
+        // The write failed, so THIS process did not create the entry.
+        // Removing `entry_path(name)` would delete a pre-existing (and
+        // likely stale) entry the operator may still want to see or reap
+        // (W11 / a30: forget nothing). `write_entry` already removes its
+        // own temp file, so there is nothing of ours to clean up here.
         rollback(&cleanup);
         return Ok(fail(format!(
             "could not write the delegate registry entry: {err}"
@@ -2263,7 +2287,8 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
         // The sentence did not land, so this start did not happen. Undo it
         // rather than leave a workspace, a checkout and a registry entry
-        // describing a round nobody is running.
+        // describing a round nobody is running. The entry WAS written by
+        // this process on the line above, so removing it here is correct.
         let _ = std::fs::remove_file(entry_path(name));
         rollback(&cleanup);
         return Ok(fail(format!(
@@ -2410,29 +2435,14 @@ fn await_ready(
 ) -> Result<serde_json::Value, String> {
     let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
     let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
-    let ready_ms = u64::try_from(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis(),
-    )
-    .unwrap_or(0);
 
-    match super::ready::wait_for_ready(name, &pane_id, ready_ms) {
-        Ok(super::ready::ReadyOutcome::Ready(_)) => {}
-        Ok(super::ready::ReadyOutcome::Refused { code, message }) => {
-            return Err(format!(
-                "delegate {name} never became ready: {code}: {message}"
-            ));
-        }
-        Ok(super::ready::ReadyOutcome::SubscribeRefused(body)) => {
-            return Err(format!("delegate {name}: {body}"));
-        }
-        Err(err) => {
-            return Err(format!(
-                "delegate {name}: readiness could not be watched: {err}"
-            ))
-        }
-    }
+    // W9(b): the readiness wait is re-implemented here on `bounded`,
+    // reusing `ready.rs`'s pure classifiers (`classify_ready_event`,
+    // `status_is_ready`, `ReadySignal`) but not its I/O. The I/O helpers
+    // in `ready.rs` (`current_status`, `last_pane_line`) go through the
+    // unbounded `send_request` — reaching them from a delegate would make
+    // a stalled server freeze `start` forever (G1).
+    delegate_wait_for_ready(name, &terminal_id, &pane_id, deadline)?;
 
     let mut last_status: Option<String> = None;
     loop {
@@ -2475,6 +2485,122 @@ fn await_ready(
 fn sleep_bounded(deadline: Instant, interval: Duration) {
     let left = deadline.saturating_duration_since(Instant::now());
     std::thread::sleep(left.min(interval));
+}
+
+/// The readiness subscription + snapshot loop, bounded end to end.
+///
+/// Shape identical to `ready::wait_for_ready` but:
+/// - the subscribe's read timeout is `deadline - now`, capped at 60 s;
+/// - the snapshot and any re-read go through `agent_record` (bounded via
+///   `bounded`), not `send_request`;
+/// - a timeout past the deadline returns `is not ready: timed out`, which
+///   `start`'s caller turns into exit 1 then rolls back.
+///
+/// Pure classifiers (`classify_ready_event`, `status_is_ready`,
+/// `ReadySignal`) are still reused from `ready.rs` — only the socket I/O
+/// is re-implemented here (W9 choice (b)).
+fn delegate_wait_for_ready(
+    name: &str,
+    terminal_id: &str,
+    pane_id: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    // One cap for the whole phase, computed once up front. If the deadline
+    // has already passed, say "timed out" and skip the subscribe entirely:
+    // no request is sent while out of clock.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("delegate {name} is not ready: timed out"));
+    }
+
+    // Subscribe FIRST, then snapshot: a status that lands between the ack
+    // and the snapshot is delivered rather than missed. The subscribe's
+    // own read_timeout is already bounded.
+    let subscribe = Request {
+        id: "cli:delegate:ready".into(),
+        method: Method::EventsSubscribe(EventsSubscribeParams {
+            subscriptions: vec![
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: pane_id.to_owned(),
+                    agent_status: None,
+                },
+                Subscription::PaneExited {},
+            ],
+        }),
+    };
+    let (ack, mut stream) = ApiClient::local()
+        .subscribe_value(&subscribe, Some(remaining))
+        .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
+    if let Err(err) = crate::api::client::parse_response_value(ack) {
+        return Err(match err {
+            ApiClientError::ErrorResponse(response) => format!(
+                "delegate {name}: {}",
+                serde_json::to_string(&response).unwrap_or_else(|_| String::new())
+            ),
+            _ => format!("delegate {name}: readiness could not be watched: {err}"),
+        });
+    }
+
+    // Snapshot after the subscribe is live, bounded by the same deadline.
+    match agent_record(terminal_id, Some(deadline)) {
+        AgentFetch::Found(record) => {
+            let status = field(&record, "agent_status").unwrap_or("");
+            if status_is_ready(status) {
+                return Ok(());
+            }
+        }
+        AgentFetch::Missing => {
+            return Err(format!(
+                "delegate {name} never became ready: the agent no longer resolves"
+            ));
+        }
+        AgentFetch::TimedOut => {
+            return Err(format!("delegate {name} is not ready: timed out"));
+        }
+        AgentFetch::Failed(reason) => {
+            return Err(format!("delegate {name}: {reason}"));
+        }
+    }
+
+    // Loop over the subscription stream, bounded by the deadline on every
+    // read. `classify_ready_event` is the pure helper — the same one
+    // `agent start --wait-ready` uses, so a Ready/Exited reading of an
+    // event is identical byte for byte.
+    loop {
+        let Some(remaining) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(format!("delegate {name} is not ready: timed out"));
+        };
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
+        match stream.next_value() {
+            Ok(None) => {
+                return Err(format!(
+                    "delegate {name} never became ready: the readiness subscription closed"
+                ));
+            }
+            Ok(Some(event)) => match classify_ready_event(&event, pane_id) {
+                ReadySignal::Ready(_) => return Ok(()),
+                ReadySignal::Exited => {
+                    return Err(format!(
+                        "delegate {name}: the agent's pane exited before it became ready"
+                    ));
+                }
+                ReadySignal::KeepWaiting => continue,
+            },
+            Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
+                return Err(format!("delegate {name} is not ready: timed out"));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "delegate {name}: readiness could not be watched: {err}"
+                ))
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------- send
@@ -2714,9 +2840,22 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         // statement about the TURN rather than an error: the live status is what
         // says whether that turn is still running.
         if code == "no_result" {
-            let status = agent_record_opt(&entry.terminal_id, None)
-                .and_then(|record| field(&record, "agent_status").map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
+            // The store said no reply yet — ask the live agent whether the
+            // turn is still running. An unreachable server here is a FAILURE
+            // (W13 / G5): "running"/"unknown" at exit 0 would make a dead
+            // socket indistinguishable from a healthy running turn.
+            let status = match agent_record(&entry.terminal_id, None) {
+                AgentFetch::Found(record) => field(&record, "agent_status")
+                    .unwrap_or("unknown")
+                    .to_string(),
+                AgentFetch::Missing => "unknown".to_string(),
+                AgentFetch::TimedOut => {
+                    return Ok(fail(format!("delegate {}: timed out", entry.name)))
+                }
+                AgentFetch::Failed(reason) => {
+                    return Ok(fail(format!("delegate {}: {reason}", entry.name)))
+                }
+            };
             let running = matches!(status.as_str(), "working" | "blocked" | "unknown");
             let outcome = if running { "running" } else { "no_result" };
             emit_outcome(&entry, outcome, None, flags.json, &entry.cursor);
@@ -2765,9 +2904,18 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(entry) => entry,
         Err(code) => return Ok(code),
     };
-    let status = agent_record_opt(&entry.terminal_id, None)
-        .and_then(|record| field(&record, "agent_status").map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string());
+    // `agent_record`, not `_opt`: an unreachable server is a FAILURE, never
+    // a cheerful "unknown" at exit 0 (W13 / G5).
+    let status = match agent_record(&entry.terminal_id, None) {
+        AgentFetch::Found(record) => field(&record, "agent_status")
+            .unwrap_or("unknown")
+            .to_string(),
+        AgentFetch::Missing => "unknown".to_string(),
+        AgentFetch::TimedOut => return Ok(fail(format!("delegate {}: timed out", entry.name))),
+        AgentFetch::Failed(reason) => {
+            return Ok(fail(format!("delegate {}: {reason}", entry.name)))
+        }
+    };
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
         // that appears with its first value is not a field a caller can test for.
