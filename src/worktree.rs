@@ -516,17 +516,21 @@ fn checkout_is_readable(checkout: &std::path::Path) -> bool {
 ///   1. The `main`/`master` floor — hardcoded and config-INDEPENDENT, so a repo
 ///      with no config (or a failed default-branch probe) can never have these
 ///      pruned.
-///   2. The repo's detected default branch (`origin/HEAD`, else main/master).
+///   2. Every branch in the landing set ([`integration_targets`]) — the detected
+///      default branch plus the integration branches it judged work against.
+///      Naming `dev` as a target while leaving it deletable is the hole #633
+///      would otherwise open: a repo that squash-merges into `dev` would get
+///      `merged: true` on `dev` itself and delete the branch it landed into.
 ///   3. `extra_protected` — the `[worktrees] protected_branches` repo policy,
 ///      which EXTENDS the floor (long-lived `develop`, `release/*`, ...). It can
 ///      only add protection, never remove tier 1.
 pub(crate) fn is_protected_branch(
     branch: &str,
-    default_branch: Option<&str>,
+    landing_targets: &[IntegrationTarget],
     extra_protected: &[String],
 ) -> bool {
     matches!(branch, "main" | "master")
-        || default_branch == Some(branch)
+        || landing_targets.iter().any(|target| target.name == branch)
         || extra_protected.iter().any(|b| b == branch)
 }
 
@@ -939,6 +943,117 @@ pub(crate) fn detect_default_branch(repo_root: &std::path::Path) -> Option<Strin
     None
 }
 
+/// One branch the merge gate treats as a place work lands, paired with the ref
+/// every git question about it goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntegrationTarget {
+    /// The branch as a user names it, with no `origin/` prefix even when the ref
+    /// that answered is the remote's. This is what `evidence` reports, because
+    /// "already in dev" is the fact and "already in refs/remotes/origin/dev" is
+    /// a spelling of it.
+    pub(crate) name: String,
+    /// Spelled in full for the reason [`branch_ref`] exists (#243): a tag
+    /// sharing the branch's name outranks it in git's ambiguity order and would
+    /// answer about the wrong history.
+    pub(crate) git_ref: String,
+}
+
+/// Every branch whose content counts as landed work, and the ref to ask git
+/// about (#633).
+///
+/// [`detect_default_branch`] answers ONE name and it reads
+/// `refs/remotes/origin/HEAD`, a symref git writes once at clone time and never
+/// revises — it has no way to notice that GitHub's default branch moved. This
+/// repo's PRs have squash-merged into `dev` while that symref still says `main`,
+/// so every local fallback in the merge gate was asking about a branch that no
+/// longer receives work, and with `gh` unavailable the verdict for a fully
+/// landed branch was `NotMerged`. The sweep tiers read that as work at risk.
+///
+/// A SET, because the question behind the gate is "would deleting this lose
+/// work?", and a repo with long-lived integration branches has more than one
+/// place work lands. Content already in ANY target is recorded somewhere the
+/// user can get it back, so it is safe to read as landed; content in NONE of
+/// them is not, and every other rule in [`branch_merge_gate`] still has to hold
+/// before anything is deleted.
+///
+/// The detected default comes FIRST so a repo whose `origin/HEAD` is correct
+/// answers exactly as it always did, evidence strings included. `dev`, `main`
+/// and `master` follow, deduplicated, and only where a ref for them actually
+/// exists — `configured` is the repo's `[worktrees] integration_branches`
+/// policy, for a landing branch named something else.
+pub(crate) fn integration_targets(
+    repo_root: &std::path::Path,
+    configured: &[String],
+) -> Vec<IntegrationTarget> {
+    let root = repo_root.to_string_lossy().to_string();
+    let known = local_and_origin_refs(&root);
+    let mut names: Vec<String> = Vec::new();
+    if let Some(default) = detect_default_branch(repo_root) {
+        claim_name(&mut names, &default);
+    }
+    for candidate in configured
+        .iter()
+        .map(String::as_str)
+        .chain(["dev", "main", "master"])
+    {
+        claim_name(&mut names, candidate);
+    }
+
+    let mut targets: Vec<IntegrationTarget> = Vec::new();
+    for name in names {
+        // BOTH spellings are asked, because the local branch and its
+        // remote-tracking ref can sit at different commits and either may hold
+        // the squash. Neither can produce a false "landed": a target whose tree
+        // already holds the branch's content means that content is recorded,
+        // whichever ref happened to be current.
+        for git_ref in [branch_ref(&name), format!("refs/remotes/origin/{name}")] {
+            let exists = known.iter().any(|existing| existing == &git_ref);
+            let already = targets.iter().any(|target| target.git_ref == git_ref);
+            if exists && !already {
+                targets.push(IntegrationTarget {
+                    name: name.clone(),
+                    git_ref,
+                });
+            }
+        }
+    }
+    targets
+}
+
+/// Add `name` to the ordered target-name list unless it is empty or already
+/// there. The default branch leads so it keeps winning the evidence string.
+fn claim_name(names: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+        names.push(name.to_string());
+    }
+}
+
+/// Every local branch and origin remote-tracking ref, as full refnames — one
+/// process for the whole target set rather than one per candidate name.
+fn local_and_origin_refs(root: &str) -> Vec<String> {
+    run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes/origin",
+        ],
+        None,
+    )
+    .map(|out| {
+        out.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// GitHub PR state for a worktree branch, shown in the pane header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
@@ -1153,16 +1268,21 @@ fn branch_ref(branch: &str) -> String {
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
 /// 1. `gh pr view` with gh's own repo resolution, then pinned to the origin
 ///    remote's repo (multi-remote checkouts resolve to upstream otherwise).
-/// 2. `git branch --merged <default-branch>`.
+/// 2. `git branch --merged <target>`, asked of EVERY branch in the landing set
+///    ([`integration_targets`]) rather than of one detected default — see #633
+///    for why `origin/HEAD` alone is the wrong single question.
 /// 3. Remote containment: the branch tip is reachable from another pushed
 ///    remote ref (e.g. merged into a feature branch) — the work is recorded,
 ///    so deleting the local branch loses nothing.
 /// 4. The branch holds no commits of its own — every commit on it is already
 ///    on some other ref, local or remote, so there is nothing to lose (#243).
+/// 5. `git merge-tree` content check, also asked of every target: a squash
+///    leaves no ancestry to find, so the content question is the one that
+///    recognises it.
 ///
 /// Anything inconclusive is NotMerged — deletion needs positive evidence.
 ///
-/// (4) is deliberately last even though it is the only purely-local check and
+/// (4) is deliberately late even though it is the only purely-local check and
 /// would short-circuit the `gh` call. A disposable branch is very often *also*
 /// merged or remotely contained, and "merged into main" says more about where
 /// the work went than (4) can. Latency is the cheaper thing to spend here —
@@ -1171,6 +1291,20 @@ pub(crate) fn branch_merge_gate(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     branch: &str,
+    configured_targets: &[String],
+) -> WorktreeMergeGate {
+    let targets = integration_targets(repo_root, configured_targets);
+    branch_merge_gate_against(repo_root, checkout, branch, &targets)
+}
+
+/// [`branch_merge_gate`] for a caller that already resolved the landing set, so
+/// one verdict's protection tiers and merge answer cannot be decided against
+/// two different lists.
+fn branch_merge_gate_against(
+    repo_root: &std::path::Path,
+    checkout: &std::path::Path,
+    branch: &str,
+    targets: &[IntegrationTarget],
 ) -> WorktreeMergeGate {
     let root = repo_root.to_string_lossy().to_string();
     let local_tip = run_command_capture(
@@ -1211,7 +1345,7 @@ pub(crate) fn branch_merge_gate(
         }
     }
 
-    if let Some(default_branch) = detect_default_branch(repo_root) {
+    for target in targets {
         if let Ok(merged) = run_command_capture(
             "git",
             &[
@@ -1220,9 +1354,10 @@ pub(crate) fn branch_merge_gate(
                 "branch",
                 "--merged",
                 // The *base* is a commit-ish too, and just as shadowable: a
-                // tag named after the default branch answers this question
-                // about the wrong commit (#243).
-                &branch_ref(&default_branch),
+                // tag named after an integration branch answers this question
+                // about the wrong commit (#243). `target.git_ref` is spelled in
+                // full for exactly that reason.
+                &target.git_ref,
                 "--format",
                 "%(refname:short)",
             ],
@@ -1233,7 +1368,7 @@ pub(crate) fn branch_merge_gate(
             // nothing here — the branch is kept, which is the safe answer.
             if merged.lines().any(|line| line.trim() == branch) {
                 return WorktreeMergeGate::Merged {
-                    evidence: format!("merged into {default_branch}"),
+                    evidence: format!("merged into {}", target.name),
                 };
             }
         }
@@ -1265,14 +1400,14 @@ pub(crate) fn branch_merge_gate(
 
     // Squash merges leave no ancestry to find (#287 landed that way and this
     // gate refused to clean up after it): the content is replayed as ONE new
-    // commit, so no commit of the branch is ever an ancestor of the default
+    // commit, so no commit of the branch is ever an ancestor of any landing
     // branch, and every source above asks an ancestry question. Ask the
     // question the gate actually cares about instead — would deleting this
-    // lose work? — by merging the branch into the default branch in memory.
-    if let Some(default_branch) = detect_default_branch(repo_root) {
-        if branch_content_already_in(&root, branch, &default_branch) {
+    // lose work? — by merging the branch into each target in memory.
+    for target in targets {
+        if branch_content_already_in(&root, branch, &target.git_ref) {
             return WorktreeMergeGate::Merged {
-                evidence: format!("already in {default_branch} (squashed or rebased)"),
+                evidence: format!("already in {} (squashed or rebased)", target.name),
             };
         }
     }
@@ -1289,10 +1424,14 @@ pub(crate) fn branch_merge_gate(
 /// someone else landed by another route. In every one of those cases deleting
 /// the local branch loses no work, which is the only thing this gate is for.
 ///
+/// `base` is a FULL refname rather than a branch name, which is what keeps a
+/// tag sharing the branch's name from answering about the wrong history
+/// ([`branch_ref`], #243).
+///
 /// Chosen over the obvious tree comparison, which is wrong in a way that shows
 /// up immediately: diffing the branch against `base` over the paths it touched
 /// reports base's OWN later edits to those files as missing content, so the
-/// check starts failing the moment the default branch moves on.
+/// check starts failing the moment the base branch moves on.
 ///
 /// Anything unusable is NOT evidence, and the branch is kept: a merge that
 /// conflicts (non-zero exit), a git too old for `--write-tree` (< 2.38), an
@@ -1301,12 +1440,7 @@ pub(crate) fn branch_merge_gate(
 fn branch_content_already_in(root: &str, branch: &str, base: &str) -> bool {
     let Ok(base_tree) = run_command_capture(
         "git",
-        &[
-            "-C",
-            root,
-            "rev-parse",
-            &format!("{}^{{tree}}", branch_ref(base)),
-        ],
+        &["-C", root, "rev-parse", &format!("{base}^{{tree}}")],
         None,
     ) else {
         return false;
@@ -1318,7 +1452,7 @@ fn branch_content_already_in(root: &str, branch: &str, base: &str) -> bool {
             root,
             "merge-tree",
             "--write-tree",
-            &branch_ref(base),
+            base,
             &branch_ref(branch),
         ],
         None,
@@ -1478,13 +1612,23 @@ impl WorktreeKillVerdict {
 ///
 /// `extra_protected` is the `[worktrees] protected_branches` repo policy; it
 /// EXTENDS the hardcoded main/master floor and can never remove it.
+/// `integration_branches` is the `[worktrees] integration_branches` policy the
+/// landing set reads (#633).
+///
+/// The landing set is resolved ONCE and handed to both halves. Protection and
+/// the merge answer have to be decided against the same list — a target the
+/// gate is willing to call "landed in" and a branch it is willing to delete are
+/// the same question asked twice, and answering them from two different lists
+/// is how a `dev` worktree ends up with `merged: true` and `protected: false`.
 pub(crate) fn resolve_kill_verdict(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     extra_protected: &[String],
+    integration_branches: &[String],
 ) -> WorktreeKillVerdict {
-    let (branch, protected) = kill_verdict_facts(repo_root, checkout, extra_protected);
-    let gate = resolve_kill_gate(repo_root, checkout, branch.as_deref());
+    let targets = integration_targets(repo_root, integration_branches);
+    let (branch, protected) = kill_verdict_facts(checkout, &targets, extra_protected);
+    let gate = resolve_kill_gate(repo_root, checkout, branch.as_deref(), &targets);
     WorktreeKillVerdict {
         branch,
         gate,
@@ -1500,18 +1644,14 @@ pub(crate) fn resolve_kill_verdict(
 /// the branch name would turn "we could not reach GitHub" into a dialog that
 /// cannot name what it is about.
 fn kill_verdict_facts(
-    repo_root: &std::path::Path,
     checkout: &std::path::Path,
+    targets: &[IntegrationTarget],
     extra_protected: &[String],
 ) -> (Option<String>, bool) {
     let branch = checkout_branch_name(checkout);
-    let protected = branch.as_deref().is_some_and(|branch| {
-        is_protected_branch(
-            branch,
-            detect_default_branch(repo_root).as_deref(),
-            extra_protected,
-        )
-    });
+    let protected = branch
+        .as_deref()
+        .is_some_and(|branch| is_protected_branch(branch, targets, extra_protected));
     (branch, protected)
 }
 
@@ -1520,13 +1660,14 @@ fn resolve_kill_gate(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     branch: Option<&str>,
+    targets: &[IntegrationTarget],
 ) -> WorktreeMergeGate {
     match branch {
         // A detached checkout has no branch to judge or delete, and a checkout
         // that is gone has none to resolve — two different refusals that used
         // to share one wording (#360).
         None => gate_for_branchless_checkout(checkout),
-        Some(branch) => branch_merge_gate(repo_root, checkout, branch),
+        Some(branch) => branch_merge_gate_against(repo_root, checkout, branch, targets),
     }
 }
 
@@ -1582,20 +1723,26 @@ fn collect_indexed_within<T>(
 pub(crate) fn resolve_kill_verdicts_bounded(
     jobs: &[(PathBuf, PathBuf)],
     extra_protected: &[String],
+    integration_branches: &[String],
 ) -> Vec<(WorktreeKillVerdict, bool)> {
-    let facts: Vec<(Option<String>, bool)> = jobs
+    let facts: Vec<(Vec<IntegrationTarget>, Option<String>, bool)> = jobs
         .iter()
-        .map(|(repo_root, checkout)| kill_verdict_facts(repo_root, checkout, extra_protected))
+        .map(|(repo_root, checkout)| {
+            let targets = integration_targets(repo_root, integration_branches);
+            let (branch, protected) = kill_verdict_facts(checkout, &targets, extra_protected);
+            (targets, branch, protected)
+        })
         .collect();
 
     let (tx, rx) = std::sync::mpsc::channel();
     for (index, (repo_root, checkout)) in jobs.iter().enumerate() {
         let repo_root = repo_root.clone();
         let checkout = checkout.clone();
-        let branch = facts[index].0.clone();
+        let branch = facts[index].1.clone();
+        let targets = facts[index].0.clone();
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let gate = resolve_kill_gate(&repo_root, &checkout, branch.as_deref());
+            let gate = resolve_kill_gate(&repo_root, &checkout, branch.as_deref(), &targets);
             let _ = tx.send((index, gate));
         });
     }
@@ -1606,7 +1753,7 @@ pub(crate) fn resolve_kill_verdicts_bounded(
     facts
         .into_iter()
         .zip(gates)
-        .map(|((branch, protected), gate)| {
+        .map(|((_targets, branch, protected), gate)| {
             let timed_out = gate.is_none();
             (
                 WorktreeKillVerdict {
@@ -1629,10 +1776,15 @@ pub(crate) fn resolve_kill_verdict_with_timeout(
     repo_root: PathBuf,
     checkout: PathBuf,
     extra_protected: &[String],
+    integration_branches: &[String],
 ) -> (WorktreeKillVerdict, bool) {
-    resolve_kill_verdicts_bounded(&[(repo_root, checkout)], extra_protected)
-        .pop()
-        .expect("one job yields one verdict")
+    resolve_kill_verdicts_bounded(
+        &[(repo_root, checkout)],
+        extra_protected,
+        integration_branches,
+    )
+    .pop()
+    .expect("one job yields one verdict")
 }
 
 /// When work last happened on this checkout, as unix seconds — the last commit
@@ -2344,6 +2496,129 @@ mod tests {
         (repo, origin)
     }
 
+    /// Absolute path of `program` as this process's PATH resolves it, so a
+    /// fixture can build a PATH that keeps one tool and drops the rest.
+    fn resolve_on_path(program: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Run `body` with a PATH that resolves `git` and nothing else, so `gh` is
+    /// genuinely ABSENT rather than present-and-unreachable.
+    ///
+    /// The distinction is the whole point of the #633 fixture. A stub `gh` that
+    /// exits non-zero proves the fallback works when GitHub says no; a missing
+    /// `gh` proves it works when nobody can be asked at all, which is the state
+    /// an offline machine, a server launched without the gh profile, and every
+    /// rate-limited hour are in. Both would pass with a stub and only one with
+    /// this.
+    fn with_gh_absent_from_path<T>(scratch: &Path, body: impl FnOnce() -> T) -> T {
+        let git = resolve_on_path("git").expect("git is on PATH for the fixture itself");
+        let bin_dir = scratch.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(&git, bin_dir.join("git")).unwrap();
+        let original = std::env::var_os("PATH");
+        std::env::set_var("PATH", &bin_dir);
+        let value = body();
+        match original {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        value
+    }
+
+    /// A repo shaped like one whose GitHub default branch moved AFTER the clone:
+    /// a bare origin carrying `main` and `dev`, `origin/HEAD` still naming
+    /// `main` (git writes that symref once and never revises it), and a
+    /// worktree branch squash-merged into `dev` only — which is where this
+    /// repo's PRs land.
+    ///
+    /// `origin/HEAD` pointing at a branch that is no longer the landing site is
+    /// the whole of #633: the git fallbacks compare against `main`, the squash
+    /// lives in `dev`, and a branch whose work has fully landed reads as
+    /// unmerged until a release fast-forwards `main` onto `dev`.
+    fn repo_with_a_stale_origin_head(name: &str) -> StaleOriginHead {
+        let repo = create_committed_repo(name);
+        let origin = unique_temp_path(&format!("{name}-origin"));
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--quiet", "--bare"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        // `create_committed_repo` commits on whatever `init.defaultBranch` says
+        // on the developer's machine; pin the primary branch's name so the
+        // fixture's `main` is `main` everywhere (#268's reason, same shape).
+        run_git(&repo, &["branch", "-M", "main"]);
+        run_git(&repo, &["branch", "dev"]);
+        run_git(&repo, &["push", "--quiet", "-u", "origin", "main", "dev"]);
+        // What a clone of this repo would have recorded, and what git has no
+        // mechanism to update afterwards.
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let checkout = unique_temp_path(&format!("{name}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/landed-into-dev",
+                checkout.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(checkout.join("landed.txt"), "one\n").unwrap();
+        run_git(&checkout, &["add", "landed.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "first"]);
+        std::fs::write(checkout.join("landed.txt"), "one\ntwo\n").unwrap();
+        run_git(&checkout, &["add", "landed.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "second"]);
+        run_git(
+            &repo,
+            &["push", "--quiet", "-u", "origin", "feature/landed-into-dev"],
+        );
+
+        // The squash GitHub performs on merge into `dev`: the content replays as
+        // ONE new commit on `dev`, and not one commit of the branch becomes an
+        // ancestor of anything. `main` never sees it.
+        run_git(&repo, &["checkout", "--quiet", "dev"]);
+        run_git(&repo, &["merge", "--squash", "feature/landed-into-dev"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "feature work (#633)"]);
+        run_git(&repo, &["push", "--quiet", "origin", "dev"]);
+        run_git(&repo, &["checkout", "--quiet", "main"]);
+
+        StaleOriginHead {
+            repo,
+            origin,
+            checkout,
+        }
+    }
+
+    struct StaleOriginHead {
+        repo: PathBuf,
+        origin: PathBuf,
+        checkout: PathBuf,
+    }
+
+    impl StaleOriginHead {
+        fn cleanup(self) {
+            let _ = std::fs::remove_dir_all(&self.checkout);
+            let _ = std::fs::remove_dir_all(&self.repo);
+            let _ = std::fs::remove_dir_all(&self.origin);
+        }
+    }
+
     fn origin_has_branch(origin: &Path, branch: &str) -> bool {
         run_command_capture(
             "git",
@@ -2996,7 +3271,7 @@ prunable stale
         // The evidence names the base the session was cut from, rather than
         // the bare "no commits of its own" — the user learns where the work is.
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "worktree/fresh"),
+            branch_merge_gate(&repo, &checkout, "worktree/fresh", &[]),
             WorktreeMergeGate::Merged {
                 evidence: "contained in feature/base".to_string()
             }
@@ -3008,7 +3283,7 @@ prunable stale
         run_git(&checkout, &["add", "new.txt"]);
         run_git(&checkout, &["commit", "--quiet", "-m", "real work"]);
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "worktree/fresh"),
+            branch_merge_gate(&repo, &checkout, "worktree/fresh", &[]),
             WorktreeMergeGate::NotMerged
         );
 
@@ -3080,7 +3355,7 @@ prunable stale
             "the branch's commit lives nowhere else — the tag is not it"
         );
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "v1.0"),
+            branch_merge_gate(&repo, &checkout, "v1.0", &[]),
             WorktreeMergeGate::NotMerged,
             "a same-named tag must not become evidence for deleting the branch"
         );
@@ -3130,7 +3405,7 @@ prunable stale
         );
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "sidework"),
+            branch_merge_gate(&repo, &checkout, "sidework", &[]),
             WorktreeMergeGate::NotMerged,
             "a tag shadowing the default branch must not authorise a delete"
         );
@@ -3639,7 +3914,7 @@ prunable stale
         run_git(&checkout, &["add", "new.txt"]);
         run_git(&checkout, &["commit", "--quiet", "-m", "work"]);
 
-        let verdict = resolve_kill_verdict(&repo, &checkout, &[]);
+        let verdict = resolve_kill_verdict(&repo, &checkout, &[], &[]);
         assert_eq!(verdict.branch.as_deref(), Some("feature/landed"));
         assert!(!verdict.merged(), "unlanded work is not safe to delete");
 
@@ -3666,7 +3941,7 @@ prunable stale
             "a squash must leave the branch tip unreachable from the default branch"
         );
 
-        let verdict = resolve_kill_verdict(&repo, &checkout, &[]);
+        let verdict = resolve_kill_verdict(&repo, &checkout, &[], &[]);
         assert!(verdict.merged(), "a squash-merged branch is safe to delete");
         assert_eq!(
             verdict.evidence(),
@@ -3708,13 +3983,14 @@ prunable stale
         );
 
         // Unprotected by default...
-        let verdict = resolve_kill_verdict(&repo, &main_checkout, &[]);
+        let verdict = resolve_kill_verdict(&repo, &main_checkout, &[], &[]);
         assert_eq!(verdict.branch.as_deref(), Some("release/1.0"));
         assert!(!verdict.protected);
 
         // ...and protected by the repo's `protected_branches` policy, which
         // only ever adds.
-        let verdict = resolve_kill_verdict(&repo, &main_checkout, &["release/1.0".to_string()]);
+        let verdict =
+            resolve_kill_verdict(&repo, &main_checkout, &["release/1.0".to_string()], &[]);
         assert!(verdict.protected);
         assert!(
             !verdict.would_delete_branch(false),
@@ -3723,7 +3999,7 @@ prunable stale
 
         // The default branch itself, checked out where git allows it.
         assert!(
-            is_protected_branch(&default, Some(&default), &[]),
+            is_protected_branch(&default, &integration_targets(&repo, &[]), &[]),
             "the repo's default branch is protected without any config"
         );
 
@@ -3893,7 +4169,7 @@ prunable stale
         run_git(&checkout, &["commit", "--quiet", "-m", "second"]);
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed"),
+            branch_merge_gate(&repo, &checkout, "feature/squashed", &[]),
             WorktreeMergeGate::NotMerged,
             "unmerged work must keep the branch"
         );
@@ -3921,7 +4197,7 @@ prunable stale
         );
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed"),
+            branch_merge_gate(&repo, &checkout, "feature/squashed", &[]),
             WorktreeMergeGate::Merged {
                 evidence: format!("already in {default} (squashed or rebased)")
             }
@@ -3961,7 +4237,7 @@ prunable stale
         run_git(&checkout, &["commit", "--quiet", "-m", "after the squash"]);
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed-plus"),
+            branch_merge_gate(&repo, &checkout, "feature/squashed-plus", &[]),
             WorktreeMergeGate::NotMerged,
             "post-squash work must keep the branch"
         );
@@ -3991,14 +4267,14 @@ prunable stale
 
         // Unmerged branch: no evidence (gh pr view fails in a remote-less repo).
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/unmerged"),
+            branch_merge_gate(&repo, &checkout, "feature/unmerged", &[]),
             WorktreeMergeGate::NotMerged
         );
 
         // Merge it into the default branch: the git fallback now has evidence.
         let default = detect_default_branch(&repo).expect("default branch");
         run_git(&repo, &["merge", "--quiet", "feature/unmerged"]);
-        let gate = branch_merge_gate(&repo, &checkout, "feature/unmerged");
+        let gate = branch_merge_gate(&repo, &checkout, "feature/unmerged", &[]);
         assert_eq!(
             gate,
             WorktreeMergeGate::Merged {
@@ -4008,6 +4284,83 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_merge_gate_sees_a_squash_merge_into_an_integration_branch() {
+        // #633: the repo moved its PR base from `main` to `dev`, and PRs squash
+        // into `dev`. `origin/HEAD` still names `main` because git wrote that
+        // symref at clone time and has no way to notice GitHub's default branch
+        // moved — so every git fallback in the gate was asking about a branch
+        // that no longer receives work. With `gh` unavailable (a server without
+        // it on PATH, offline, rate-limited) the verdict was `NotMerged` for a
+        // branch whose content sits in `dev` in full, and the sweep tiers
+        // treated landed work as work at risk.
+        let stale = repo_with_a_stale_origin_head("merge-gate-stale-origin-head");
+        assert_eq!(
+            detect_default_branch(&stale.repo).as_deref(),
+            Some("main"),
+            "the stale symref is the premise: detection must still say main"
+        );
+
+        let scratch = unique_temp_path("merge-gate-stale-origin-head-path");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gate = with_gh_absent_from_path(&scratch, || {
+            branch_merge_gate(&stale.repo, &stale.checkout, "feature/landed-into-dev", &[])
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: "already in dev (squashed or rebased)".to_string()
+            },
+            "content in an integration branch is landed work, and the evidence \
+             names which branch held it"
+        );
+
+        stale.cleanup();
+    }
+
+    #[test]
+    fn branch_merge_gate_keeps_a_branch_merged_nowhere_in_the_integration_set() {
+        // The other direction of the same set: widening the comparison must not
+        // turn a genuinely unmerged branch into a deletion. This branch's
+        // content is in no target at all — not `main`, not `dev` — and it holds
+        // a commit no other ref has, so every evidence source has to stay silent.
+        let stale = repo_with_a_stale_origin_head("merge-gate-unmerged-anywhere");
+        let orphan = unique_temp_path("merge-gate-unmerged-anywhere-checkout");
+        run_git(
+            &stale.repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/nowhere",
+                orphan.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(orphan.join("only-here.txt"), "unlanded\n").unwrap();
+        run_git(&orphan, &["add", "only-here.txt"]);
+        run_git(&orphan, &["commit", "--quiet", "-m", "work landed nowhere"]);
+
+        let scratch = unique_temp_path("merge-gate-unmerged-anywhere-path");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let gate = with_gh_absent_from_path(&scratch, || {
+            branch_merge_gate(&stale.repo, &orphan, "feature/nowhere", &[])
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::NotMerged,
+            "a wider target set must not authorise deleting work that landed nowhere"
+        );
+
+        let _ = std::fs::remove_dir_all(&orphan);
+        stale.cleanup();
     }
 
     #[test]
@@ -4057,19 +4410,150 @@ prunable stale
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A landing target by name, for the tier tests that do not need a repo.
+    fn target(name: &str) -> IntegrationTarget {
+        IntegrationTarget {
+            name: name.to_string(),
+            git_ref: branch_ref(name),
+        }
+    }
+
     #[test]
-    fn is_protected_branch_covers_floor_default_and_config() {
-        // Tier 1: hardcoded floor, even with no default detected and no config.
-        assert!(is_protected_branch("main", None, &[]));
-        assert!(is_protected_branch("master", None, &[]));
-        // Tier 2: the repo's detected default branch.
-        assert!(is_protected_branch("trunk", Some("trunk"), &[]));
+    fn is_protected_branch_covers_floor_landing_set_and_config() {
+        // Tier 1: hardcoded floor, even with an empty landing set and no config.
+        assert!(is_protected_branch("main", &[], &[]));
+        assert!(is_protected_branch("master", &[], &[]));
+        // Tier 2: the detected default branch.
+        assert!(is_protected_branch("trunk", &[target("trunk")], &[]));
         // Tier 3: config policy extends the set.
         let extra = vec!["develop".to_string(), "release/1.x".to_string()];
-        assert!(is_protected_branch("develop", Some("main"), &extra));
-        assert!(is_protected_branch("release/1.x", None, &extra));
+        assert!(is_protected_branch("develop", &[target("main")], &extra));
+        assert!(is_protected_branch("release/1.x", &[], &extra));
         // An ordinary feature branch is never protected.
-        assert!(!is_protected_branch("feature/thing", Some("main"), &extra));
+        assert!(!is_protected_branch(
+            "feature/thing",
+            &[target("main"), target("dev")],
+            &extra
+        ));
+    }
+
+    #[test]
+    fn every_branch_the_gate_judges_against_is_protected() {
+        // #633's other half. The gate now calls a branch merged when its
+        // content is in ANY landing target — and `dev`, trivially, is contained
+        // in itself. If a target were not also protected, `worktree kill` on a
+        // checkout sitting on `dev` would report `merged: true` on a worktree
+        // the sweep would then delete the branch of, taking the repo's landing
+        // branch with it.
+        let stale = repo_with_a_stale_origin_head("landing-set-protects-itself");
+        let dev_checkout = unique_temp_path("landing-set-protects-itself-dev");
+        run_git(
+            &stale.repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                dev_checkout.to_str().unwrap(),
+                "dev",
+            ],
+        );
+
+        let targets = integration_targets(&stale.repo, &[]);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"dev"),
+            "the branch this repo squash-merges into must be judged against: {names:?}"
+        );
+
+        let verdict = resolve_kill_verdict(&stale.repo, &dev_checkout, &[], &[]);
+        assert_eq!(verdict.branch.as_deref(), Some("dev"));
+        assert!(
+            verdict.merged(),
+            "dev is trivially contained in itself, which is exactly why protection \
+             has to be checked independently"
+        );
+        assert!(verdict.protected, "a landing target is never deletable");
+        assert!(
+            !verdict.would_delete_branch(false),
+            "merged AND protected must still keep the branch"
+        );
+
+        // The stale default is protected too, and so is a config-named branch
+        // that does not exist here (protection cannot depend on a ref).
+        assert!(is_protected_branch(
+            "main",
+            &targets,
+            &["staging".to_string()]
+        ));
+        assert!(is_protected_branch(
+            "staging",
+            &targets,
+            &["staging".to_string()]
+        ));
+
+        let _ = std::fs::remove_dir_all(&dev_checkout);
+        stale.cleanup();
+    }
+
+    #[test]
+    fn a_configured_integration_branch_becomes_a_landing_target() {
+        // The escape hatch for a repo whose PRs land somewhere the hardcoded
+        // `dev`/`main`/`master` set cannot know about (#633). The fixture's
+        // branch is already in `dev`, so this needs work of its own that has
+        // landed nowhere yet — otherwise the `dev` target answers first and the
+        // test would pass for the wrong reason.
+        let stale = repo_with_a_stale_origin_head("configured-integration-branch");
+        run_git(&stale.repo, &["branch", "staging"]);
+        let checkout = unique_temp_path("configured-integration-branch-checkout");
+        run_git(
+            &stale.repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/for-staging",
+                checkout.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(checkout.join("staged.txt"), "staged\n").unwrap();
+        run_git(&checkout, &["add", "staged.txt"]);
+        run_git(&checkout, &["commit", "--quiet", "-m", "for staging"]);
+        run_git(&stale.repo, &["checkout", "--quiet", "staging"]);
+        run_git(&stale.repo, &["merge", "--squash", "feature/for-staging"]);
+        run_git(&stale.repo, &["commit", "--quiet", "-m", "into staging"]);
+        run_git(&stale.repo, &["checkout", "--quiet", "main"]);
+
+        assert_eq!(
+            branch_merge_gate(&stale.repo, &checkout, "feature/for-staging", &[]),
+            WorktreeMergeGate::NotMerged,
+            "without the policy entry there is no evidence about staging"
+        );
+        assert_eq!(
+            branch_merge_gate(
+                &stale.repo,
+                &checkout,
+                "feature/for-staging",
+                &["staging".to_string()],
+            ),
+            WorktreeMergeGate::Merged {
+                evidence: "already in staging (squashed or rebased)".to_string()
+            },
+            "the policy entry makes the branch a landing target, and the \
+             evidence names it"
+        );
+        assert!(
+            is_protected_branch(
+                "staging",
+                &integration_targets(&stale.repo, &["staging".to_string()]),
+                &[]
+            ),
+            "a configured landing branch is protected too"
+        );
+
+        let _ = std::fs::remove_dir_all(&checkout);
+        stale.cleanup();
     }
 
     #[test]
@@ -4121,7 +4605,7 @@ prunable stale
 
         // Not merged anywhere else yet: own tracking ref must NOT count.
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/float"),
+            branch_merge_gate(&repo, &checkout, "feature/float", &[]),
             WorktreeMergeGate::NotMerged
         );
 
@@ -4134,7 +4618,7 @@ prunable stale
         run_git(&repo, &["fetch", "--quiet", "origin"]);
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/float"),
+            branch_merge_gate(&repo, &checkout, "feature/float", &[]),
             WorktreeMergeGate::Merged {
                 evidence: "contained in origin/integration".to_string()
             }

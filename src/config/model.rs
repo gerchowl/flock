@@ -833,6 +833,13 @@ pub struct WorktreesConfig {
     /// regardless of config). A repo policy — long-lived `develop`, `release/*`.
     /// Extends the hardcoded floor; can never unprotect it (#121).
     pub protected_branches: Vec<String>,
+    /// Extra branches the merge gate treats as places work lands, beyond the
+    /// detected default branch and `dev`/`main`/`master` (#633). A repo whose
+    /// PRs land somewhere else -- `staging`, `trunk`, `next` -- names it here,
+    /// and the gate then reports `merged: true` with that branch named as the
+    /// evidence. Each entry is also protected from auto-deletion. Entries with
+    /// no such branch or `refs/remotes/origin/<entry>` are ignored.
+    pub integration_branches: Vec<String>,
 }
 
 /// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
@@ -1667,6 +1674,7 @@ impl Default for WorktreesConfig {
             adopt_external: true,
             branch_pivot_message: default_branch_pivot_message().to_string(),
             protected_branches: Vec::new(),
+            integration_branches: Vec::new(),
         }
     }
 }

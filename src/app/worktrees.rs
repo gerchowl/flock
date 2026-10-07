@@ -626,6 +626,7 @@ impl App {
         let workspace_id = ws.id.clone();
         let event_tx = self.event_tx.clone();
         let protected_branches = self.state.config.worktrees.protected_branches.clone();
+        let integration_branches = self.state.config.worktrees.integration_branches.clone();
         std::thread::spawn(move || {
             // One resolver for branch + merge gate + #121 protection, shared
             // with the sweep, `worktree.kill` and `worktree.list --scan`.
@@ -633,6 +634,7 @@ impl App {
                 repo_root.clone(),
                 checkout.clone(),
                 &protected_branches,
+                &integration_branches,
             );
             // #325: what the kill would destroy, collected on the same worker
             // that resolved the gate — the dialog holds its confirm until both
@@ -789,11 +791,13 @@ impl App {
             let checkout = row.checkout.clone();
             let event_tx = self.event_tx.clone();
             let protected_branches = self.state.config.worktrees.protected_branches.clone();
+            let integration_branches = self.state.config.worktrees.integration_branches.clone();
             std::thread::spawn(move || {
                 let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
                     repo_root.clone(),
                     checkout.clone(),
                     &protected_branches,
+                    &integration_branches,
                 );
                 let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                     crate::events::WorktreeKillGateResult {
