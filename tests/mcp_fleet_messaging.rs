@@ -33,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use support::fleet::{self, NodeSpec};
+use support::fleet::{self, NodeSpec, HUB_SPOKES};
 
 /// Two nodes that poll EACH OTHER. A one-way chain is enough to send, but a
 /// reply has to resolve the original sender through the replier's own
@@ -42,16 +42,6 @@ use support::fleet::{self, NodeSpec};
 const PAIR_AB: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &["nodeb"]),
     NodeSpec::new("nodeb", "beta", &["nodea"]),
-];
-
-/// Hub and spokes, the fleet's real shape (#410): only `nodeb` carries
-/// `[[peers]]`, and the two spokes carry none — no reverse trust, no N×N keys.
-/// The only way off a spoke is the relay the hub holds INTO it.
-const HUB_SPOKES: &[NodeSpec] = &[
-    // Wide enough that a relayed server row's `via nodeb` is not truncated.
-    NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
-    NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
-    NodeSpec::new("nodec", "gamma", &[]),
 ];
 
 const GOSSIP_TIMEOUT: Duration = Duration::from_secs(30);
