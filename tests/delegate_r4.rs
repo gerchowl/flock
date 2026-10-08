@@ -344,7 +344,7 @@ fn screen_for(state: &str) -> &'static str {
     match state {
         "working" => "\u{25a0}\u{25a0}\u{25a0}\u{25a0}\u{2b1d}\u{2b1d}  esc interrupt  opencode",
         "blocked" => "\u{25b3} Permission required",
-        "idle" => "",
+        "idle" => "opencode ready >",
         other => panic!("no screen for {other}"),
     }
 }

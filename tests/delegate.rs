@@ -11,7 +11,7 @@
 //! screen (`src/detect/agents/opencode.rs`; a `flock:opencode` state report
 //! is reserved and only carries the session). So the fake draws the screen
 //! the test asks for through `<base>/screen`: a progress run for working,
-//! nothing for idle, the permission banner for blocked. The test also plays
+//! a prompt for idle, the permission banner for blocked. The test also plays
 //! the opencode plugin's session report (`pane.report_agent_session`) and
 //! writes the session's replies into an opencode database under an isolated
 //! `XDG_DATA_HOME`, which is what `agent.result` reads.
@@ -113,6 +113,10 @@ fn write_fake_opencode(base: &Path) {
     fs::create_dir_all(&bin).unwrap();
     let script = format!(
         "#!/bin/sh\n\
+         if [ -e '{base}/starting' ]; then\n\
+         : > '{base}/startup-entered'\n\
+         while [ -e '{base}/starting' ]; do sleep 0.05; done\n\
+         fi\n\
          printf '%s\\n' \"$*\" >> '{base}/argv.log'\n\
          printf '%s\\n' \"$PWD\" >> '{base}/cwd.log'\n\
          if [ -e '{base}/die' ]; then exit 1; fi\n\
@@ -352,7 +356,7 @@ fn screen_for(state: &str) -> &'static str {
     match state {
         "working" => "\u{25a0}\u{25a0}\u{25a0}\u{25a0}\u{2b1d}\u{2b1d}  esc interrupt  opencode",
         "blocked" => "\u{25b3} Permission required",
-        "idle" => "",
+        "idle" => "opencode ready >",
         other => panic!("no screen for {other}"),
     }
 }
@@ -1574,4 +1578,47 @@ fn a19_failed_worktree_start_removes_its_checkout() {
             .any(|p| p.ends_with("w1.json")),
         "no registry entry"
     );
+}
+
+/// A process exists before its first screen paint, so that alone is not ready.
+#[test]
+fn a20_start_waits_for_the_first_screen_paint() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("starting"), "").unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let work = work_dir(&server);
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate", "start", "d1", "--brief", &b, "--cwd", &work, "--json",
+        ],
+    );
+    let pane = delegate_pane(&server, "d1");
+    let deadline = Instant::now() + WITHIN;
+    while !server.base.join("startup-entered").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the harness reaches its startup gate"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let premature = exited_within(&mut child, Duration::from_secs(2));
+    let screen = cli(
+        &server,
+        &[
+            "pane", "read", &pane, "--source", "recent", "--format", "text",
+        ],
+    );
+    fs::write(server.base.join("screen"), screen_for("idle")).unwrap();
+    fs::remove_file(server.base.join("starting")).unwrap();
+    assert!(String::from_utf8_lossy(&screen.stdout).trim().is_empty());
+    assert!(
+        premature.is_none(),
+        "a blank startup screen must not receive the brief"
+    );
+    let status = exited_within(&mut child, WITHIN).expect("start returns after first paint");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "{}", stderr(&out));
+    wait_typed(&server, 1);
 }
