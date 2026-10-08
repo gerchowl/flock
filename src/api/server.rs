@@ -408,6 +408,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentSpawn(_) => "agent.spawn",
         Method::AgentHibernate(_) => "agent.hibernate",
         Method::AgentResume(_) => "agent.resume",
+        Method::AgentRestart(_) => "agent.restart",
         Method::AgentLineage(_) => "agent.lineage",
         Method::MsgSend(_) => "msg.send",
         Method::MsgReply(_) => "msg.reply",

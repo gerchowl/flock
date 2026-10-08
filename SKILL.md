@@ -245,6 +245,29 @@ the newline gets inserted and nothing is submitted. the pause is a heuristic,
 not a guarantee: a tui that has not started reading stdin yet misses the text
 as well as the enter. wait for the pane to be ready first (see below).
 
+## restart your own process and carry on
+
+```sh
+flk agent restart self --reason "reload MCP configuration" --continue-with "finish the assigned task"
+```
+
+The call schedules the restart and returns immediately. Finish your turn
+normally. Flock waits for settled idle, stops your process tree through the
+runtime, then resumes the same native session with the original launch flags,
+profile environment, cwd, name and agent identity. It verifies a fresh report of
+the same session and an empty idle prompt before queuing the continuation through
+your inbox wake path. Read that inbox when prompted.
+
+Omit `--continue-with` to receive “You restarted yourself for: <reason>. Continue
+your task.” Use `--continue-with @FILE` for a file containing one line of plain
+instructions, at most 16 KiB. A duplicate pending restart is refused.
+
+A configured hard limit or the grace deadline can force a restart mid-turn.
+The continuation warns about potentially incomplete tools, unconfirmed transcript
+flushes and stopped background tasks/processes. Verify those before continuing.
+Unknown startup dialogs need the operator. A restart loop stops at the configured
+cap; an explicit `flk agent resume <target>` releases that stop.
+
 ## compact your own context and carry on
 
 use this when your context is filling up **and you already know what the next

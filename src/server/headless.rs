@@ -3507,6 +3507,7 @@ impl HeadlessServer {
         self.app.tick_idle_wakes(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
+        changed |= self.app.tick_agent_restarts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }

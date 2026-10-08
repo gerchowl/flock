@@ -605,7 +605,7 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) =
+        let Some((ws_idx, pane_id)) =
             self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
         else {
             return pane_not_found(id, &params.pane_id);
@@ -613,14 +613,16 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        let session_ref = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id,
+            params.agent_session_path,
+        );
+        let native_identity = session_ref.is_some();
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
-            session_ref: crate::agent_resume::session_ref_from_report(
-                &params.source,
-                &agent_label,
-                params.agent_session_id,
-                params.agent_session_path,
-            ),
+            session_ref,
             source: params.source,
             agent_label,
             state: detect_state_from_api(params.state),
@@ -629,6 +631,9 @@ impl App {
             seq: params.seq,
         });
 
+        if native_identity {
+            self.note_restart_identity_report(ws_idx, pane_id);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -730,20 +735,25 @@ impl App {
                 std::time::Instant::now(),
             );
         }
+        let session_ref = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id,
+            params.agent_session_path,
+        );
+        let native_identity = session_ref.is_some();
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
-            session_ref: crate::agent_resume::session_ref_from_report(
-                &params.source,
-                &agent_label,
-                params.agent_session_id,
-                params.agent_session_path,
-            ),
+            session_ref,
             source: params.source,
             agent_label,
             seq: params.seq,
             session_start_source,
         });
 
+        if native_identity {
+            self.note_restart_identity_report(ws_idx, pane_id);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 

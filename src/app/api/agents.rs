@@ -522,6 +522,19 @@ impl App {
     /// `agent.hibernate` (#175 C3): park a pane. Refuses with a typed code
     /// when the agent has no resumable session (data loss guard) or the pane
     /// is already hibernated. Emits `AgentHibernated` on success.
+    pub(super) fn handle_agent_restart(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentRestartParams,
+    ) -> String {
+        match self.queue_agent_restart(params, std::time::Instant::now()) {
+            Ok((pane_id, session)) => {
+                encode_success(id, ResponseResult::AgentRestartQueued { pane_id, session })
+            }
+            Err(err) => encode_error_body(id, err),
+        }
+    }
+
     pub(super) fn handle_agent_hibernate(&mut self, id: String, target: AgentTarget) -> String {
         let resolved = match self.resolve_terminal_target(&target.target) {
             Ok(resolved) => resolved,
@@ -551,6 +564,17 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        if let Some(terminal) = self
+            .state
+            .terminals
+            .values_mut()
+            .find(|t| t.id.to_string() == resolved.terminal_id)
+        {
+            if terminal.restart_stopped {
+                terminal.restart_stopped = false;
+                terminal.restart_in_progress = false;
+            }
+        }
         match self.resume_hibernated_pane(resolved.ws_idx, resolved.pane_id) {
             Ok(_) => {
                 let agent = self

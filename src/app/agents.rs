@@ -434,7 +434,7 @@ impl App {
         let spawn_env = self
             .resolve_spawn_env(&argv, self.current_api_peer_pid, None)
             .map_err(AgentStartError::ProfileUnresolved)?;
-        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
 
         // #398: two PLACEMENTS named at once is refused rather than resolved.
         // Silently preferring one is how a caller ends up reasoning about a
@@ -677,6 +677,7 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return Err(AgentStartError::SpawnFailed("terminal disappeared".into()));
         };
+        terminal.launch_env = spawn_env;
         terminal.set_agent_name(name.clone());
         terminal.set_manual_label(name);
         self.state.mark_session_dirty();

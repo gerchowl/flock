@@ -243,6 +243,12 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_msg_wait_reply,
         },
         Tool {
+            name: "flock_agent_restart",
+            description: "Ask flock to stop and resume the same agent session after your turn ends. Returns immediately: finish this turn normally. Preserves the original launch flags and environment. Flock verifies the resumed session before queuing continue_with (default: continue your task). A grace timeout may force the restart; restart loops are stopped. Unknown startup dialogs need the operator.",
+            input_schema: schema_agent_restart,
+            build: build_agent_restart,
+        },
+        Tool {
             name: "flock_self_compact",
             description: "Compact YOUR OWN context and carry on, unattended. \
                           Call this when your context is filling up and you \
@@ -1035,6 +1041,40 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn schema_agent_restart() -> Value {
+    json!({"type": "object", "properties": {
+        "target": {"type": "string", "default": "self"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "continue_with": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "when": {"type": "string", "enum": ["after_turn"], "default": "after_turn"}
+    }, "required": ["reason"], "additionalProperties": false})
+}
+
+fn build_agent_restart(args: Value) -> Result<Method, McpError> {
+    let params: crate::api::schema::AgentRestartParams =
+        serde_json::from_value(args).map_err(|err| McpError::invalid_params(err.to_string()))?;
+    if params.reason.trim().is_empty()
+        || params.reason.len() > 1024
+        || params.reason.chars().any(char::is_control)
+        || params.when != "after_turn"
+    {
+        return Err(McpError::invalid_params(
+            "reason must be plain text up to 1024 bytes; when must be after_turn",
+        ));
+    }
+    if let Some(text) = &params.continue_with {
+        if text.trim().is_empty()
+            || text.len() > 16384
+            || crate::agent_self_compact::check_continuation(text).is_err()
+        {
+            return Err(McpError::invalid_params(
+                "continue_with must be one line of plain instructions, at most 16 KiB",
+            ));
+        }
+    }
+    Ok(Method::AgentRestart(params))
+}
+
 fn schema_self_compact() -> Value {
     json!({
         "type": "object",
@@ -1302,6 +1342,7 @@ mod tests {
                 "flock_msg_read",
                 "flock_msg_mute",
                 "flock_msg_wait_reply",
+                "flock_agent_restart",
                 "flock_self_compact",
                 "flock_pane_read",
                 "flock_worktree_list",
@@ -2018,5 +2059,30 @@ mod tests {
     fn find_returns_none_for_unknown_tool() {
         assert!(find("flock_pane_close").is_none());
         assert!(find("agent.list").is_none());
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    #[test]
+    fn restart_mcp_builds_only_the_scheduled_restart_verb() {
+        let Method::AgentRestart(params) =
+            build_agent_restart(json!({"reason": "reload config"})).unwrap()
+        else {
+            panic!("wrong method")
+        };
+        assert_eq!(params.target, "self");
+        assert_eq!(params.when, "after_turn");
+        assert!(params.continue_with.is_none());
+        for args in [
+            json!({"reason": ""}),
+            json!({"reason":"reload", "when":"now"}),
+            json!({"reason":"reload", "text":"/exit"}),
+            json!({"reason":"reload", "continue_with":"/exit"}),
+            json!({"reason":"reload", "continue_with":"one\ntwo"}),
+        ] {
+            assert!(build_agent_restart(args).is_err());
+        }
     }
 }

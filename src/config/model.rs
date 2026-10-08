@@ -351,6 +351,9 @@ pub struct TerminalConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
+    /// Server-owned restart policy, with optional overrides keyed by agent name.
+    pub restart: crate::agent_restart::RestartPolicy,
+    pub restart_agents: std::collections::BTreeMap<String, crate::agent_restart::RestartPolicy>,
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Flock session. Default: true.
     pub resume_agents_on_restore: bool,
@@ -434,6 +437,8 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            restart: Default::default(),
+            restart_agents: Default::default(),
             resume_agents_on_restore: true,
             stop_transcript_wait_ms: 1_000,
             stop_transcript_poll_ms: 50,

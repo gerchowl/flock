@@ -382,3 +382,24 @@ Use `flk terminal attach <terminal_id>` when you want the same direct attach beh
 ## Give an agent read-mostly access to the flock
 
 Point an MCP-capable agent at `flk mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, tear down finished worktree spaces, and — for Claude — fork a conversation or send/reply pane-to-pane messages. `flock_worktree_kill` defaults to a dry run; pass `dry_run: false` to remove the checkout, and `self: true` for a real kill of the calling pane's own workspace. Branch deletion requires positive merge evidence. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table. The same server exposes files a human has dropped on a pane as MCP **resources**, so an agent can list and read what it was handed instead of scraping the path out of its own input surface.
+
+## Restarting an agent
+
+An agent can ask Flock to restart its own process without changing conversations:
+
+```sh
+flk agent restart self --reason "reload MCP configuration" --continue-with "finish the assigned task"
+```
+
+Over MCP, call `flock_agent_restart` with `reason`, optional `continue_with`,
+and `when: "after_turn"`. Both forms return immediately; finish the turn so
+Flock can stop at a settled idle boundary. The replacement retains the native
+session, original launch flags and profile environment, cwd, agent name, and
+stable agent identity. Flock verifies a fresh same-session report and ready
+prompt before queuing the continuation through the inbox wake path.
+
+A grace deadline or configured resource limit may force the restart. Its first
+message warns about incomplete tools, unconfirmed transcript flushes, and lost
+background tasks/processes. Unknown startup dialogs require the operator.
+Operator notifications, durable lifecycle events, and messages to the spawning
+supervisor report the result. See [restart configuration](/docs/preview/configuration/#agent-restarts).

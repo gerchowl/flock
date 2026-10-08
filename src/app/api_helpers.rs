@@ -101,7 +101,7 @@ pub(super) fn pane_agent_status_from_terminal(
 /// already exists, so a mangled sentence beats a refused delivery. The spawn
 /// path shares the filter and refuses instead, because there the text is the
 /// whole turn (`crate::spawn::prompt`, ADR-0014 §4).
-pub(super) fn sanitize_reported_prompt(prompt: &str) -> String {
+pub(crate) fn sanitize_reported_prompt(prompt: &str) -> String {
     const MAX_PROMPT_LEN: usize = 16 * 1024;
     let mut cleaned = crate::control_bytes::strip(prompt);
     if cleaned.len() > MAX_PROMPT_LEN {

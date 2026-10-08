@@ -166,6 +166,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +472,12 @@ fn capture_tab(
                 spawned_by,
                 agent_session,
                 launch_argv,
+                launch_env: tab
+                    .panes
+                    .get(id)
+                    .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                    .map(|terminal| terminal.launch_env.clone())
+                    .unwrap_or_default(),
             },
         );
     }
@@ -816,6 +824,7 @@ mod tests {
                 spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
             },
         );
         panes.insert(
@@ -832,6 +841,7 @@ mod tests {
                 spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
             },
         );
 
@@ -1514,6 +1524,7 @@ mod tests {
                 spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
             },
         );
         panes.insert(
@@ -1532,6 +1543,7 @@ mod tests {
                 spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
             },
         );
 
