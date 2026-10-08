@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.10.0] - 2026-10-08
+
 ### Added
 - Delegate stall and readiness verdicts, `--silence` (default 3m), stalled exit code 7, provider retry ETAs, and optional event-time System One advice (#627). Codex context compaction remains working.
 - `flk delegate --harness codex` now runs the full start, readiness, brief, settle, and result flow using Codex’s SessionStart hook and rollouts (#613). Hook review is refused with a named diagnostic before any brief is typed. Codex delegates default to the workspace-write sandbox with never approvals. Workspace-write blocks the network, so `git push` and `gh` require `--sandbox danger-full-access`, deliberately chosen by the caller. The Codex-only sandbox option also accepts read-only.
