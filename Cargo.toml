@@ -45,6 +45,8 @@ crossterm = { version = "0.29", features = ["serde"] }
 ctrlc = { version = "3", features = ["termination"] }
 futures-util = { version = "0.3", optional = true }
 libc = "0.2"
+# OS entropy for server-minted mesh ULIDs and collection capabilities.
+getrandom = "0.4"
 portable-pty = "0.9"
 rust-embed = { version = "8", optional = true }
 png = "0.18"
