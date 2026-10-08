@@ -427,7 +427,7 @@ Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks 
 flk integration install pi
 flk integration install omp
 flk integration install claude
-flk integration install codex
+flk integration install codex [--no-trust-hooks]
 flk integration install copilot
 flk integration install kimi
 flk integration install opencode
@@ -444,6 +444,8 @@ flk integration uninstall hermes
 flk integration uninstall qodercli
 flk integration status [--outdated-only]
 ```
+
+Installing the Codex integration records trust for flock’s exact SessionStart hook only. Other hooks still need review. Use `--no-trust-hooks` to leave hook trust untouched.
 
 ## MCP server
 

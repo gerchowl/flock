@@ -85,7 +85,8 @@ fn has_codex_visible_working_without_prompt(content: &str) -> bool {
 }
 
 fn has_codex_strong_blocked_prompt(lower_content: &str) -> bool {
-    lower_content.contains("press enter to confirm or esc to cancel")
+    has_codex_hook_review(lower_content)
+        || lower_content.contains("press enter to confirm or esc to cancel")
         || lower_content.contains("enter to submit answer")
         || lower_content.contains("enter to submit all")
         || lower_content.contains("allow command?")
@@ -224,6 +225,15 @@ pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
     codex_working_status_line(line)
 }
 
+fn has_codex_hook_review(content: &str) -> bool {
+    let bottom = bottom_non_empty_lines(content, 10);
+    bottom
+        .last()
+        .is_some_and(|line| line.trim() == "enter confirm · esc skip")
+        && bottom.iter().any(|line| line.trim() == "hooks need review")
+        && bottom.iter().any(|line| line.trim() == "› 1. review hooks")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +249,21 @@ mod tests {
             detect("Compacting context is described in the transcript\n› Ask Codex to do anything"),
             AgentState::Idle
         );
+    }
+
+    const REVIEW: &str = "  Hooks need review\n  1 hook is new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm · esc skip";
+
+    #[test]
+    fn hook_review_is_blocked_only_at_the_live_tail() {
+        assert_eq!(detect(REVIEW), AgentState::Blocked);
+        assert!(has_visible_blocker(REVIEW));
+        let idle = format!("{REVIEW}\n\n› ");
+        assert_eq!(detect(&idle), AgentState::Idle);
+        assert!(!has_visible_blocker(&idle));
+        let working = format!("{REVIEW}\n• Working (2s • esc to interrupt)\n› ");
+        assert_eq!(detect(&working), AgentState::Working);
+        assert!(!has_visible_blocker(&working));
+        assert_eq!(detect("Hooks need review\n› "), AgentState::Idle);
+        assert_eq!(detect("enter confirm · esc skip"), AgentState::Idle);
     }
 }
