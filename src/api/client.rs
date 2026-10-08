@@ -116,11 +116,13 @@ impl ApiClient {
                 protocol,
                 capabilities,
                 session_health,
+                api_listener,
             } => Ok(crate::api::RuntimeStatus {
                 version: Some(version),
                 protocol: Some(protocol),
                 capabilities,
                 session_health,
+                api_listener,
             }),
             result => Err(ApiClientError::UnexpectedResult(format!("{result:?}"))),
         }
