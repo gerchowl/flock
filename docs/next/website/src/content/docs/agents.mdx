@@ -330,7 +330,7 @@ opencode's session database (read-only); for any other agent it refuses with
 flk agent result reviewer
 ```
 
-Codex results are read from `$CODEX_HOME/sessions` (default `~/.codex/sessions`) using the session ID reported by its SessionStart hook. The reader checks the newest 1 MiB of a rollout and requires a recorded turn completion. An active turn returns the previous completed reply with `finished: false`. Codex history and delegate support are separate follow-ups.
+Codex results are read from `$CODEX_HOME/sessions` (default `~/.codex/sessions`) using the session ID reported by its SessionStart hook. The reader checks the newest 1 MiB of a rollout and requires a recorded turn completion. An active turn returns the previous completed reply with `finished: false`. Codex history remains a separate follow-up.
 
 `agent result` returns the reply the agent's newest turn ended on, plus the
 status of a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line
@@ -347,7 +347,9 @@ flk delegate start reviewer --brief ./briefs/review.md --worktree --branch revie
 flk delegate send reviewer --brief ./briefs/follow-ups.md --await
 ```
 
-`--harness` picks the agent, `opencode` (the default) or `claude`; `--model M` is passed through to it as `--model M`. With `claude`, a fresh worktree is a folder Claude has no trust record for, so it stops on its folder-trust dialog — the delegate names that dialog and refuses rather than typing the brief at it (#605), and `flk delegate` cannot pre-trust the folder for you.
+`--harness` picks the agent, `opencode` (the default), `claude`, or `codex`; `--model M` is passed through to it as `--model M`. With `claude`, a fresh worktree is a folder Claude has no trust record for, so it stops on its folder-trust dialog — the delegate names that dialog and refuses rather than typing the brief at it (#605), and `flk delegate` cannot pre-trust the folder for you.
+
+Codex delegates default to `codex --ask-for-approval never --sandbox workspace-write [--model M]`. The workspace-write sandbox blocks the network, so a delegate that must `git push` or use `gh` needs `flk delegate start ... --harness codex --sandbox danger-full-access`, chosen deliberately by the caller. This opt-in grants full filesystem and network access. Codex also accepts `--sandbox read-only`; other harnesses reject `--sandbox`. Hook trust still applies: a live hook-review dialog is refused before the brief is submitted; run `flk integration install codex` to trust flock’s own hook. The SessionStart hook reports the rollout session used for results.
 
 The brief is a file and exactly one sentence is typed into the agent: `Read <absolute path> and execute it exactly.` Settling is not finishing, so the await reports a round only when the agent actually worked on it and wrote a reply after the brief was submitted — `send` cannot report the previous round's answer as this one's. `flk delegate reap` removes what was recorded; `flk delegate status` and `flk delegate result` read without waiting. See the CLI reference for the flags and exit codes.
 

@@ -630,7 +630,7 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
             "--cwd",
             &work,
             "--harness",
-            "codex",
+            "aider",
         ],
         vec![
             "delegate", "start", "u1", "--brief", &missing_s, "--cwd", &work,
@@ -689,7 +689,7 @@ fn a1_usage_errors_exit_2_and_create_nothing() {
             "--cwd",
             &work,
             "--harness",
-            "codex",
+            "aider",
         ],
     );
     assert!(

@@ -225,7 +225,7 @@ pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
     codex_working_status_line(line)
 }
 
-fn has_codex_hook_review(content: &str) -> bool {
+pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
     let bottom = bottom_non_empty_lines(content, 10);
     bottom
         .last()

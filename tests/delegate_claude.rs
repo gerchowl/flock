@@ -873,12 +873,12 @@ fn c4_an_unsupported_harness_is_a_usage_error() {
             "--cwd",
             &work,
             "--harness",
-            "codex",
+            "aider",
         ],
     );
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("not supported") && stderr(&out).contains("opencode|claude"),
+        stderr(&out).contains("not supported") && stderr(&out).contains("opencode|claude|codex"),
         "the refusal says what this build drives: {}",
         stderr(&out)
     );
