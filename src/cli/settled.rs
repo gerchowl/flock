@@ -1315,6 +1315,13 @@ fn sample_from_record(record: &serde_json::Value) -> Result<Sample, String> {
         .and_then(serde_json::Value::as_str)
         .ok_or("the server's record named no agent_status")?;
     let status = parse_reported_status(status)?;
+    // A provider wait is pending work, not a human-input dwell. The delegate
+    // monitor owns its ETA and persistence thresholds while the cursor stays real.
+    let status = if status == AgentStatus::Blocked && record["blocked_reason"] == "provider_limit" {
+        AgentStatus::Working
+    } else {
+        status
+    };
     // Hibernation is answered BEFORE the cursor is asked for. The status is
     // derived from the stashed resume plan rather than from a live turn, so
     // demanding a cursor first would turn "this agent is parked" into a parse

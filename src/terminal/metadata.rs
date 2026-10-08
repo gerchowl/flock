@@ -383,6 +383,11 @@ impl TerminalState {
         now: Instant,
         enforce_ttl: bool,
     ) -> Option<String> {
+        if state == AgentState::Blocked {
+            if let Some(wait) = &self.provider_limit {
+                return Some(wait.description());
+            }
+        }
         if let Some(custom_status) = self.newest_metadata_custom_status(now, enforce_ttl) {
             return Some(custom_status);
         }

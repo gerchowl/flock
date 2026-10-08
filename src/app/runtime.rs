@@ -910,6 +910,7 @@ impl App {
                 data: crate::api::schema::EventData::CheckFired {
                     name: decision.name.clone(),
                     episode: decision.episode.clone(),
+                    detail: None,
                 },
             });
             self.dispatch_check_action(&decision);
@@ -1170,6 +1171,7 @@ impl App {
                             data: crate::api::schema::EventData::CheckFired {
                                 name: crate::checks::REAP_CHECK_NAME.to_string(),
                                 episode,
+                                detail: None,
                             },
                         });
                     }
@@ -1273,6 +1275,7 @@ impl App {
                 data: crate::api::schema::EventData::CheckFired {
                     name: crate::checks::BLOCKED_ALERT_CHECK_NAME.to_string(),
                     episode: fire.episode.clone(),
+                    detail: self.provider_limit_detail(fire.pane_id),
                 },
             });
             self.dispatch_blocked_alert_notify(&fire);
@@ -1547,10 +1550,24 @@ impl App {
         }
     }
 
+    fn provider_limit_detail(&self, pane_id: crate::layout::PaneId) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .filter(|terminal| terminal.state == crate::detect::AgentState::Blocked)
+            .and_then(|terminal| terminal.provider_limit.as_ref())
+            .map(|wait| wait.description())
+    }
+
     fn dispatch_blocked_alert_notify(&mut self, fire: &crate::checks::BlockedAlertFire) {
         use crate::api::schema::{NotificationShowParams, NotificationShowSound};
         let duration = crate::checks::format_blocked_duration(fire.duration_secs);
-        let title = format!("agent blocked {duration}: {}", fire.label);
+        let title = match self.provider_limit_detail(fire.pane_id) {
+            Some(detail) => format!("{} {detail}", fire.label),
+            None => format!("agent blocked {duration}: {}", fire.label),
+        };
         let params = NotificationShowParams {
             title,
             body: Some(format!(
@@ -2050,6 +2067,7 @@ mod tests {
                 agent: Some(crate::detect::Agent::Pi),
                 state: crate::detect::AgentState::Blocked,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
@@ -2556,6 +2574,55 @@ mod tests {
     }
 
     /// A pane whose Blocked age hasn't crossed the threshold does not fire.
+    #[test]
+    fn blocked_alert_provider_reason_reaches_digest() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 1;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.workspaces.push(Workspace::test_new("provider"));
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let detection = crate::detect::detect_agent(
+            Some(crate::detect::Agent::OpenCode),
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m 15s attempt #1] esc interrupt",
+        );
+        let now = Instant::now();
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::OpenCode),
+                state: detection.state,
+                activity: detection.activity,
+                provider_limit: detection.provider_limit,
+                visible_blocker: true,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: now,
+            });
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .state_changed_at = Some(now - Duration::from_secs(2));
+        assert!(app.evaluate_blocked_alert(now));
+        let events = app.event_hub.events_after(0);
+        let options = crate::digest::RenderOptions {
+            since_ms: 0,
+            generated_for_date: "2026-10-08",
+            since_label: "epoch",
+        };
+        let html =
+            crate::digest::render(events.iter().map(|(seq, event)| (*seq, 0, event)), &options);
+        assert!(html.contains("rate-limited, retry in 46m 15s"), "{html}");
+    }
+
     #[test]
     fn blocked_alert_below_threshold_never_fires_via_app() {
         use crate::detect::{Agent, AgentState};

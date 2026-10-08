@@ -2705,6 +2705,11 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Live provider-limit wait, absent after the provider resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3158,6 +3163,8 @@ pub enum EventData {
     CheckFired {
         name: String,
         episode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// #175 phase 4 check-runner: the last outcome was Error; the runner
     /// leaves the debounce counter untouched but records the reason.
@@ -4486,6 +4493,8 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            blocked_reason: None,
+            retry_after_ms: None,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -4501,6 +4510,15 @@ mod tests {
             turn_cursor: Some("term_1:0:3:9:w".into()),
             revision: 4,
         }
+    }
+
+    #[test]
+    fn provider_limit_check_detail_is_optional_for_old_events() {
+        let event: EventData = serde_json::from_str(
+            r#"{"type":"check_fired","name":"blocked_alert","episode":"fixture"}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, EventData::CheckFired { detail: None, .. }));
     }
 
     #[test]
