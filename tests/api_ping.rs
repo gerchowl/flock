@@ -2401,10 +2401,10 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     cleanup_spawned_flock(child, base);
 }
 
-/// Socket -> PTY -> fake composer: raw writes stay raw, submission is a
+/// Socket -> PTY -> fake composer: text uses negotiated paste, submission is a
 /// separate negotiated key after the paste has settled.
 #[test]
-fn agent_send_submit_over_socket_and_cli_preserves_raw_bytes() {
+fn agent_send_and_pane_send_text_use_bracketed_paste() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = test_lock();
@@ -2481,7 +2481,7 @@ with log.open('w') as out:
     let raw = send_request(
         &socket_path,
         &serde_json::json!({
-            "id": "raw", "method": "agent.send", "params": {"target": pane, "text": "raw"}
+            "id": "raw", "method": "agent.send", "params": {"target": pane, "text": "Ship it!\nworld!"}
         })
         .to_string(),
     );
@@ -2510,7 +2510,11 @@ with log.open('w') as out:
             })
             .collect()
     };
-    assert_eq!(bytes(&read_log()), b"raw");
+    assert_eq!(bytes(&read_log()), b"\x1b[200~Ship it!\nworld!\x1b[201~");
+    let plain_cli = run_flk(&socket_path, &["agent", "send", pane, "cli!"]);
+    assert!(plain_cli.status.success());
+    let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
+    assert!(pane_cli.status.success());
     let submitted = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2530,7 +2534,7 @@ with log.open('w') as out:
         String::from_utf8_lossy(&cli.stderr)
     );
     let expected =
-        b"raw\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
+        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
     let deadline = Instant::now() + Duration::from_secs(5);
     while bytes(&read_log()).len() < expected.len() {
         assert!(

@@ -198,6 +198,8 @@ flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <pane_id> <command>
 ```
 
+`pane send-text` uses bracketed paste when the terminal enables it and does not send Enter. Terminals without bracketed paste receive the text bytes directly.
+
 `pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
 Arm a self-compaction of your own context:
@@ -288,7 +290,7 @@ flk checks run <name>
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
 
-`agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream **without submitting**. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
+`agent read` reads the resolved terminal stream. `agent send` pastes text to that stream **without submitting**, using bracketed paste when the terminal enables it so punctuation such as `!` stays literal input. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
