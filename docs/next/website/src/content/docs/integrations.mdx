@@ -12,6 +12,7 @@ Use integrations when you want native agent session restore, direct state report
 Open settings inside Flock and use the integrations tab to install recommended integrations for agents found on your `PATH`, or run commands manually:
 
 ```bash
+flk integration sync [--dry-run]
 flk integration install pi
 flk integration install omp
 flk integration install claude
@@ -25,7 +26,7 @@ flk integration install qodercli
 
 Claude, Codex, and OpenCode installation also adds an MCP entry named flock when none exists. Its command is an absolute launch path, retaining profile symlinks instead of resolving them into `/nix/store`. Claude uses `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json` for a selected profile; Codex uses `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`); OpenCode uses `~/.config/opencode/opencode.json` or an existing `opencode.jsonc`.
 
-Existing MCP entries, including custom commands, arguments and environment, are preserved. Symlinked or read-only MCP configs receive guidance for their configuration owner. JSONC with comments requires an owner-managed edit. `flk integration status` and `--outdated-only` flag flock MCP commands pinned to `/nix/store`; update the owning configuration to an absolute profile/user-local launch path and reconnect the harness. Already-running bridges retain their executable and tool catalog. Uninstall removes hooks/plugins and leaves MCP entries under their configuration owner's control.
+Existing MCP entries, including custom commands, arguments and environment, are preserved. Symlinked or read-only MCP configs receive guidance for their configuration owner. Initial registration in JSONC with comments requires an owner-managed edit; sync preserves JSONC comments when updating a registered command. `flk integration status` and `--outdated-only` flag flock MCP commands pinned to `/nix/store`; update the owning configuration to an absolute profile/user-local launch path and reconnect the harness. Already-running bridges retain their executable and tool catalog. Uninstall removes hooks/plugins and leaves MCP entries under their configuration owner's control.
 
 MCP registration failures print guidance and leave successful hook/plugin installation intact, including installations launched only from `/nix/store` and commented OpenCode JSON files. Pane hooks use their own server executable; when no stable profile path exists, they retain its store path so hook calls still work. The existing macOS TCC copy behavior remains the same.
 
@@ -235,3 +236,11 @@ flk pane read 1-1 --source recent --lines 50
 ```
 
 If integration state looks wrong, first confirm the agent is running inside Flock and that the relevant hook or plugin was installed for the same user account.
+
+### Sync after an upgrade
+
+Run `flk integration sync --dry-run` to review the plan, then `flk integration sync` with the newly installed binary to refresh installed Claude, Codex and OpenCode hook assets and flock MCP launch paths. This works for package-manager installs and when the binary is already current. Each target reports `updated`, `already-current`, `skipped-declarative`, or `failed`; failures return exit code 1 and do not prevent other targets from being checked.
+
+Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their defaults) and the user OpenCode config; it does not search other homes or profiles. Only MCP entries named flock launching a bare or store-pinned flk executable (including the legacy flock name) with `mcp serve` are migrated; explicit stable custom paths are preserved. Custom commands and unrelated entries are preserved, as are arguments, environment, permissions, comments and Codex hook trust. Symlinked or read-only configs are skipped with a fragment to merge through their Nix/Home Manager configuration owner.
+
+Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.

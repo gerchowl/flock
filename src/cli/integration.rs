@@ -12,6 +12,7 @@ pub(super) fn run_integration_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
+        "sync" => integration_sync(&args[1..]),
         "install" => integration_install(&args[1..]),
         "uninstall" => integration_uninstall(&args[1..]),
         "status" => integration_status(&args[1..]),
@@ -64,6 +65,28 @@ fn integration_verify(args: &[String]) -> std::io::Result<i32> {
             Ok(1)
         }
     }
+}
+
+fn integration_sync(args: &[String]) -> std::io::Result<i32> {
+    let dry_run = match args {
+        [] => false,
+        [flag] if flag == "--dry-run" => true,
+        _ => {
+            eprintln!("usage: flk integration sync [--dry-run]");
+            return Ok(2);
+        }
+    };
+    let outcomes = crate::integration::sync::run(dry_run)?;
+    let failed = outcomes.iter().any(|outcome| outcome.failed);
+    for outcome in outcomes {
+        println!("{}", outcome.message);
+    }
+    if let Err(err) = super::status::run_status_command(&[]) {
+        eprintln!("server drift: unknown ({err}); check `flk status`");
+    }
+    println!("Running agents need `flk agent restart` or an MCP reconnect to pick up changes.");
+    println!("Check `flk status` for server drift; use `flk server live-handoff` if needed. Sync never hands off or stops sessions.");
+    Ok(i32::from(failed))
 }
 
 fn integration_status(args: &[String]) -> std::io::Result<i32> {
@@ -292,6 +315,7 @@ fn print_integration_help() {
     eprintln!("  flk integration uninstall opencode");
     eprintln!("  flk integration uninstall hermes");
     eprintln!("  flk integration uninstall qodercli");
+    eprintln!("  flk integration sync [--dry-run]");
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
     eprintln!("  flk integration verify");
