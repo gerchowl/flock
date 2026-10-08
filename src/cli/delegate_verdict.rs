@@ -25,74 +25,19 @@ pub(super) fn last_line(screen: &str) -> String {
 }
 
 pub(super) fn provider_limit(screen: &str) -> Option<Verdict> {
-    // The provider status row needs BOTH the error and retry controls. A quoted
-    // error in the agent's transcript is not evidence of a provider wait.
-    let line = screen.lines().rev().take(40).find(|line| {
-        let lower = line.to_lowercase();
-        (lower.contains("usage exceeded") || lower.contains("rate limit"))
-            && lower.contains("retrying in ")
-            && lower.contains("attempt #")
-            && lower.contains("esc interrupt")
-    })?;
-    let lower = line.to_lowercase();
-    let eta = lower
-        .split_once("retrying in ")?
-        .1
-        .split_once(" attempt #")?
-        .0;
+    let wait = crate::detect::provider_limit::opencode(screen)?;
     Some(Verdict {
         verdict: "provider_limit".into(),
         reason: "provider_limit".into(),
-        retry_after_ms: parse_duration(eta).ok(),
+        retry_after_ms: wait.retry_after_ms,
         last_line: last_line(screen),
     })
 }
 
-pub(super) fn parse_duration(value: &str) -> Result<u64, String> {
-    let value = value.trim();
-    if value == "0" {
-        return Ok(0);
-    }
-    let mut total = 0_u64;
-    let mut rest = value;
-    while !rest.is_empty() {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        let count = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if count == 0 {
-            return Err(format!("invalid duration: {value}"));
-        }
-        let number = rest[..count]
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration: {value}"))?;
-        rest = &rest[count..];
-        let (unit, factor) = if rest.starts_with("ms") {
-            (2, 1)
-        } else if rest.starts_with('s') {
-            (1, 1_000)
-        } else if rest.starts_with('m') {
-            (1, 60_000)
-        } else if rest.starts_with('h') {
-            (1, 3_600_000)
-        } else {
-            return Err(format!("duration needs ms, s, m or h: {value}"));
-        };
-        total = number
-            .checked_mul(factor)
-            .and_then(|n| total.checked_add(n))
-            .ok_or_else(|| format!("duration too large: {value}"))?;
-        rest = &rest[unit..];
-    }
-    if value.is_empty() {
-        return Err("duration is empty".into());
-    }
-    Ok(total)
-}
+pub(super) use crate::detect::provider_limit::parse_duration;
 
 pub(super) fn readiness(screen: &str, status: &str) -> Verdict {
-    if matches!(status, "working" | "unknown") {
+    if matches!(status, "working" | "unknown" | "blocked") {
         if let Some(mut verdict) = provider_limit(screen) {
             verdict.verdict = "stalled".into();
             return verdict;
@@ -150,13 +95,14 @@ impl Monitor {
 
     pub fn observe(&mut self, status: &str, screen: &str, now: Instant) -> bool {
         self.screen = screen.to_string();
-        if matches!(status, "working" | "unknown") {
+        if matches!(status, "working" | "unknown" | "blocked") {
             if let Some(verdict) = provider_limit(screen) {
                 let since = *self.retry_since.get_or_insert(now);
                 let threshold = self.silence.unwrap_or(Duration::from_secs(300));
-                if verdict
-                    .retry_after_ms
-                    .is_some_and(|eta| Duration::from_millis(eta) >= threshold)
+                if status == "blocked"
+                    || verdict
+                        .retry_after_ms
+                        .is_some_and(|eta| Duration::from_millis(eta) >= threshold)
                     || self
                         .silence
                         .is_some_and(|window| now.saturating_duration_since(since) >= window)
@@ -273,6 +219,15 @@ mod tests {
             "The transcript mentions usage exceeded and retrying in 46m attempt #1"
         )
         .is_none());
+    }
+
+    #[test]
+    fn delegate_blocked_provider_readiness_retains_retry_eta() {
+        let screen = "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt";
+        let verdict = readiness(screen, "blocked");
+        assert_eq!(verdict.verdict, "stalled");
+        assert_eq!(verdict.reason, "provider_limit");
+        assert_eq!(verdict.retry_after_ms, Some(2_775_000));
     }
 
     #[test]

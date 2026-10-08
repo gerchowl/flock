@@ -49,6 +49,8 @@ The sidebar rolls state upward.
 
 A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
 
+OpenCode provider quota and rate-limit retry screens count as blocked, even while the progress bar animates. `agent get` reports `blocked_reason: "provider_limit"` and `retry_after_ms` while that screen is live. Detection returns to working or idle when the provider wait clears; Flock leaves subscription overlays for you to handle.
+
 An unselected tab in the tab strip wears the tint of its own panes, so a blocked agent waiting in a background tab is visible in the strip rather than hidden behind a tab number. The selected tab stays accent — the tint speaks for tabs you are not looking at, and is drawn dimmed so it never shouts over the one you are in. The strip is only drawn for the active workspace, so this tells you about that workspace's tabs and nothing about another workspace's.
 
 This is the main Flock workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.

@@ -79,8 +79,13 @@ impl Pane {
                         } else {
                             "term_fixture:0:1:1:w"
                         };
-                        json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
-                        "agent_status": status, "turn_cursor": cursor, "revision": 0}})
+                        let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
+                        "agent_status": status, "turn_cursor": cursor, "revision": 0}});
+                        if status == "blocked" && frames[frame].1.contains("retrying in 46m 15s") {
+                            record["agent"]["blocked_reason"] = json!("provider_limit");
+                            record["agent"]["retry_after_ms"] = json!(2_775_000);
+                        }
+                        record
                     }
                     "pane.read" => {
                         assert_eq!(request["params"]["source"], "detection");
@@ -295,6 +300,56 @@ fn delegate_silence_stalls_a_working_pane_and_status_remembers_the_verdict() {
         .output()
         .unwrap();
     assert_eq!(Pane::json(&status)["verdict"], "stalled");
+}
+
+#[test]
+fn delegate_blocked_provider_retry_is_stalled_with_eta() {
+    let pane = Pane::new(
+        "blocked",
+        "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt",
+    );
+    let live = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert!(live.status.success());
+    let live = Pane::json(&live);
+    assert_eq!(live["blocked_reason"], "provider_limit");
+    assert_eq!(live["retry_after_ms"], 2_775_000);
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "0",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let value = Pane::json(&out);
+    assert_eq!(value["reason"], "provider_limit");
+    assert_eq!(value["retry_after_ms"], 2_775_000);
+    let status = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(
+        Pane::json(&status)["latest_verdict"]["reason"],
+        "provider_limit"
+    );
 }
 
 #[test]

@@ -2694,6 +2694,11 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Live provider-limit wait, absent after the provider resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -4474,6 +4479,8 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            blocked_reason: None,
+            retry_after_ms: None,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,

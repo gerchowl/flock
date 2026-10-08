@@ -4,6 +4,7 @@
 //! against known agent output patterns to determine state.
 
 mod agents;
+pub(crate) mod provider_limit;
 
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1977,6 +1978,57 @@ mod tests {
     }
 
     // ---- OpenCode ----
+
+    #[test]
+    fn opencode_provider_limit_is_blocked_before_progress() {
+        for error in [
+            "Free usage exceeded, subscribe to Go",
+            "rate limit",
+            "usage limit reached",
+        ] {
+            let screen = format!("■■⬝⬝⬝⬝⬝⬝ {error} [retrying in 46m 15s attempt #1] esc interrupt");
+            let detection = detect_agent(Some(Agent::OpenCode), &screen);
+            assert_eq!(detection.state, AgentState::Blocked, "{error}");
+            assert!(detection.visible_blocker);
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_wrapped_capture_retains_eta() {
+        let screen = "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retry\ning in 46m 15s attempt #1]      esc interrupt";
+        assert_eq!(detect_opencode(screen), AgentState::Blocked);
+        assert_eq!(
+            provider_limit::opencode(screen).unwrap().retry_after_ms,
+            Some(2_775_000)
+        );
+    }
+
+    #[test]
+    fn opencode_provider_limit_requires_live_controls_on_same_row() {
+        for screen in [
+            "Free usage exceeded [retrying in 46m attempt #1]\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+            "Free usage exceeded [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝ tool failed [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit esc interrupt",
+            "A quoted status: ■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ esc interrupt\nrate limit [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝\n\nrate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+        ] {
+            assert_ne!(detect_opencode(screen), AgentState::Blocked, "{screen}");
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_recovers_on_next_screen() {
+        let wait = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt";
+        assert_eq!(detect_opencode(wait), AgentState::Blocked);
+        assert_eq!(
+            detect_opencode("■■⬝⬝⬝⬝⬝⬝ esc interrupt"),
+            AgentState::Working
+        );
+        assert_eq!(detect_opencode("ctrl+p commands"), AgentState::Idle);
+    }
 
     #[test]
     fn opencode_waiting_permission() {

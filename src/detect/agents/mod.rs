@@ -106,6 +106,7 @@ fn has_visible_blocker(agent: Agent, content: &str, state: AgentState) -> bool {
         Agent::Claude => claude_code::has_visible_blocker(content),
         Agent::Codex => codex::has_visible_blocker(content),
         Agent::Kimi => kimi::has_visible_blocker(content),
+        Agent::OpenCode => super::provider_limit::opencode(content).is_some(),
         _ => false,
     }
 }
