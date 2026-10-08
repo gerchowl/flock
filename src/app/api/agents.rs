@@ -609,6 +609,7 @@ impl App {
             return self.handle_pane_submit(
                 id,
                 crate::api::schema::PaneSubmitParams {
+                    self_submit_confirmed: None,
                     pane_id: pane,
                     text: params.text,
                     if_session: None,

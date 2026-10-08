@@ -857,10 +857,12 @@ async fn guarded_submit_refuses_drafts_and_concurrent_input() {
 #[tokio::test]
 async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
     use super::super::guarded_submit::Outcome;
-    for (text, hook) in [
-        ("hello", true),
-        ("  hello\n world  ", true),
-        ("hello", false),
+    for (text, hook, sent) in [
+        ("hello", true, true),
+        ("hello", true, false),
+        ("  hello\n world  ", true, true),
+        ("hello", false, true),
+        ("hello", false, false),
     ] {
         let Rig {
             mut app,
@@ -874,6 +876,14 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
             .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
             .unwrap();
         drain(&mut pty);
+        if sent {
+            runtime(&app).test_process_pty_bytes(&claude_screen(text));
+            assert_eq!(
+                app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+                None
+            );
+            assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        }
         if hook {
             let reported = app.handle_api_request(Request {
                 id: "prompt".into(),
@@ -907,8 +917,18 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
             );
         }
         assert_eq!(
-            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-            Some(if hook {
+            app.advance_guarded_submit(
+                &pane,
+                &mut attempt,
+                if !sent && hook {
+                    now + GAP / 2
+                } else {
+                    now + GAP
+                }
+            ),
+            Some(if !sent {
+                Outcome::Abandoned("turn_started_before_enter")
+            } else if hook {
                 Outcome::Accepted
             } else {
                 Outcome::ObservedAccepted
@@ -948,6 +968,7 @@ async fn guarded_client_submit_is_atomic_with_session_settle_and_serialization_g
     let submit = |id: &str| Request {
         id: id.into(),
         method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            self_submit_confirmed: None,
             pane_id: pane.clone(),
             text: "hello".into(),
             if_session: None,
@@ -1029,4 +1050,116 @@ async fn guarded_client_rechecks_session_and_settle_before_enter() {
         );
         assert!(drain(&mut pty).is_empty());
     }
+}
+
+#[tokio::test]
+async fn guarded_dispatch_requires_consuming_deferred_attempt() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let response = app.handle_api_request(Request {
+        id: "first".into(),
+        method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            self_submit_confirmed: None,
+            pane_id: pane.clone(),
+            text: "hello".into(),
+            if_session: None,
+            min_age_secs: 0,
+        }),
+    });
+    assert!(response.contains("ok"));
+    let (_, reserved, _) = app.pending_agent_submit.as_ref().unwrap();
+    assert!(app.active_submissions.contains(reserved));
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+    app.event_tx = event_tx;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    assert!(app.pending_agent_submit.is_none());
+    // A later dispatch must leave the scheduled attempt's reservation intact.
+    app.handle_api_request(Request {
+        id: "next".into(),
+        method: Method::AgentList(crate::api::schema::EmptyParams {}),
+    });
+    assert!(app.active_submissions.contains(&pane));
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    let crate::events::AppEvent::AgentSubmit {
+        request_id,
+        pane_id,
+        attempt,
+        respond_to,
+    } = event_rx.recv().await.unwrap()
+    else {
+        panic!("expected submit event")
+    };
+    runtime(&app).test_stamp_operator_input_at(Instant::now());
+    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    assert!(!app.active_submissions.contains(&pane));
+    assert!(receiver.recv().unwrap().contains("abandoned"));
+}
+
+#[tokio::test]
+async fn finished_idle_wakes_release_explicit_submit_reservation() {
+    use super::super::guarded_submit::CONFIRM_WINDOW;
+    for abandon in [true, false] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "finished-wake", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        assert!(app.idle_wake.in_flight(&pane));
+        if abandon {
+            runtime(&app).test_stamp_operator_input_at(Instant::now());
+            tick_past_gap(&mut app);
+        } else {
+            tick_past_gap(&mut app);
+            let now = Instant::now() + GAP + CONFIRM_WINDOW;
+            app.tick_idle_wakes(now);
+            app.tick_idle_wakes(now + CONFIRM_WINDOW);
+        }
+        assert!(!app.idle_wake.in_flight(&pane));
+        assert!(app.idle_wake.panes[&pane].in_flight.is_none());
+        runtime(&app).test_process_pty_bytes(&claude_screen(""));
+        claude_idle_for(&mut app, settled());
+        let result = app.begin_guarded_submit(
+            &pane,
+            "explicit",
+            None,
+            Duration::ZERO,
+            Instant::now() + GAP,
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn guarded_mcp_submit_requires_calling_workspace_confirmation() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let (ws, id) = app.parse_pane_id(&pane).unwrap();
+    app.test_pane_child_pids.insert(id, std::process::id());
+    app.current_api_peer_pid = Some(std::process::id());
+    let response = app.handle_api_request(Request {
+        id: "mcp".into(),
+        method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            pane_id: pane,
+            text: "hello".into(),
+            self_submit_confirmed: Some(false),
+            if_session: None,
+            min_age_secs: 0,
+        }),
+    });
+    assert!(response.contains("self_submit_unconfirmed"), "{response}");
+    assert_eq!(app.caller_workspace_idx(), Some(ws));
+    assert!(drain(&mut pty).is_empty());
 }

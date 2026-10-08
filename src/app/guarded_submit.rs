@@ -215,6 +215,13 @@ impl App {
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
             return encode_error(id, "pane_gone", "pane_gone");
         };
+        if params.self_submit_confirmed == Some(false) && self.caller_workspace_idx() == Some(ws) {
+            return encode_error(
+                id,
+                "self_submit_unconfirmed",
+                "submitting to your own workspace requires self: true",
+            );
+        }
         params.pane_id = pane;
         match self.begin_guarded_submit(
             &params.pane_id,
@@ -349,12 +356,15 @@ impl App {
             Err(reason) => return Some(Outcome::Abandoned(reason)),
         };
         let reported_text = crate::control_bytes::strip(&attempt.text);
-        if terminal.prompt_report_generation > attempt.prompt_generation
-            && terminal.last_prompt.as_deref() == Some(reported_text.trim())
-        {
+        let reported = terminal.prompt_report_generation > attempt.prompt_generation
+            && terminal.last_prompt.as_deref() == Some(reported_text.trim());
+        if !attempt.sent && (started || reported) {
+            return Some(Outcome::Abandoned("turn_started_before_enter"));
+        }
+        if attempt.sent && reported {
             return Some(Outcome::Accepted);
         }
-        if started {
+        if attempt.sent && started {
             return Some(Outcome::ObservedAccepted);
         }
         if now < attempt.due {

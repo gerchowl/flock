@@ -2651,7 +2651,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
     if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
-        if harness.confirm_submit {
+        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
             return Ok(fail(format!(
                 "delegate {name}: brief submission could not be confirmed: {reason}. \
                  Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
@@ -2705,6 +2705,7 @@ fn rollback(cleanup: &Cleanup) {
 fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     bounded_submit(
         Method::PaneSubmit(PaneSubmitParams {
+            self_submit_confirmed: None,
             pane_id: pane_id.to_owned(),
             text: text.to_owned(),
             if_session: None,

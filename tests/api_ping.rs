@@ -2638,3 +2638,159 @@ with log.open('w') as out:
     );
     cleanup_spawned_flock(child, base);
 }
+
+#[test]
+fn guarded_submit_enter_follows_socket_paste_by_at_least_100ms() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let config_home = base.join("config");
+    std::env::set_var("HOME", &config_home);
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let script = base.join("codex");
+    let shell = base.join("composer-shell");
+    let log = base.join("input.jsonl");
+    fs::write(
+        &script,
+        r#"import json, os, sys, time, tty
+from pathlib import Path
+tty.setraw(0)
+log = Path(__file__).with_name('input.jsonl')
+os.write(1, b'\x1b[?2004h\x1b[2J\x1b[HOpenAI Codex\r\nREADY\r\n\xe2\x80\xba \r\n  ? for shortcuts\r\n')
+with log.open('w') as out:
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
+        out.flush()
+        if b'\r' in data: os.write(1, b'\x1b[2J\x1b[HOpenAI Codex\r\n\xe2\x80\xa2 Working (1s \xe2\x80\xa2 esc to interrupt)\r\n\xe2\x80\xba socket prompt\r\n  ? for shortcuts\r\n')
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        shell.to_str().unwrap(),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "read", "method": "pane.read", "params": {"pane_id": pane, "source": "recent"}
+            })
+            .to_string(),
+        );
+        if read.to_string().contains("READY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake composer never became ready: {read}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let agent = send_request(
+            &socket_path,
+            &serde_json::json!({"id":"idle", "method":"agent.get", "params":{"target":pane}})
+                .to_string(),
+        );
+        if matches!(
+            agent["result"]["agent"]["agent_status"].as_str(),
+            Some("idle" | "done")
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "composer never detected idle: {agent}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let read_log = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let bytes = |rows: &[serde_json::Value]| -> Vec<u8> {
+        rows.iter()
+            .flat_map(|row| {
+                row["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+            })
+            .collect()
+    };
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "submit", "method": "agent.send",
+            "params": {"target": pane, "text": "socket prompt", "submit": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        submitted["result"]["outcome"], "observed_accepted",
+        "{submitted}"
+    );
+    let rows = read_log();
+    assert_eq!(bytes(&rows), b"\x1b[200~socket prompt\x1b[201~\r");
+    let paste_at = rows
+        .iter()
+        .find(|row| {
+            row["bytes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(b's'))
+        })
+        .unwrap()["at"]
+        .as_f64()
+        .unwrap();
+    let enter_at = rows
+        .iter()
+        .find(|row| {
+            row["bytes"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(13))
+        })
+        .unwrap()["at"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        enter_at - paste_at >= 0.100,
+        "Enter followed paste after {} seconds",
+        enter_at - paste_at
+    );
+    cleanup_spawned_flock(child, base);
+}

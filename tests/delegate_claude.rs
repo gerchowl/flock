@@ -890,3 +890,29 @@ fn c4_an_unsupported_harness_is_a_usage_error() {
         "no harness was launched"
     );
 }
+
+#[test]
+fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let b = brief(&server, "refused.md", "brief\n");
+    let mut child = start_claude(&server, "refused", &b, &["--json"]);
+    let pane = delegate_pane(&server, "refused");
+    report_session(&server, &pane);
+    fs::write(
+        server.base.join("screen"),
+        claude_prompt_box().replace("❯ ", "❯ operator draft"),
+    )
+    .unwrap();
+    let status = exited_within(&mut child, WITHIN).expect("refusal returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("input_not_empty"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("Workspace kept"));
+    assert_eq!(workspaces(&server).len(), before);
+    assert!(agent_get(&server, "refused").is_none());
+    assert!(typed(&server).is_empty());
+    let list = cli(&server, &["delegate", "list", "--json"]);
+    assert!(!stdout(&list).contains("refused"), "{}", stdout(&list));
+}

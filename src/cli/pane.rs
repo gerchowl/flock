@@ -627,26 +627,28 @@ fn parse_guarded_pane_run(
     let mut min_age_secs = 0;
     while at < args.len() {
         match args[at].as_str() {
-            "--if-session" | "--min-age-secs" | "--if-status" => {
+            "--if-session" | "--min-age-secs" => {
                 let name = &args[at];
                 let value = args
                     .get(at + 1)
                     .ok_or_else(|| format!("missing value for {name}"))?;
-                match name.as_str() {
-                    "--if-session" => session = Some(value.clone()),
-                    "--min-age-secs" => {
-                        min_age_secs = value
-                            .parse()
-                            .map_err(|_| "--min-age-secs requires a nonnegative integer")?
-                    }
-                    _ if matches!(value.as_str(), "idle" | "done") => (),
-                    _ => return Err("--if-status requires idle or done".into()),
+                if name == "--if-session" {
+                    session = Some(value.clone());
+                } else {
+                    min_age_secs = value
+                        .parse()
+                        .map_err(|_| "--min-age-secs requires a nonnegative integer")?;
                 }
                 at += 2;
             }
             "--" => {
                 at += 1;
                 break;
+            }
+            "--if-status" => {
+                return Err(
+                    "--if-status is unsupported; guarded submit requires idle or done".into(),
+                )
             }
             _ => break,
         }
@@ -660,6 +662,7 @@ fn parse_guarded_pane_run(
         return Err("missing text".into());
     }
     Ok(Some(crate::api::schema::PaneSubmitParams {
+        self_submit_confirmed: None,
         pane_id,
         text: args[at..].join(" "),
         if_session: session,

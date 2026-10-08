@@ -98,9 +98,12 @@ impl IdleWakeTracker {
     /// two submissions the pane's reader cannot tell apart, and they go in as
     /// one line. One of them has to wait.
     pub(crate) fn in_flight(&self, pane: &str) -> bool {
-        self.panes
-            .get(pane)
-            .is_some_and(|entry| entry.in_flight.is_some())
+        self.panes.get(pane).is_some_and(|entry| {
+            entry
+                .in_flight
+                .as_ref()
+                .is_some_and(|flight| flight.submit_at.is_some())
+        })
     }
 
     fn note_deadline(&mut self, at: Instant) {
@@ -375,11 +378,8 @@ impl App {
     /// Flock does NOT try to erase an abandoned sentence. It knows what it
     /// wrote, but not what the agent made of it — a TUI may collapse a paste
     /// into a single chip — so a counted run of backspaces could eat into
-    /// whatever sits before it. The wake also stays in flight after an
-    /// abandon, which fails safe: nothing more is typed into that pane until
-    /// its agent leaves `Idle` or reads its inbox, and even then the
-    /// empty-prompt gate refuses to type next to a sentence still sitting
-    /// there.
+    /// whatever sits before it. A finished attempt releases its reservation;
+    /// the empty-prompt gate still refuses to type beside a stranded sentence.
     fn submit_idle_wake(&mut self, pane: &str, now: Instant) -> Decision {
         let Some(mut attempt) = self
             .idle_wake
@@ -428,7 +428,12 @@ impl App {
             Some(
                 super::guarded_submit::Outcome::Abandoned(reason)
                 | super::guarded_submit::Outcome::Unconfirmed(reason),
-            ) => Decision::Abandoned(reason),
+            ) => {
+                if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
+                    entry.in_flight = None;
+                }
+                Decision::Abandoned(reason)
+            }
         }
     }
 

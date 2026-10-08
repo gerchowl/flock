@@ -1575,6 +1575,9 @@ pub struct PaneArmSelfCompactParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaneSubmitParams {
+    /// MCP caller-workspace confirmation, matching the worktree teardown guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_submit_confirmed: Option<bool>,
     pub pane_id: String,
     pub text: String,
     #[serde(default)]

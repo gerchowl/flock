@@ -1285,7 +1285,9 @@ impl App {
             self.pending_agent_submit.is_none(),
             "deferred agent submit must be consumed by respond_or_park before the next request"
         );
-        self.pending_agent_submit = None;
+        if let Some((_, pane, _)) = self.pending_agent_submit.take() {
+            self.active_submissions.remove(&pane);
+        }
 
         let response = match request.method {
             Method::ServerStop(_) => {

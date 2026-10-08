@@ -721,25 +721,30 @@ fn assert_recorded_sandbox(server: &Server, sandbox: &str) {
 /// the guarded retry, leaving the owned composer visible during confirmation.
 #[test]
 fn guarded_submit_socket_pty_retries_enter_without_retyping() {
-    guarded_socket("codex", false);
+    guarded_socket("codex", false, false);
 }
 
 #[test]
 fn guarded_submit_slow_reader_confirms_with_one_enter_retry() {
-    guarded_socket("codex", true);
+    guarded_socket("codex", true, false);
 }
 
 #[test]
 fn guarded_submit_claude_socket_pty_retries_without_retyping() {
-    guarded_socket("claude", false);
+    guarded_socket("claude", false, false);
 }
 
 #[test]
 fn guarded_submit_opencode_socket_pty_retries_without_retyping() {
-    guarded_socket("opencode", false);
+    guarded_socket("opencode", false, false);
 }
 
-fn guarded_socket(kind: &str, slow: bool) {
+#[test]
+fn guarded_submit_first_enter_works_with_late_composer_repaint() {
+    guarded_socket("codex", false, true);
+}
+
+fn guarded_socket(kind: &str, slow: bool, first_works: bool) {
     let server = start_server();
     let script = r#"import os, sys, tty, time
 from pathlib import Path
@@ -756,7 +761,9 @@ def draw(working=False):
     sys.stdout.flush()
 sys.stdout.write('\x1b[?2004h')
 draw()
-if (log.parent / 'slow-reader').exists(): time.sleep(0.35)
+if (log.parent / 'slow-reader').exists():
+    while not (log.parent / 'idle-detected').exists(): time.sleep(0.01)
+    time.sleep(0.35)
 while True:
     byte = os.read(0, 1)
     with log.open('ab') as out: out.write(byte)
@@ -767,7 +774,12 @@ while True:
         continue
     if byte == b'\r' and not paste:
         enters += 1
-        if enters == 2: draw(True)
+        if (log.parent / 'first-works').exists() and enters == 1:
+            draw(True)
+            time.sleep(2.3)
+            text = b''
+            draw()
+        elif enters == 2: draw(True)
     else:
         text += byte
         if not paste: draw()
@@ -791,6 +803,9 @@ while True:
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     if slow {
         fs::write(server.base.join("slow-reader"), "").unwrap();
+    }
+    if first_works {
+        fs::write(server.base.join("first-works"), "").unwrap();
     }
     let ws = operator_workspace(&server);
     let started = request(
@@ -833,6 +848,7 @@ while True:
         ],
     );
     assert!(ansi.status.success());
+    fs::write(server.base.join("idle-detected"), "").unwrap();
     let response = request(&server, &serde_json::json!({
         "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
     }).to_string());
@@ -840,18 +856,31 @@ while True:
         response["result"]["outcome"], "observed_accepted",
         "{response}"
     );
-    assert_eq!(response["result"]["retried"], true, "{response}");
+    assert_eq!(response["result"]["retried"], !first_works, "{response}");
+    if first_works {
+        thread::sleep(Duration::from_millis(2400));
+    }
     let bytes = fs::read(server.base.join("guarded-bytes")).unwrap();
-    assert_eq!(bytes, b"\x1b[200~hello\x1b[201~\r\r");
+    assert_eq!(
+        bytes,
+        if first_works {
+            b"\x1b[200~hello\x1b[201~\r".as_slice()
+        } else {
+            b"\x1b[200~hello\x1b[201~\r\r".as_slice()
+        }
+    );
     let read = cli(
         &server,
         &[
             "pane", "read", &pane, "--source", "recent", "--format", "text",
         ],
     );
-    assert!(stdout(&read).contains(if kind == "opencode" {
-        "esc interrupt"
-    } else {
-        "esc to interrupt"
-    }));
+    assert!(
+        first_works
+            || stdout(&read).contains(if kind == "opencode" {
+                "esc interrupt"
+            } else {
+                "esc to interrupt"
+            })
+    );
 }
