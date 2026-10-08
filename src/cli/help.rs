@@ -140,7 +140,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "notification",
         "show",
-        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]",
+        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]\nUses [ui.toast] delivery in the server config. delivery = \"off\" (the default) disables popups and returns reason \"disabled\".\nExit 0: shown; exit 3: not shown (disabled, busy, rate_limited, or no_foreground_client). JSON is printed in either case.\nNotifications are still recorded when not shown. Use flk notification list to read them.",
     ),
     (
         "notification",
