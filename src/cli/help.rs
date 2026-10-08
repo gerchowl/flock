@@ -76,7 +76,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "workspace",
         "create",
-        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]",
     ),
     ("workspace", "get", "flk workspace get <workspace_id>"),
     ("workspace", "focus", "flk workspace focus <workspace_id>"),
@@ -100,7 +100,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "worktree",
         "create",
-        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]",
+        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]",
     ),
     (
         "worktree",
@@ -131,7 +131,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "tab",
         "create",
-        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]\n  --workspace places the tab in that workspace; --cwd only sets the directory.",
     ),
     ("tab", "get", "flk tab get <tab_id>"),
     ("tab", "focus", "flk tab focus <tab_id>"),
@@ -140,7 +140,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "notification",
         "show",
-        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]",
+        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]\nUses [ui.toast] delivery in the server config. delivery = \"off\" (the default) disables popups and returns reason \"disabled\".\nExit 0: shown; exit 3: not shown (disabled, busy, rate_limited, or no_foreground_client). JSON is printed in either case.\nNotifications are still recorded when not shown. Use flk notification list to read them.",
     ),
     (
         "notification",
@@ -169,6 +169,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("agent", "hibernate", "flk agent hibernate <target>"),
     ("agent", "resume", "flk agent resume <target>"),
     ("agent", "restart", super::agent::AGENT_RESTART_USAGE),
+    ("agent", "history", super::agent::AGENT_HISTORY_USAGE),
     ("agent", "result", super::agent::AGENT_RESULT_USAGE),
     (
         "msg",
@@ -196,21 +197,21 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "read",
-        "flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]",
+        super::pane::PANE_READ_USAGE,
     ),
     (
         "pane",
         "split",
-        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]",
+        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
     ),
     (
         "pane",
         "move",
         "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
-    ("pane", "close", "flk pane close <pane_id>"),
+    ("pane", "close", super::pane::PANE_CLOSE_USAGE),
     ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),
-    ("pane", "send-keys", "flk pane send-keys <pane_id> <key> [key ...]"),
+    ("pane", "send-keys", super::pane::PANE_SEND_KEYS_USAGE),
     (
         "pane",
         "arm-self-compact",
@@ -224,7 +225,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "report-metadata",
-        "flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
+        "flk pane report-metadata [<pane_id>] [--pane <pane_id>] --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
     ),
     (
         "pane",
@@ -406,6 +407,16 @@ pub(super) fn help_usage(args: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{asks_for_help, help_usage, LITERAL_TEXT, VERBS};
+
+    #[test]
+    fn pane_verb_help_documents_targets_and_precedence() {
+        for verb in ["read", "send-text", "send-keys", "close"] {
+            let usage = usage_for(&["pane", verb, "--help"]).unwrap();
+            assert!(usage.contains(&format!("flk pane {verb} <target>")));
+            assert!(usage.contains("pane id, terminal id, or unique agent name/label"));
+            assert!(usage.contains("A pane id wins over a same-named agent"));
+        }
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         std::iter::once("flk")

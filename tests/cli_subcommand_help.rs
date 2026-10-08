@@ -374,3 +374,27 @@ impl Drop for TempRepo {
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
+
+#[test]
+fn agent_history_help_and_invalid_arguments() {
+    let env = Env::new();
+    for flag in ["--help", "-h"] {
+        let output = env.flk(&["agent", "history", flag]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout_of(&output).contains("--detail reply|collapsed|full"));
+        assert!(stdout_of(&output).contains("--cursor N"));
+        assert!(stdout_of(&output).contains("--limit N"));
+    }
+    for args in [
+        vec!["agent", "history"],
+        vec!["agent", "history", "reviewer", "--detail", "invalid"],
+        vec!["agent", "history", "reviewer", "--cursor", "-1"],
+        vec!["agent", "history", "reviewer", "--limit", "4294967296"],
+        vec!["agent", "history", "reviewer", "--limit"],
+        vec!["agent", "history", "reviewer", "--unknown"],
+    ] {
+        let output = env.flk(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+        assert!(!stderr_of(&output).is_empty());
+    }
+}

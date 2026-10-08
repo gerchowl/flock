@@ -1462,6 +1462,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     let bounded_res = match mode {
         Mode::Worktree => bounded(
             Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some(repo.clone()),
                 branch: flags.branch.clone(),
                 base: flags.base.clone(),
@@ -1477,6 +1478,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 .expect("placement was validated before anything was created");
             bounded(
                 Method::WorkspaceCreate(WorkspaceCreateParams {
+                    dry_run: false,
                     cwd: Some(cwd),
                     focus: false,
                     label: None,
@@ -2923,6 +2925,7 @@ fn start_the_agent(
     let argv = (harness.argv)(options);
     let response = request(
         Method::AgentStart(AgentStartParams {
+            dry_run: false,
             name: name.to_string(),
             cwd: Some(placement.cwd.clone()),
             workspace_id: Some(placement.workspace_id.clone()),
@@ -3642,16 +3645,15 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     };
     // `agent_record`, not `_opt`: an unreachable server is a FAILURE, never
     // a cheerful "unknown" at exit 0 (W13 / G5).
-    let status = match agent_record(&entry.terminal_id, None) {
-        AgentFetch::Found(record) => field(&record, "agent_status")
-            .unwrap_or("unknown")
-            .to_string(),
-        AgentFetch::Missing => "unknown".to_string(),
+    let record = match agent_record(&entry.terminal_id, None) {
+        AgentFetch::Found(record) => record,
+        AgentFetch::Missing => serde_json::json!({}),
         AgentFetch::TimedOut => return Ok(fail(format!("delegate {}: timed out", entry.name))),
         AgentFetch::Failed(reason) => {
             return Ok(fail(format!("delegate {}: {reason}", entry.name)))
         }
     };
+    let status = field(&record, "agent_status").unwrap_or("unknown");
     let latest = load_observation(&entry);
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
@@ -3661,6 +3663,8 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
             serde_json::json!({
                 "name": entry.name,
                 "agent_status": status,
+                "blocked_reason": record.get("blocked_reason"),
+                "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
                 "workspace_id": entry.workspace_id,
                 "mode": entry.mode,
@@ -3678,6 +3682,16 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         );
     } else {
         println!("delegate {name}: {status}");
+        if let Some(reason) = field(&record, "blocked_reason") {
+            if let Some(eta) = record
+                .get("retry_after_ms")
+                .and_then(serde_json::Value::as_u64)
+            {
+                println!("  {reason}, retry in {}s", eta / 1_000);
+            } else {
+                println!("  {reason}");
+            }
+        }
         if let Some(verdict) = latest
             .as_ref()
             .and_then(|v| v.get("verdict"))

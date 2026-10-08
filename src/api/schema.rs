@@ -244,6 +244,20 @@ pub enum Method {
     RevertRun(RevertRunParams),
 }
 
+impl Method {
+    pub(crate) fn is_allocation_preview(&self) -> bool {
+        match self {
+            Self::WorkspaceCreate(p) => p.dry_run,
+            Self::WorktreeCreate(p) => p.dry_run,
+            Self::TabCreate(p) => p.dry_run,
+            Self::PaneSplit(p) => p.dry_run,
+            Self::AgentStart(p) => p.dry_run,
+            Self::AgentFork(p) => p.dry_run,
+            _ => false,
+        }
+    }
+}
+
 /// `revert.run` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevertRunParams {
@@ -563,6 +577,9 @@ pub struct TabTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -595,6 +612,9 @@ pub struct WorktreeListParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorktreeCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -684,6 +704,9 @@ pub struct WorktreeKillParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -833,6 +856,9 @@ pub struct AgentRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -921,6 +947,9 @@ pub enum SpawnLocation {
 /// optionally seeded with a pivot prompt as its opening turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentForkParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Pane id, terminal id, or agent name — same grammar as `agent.send`.
     pub target: String,
     /// New branch name; a slug is generated when omitted.
@@ -1399,6 +1428,9 @@ pub struct InboxMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSplitParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     pub target_pane_id: String,
@@ -2065,6 +2097,10 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    AllocationPlan {
+        operation: String,
+        plan: serde_json::Value,
+    },
     Pong {
         version: String,
         protocol: u32,
@@ -2734,6 +2770,11 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Live provider-limit wait, absent after the provider resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -3187,6 +3228,8 @@ pub enum EventData {
     CheckFired {
         name: String,
         episode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// #175 phase 4 check-runner: the last outcome was Error; the runner
     /// leaves the debounce counter untouched but records the reason.
@@ -3913,6 +3956,7 @@ mod tests {
         let request = Request {
             id: "req_1".into(),
             method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                dry_run: false,
                 cwd: Some("/tmp".into()),
                 focus: true,
                 label: Some("api".into()),
@@ -4530,6 +4574,8 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            blocked_reason: None,
+            retry_after_ms: None,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -4545,6 +4591,15 @@ mod tests {
             turn_cursor: Some("term_1:0:3:9:w".into()),
             revision: 4,
         }
+    }
+
+    #[test]
+    fn provider_limit_check_detail_is_optional_for_old_events() {
+        let event: EventData = serde_json::from_str(
+            r#"{"type":"check_fired","name":"blocked_alert","episode":"fixture"}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, EventData::CheckFired { detail: None, .. }));
     }
 
     #[test]

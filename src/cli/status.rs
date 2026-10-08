@@ -103,12 +103,14 @@ pub(crate) enum ServerRuntimeStatus {
 
 fn print_full_status(json: bool) -> std::io::Result<i32> {
     let server = read_server_runtime_status()?;
+    let installed = read_installed_status(&server);
 
     if json {
         print_json(&FullStatusJson {
             client: client_status_json(),
             server: server_status_json(&server),
             update: update_status_json(&server),
+            installed,
         })?;
         return Ok(0);
     }
@@ -123,6 +125,15 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     println!();
     println!("server:");
     print_server_status_body(&server, "  ");
+    println!();
+    println!("installed:");
+    println!("  binary: {}", option_label(installed.binary.as_deref()));
+    println!("  version: {}", option_label(installed.version.as_deref()));
+    println!("  client_drift: {}", drift_label(installed.client_drift));
+    println!("  server_drift: {}", drift_label(installed.server_drift));
+    if let Some(error) = &installed.error {
+        println!("  error: {error}");
+    }
     println!();
     println!("update:");
     println!("  restart_needed: {}", restart_needed_label(&server));
@@ -278,9 +289,91 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    installed: InstalledStatusJson,
     client: ClientStatusJson,
     server: ServerStatusJson,
     update: UpdateStatusJson,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledStatusJson {
+    binary: Option<String>,
+    version: Option<String>,
+    client_drift: Option<bool>,
+    server_drift: Option<bool>,
+    error: Option<String>,
+}
+
+fn drift_label(drift: Option<bool>) -> &'static str {
+    match drift {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn read_installed_status(server: &ServerRuntimeStatus) -> InstalledStatusJson {
+    installed_status_at(
+        crate::integration::launch::stable_launch_path(),
+        server,
+        std::time::Duration::from_secs(2),
+    )
+}
+
+fn installed_status_at(
+    path: std::io::Result<std::path::PathBuf>,
+    server: &ServerRuntimeStatus,
+    timeout: std::time::Duration,
+) -> InstalledStatusJson {
+    let mut status = InstalledStatusJson {
+        binary: None,
+        version: None,
+        client_drift: None,
+        server_drift: None,
+        error: None,
+    };
+    let result = path.and_then(|path| {
+        status.binary = Some(path.display().to_string());
+        probe_installed_version(&path, timeout)
+    });
+    match result {
+        Ok(version) => {
+            status.client_drift = Some(version != crate::build_info::version());
+            status.server_drift = match server {
+                ServerRuntimeStatus::Running {
+                    version: running, ..
+                } => running.as_ref().map(|running| running != &version),
+                ServerRuntimeStatus::NotRunning => None,
+            };
+            status.version = Some(version);
+        }
+        Err(err) => status.error = Some(err.to_string()),
+    }
+    status
+}
+
+fn probe_installed_version(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<String> {
+    // --version is an identity-only command, including for older installed flk.
+    // Never execute a harness's arbitrary configured MCP command to probe it.
+    // Resolve only for this probe, never for the persisted launch command.
+    let probe_path = std::fs::canonicalize(path)?;
+    let output = crate::process::TracedCommand::new(probe_path, "status")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output_traced_with_timeout(timeout)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("installed flk --version failed"));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(std::io::Error::other)?;
+    let version = text
+        .trim()
+        .strip_prefix("flk ")
+        .filter(|version| !version.is_empty() && !version.chars().any(char::is_whitespace))
+        .ok_or_else(|| std::io::Error::other("unrecognized installed flk version output"))?;
+    Ok(version.to_owned())
 }
 
 #[derive(Serialize)]
@@ -431,6 +524,99 @@ fn status_help_text() -> String {
         "  flk status client [--json]  show local client binary status"
     );
     out
+}
+
+#[cfg(test)]
+mod installed_tests {
+    use super::*;
+
+    #[test]
+    fn installed_version_probe_reports_three_way_drift_after_symlink_retarget() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = crate::test_support::unique_temp_path("installed-version-drift");
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = dir.join("flk");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        for (path, version) in [
+            (&first, crate::build_info::version()),
+            (&second, "99.0.0-fixture".to_owned()),
+        ] {
+            std::fs::write(path, format!("#!/bin/sh\nprintf 'flk {version}\\n'\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink(&first, &launch).unwrap();
+        let server = ServerRuntimeStatus::Running {
+            version: Some(crate::build_info::version()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            capabilities: None,
+            session_health: None,
+            api_listener: None,
+        };
+        let before = installed_status_at(
+            Ok(launch.clone()),
+            &server,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(before.client_drift, Some(false), "{before:?}");
+        assert_eq!(before.server_drift, Some(false));
+        std::fs::remove_file(&launch).unwrap();
+        symlink(&second, &launch).unwrap();
+        let after = installed_status_at(
+            Ok(launch.clone()),
+            &server,
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(after.version.as_deref(), Some("99.0.0-fixture"));
+        assert_eq!(after.client_drift, Some(true));
+        assert_eq!(after.server_drift, Some(true));
+        assert_eq!(after.binary.as_deref(), Some(launch.to_str().unwrap()));
+        assert!(after.error.is_none());
+        let absent = installed_status_at(
+            Ok(launch),
+            &ServerRuntimeStatus::NotRunning,
+            std::time::Duration::from_secs(10),
+        );
+        assert!(absent.server_drift.is_none());
+        assert!(absent.version.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn installed_version_probe_bounds_hangs_and_reports_unknown_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::unique_temp_path("installed-version-errors");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flk");
+        std::fs::write(&path, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err =
+            probe_installed_version(&path, std::time::Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        for script in [
+            "#!/bin/sh\nexit 1\n",
+            "#!/bin/sh\nprintf 'unrelated output\\n'\n",
+        ] {
+            std::fs::write(&path, script).unwrap();
+            let status = installed_status_at(
+                Ok(path.clone()),
+                &ServerRuntimeStatus::NotRunning,
+                std::time::Duration::from_secs(10),
+            );
+            assert!(status.version.is_none());
+            assert!(status.error.is_some());
+            assert!(status.client_drift.is_none());
+            assert!(status.server_drift.is_none());
+        }
+        std::fs::remove_file(&path).unwrap();
+        let missing = installed_status_at(
+            Ok(path),
+            &ServerRuntimeStatus::NotRunning,
+            std::time::Duration::from_secs(10),
+        );
+        assert!(missing.error.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(test)]

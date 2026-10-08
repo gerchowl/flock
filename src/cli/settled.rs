@@ -7,8 +7,7 @@
 //! agent enter `working` (or the cursor was captured while it was working), and
 //! then saw its reported status hold `idle`/`done` with **no state transition at
 //! all** for the settle window. It is a statement about what flock observed, not
-//! about what the agent did. The result of a turn is `flk agent result`
-//! (once #575 lands), which this package does not ship.
+//! about what the agent did. Read the result of a turn with `flk agent result`.
 //!
 //! ## Why one module
 //!
@@ -1316,6 +1315,13 @@ fn sample_from_record(record: &serde_json::Value) -> Result<Sample, String> {
         .and_then(serde_json::Value::as_str)
         .ok_or("the server's record named no agent_status")?;
     let status = parse_reported_status(status)?;
+    // A provider wait is pending work, not a human-input dwell. The delegate
+    // monitor owns its ETA and persistence thresholds while the cursor stays real.
+    let status = if status == AgentStatus::Blocked && record["blocked_reason"] == "provider_limit" {
+        AgentStatus::Working
+    } else {
+        status
+    };
     // Hibernation is answered BEFORE the cursor is asked for. The status is
     // derived from the stashed resume plan rather than from a live turn, so
     // demanding a cursor first would turn "this agent is parked" into a parse

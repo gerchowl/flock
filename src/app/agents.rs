@@ -404,7 +404,7 @@ impl App {
         &mut self,
         params: AgentStartParams,
         caller: &SpawnCaller,
-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+    ) -> Result<crate::api::schema::ResponseResult, AgentStartError> {
         let name = params.name.trim().to_string();
         if name.is_empty() {
             return Err(AgentStartError::InvalidName);
@@ -490,7 +490,7 @@ impl App {
             return Err(AgentStartError::NoActiveWorkspace);
         }
 
-        let (ws_idx, tab_idx, pane_id) = if let Some(tab_id) = params.tab_id {
+        let (cwd, placement) = if let Some(tab_id) = params.tab_id {
             let (ws_idx, tab_idx) =
                 self.parse_tab_id(&tab_id)
                     .ok_or_else(|| AgentStartError::TargetNotFound {
@@ -510,14 +510,14 @@ impl App {
             }
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-            self.spawn_agent_split(
-                ws_idx,
-                target_pane,
-                params.split.unwrap_or(SplitDirection::Right),
+            (
                 cwd,
-                &argv,
-                focus,
-            )?
+                StartPlacement::Split(
+                    ws_idx,
+                    target_pane,
+                    params.split.unwrap_or(SplitDirection::Right),
+                ),
+            )
         } else if let Some(workspace_id) = params.workspace_id {
             let ws_idx = self.parse_workspace_id(&workspace_id).ok_or_else(|| {
                 AgentStartError::TargetNotFound {
@@ -527,14 +527,14 @@ impl App {
             let tab_idx = self.state.workspaces[ws_idx].active_tab;
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-            self.spawn_agent_split(
-                ws_idx,
-                target_pane,
-                params.split.unwrap_or(SplitDirection::Right),
+            (
                 cwd,
-                &argv,
-                focus,
-            )?
+                StartPlacement::Split(
+                    ws_idx,
+                    target_pane,
+                    params.split.unwrap_or(SplitDirection::Right),
+                ),
+            )
         } else if let Some(ws_idx) = named_workspace {
             // #398: the placement was asked for by name, so it is reached from
             // any caller — including one flock cannot place, which is the whole
@@ -544,9 +544,7 @@ impl App {
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             match params.split {
-                Some(split) => {
-                    self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
-                }
+                Some(split) => (cwd, StartPlacement::Split(ws_idx, target_pane, split)),
                 // Without `--split` this is a placement, not a pane gesture, so
                 // it takes the shape `--workspace` does for #364: the agent is
                 // the only pane of a tab nobody else is in. Under
@@ -557,7 +555,7 @@ impl App {
                 // rather than "a tab in it".
                 None => {
                     let workspace_id = self.public_workspace_id(ws_idx);
-                    self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
+                    (cwd, StartPlacement::Workspace(workspace_id))
                 }
             }
         } else if let Some(split) = params.split {
@@ -594,12 +592,12 @@ impl App {
                 // spaces open there is no active workspace to guess at, so a
                 // fresh node still starts an agent from a script.
                 let cwd = self.agent_start_cwd(explicit_cwd, None);
-                self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+                (cwd, StartPlacement::NewWorkspace)
             } else if let Some(ws_idx) = matched.filter(|idx| *idx < self.state.workspaces.len()) {
                 let tab_idx = self.state.workspaces[ws_idx].active_tab;
                 let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
                 let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-                self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
+                (cwd, StartPlacement::Split(ws_idx, target_pane, split))
             } else {
                 // A split needs an existing space to split. An unmatched cwd
                 // is placement ENOUGH on the untargeted arm below — flock
@@ -640,9 +638,7 @@ impl App {
             let requested_cwd = explicit_cwd.clone();
             let cwd = self.agent_start_cwd(explicit_cwd, None);
             match self.agent_cwd_workspace_id(requested_cwd.as_deref()) {
-                Some(workspace_id) => {
-                    self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
-                }
+                Some(workspace_id) => (cwd, StartPlacement::Workspace(workspace_id)),
                 // A `--cwd` that names a real directory is placement ENOUGH,
                 // even though it matches no open space: flock mints the space
                 // at it, and a dispatcher pointing at a checkout this server
@@ -651,7 +647,7 @@ impl App {
                 // a new repo from a script, with no flag left that expresses
                 // it.
                 None if requested_cwd.as_deref().is_some_and(|path| path.is_dir()) => {
-                    self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+                    (cwd, StartPlacement::NewWorkspace)
                 }
                 // What is left gave flock nothing to place: no `--cwd` at all,
                 // or one that is not a directory. The untargeted path then
@@ -660,10 +656,46 @@ impl App {
                 // trust prompt, reached without anybody asking for it. So a
                 // caller flock cannot place is refused (#398), and an operator
                 // in a pane keeps the behaviour they have today.
-                None if caller.may_default_to_active() => {
-                    self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
-                }
+                None if caller.may_default_to_active() => (cwd, StartPlacement::NewWorkspace),
                 None => return Err(AgentStartError::PlacementRequired),
+            }
+        };
+
+        if params.dry_run {
+            let (kind, workspace_id, target_pane_id, direction) = match &placement {
+                StartPlacement::Split(ws, pane, direction) => (
+                    "split",
+                    Some(self.public_workspace_id(*ws)),
+                    self.public_pane_id(*ws, *pane),
+                    Some(direction.clone()),
+                ),
+                StartPlacement::Workspace(ws) => (
+                    if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+                        "sibling_workspace"
+                    } else {
+                        "tab"
+                    },
+                    Some(ws.clone()),
+                    None,
+                    None,
+                ),
+                StartPlacement::NewWorkspace => ("workspace", None, None, None),
+            };
+            return Ok(crate::api::schema::ResponseResult::AllocationPlan {
+                operation: "agent.start".into(),
+                plan: serde_json::json!({"name": name, "cwd": cwd, "argv": argv, "focus": focus,
+                    "placement": kind, "workspace_id": workspace_id, "target_pane_id": target_pane_id, "direction": direction}),
+            });
+        }
+        let (ws_idx, tab_idx, pane_id) = match placement {
+            StartPlacement::Split(ws, pane, direction) => {
+                self.spawn_agent_split(ws, pane, direction, cwd, &argv, focus)?
+            }
+            StartPlacement::Workspace(ws) => {
+                self.spawn_agent_in_workspace(&ws, cwd, rows, cols, &argv, focus)?
+            }
+            StartPlacement::NewWorkspace => {
+                self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
             }
         };
 
@@ -686,7 +718,7 @@ impl App {
             .agent_info(ws_idx, pane_id)
             .ok_or_else(|| AgentStartError::SpawnFailed("agent disappeared".into()))?;
         debug_assert_eq!(agent.tab_id, self.public_tab_id(ws_idx, tab_idx).unwrap());
-        Ok((agent, argv))
+        Ok(crate::api::schema::ResponseResult::AgentStarted { agent, argv })
     }
 
     pub(super) fn agent_start_error_body(
@@ -1037,6 +1069,9 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
@@ -1045,6 +1080,8 @@ impl App {
             title: pane.title,
             display_agent: pane.display_agent,
             agent_status: pane.agent_status,
+            blocked_reason: provider_wait.as_ref().map(|_| "provider_limit".into()),
+            retry_after_ms: provider_wait.and_then(|wait| wait.retry_after_ms),
             custom_status: pane.custom_status,
             state_labels: pane.state_labels,
             agent_session: pane.agent_session,
@@ -1184,6 +1221,12 @@ pub(super) enum AgentRenameError {
     },
 }
 
+enum StartPlacement {
+    Split(usize, crate::layout::PaneId, SplitDirection),
+    Workspace(String),
+    NewWorkspace,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
@@ -1244,6 +1287,7 @@ mod tests {
         Request {
             id: "req_agent_start_cwd".into(),
             method: Method::AgentStart(AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: Some(workspace_id.to_string()),
@@ -1263,6 +1307,7 @@ mod tests {
         Request {
             id: "req_agent_start_profile".into(),
             method: Method::AgentStart(AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some("/".into()),
                 workspace_id: None,

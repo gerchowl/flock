@@ -83,6 +83,7 @@ async fn publish_state_changed_event(
     agent: Option<Agent>,
     state: AgentState,
     activity: Option<String>,
+    provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     visible_blocker: bool,
     visible_idle: bool,
     visible_working: bool,
@@ -98,6 +99,7 @@ async fn publish_state_changed_event(
             agent,
             state,
             activity,
+            provider_limit,
             visible_blocker,
             visible_idle,
             visible_working,
@@ -380,6 +382,7 @@ fn detection_update_for_publish(
         return Some(crate::detect::AgentDetection {
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             skip_state_update: false,
             visible_blocker: false,
             visible_idle: false,
@@ -589,6 +592,7 @@ fn spawn_basic_detection_task(
                     agent,
                     new_state,
                     detection.activity.clone(),
+                    detection.provider_limit.clone(),
                     visible_blocker,
                     visible_idle,
                     visible_working,
@@ -1695,6 +1699,7 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_idle = false;
                 let mut last_visible_working = false;
+                let mut last_activity: Option<String> = None;
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
 
@@ -1907,7 +1912,8 @@ impl PaneRuntime {
                         agent_changed,
                         process_exited,
                         stable_refresh_due,
-                    ) {
+                    ) || detection.activity != last_activity
+                    {
                         debug!(
                             pane = pane_id.raw(),
                             ?state,
@@ -1920,6 +1926,7 @@ impl PaneRuntime {
                         last_visible_blocker = visible_blocker;
                         last_visible_idle = visible_idle;
                         last_visible_working = visible_working;
+                        last_activity.clone_from(&detection.activity);
                         if visible_blocker || visible_idle || visible_working {
                             last_visible_signal_refresh = Some(now);
                         } else {
@@ -1931,6 +1938,7 @@ impl PaneRuntime {
                             agent,
                             new_state,
                             detection.activity.clone(),
+                            detection.provider_limit.clone(),
                             visible_blocker,
                             visible_idle,
                             visible_working,
@@ -3282,6 +3290,7 @@ mod tests {
             Some(Agent::Pi),
             AgentState::Idle,
             None,
+            None,
             false,
             false,
             false,
@@ -3322,6 +3331,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,

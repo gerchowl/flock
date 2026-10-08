@@ -26,6 +26,31 @@ pub(crate) fn resolve_new_terminal_cwd(
 }
 
 impl App {
+    pub(super) fn resolve_tab_create_cwd(
+        &self,
+        source_ws_idx: Option<usize>,
+        cwd_override: Option<PathBuf>,
+        sibling: bool,
+    ) -> PathBuf {
+        let pinned_cwd = if sibling {
+            sibling_spawn_seed(source_ws_idx.and_then(|idx| self.state.workspaces.get(idx))).1
+        } else {
+            None
+        };
+        cwd_override.or(pinned_cwd).unwrap_or_else(|| {
+            let follow_cwd = source_ws_idx.and_then(|idx| {
+                if sibling {
+                    self.seed_cwd_from_workspace(idx)
+                } else {
+                    self.state
+                        .focused_runtime_in_workspace(&self.terminal_runtimes, idx)
+                        .and_then(|runtime| runtime.cwd())
+                }
+            });
+            self.resolve_new_terminal_cwd(follow_cwd)
+        })
+    }
+
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         self.state
             .workspaces
@@ -128,15 +153,8 @@ impl App {
         focus: bool,
     ) -> std::io::Result<usize> {
         let source = source_ws_idx.and_then(|ws_idx| self.state.workspaces.get(ws_idx));
-        let (membership, pinned_cwd) = sibling_spawn_seed(source);
-        let initial_cwd = match cwd_override.or(pinned_cwd) {
-            Some(path) => path,
-            None => {
-                let follow_cwd =
-                    source_ws_idx.and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
-                self.resolve_new_terminal_cwd(follow_cwd)
-            }
-        };
+        let (membership, _) = sibling_spawn_seed(source);
+        let initial_cwd = self.resolve_tab_create_cwd(source_ws_idx, cwd_override, true);
         let idx = self.create_workspace_with_options(initial_cwd, focus)?;
         if membership.is_some() {
             self.state.workspaces[idx].worktree_space = membership;

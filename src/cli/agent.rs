@@ -20,6 +20,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
+        "history" => agent_history(&args[1..]),
         "result" => agent_result(&args[1..]),
         "send" => agent_send(&args[1..]),
         "rename" => agent_rename(&args[1..]),
@@ -47,14 +48,17 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// constants (#455) — one answer per verb, not two that can disagree.
 pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Send pastes text (bracketed when enabled) without submitting. Use pane send-keys for control keys (Enter, C-c, Esc). --submit waits 120 ms, then sends Enter.\n  Use -- before the target to send text beginning with --submit literally.\n  Success reports input queued, not confirmation that the agent accepted it.";
 
+pub(super) const AGENT_HISTORY_USAGE: &str =
+    "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
+
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>";
 
 pub(super) const AGENT_RESTART_USAGE: &str =
     "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
 
-pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]";
 
 pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "flk agent wait <target> --status <",
@@ -79,7 +83,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           · 1 every other error, including a server unreachable for 30 s when no --timeout\n",
     "           was given. A timeout is 1 for the non-settled statuses above.\n",
     "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
-    "  output use `flk agent result` (once #575 lands). Native agents are read from the screen every\n",
+    "  output use `flk agent result`. Native agents are read from the screen every\n",
     "  300-500 ms, so a working phase shorter than one sample is never observed — a cursor taken\n",
     "  before one waits for the next turn instead. A turn cursor never satisfies a wait on another\n",
     "  terminal or another execution.",
@@ -94,6 +98,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
 /// into them never reaches the request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgentStartFlags {
+    dry_run: bool,
     cwd: Option<String>,
     workspace_id: Option<String>,
     tab_id: Option<String>,
@@ -175,6 +180,10 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.focus = false;
                 index += 1;
             }
+            "--dry-run" => {
+                flags.dry_run = true;
+                index += 1;
+            }
             "--wait-ready" => {
                 flags.wait_ready = true;
                 index += 1;
@@ -220,6 +229,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let AgentStartFlags {
+        dry_run,
         cwd,
         workspace_id,
         tab_id,
@@ -234,6 +244,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            dry_run,
             name: name.clone(),
             cwd,
             workspace_id,
@@ -245,7 +256,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             argv: args[separator + 1..].to_vec(),
         }),
     })?;
-    if !wait_ready || response.get("error").is_some() {
+    if dry_run || !wait_ready || response.get("error").is_some() {
         return super::print_response(&response);
     }
 
@@ -279,6 +290,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     let mut label = None;
     let mut pivot = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 1;
     while index < args.len() {
@@ -327,6 +339,10 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
                 pivot = Some(String::new());
                 index += 1;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -345,6 +361,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:fork".into(),
         method: Method::AgentFork(AgentForkParams {
+            dry_run,
             target: target.clone(),
             branch,
             base,
@@ -840,6 +857,68 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_history(args: &[String]) -> std::io::Result<i32> {
+    use crate::agent_transcript::TranscriptDetail;
+
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("usage: {AGENT_HISTORY_USAGE}");
+        return Ok(2);
+    };
+    let mut detail = TranscriptDetail::default();
+    let mut cursor = None;
+    let mut limit = None;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !matches!(flag, "--detail" | "--cursor" | "--limit") {
+            eprintln!("unknown option: {flag}");
+            return Ok(2);
+        }
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {flag}");
+            return Ok(2);
+        };
+        match flag {
+            "--detail" => {
+                detail = match value.as_str() {
+                    "reply" => TranscriptDetail::Reply,
+                    "collapsed" => TranscriptDetail::Collapsed,
+                    "full" => TranscriptDetail::Full,
+                    _ => {
+                        eprintln!("invalid --detail: expected reply, collapsed, or full");
+                        return Ok(2);
+                    }
+                };
+            }
+            "--cursor" => match super::parse_u64_flag(flag, value) {
+                Ok(parsed) => cursor = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            "--limit" => match super::parse_u32_flag(flag, value) {
+                Ok(parsed) => limit = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:history".into(),
+        method: Method::AgentHistory(crate::api::schema::AgentHistoryParams {
+            target: target.clone(),
+            detail,
+            cursor,
+            limit,
+        }),
+    })?)
+}
+
 /// `flk agent result` (#575): the reply an agent's newest turn ended on, and
 /// the `DONE:` / `BLOCKED:` / `VERDICT:` line it ends with — Claude and
 /// opencode alike. `--offset` pages a long report by characters.
@@ -894,6 +973,7 @@ fn print_agent_help() {
     eprintln!("  flk agent list");
     eprintln!("  flk agent get <target>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  {AGENT_HISTORY_USAGE}");
     eprintln!("  {AGENT_RESULT_USAGE}");
     eprintln!(
         "    the reply the agent's newest turn ended on (claude or opencode), with the status of"
@@ -907,7 +987,7 @@ fn print_agent_help() {
     eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
-    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
+    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
     eprintln!("  {AGENT_RESTART_USAGE}");
@@ -949,9 +1029,7 @@ fn print_agent_help() {
         "    (`done` too: an unattended agent goes quiet as `done`, which is an effective idle)."
     );
     eprintln!("    `done` on its own means exactly that effective state, not a UI-only marker:");
-    eprintln!(
-        "    --status settled waits for the agent to go quiet; `flk agent result` (once #575 lands) is"
-    );
+    eprintln!("    --status settled waits for the agent to go quiet; `flk agent result` is");
     eprintln!("    the turn's output, which settled does not promise.");
 }
 

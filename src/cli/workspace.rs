@@ -45,6 +45,7 @@ fn workspace_list(args: &[String]) -> std::io::Result<i32> {
 fn workspace_create(args: &[String]) -> std::io::Result<i32> {
     let mut cwd = None;
     let mut focus = false;
+    let mut dry_run = false;
     let mut label = None;
 
     let mut index = 0;
@@ -66,6 +67,10 @@ fn workspace_create(args: &[String]) -> std::io::Result<i32> {
                 label = Some(value.clone());
                 index += 2;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -83,7 +88,12 @@ fn workspace_create(args: &[String]) -> std::io::Result<i32> {
 
     super::print_response(&super::send_request(&Request {
         id: "cli:workspace:create".into(),
-        method: Method::WorkspaceCreate(WorkspaceCreateParams { cwd, focus, label }),
+        method: Method::WorkspaceCreate(WorkspaceCreateParams {
+            dry_run,
+            cwd,
+            focus,
+            label,
+        }),
     })?)
 }
 
@@ -159,7 +169,9 @@ fn workspace_close(args: &[String]) -> std::io::Result<i32> {
 fn print_workspace_help() {
     eprintln!("flk workspace commands:");
     eprintln!("  flk workspace list");
-    eprintln!("  flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]");
+    eprintln!(
+        "  flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]"
+    );
     eprintln!("  flk workspace get <workspace_id>");
     eprintln!("  flk workspace focus <workspace_id>");
     eprintln!("  flk workspace rename <workspace_id> <label>");

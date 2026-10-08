@@ -1,5 +1,9 @@
 mod atomic_write;
 mod codex_hook_trust;
+mod jsonc;
+pub(crate) mod launch;
+mod mcp_config;
+pub(crate) use mcp_config::pinned_path_notices;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,11 +16,9 @@ use serde_json::{json, Map, Value};
 use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
-/// Absolute path to the flock binary running this pane's server. Thin hook
-/// stubs exec `"$FLOCK_BIN" hook <agent> <action>` so they reach `flk hook`
-/// without depending on PATH inside the agent's shell (#158). Stamped at spawn
-/// from `current_exe()`, so it always matches the running flock — install and
-/// `integration manifest` (nix/off-host) alike, no baked-in path to drift.
+/// Stable absolute launch path for hook stubs, without resolving profile
+/// symlinks into immutable store paths where possible, with the server's own
+/// executable as the fallback for installations without a stable path.
 pub(crate) const FLOCK_BIN_ENV_VAR: &str = "FLOCK_BIN";
 const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
@@ -27,7 +29,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 9;
+const CLAUDE_INTEGRATION_VERSION: u32 = 10;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -47,11 +49,11 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
 pub(crate) const CLAUDE_HOOK_TIMEOUT: u64 = 10;
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 6;
+const CODEX_INTEGRATION_VERSION: u32 = 7;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/flock-agent-state.sh");
-const KIMI_INTEGRATION_VERSION: u32 = 2;
+const KIMI_INTEGRATION_VERSION: u32 = 3;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> flock kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< flock kimi integration";
@@ -70,7 +72,7 @@ const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
 ];
 const COPILOT_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const COPILOT_HOOK_ASSET: &str = include_str!("assets/copilot/flock-agent-state.sh");
-const COPILOT_INTEGRATION_VERSION: u32 = 1;
+const COPILOT_INTEGRATION_VERSION: u32 = 2;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
@@ -83,7 +85,7 @@ const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py")
 const HERMES_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/flock-agent-state.sh");
-const QODERCLI_INTEGRATION_VERSION: u32 = 2;
+const QODERCLI_INTEGRATION_VERSION: u32 = 3;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
 const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
@@ -280,9 +282,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     }
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
-    // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
-    if let Ok(exe) = std::env::current_exe() {
-        cmd.env(FLOCK_BIN_ENV_VAR, exe);
+    // Stamp this server's executable rather than an outer pane's inherited
+    // FLOCK_BIN. Keep the current executable as a Nix-only fallback (#158).
+    if let Ok(current) = std::env::current_exe() {
+        cmd.env(
+            FLOCK_BIN_ENV_VAR,
+            launch::pane_launch_path(&current, launch::stable_launch_path()),
+        );
     }
     // #175 S3 commit 4 (ops): consume the one-shot FLOCK_RUN_ID set by
     // the caller right before spawn. Thread-local because pane spawn is
@@ -517,7 +523,10 @@ pub(crate) fn install_target_with_hook_trust(
     target: crate::api::schema::IntegrationTarget,
     trust_hooks: bool,
 ) -> io::Result<Vec<String>> {
-    let messages = match target {
+    // Codex hooks and MCP share a config file. Capture ownership before the
+    // hook adapter can replace it, so MCP registration respects its owner.
+    let mcp_config_externally_owned = mcp_config::externally_owned(target);
+    let mut messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
             vec![format!("installed pi integration to {}", path.display())]
@@ -631,6 +640,10 @@ pub(crate) fn install_target_with_hook_trust(
             ]
         }
     };
+
+    if let Some(message) = mcp_config::install(target, mcp_config_externally_owned) {
+        messages.push(message);
+    }
 
     crate::logging::integration_action("install", integration_target_label(target), "ok");
     Ok(messages)
@@ -968,7 +981,7 @@ fn integration_specs() -> [(
         ),
         (
             crate::api::schema::IntegrationTarget::Claude,
-            claude_dir().map(|dir| dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME)),
+            claude_dir().map(|dir| effective_claude_hook_path(&dir)),
             CLAUDE_INTEGRATION_VERSION,
         ),
         (
@@ -1152,7 +1165,7 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     let hooks_dir = dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
 
-    let hook_path = hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
+    let hook_path = effective_claude_hook_path(&dir);
     fs::write(&hook_path, CLAUDE_HOOK_ASSET)?;
     make_executable(&hook_path)?;
     // Rebrand cleanup: drop the dead `herdr-agent-state.sh` shim left by a
@@ -1363,7 +1376,7 @@ pub(crate) fn verify_integration_manifest() -> ManifestVerdict {
 /// (nothing to drift against — the reap is not stopped for missing files).
 fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let dir = claude_dir().ok()?;
-    let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+    let hook_path = effective_claude_hook_path(&dir);
     let settings_path = dir.join("settings.json");
     // Half-state is asymmetric and both directions are drift (#143):
     //  * shim missing but settings still register it  -> hooks fire nothing
@@ -1488,7 +1501,7 @@ pub(crate) fn integration_manifest(
     match target {
         crate::api::schema::IntegrationTarget::Claude => {
             let dir = claude_dir()?;
-            let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+            let hook_path = effective_claude_hook_path(&dir);
             let settings_path = dir.join("settings.json");
             Ok(json!({
                 "target": integration_target_label(target),
@@ -2795,6 +2808,44 @@ fn omp_extension_dir() -> io::Result<PathBuf> {
     )
 }
 
+/// Profiles can register the shared hook with the same command fragment that
+/// flock installs. Read the registration instead of assuming a profile copy.
+fn effective_claude_hook_path(dir: &Path) -> PathBuf {
+    let registered = fs::read_to_string(dir.join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|settings| {
+            let entries = settings.get("hooks")?.get("SessionStart")?.as_array()?;
+            entries.iter().find_map(|entry| {
+                entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+                    if hook.get("type")?.as_str()? != "command" {
+                        return None;
+                    }
+                    let command = hook.get("command")?.as_str()?;
+                    let raw = command.strip_prefix("bash ")?.strip_suffix(" session")?;
+                    let decoded = raw
+                        .strip_prefix('\'')
+                        .and_then(|raw| raw.strip_suffix('\''))
+                        .map(|raw| raw.replace("'\"'\"'", "'"))
+                        .unwrap_or_else(|| raw.to_owned());
+                    let path = PathBuf::from(decoded);
+                    if !path.is_absolute() || path.file_name()? != CLAUDE_HOOK_INSTALL_NAME {
+                        return None;
+                    }
+                    let quoted = format!(
+                        "bash {} session",
+                        shell_single_quote(&path.display().to_string())
+                    );
+                    let unquoted = format!("bash {} session", path.display());
+                    (command == quoted
+                        || (command == unquoted && !raw.chars().any(char::is_whitespace)))
+                    .then_some(path)
+                })
+            })
+        });
+    registered.unwrap_or_else(|| dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME))
+}
+
 fn claude_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(CLAUDE_CONFIG_DIR_ENV_VAR, &[".claude"])
 }
@@ -3428,20 +3479,76 @@ mod tests {
     }
 
     #[test]
-    fn apply_pane_env_stamps_flock_bin_to_current_exe() {
+    fn apply_pane_env_stamps_flock_bin_to_stable_launch_path() {
         let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env_remove(FLOCK_BIN_ENV_VAR);
         apply_pane_env(&mut cmd, PaneId::from_raw(7));
-        let expected = std::env::current_exe().expect("current_exe in test");
+        let expected = launch::stable_launch_path().expect("stable launch in test");
         assert_eq!(
             cmd.get_env(FLOCK_BIN_ENV_VAR),
             Some(expected.as_os_str()),
-            "FLOCK_BIN must point at the running flock binary so hook stubs \
-             reach `flk hook` without relying on PATH"
+            "FLOCK_BIN must retain a stable launch path for hook stubs"
         );
         assert_eq!(
             cmd.get_env(FLOCK_PANE_ID_ENV_VAR),
             Some(std::ffi::OsStr::new("p_7"))
         );
+    }
+
+    #[test]
+    fn claude_profile_status_and_install_use_shared_registered_hook() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let shared = base.join("shared hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+        let profile = base.join("profile");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(&shared, CLAUDE_HOOK_ASSET).unwrap();
+        let settings = json!({"hooks": claude_hooks_fragment(&shared)});
+        fs::write(profile.join("settings.json"), settings.to_string()).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &profile);
+        let status = installed_integration_statuses()
+            .into_iter()
+            .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+            .unwrap();
+        assert_eq!(status.path, shared);
+        assert_eq!(status.state, IntegrationStatusKind::Current);
+        assert!(verify_claude_settings_drift().is_none());
+        let installed = install_claude().unwrap();
+        assert_eq!(installed.hook_path, shared);
+        assert!(!profile
+            .join("hooks")
+            .join(CLAUDE_HOOK_INSTALL_NAME)
+            .exists());
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(profile.join("settings.json")).unwrap())
+                .unwrap();
+        for (event, _, _) in CLAUDE_HOOK_ENTRIES {
+            assert_eq!(after["hooks"][event].as_array().unwrap().len(), 1);
+        }
+        fs::remove_file(&shared).unwrap();
+        let status = installed_integration_statuses()
+            .into_iter()
+            .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+            .unwrap();
+        assert_eq!(status.state, IntegrationStatusKind::NotInstalled);
+        assert!(verify_claude_settings_drift().is_some());
+        clear_integration_path_env();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pane_env_supersedes_outer_launch_and_replaces_inherited_store_pin() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env(FLOCK_BIN_ENV_VAR, "/nix/store/fixture-flock/bin/flk");
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let selected = PathBuf::from(cmd.get_env(FLOCK_BIN_ENV_VAR).unwrap());
+        assert!(!launch::is_store_path(&selected));
+        let custom = crate::test_support::unique_temp_path("custom-flk");
+        cmd.env(FLOCK_BIN_ENV_VAR, &custom);
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let own = std::env::current_exe().unwrap();
+        assert_eq!(cmd.get_env(FLOCK_BIN_ENV_VAR), Some(own.as_os_str()));
     }
 
     fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -4217,7 +4324,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4247,7 +4354,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4828,7 +4935,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_v1_integration_status_is_current() {
+    fn copilot_v1_integration_status_is_outdated() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -4850,8 +4957,8 @@ mod tests {
 
         assert_eq!(copilot.path, hook_path);
         assert_eq!(copilot.installed_version, Some(1));
-        assert_eq!(copilot.expected_version, 1);
-        assert_eq!(copilot.state, IntegrationStatusKind::Current);
+        assert_eq!(copilot.expected_version, COPILOT_INTEGRATION_VERSION);
+        assert_eq!(copilot.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -5139,7 +5246,7 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        // Codex, kimi and qodercli are thin stubs now too (#238): their bodies
+        // Codex, Copilot, kimi and qodercli are thin stubs now too (#238): their bodies
         // were an embedded python3 heredoc and now live in `flk hook <agent>`
         // (cli::hook::tests). The stubs only delegate — and crucially no longer
         // need an interpreter resolved from ambient PATH.
@@ -5150,19 +5257,19 @@ mod tests {
         assert!(QODERCLI_HOOK_ASSET.contains("hook qodercli"));
         assert!(!QODERCLI_HOOK_ASSET.contains("pane.report_agent"));
         for (name, asset) in [
+            ("claude", CLAUDE_HOOK_ASSET),
+            ("copilot", COPILOT_HOOK_ASSET),
             ("codex", CODEX_HOOK_ASSET),
             ("kimi", KIMI_HOOK_ASSET),
             ("qodercli", QODERCLI_HOOK_ASSET),
         ] {
             assert!(
-                !asset.contains("command -v python3"),
+                !asset.contains("command -v python3") && !asset.contains("python3 -"),
                 "{name} still guards on an ambient python3 (#238)"
             );
         }
-        assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
-        assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
-        assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
-        assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
+        assert!(COPILOT_HOOK_ASSET.contains("hook copilot event"));
+        assert!(!COPILOT_HOOK_ASSET.contains("pane.report_agent"));
         // Opencode is a thin plugin now (#158): it maps session events and
         // delegates to `flk hook opencode session`; the report lives in Rust.
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));

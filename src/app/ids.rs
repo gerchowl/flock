@@ -35,6 +35,7 @@ impl App {
             .position(|workspace| workspace.id == id)
             .or_else(|| id.strip_prefix("w_")?.parse::<usize>().ok()?.checked_sub(1))
             .or_else(|| id.parse::<usize>().ok()?.checked_sub(1))
+            .filter(|&index| index < self.state.workspaces.len())
     }
 
     pub(super) fn parse_tab_id(&self, id: &str) -> Option<(usize, usize)> {
@@ -287,6 +288,22 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn workspace_ids_reject_out_of_range_aliases() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("main")];
+        assert_eq!(app.parse_workspace_id(&app.state.workspaces[0].id), Some(0));
+        for id in ["1", "w_1"] {
+            assert_eq!(app.parse_workspace_id(id), Some(0));
+        }
+        for id in ["0", "w_0", "2", "w_2", "999999", "w_999999", "unknown"] {
+            assert_eq!(app.parse_workspace_id(id), None, "{id}");
+        }
+        app.state.workspaces.clear();
+        assert_eq!(app.parse_workspace_id("1"), None);
+        assert_eq!(app.parse_workspace_id("w_1"), None);
     }
 
     #[test]

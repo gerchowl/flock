@@ -42,3 +42,17 @@ pub(super) fn encode_error_with_data(
 pub(super) fn encode_error_body(id: String, error: ErrorBody) -> String {
     serde_json::to_string(&ErrorResponse { id, error }).unwrap()
 }
+
+pub(crate) fn encode_allocation_plan(
+    id: String,
+    operation: &str,
+    plan: serde_json::Value,
+) -> String {
+    encode_success(
+        id,
+        ResponseResult::AllocationPlan {
+            operation: operation.into(),
+            plan,
+        },
+    )
+}

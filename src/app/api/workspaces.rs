@@ -63,6 +63,15 @@ impl App {
                 .and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
             self.resolve_new_terminal_cwd(follow_cwd)
         });
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "workspace.create",
+                serde_json::json!({
+                    "cwd": cwd, "label": params.label, "focus": params.focus,
+                }),
+            );
+        }
         match self.create_workspace_with_options(cwd, params.focus) {
             Ok(index) => {
                 if let Some(label) = params.label {

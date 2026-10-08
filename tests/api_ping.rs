@@ -815,6 +815,89 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
 }
 
 #[test]
+fn opencode_provider_limit_screen_reaches_agent_get_and_recovers() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let screen_path = base.join("screen");
+    fs::write(
+        &screen_path,
+        "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt",
+    )
+    .unwrap();
+    let fake = bin_dir.join("opencode");
+    fs::write(&fake, format!(
+        "#!/bin/sh\nlast=\nwhile :; do\nnow=$(cat '{}')\nif [ \"$now\" != \"$last\" ]; then\nprintf '\\033[2J\\033[H%s\\n' \"$now\"\nlast=$now\nfi\nsleep 0.1\ndone\n",
+        screen_path.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let started = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "provider_start", "method": "agent.start", "params": {
+                "name": "quota", "cwd": base, "argv": [fake]
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(started["result"]["type"], "agent_started", "{started}");
+    let target = serde_json::json!({
+        "id": "provider_get", "method": "agent.get", "params": {"target": "quota"}
+    })
+    .to_string();
+    for (screen, expected) in [
+        (None, "blocked"),
+        (
+            Some("■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 14s attempt #1] esc interrupt"),
+            "blocked",
+        ),
+        (Some("■■⬝⬝⬝⬝⬝⬝ esc interrupt"), "working"),
+        (Some("ctrl+p commands"), "idle"),
+    ] {
+        if let Some(screen) = screen {
+            fs::write(&screen_path, screen).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let record = send_request(&socket_path, &target);
+            let agent = &record["result"]["agent"];
+            if agent["agent_status"] == expected
+                && (expected != "blocked"
+                    || screen.is_none()
+                    || agent["retry_after_ms"] == 2_774_000)
+            {
+                if expected == "blocked" {
+                    assert_eq!(agent["blocked_reason"], "provider_limit");
+                    let eta = if screen.is_some() {
+                        2_774_000
+                    } else {
+                        2_775_000
+                    };
+                    assert_eq!(agent["retry_after_ms"], eta);
+                    assert!(agent["custom_status"]
+                        .as_str()
+                        .unwrap()
+                        .contains("rate-limited, retry in 46m"));
+                } else {
+                    assert!(agent.get("blocked_reason").is_none());
+                    assert!(agent.get("retry_after_ms").is_none());
+                }
+                break;
+            }
+            assert!(Instant::now() < deadline, "expected {expected}: {record}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    cleanup_spawned_flock(child, base);
+}
+
+#[test]
 fn agent_start_creates_named_terminal_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();

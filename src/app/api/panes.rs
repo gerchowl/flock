@@ -17,6 +17,23 @@ use super::super::api_helpers::{
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    fn resolve_pane_target(
+        &self,
+        target: &str,
+    ) -> Result<(usize, crate::layout::PaneId), crate::api::schema::ErrorBody> {
+        self.resolve_terminal_target(target)
+            .map(|resolved| (resolved.ws_idx, resolved.pane_id))
+            .map_err(|error| match error {
+                crate::app::terminal_targets::TerminalTargetError::NotFound { target } => {
+                    crate::api::schema::ErrorBody {
+                        code: "pane_not_found".into(),
+                        message: format!("pane {target} not found"),
+                    }
+                }
+                error => self.agent_target_error_body(error),
+            })
+    }
+
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let Some((ws_idx, target_pane_id)) = self.parse_pane_id(&params.target_pane_id) else {
             return pane_not_found(id, &params.target_pane_id);
@@ -33,6 +50,17 @@ impl App {
             });
             Some(self.resolve_new_terminal_cwd(follow_cwd))
         });
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "pane.split",
+                serde_json::json!({
+                    "workspace_id": self.public_workspace_id(ws_idx),
+                    "target_pane_id": self.public_pane_id(ws_idx, target_pane_id),
+                    "direction": params.direction, "cwd": split_cwd, "focus": params.focus,
+                }),
+            );
+        }
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
@@ -548,8 +576,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         // Echo back the canonical public id so a request that used the legacy
         // `<ws>-<n>` form still reads the new-style `<ws>:p<n>` in the result.
@@ -976,11 +1005,15 @@ impl App {
         id: String,
         params: PaneSendTextParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
@@ -1158,8 +1191,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return pane_not_found(id, &target.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&target.pane_id) {
+            Ok(target) => target,
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         // Capture the canonical public pane id BEFORE close (closing drops
         // the public-number mapping, so emitting the event afterwards using
@@ -1208,11 +1242,15 @@ impl App {
         id: String,
         params: PaneSendKeysParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
@@ -1310,6 +1348,179 @@ fn invalid_agent(id: String) -> String {
 mod tests {
     use super::*;
     use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
+
+    #[tokio::test]
+    async fn pane_verbs_accept_agent_targets() {
+        for target_kind in ["name", "terminal", "pane", "legacy"] {
+            let (mut app, terminal_id, public) = app_with_terminal();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .agent_name = Some("builder".into());
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80,
+                    24,
+                    0,
+                    b"agent output",
+                    8,
+                );
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane_id, runtime);
+            let target = match target_kind {
+                "name" => "builder".to_string(),
+                "terminal" => terminal_id.to_string(),
+                "legacy" => public.replace(":p", "-"),
+                _ => public.clone(),
+            };
+            for (method, extra) in [
+                ("pane.read", serde_json::json!({"source": "recent"})),
+                ("pane.send_text", serde_json::json!({"text": "prompt"})),
+                ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+                ("pane.close", serde_json::json!({})),
+            ] {
+                let mut params = extra;
+                params["pane_id"] = target.clone().into();
+                let response: serde_json::Value = serde_json::from_str(
+                    &app.handle_api_request(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "targets", "method": method, "params": params,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap();
+                assert!(response.get("result").is_some(), "{method}: {response}");
+                match method {
+                    "pane.read" => {
+                        assert_eq!(response["result"]["read"]["pane_id"], public);
+                        assert!(response["result"]["read"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("agent output"));
+                    }
+                    "pane.send_text" => assert_eq!(rx.try_recv().unwrap().as_ref(), b"prompt"),
+                    "pane.send_keys" => assert_eq!(rx.try_recv().unwrap().as_ref(), b"\r"),
+                    _ => assert!(app.state.workspaces.is_empty()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_target_id_wins_over_same_named_agent() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].terminal_id(other).unwrap().clone();
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .agent_name = Some(public.clone());
+        assert_eq!(app.resolve_pane_target(&public).unwrap(), (0, pane_id));
+        let response = app.handle_pane_close("precedence".into(), PaneTarget { pane_id: public });
+        assert!(response.contains("\"result\""), "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(other),
+            Some(&other_terminal)
+        );
+    }
+
+    #[test]
+    fn pane_target_accepts_legacy_workspace_pane_form() {
+        let (app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let legacy = public.replace(":p", "-");
+        assert_ne!(legacy, public);
+        assert_eq!(app.resolve_pane_target(&legacy).unwrap(), (0, pane_id));
+    }
+
+    #[test]
+    fn pane_send_missing_runtime_names_resolved_pane() {
+        let (mut app, terminal_id, public) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_name = Some("builder".into());
+        for (method, extra) in [
+            ("pane.send_text", serde_json::json!({"text": "prompt"})),
+            ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+        ] {
+            let mut params = extra;
+            params["pane_id"] = "builder".into();
+            let response: serde_json::Value = serde_json::from_str(
+                &app.handle_api_request(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "missing-runtime", "method": method, "params": params,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], "pane_not_found");
+            assert_eq!(
+                response["error"]["message"],
+                format!("pane {public} not found")
+            );
+        }
+    }
+
+    #[test]
+    fn pane_verbs_reject_ambiguous_and_missing_agent_targets() {
+        let (mut app, terminal_id, _) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_name = Some("builder".into());
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].terminal_id(other).unwrap().clone();
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .agent_name = Some("builder".into());
+        for (target, code) in [
+            ("builder", "agent_target_ambiguous"),
+            ("missing", "pane_not_found"),
+        ] {
+            for (method, extra) in [
+                ("pane.read", serde_json::json!({"source": "recent"})),
+                ("pane.send_text", serde_json::json!({"text": "prompt"})),
+                ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+                ("pane.close", serde_json::json!({})),
+            ] {
+                let mut params = extra;
+                params["pane_id"] = target.into();
+                let response: serde_json::Value = serde_json::from_str(
+                    &app.handle_api_request(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "targets", "method": method, "params": params,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(response["error"]["code"], code, "{method}: {response}");
+                if target == "builder" {
+                    let message = response["error"]["message"].as_str().unwrap();
+                    assert!(message.contains(&terminal_id.to_string()));
+                    assert!(message.contains(&other_terminal.to_string()));
+                }
+                assert_eq!(app.state.workspaces.len(), 2);
+            }
+        }
+    }
 
     fn app_with_linked_worktree() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

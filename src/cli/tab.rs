@@ -61,6 +61,7 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
     let mut cwd = None;
     let mut focus = false;
+    let mut dry_run = false;
     let mut label = None;
 
     let mut index = 0;
@@ -90,6 +91,10 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
                 label = Some(value.clone());
                 index += 2;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -108,6 +113,7 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:tab:create".into(),
         method: Method::TabCreate(TabCreateParams {
+            dry_run,
             workspace_id,
             cwd,
             focus,
@@ -189,8 +195,9 @@ fn print_tab_help() {
     eprintln!("flk tab commands:");
     eprintln!("  flk tab list [--workspace <workspace_id>]");
     eprintln!(
-        "  flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]"
+        "  flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]"
     );
+    eprintln!("  --workspace places the tab in that workspace; --cwd only sets the directory.");
     eprintln!("  flk tab get <tab_id>");
     eprintln!("  flk tab focus <tab_id>");
     eprintln!("  flk tab rename <tab_id> <label>");

@@ -170,12 +170,12 @@ impl App {
         // answer to the same question, which is the drift #124 / #197 /
         // #199-#210 are.
         let caller = self.spawn_caller();
-        let (agent, argv) = match self.start_agent(params, &caller) {
+        let result = match self.start_agent(params, &caller) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
 
-        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+        encode_success(id, result)
     }
 
     pub(super) fn handle_agent_read(
