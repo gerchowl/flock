@@ -2652,6 +2652,7 @@ mod tests {
             protocol: Some(2),
             capabilities: None,
             session_health: None,
+            api_listener: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2707,6 +2708,7 @@ mod tests {
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
                 session_health: None,
+                api_listener: None,
             },
         };
 
@@ -2903,6 +2905,7 @@ mod tests {
             protocol: Some(2),
             capabilities: None,
             session_health: None,
+            api_listener: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),

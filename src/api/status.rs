@@ -13,6 +13,7 @@ pub struct RuntimeStatus {
     /// older than this field, which is healthy by default rather than unknown —
     /// the same reading `#[serde(default)]` gives the wire.
     pub session_health: Option<crate::platform::SessionHealth>,
+    pub api_listener: Option<crate::api::schema::ApiListenerHealth>,
 }
 
 pub fn read_runtime_status_at(
@@ -53,11 +54,13 @@ pub fn read_runtime_status_at(
             protocol,
             capabilities,
             session_health,
+            api_listener,
         } => Ok(Some(RuntimeStatus {
             version: Some(version),
             protocol: Some(protocol),
             capabilities,
             session_health,
+            api_listener,
         })),
         result => Err(io::Error::other(format!(
             "server status request returned unexpected result: {result:?}"
