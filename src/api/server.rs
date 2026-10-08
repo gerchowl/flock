@@ -20,6 +20,8 @@ use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestS
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const ACCEPT_UNKNOWN_ERROR_LIMIT: u64 = 5;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -117,25 +119,79 @@ pub fn start_server_with_capabilities(
 }
 
 fn run_accept_loop<T>(
+    accept: impl FnMut() -> io::Result<T>,
+    running: &AtomicBool,
+    health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    serve: impl FnMut(T),
+) {
+    run_accept_loop_with_sleep(accept, running, health, serve, std::thread::sleep);
+}
+
+fn run_accept_loop_with_sleep<T>(
     mut accept: impl FnMut() -> io::Result<T>,
     running: &AtomicBool,
     health: &Mutex<crate::api::schema::ApiListenerHealth>,
     mut serve: impl FnMut(T),
+    mut sleep: impl FnMut(Duration),
 ) {
+    let mut failures = 0u64;
+    let mut backoff = ACCEPT_ERROR_BACKOFF;
     while running.load(Ordering::Relaxed) {
         match accept() {
-            Ok(stream) => serve(stream),
+            Ok(stream) => {
+                if failures > 0 {
+                    crate::logging::api_listener_accept_recovered(failures);
+                }
+                failures = 0;
+                backoff = ACCEPT_ERROR_BACKOFF;
+                serve(stream);
+            }
             Err(err) => {
-                crate::logging::api_listener_accept_failed(&err.to_string());
+                failures = failures.saturating_add(1);
+                let fatal = accept_error_is_fatal(&err, failures);
                 let mut status = health
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 status.accept_errors = status.accept_errors.saturating_add(1);
                 status.last_accept_error = Some(err.to_string());
+                status.stopped = fatal;
                 drop(status);
-                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                if fatal {
+                    crate::logging::api_listener_accept_failed(&err.to_string(), failures, true);
+                    break;
+                }
+                if failures == 1 {
+                    crate::logging::api_listener_accept_failed(&err.to_string(), failures, false);
+                }
+                sleep(backoff);
+                backoff = (backoff * 2).min(ACCEPT_ERROR_MAX_BACKOFF);
             }
         }
+    }
+}
+
+fn accept_error_is_fatal(err: &io::Error, failures: u64) -> bool {
+    match err.raw_os_error() {
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => true,
+        Some(
+            libc::EMFILE
+            | libc::ENFILE
+            | libc::ECONNABORTED
+            | libc::EINTR
+            | libc::EAGAIN
+            | libc::ENOBUFS
+            | libc::ENOMEM,
+        ) => false,
+        _ if matches!(
+            err.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionAborted
+        ) =>
+        {
+            false
+        }
+        _ => failures >= ACCEPT_UNKNOWN_ERROR_LIMIT,
     }
 }
 
@@ -799,7 +855,7 @@ mod tests {
         run_accept_loop(
             || {
                 if std::mem::take(&mut fail) {
-                    Err(io::Error::other("injected accept failure"))
+                    Err(io::Error::from_raw_os_error(libc::EMFILE))
                 } else {
                     listener.accept().map(|(stream, _)| stream)
                 }
@@ -818,7 +874,7 @@ mod tests {
         assert_eq!(response["result"]["api_listener"]["accept_errors"], 1);
         assert_eq!(
             response["result"]["api_listener"]["last_accept_error"],
-            "injected accept failure"
+            io::Error::from_raw_os_error(libc::EMFILE).to_string()
         );
         drop(listener);
         fs::remove_file(path).unwrap();
@@ -845,6 +901,142 @@ mod tests {
         assert_eq!(attempts, 2);
         assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF * 2);
         assert_eq!(health.lock().unwrap().accept_errors, 2);
+    }
+
+    #[test]
+    fn transient_accept_errors_grow_cap_and_reset_backoff_without_log_flood() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let mut served = 0;
+        let logs = crate::logging::capture_logs(|| {
+            run_accept_loop_with_sleep(
+                || {
+                    attempts += 1;
+                    if attempts == 9 || attempts == 11 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from_raw_os_error(libc::EMFILE))
+                    }
+                },
+                &running,
+                &health,
+                |_| {
+                    served += 1;
+                    if served == 2 {
+                        running.store(false, Ordering::Relaxed);
+                    }
+                },
+                |duration| sleeps.push(duration),
+            );
+        });
+        assert_eq!(
+            sleeps,
+            [50, 100, 200, 400, 800, 1600, 2000, 2000, 50].map(Duration::from_millis)
+        );
+        assert_eq!(health.lock().unwrap().accept_errors, 9);
+        assert!(!health.lock().unwrap().stopped);
+        assert_eq!(
+            logs.matches("event=\"api.listener.accept\"").count(),
+            4,
+            "{logs}"
+        );
+        assert_eq!(logs.matches("WARN").count(), 2, "{logs}");
+        assert_eq!(logs.matches("INFO").count(), 2, "{logs}");
+        assert!(!logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("failures=8"), "{logs}");
+    }
+
+    #[test]
+    fn fatal_accept_errors_stop_once_and_surface_in_ping() {
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let running = AtomicBool::new(true);
+            let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+            let mut attempts = 0;
+            let logs = crate::logging::capture_logs(|| {
+                run_accept_loop_with_sleep(
+                    || {
+                        attempts += 1;
+                        Err::<(), _>(io::Error::from_raw_os_error(code))
+                    },
+                    &running,
+                    &health,
+                    |_| panic!("fatal accepts cannot serve"),
+                    |_| panic!("fatal accepts cannot retry"),
+                );
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(logs.matches("ERROR").count(), 1, "{logs}");
+            assert_eq!(
+                logs.matches("event=\"api.listener.accept\"").count(),
+                1,
+                "{logs}"
+            );
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let response = handle_request(
+                Request {
+                    id: "fatal-status".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                None,
+                &health,
+            );
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["api_listener"]["stopped"], true);
+            assert_eq!(response["result"]["api_listener"]["accept_errors"], 1);
+            assert_eq!(
+                response["result"]["api_listener"]["last_accept_error"],
+                io::Error::from_raw_os_error(code).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn unclassified_accept_errors_stop_after_bounded_failures() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut sleeps = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            run_accept_loop_with_sleep(
+                || Err::<(), _>(io::Error::other("injected unknown accept error")),
+                &running,
+                &health,
+                |_| panic!("failed accepts cannot serve"),
+                |duration| sleeps.push(duration),
+            );
+        });
+        assert_eq!(sleeps.len() as u64, ACCEPT_UNKNOWN_ERROR_LIMIT - 1);
+        assert_eq!(
+            health.lock().unwrap().accept_errors,
+            ACCEPT_UNKNOWN_ERROR_LIMIT
+        );
+        assert!(health.lock().unwrap().stopped);
+        assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+        assert_eq!(logs.matches("ERROR").count(), 1, "{logs}");
+    }
+
+    #[test]
+    fn documented_transient_accept_errors_keep_retrying() {
+        for code in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+        ] {
+            assert!(!accept_error_is_fatal(
+                &io::Error::from_raw_os_error(code),
+                100
+            ));
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            assert!(!accept_error_is_fatal(&io::Error::from(kind), 100));
+        }
     }
 
     fn env_lock() -> &'static Mutex<()> {

@@ -170,6 +170,7 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
             if let Some(health) = api_listener {
+                println!("{indent}api listener stopped: {}", health.stopped);
                 println!("{indent}api accept errors: {}", health.accept_errors);
                 if let Some(err) = &health.last_accept_error {
                     println!("{indent}last api accept error: {err}");
@@ -444,11 +445,13 @@ mod tests {
             capabilities: None,
             session_health: None,
             api_listener: Some(crate::api::schema::ApiListenerHealth {
+                stopped: true,
                 accept_errors: 2,
                 last_accept_error: Some("injected accept failure".into()),
             }),
         };
         let json = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(json["api_listener"]["stopped"], true);
         assert_eq!(json["api_listener"]["accept_errors"], 2);
         assert_eq!(
             json["api_listener"]["last_accept_error"],

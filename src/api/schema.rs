@@ -2033,6 +2033,8 @@ pub struct ServerCapabilities {
 /// Accept failures retained for the lifetime of the API listener.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiListenerHealth {
+    #[serde(default)]
+    pub stopped: bool,
     pub accept_errors: u64,
     pub last_accept_error: Option<String>,
 }

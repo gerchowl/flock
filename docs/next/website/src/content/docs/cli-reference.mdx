@@ -33,7 +33,7 @@ flk status server
 flk status client
 ```
 
-Server status includes the API listener’s accept-error count and latest error. Accept failures are logged and retried after 50 ms; diagnostics remain until that listener is replaced. With `--json`, these are `server.api_listener.accept_errors` and `server.api_listener.last_accept_error` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics.
+Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
 ## Server
 
