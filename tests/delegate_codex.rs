@@ -667,9 +667,17 @@ fn assert_sandbox_refusal_creates_nothing(harness: &str) {
         walk(&server.base.join("wt")).is_empty(),
         "no checkout created"
     );
+    // Server startup owns these two files; refusal must write no other state.
+    let state = server.base.join("state");
+    let mesh = state.join(app_dir_name()).join("mesh");
+    let allowed = [mesh.join("identity.json"), mesh.join("identity.lock")];
+    let unexpected: Vec<_> = walk(&state)
+        .into_iter()
+        .filter(|path| !allowed.contains(path))
+        .collect();
     assert!(
-        walk(&server.base.join("state")).is_empty(),
-        "no registry or other state created"
+        unexpected.is_empty(),
+        "sandbox refusal wrote registry or other state: {unexpected:?}"
     );
     assert!(agent_get(&server, "refused").is_none(), "no agent started");
     assert!(
