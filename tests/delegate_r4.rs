@@ -112,7 +112,7 @@ fn write_fake_opencode(base: &Path) {
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
          first=1; while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; \
-         if [ -n \"$first\" ]; then first=; printf '\\033[2J\\033[H■■■■⬝⬝  esc interrupt  opencode\\n'; sleep 0.4; \
+         if [ ! -e '{base}/manual-submit' ]; then first=; printf '\\033[2J\\033[H■■■■⬝⬝  esc interrupt  opencode\\n'; sleep 0.4; \
          printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; fi; done\n",
         base = base.display()
     );
@@ -346,7 +346,7 @@ fn screen_for(state: &str) -> &'static str {
     match state {
         "working" => "\u{25a0}\u{25a0}\u{25a0}\u{25a0}\u{2b1d}\u{2b1d}  esc interrupt  opencode",
         "blocked" => "\u{25b3} Permission required",
-        "idle" => "opencode ready >",
+        "idle" => "┃\n┃  Ask anything…\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n",
         other => panic!("no screen for {other}"),
     }
 }
