@@ -1727,8 +1727,15 @@ impl SidebarGapSetting {
     }
 }
 
-/// All built-in theme names in display order.
+/// The theme used when `[theme] name` is unset — and the fallback for an
+/// unknown name. Dalton (gerchowl/dalton-colorscheme) is colorblind-friendly:
+/// it keeps meaning off the red-green axis, so it is the safe default.
+pub const DEFAULT_THEME: &str = "dalton";
+
+/// All built-in theme names in display order (the default first).
 pub const THEME_NAMES: &[&str] = &[
+    "dalton",
+    "dalton-light",
     "catppuccin",
     "catppuccin-latte",
     "terminal",
@@ -1747,8 +1754,6 @@ pub const THEME_NAMES: &[&str] = &[
     "rose-pine",
     "rose-pine-dawn",
     "vesper",
-    "dalton",
-    "dalton-light",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3645,8 +3650,8 @@ impl AppState {
                 crate::ui::screensaver::ScreensaverSim::default(),
             ),
             section_grouping_memo: std::cell::RefCell::new(None),
-            palette: Palette::catppuccin(),
-            theme_name: "catppuccin".to_string(),
+            palette: Palette::dalton(),
+            theme_name: DEFAULT_THEME.to_string(),
             settings: SettingsState {
                 section: SettingsSection::Theme,
                 list: SelectionListState::new(0),

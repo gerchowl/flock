@@ -357,14 +357,15 @@ fn resolve_palette_with_legacy_accent(
     config: &crate::config::Config,
     use_legacy_ui_accent: bool,
 ) -> state::Palette {
-    // Start with the named theme (default: catppuccin)
-    let base_name = config.theme.name.as_deref().unwrap_or("catppuccin");
+    // Start with the named theme (default: state::DEFAULT_THEME)
+    let base_name = config.theme.name.as_deref().unwrap_or(state::DEFAULT_THEME);
     let mut palette = state::Palette::from_name(base_name).unwrap_or_else(|| {
         tracing::warn!(
             theme = base_name,
-            "unknown theme, falling back to catppuccin"
+            fallback = state::DEFAULT_THEME,
+            "unknown theme, falling back to the default"
         );
-        state::Palette::catppuccin()
+        state::Palette::from_name(state::DEFAULT_THEME).expect("DEFAULT_THEME is built in")
     });
 
     // Apply custom overrides if present
@@ -779,7 +780,7 @@ impl App {
                 .theme
                 .name
                 .clone()
-                .unwrap_or_else(|| "catppuccin".to_string()),
+                .unwrap_or_else(|| state::DEFAULT_THEME.to_string()),
             settings: state::SettingsState {
                 section: state::SettingsSection::Theme,
                 list: state::SelectionListState::new(0),
@@ -1710,7 +1711,7 @@ impl App {
                 .theme
                 .name
                 .clone()
-                .unwrap_or_else(|| "catppuccin".to_string());
+                .unwrap_or_else(|| state::DEFAULT_THEME.to_string());
         }
 
         let status = if diagnostics.is_empty() {
@@ -1953,6 +1954,27 @@ mod tests {
         crate::raw_input::RawInputEvent::Key(
             crate::input::TerminalKey::new(code, modifiers).with_kind(kind),
         )
+    }
+
+    #[test]
+    fn unset_theme_defaults_to_dalton() {
+        let config = Config::default();
+        assert!(config.theme.name.is_none());
+        let palette = resolve_palette(&config);
+        let dalton = state::Palette::dalton();
+        assert_eq!(palette.text, dalton.text);
+        assert_eq!(palette.accent, dalton.accent);
+        assert_eq!(palette.panel_bg, dalton.panel_bg);
+        assert_eq!(state::DEFAULT_THEME, "dalton");
+        assert_eq!(state::THEME_NAMES[0], state::DEFAULT_THEME);
+    }
+
+    #[test]
+    fn unknown_theme_falls_back_to_dalton() {
+        let mut config = Config::default();
+        config.theme.name = Some("no-such-theme".into());
+        let palette = resolve_palette(&config);
+        assert_eq!(palette.text, state::Palette::dalton().text);
     }
 
     fn release_notes_state() -> state::ReleaseNotesState {
