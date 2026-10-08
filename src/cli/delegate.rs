@@ -683,6 +683,8 @@ struct Entry {
     repo_key: Option<String>,
     harness: String,
     model: Option<String>,
+    #[serde(default)]
+    sandbox: Option<String>,
     round: u64,
     brief: String,
     submitted_at_ms: u64,
@@ -2536,6 +2538,12 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         repo_key: placement.repo_key.clone(),
         harness: harness.name.to_string(),
         model: flags.model.clone(),
+        sandbox: harness.supports_sandbox.then(|| {
+            flags
+                .sandbox
+                .clone()
+                .unwrap_or_else(|| "workspace-write".into())
+        }),
         round: 1,
         brief: brief.clone(),
         submitted_at_ms,
@@ -3329,6 +3337,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
                 "branch": entry.branch,
                 "harness": entry.harness,
                 "model": entry.model,
+                "sandbox": entry.sandbox,
                 "round": entry.round,
                 "turn_cursor": entry.cursor,
                 "goal": serde_json::Value::Null,
@@ -3337,6 +3346,9 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     } else {
         println!("delegate {name}: {status}");
         println!("  round {} · {}", entry.round, entry.mode);
+        if let Some(sandbox) = &entry.sandbox {
+            println!("  sandbox {sandbox}");
+        }
         if let Some(worktree) = &entry.worktree {
             println!("  worktree {worktree}");
         }
@@ -4308,6 +4320,18 @@ mod tests {
                 (spec.argv)(HarnessOptions::default()).join(" "),
                 expected_without
             );
+        }
+    }
+
+    #[test]
+    fn delegate_sandbox_refuses_non_codex_harnesses() {
+        for name in ["opencode", "claude"] {
+            let harness = validate_harness(Some(name)).expect("supported harness");
+            assert_eq!(
+                validate_sandbox(harness, Some("workspace-write")),
+                Err(format!("--sandbox is not supported by {name}"))
+            );
+            assert!(validate_sandbox(harness, None).is_ok());
         }
     }
 

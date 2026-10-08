@@ -488,6 +488,10 @@ fn codex_delegate_start_ready_submit_settled_and_result() {
         read_lines(&server.base.join("argv.log")),
         vec!["--ask-for-approval never --sandbox workspace-write --model m1"]
     );
+    assert!(!read_lines(&server.base.join("argv.log"))
+        .join(" ")
+        .contains("danger-full-access"));
+    assert_recorded_sandbox(&server, "workspace-write");
     let read = cli(&server, &["delegate", "result", "d1", "--json"]);
     assert!(read.status.success(), "{}", stderr(&read));
     assert!(stdout_json(&read)["text"]
@@ -581,31 +585,134 @@ fn codex_delegate_session_hook_can_arrive_after_submit() {
     assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
     let out = finish(child);
     assert_eq!(stdout_json(&out)["status_text"], "session reported");
+    assert_recorded_sandbox(&server, "danger-full-access");
     assert_eq!(
         read_lines(&server.base.join("argv.log")),
         vec!["--ask-for-approval never --sandbox danger-full-access"]
     );
 }
 
-#[test]
-fn codex_delegate_sandbox_requires_explicit_supported_choice() {
-    let server = start_server();
-    for harness in ["opencode", "claude"] {
-        let out = cli(
-            &server,
-            &[
-                "delegate",
-                "start",
-                "refused",
-                "--harness",
-                harness,
-                "--sandbox",
-                "danger-full-access",
-                "--cwd",
-                server.base.join("work").to_str().unwrap(),
-            ],
-        );
-        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-        assert!(stderr(&out).contains("--sandbox is not supported"));
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
     }
+    out
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+}
+
+fn committed_repo(server: &Server) -> PathBuf {
+    let repo = server.base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("README.md"), "repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    repo
+}
+
+fn assert_sandbox_refusal_creates_nothing(harness: &str) {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server);
+    let repo = committed_repo(&server);
+    let b = brief(&server, "task.md", "do it\n");
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "refused",
+            "--harness",
+            harness,
+            "--sandbox",
+            "workspace-write",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--branch",
+            "test/sandbox-refusal",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("--sandbox is not supported by {harness}")));
+    assert!(out.stdout.is_empty());
+    assert_eq!(workspaces(&server), before, "no workspace created");
+    assert!(
+        walk(&server.base.join("wt")).is_empty(),
+        "no checkout created"
+    );
+    assert!(
+        walk(&server.base.join("state")).is_empty(),
+        "no registry or other state created"
+    );
+    assert!(agent_get(&server, "refused").is_none(), "no agent started");
+    assert!(
+        read_lines(&server.base.join("argv.log")).is_empty(),
+        "no harness launched"
+    );
+    let listing = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+        "no git checkout registered"
+    );
+}
+
+#[test]
+fn delegate_opencode_sandbox_refusal_creates_nothing() {
+    assert_sandbox_refusal_creates_nothing("opencode");
+}
+
+#[test]
+fn delegate_claude_sandbox_refusal_creates_nothing() {
+    assert_sandbox_refusal_creates_nothing("claude");
+}
+
+fn assert_recorded_sandbox(server: &Server, sandbox: &str) {
+    let status = cli(server, &["delegate", "status", "d1", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["sandbox"], sandbox);
+    let text = cli(server, &["delegate", "status", "d1"]);
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains(&format!("sandbox {sandbox}")));
+    let registry = walk(&server.base.join("state"))
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "d1.json"))
+        .expect("delegate registry entry");
+    let entry: serde_json::Value = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+    assert_eq!(entry["sandbox"], sandbox);
 }

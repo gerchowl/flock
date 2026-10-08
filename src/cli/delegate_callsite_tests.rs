@@ -318,6 +318,7 @@ fn entry_for(name: &str) -> Entry {
         repo_key: None,
         harness: "opencode".to_string(),
         model: None,
+        sandbox: None,
         round: 1,
         brief: "x".to_string(),
         submitted_at_ms: 0,
