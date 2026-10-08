@@ -208,7 +208,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
     ("pane", "close", "flk pane close <pane_id>"),
-    ("pane", "send-text", "flk pane send-text <pane_id> <text>"),
+    ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),
     ("pane", "send-keys", "flk pane send-keys <pane_id> <key> [key ...]"),
     (
         "pane",
