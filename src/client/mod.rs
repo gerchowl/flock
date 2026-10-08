@@ -6050,6 +6050,16 @@ mod tests {
     /// its own, never surfacing the drop as an error.
     #[test]
     fn a_dropped_remote_leg_redials_the_bridge_until_it_answers_again() {
+        assert_dropped_remote_leg_redials(Duration::ZERO);
+    }
+
+    #[test]
+    fn a_dropped_remote_leg_redials_after_a_delayed_first_redial() {
+        // Exceed the old bridge's 150 ms outage to exercise a delayed client.
+        assert_dropped_remote_leg_redials(Duration::from_millis(250));
+    }
+
+    fn assert_dropped_remote_leg_redials(first_redial_delay: Duration) {
         use std::os::unix::net::UnixListener;
 
         // Under /tmp, not temp_dir(): a nix-develop TMPDIR overflows sun_path.
@@ -6058,16 +6068,21 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).expect("bind fake bridge");
         let bridge_socket = socket.clone();
+        let (failed_dial_tx, failed_dial_rx) = std::sync::mpsc::channel();
+        let (listening_tx, listening_rx) = std::sync::mpsc::channel();
         let fake_bridge = std::thread::spawn(move || {
-            // The live session, then the drop: accept and hang up at once.
+            // Close the listener before EOF can trigger the first redial.
             let (first, _) = listener.accept().expect("first accept");
-            drop(first);
-            // The transport is gone: dials fail for a while.
             drop(listener);
             let _ = std::fs::remove_file(&bridge_socket);
-            std::thread::sleep(Duration::from_millis(150));
+            drop(first);
+            // Stay down until a redial has actually failed, regardless of scheduling.
+            failed_dial_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("client observed a failed redial");
             // Back: a fresh listener answers the redial.
             let listener = UnixListener::bind(&bridge_socket).expect("rebind fake bridge");
+            listening_tx.send(()).expect("notify client bridge is back");
             let (mut second, _) = listener.accept().expect("redial accept");
             second.write_all(b"k").expect("answer the redial");
             let _ = std::fs::remove_file(&bridge_socket);
@@ -6087,7 +6102,28 @@ mod tests {
             result = Some(attach_until_done(
                 |_stdin| {
                     attempts += 1;
-                    attach_over_socket(&socket, &attached)
+                    if attempts == 2 {
+                        std::thread::sleep(first_redial_delay);
+                    }
+                    let result = attach_over_socket(&socket, &attached);
+                    if attempts == 2 {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(AttachAttemptError::Handshake(
+                                    ClientError::ConnectionFailed(_)
+                                ))
+                            ),
+                            "the first redial must reach the unavailable bridge"
+                        );
+                        failed_dial_tx
+                            .send(())
+                            .expect("notify bridge of failed dial");
+                        listening_rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("bridge listening for the next redial");
+                    }
+                    result
                 },
                 &attached,
                 Some(&plan),
