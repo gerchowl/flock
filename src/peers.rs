@@ -1578,7 +1578,8 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
 /// operator's ssh config runs its own child ssh for the jump hop, which reads
 /// the config afresh and does NOT inherit `ControlMaster=no` — that hop can
 /// still ride a mux.
-pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 12] = [
+pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 13] = [
+    "-C",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -2109,6 +2110,10 @@ mod tests {
         );
         // flock's own dials never ride, or leave behind, a shared mux.
         assert!(logs.contains("ControlMaster=no") && logs.contains("ControlPath=none"));
+        assert!(
+            logs.contains("-C"),
+            "peer dial must enable compression: {logs}"
+        );
     }
 
     /// ssh cannot say its agent is gone — that is a debug-level message — so
