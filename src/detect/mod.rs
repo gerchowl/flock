@@ -359,6 +359,11 @@ pub(crate) fn claude_composer(screen: &str) -> Option<String> {
     agents::claude_code::prompt_input(screen)
 }
 
+/// Read the Codex prompt and footer bounds from the unscrolled snapshot.
+pub(crate) fn codex_composer_region(screen: &str) -> Option<(usize, usize)> {
+    agents::codex::composer_region(screen)
+}
+
 /// Whether this screen is Claude Code's folder-trust dialog and nothing else.
 ///
 /// The public seam for the `delegate` readiness gate (#612): a caller that has
