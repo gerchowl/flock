@@ -3,7 +3,7 @@
 # managed by flock; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=claude
-# FLOCK_INTEGRATION_VERSION=9
+# FLOCK_INTEGRATION_VERSION=10
 #
 # Thin stub (#158). The hook body — parse the payload, report over the flock
 # socket, scrape the transcript, lift the recap sentinel, emit the Stop nudge —
@@ -13,8 +13,16 @@
 # stdout, which we pass through untouched.
 #
 # FLOCK_BIN is stamped into the pane env by flock (falls back to `flk` on PATH).
-# A hook must never fail the parent agent, so a missing binary or any error is
-# a silent no-op: we swallow stderr and always exit 0.
+# Outside a flock pane this is a clean no-op. A missing binary inside a pane
+# is a dependency error, reported once without failing the parent agent.
+[ "${FLOCK_ENV:-}" = "1" ] || exit 0
+[ -n "${FLOCK_SOCKET_PATH:-}" ] || exit 0
+[ -n "${FLOCK_PANE_ID:-}" ] || exit 0
+flock_bin="${FLOCK_BIN:-flk}"
+if ! command -v "$flock_bin" >/dev/null 2>&1; then
+    printf 'flock hook: required binary %s not found or not executable\n' "$flock_bin" >&2
+    exit 0
+fi
 
-"${FLOCK_BIN:-flk}" hook claude "${1:-}" 2>/dev/null
+"$flock_bin" hook claude "${1:-}" 2>/dev/null
 exit 0
