@@ -139,6 +139,9 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    /// Installed from the API listener during server startup.
+    pub(crate) node_id: Option<String>,
+    pub(crate) clone_detection_warning: Option<String>,
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
@@ -913,6 +916,8 @@ impl App {
             self_compact_deadline: None,
             restarts: Default::default(),
             event_hub,
+            node_id: None,
+            clone_detection_warning: None,
             last_focus,
             no_session,
             input_rx: None,
