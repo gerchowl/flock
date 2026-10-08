@@ -156,6 +156,46 @@ fn has_codex_current_prompt(content: &str) -> bool {
     codex_current_prompt_region(content).is_some()
 }
 
+/// Prompt and footer line indices in the live bottom-buffer composer.
+pub(in crate::detect) fn composer_region(content: &str) -> Option<(usize, usize)> {
+    let lines: Vec<_> = content.lines().collect();
+    let prompt = lines.iter().rposition(|line| codex_prompt_line(line))?;
+    let footer = lines[prompt + 1..]
+        .iter()
+        .position(|line| composer_footer(line))?;
+    let footer = prompt + 1 + footer;
+    // Bullets inside a draft are input, but output below the footer means
+    // this is no longer the live composer.
+    if lines[footer + 1..]
+        .iter()
+        .any(|line| codex_block_marker_line(line))
+    {
+        return None;
+    }
+    Some((prompt, footer))
+}
+
+fn composer_footer(line: &str) -> bool {
+    if line.contains("? for shortcuts") || line.contains("context left") {
+        return true;
+    }
+    // Codex 0.160.1 can show only its model/effort and directory status line.
+    // Require all three fields, below the prompt, rather than banner text.
+    let Some((model_effort, directory)) = line.trim().split_once(" · ") else {
+        return false;
+    };
+    let Some((model, effort)) = model_effort.split_once(' ') else {
+        return false;
+    };
+    model.to_ascii_lowercase().starts_with("gpt-")
+        && !model.chars().any(char::is_whitespace)
+        && matches!(
+            effort,
+            "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        )
+        && (directory.starts_with('/') || directory.starts_with("~/"))
+}
+
 fn codex_current_prompt_region(content: &str) -> Option<(Vec<&str>, usize)> {
     let lines: Vec<&str> = content.lines().collect();
     let prompt_index = lines.iter().rposition(|line| codex_prompt_line(line))?;
@@ -171,10 +211,12 @@ fn codex_current_prompt_region(content: &str) -> Option<(Vec<&str>, usize)> {
 }
 
 fn codex_prompt_line(line: &str) -> bool {
+    let line = line.trim_start();
     line == "›" || line.starts_with("› ")
 }
 
 fn codex_block_marker_line(line: &str) -> bool {
+    let line = line.trim_start();
     line.starts_with('•') || line.starts_with('■') || line.starts_with('✗') || line.starts_with('✓')
 }
 
@@ -267,3 +309,7 @@ mod tests {
         assert_eq!(detect("enter confirm · esc skip"), AgentState::Idle);
     }
 }
+
+#[cfg(test)]
+#[path = "codex/submit_721_tests.rs"]
+mod submit_721_tests;
