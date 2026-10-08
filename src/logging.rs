@@ -3626,13 +3626,35 @@ pub(crate) fn api_connection_failed(err: &str) {
     );
 }
 
-pub(crate) fn api_listener_accept_failed(err: &str) {
-    tracing::error!(
+pub(crate) fn api_listener_accept_failed(err: &str, failures: u64, fatal: bool) {
+    if fatal {
+        tracing::error!(
+            event = "api.listener.accept",
+            subsystem = "api",
+            outcome = "stopped",
+            err,
+            failures,
+            "api listener stopped after accept failure"
+        );
+    } else {
+        tracing::warn!(
+            event = "api.listener.accept",
+            subsystem = "api",
+            outcome = "retrying",
+            err,
+            failures,
+            "api listener accept failed, retrying"
+        );
+    }
+}
+
+pub(crate) fn api_listener_accept_recovered(failures: u64) {
+    tracing::info!(
         event = "api.listener.accept",
         subsystem = "api",
-        outcome = "error",
-        err,
-        "api listener accept failed"
+        outcome = "recovered",
+        failures,
+        "api listener accept recovered"
     );
 }
 
@@ -6346,11 +6368,11 @@ mod tests {
         assert!(conn.contains("err=\"framing\""), "{conn}");
         assert!(conn.contains("WARN"), "{conn}");
 
-        let accept = capture_logs(|| api_listener_accept_failed("EBADF"));
+        let accept = capture_logs(|| api_listener_accept_failed("EBADF", 1, true));
         assert!(accept.contains("event=\"api.listener.accept\""), "{accept}");
         assert!(
             accept.contains("ERROR"),
-            "accept-loop dying is ERROR — the server can no longer take new clients: {accept}"
+            "accept failure is ERROR — new clients must wait for the listener to retry: {accept}"
         );
 
         let timeout = capture_logs(|| api_connection_write_timeout_unavailable("ENOTSOCK"));
