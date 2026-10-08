@@ -3,6 +3,7 @@ mod codex_hook_trust;
 mod jsonc;
 pub(crate) mod launch;
 mod mcp_config;
+pub(crate) mod sync;
 pub(crate) use mcp_config::pinned_path_notices;
 use std::fs;
 use std::io;
