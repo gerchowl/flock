@@ -120,3 +120,5 @@ An earlier round of the numbers above included a "0.01s LAN" figure that was
 a merged commit message before being caught. `/usr/bin/time -p ssh … | grep
 real` times a failure just as happily as a success. Check exit status when
 timing network calls.
+
+See [ADR-0026](0026-mesh-fleet-transport.md) (accepted 2026-10-08) for mesh mode.

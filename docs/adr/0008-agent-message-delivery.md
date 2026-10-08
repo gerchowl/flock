@@ -120,3 +120,5 @@ be revisited if the guarantee firms up.
 **A fourth `flk msg` transport of its own.** Rejected on DRY grounds: peer
 federation already exists for cross-host traffic. If it cannot carry a message
 record, that is the thing to fix.
+
+See [ADR-0026](0026-mesh-fleet-transport.md) (accepted 2026-10-08) for mesh mode.
