@@ -76,6 +76,9 @@ pub(crate) struct MailboxRegistry {
     /// newest `MAX_SEEN` no longer wakes, exactly as a reply to a delivered
     /// message that aged out of `history` does not.
     relayed_questions: HashSet<String>,
+    /// Questions whose SSH result is pending. A reply can arrive before the
+    /// sending SSH process exits. Counts cover concurrent retries of one id.
+    relaying_questions: HashMap<String, usize>,
     /// Insertion order of `relayed_questions`, for eviction.
     relayed_questions_order: VecDeque<String>,
 }
@@ -643,6 +646,23 @@ impl MailboxRegistry {
             .or_else(|| self.queued_message(correlation_id).map(|m| m.intent))
             .is_some_and(MsgIntent::wakes)
             || self.relayed_questions.contains(correlation_id)
+            || self.relaying_questions.contains_key(correlation_id)
+    }
+
+    pub(crate) fn start_relaying_question(&mut self, correlation_id: &str) {
+        *self
+            .relaying_questions
+            .entry(correlation_id.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn finish_relaying_question(&mut self, correlation_id: &str) {
+        if let Some(count) = self.relaying_questions.get_mut(correlation_id) {
+            *count -= 1;
+            if *count == 0 {
+                self.relaying_questions.remove(correlation_id);
+            }
+        }
     }
 
     /// Remember a waking message that left for another host, so its answer
