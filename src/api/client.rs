@@ -11,6 +11,8 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 
+const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
+
 /// API connection target resolved by clients at the process edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionTarget {
@@ -145,10 +147,10 @@ impl ApiClient {
         let protocol = response
             .pointer("/result/protocol")
             .and_then(serde_json::Value::as_u64);
-        if protocol != Some(u64::from(crate::protocol::PROTOCOL_VERSION)) {
+        if protocol.is_none_or(|version| version < u64::from(MIN_ALLOCATION_PREVIEW_PROTOCOL)) {
             return Err(ApiClientError::Io(io::Error::other(format!(
-                "allocation preview requires server protocol {}, received {protocol:?}; update the server before retrying --dry-run",
-                crate::protocol::PROTOCOL_VERSION,
+                "allocation preview requires server protocol {} or newer, received {protocol:?}; update the server before retrying --dry-run",
+                MIN_ALLOCATION_PREVIEW_PROTOCOL,
             ))));
         }
         Ok(())
@@ -287,7 +289,7 @@ mod tests {
             let ping: Request = read_json_line(&mut reader).unwrap();
             assert!(matches!(ping.method, Method::Ping(_)));
             let response = serde_json::json!({"id": ping.id, "result": {
-                "type": "pong", "version": "old", "protocol": crate::protocol::PROTOCOL_VERSION - 1,
+                "type": "pong", "version": "old", "protocol": MIN_ALLOCATION_PREVIEW_PROTOCOL - 1,
             }});
             writeln!(reader.get_mut(), "{response}").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -317,6 +319,51 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn allocation_dry_run_accepts_protocol_27() {
+        let path = std::env::temp_dir().join(format!("f459-new-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: Request = read_json_line(&mut reader).unwrap();
+            assert!(matches!(ping.method, Method::Ping(_)));
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id": ping.id, "result": {
+                    "type": "pong", "version": "future", "protocol": 27,
+                }})
+            )
+            .unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let request: Request = read_json_line(&mut reader).unwrap();
+            assert!(request.method.is_allocation_preview());
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id": request.id, "result": {
+                    "type": "allocation_plan", "operation": "worktree.create", "plan": {},
+                }})
+            )
+            .unwrap();
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let response = client
+            .request_value(&Request {
+                id: "preview".into(),
+                method: Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                    dry_run: true,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        assert_eq!(response["result"]["type"], "allocation_plan");
+        server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

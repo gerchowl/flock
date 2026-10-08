@@ -54,15 +54,14 @@ impl App {
         &mut self,
         id: String,
         source_ws_idx: usize,
-        cwd: Option<String>,
+        cwd: PathBuf,
         label: Option<String>,
         focus: bool,
     ) -> String {
-        let cwd_override = cwd.map(PathBuf::from);
         let ws_idx = match self.create_sibling_workspace_from(
             Some(source_ws_idx),
             label,
-            cwd_override,
+            Some(cwd),
             focus,
         ) {
             Ok(ws_idx) => ws_idx,
@@ -100,30 +99,14 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
+        let sibling = self.state.tab_mode == crate::config::TabModeConfig::Workspace;
+        let cwd = self.resolve_tab_create_cwd(Some(ws_idx), cwd.map(PathBuf::from), sibling);
         if dry_run {
-            let sibling = self.state.tab_mode == crate::config::TabModeConfig::Workspace;
-            let follow_cwd = if sibling {
-                self.seed_cwd_from_workspace(ws_idx)
-            } else {
-                self.state
-                    .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-                    .and_then(|rt| rt.cwd())
-            };
-            let pinned_cwd = sibling
-                .then(|| {
-                    crate::app::creation::sibling_spawn_seed(self.state.workspaces.get(ws_idx)).1
-                })
-                .flatten();
-            let resolved_cwd = cwd
-                .as_ref()
-                .map(PathBuf::from)
-                .or(pinned_cwd)
-                .unwrap_or_else(|| self.resolve_new_terminal_cwd(follow_cwd));
             return super::responses::encode_allocation_plan(
                 id,
                 "tab.create",
                 serde_json::json!({
-                    "workspace_id": self.public_workspace_id(ws_idx), "cwd": resolved_cwd,
+                    "workspace_id": self.public_workspace_id(ws_idx), "cwd": cwd,
                     "placement": if sibling { "sibling_workspace" } else { "tab" },
                     "label": label, "focus": focus,
                 }),
@@ -133,16 +116,9 @@ impl App {
         // The keyboard path branches here; this one did not, so an agent
         // calling tab.create grew an inner tab that the workspace-mode strip
         // never shows and that carries none of the space grouping.
-        if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+        if sibling {
             return self.create_sibling_workspace_for_api(id, ws_idx, cwd, label, focus);
         }
-        let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
-            let follow_cwd = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-                .and_then(|rt| rt.cwd());
-            self.resolve_new_terminal_cwd(follow_cwd)
-        });
         let (rows, cols) = self.state.estimate_pane_size();
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
@@ -375,6 +351,50 @@ mod tests {
                 .map(|space| space.key.as_str()),
             Some("/repo/flock/.git")
         );
+    }
+
+    #[tokio::test]
+    async fn allocation_dry_run_tab_preview_pins_sibling_checkout_cwd() {
+        let mut app = test_app();
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        let checkout = std::env::temp_dir().join("flock-preview-sibling-checkout");
+        let override_cwd = std::env::temp_dir().join("flock-preview-sibling-override");
+        let mut ws = crate::workspace::Workspace::test_new("preview-sibling");
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "preview-repo".into(),
+            label: "preview".into(),
+            repo_root: checkout.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        let source_id = ws.id.clone();
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminals = app.state.terminals.len();
+        for cwd in [None, Some(override_cwd.clone())] {
+            let expected = cwd.clone().unwrap_or_else(|| checkout.clone());
+            let response = app.handle_api_request(Request {
+                id: "preview".into(),
+                method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                    dry_run: true,
+                    workspace_id: Some(source_id.clone()),
+                    cwd: cwd.map(|path| path.display().to_string()),
+                    focus: true,
+                    label: None,
+                }),
+            });
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["plan"]["placement"], "sibling_workspace");
+            assert_eq!(
+                response["result"]["plan"]["cwd"],
+                expected.display().to_string()
+            );
+            assert_eq!(app.state.workspaces.len(), 1);
+            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+            assert_eq!(app.state.terminals.len(), terminals);
+            assert_eq!(app.terminal_runtimes.len(), 0);
+        }
     }
 
     /// The default mode is unchanged: a tab is still a tab.
