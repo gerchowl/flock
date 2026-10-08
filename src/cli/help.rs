@@ -196,7 +196,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "read",
-        "flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]",
+        super::pane::PANE_READ_USAGE,
     ),
     (
         "pane",
@@ -208,9 +208,9 @@ const VERBS: &[(&str, &str, &str)] = &[
         "move",
         "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
-    ("pane", "close", "flk pane close <pane_id>"),
+    ("pane", "close", super::pane::PANE_CLOSE_USAGE),
     ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),
-    ("pane", "send-keys", "flk pane send-keys <pane_id> <key> [key ...]"),
+    ("pane", "send-keys", super::pane::PANE_SEND_KEYS_USAGE),
     (
         "pane",
         "arm-self-compact",
@@ -406,6 +406,16 @@ pub(super) fn help_usage(args: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{asks_for_help, help_usage, LITERAL_TEXT, VERBS};
+
+    #[test]
+    fn pane_verb_help_documents_targets_and_precedence() {
+        for verb in ["read", "send-text", "send-keys", "close"] {
+            let usage = usage_for(&["pane", verb, "--help"]).unwrap();
+            assert!(usage.contains(&format!("flk pane {verb} <target>")));
+            assert!(usage.contains("pane id, terminal id, or unique agent name/label"));
+            assert!(usage.contains("A pane id wins over a same-named agent"));
+        }
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         std::iter::once("flk")
