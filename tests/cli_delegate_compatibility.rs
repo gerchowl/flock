@@ -1,4 +1,4 @@
-//! Version gates run through the CLI and an isolated socket, before any work.
+//! Capability-failure diagnosis through the CLI and an isolated socket.
 #![allow(clippy::disallowed_methods)] // The harness drives the compiled binary.
 
 use std::io::{BufRead, BufReader, Write};
@@ -38,6 +38,7 @@ fn run(
     args: &[&str],
     version: Option<&str>,
     error: Option<serde_json::Value>,
+    ping_stalls: bool,
 ) -> (std::process::Output, Vec<String>) {
     let dir = TempDir::new();
     let socket = dir.path().join("api.sock");
@@ -51,6 +52,23 @@ fn run(
             other => other,
         })
         .collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in socket.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let registry = dir
+        .path()
+        .join("flock-dev/delegates")
+        .join(format!("{hash:016x}"));
+    std::fs::create_dir_all(&registry).unwrap();
+    let entry = serde_json::json!({
+        "name":"fixture", "terminal_id":"term_fixture", "pane_id":"w1:p1",
+        "root_pane":"w1:p0", "workspace_id":"w1", "mode":"cwd", "worktree":null,
+        "branch":null, "harness":"codex", "model":null, "round":1,
+        "brief":brief, "submitted_at_ms":0, "cursor":"term_fixture:0:0:0:i", "created_at_ms":0
+    });
+    std::fs::write(registry.join("fixture.json"), entry.to_string()).unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -77,12 +95,24 @@ fn run(
                 .unwrap();
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let method = request["method"].as_str().unwrap().to_owned();
+            methods.push(method.clone());
+            if method == "ping" && ping_stalls {
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                break;
+            }
             let response = if method == "ping" {
                 serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":1}})
+            } else if let Some(error) = &error {
+                serde_json::json!({"id":request["id"],"error":error})
+            } else if method == "agent.get" {
+                serde_json::json!({"id":request["id"],"result":{"agent":{
+                    "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle"
+                }}})
             } else {
-                serde_json::json!({"id":request["id"],"error":error.clone().unwrap_or_else(|| serde_json::json!({"code":"pane_not_found","message":"fixture pane missing"}))})
+                serde_json::json!({"id":request["id"],"result":{"text":"fixture reply"}})
             };
-            methods.push(method);
             writeln!(stream, "{response}").unwrap();
         }
         methods
@@ -100,80 +130,159 @@ fn run(
     (output, server.join().unwrap())
 }
 
+fn unknown_variant() -> serde_json::Value {
+    serde_json::json!({"code":"invalid_request", "message":"unknown variant `agent.result`, expected one of `ping`, `agent.list`"})
+}
+
 #[test]
-fn delegate_old_server_is_rejected_before_any_work() {
-    for verb in ["start", "send", "wait", "result", "status", "reap"] {
-        let args = if verb == "start" {
-            vec![
-                "delegate", verb, "fixture", "--brief", "BRIEF", "--cwd", "CWD",
-            ]
-        } else {
-            vec!["delegate", verb, "fixture"]
-        };
-        let (output, methods) = run(&args, Some("0.6.8-fork.9ebb536"), None);
+fn agent_result_success_has_no_diagnostic_ping() {
+    let (output, methods) = run(&["agent", "result", "fixture"], None, None, false);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(methods, ["agent.result"]);
+}
+
+#[test]
+fn delegate_success_has_no_diagnostic_ping() {
+    let (output, methods) = run(&["delegate", "status", "fixture"], None, None, false);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(methods, ["agent.get", "agent.get"]);
+}
+
+#[test]
+fn agent_result_old_server_names_version_gap() {
+    let (output, methods) = run(
+        &["agent", "result", "fixture"],
+        Some("0.6.8-fork.9ebb536"),
+        Some(unknown_variant()),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("flk agent result needs a server ≥ 0.9.0 (running: 0.6.8-fork.9ebb536); hand it off with `flk server live-handoff` or upgrade and restart it"), "{stderr}");
+    assert!(!stderr.contains("unknown variant"));
+    assert_eq!(methods, ["agent.result", "ping"]);
+}
+
+#[test]
+fn unknown_or_supported_version_preserves_original_error() {
+    for version in [
+        None,
+        Some("unparseable"),
+        Some("0.9.0"),
+        Some("0.9.0-preview.abc"),
+        Some("0.10.0+build"),
+    ] {
+        let (output, methods) = run(
+            &["agent", "result", "fixture"],
+            version,
+            Some(unknown_variant()),
+            false,
+        );
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("flk delegate needs a server ≥ 0.9.0 (running: 0.6.8-fork.9ebb536)"),
+            stderr.contains("unknown variant `agent.result`, expected one of `ping`, `agent.list`"),
             "{stderr}"
         );
-        assert!(stderr.contains("flk server live-handoff"));
-        assert_eq!(methods, ["ping"]);
+        assert!(!stderr.contains("needs a server"));
+        assert_eq!(methods, ["agent.result", "ping"]);
     }
 }
 
 #[test]
-fn agent_result_old_or_unknown_server_is_rejected_before_lookup() {
-    for version in [Some("0.8.0"), None, Some("unparseable")] {
-        let (output, methods) = run(&["agent", "result", "fixture"], version, None);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("flk agent result needs a server ≥ 0.9.0"));
-        assert_eq!(methods, ["ping"]);
-    }
-}
-
-#[test]
-fn agent_result_supported_versions_preserve_unrelated_errors() {
-    for version in ["0.9.0", "0.9.0-preview.abc", "0.10.0+build", "1.0.0"] {
-        let (output, methods) = run(&["agent", "result", "fixture"], Some(version), None);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("pane_not_found"));
-        assert_eq!(methods, ["ping", "agent.result"]);
-    }
-}
-
-#[test]
-fn agent_result_unknown_variant_names_version_gap_without_variant_list() {
-    let error = serde_json::json!({"code":"invalid_request", "message":"unknown variant `agent.result`, expected one of `ping`, `agent.list`"});
-    let (output, methods) = run(&["agent", "result", "fixture"], Some("0.9.0"), Some(error));
+fn diagnostic_ping_timeout_preserves_original_error() {
+    let started = std::time::Instant::now();
+    let (output, methods) = run(
+        &["agent", "result", "fixture"],
+        None,
+        Some(unknown_variant()),
+        true,
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("flk agent result needs a server ≥ 0.9.0 (running: 0.9.0)"));
-    assert!(!stderr.contains("unknown variant"));
-    assert_eq!(methods, ["ping", "agent.result", "ping"]);
+    assert!(
+        stderr.contains("unknown variant `agent.result`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("needs a server"));
+    assert_eq!(methods, ["agent.result", "ping"]);
+}
+
+#[test]
+fn unrelated_errors_have_no_diagnostic_ping() {
+    let error = serde_json::json!({"code":"pane_not_found","message":"fixture pane missing"});
+    let (output, methods) = run(
+        &["agent", "result", "fixture"],
+        Some("0.6.8"),
+        Some(error),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("fixture pane missing"));
+    assert_eq!(methods, ["agent.result"]);
 }
 
 #[test]
 fn delegate_unknown_variant_names_version_gap() {
-    let error = serde_json::json!({"code":"invalid_request", "message":"unknown variant `agent.get`, expected one of `ping`"});
     let (output, methods) = run(
-        &[
-            "delegate", "start", "fixture", "--brief", "BRIEF", "--cwd", "CWD",
-        ],
-        Some("0.9.0"),
-        Some(error),
+        &["delegate", "status", "fixture"],
+        Some("0.6.8-fork.9ebb536"),
+        Some(unknown_variant()),
+        false,
     );
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("flk delegate needs a server ≥ 0.9.0"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("flk delegate needs a server ≥ 0.9.0 (running: 0.6.8-fork.9ebb536); hand it off with `flk server live-handoff` or upgrade and restart it"), "{stderr}");
     assert!(!stderr.contains("unknown variant"));
-    assert!(methods.len() >= 2);
+    assert_eq!(methods, ["agent.get", "ping"]);
+}
+
+#[test]
+fn delegate_missing_turn_cursor_diagnoses_only_confirmed_old_server() {
+    for version in [Some("0.6.8-fork.9ebb536"), None, Some("0.9.0")] {
+        let (output, methods) = run(
+            &["delegate", "send", "fixture", "--brief", "BRIEF"],
+            version,
+            None,
+            false,
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if version == Some("0.6.8-fork.9ebb536") {
+            assert!(
+                stderr
+                    .contains("flk delegate needs a server ≥ 0.9.0 (running: 0.6.8-fork.9ebb536)"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("flk server live-handoff"));
+        } else {
+            assert!(
+                stderr.contains("the server's record carried no turn cursor"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("needs a server"));
+        }
+        assert_eq!(methods, ["agent.get", "agent.get", "ping"]);
+    }
+}
+
+#[test]
+fn unknown_method_diagnoses_confirmed_old_server() {
+    let error =
+        serde_json::json!({"code":"unknown_method", "message":"unknown method agent.result"});
+    let (output, methods) = run(
+        &["agent", "result", "fixture"],
+        Some("0.8.0"),
+        Some(error),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("flk agent result needs a server ≥ 0.9.0 (running: 0.8.0)"));
+    assert_eq!(methods, ["agent.result", "ping"]);
 }

@@ -809,7 +809,6 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    super::compatibility::require_turn_server("flk agent result")?;
     let response = super::send_request(&Request {
         id: "cli:agent:result".into(),
         method: Method::AgentResult(crate::api::schema::AgentResultParams {
@@ -819,7 +818,7 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
         }),
     })?;
     if let Some(message) =
-        super::compatibility::unknown_variant_message(&response, "flk agent result")
+        super::compatibility::capability_error_message(&response, "flk agent result")
     {
         return Err(std::io::Error::other(message));
     }
