@@ -49,6 +49,8 @@ The sidebar rolls state upward.
 
 A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
 
+OpenCode provider quota and rate-limit retry screens count as blocked, even while the progress bar animates. `agent get` reports `blocked_reason: "provider_limit"` and `retry_after_ms` while that screen is live. The sidebar and attention notifications show the provider reason and retry time; blocked-alert digests retain those details. Detection returns to working or idle when the provider wait clears; Flock leaves subscription overlays for you to handle.
+
 An unselected tab in the tab strip wears the tint of its own panes, so a blocked agent waiting in a background tab is visible in the strip rather than hidden behind a tab number. The selected tab stays accent — the tint speaks for tabs you are not looking at, and is drawn dimmed so it never shouts over the one you are in. The strip is only drawn for the active workspace, so this tells you about that workspace's tabs and nothing about another workspace's.
 
 This is the main Flock workflow: start several agents, let them work in parallel, and use the sidebar to see which project needs a decision, which one is still running, and which one is ready to review.
@@ -255,7 +257,7 @@ change it; `--settle 0` settles on the sample after the first qualifying one).
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
-flk agent send worker "review the auth module" && flk pane send-keys 1-2 Enter
+flk agent send --submit worker "review the auth module"
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
@@ -320,9 +322,11 @@ flk agent history reviewer --detail full --cursor "$next"
 
 `agent history` reads the agent's own session transcript, one entry per turn,
 unwrapped, with a cursor so a poll reads only what was appended. It touches no
-pane state, so polling it is safe. It reads Claude's session transcript and
-opencode's session database (read-only); for any other agent it refuses with
-`unsupported_for_agent` rather than inventing an answer.
+pane state, so polling it is safe. `--detail` accepts `reply` (the default),
+`collapsed`, or `full`; `--limit` defaults to 20 and is capped at 200. Pass the
+response's `next_cursor` as `--cursor` to continue reading. It reads Claude's
+session transcript and opencode's session database (read-only); for any other
+agent it refuses with `unsupported_for_agent` rather than inventing an answer.
 
 **To learn how a delegated task went, read its result:**
 
@@ -350,6 +354,8 @@ flk delegate send reviewer --brief ./briefs/follow-ups.md --await
 `--harness` picks the agent, `opencode` (the default), `claude`, or `codex`; `--model M` is passed through to it as `--model M`. With `claude`, a fresh worktree is a folder Claude has no trust record for, so it stops on its folder-trust dialog — the delegate names that dialog and refuses rather than typing the brief at it (#605), and `flk delegate` cannot pre-trust the folder for you.
 
 Codex delegates default to `codex --ask-for-approval never --sandbox workspace-write [--model M]`. The workspace-write sandbox blocks the network, so a delegate that must `git push` or use `gh` needs `flk delegate start ... --harness codex --sandbox danger-full-access`, chosen deliberately by the caller. This opt-in grants full filesystem and network access. Codex also accepts `--sandbox read-only`; other harnesses reject `--sandbox`. Hook trust still applies: a live hook-review dialog is refused before the brief is submitted; run `flk integration install codex` to trust flock’s own hook. The SessionStart hook reports the rollout session used for results.
+
+OpenCode `delegate start` waits up to 15 seconds for a new turn after its pre-submit cursor. If no turn starts, it retries once only when the composer visibly holds the brief (Enter only) or shows an empty prompt (retype and Enter), then waits within a second 15-second window. If submission remains unconfirmed, it exits 1 and keeps the workspace and registry for inspection; use `flk delegate reap <name>` to remove them. A startup session report alone does not confirm submission.
 
 The brief is a file and exactly one sentence is typed into the agent: `Read <absolute path> and execute it exactly.` Settling is not finishing, so the await reports a round only when the agent actually worked on it and wrote a reply after the brief was submitted — `send` cannot report the previous round's answer as this one's. `flk delegate reap` removes what was recorded; `flk delegate status` and `flk delegate result` read without waiting. See the CLI reference for the flags and exit codes.
 
@@ -382,3 +388,27 @@ Use `flk terminal attach <terminal_id>` when you want the same direct attach beh
 ## Give an agent read-mostly access to the flock
 
 Point an MCP-capable agent at `flk mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, tear down finished worktree spaces, and — for Claude — fork a conversation or send/reply pane-to-pane messages. `flock_worktree_kill` defaults to a dry run; pass `dry_run: false` to remove the checkout, and `self: true` for a real kill of the calling pane's own workspace. Branch deletion requires positive merge evidence. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table. The same server exposes files a human has dropped on a pane as MCP **resources**, so an agent can list and read what it was handed instead of scraping the path out of its own input surface.
+
+## Restarting an agent
+
+An agent can ask Flock to restart its own process without changing conversations:
+
+```sh
+flk agent restart self --reason "reload MCP configuration" --continue-with "finish the assigned task"
+```
+
+Over MCP, call the self-only `flock_agent_restart` with `reason`, optional `continue_with`,
+and `when: "after_turn"`. Both forms return immediately; finish the turn so
+Flock can stop at a settled idle boundary. The replacement retains the native
+session, original launch flags and profile environment, cwd, agent name, and
+stable agent identity. Flock verifies a fresh same-session report and ready
+prompt before queuing the continuation through the inbox wake path.
+
+A grace deadline or configured resource limit may force the restart. Its first
+message warns about incomplete tools, unconfirmed transcript flushes, and lost
+background tasks/processes. Unknown startup dialogs require the operator.
+Failures retain a resume plan and release the restart lock so an operator can
+retry with `flk agent resume <target>`. Explicit rate-limited requests leave the
+agent running. Pending restarts are cancelled and reported during server handoff.
+Operator notifications, durable lifecycle events, and messages to the spawning
+supervisor report the result. See [restart configuration](/docs/preview/configuration/#agent-restarts).

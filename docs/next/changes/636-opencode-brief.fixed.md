@@ -1,1 +1,0 @@
-- **OpenCode delegate starts now confirm that the brief started a new turn.** Startup session reports no longer count as submission evidence; a bounded confirmation allows one retry only when the composer visibly holds the brief or is empty. Unconfirmed starts exit non-zero and keep the workspace for inspection (#636).

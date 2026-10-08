@@ -806,3 +806,100 @@ timeout_s = 3
 ```
 
 `SYSTEMONE_URL` overrides `urls` with comma- or space-separated endpoints. The timeout bounds the whole ordered failover attempt. After three failed attempts, an endpoint is skipped for ten minutes. Advice appears as `s1: {fused, verdict}` in delegate JSON; it never changes the outcome or exit code. Missing or unavailable endpoints produce `s1: null`. No requests occur during polling.
+
+## Agent restarts
+
+Explicit `agent restart` / `flock_agent_restart` requests are enabled by default.
+Automatic resource interventions are opt-in: zero disables an individual hard
+limit. A requested restart still has a five-minute grace deadline.
+
+```toml
+[session.restart]
+enabled = true
+restart_grace_secs = 300
+kill_grace_secs = 10
+verify_timeout_secs = 120
+settle_ms = 2000
+fresh_ms = 2500
+operator_quiet_ms = 15000
+flush_wait_ms = 1000
+max_restarts = 3
+window_secs = 1800
+hard_rss_cap = 0               # agent process-tree RSS, bytes
+host_floor = 0                 # host available memory, bytes; heaviest agent first
+hard_spin_for_secs = 0
+spin_cpu_percent = 95.0
+hard_unresponsive_for_secs = 0  # no status/output progress while non-idle
+
+[session.restart_agents.review]
+hard_rss_cap = 8589934592
+```
+
+Per-agent overrides are keyed by the assigned agent name and use the same fields
+and defaults as `session.restart`. The host's `enabled = false` overrides all
+agents. RSS/CPU/process-tree samples run every two seconds when a restart is
+pending or an automatic limit is enabled. CPU is summed across the tree, so it
+can exceed 100% on multiple cores. Host-floor recovery stops the heaviest agent
+first and waits for its shutdown before choosing another.
+
+A graceful restart requires an empty, freshly observed idle prompt and operator
+quiet. Grace expiry still waits for operator quiet; hard resource limits may
+interrupt a busy process. Flock sends SIGTERM to the tree, then SIGKILL after
+`kill_grace_secs`, and waits for termination before launching the replacement.
+The default cap allows three restarts per agent in thirty minutes within the
+running server. Explicit requests at the cap return `restart_rate_limited`
+with `retry_after_secs` and leave the agent running. Only a forced hard-limit
+restart at the cap stops without resuming; its report includes `stop_only: true`.
+The pane can then be recovered with explicit `flk agent resume <target>`.
+
+Agents with background shells may not reach settled idle even after their turn
+ends ([known limitation #697](https://github.com/gerchowl/flock/issues/697)).
+When the grace deadline forces that case, the continuation says the restart
+happened after the idle grace, rather than claiming an interrupted turn.
+Restart requests require a supported harness and a confirmed session-reporting
+hook. Without that evidence, Flock refuses before stopping the process.
+
+A stop failure, missing runtime, failed resume, or verification failure releases
+the restart lock and retains the resume plan. Reports explain how to retry with
+`flk agent resume <target>`; stop any surviving old processes or close a running
+startup dialog first. A live replacement retains its normal status: its retry
+plan is held separately and only becomes a hibernation plan after it exits.
+For a session mismatch, the report identifies the requester's original session
+as the retry target; that session becomes the pane's stored identity on exit.
+A resumed process that exits reports its last output.
+
+Pending and verifying requests are cancelled before server handoff. Flock
+reports `restart_cancelled` in the requester's inbox, the pane's notification,
+and its recap panel; the notification and inbox report survive the handoff.
+Request a new restart after handoff if it is still needed. A handoff attempted
+while a restart's process tree is being torn down is refused until teardown
+finishes, so the new server cannot race an old reaper.
+
+Flock checks Claude's last Stop-hook reply against its transcript, opencode's
+completed final database row, or Codex's latest persisted assistant message. It
+waits up to `flush_wait_ms`; an unavailable or unconfirmed store is disclosed in
+the continuation. Background tasks reported by the last Claude Stop hook and
+snapshotted background process names/PIDs are included in agent and supervisor
+reports, excluding the harness itself and MCP server descendants, so it can recreate
+what it still needs. Other harnesses without a flush reader get the same warning.
+
+The Claude development-channel warning recorded in ADR-0019 may receive Enter
+only when the original launch requested development channels and both recorded
+controls match. Other startup dialogs require an operator-approved profile:
+
+```toml
+[[session.restart.dialogs]]
+agent = "pi"
+lines = ["Exact title of an approved startup dialog", "Exact selected control"]
+answer = "enter" # or "escape"
+```
+
+All lines must match visible controls, with at least two nonempty lines. Use a
+profile only for a known dialog you have approved; credential prompts are
+excluded even if a profile matches. Flock leaves unknown screens untouched and
+reports `restart_stuck` after the verification timeout. It changes no harness
+survey, trust, login, or update settings.
+
+The goal supervisor tracked in #573 is not implemented in this checkout, so this
+restart lifecycle does not yet re-arm or re-inject a Flock goal. Stable agent
+identity and spawning-supervisor routing are retained for that integration.
