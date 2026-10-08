@@ -61,6 +61,7 @@ mod kitty_graphics;
 mod layout;
 mod logging;
 mod mcp;
+mod mesh;
 mod pane;
 mod peer_stream;
 mod peers;

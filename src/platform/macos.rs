@@ -955,6 +955,25 @@ pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
     &["/var/run", "/private/tmp"]
 }
 
+/// Hardware UUID, independent of hostname and flock's state dir.
+pub(crate) fn machine_identity() -> std::io::Result<String> {
+    let mut id = [0u8; 16];
+    let timeout = libc::timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    // SAFETY: id points to a writable 16-byte UUID and timeout is initialized.
+    if unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if id == [0; 16] {
+        return Err(std::io::Error::other(
+            "cannot bind node identity: empty hardware UUID",
+        ));
+    }
+    Ok(id.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {

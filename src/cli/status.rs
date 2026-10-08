@@ -407,6 +407,8 @@ struct ServerStatusJson {
 #[derive(Serialize)]
 struct ServerCapabilitiesJson {
     live_handoff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -441,6 +443,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
+                    node_id: capabilities.node_id.clone(),
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),

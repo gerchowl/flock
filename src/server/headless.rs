@@ -360,11 +360,14 @@ impl HeadlessServer {
     /// 2. Binds the client socket listener
     /// 3. Returns the server ready to run
     pub fn new(
-        app: app::App,
+        mut app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
+        app.node_id = api_server
+            .as_ref()
+            .and_then(|server| server.node_id.clone());
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
@@ -1205,6 +1208,7 @@ impl HeadlessServer {
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(true)?;
 
+        self.app.node_id = api_server.node_id.clone();
         self.api_server = Some(api_server);
         self.client_listener = listener;
         self.client_socket_path = client_path;
