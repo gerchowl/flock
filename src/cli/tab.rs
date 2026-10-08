@@ -191,6 +191,7 @@ fn print_tab_help() {
     eprintln!(
         "  flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]"
     );
+    eprintln!("  --workspace places the tab in that workspace; --cwd only sets the directory.");
     eprintln!("  flk tab get <tab_id>");
     eprintln!("  flk tab focus <tab_id>");
     eprintln!("  flk tab rename <tab_id> <label>");

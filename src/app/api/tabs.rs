@@ -94,9 +94,6 @@ impl App {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
             };
-            if self.state.workspaces.get(ws_idx).is_none() {
-                return workspace_not_found(id, &workspace_id);
-            }
             ws_idx
         } else if let Some(active) = self.state.active {
             active
