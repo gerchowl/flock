@@ -46,7 +46,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Send pastes text (bracketed when enabled) without submitting. Use pane send-keys for control keys (Enter, C-c, Esc). --submit waits 120 ms, then sends Enter.\n  Use -- before the target to send text beginning with --submit literally.\n  Success reports input queued, not confirmation that the agent accepted it.";
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Send pastes text (bracketed when enabled) without submitting. Use pane send-keys for control keys (Enter, C-c, Esc). --submit requires a fresh idle agent and empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry).\n  Use -- before the target to send text beginning with --submit literally.\n  Raw send reports input queued. --submit reports accepted, observed_accepted, unconfirmed or abandoned.";
 
 pub(super) const AGENT_HISTORY_USAGE: &str =
     "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";

@@ -602,58 +602,29 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
-        let submit_pane = if params.submit {
-            let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
+        if params.submit {
+            let Some(pane) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
                 return agent_not_found(id, &params.target);
             };
-            Some(pane_id)
-        } else {
-            None
-        };
+            return self.handle_pane_submit(
+                id,
+                crate::api::schema::PaneSubmitParams {
+                    self_submit_confirmed: None,
+                    pane_id: pane,
+                    text: params.text,
+                    if_session: None,
+                    min_age_secs: 0,
+                },
+            );
+        }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
         let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
-        let child_pid = runtime.child_pid();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "agent_send_failed", err.to_string());
         }
 
-        if let Some(pane_id) = submit_pane {
-            self.pending_agent_submit = Some((id.clone(), pane_id, child_pid));
-        }
-        encode_success(id, ResponseResult::Ok {})
-    }
-
-    pub(crate) fn complete_agent_submit(
-        &mut self,
-        id: String,
-        pane: &str,
-        child_pid: Option<u32>,
-    ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
-            return agent_not_found(id, pane);
-        };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return agent_not_found(id, pane);
-        };
-        if runtime.child_pid() != child_pid {
-            return encode_error(
-                id,
-                "agent_send_failed",
-                "agent execution changed before submit",
-            );
-        }
-        let enter = runtime.encode_terminal_key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::empty(),
-            )
-            .into(),
-        );
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(enter)) {
-            return encode_error(id, "agent_send_failed", err.to_string());
-        }
         encode_success(id, ResponseResult::Ok {})
     }
 }
@@ -702,7 +673,11 @@ mod tests {
     #[should_panic(expected = "deferred agent submit must be consumed by respond_or_park")]
     fn agent_send_submit_cannot_be_silently_cleared_by_the_next_request() {
         let mut app = test_app();
-        app.pending_agent_submit = Some(("send".into(), "1:p1".into(), None));
+        app.pending_agent_submit = Some((
+            "send".into(),
+            "1:p1".into(),
+            crate::app::guarded_submit::Attempt::test_new(),
+        ));
         app.handle_api_request(Request {
             id: "next".into(),
             method: Method::Ping(crate::api::schema::PingParams {}),

@@ -354,6 +354,11 @@ pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool>
     }
 }
 
+/// Read the recognized Claude composer from the unscrolled detection snapshot.
+pub(crate) fn claude_composer(screen: &str) -> Option<String> {
+    agents::claude_code::prompt_input(screen)
+}
+
 /// Whether this screen is Claude Code's folder-trust dialog and nothing else.
 ///
 /// The public seam for the `delegate` readiness gate (#612): a caller that has

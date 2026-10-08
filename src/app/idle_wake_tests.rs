@@ -121,6 +121,21 @@ fn drain(pty: &mut mpsc::Receiver<Bytes>) -> Vec<Vec<u8>> {
 
 /// Run the loop tick far enough past the typing for the Enter to be due.
 fn tick_past_gap(app: &mut App) {
+    // Echo the fake child's consumed paste, as a real composer does before Enter.
+    if let Some(flight) = app
+        .idle_wake
+        .panes
+        .values()
+        .find_map(|entry| entry.in_flight.as_ref())
+    {
+        if let Some(attempt) = &flight.attempt {
+            if crate::detect::agent_prompt_is_empty(Agent::Claude, &runtime(app).detection_text())
+                == Some(true)
+            {
+                runtime(app).test_process_pty_bytes(&claude_screen(&attempt.text));
+            }
+        }
+    }
     app.tick_idle_wakes(Instant::now() + GAP + Duration::from_millis(5));
 }
 
@@ -560,17 +575,19 @@ async fn reading_the_inbox_or_leaving_idle_ends_the_flight_and_only_new_mail_wak
         false,
         now - settled(),
     );
-    tick_past_gap(&mut app);
+    app.tick_idle_wakes(Instant::now() + GAP + Duration::from_millis(100));
     claude_idle_for(&mut app, settled());
     tick_past_gap(&mut app);
     assert!(drain(&mut pty).is_empty(), "announced mail is not re-typed");
 
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
     // A NEW message after the agent left Idle earns its own wake.
     send(&mut app, &pane, "c-2", MsgIntent::NeedsReply);
     assert_eq!(drain(&mut pty), vec![super::idle_wake_text(2).into_bytes()]);
     tick_past_gap(&mut app);
     drain(&mut pty);
 
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
     // Reading clears everything; the next message starts fresh.
     read_inbox(&mut app, &pane);
     assert!(app.idle_wake.panes.is_empty());
@@ -725,4 +742,424 @@ async fn under_channel_push_a_turn_the_push_started_is_never_typed_over() {
         drain(&mut pty).is_empty(),
         "a working agent is not typed into"
     );
+}
+
+#[tokio::test]
+async fn guarded_submit_retries_only_enter_once_and_reports_unconfirmed() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let now = Instant::now();
+    let mut attempt = app
+        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+        .unwrap();
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+    assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+    assert!(drain(&mut pty).is_empty());
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+        None
+    );
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+        None
+    );
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
+        Some(Outcome::Unconfirmed("confirm_timeout"))
+    );
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn guarded_submit_never_retypes_when_composer_clears_or_dialog_appears() {
+    use super::super::guarded_submit::Outcome;
+    for dialog in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        let screen = if dialog {
+            [
+                claude_screen("hello"),
+                "\r\nEnter to select · Esc to cancel".as_bytes().to_vec(),
+            ]
+            .concat()
+        } else {
+            claude_screen("")
+        };
+        runtime(&app).test_process_pty_bytes(&screen);
+        assert_eq!(
+            app.advance_guarded_submit(
+                &pane,
+                &mut attempt,
+                now + GAP + super::super::guarded_submit::CONFIRM_WINDOW
+            ),
+            Some(Outcome::Unconfirmed("owned_composer_not_visible"))
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn guarded_submit_refuses_drafts_and_concurrent_input() {
+    use super::super::guarded_submit::Outcome;
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    runtime(&app).test_process_pty_bytes(&claude_screen("human draft"));
+    assert_eq!(
+        app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
+            .unwrap_err(),
+        "input_not_empty"
+    );
+    assert!(drain(&mut pty).is_empty());
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
+    let now = Instant::now();
+    let mut attempt = app
+        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+        .unwrap();
+    drain(&mut pty);
+    runtime(&app)
+        .try_send_bytes(Bytes::from_static(b"human edit"))
+        .unwrap();
+    drain(&mut pty);
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+        Some(Outcome::Abandoned("operator_active"))
+    );
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
+    use super::super::guarded_submit::Outcome;
+    for (text, hook, sent) in [
+        ("hello", true, true),
+        ("hello", true, false),
+        ("  hello\n world  ", true, true),
+        ("hello", false, true),
+        ("hello", false, false),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        runtime(&app).test_process_pty_bytes(b"\x1b[?2004h");
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        if sent {
+            runtime(&app).test_process_pty_bytes(&claude_screen(text));
+            assert_eq!(
+                app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+                None
+            );
+            assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        }
+        if hook {
+            let reported = app.handle_api_request(Request {
+                id: "prompt".into(),
+                method: Method::PaneReportPrompt(crate::api::schema::PaneReportPromptParams {
+                    pane_id: pane.clone(),
+                    source: "flock:claude".into(),
+                    agent: "claude".into(),
+                    prompt: text.into(),
+                    seq: Some(1),
+                }),
+            });
+            assert!(reported.contains("\"ok\""), "{reported}");
+        } else {
+            terminal(&mut app).set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Working,
+                false,
+                false,
+                true,
+                false,
+                now,
+            );
+            terminal(&mut app).set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                false,
+                now,
+            );
+        }
+        assert_eq!(
+            app.advance_guarded_submit(
+                &pane,
+                &mut attempt,
+                if !sent && hook {
+                    now + GAP / 2
+                } else {
+                    now + GAP
+                }
+            ),
+            Some(if !sent {
+                Outcome::Abandoned("turn_started_before_enter")
+            } else if hook {
+                Outcome::Accepted
+            } else {
+                Outcome::ObservedAccepted
+            })
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn guarded_client_submit_is_atomic_with_session_settle_and_serialization_gates() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let now = Instant::now();
+    assert_eq!(
+        app.begin_guarded_submit(
+            &pane,
+            "hello",
+            Some("another-session"),
+            Duration::ZERO,
+            now,
+            false
+        )
+        .unwrap_err(),
+        "session_mismatch"
+    );
+    assert_eq!(
+        app.begin_guarded_submit(&pane, "hello", None, settled() * 2, now, false)
+            .unwrap_err(),
+        "not_settled"
+    );
+    assert!(drain(&mut pty).is_empty());
+    let submit = |id: &str| Request {
+        id: id.into(),
+        method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            self_submit_confirmed: None,
+            pane_id: pane.clone(),
+            text: "hello".into(),
+            if_session: None,
+            min_age_secs: 0,
+        }),
+    };
+    let first = app.handle_api_request(submit("first"));
+    assert!(first.contains("\"ok\""), "{first}");
+    let _parked = app.pending_agent_submit.take().unwrap();
+    let competing = app.handle_api_request(submit("competing"));
+    assert!(competing.contains("injection_pending"), "{competing}");
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+}
+
+#[tokio::test]
+async fn guarded_client_rechecks_session_and_settle_before_enter() {
+    use super::super::guarded_submit::Outcome;
+    for session_change in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let report = |session: &str, seq| Request {
+            id: "session".into(),
+            method: Method::PaneReportAgentSession(
+                crate::api::schema::PaneReportAgentSessionParams {
+                    pane_id: pane.clone(),
+                    source: "flock:claude".into(),
+                    agent: "claude".into(),
+                    seq: Some(seq),
+                    agent_session_id: Some(session.into()),
+                    agent_session_path: None,
+                    session_start_source: Some("resume".into()),
+                },
+            ),
+        };
+        assert!(app
+            .handle_api_request(report("first-session", 1))
+            .contains("\"ok\""));
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(
+                &pane,
+                "hello",
+                Some("first-session"),
+                Duration::from_secs(1),
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        if session_change {
+            assert!(app
+                .handle_api_request(report("second-session", 2))
+                .contains("\"ok\""));
+        } else {
+            for state in [AgentState::Blocked, AgentState::Idle] {
+                terminal(&mut app).set_detected_state_with_screen_signals_at(
+                    Some(Agent::Claude),
+                    state,
+                    false,
+                    state == AgentState::Idle,
+                    false,
+                    false,
+                    now,
+                );
+            }
+        }
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(Outcome::Abandoned(if session_change {
+                "session_mismatch"
+            } else {
+                "not_settled"
+            }))
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn guarded_dispatch_requires_consuming_deferred_attempt() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let response = app.handle_api_request(Request {
+        id: "first".into(),
+        method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            self_submit_confirmed: None,
+            pane_id: pane.clone(),
+            text: "hello".into(),
+            if_session: None,
+            min_age_secs: 0,
+        }),
+    });
+    assert!(response.contains("ok"));
+    let (_, reserved, _) = app.pending_agent_submit.as_ref().unwrap();
+    assert!(app.active_submissions.contains(reserved));
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+    app.event_tx = event_tx;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    assert!(app.pending_agent_submit.is_none());
+    // A later dispatch must leave the scheduled attempt's reservation intact.
+    app.handle_api_request(Request {
+        id: "next".into(),
+        method: Method::AgentList(crate::api::schema::EmptyParams {}),
+    });
+    assert!(app.active_submissions.contains(&pane));
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    let crate::events::AppEvent::AgentSubmit {
+        request_id,
+        pane_id,
+        attempt,
+        respond_to,
+    } = event_rx.recv().await.unwrap()
+    else {
+        panic!("expected submit event")
+    };
+    runtime(&app).test_stamp_operator_input_at(Instant::now());
+    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    assert!(!app.active_submissions.contains(&pane));
+    assert!(receiver.recv().unwrap().contains("abandoned"));
+}
+
+#[tokio::test]
+async fn finished_idle_wakes_release_explicit_submit_reservation() {
+    use super::super::guarded_submit::CONFIRM_WINDOW;
+    for abandon in [true, false] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "finished-wake", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        assert!(app.idle_wake.in_flight(&pane));
+        if abandon {
+            runtime(&app).test_stamp_operator_input_at(Instant::now());
+            tick_past_gap(&mut app);
+        } else {
+            tick_past_gap(&mut app);
+            let now = Instant::now() + GAP + CONFIRM_WINDOW;
+            app.tick_idle_wakes(now);
+            app.tick_idle_wakes(now + CONFIRM_WINDOW);
+        }
+        assert!(!app.idle_wake.in_flight(&pane));
+        assert!(app.idle_wake.panes[&pane].in_flight.is_none());
+        runtime(&app).test_process_pty_bytes(&claude_screen(""));
+        claude_idle_for(&mut app, settled());
+        let result = app.begin_guarded_submit(
+            &pane,
+            "explicit",
+            None,
+            Duration::ZERO,
+            Instant::now() + GAP,
+            false,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn guarded_mcp_submit_requires_calling_workspace_confirmation() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let (ws, id) = app.parse_pane_id(&pane).unwrap();
+    app.test_pane_child_pids.insert(id, std::process::id());
+    app.current_api_peer_pid = Some(std::process::id());
+    let response = app.handle_api_request(Request {
+        id: "mcp".into(),
+        method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+            pane_id: pane,
+            text: "hello".into(),
+            self_submit_confirmed: Some(false),
+            if_session: None,
+            min_age_secs: 0,
+        }),
+    });
+    assert!(response.contains("self_submit_unconfirmed"), "{response}");
+    assert_eq!(app.caller_workspace_idx(), Some(ws));
+    assert!(drain(&mut pty).is_empty());
 }
