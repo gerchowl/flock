@@ -1,12 +1,13 @@
 # ADR 0026 — Mesh fleet transport and durable message custody
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-08
 - Issues: [#661](https://github.com/gerchowl/flock/issues/661),
   [#623](https://github.com/gerchowl/flock/issues/623),
   [#640](https://github.com/gerchowl/flock/issues/640).
-- Decision owner: operator. Proposed extension of ADR-0009 and clarification
-  of ADR-0008, superseding their affected transport contracts only if accepted.
+- Decision owner: operator, accepted 2026-10-08 with all recommended defaults.
+  Extends ADR-0009 and clarifies ADR-0008, superseding their affected transport
+  contracts. Acceptance records the design, not its implementation.
 - Implemented: none. No mesh implementation ships with this document.
 
 ## Evidence and scope
@@ -72,7 +73,7 @@ for an address learned only from gossip or `from_host`.
 
 Replace the one-hub guard in `relay_message_to_host` with a bounded route:
 carry the immutable message key, visited node ids and remaining hop budget
-(proposed default eight). Refuse a repeated node or exhausted budget for that
+(default eight). Refuse a repeated node or exhausted budget for that
 attempt, retain custody and seek a fresh route. Duplicate edges and changed
 routes do not create new messages. Reject forged origin claims and route
 advertisements not bound to the authenticated neighbor. Same-user SSH is the
@@ -80,7 +81,7 @@ trust boundary, not Byzantine protection against a compromised trusted hub.
 
 ## Durable outbox and acknowledgement contract
 
-**Recommended: a dedicated SQLite custody store** at
+**Use a dedicated SQLite custody store** at
 `session::data_dir()/mesh-mail.sqlite`, independent of ADR-0005's rotating
 audit log. Use the existing SQLite dependency, WAL transactions and
 `synchronous=FULL`, with durable file/directory creation. The store owns
@@ -105,7 +106,7 @@ acceptance and provide an authenticated retry operation for that same key.
 At-least-once transport produces exactly-once mailbox import within the
 retention contract, not exactly-once agent execution.
 
-Bound the store independently: recommended 256 MiB total logical data and
+Bound the store independently: 256 MiB total logical data and
 10,000 active envelopes per node, including retained inbox bodies, with a
 reserved 16 MiB within that bound for dedupe and terminal receipts. Check
 quota inside the acceptance transaction. When full, return `mail_store_full`
@@ -268,7 +269,7 @@ or delivery evidence.
 
 ## Cross-host replies and confirmations (ADR-0008 clarification)
 
-This proposal preserves ADR-0008's tool inbox and sender-authority boundary.
+This decision preserves ADR-0008's tool inbox and sender-authority boundary.
 Agent identity, location and reachability are distinct. A sender AgentId
 names a reply recipient but does not prove a live return channel. `from_host`
 is never dialing authority. Queued and delivered metadata retain the
@@ -310,7 +311,7 @@ These are implementation responsibilities, not claims of existing APIs:
 - `src/api/reply_wait.rs`: consume imported local facts, without networking.
 
 **Step-1 prerequisite: node identity bootstrap and persistence.**
-Recommended: generate an Ed25519 keypair once in the state directory with
+Generate an Ed25519 keypair once in the state directory with
 mode 0600 and fsync, derive node id from the public key, and pin the public
 key/node id exchanged on the first authenticated held SSH edge. Reconnect
 proves possession against that pinned binding. Reject unexpected replacement
@@ -322,8 +323,8 @@ subsequently closed. A direct peer that has never held an edge must
 establish one for enrollment before using step-1 durable delivery or
 collection. Until then, only explicitly opted-in legacy sends have the
 weaker contract below. Prevent cloned state directories from concurrently
-claiming the same identity. Final provisioning and key format remain an
-owner decision, but step 1 cannot defer stable identity to step 2 because
+claiming the same identity. The owner accepted this identity scheme with
+the defaults below. Step 1 cannot defer stable identity to step 2 because
 its dedupe and collection authorization depend on it.
 
 **Step 1 (#623):** dedicated store, minted message ids, durable reply outbox
@@ -399,32 +400,32 @@ quiet healthy edges retaining routes, closed edges withdrawing routes, and
 `tests/mcp_fleet_messaging.rs` supply the harness. This docs-only PR adds no
 runtime tests or behavior.
 
-## Owner decisions
+## Decisions (accepted by the owner 2026-10-08)
 
-Each recommendation below requires owner acceptance before implementation
-advertises mesh capability:
+The owner accepted all seven defaults below. Implementation must satisfy
+these decisions before advertising mesh capability:
 
-1. **TTL and resource defaults:** recommend seven days of remaining TTL,
+1. **TTL and resource defaults:** use seven days of remaining TTL,
    retry backoff 60 seconds to five minutes with jitter, hop limit eight,
    256 MiB logical store including a 16 MiB metadata reserve, and 10,000 active
    envelopes. Bound WAL/disk overhead with checkpoints and a disk-reserve guard.
-2. **Storage:** recommend the dedicated SQLite store with FULL durability and
+2. **Storage:** use the dedicated SQLite store with FULL durability and
    transactional inbox/dedupe import. Audit events remain metadata only.
-3. **Node identity:** recommend a once-generated persisted Ed25519 keypair,
+3. **Node identity:** use a once-generated persisted Ed25519 keypair,
    public-key-derived id, first-edge SSH-authenticated enrollment and pinned
    possession checks. Operator re-enrollment is required on key replacement.
-4. **Agent removed:** recommend explicit kill or permanent close/exit only
-   when no retained resumable session exists. Preserve AgentId through #582
+4. **Agent removed:** declare removal on explicit kill or permanent close/exit
+   only when no retained resumable session exists. Preserve AgentId through #582
    restart/resume, and report resume failure as offline until kill or expiry.
-5. **Final-outcome retention:** recommend seven days after local termination,
-   independent of audit rotation. After GC, return `outcome_retention_elapsed`
+5. **Final-outcome retention:** retain outcomes for seven days after local
+   termination, independent of audit rotation. After GC, return `outcome_retention_elapsed`
    for queries carrying an expired, authenticated message reference rather
    than inventing a delivery result.
-6. **Old peers:** recommend explicit opt-in legacy sends with weaker-guarantee
+6. **Old peers:** allow explicit opt-in legacy sends with weaker-guarantee
    warnings. Default durable sends stay queued for a capable path, or are
    refused before acceptance when only a legacy route is available and the
    caller does not accept queuing. Never silently downgrade accepted custody.
-7. **Hub body retention:** recommend bodies only in the bounded custody store,
+7. **Hub body retention:** retain bodies only in the bounded custody store,
    delete after durable downstream custody transfer (retain metadata/receipt)
    or local expiry, and never append them to mesh audit events. Origins and
    final inbox owners retain their own copies under their respective TTL/read

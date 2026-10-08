@@ -121,4 +121,4 @@ be revisited if the guarantee firms up.
 federation already exists for cross-host traffic. If it cannot carry a message
 record, that is the thing to fix.
 
-See [ADR-0026](0026-mesh-fleet-transport.md) (proposed) for mesh mode.
+See [ADR-0026](0026-mesh-fleet-transport.md) (accepted 2026-10-08) for mesh mode.
