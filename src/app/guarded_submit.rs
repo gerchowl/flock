@@ -306,7 +306,7 @@ impl App {
         if text.contains(['\n', '\t']) && !bytes.starts_with(b"\x1b[200~") {
             return Err("unsafe_text");
         }
-        let mut evidence = self.new_delivery_attempt(pane, wake);
+        let mut evidence = self.new_delivery_attempt(pane, wake)?;
         self.record_delivery_attempt(&evidence);
         if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
             evidence.state = "abandoned".into();
@@ -484,7 +484,7 @@ impl App {
             let _ = respond_to.send(encode_success(
                 id,
                 ResponseResult::GuardedSubmit {
-                    attempt: attempt.evidence,
+                    attempt: Some(attempt.evidence),
                     outcome: outcome.to_owned(),
                     reason,
                     retried: attempt.retried,
@@ -518,13 +518,12 @@ fn new_evidence(
 }
 
 impl App {
-    fn new_delivery_attempt(&self, pane: &str, wake: bool) -> crate::api::schema::DeliveryAttempt {
-        // The sequence remains monotonic across restarts, even within one millisecond.
-        let id = format!(
-            "attempt:{}:{}",
-            super::api::messages::now_ms(),
-            self.event_hub.current_sequence()
-        );
+    fn new_delivery_attempt(
+        &self,
+        pane: &str,
+        wake: bool,
+    ) -> Result<crate::api::schema::DeliveryAttempt, &'static str> {
+        let id = self.delivery_attempt_registry.borrow_mut().reserve_id()?;
         let ids = if wake {
             self.mailboxes
                 .queued_infos(Some(pane))
@@ -534,10 +533,13 @@ impl App {
         } else {
             Vec::new()
         };
-        new_evidence(id, pane, wake, ids)
+        Ok(new_evidence(id, pane, wake, ids))
     }
 
     pub(crate) fn record_delivery_attempt(&self, attempt: &crate::api::schema::DeliveryAttempt) {
+        self.delivery_attempt_registry
+            .borrow_mut()
+            .record(attempt.clone());
         self.emit_event(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::DeliveryAttemptUpdated,
             data: crate::api::schema::EventData::DeliveryAttemptUpdated {
@@ -564,18 +566,7 @@ impl App {
     }
 
     pub(crate) fn delivery_attempts(&self) -> Vec<crate::api::schema::DeliveryAttempt> {
-        let mut events = std::collections::BTreeMap::new();
-        for (seq, _, event) in self.event_hub.persisted_events_after(0) {
-            events.insert(seq, event);
-        }
-        events.extend(self.event_hub.events_after(0));
-        let mut attempts = std::collections::BTreeMap::new();
-        for event in events.into_values() {
-            if let crate::api::schema::EventData::DeliveryAttemptUpdated { attempt } = event.data {
-                attempts.insert(attempt.attempt_id.clone(), attempt);
-            }
-        }
-        attempts.into_values().collect()
+        self.delivery_attempt_registry.borrow().snapshot()
     }
 }
 

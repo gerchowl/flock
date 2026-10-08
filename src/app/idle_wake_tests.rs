@@ -653,6 +653,11 @@ async fn reading_the_inbox_inside_the_gap_drops_the_enter() {
     read_inbox(&mut app, &pane);
     tick_past_gap(&mut app);
     assert!(drain(&mut pty).is_empty());
+    assert_eq!(app.delivery_attempts()[0].state, "abandoned");
+    assert_eq!(
+        app.delivery_attempts()[0].reason.as_deref(),
+        Some("inbox_read")
+    );
 }
 
 /// A message relayed in from another host arrives as a `msg.send` carrying
@@ -1226,6 +1231,18 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
         }))
         .unwrap()
     };
+    // Polling must still find queued mail after transient events roll the ring.
+    for revision in 0..4100 {
+        app.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneOutputChanged,
+            data: crate::api::schema::EventData::PaneOutputChanged {
+                pane_id: pane.clone(),
+                workspace_id: "fixture-workspace".into(),
+                revision,
+            },
+        });
+    }
+    let cold_reads = app.event_hub.cold_read_count();
     let before = status(&mut app);
     assert_eq!(before["result"]["state"], "queued");
     assert_eq!(before["result"]["attempts"][0]["state"], "unconfirmed");
@@ -1233,7 +1250,20 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
         id: "list".into(),
         method: Method::MsgList(crate::api::schema::MsgListParams { pane: None }),
     });
-    assert!(listing.contains("confirm_timeout"));
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    assert_eq!(
+        listing["result"]["messages"][0]["attempts"][0]["state"],
+        "unconfirmed"
+    );
+    assert_eq!(
+        listing["result"]["messages"][0]["attempts"][0]["attempt_id"],
+        attempts[0].attempt_id
+    );
+    assert_eq!(
+        app.event_hub.cold_read_count(),
+        cold_reads,
+        "polling status/list must never scan disk"
+    );
     let persisted = std::fs::read_to_string(&log).unwrap();
     for line in persisted
         .lines()
@@ -1352,4 +1382,118 @@ async fn delivery_attempt_accepted_wake_does_not_read_mail() {
     assert_eq!(app.delivery_attempts()[0].state, "accepted");
     assert_eq!(app.mailboxes.queued_len(&pane), 1);
     assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn delivery_attempt_read_during_verification_is_success() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "read-during-verify", MsgIntent::NeedsReply);
+    tick_past_gap(&mut app);
+    assert_eq!(app.delivery_attempts()[0].state, "submit_sent");
+    drain(&mut pty);
+    read_inbox(&mut app, &pane);
+    assert_eq!(app.delivery_attempts()[0].state, "read");
+    assert_eq!(
+        app.delivery_attempts()[0].reason.as_deref(),
+        Some("inbox_read")
+    );
+    tick_past_gap(&mut app);
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn delivery_attempt_disable_resets_tracker_and_digest_reports_abandonment() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "disabled-wake", MsgIntent::NeedsReply);
+    assert!(!drain(&mut pty).is_empty());
+    app.state.config.msg.idle_wake = false;
+    app.tick_idle_wakes(Instant::now());
+    assert!(app.idle_wake.panes.is_empty());
+    let attempts = app.delivery_attempts();
+    assert_eq!(attempts[0].state, "abandoned");
+    assert_eq!(attempts[0].reason.as_deref(), Some("idle_wake_disabled"));
+    let events = app.event_hub.events_after(0);
+    let digest = crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
+    let row = digest
+        .yellow
+        .iter()
+        .find(|row| row.kind == "delivery_attempt_updated")
+        .unwrap();
+    assert_eq!(row.summary, "abandoned: idle_wake_disabled");
+    assert!(row
+        .context
+        .contains(&("attempt_id".into(), attempts[0].attempt_id.clone())));
+    assert!(row.context.contains(&("pane".into(), pane.clone())));
+    assert!(row
+        .context
+        .contains(&("correlation_ids".into(), "disabled-wake".into())));
+    app.state.config.msg.idle_wake = true;
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
+    app.tick_idle_wakes(Instant::now());
+    assert!(
+        !drain(&mut pty).is_empty(),
+        "explicit re-enable restores dev's fresh tracker behavior"
+    );
+}
+
+#[tokio::test]
+async fn delivery_attempt_handoff_import_restores_interrupted_evidence() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let log = std::env::temp_dir().join(format!(
+        "flock-attempt-handoff-{}-{}.jsonl",
+        std::process::id(),
+        crate::app::api::messages::now_ms()
+    ));
+    app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "handoff-attempt", MsgIntent::NeedsReply);
+    assert!(!drain(&mut pty).is_empty());
+    let id = app.delivery_attempts()[0].attempt_id.clone();
+    let snapshot = crate::persist::capture(
+        &[],
+        &Default::default(),
+        &Default::default(),
+        None,
+        0,
+        Default::default(),
+        24,
+        0.5,
+        Default::default(),
+        Default::default(),
+    );
+    let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let restored = App::new_from_handoff(
+        &crate::config::Config::default(),
+        None,
+        api_rx,
+        crate::api::EventHub::with_persistence(log.clone()),
+        &snapshot,
+        &mut Default::default(),
+    )
+    .unwrap();
+    let attempts = restored.delivery_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_id, id);
+    assert_eq!(attempts[0].state, "unconfirmed");
+    assert_eq!(attempts[0].reason.as_deref(), Some("server_restarted"));
+    assert!(restored.idle_wake.panes[&pane]
+        .announced
+        .contains("handoff-attempt"));
+    assert!(!restored.idle_wake.in_flight(&pane));
+    assert!(drain(&mut pty).is_empty());
+    std::fs::remove_file(log).unwrap();
 }

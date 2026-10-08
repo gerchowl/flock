@@ -1377,10 +1377,14 @@ pub struct DeliveryAttempt {
     pub correlation_ids: Vec<String>,
     pub wake: bool,
     pub state: String,
+    #[serde(default)]
     pub reason: Option<String>,
     pub queued_at_ms: u64,
+    #[serde(default)]
     pub typed_at_ms: Option<u64>,
+    #[serde(default)]
     pub submit_sent_at_ms: Option<u64>,
+    #[serde(default)]
     pub finished_at_ms: Option<u64>,
     pub retried: bool,
 }
@@ -2140,7 +2144,8 @@ pub struct ApiListenerHealth {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
     GuardedSubmit {
-        attempt: DeliveryAttempt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<DeliveryAttempt>,
         outcome: String,
         reason: Option<String>,
         retried: bool,

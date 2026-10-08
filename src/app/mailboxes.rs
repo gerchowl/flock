@@ -170,7 +170,7 @@ pub(crate) enum EnqueueOutcome {
 
 pub(crate) const MAX_QUEUED_PER_PANE: usize = 32;
 pub(crate) const RATE_LIMIT_PER_MINUTE: usize = 20;
-const MAX_SEEN: usize = 4096;
+pub(super) const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;

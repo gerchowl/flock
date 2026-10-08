@@ -301,6 +301,28 @@ mod tests {
     }
 
     #[test]
+    fn flock_msg_status_routes_correlation_and_preserves_attempt_evidence() {
+        let payload = json!({"type": "msg_status", "correlation_id": "mail-1", "state": "queued",
+            "attempts": [{"attempt_id": "attempt-1", "pane": "fixture-pane", "state": "unconfirmed",
+                "correlation_ids": ["mail-1"], "reason": "confirm_timeout"}]});
+        let flock = MockApi::ok(json!({"id": "mcp:1", "result": payload}));
+        let result = route(
+            "tools/call",
+            json!({"name": "flock_msg_status",
+            "arguments": {"correlation_id": "mail-1"}}),
+            &flock,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let inner: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner, payload);
+        assert!(
+            matches!(&flock.calls.borrow()[0], Method::MsgStatus(params) if params.correlation_id == "mail-1")
+        );
+    }
+
+    #[test]
     fn tools_call_unknown_name_refuses_not_exposed() {
         // pane.close-shaped name — the design's canary for the hidden verbs.
         let flock = MockApi::ok(json!({}));

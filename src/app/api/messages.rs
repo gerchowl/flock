@@ -678,21 +678,16 @@ impl App {
 
     /// `msg.status` — what became of one message, asked by whoever sent it.
     ///
-    /// Read from the durable log rather than the mailbox: a message that was
-    /// already consumed, aged out, or relayed away is gone from the queue,
-    /// and those are precisely the outcomes a sender wants to ask about.
+    /// Read retained receipt events and the live mailbox without disk I/O.
+    /// Consumed or relayed messages leave the queue, while queued messages
+    /// must remain queryable even after their receipt event leaves the ring.
     ///
     /// The last event for a correlation id wins. Ordering is by sequence, and
     /// #175 O1 makes that monotonic across restarts, so "last" is a real
     /// ordering rather than whatever the file happened to yield.
     pub(super) fn handle_msg_status(&mut self, id: String, params: MsgStatusParams) -> String {
         let mut found: Option<ResponseResult> = None;
-        let mut history = std::collections::BTreeMap::new();
-        for (seq, _, event) in self.event_hub.persisted_events_after(0) {
-            history.insert(seq, event);
-        }
-        history.extend(self.event_hub.events_after(0));
-        for event in history.values() {
+        for (_, event) in self.event_hub.events_after(0) {
             match &event.data {
                 EventData::MessageQueued { correlation_id, .. }
                     if *correlation_id == params.correlation_id =>
@@ -763,6 +758,24 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if found.is_none()
+            && self
+                .mailboxes
+                .queued_message(&params.correlation_id)
+                .is_some()
+        {
+            found = Some(ResponseResult::MsgStatus {
+                attempts: Vec::new(),
+                correlation_id: params.correlation_id.clone(),
+                state: "queued".into(),
+                outcome_known: true,
+                to_host: None,
+                route: None,
+                path: None,
+                detail: Some("waiting in a local inbox, not yet read".into()),
+                reply: None,
+            });
         }
         // #576: and what came back. A held reply (the sender had no inbox)
         // can be the only trace of the exchange on this server.

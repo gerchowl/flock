@@ -138,8 +138,33 @@ impl App {
     /// whose Enter was still pending is dropped here, and that is logged like
     /// every other withheld Enter — its sentence is still in the prompt.
     pub(crate) fn idle_wake_on_read(&mut self, pane: &str) {
-        self.abandon_idle_wake(pane, "inbox_read");
-        self.idle_wake.panes.remove(pane);
+        let flight = self
+            .idle_wake
+            .panes
+            .remove(pane)
+            .and_then(|entry| entry.in_flight);
+        if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
+            if attempt.evidence.submit_sent_at_ms.is_some() {
+                attempt.evidence.state = "read".into();
+                attempt.evidence.reason = Some("inbox_read".into());
+                attempt.evidence.finished_at_ms = Some(super::api::messages::now_ms());
+                self.record_delivery_attempt(&attempt.evidence);
+            } else {
+                self.finish_delivery_attempt(
+                    &mut attempt,
+                    &super::guarded_submit::Outcome::Abandoned("inbox_read"),
+                );
+                crate::logging::idle_wake_abandoned(pane, "inbox_read");
+            }
+        }
+        for mut attempt in self.delivery_attempts() {
+            if attempt.wake && attempt.pane == pane && attempt.state == "unconfirmed" {
+                attempt.state = "read".into();
+                attempt.reason = Some("inbox_read".into());
+                attempt.finished_at_ms = Some(super::api::messages::now_ms());
+                self.record_delivery_attempt(&attempt);
+            }
+        }
     }
 
     fn abandon_idle_wake(&mut self, pane: &str, reason: &'static str) {
@@ -167,7 +192,7 @@ impl App {
             for pane in panes {
                 self.abandon_idle_wake(&pane, "idle_wake_disabled");
             }
-            self.idle_wake.next_deadline = None;
+            self.idle_wake = IdleWakeTracker::default();
             return;
         }
         self.idle_wake.next_deadline = None;
@@ -480,7 +505,19 @@ impl App {
 
 impl App {
     pub(crate) fn restore_delivery_attempts(&mut self) {
-        for mut attempt in self.delivery_attempts() {
+        let mut events = std::collections::BTreeMap::new();
+        for (seq, _, event) in self.event_hub.persisted_events_after(0) {
+            events.insert(seq, event);
+        }
+        events.extend(self.event_hub.events_after(0));
+        let mut restored = std::collections::BTreeMap::new();
+        for event in events.into_values() {
+            if let crate::api::schema::EventData::DeliveryAttemptUpdated { attempt } = event.data {
+                restored.insert(attempt.attempt_id.clone(), attempt);
+            }
+        }
+        self.delivery_attempt_registry.borrow_mut().clear();
+        for attempt in restored.into_values() {
             if attempt.wake {
                 self.idle_wake
                     .panes
@@ -489,6 +526,9 @@ impl App {
                     .announced
                     .extend(attempt.correlation_ids.iter().cloned());
             }
+            self.delivery_attempt_registry.borrow_mut().record(attempt);
+        }
+        for mut attempt in self.delivery_attempts() {
             if attempt.finished_at_ms.is_none() {
                 attempt.state = "unconfirmed".into();
                 attempt.reason = Some("server_restarted".into());
