@@ -87,6 +87,10 @@ fn write_fake_codex(base: &Path) {
 }
 
 fn start_server() -> Server {
+    start_server_with_rows(24)
+}
+
+fn start_server_with_rows(rows: u16) -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -115,7 +119,7 @@ fn start_server() -> Server {
 
     let pair = native_pty_system()
         .openpty(PtySize {
-            rows: 24,
+            rows,
             cols: 80,
             pixel_width: 0,
             pixel_height: 0,
@@ -585,7 +589,7 @@ while True:
 
 #[test]
 fn codex_delegate_startup_passive_banners_submit_and_confirm() {
-    let server = start_server();
+    let server = start_server_with_rows(40);
     operator_workspace(&server);
     startup_screen_harness(
         &server,
@@ -617,7 +621,7 @@ fn codex_delegate_startup_passive_banners_submit_and_confirm() {
 
 #[test]
 fn codex_delegate_startup_update_dialog_refuses_without_typing() {
-    let server = start_server();
+    let server = start_server_with_rows(40);
     operator_workspace(&server);
     let before = workspaces(&server).len();
     startup_screen_harness(
