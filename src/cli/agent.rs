@@ -20,6 +20,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
+        "history" => agent_history(&args[1..]),
         "result" => agent_result(&args[1..]),
         "send" => agent_send(&args[1..]),
         "rename" => agent_rename(&args[1..]),
@@ -45,6 +46,9 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
 pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Plain send types literal text without submitting. --submit types terminal input, waits 120 ms, then sends Enter.\n  Use -- before the target to send text beginning with --submit literally.\n  Success reports input queued, not confirmation that the agent accepted it.";
+
+pub(super) const AGENT_HISTORY_USAGE: &str =
+    "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
@@ -776,6 +780,68 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_history(args: &[String]) -> std::io::Result<i32> {
+    use crate::agent_transcript::TranscriptDetail;
+
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("usage: {AGENT_HISTORY_USAGE}");
+        return Ok(2);
+    };
+    let mut detail = TranscriptDetail::default();
+    let mut cursor = None;
+    let mut limit = None;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !matches!(flag, "--detail" | "--cursor" | "--limit") {
+            eprintln!("unknown option: {flag}");
+            return Ok(2);
+        }
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {flag}");
+            return Ok(2);
+        };
+        match flag {
+            "--detail" => {
+                detail = match value.as_str() {
+                    "reply" => TranscriptDetail::Reply,
+                    "collapsed" => TranscriptDetail::Collapsed,
+                    "full" => TranscriptDetail::Full,
+                    _ => {
+                        eprintln!("invalid --detail: expected reply, collapsed, or full");
+                        return Ok(2);
+                    }
+                };
+            }
+            "--cursor" => match super::parse_u64_flag(flag, value) {
+                Ok(parsed) => cursor = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            "--limit" => match super::parse_u32_flag(flag, value) {
+                Ok(parsed) => limit = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:history".into(),
+        method: Method::AgentHistory(crate::api::schema::AgentHistoryParams {
+            target: target.clone(),
+            detail,
+            cursor,
+            limit,
+        }),
+    })?)
+}
+
 /// `flk agent result` (#575): the reply an agent's newest turn ended on, and
 /// the `DONE:` / `BLOCKED:` / `VERDICT:` line it ends with — Claude and
 /// opencode alike. `--offset` pages a long report by characters.
@@ -824,6 +890,7 @@ fn print_agent_help() {
     eprintln!("  flk agent list");
     eprintln!("  flk agent get <target>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  {AGENT_HISTORY_USAGE}");
     eprintln!("  {AGENT_RESULT_USAGE}");
     eprintln!(
         "    the reply the agent's newest turn ended on (claude or opencode), with the status of"
