@@ -2,6 +2,7 @@
 //! Opening the custody store is owned by the future handoff integration.
 
 pub mod clock;
+pub mod hello;
 pub(crate) mod identity;
 pub mod key;
 pub mod store;

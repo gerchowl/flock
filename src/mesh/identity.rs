@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -37,6 +37,14 @@ impl NodeIdentity {
 
     pub(crate) fn node_id(&self) -> String {
         digest_hex(self.key.verifying_key().as_bytes())
+    }
+
+    pub(crate) fn public_key(&self) -> [u8; 32] {
+        self.key.verifying_key().to_bytes()
+    }
+
+    pub(crate) fn sign(&self, bytes: &[u8]) -> Vec<u8> {
+        self.key.sign(bytes).to_bytes().to_vec()
     }
 
     fn load_at(state_dir: &Path, machine: io::Result<String>) -> io::Result<Self> {

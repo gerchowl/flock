@@ -37,6 +37,28 @@ flk status client
 
 Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
+## Peer enrollment
+
+`flk peers` and `flk status` show each peer's configured name, short node ID,
+and enrollment state: `pending`, `pinned`, or `refused` with the reason.
+`flk peers status --json` includes `node_id`, `enrollment`, and
+`enrollment_reason`; `flk status --json` includes a `peers` array.
+
+Held SSH edges authenticate both node keys using fresh challenges and require
+matching mesh protocol versions (`mesh: 1`). First contact pins the identity.
+Pins survive restarts. An unexpected key change is refused as a possible
+impersonation or re-key. After verifying the replacement, a local operator
+outside agent panes can clear that peer's pin and reconnect:
+
+```bash
+flk peers enroll --reset <peer>
+```
+
+Reset is not exposed through MCP and is refused from agent panes and SSH
+relays. Peers using a custom `summary_command`, incompatible versions, or a
+failing relay are refused with a concrete reason. Version refusals include
+`upgrade flk on <peer>`; discovery does not fall back to one-shot SSH.
+
 ## Server
 
 ```bash

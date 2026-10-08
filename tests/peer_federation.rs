@@ -189,6 +189,12 @@ fn spawn_server(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.cwd(cwd);
+    // Each simulated node owns its identity and pins, like the shared fleet fixture.
+    cmd.env("HOME", config_home.join("home"));
+    cmd.env("XDG_STATE_HOME", config_home.join("state"));
+    cmd.env("XDG_DATA_HOME", config_home.join("data"));
+    cmd.env("XDG_CACHE_HOME", config_home.join("cache"));
+    cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);

@@ -3700,22 +3700,6 @@ pub(crate) fn peer_summary_applied(
     );
 }
 
-/// The held connection could not carry this poll, so it went over a one-shot
-/// ssh instead. DEBUG, not WARN: on a fleet mid-rollout — or with a peer that
-/// is simply asleep — this is the expected steady state, not a fault, and the
-/// poll itself still succeeded.
-pub(crate) fn peer_stream_fallback(peer: &str, err: &str) {
-    tracing::debug!(
-        target: "flock::peers",
-        event = "peer.stream.fallback",
-        subsystem = "peers",
-        outcome = "fallback",
-        peer,
-        err,
-        "peer stream unavailable, using one-shot ssh"
-    );
-}
-
 /// A gossiped fleet row carried an ssh destination or `ProxyJump` this host
 /// refuses to hand OpenSSH (#392), so the row was dropped.
 ///

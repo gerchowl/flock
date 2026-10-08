@@ -93,8 +93,10 @@ impl App {
 
     /// Whether a hub currently holds a relay into this server.
     pub(super) fn uplink_attached(&self) -> bool {
-        self.uplink
-            .is_attached(Instant::now(), self.uplink_heartbeat())
+        self.uplink.enrolled_hub().is_some()
+            && self
+                .uplink
+                .is_attached(Instant::now(), self.uplink_heartbeat())
     }
 
     /// Send `response` to the caller — or, if the handler parked this
@@ -404,6 +406,13 @@ impl App {
         if let Some(refusal) = self.refuse_unless_relay(&id, "msg.uplink_take") {
             return refusal;
         }
+        if self.uplink.enrolled_hub().is_none() {
+            return encode_error(
+                id,
+                "mesh_not_enrolled",
+                "mesh.hello must authenticate this edge first",
+            );
+        }
         let heartbeat = self.uplink_heartbeat();
         let frames = self
             .uplink
@@ -421,9 +430,16 @@ impl App {
         if let Some(refusal) = self.refuse_unless_relay(&id, "msg.uplink_result") {
             return refusal;
         }
+        if self.uplink.enrolled_hub().is_none() {
+            return encode_error(
+                id,
+                "mesh_not_enrolled",
+                "mesh.hello must authenticate this edge first",
+            );
+        }
         // The hub's name is the one recorded for this relay, not whatever this
         // frame says: a relay speaks for one hub for as long as it is bound.
-        if let Some(hub) = self.uplink.record_hub(&params.hub) {
+        if let Some(hub) = self.uplink.enrolled_hub() {
             params.hub = hub;
         }
         let Some(mut send) = self.uplink.complete(&params.uplink_id) else {
@@ -792,6 +808,8 @@ mod tests {
         app.uplink
             .attach_relay(pid, started, crate::platform::process_start_time)
             .expect("no relay bound yet");
+        // Messaging tests start after the separately exercised mesh handshake.
+        app.uplink.enroll_hub("hopper".into());
     }
 
     /// Run a request as the bound relay would: from the relay's pid.
@@ -818,6 +836,19 @@ mod tests {
 
     fn value(line: &str) -> serde_json::Value {
         serde_json::from_str(line).expect("json")
+    }
+
+    #[tokio::test]
+    async fn enrollment_reset_is_refused_from_agent_panes_and_bound_relays() {
+        let mut app = test_app();
+        attest_caller(&mut app);
+        let response = value(&app.handle_peers_enroll_reset("reset".into(), "peer.test".into()));
+        assert_eq!(response["error"]["code"], "operator_only");
+        bind_relay(&mut app);
+        app.current_api_peer_pid = Some(relay_pid());
+        let response = value(&app.handle_peers_enroll_reset("reset".into(), "peer.test".into()));
+        assert_eq!(response["error"]["code"], "operator_only");
+        assert_eq!(app.uplink.enrolled_hub().as_deref(), Some("hopper"));
     }
 
     #[tokio::test]

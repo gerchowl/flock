@@ -17,6 +17,7 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "status" => peers_status(&args[1..]),
+        "enroll" => peers_enroll(&args[1..]),
         "summary" => peers_summary(&args[1..]),
         "checkout-prepare" => peers_checkout_prepare(&args[1..]),
         "logs" => peers_logs(&args[1..]),
@@ -30,6 +31,51 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn peers_enroll(args: &[String]) -> std::io::Result<i32> {
+    let [reset, peer] = args else {
+        eprintln!("usage: flk peers enroll --reset <peer>");
+        return Ok(2);
+    };
+    if reset != "--reset" || peer.is_empty() {
+        eprintln!("usage: flk peers enroll --reset <peer>");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:peers:enroll".into(),
+        method: Method::PeersEnrollReset(crate::api::schema::PeersEnrollResetParams {
+            peer: peer.clone(),
+        }),
+    })?)
+}
+
+pub(super) fn read_enrollment() -> std::io::Result<Vec<crate::mesh::hello::Enrollment>> {
+    let response = super::send_request(&Request {
+        id: "cli:peers:enrollment".into(),
+        method: Method::PeersEnrollment(EmptyParams {}),
+    })?;
+    serde_json::from_value(response["result"]["peers"].clone()).map_err(std::io::Error::other)
+}
+
+pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String {
+    let node = status
+        .node_id
+        .as_deref()
+        .unwrap_or("unknown")
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let mut line = format!(
+        "{}  node {}  {}",
+        printable(&status.peer),
+        printable(&node),
+        printable(&status.state)
+    );
+    if let Some(reason) = &status.reason {
+        line.push_str(&format!(": {}", printable(reason)));
+    }
+    line
 }
 
 /// Default and max tail size for `peers logs`. The cap bounds the over-SSH wire
@@ -229,19 +275,40 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
         .cloned()
         .and_then(|rows| serde_json::from_value(rows).ok())
         .unwrap_or_default();
+    let enrollment = read_enrollment()?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
-        );
+        let mut values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(std::io::Error::other)?;
+        for status in &enrollment {
+            let index = values
+                .iter()
+                .position(|v| v["name"].as_str() == Some(&status.peer));
+            let row = if let Some(index) = index {
+                &mut values[index]
+            } else {
+                values.push(serde_json::json!({"name": status.peer}));
+                values
+                    .last_mut()
+                    .ok_or_else(|| std::io::Error::other("missing peer row"))?
+            };
+            row["node_id"] = serde_json::json!(status.node_id);
+            row["enrollment"] = serde_json::json!(status.state);
+            row["enrollment_reason"] = serde_json::json!(status.reason);
+        }
+        println!("{}", serde_json::to_string(&values)?);
         return Ok(0);
     }
-    if rows.is_empty() {
+    if rows.is_empty() && enrollment.is_empty() {
         println!("no peers configured");
-        return Ok(0);
     }
     for line in status_table(&rows) {
         println!("{line}");
+    }
+    for status in &enrollment {
+        println!("{}", enrollment_line(status));
     }
     Ok(0)
 }
@@ -397,6 +464,21 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
         let request = line.trim();
         if request.is_empty() {
             continue;
+        }
+        let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
+        if parsed.as_ref().and_then(|v| v["method"].as_str()) != Some("mesh.hello") {
+            let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});
+            let answer = relay_local_request(&socket, &check)?;
+            let answer: serde_json::Value =
+                serde_json::from_str(&answer).map_err(std::io::Error::other)?;
+            if let Some(error) = answer.get("error") {
+                let id = parsed
+                    .as_ref()
+                    .and_then(|v| v["id"].as_str())
+                    .unwrap_or_default();
+                write_relay_error(id, "mesh_not_enrolled", &error.to_string())?;
+                continue;
+            }
         }
         // A closed stdout means the hub hung up. That is the ordinary way
         // this process ends, not a failure worth a message nobody can read.
@@ -592,6 +674,10 @@ fn start_uplink_pull(socket: std::path::PathBuf) {
                     if !attach_relay(&socket) {
                         return;
                     }
+                    continue;
+                }
+                if error.get("code").and_then(|code| code.as_str()) == Some("mesh_not_enrolled") {
+                    std::thread::sleep(UPLINK_RETRY);
                     continue;
                 }
                 // Anything else is an older build without the method. It will
@@ -849,6 +935,7 @@ fn write_relay_error(id: &str, code: &str, message: &str) -> std::io::Result<()>
 fn print_peers_help() {
     eprintln!("usage: flk peers [status] [--json]");
     eprintln!("       flk peers summary [--json]");
+    eprintln!("       flk peers enroll --reset <peer>  (local operator only)");
     eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
     eprintln!("       flk peers logs [--all] [--lines N] [--json]");
     eprintln!(

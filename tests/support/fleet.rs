@@ -90,14 +90,14 @@ impl NodeSpec {
     }
 }
 
-/// Transport fixtures until the production mesh handshake lands. Native runs
-/// the real relay unchanged. The other modes inject explicit mesh refusals
-/// while continuing to forward every legacy method to the real server.
+/// Native runs the real handshake. Fault modes refuse mesh negotiation or
+/// corrupt a possession proof while using the same real relay process.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshMode {
     Native,
     Disabled,
+    ForgedSignature,
     VersionMismatch(u32),
 }
 

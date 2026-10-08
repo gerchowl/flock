@@ -8,6 +8,7 @@ mod fleet;
 mod handoffs;
 mod integrations;
 mod lineage;
+mod mesh;
 pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
@@ -1401,6 +1402,11 @@ impl App {
             Method::MsgUplinkTake(params) => {
                 return self.handle_msg_uplink_take(request.id, params)
             }
+            Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
+            Method::PeersEnrollReset(params) => {
+                return self.handle_peers_enroll_reset(request.id, params.peer)
+            }
+            Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
             Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),
             Method::MsgUplinkResult(params) => {
                 return self.handle_msg_uplink_result(request.id, params)

@@ -148,6 +148,12 @@ pub enum Method {
     /// relay method is accepted only from the process that did.
     #[serde(rename = "peers.relay_attach")]
     PeersRelayAttach(EmptyParams),
+    #[serde(rename = "mesh.hello")]
+    MeshHello(crate::mesh::hello::Hello),
+    #[serde(rename = "peers.enroll_reset")]
+    PeersEnrollReset(PeersEnrollResetParams),
+    #[serde(rename = "peers.enrollment")]
+    PeersEnrollment(EmptyParams),
     /// #410: the hub's answer to a message a spoke handed up, sent back down
     /// the same relay.
     #[serde(rename = "msg.uplink_result")]
@@ -2098,6 +2104,11 @@ pub struct ErrorBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersEnrollResetParams {
+    pub peer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
     /// SHA-256 of the persisted Ed25519 public key, not a mesh enrollment claim.
@@ -2174,6 +2185,12 @@ pub enum ResponseResult {
         path: String,
         encoding: HandoffEncoding,
         content: String,
+    },
+    MeshHello {
+        challenge: crate::mesh::hello::Challenge,
+    },
+    PeersEnrollment {
+        peers: Vec<crate::mesh::hello::Enrollment>,
     },
     PeersSummary {
         /// This server's persistent per-user node identity.

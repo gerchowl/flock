@@ -27,10 +27,8 @@
 //! connection (the roaming-hopper case) and exits — which arrives here as EOF
 //! on the reader thread. No timer decides that.
 //!
-//! Every failure falls back to the one-shot spawn. That is what keeps this
-//! never-worse-than-today, and it is not only an error path: a peer whose
-//! `flk` predates `peers relay` can never hold a stream at all, so the
-//! fallback is also the compatibility path during a fleet rollout.
+//! Every held edge must complete mesh.hello before carrying requests. A peer
+//! that cannot authenticate is refused with its reason retained for status.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -49,9 +47,8 @@ use crate::config::PeerConfig;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Refuse to re-spawn a connection that just died, so a peer that is asleep or
-/// running an old `flk` cannot turn into a reconnect storm. Polls continue via
-/// the one-shot fallback throughout, so data keeps flowing at today's cadence
-/// while this backoff runs.
+/// running an old `flk` cannot turn into a reconnect storm. Status retains
+/// the refusal reason while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long a failed stream waits for ssh's stderr to drain before it is
@@ -68,6 +65,7 @@ const STDERR_SETTLE: Duration = Duration::from_secs(1);
 /// blocking forever on a pipe that has no read timeout.
 struct PeerStream {
     child: Child,
+    authenticated: Arc<std::sync::atomic::AtomicBool>,
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
@@ -83,7 +81,7 @@ struct PeerStream {
     latest_push: Arc<Mutex<Option<(std::time::Instant, String)>>>,
     /// The last few lines ssh wrote to stderr (#418). Before this the relay's
     /// stderr went to /dev/null, so a stream that could never be established
-    /// fell back to one-shot polling with no word about why.
+    /// failed without explaining why.
     stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
     /// Disconnects when ssh's stderr reaches EOF — ssh has exited.
     stderr_done: Receiver<()>,
@@ -247,6 +245,7 @@ impl PeerStream {
             });
         }
 
+        let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stdin = child.stdin.take().ok_or("ssh stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("ssh stdout unavailable")?;
         let (tx, lines) = std::sync::mpsc::channel();
@@ -271,6 +270,7 @@ impl PeerStream {
         for _ in 0..UPLINK_FORWARD_WORKERS {
             let spoke = peer.clone();
             let queue = Arc::clone(&uplink_rx);
+            let authenticated = Arc::clone(&authenticated);
             std::thread::spawn(move || loop {
                 let next = match queue.lock() {
                     Ok(queue) => queue.recv(),
@@ -279,12 +279,15 @@ impl PeerStream {
                 let Ok(line) = next else {
                     return;
                 };
-                forward_uplinked_frame(&spoke, &line);
+                if authenticated.load(std::sync::atomic::Ordering::Acquire) {
+                    forward_uplinked_frame(&spoke, &line);
+                }
             });
         }
 
         Ok(Self {
             child,
+            authenticated,
             stdin,
             lines,
             next_id: 0,
@@ -293,6 +296,63 @@ impl PeerStream {
             stderr_done,
             agent,
         })
+    }
+
+    fn enroll(&mut self, peer: &PeerConfig) -> Result<String, String> {
+        use crate::mesh::{
+            hello::{self, Challenge, Hello, Offer},
+            identity::NodeIdentity,
+        };
+        let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
+        let dialer = Offer::new(&identity, crate::app::short_host_name())?;
+        let request = serde_json::to_value(Hello::Begin {
+            offer: dialer.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+        let raw = self.request("mesh.hello", request)?;
+        let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if let Some(error) = response.get("error") {
+            if matches!(
+                error["code"].as_str(),
+                Some("invalid_request" | "mesh_version_mismatch")
+            ) {
+                let remote = error["data"]["mesh"]
+                    .as_u64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unsupported".into());
+                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::VERSION, peer.name));
+            }
+            return Err(format!("mesh handshake refused for {}: {error}", peer.name));
+        }
+        let challenge: Challenge = serde_json::from_value(response["result"]["challenge"].clone())
+            .map_err(|e| {
+                format!(
+                    "unsupported mesh hello (local {}, remote unknown): {e}; upgrade flk on {}",
+                    hello::VERSION,
+                    peer.name
+                )
+            })?;
+        challenge.offer.validate(&peer.name)?;
+        hello::verify(&dialer, &challenge.offer, "acceptor", &challenge.signature)?;
+        hello::check_pin(&peer.name, &challenge.offer, false)?;
+        let signature = hello::sign(&identity, &dialer, &challenge.offer, "dialer")?;
+        let finish =
+            serde_json::to_value(Hello::Finish { signature }).map_err(|e| e.to_string())?;
+        let raw = self.request("mesh.hello", finish)?;
+        let ack: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if let Some(error) = ack.get("error") {
+            return Err(format!("mesh enrollment refused: {error}"));
+        }
+        if !ack.get("result").is_some_and(serde_json::Value::is_object) {
+            return Err("invalid mesh enrollment acknowledgement".into());
+        }
+        hello::check_pin(&peer.name, &challenge.offer, true)?;
+        if let Ok(mut push) = self.latest_push.lock() {
+            *push = None;
+        }
+        self.authenticated
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(challenge.offer.node_id)
     }
 
     /// Explain a failed request from what ssh said on the way out.
@@ -349,7 +409,19 @@ impl PeerStream {
             .map_err(|err| format!("flush failed: {err}"))?;
 
         match self.lines.recv_timeout(REQUEST_TIMEOUT) {
-            Ok(line) => Ok(line),
+            Ok(line) => {
+                if method != "mesh.hello" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if matches!(
+                            value["error"]["code"].as_str(),
+                            Some("mesh_not_enrolled" | "not_the_relay")
+                        ) {
+                            return Err("mesh edge lost enrollment; reconnect required".into());
+                        }
+                    }
+                }
+                Ok(line)
+            }
             Err(RecvTimeoutError::Timeout) => Err(format!(
                 "{WEDGED} in {}s — peer relay wedged",
                 REQUEST_TIMEOUT.as_secs()
@@ -448,6 +520,8 @@ fn forward_uplinked_frame(spoke: &PeerConfig, line: &str) {
 
 impl Drop for PeerStream {
     fn drop(&mut self) {
+        self.authenticated
+            .store(false, std::sync::atomic::Ordering::Release);
         // Closing stdin ends `peers relay` at its own read loop, so the remote
         // side exits cleanly instead of being killed mid-request.
         let _ = self.child.kill();
@@ -477,13 +551,60 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Default::default)
 }
 
+type Enrollments = Mutex<HashMap<String, crate::mesh::hello::Enrollment>>;
+
+fn enrollments() -> &'static Enrollments {
+    static STATUS: OnceLock<Enrollments> = OnceLock::new();
+    STATUS.get_or_init(Default::default)
+}
+
+fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<String>) {
+    if let Ok(mut statuses) = enrollments().lock() {
+        let previous = statuses.get(&peer.name).and_then(|s| s.node_id.clone());
+        statuses.insert(
+            peer.name.clone(),
+            crate::mesh::hello::Enrollment {
+                peer: peer.name.clone(),
+                node_id: node_id.or(previous),
+                state: if reason.is_some() {
+                    "refused"
+                } else {
+                    "pinned"
+                }
+                .into(),
+                reason,
+            },
+        );
+    }
+}
+
+pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
+    enrollments()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&peer.name).cloned())
+        .unwrap_or_else(|| crate::mesh::hello::Enrollment {
+            peer: peer.name.clone(),
+            node_id: None,
+            state: "pending".into(),
+            reason: None,
+        })
+}
+
+pub(crate) fn reset_enrollment(peer: &str) {
+    // Removing the registry entry avoids waiting on a worker that is itself
+    // waiting for an API response from this loop.
+    if let Ok(mut registry) = registry().lock() {
+        registry.remove(peer);
+    }
+    if let Ok(mut statuses) = enrollments().lock() {
+        statuses.remove(peer);
+    }
+}
+
 /// Send an API request to `peer` over its held connection.
 ///
-/// `Err` means the caller should fall back to the one-shot spawn — it covers
-/// a peer too old to have `peers relay`, one that is asleep, and one whose
-/// relay has wedged, deliberately without distinguishing them: the answer is
-/// the same in every case, and the fallback is a working path rather than a
-/// degraded one.
+/// Errors refuse this edge. There is no compatibility fallback.
 pub fn request(
     peer: &PeerConfig,
     method: &str,
@@ -524,6 +645,11 @@ fn request_over(
     params: serde_json::Value,
     spawn: bool,
 ) -> Result<String, String> {
+    if peer.summary_command != crate::config::model::default_peer_summary_command() {
+        let reason = "custom summary transport unsupported: restore the default summary_command to hold a mesh edge".to_string();
+        set_enrollment(peer, None, Some(reason.clone()));
+        return Err(reason);
+    }
     // Outer lock is held only long enough to find the slot; the request itself
     // runs under the per-peer lock so one slow peer cannot stall the others.
     let slot = {
@@ -549,7 +675,11 @@ fn request_over(
 
     if let Some(retry_after) = slot.retry_after {
         if std::time::Instant::now() < retry_after {
-            return Err("connection backing off".into());
+            return Err(slot
+                .failure
+                .as_ref()
+                .map(|f| f.detail.clone())
+                .unwrap_or_else(|| "connection backing off".into()));
         }
     }
 
@@ -568,8 +698,31 @@ fn request_over(
             return Err("no held connection".into());
         }
         match PeerStream::spawn(peer) {
-            Ok(stream) => slot.stream = Some(stream),
+            Ok(mut stream) => match stream.enroll(peer) {
+                Ok(node_id) => {
+                    set_enrollment(peer, Some(node_id), None);
+                    slot.stream = Some(stream);
+                }
+                Err(err) => {
+                    let (detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED) {
+                        stream.explain(&err)
+                    } else {
+                        (err, None)
+                    };
+                    set_enrollment(peer, None, Some(detail.clone()));
+                    record_establish_failure(
+                        &mut slot,
+                        &peer.name,
+                        &detail,
+                        tail.as_deref(),
+                        RECONNECT_BACKOFF,
+                    );
+                    slot.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
+                    return Err(detail);
+                }
+            },
             Err(err) => {
+                set_enrollment(peer, None, Some(err.clone()));
                 record_establish_failure(&mut slot, &peer.name, &err, None, Duration::ZERO);
                 return Err(err);
             }
@@ -593,6 +746,7 @@ fn request_over(
         }
         Err(err) => {
             let (detail, tail) = stream.explain(&err);
+            set_enrollment(peer, None, Some(detail.clone()));
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
             slot.stream = None;
@@ -706,11 +860,17 @@ const MAX_PUSH_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 /// of the slot either way, because leaving it would have the next poll re-judge
 /// the same expired snapshot instead of getting on with a live request.
 pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
+    if peer.summary_command != crate::config::model::default_peer_summary_command() {
+        return None;
+    }
     let slot = {
         let registry = registry().lock().ok()?;
         Arc::clone(registry.get(&peer.name)?)
     };
     let mut slot = slot.lock().ok()?;
+    if slot.target != peer.ssh_target() {
+        return None;
+    }
     let stream = slot.stream.as_mut()?;
     let mut push = stream.latest_push.lock().ok()?;
     let (arrived, payload) = push.take()?;
@@ -1066,7 +1226,7 @@ mod tests {
         let second = request(&peer, "peers.summary", serde_json::json!({}));
         assert_eq!(
             second.unwrap_err(),
-            "connection backing off",
+            first.unwrap_err(),
             "the retry is refused locally rather than spawning ssh again"
         );
         retain_configured(&[]);
@@ -1116,11 +1276,11 @@ mod tests {
         // cleared the registry, a failing peer would retry on every reload and
         // the backoff would stop bounding anything.
         let peer = peer("retain-test-kept-host");
-        let _ = request(&peer, "peers.summary", serde_json::json!({}));
+        let first = request(&peer, "peers.summary", serde_json::json!({}));
         retain_configured(std::slice::from_ref(&peer));
         assert_eq!(
             request(&peer, "peers.summary", serde_json::json!({})).unwrap_err(),
-            "connection backing off",
+            first.unwrap_err(),
             "a still-configured peer keeps its slot, backoff included"
         );
         retain_configured(&[]);

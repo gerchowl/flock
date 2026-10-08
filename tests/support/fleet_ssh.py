@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Local ssh transport for fleet.rs, including directed partitions and faults.
 
-Only mesh requests are synthetic in fault modes. Every other request, summary
-push and uplink frame still traverses the real flk peers relay process.
+Only mesh requests are altered in fault modes. Every other request, summary
+push and uplink frame traverses the real flk peers relay and its enrollment gate.
 """
 import json
 import os
@@ -89,17 +89,20 @@ def forward_input():
                 continue
             method = request.get("method", "")
             mode = node["mesh"]
-            if isinstance(method, str) and method.startswith("mesh.") and mode != "native":
+            if isinstance(method, str) and method.startswith("mesh.") and mode not in ("native", "forged_signature"):
                 if mode == "disabled":
                     code, message = "invalid_request", f"unknown variant `{method}`"
                 else:
-                    # A synthetic refusal, not a proposed mesh.hello schema.
                     code = "mesh_version_mismatch"
                     message = f"fixture mesh version {mode['version_mismatch']} is incompatible"
                 emit(json.dumps({"id": request.get("id"), "error": {
                     "code": code, "message": message,
+                    "data": {"mesh": mode.get("version_mismatch")} if isinstance(mode, dict) else {},
                 }}) + "\n")
             else:
+                if mode == "forged_signature" and method == "mesh.hello" and request.get("params", {}).get("phase") == "finish":
+                    request["params"]["signature"] = [0] * 64
+                    line = json.dumps(request) + "\n"
                 child.stdin.write(line)
                 child.stdin.flush()
     except (BrokenPipeError, ValueError):

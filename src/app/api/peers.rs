@@ -133,13 +133,12 @@ impl App {
         if let Some(refusal) = self.refuse_unless_relay(&id, "peers.hub_fleet") {
             return refusal;
         }
-        // The name recorded for this relay binding; the frame's own claim only
-        // ever seeds it, on the binding's first frame. No wire fallback.
-        let Some(hub) = self.uplink.record_hub(&params.hub) else {
+        // The verified key maps to this locally enrolled name.
+        let Some(hub) = self.uplink.enrolled_hub() else {
             return super::responses::encode_error(
                 id,
-                "not_the_relay",
-                "peers.hub_fleet arrived with no relay bound",
+                "mesh_not_enrolled",
+                "peers.hub_fleet requires mesh.hello enrollment",
             );
         };
         let mut fleet = params.fleet;
@@ -147,12 +146,6 @@ impl App {
         // relay. A row about some other machine is not the hub speaking for
         // itself.
         //
-        // What the binding attests is the relay PROCESS. The hub's NAME is
-        // the one that process declared in its first frame (`record_hub`),
-        // so a relay could call itself anything. That stays within the
-        // same-user boundary the relay already runs in: only a process this
-        // user started can bind, and the home row it could then repaint
-        // still switches via the home target, never an ssh dial.
         let hub_key = hub.to_ascii_lowercase();
         let hub_self = params
             .hub_self
@@ -1516,6 +1509,7 @@ mod tests {
         app.uplink
             .attach_relay(relay, started, crate::platform::process_start_time)
             .expect("bound");
+        app.uplink.enroll_hub("hub".into());
         app.current_api_peer_pid = Some(relay);
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "down".into(),
@@ -1744,12 +1738,13 @@ mod tests {
     }
 
     /// Bind this test process as the relay, as `peers.relay_attach` would.
-    fn bind_relay(app: &mut App) {
+    fn bind_relay(app: &mut App, peer: &str) {
         let relay = std::process::id();
         let started = crate::platform::process_start_time(relay).expect("own start time");
         app.uplink
             .attach_relay(relay, started, crate::platform::process_start_time)
             .expect("bound");
+        app.uplink.enroll_hub(peer.into());
         app.current_api_peer_pid = Some(relay);
     }
 
@@ -1819,7 +1814,7 @@ mod tests {
 
         // One refresh window: A's next poll of B pushes down, exactly what
         // `PeerPollDue` hands `push_hub_fleet`.
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, &crate::app::short_host_name());
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
@@ -1899,7 +1894,7 @@ mod tests {
         claim.workspaces = vec![planted_space("planted-by-a-spoke")];
         let mut forged_self = hub_row("hopper", "hopper", 0);
         forged_self.workspaces = vec![planted_space("planted-by-kiln")];
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "kiln");
         // The bound hub is kiln, not home: its fleet row about hopper and its
         // `hub_self` naming hopper are both claims about someone else.
         push_down(
@@ -1925,7 +1920,7 @@ mod tests {
         // polled node's say-so. Only the hub's own `hub_self` counts.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "hopper");
         let mut genuine = hub_row("hopper", "hopper", 0);
         genuine.workspaces = vec![planted_space("home-for-real")];
         push_down(
@@ -1960,7 +1955,7 @@ mod tests {
         // is not the client's home, its `hub_self` is its own row.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "kiln");
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
@@ -1988,7 +1983,7 @@ mod tests {
         // got past `without_origin_claims` and rendered as a second hopper.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "kiln");
         let mut disguised = hub_row("hopper", "hopper", 0);
         disguised.host = Some("hopper\u{7}".into());
         push_down(
@@ -2014,7 +2009,7 @@ mod tests {
         // #425 review: the hub_fleet receive path renders what it is handed.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "hopper");
         let mut row = hub_row("hopper", "hopper", 0);
         row.workspaces = vec![planted_space("ok\u{1b}]52;c;cGF5bG9hZA==\u{7}name")];
         push_down(
@@ -2065,7 +2060,7 @@ mod tests {
             activity: None,
             agents: Vec::new(),
         }];
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "hopper");
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
@@ -2101,7 +2096,7 @@ mod tests {
             origin_summary: None,
             received_at: std::time::Instant::now(),
         });
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "hopper");
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
@@ -2125,7 +2120,7 @@ mod tests {
         // (a spoke hears its hub whether or not anyone is attached) must not
         // stand beside the home row. The origin slot stands for that machine.
         let mut spoke = test_app();
-        bind_relay(&mut spoke);
+        bind_relay(&mut spoke, "hopper");
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {

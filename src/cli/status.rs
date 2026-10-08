@@ -104,6 +104,11 @@ pub(crate) enum ServerRuntimeStatus {
 fn print_full_status(json: bool) -> std::io::Result<i32> {
     let server = read_server_runtime_status()?;
     let installed = read_installed_status(&server);
+    let peers = if matches!(server, ServerRuntimeStatus::Running { .. }) {
+        super::peers::read_enrollment()?
+    } else {
+        Vec::new()
+    };
 
     if json {
         print_json(&FullStatusJson {
@@ -111,10 +116,14 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
             server: server_status_json(&server),
             update: update_status_json(&server),
             installed,
+            peers,
         })?;
         return Ok(0);
     }
 
+    for peer in &peers {
+        println!("{}", super::peers::enrollment_line(peer));
+    }
     println!("client:");
     println!("  version: {}", crate::build_info::version());
     println!(
@@ -299,6 +308,7 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    peers: Vec<crate::mesh::hello::Enrollment>,
     installed: InstalledStatusJson,
     client: ClientStatusJson,
     server: ServerStatusJson,
