@@ -3663,5 +3663,20 @@ fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
     fs::write(opencode.join("opencode.jsonc"), "{ // config owner keeps comments\n \"mcp\": {\"flock\": {\"command\": [\"/nix/store/fixture-flock/bin/flk\", \"mcp\", \"serve\",],},},}\n").unwrap();
     let status = run(&["integration", "status"]);
     assert!(String::from_utf8_lossy(&status.stdout).contains("opencode MCP: pinned store path"));
+    let owned_codex = home.join("owned-codex.toml");
+    let owned_codex_content = "model = 'fixture'\n";
+    fs::write(&owned_codex, owned_codex_content).unwrap();
+    fs::remove_file(codex.join("config.toml")).unwrap();
+    symlink(&owned_codex, codex.join("config.toml")).unwrap();
+    let result = run(&["integration", "install", "codex"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("externally owned"));
+    assert_eq!(
+        fs::read_to_string(&owned_codex).unwrap(),
+        owned_codex_content
+    );
+    let after_hooks: toml::Value =
+        toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert!(after_hooks.get("mcp_servers").is_none());
     cleanup_test_base(&base);
 }

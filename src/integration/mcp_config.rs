@@ -35,7 +35,23 @@ fn config_path(target: IntegrationTarget) -> io::Result<Option<PathBuf>> {
     })
 }
 
-pub(super) fn install(target: IntegrationTarget) -> io::Result<Option<String>> {
+pub(super) fn externally_owned(target: IntegrationTarget) -> bool {
+    config_path(target)
+        .ok()
+        .flatten()
+        .is_some_and(|path| externally_owned_at(&path))
+}
+
+fn externally_owned_at(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_symlink() || metadata.permissions().readonly()
+    })
+}
+
+pub(super) fn install(
+    target: IntegrationTarget,
+    originally_owned: bool,
+) -> io::Result<Option<String>> {
     let Some(path) = config_path(target)? else {
         return Ok(None);
     };
@@ -89,9 +105,7 @@ pub(super) fn install(target: IntegrationTarget) -> io::Result<Option<String>> {
             path.display()
         )));
     };
-    if fs::symlink_metadata(&path).is_ok_and(|metadata| {
-        metadata.file_type().is_symlink() || metadata.permissions().readonly()
-    }) {
+    if originally_owned || externally_owned_at(&path) {
         return Ok(Some(format!(
             "MCP config {} is externally owned; merge command {} with args mcp serve",
             path.display(),

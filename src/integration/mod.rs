@@ -525,6 +525,9 @@ pub(crate) fn install_target_with_hook_trust(
     target: crate::api::schema::IntegrationTarget,
     trust_hooks: bool,
 ) -> io::Result<Vec<String>> {
+    // Codex hooks and MCP share a config file. Capture ownership before the
+    // hook adapter can replace it, so MCP registration respects its owner.
+    let mcp_config_externally_owned = mcp_config::externally_owned(target);
     let mut messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
@@ -640,7 +643,7 @@ pub(crate) fn install_target_with_hook_trust(
         }
     };
 
-    if let Some(message) = mcp_config::install(target)? {
+    if let Some(message) = mcp_config::install(target, mcp_config_externally_owned)? {
         messages.push(message);
     }
 
