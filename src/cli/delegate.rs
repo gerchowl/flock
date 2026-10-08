@@ -4151,7 +4151,7 @@ fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> 
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.into(),
             source: ReadSource::Detection,
-            lines: Some(40),
+            lines: None,
             format: ReadFormat::Text,
             strip_ansi: true,
         }),

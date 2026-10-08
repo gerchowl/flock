@@ -259,8 +259,6 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
     best.map(|(_, agent, name)| (agent, name))
 }
 
-/// Detect the state of an agent from the live terminal tail snapshot.
-/// If `agent` is `None`, returns `Unknown`.
 /// Transcript evidence with the detectors' recognized live status rows removed.
 pub(crate) fn progress_text(screen: &str) -> String {
     screen
@@ -270,10 +268,39 @@ pub(crate) fn progress_text(screen: &str) -> String {
                 && !agents::claude_code::has_spinner_activity(line)
                 && !agents::opencode::is_progress_chrome(line)
         })
+        .map(normalize_running_tool_counter)
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// Keep Claude's running-tool row as evidence, ignoring only its elapsed suffix.
+fn normalize_running_tool_counter(line: &str) -> &str {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("⎿ Running… (") {
+        return line;
+    }
+    let Some((row, elapsed)) = line.trim_end().rsplit_once(" (") else {
+        return line;
+    };
+    let Some(elapsed) = elapsed.strip_suffix(')') else {
+        return line;
+    };
+    let parts: Vec<&str> = elapsed.split_whitespace().collect();
+    if parts.is_empty()
+        || !parts.iter().all(|part| {
+            let Some(digits) = part.strip_suffix(['h', 'm', 's']) else {
+                return false;
+            };
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return line;
+    }
+    row
+}
+
+/// Detect the state of an agent from the live terminal tail snapshot.
+/// If `agent` is `None`, returns `Unknown`.
 #[cfg(test)]
 pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
     detect_agent(agent, screen_content).state

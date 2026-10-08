@@ -1320,12 +1320,6 @@ mod tests {
         app
     }
 
-    /// #393: `flock_agent_read` / `flock_pane_read` were documented as marking
-    /// the pane seen, and agents were told to "use sparingly". Neither handler
-    /// touches `seen` — only operator view transitions do — so the claim
-    /// steered agents off a read that never moved the attention queue. Driven
-    /// off the wire, both verbs, from both starting values: an "unchanged"
-    /// that only held for one of them would be a read that sets `seen`.
     #[tokio::test]
     async fn detect_pane_read_excludes_scrollback_and_reads_bottom_screen() {
         let mut app = App::new(
@@ -1363,6 +1357,12 @@ mod tests {
         }
     }
 
+    /// #393: `flock_agent_read` / `flock_pane_read` were documented as marking
+    /// the pane seen, and agents were told to "use sparingly". Neither handler
+    /// touches `seen` — only operator view transitions do — so the claim
+    /// steered agents off a read that never moved the attention queue. Driven
+    /// off the wire, both verbs, from both starting values: an "unchanged"
+    /// that only held for one of them would be a read that sets `seen`.
     #[tokio::test]
     async fn api_pane_read_leaves_seen_untouched() {
         let mut app = App::new(

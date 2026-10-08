@@ -251,6 +251,37 @@ mod tests {
     }
 
     #[test]
+    fn delegate_running_tool_counter_stalls_without_hiding_progress() {
+        let now = Instant::now();
+        let mut monitor = Monitor::new(100, now);
+        let first = "Bash(build)\n  ⎿ Running… (2m 5s)";
+        let ticking = "Bash(build)\n  ⎿ Running… (2m 6s)";
+        assert!(!monitor.observe("working", first, now));
+        assert!(monitor.observe("working", ticking, now + Duration::from_millis(100)));
+        assert_eq!(monitor.latest.as_ref().unwrap().reason, "silence");
+        for progress in [
+            "Bash(build)\n  ⎿ Running… (2m 7s)\ncompiled module",
+            "Bash(test)\n  ⎿ Running… (2m 7s)",
+            "Bash(build)\n  ⎿ Finished",
+        ] {
+            let mut monitor = Monitor::new(100, now);
+            assert!(!monitor.observe("working", first, now));
+            assert!(!monitor.observe("working", progress, now + Duration::from_millis(100)));
+        }
+        assert_eq!(
+            crate::detect::progress_text(first),
+            "Bash(build)\n  ⎿ Running…"
+        );
+        for transcript in [
+            "The tool was Running… (2m 5s)",
+            "⎿ Running… (build output)",
+            "⎿ Running… (2m 5s) more output",
+        ] {
+            assert_eq!(crate::detect::progress_text(transcript), transcript);
+        }
+    }
+
+    #[test]
     fn delegate_silence_requires_unchanged_working_screen() {
         let now = Instant::now();
         let mut monitor = Monitor::new(100, now);
