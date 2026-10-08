@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Guardrails hooks in fresh worktrees now explain how to load missing tooling with `nix develop` or `direnv allow`, instead of failing with “No such file or directory” (#642).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

@@ -1,7 +1,7 @@
 # Governance gates, run by `prek` (pre-commit compatible). Tooling comes from
-# the guardrails devShell (flake.nix → lib.mkDevShell), so every `entry` is on
-# PATH. Installed automatically by the devShell shellHook; manually via
-# `just install-hooks`.
+# the guardrails devShell (flake.nix → lib.mkDevShell). Guardrails entries
+# use a wrapper that explains how to load missing tooling. Installed automatically
+# by the devShell shellHook; manually via `just install-hooks`.
 #
 # Rollout status: all three agent-drift gates are now HARD gates. flock's source
 # is clean of real stubs and debug spew; the few flagged lines are legitimate CLI
@@ -14,7 +14,7 @@ repos:
       # --- agent-drift gates (hard) --------------------------------------------
       - id: no-fake-impl
         name: "no fake/placeholder implementations"
-        entry: guardrails-no-fake-impl
+        entry: sh scripts/run_guardrail.sh guardrails-no-fake-impl
         language: system
         pass_filenames: true
       # Layered with clippy's print_stdout/print_stderr/dbg_macro denies
@@ -25,12 +25,12 @@ repos:
       # the files listed all still print legitimately (annotated per-fn).
       - id: no-debug-leftovers
         name: "no debug-print leftovers — use the tracing facade"
-        entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/* guardrails-no-debug-leftovers
+        entry: env GUARDRAILS_OUTPUT_GLOBS=*/cli/*:*/cli.rs:*/update.rs:*/remote.rs:*/server/headless.rs:*/client/mod.rs:*/integration/mod.rs:*/web/*:scripts/*:vendor/* sh scripts/run_guardrail.sh guardrails-no-debug-leftovers
         language: system
         pass_filenames: true
       - id: no-commented-code
         name: "no commented-out code"
-        entry: guardrails-no-commented-code
+        entry: sh scripts/run_guardrail.sh guardrails-no-commented-code
         language: system
         pass_filenames: true
       # Raw ?/% Debug/Display field formatters splat arbitrary values into the
@@ -40,7 +40,7 @@ repos:
       # markers (scripts/mark_trace_fields.py); burn-down census: docs/DEBT.md.
       - id: no-raw-trace-fields
         name: "no raw ?/% fields in tracing macros — shape in logging.rs"
-        entry: env GUARDRAILS_TRACE_ALLOW_GLOBS=*/logging.rs guardrails-no-raw-trace-fields
+        entry: env GUARDRAILS_TRACE_ALLOW_GLOBS=*/logging.rs sh scripts/run_guardrail.sh guardrails-no-raw-trace-fields
         language: system
         pass_filenames: true
       # Tests that read the process cwd, the machine's hostname, or a hardcoded
@@ -97,7 +97,7 @@ repos:
       # committed (git records it and `git status` is clean afterwards).
       - id: no-conflict-markers
         name: "no merge conflict markers"
-        entry: guardrails-no-conflict-markers
+        entry: sh scripts/run_guardrail.sh guardrails-no-conflict-markers
         language: system
         pass_filenames: true
 
@@ -107,7 +107,7 @@ repos:
       # "declared" rather than implying every doc in the tree is verified.
       - id: derived-docs
         name: "declared-derived doc regions still match their generator"
-        entry: guardrails-derived-docs
+        entry: sh scripts/run_guardrail.sh guardrails-derived-docs
         language: system
         pass_filenames: true
       # Every Accepted ADR — read from each ADR file's own `- Status:` header,
@@ -115,7 +115,7 @@ repos:
       # Also fails duplicate ADR ids and an index that omits or disagrees.
       - id: adr-matrix
         name: "every Accepted ADR cited in FEATURE-MATRIX.md"
-        entry: guardrails-adr-matrix
+        entry: sh scripts/run_guardrail.sh guardrails-adr-matrix
         language: system
         pass_filenames: false
         files: (^docs/adr/|^FEATURE-MATRIX\.md$)
@@ -149,7 +149,7 @@ repos:
       # run: logic block unless annotated `guardrails-ok(ci-shim): <reason>`.
       - id: ci-shim
         name: "CI is a shim over `nix flake check`"
-        entry: env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim
+        entry: env GUARDRAILS_CI_SHIM_ENFORCE=1 sh scripts/run_guardrail.sh guardrails-ci-shim
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
         pass_filenames: true
@@ -157,13 +157,13 @@ repos:
       # --- pre-push (CI-deep; inert until the first criterion bench lands) ------
       - id: perf-budget
         name: "perf regressions vs perf-budgets.toml"
-        entry: guardrails-perf-budget
+        entry: sh scripts/run_guardrail.sh guardrails-perf-budget
         language: system
         stages: [pre-push]
         pass_filenames: false
       - id: perf-record
         name: "append bench medians to perf-history.csv"
-        entry: guardrails-perf-record
+        entry: sh scripts/run_guardrail.sh guardrails-perf-record
         language: system
         stages: [pre-push]
         pass_filenames: false
@@ -172,7 +172,7 @@ repos:
       # `just log-budget` to capture one and gate it for real.
       - id: log-budget
         name: "log noise/silence vs log-budgets.toml"
-        entry: guardrails-log-budget
+        entry: sh scripts/run_guardrail.sh guardrails-log-budget
         language: system
         stages: [pre-push]
         pass_filenames: false

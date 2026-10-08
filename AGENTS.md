@@ -88,6 +88,8 @@ If the current session is already inside an isolated task worktree, keep using i
 
 Before committing, propose the commit message and get alignment.
 
+In a fresh worktree, commit with `nix develop --command git commit` so the guardrails hooks have their tooling on PATH, or run `direnv allow` and load the environment in a direnv-enabled shell.
+
 After the change is integrated, remove the task worktree and delete the task branch locally and remotely.
 
 ## Testing
