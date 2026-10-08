@@ -2100,6 +2100,11 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
+    /// SHA-256 of the persisted Ed25519 public key, not a mesh enrollment claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_detection_warning: Option<String>,
 }
 
 /// Accept failures retained for the lifetime of the API listener.
@@ -2171,6 +2176,11 @@ pub enum ResponseResult {
         content: String,
     },
     PeersSummary {
+        /// This server's persistent per-user node identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clone_detection_warning: Option<String>,
         /// Short hostname of the answering server.
         host: String,
         /// flock version string of the answering server (spot un-deployed peers).
@@ -4221,7 +4231,11 @@ mod tests {
             result: ResponseResult::Pong {
                 version: "0.1.2".into(),
                 protocol: 6,
-                capabilities: Some(ServerCapabilities { live_handoff: true }),
+                capabilities: Some(ServerCapabilities {
+                    live_handoff: true,
+                    node_id: None,
+                    clone_detection_warning: None,
+                }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
             },

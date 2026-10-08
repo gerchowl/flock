@@ -13,6 +13,8 @@ impl App {
         encode_success(
             id,
             ResponseResult::PeersSummary {
+                node_id: self.node_id.clone(),
+                clone_detection_warning: self.clone_detection_warning.clone(),
                 host: short_host_name(),
                 version: Some(crate::build_info::version()),
                 protocol: Some(crate::protocol::PROTOCOL_VERSION),

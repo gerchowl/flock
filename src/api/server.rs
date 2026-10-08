@@ -33,6 +33,8 @@ const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
     path: PathBuf,
+    pub(crate) node_id: Option<String>,
+    pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
 }
@@ -59,10 +61,18 @@ pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
 ) -> std::io::Result<ServerHandle> {
+    let identity = crate::mesh::identity::NodeIdentity::load()?;
+    if let Some(warning) = &identity.clone_detection_warning {
+        crate::logging::node_clone_detection_unavailable(warning);
+    }
     start_server_with_capabilities(
         api_tx,
         event_hub,
-        Some(ServerCapabilities { live_handoff: true }),
+        Some(ServerCapabilities {
+            live_handoff: true,
+            node_id: Some(identity.node_id()),
+            clone_detection_warning: identity.clone_detection_warning.clone(),
+        }),
     )
 }
 
@@ -81,6 +91,10 @@ pub fn start_server_with_capabilities(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let node_id = capabilities.as_ref().and_then(|caps| caps.node_id.clone());
+    let clone_detection_warning = capabilities
+        .as_ref()
+        .and_then(|caps| caps.clone_detection_warning.clone());
     let thread = std::thread::spawn(move || {
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
         run_accept_loop(
@@ -112,6 +126,8 @@ pub fn start_server_with_capabilities(
 
     Ok(ServerHandle {
         _thread: thread,
+        node_id,
+        clone_detection_warning,
         path,
         identity,
         running,
@@ -1166,7 +1182,11 @@ mod tests {
                 method: Method::Ping(crate::api::schema::PingParams::default()),
             },
             &tx,
-            Some(ServerCapabilities { live_handoff: true }),
+            Some(ServerCapabilities {
+                live_handoff: true,
+                node_id: None,
+                clone_detection_warning: None,
+            }),
             None,
             &Mutex::default(),
         );

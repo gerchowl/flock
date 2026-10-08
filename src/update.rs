@@ -2706,7 +2706,11 @@ mod tests {
             server: crate::api::RuntimeStatus {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
-                capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    node_id: None,
+                    clone_detection_warning: None,
+                }),
                 session_health: None,
                 api_listener: None,
             },

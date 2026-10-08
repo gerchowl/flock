@@ -1411,7 +1411,18 @@ fn a14_unsafe_names_are_usage_errors() {
         assert_eq!(out.status.code(), Some(2), "{name:?}: {}", stderr(&out));
     }
     assert_eq!(workspaces(&server).len(), before);
-    assert!(walk(&server.base.join("state")).is_empty());
+    // Server startup owns these two files; rejected names must write no other state.
+    let state = server.base.join("state");
+    let mesh = state.join(app_dir_name()).join("mesh");
+    let allowed = [mesh.join("identity.json"), mesh.join("identity.lock")];
+    let unexpected: Vec<_> = walk(&state)
+        .into_iter()
+        .filter(|path| !allowed.contains(path))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unsafe delegate names wrote state: {unexpected:?}"
+    );
 }
 
 /// E15: one round at a time: a `send` while a round is being awaited is

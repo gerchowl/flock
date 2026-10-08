@@ -4721,6 +4721,17 @@ pub(crate) fn capture_logs_across_threads(f: impl FnOnce()) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Once at server startup, never once per status poll or handoff rollback.
+pub(crate) fn node_clone_detection_unavailable(warning: &str) {
+    tracing::warn!(
+        target: "flock::mesh",
+        event = "mesh.clone_detection.unavailable",
+        subsystem = "mesh",
+        outcome = "unavailable",
+        "{warning}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
