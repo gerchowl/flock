@@ -263,7 +263,16 @@ fn read_pane_tty_size_after_marker(
     marker: &str,
     timeout: Duration,
 ) -> (u16, u16) {
-    pane_send_text(socket_path, pane_id, &format!("echo {marker}; stty size\n"));
+    pane_send_text(socket_path, pane_id, &format!("echo {marker}; stty size"));
+    let enter = send_json_request(
+        socket_path,
+        &serde_json::json!({
+            "id": "size_enter", "method": "pane.send_keys",
+            "params": {"pane_id": pane_id, "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert!(enter.get("error").is_none());
 
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -809,12 +818,21 @@ fn output_accumulated_while_detached_visible_on_reattach() {
     // Send text to the pane via API while detached.
     let mut send_stream = UnixStream::connect(&api_socket).expect("connect to API");
     let send_request = format!(
-        r#"{{"id":"4","method":"pane.send_text","params":{{"pane_id":"{pane_id}","text":"echo DURING_DETACH\n"}}}}"#
+        r#"{{"id":"4","method":"pane.send_text","params":{{"pane_id":"{pane_id}","text":"echo DURING_DETACH"}}}}"#
     );
     writeln!(send_stream, "{}", send_request).unwrap();
     let mut send_reader = BufReader::new(send_stream);
     let mut send_response = String::new();
     send_reader.read_line(&mut send_response).unwrap();
+    let enter = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "detached_enter", "method": "pane.send_keys",
+            "params": {"pane_id": pane_id, "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert!(enter.get("error").is_none());
 
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {

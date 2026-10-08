@@ -63,9 +63,10 @@ pub const MAX_CONTINUATION_BYTES: usize = 16 * 1024;
 ///
 /// The threat is concrete rather than theoretical. A continuation reaches a
 /// real PTY, and `encode_api_text` wraps it between `\x1b[200~` and `\x1b[201~`
-/// WITHOUT escaping — so a continuation containing `\x1b[201~` closes the paste
-/// early and everything after it is read as keystrokes. And with bracketed
-/// paste off it is raw bytes, so a control byte is a control byte. Either way
+/// after stripping embedded paste delimiters to prevent early paste termination.
+/// This guard still refuses those bytes instead of silently changing a saved
+/// continuation. With bracketed paste off the encoder sends raw bytes, so a
+/// control byte is a control byte. Either way
 /// the caller, who may be an agent on another pane rather than this one, could
 /// otherwise make flock type and submit anything a human could.
 pub fn check_continuation(text: &str) -> Result<(), ContinuationProblem> {

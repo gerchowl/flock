@@ -972,7 +972,8 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
 
