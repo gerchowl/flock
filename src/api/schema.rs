@@ -172,6 +172,8 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "pane.submit")]
+    PaneSubmit(PaneSubmitParams),
     #[serde(rename = "pane.arm_self_compact")]
     PaneArmSelfCompact(PaneArmSelfCompactParams),
     #[serde(rename = "pane.read")]
@@ -823,7 +825,7 @@ pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 pub struct AgentSendParams {
     pub target: String,
     pub text: String,
-    /// Type as terminal input, wait 120 ms, then send negotiated Enter.
+    /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
     #[serde(default)]
     pub submit: bool,
 }
@@ -1569,6 +1571,18 @@ pub struct PaneArmSelfCompactParams {
     pub abort: bool,
 }
 
+/// Server-side guarded agent submission for clients that cannot safely read then send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneSubmitParams {
+    pub pane_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub if_session: Option<String>,
+    #[serde(default)]
+    pub min_age_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendInputParams {
     pub pane_id: String,
@@ -2097,6 +2111,11 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    GuardedSubmit {
+        outcome: String,
+        reason: Option<String>,
+        retried: bool,
+    },
     AllocationPlan {
         operation: String,
         plan: serde_json::Value,

@@ -398,6 +398,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
     assert_eq!(
         names,
         vec![
+            "flock_pane_submit",
             "flock_agent_list",
             "flock_agent_get",
             "flock_agent_read",

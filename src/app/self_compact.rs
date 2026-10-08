@@ -327,6 +327,9 @@ impl App {
         if !crate::agent_self_compact::agent_can_self_compact(terminal.effective_known_agent()) {
             return SelfCompactDecision::Suppressed("cannot_self_compact");
         }
+        if self.active_submissions.contains(pane) {
+            return SelfCompactDecision::Suppressed("guarded_submit_in_flight");
+        }
         if self.idle_wake.in_flight(pane) {
             return SelfCompactDecision::Suppressed("idle_wake_in_flight");
         }

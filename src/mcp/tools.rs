@@ -9,6 +9,9 @@
 //! is how the design keeps mutating verbs (`pane.close`, `worktree.remove`,
 //! `agent.start`, pane `send_*`, …) off the MCP surface.
 //!
+//! `flock_pane_submit` is the guarded exception: it requires a fresh idle
+//! composer and confirms acceptance, with no raw key or dialog override.
+//!
 //! `flock_worktree_kill` exposes teardown with a dry-run default and a caller
 //! workspace guard. Branch deletion still requires positive merge evidence.
 //!
@@ -53,6 +56,12 @@ impl Tool {
 /// The full ordered tool table. Order is load-bearing for the golden test.
 pub(super) fn table() -> &'static [Tool] {
     &[
+        Tool {
+            name: "flock_pane_submit",
+            description: "Submit to a fresh idle agent with an empty recognized composer. The server serializes input, checks for dialogs and operator edits, and confirms a new turn with at most one Enter retry. Returns accepted, observed_accepted, unconfirmed or abandoned. Does not mark mail read.",
+            input_schema: schema_pane_submit,
+            build: build_pane_submit,
+        },
         Tool {
             name: "flock_agent_list",
             description: "List agents, and the fleet directory. `agents` is \
@@ -449,6 +458,18 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
         // An MCP-spawned child never steals the operator's focus.
         focus: false,
     }))
+}
+
+fn schema_pane_submit() -> Value {
+    json!({"type": "object", "required": ["pane_id", "text"], "additionalProperties": false,
+        "properties": {"pane_id": {"type": "string"}, "text": {"type": "string"},
+            "if_session": {"type": "string"}, "min_age_secs": {"type": "integer", "minimum": 0}}})
+}
+
+fn build_pane_submit(args: Value) -> Result<Method, McpError> {
+    serde_json::from_value(args)
+        .map(Method::PaneSubmit)
+        .map_err(|err| McpError::invalid_params(err.to_string()))
 }
 
 fn schema_no_args() -> Value {
@@ -1337,6 +1358,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "flock_pane_submit",
                 "flock_agent_list",
                 "flock_agent_get",
                 "flock_agent_read",

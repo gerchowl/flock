@@ -115,7 +115,7 @@ fn write_fake_claude(base: &Path) {
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; printf '\\033[2J\\033[H✻ Crunching… (esc to interrupt)\\n'; sleep 0.4; printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; done\n",
         base = base.display()
     );
     let path = bin.join("claude");

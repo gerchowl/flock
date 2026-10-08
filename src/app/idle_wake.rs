@@ -26,8 +26,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-
 use crate::app::App;
 use crate::detect::{Agent, AgentState};
 
@@ -67,10 +65,10 @@ struct PaneWake {
 }
 
 struct InFlight {
-    typed_at: Instant,
     /// When the Enter is due; `None` once it was sent or abandoned.
     submit_at: Option<Instant>,
     count: usize,
+    attempt: Option<super::guarded_submit::Attempt>,
 }
 
 /// Test-only: mark `pane` as having a typed sentence whose Enter has not gone
@@ -81,9 +79,9 @@ struct InFlight {
 pub(crate) fn test_arm_in_flight(tracker: &mut IdleWakeTracker, pane: &str) {
     let entry = tracker.panes.entry(pane.to_string()).or_default();
     entry.in_flight = Some(InFlight {
-        typed_at: Instant::now(),
         submit_at: Some(Instant::now() + Duration::from_secs(30)),
         count: 1,
+        attempt: None,
     });
 }
 
@@ -240,7 +238,7 @@ impl App {
                 self.idle_wake.note_deadline(submit_at);
                 return Decision::Suppressed("submit_pending");
             }
-            return self.submit_idle_wake(pane, ws_idx, pane_id, now);
+            return self.submit_idle_wake(pane, now);
         }
         if self
             .idle_wake
@@ -336,9 +334,9 @@ impl App {
         // is still in the box, and the Enter would submit it together with
         // the sentence. Read off the screen here, at the keystroke, never on
         // the tick.
-        match agent
-            .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
-        {
+        match agent.and_then(|agent| {
+            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text())
+        }) {
             Some(true) => {}
             Some(false) => return Decision::Suppressed("prompt_not_empty"),
             None => return Decision::Suppressed("no_prompt_box"),
@@ -346,10 +344,11 @@ impl App {
 
         let count = self.mailboxes.queued_len(pane);
         let text = idle_wake_text(count);
-        let bytes = super::api_helpers::encode_api_text(runtime, &text);
-        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
-            return Decision::Suppressed("write_failed");
-        }
+        let attempt = match self.begin_guarded_submit(pane, &text, None, Duration::ZERO, now, true)
+        {
+            Ok(attempt) => attempt,
+            Err(reason) => return Decision::Suppressed(reason),
+        };
 
         // The Enter is its own write, after the pane's reader has come back
         // round — the #362 lesson: text and a carriage return in one read are
@@ -359,9 +358,9 @@ impl App {
         let entry = self.idle_wake.panes.entry(pane.to_string()).or_default();
         entry.announced.extend(wakeable_ids.iter().cloned());
         entry.in_flight = Some(InFlight {
-            typed_at: now,
             submit_at: Some(submit_at),
             count,
+            attempt: Some(attempt),
         });
         Decision::Typed
     }
@@ -381,61 +380,29 @@ impl App {
     /// its agent leaves `Idle` or reads its inbox, and even then the
     /// empty-prompt gate refuses to type next to a sentence still sitting
     /// there.
-    fn submit_idle_wake(
-        &mut self,
-        pane: &str,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        now: Instant,
-    ) -> Decision {
-        let typed_at = self
+    fn submit_idle_wake(&mut self, pane: &str, now: Instant) -> Decision {
+        let Some(mut attempt) = self
             .idle_wake
             .panes
-            .get(pane)
-            .and_then(|entry| entry.in_flight.as_ref())
-            .map_or(now, |flight| flight.typed_at);
-        let abandon = |app: &mut App, reason: &'static str| {
-            if let Some(flight) = app
-                .idle_wake
-                .panes
-                .get_mut(pane)
-                .and_then(|entry| entry.in_flight.as_mut())
-            {
-                flight.submit_at = None;
-            }
-            Decision::Abandoned(reason)
-        };
-
-        if let Some(suppression) = self.wake_suppression(pane, super::api::messages::now_ms()) {
-            return abandon(self, suppression.reason);
-        }
-        // The full freshness check, not just `state == Idle`: a screen that
-        // went stale or unreadable inside the gap is not evidence either. The
-        // settle is already proven, so it is not asked again.
-        let fresh = Duration::from_millis(self.state.config.msg.idle_wake_fresh_ms);
-        let blocker = match self.terminal_for_pane(ws_idx, pane_id) {
-            Some(terminal) => terminal.idle_wake_blocker(now, Duration::ZERO, fresh),
-            None => Some("pane_gone"),
-        };
-        if let Some(blocker) = blocker {
-            return abandon(self, blocker);
-        }
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return abandon(self, "pane_gone");
-        };
-        if runtime
-            .last_operator_input_at()
-            .is_some_and(|input| input >= typed_at)
-        {
-            return abandon(self, "operator_active");
-        }
-        let Ok(mut keys) = super::api_helpers::encode_api_keys(runtime, &["Enter".to_string()])
+            .get_mut(pane)
+            .and_then(|entry| entry.in_flight.as_mut())
+            .and_then(|flight| flight.attempt.take())
         else {
-            return abandon(self, "write_failed");
+            return Decision::Abandoned("missing_attempt");
         };
-        let enter = keys.pop().unwrap_or_else(|| b"\r".to_vec());
-        if runtime.try_send_flock_authored(Bytes::from(enter)).is_err() {
-            return abandon(self, "write_failed");
+        let enter_due = now >= attempt.due;
+        let outcome = if let Some(suppression) =
+            self.wake_suppression(pane, super::api::messages::now_ms())
+        {
+            Some(super::guarded_submit::Outcome::Abandoned(
+                suppression.reason,
+            ))
+        } else {
+            self.advance_guarded_submit(pane, &mut attempt, now)
+        };
+        let next = now + Duration::from_millis(50);
+        if outcome.is_none() {
+            self.idle_wake.note_deadline(next);
         }
         if let Some(flight) = self
             .idle_wake
@@ -443,9 +410,26 @@ impl App {
             .get_mut(pane)
             .and_then(|entry| entry.in_flight.as_mut())
         {
-            flight.submit_at = None;
+            flight.submit_at = outcome.is_none().then_some(next);
+            flight.attempt = outcome.is_none().then_some(attempt);
         }
-        Decision::Submitted
+        match outcome {
+            None if enter_due => Decision::Submitted,
+            None => Decision::Suppressed("confirm_pending"),
+            Some(
+                super::guarded_submit::Outcome::Accepted
+                | super::guarded_submit::Outcome::ObservedAccepted,
+            ) => {
+                if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
+                    entry.in_flight = None;
+                }
+                Decision::Suppressed("accepted")
+            }
+            Some(
+                super::guarded_submit::Outcome::Abandoned(reason)
+                | super::guarded_submit::Outcome::Unconfirmed(reason),
+            ) => Decision::Abandoned(reason),
+        }
     }
 
     /// `pub(crate)` rather than private because `app::self_compact` walks the

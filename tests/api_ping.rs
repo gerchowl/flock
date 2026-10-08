@@ -2615,44 +2615,26 @@ with log.open('w') as out:
         })
         .to_string(),
     );
-    assert_eq!(submitted["result"]["type"], "ok");
+    assert!(
+        submitted.get("error").is_some(),
+        "unknown composers must refuse: {submitted}"
+    );
     let cli = run_flk(
         &socket_path,
         &["agent", "send", "--submit", pane, "cli prompt"],
     );
-    assert!(
-        cli.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cli.stderr)
-    );
+    assert!(!cli.status.success(), "unknown composers must refuse");
     let expected =
-        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
+        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~";
     let deadline = Instant::now() + Duration::from_secs(5);
     while bytes(&read_log()).len() < expected.len() {
-        assert!(
-            Instant::now() < deadline,
-            "missing submitted input: {:?}",
-            bytes(&read_log())
-        );
+        assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(10));
     }
-    let rows = read_log();
-    assert_eq!(bytes(&rows), expected);
-    for prompt in [b"socket prompt".as_slice(), b"cli prompt".as_slice()] {
-        let paste = rows
-            .iter()
-            .position(|row| {
-                bytes(std::slice::from_ref(row))
-                    .windows(prompt.len())
-                    .any(|part| part == prompt)
-            })
-            .unwrap();
-        let enter = &rows[paste + 1];
-        assert_eq!(bytes(std::slice::from_ref(enter)), b"\x1b[13u");
-        assert!(
-            enter["at"].as_f64().unwrap() - rows[paste]["at"].as_f64().unwrap() >= 0.10,
-            "Enter must arrive after the paste settling gap"
-        );
-    }
+    assert_eq!(
+        bytes(&read_log()),
+        expected,
+        "guarded submission must send no bytes to an unknown composer"
+    );
     cleanup_spawned_flock(child, base);
 }
