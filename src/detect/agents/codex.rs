@@ -159,7 +159,9 @@ fn has_codex_current_prompt(content: &str) -> bool {
 /// Prompt and footer line indices in the live bottom-buffer composer.
 pub(in crate::detect) fn composer_region(content: &str) -> Option<(usize, usize)> {
     let lines: Vec<_> = content.lines().collect();
-    let prompt = lines.iter().rposition(|line| codex_prompt_line(line))?;
+    let prompt = lines
+        .iter()
+        .rposition(|line| codex_prompt_line(line.trim_start()))?;
     let footer = lines[prompt + 1..]
         .iter()
         .position(|line| composer_footer(line))?;
@@ -168,7 +170,7 @@ pub(in crate::detect) fn composer_region(content: &str) -> Option<(usize, usize)
     // this is no longer the live composer.
     if lines[footer + 1..]
         .iter()
-        .any(|line| codex_block_marker_line(line))
+        .any(|line| codex_block_marker_line(line.trim_start()))
     {
         return None;
     }
@@ -211,12 +213,10 @@ fn codex_current_prompt_region(content: &str) -> Option<(Vec<&str>, usize)> {
 }
 
 fn codex_prompt_line(line: &str) -> bool {
-    let line = line.trim_start();
     line == "›" || line.starts_with("› ")
 }
 
 fn codex_block_marker_line(line: &str) -> bool {
-    let line = line.trim_start();
     line.starts_with('•') || line.starts_with('■') || line.starts_with('✗') || line.starts_with('✓')
 }
 

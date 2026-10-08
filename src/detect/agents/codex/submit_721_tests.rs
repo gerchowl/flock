@@ -20,27 +20,22 @@ fn codex_721_classifier_shares_live_composer_boundaries() {
 }
 
 #[test]
-fn codex_721_classifier_recognizes_indented_live_prompt_and_working_controls() {
-    for (screen, working) in [
-        (INLINE, false),
-        (ALT, false),
-        (
-            include_str!("../../../../tests/fixtures/codex-submit-721/inline-working.txt"),
-            true,
-        ),
-        (
-            include_str!("../../../../tests/fixtures/codex-submit-721/alt-working.txt"),
-            true,
-        ),
-    ] {
+fn codex_721_indentation_tolerance_is_local_to_composer_bounds() {
+    for screen in [INLINE, ALT] {
         let padded = screen
             .lines()
             .map(|line| format!("  {line}\n"))
             .collect::<String>();
-        let detection = detect_agent(Some(Agent::Codex), &padded);
-        assert_eq!(detection.visible_working, working);
-        assert_eq!(detection.visible_idle, !working);
+        assert_eq!(composer_region(&padded), composer_region(screen));
+        assert_eq!(
+            composer_region(&format!("{padded}\n  • Working (1s • esc to interrupt)")),
+            None
+        );
     }
+    assert!(!codex_prompt_line("  › pasted transcript"));
+    assert!(!codex_block_marker_line(
+        "  • Working (1s • esc to interrupt)"
+    ));
 }
 
 #[test]
