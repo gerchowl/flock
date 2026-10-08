@@ -33,6 +33,8 @@ flk status server
 flk status client
 ```
 
+Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
+
 ## Server
 
 ```bash
@@ -200,6 +202,8 @@ flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <pane_id> <command>
 ```
 
+`pane send-text` uses bracketed paste when the terminal enables it and does not send Enter. Terminals without bracketed paste receive the text bytes directly. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys; control bytes passed to `send-text` are pasted as text when bracketed paste is enabled.
+
 `pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
 Arm a self-compaction of your own context:
@@ -267,6 +271,7 @@ flk pane report-metadata <pane_id> \
 flk agent list
 flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
+flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]
 flk agent result <target> [--max-chars N] [--offset N]
 flk agent send [--submit] <target> <text>
 flk agent rename <target> <name>|--clear
@@ -290,7 +295,7 @@ flk checks run <name>
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
 
-`agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream **without submitting**. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
+`agent read` reads the resolved terminal stream. `agent send` pastes text to that stream **without submitting**, using bracketed paste when the terminal enables it so punctuation such as `!` stays literal input. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys instead of embedding control bytes in the text. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
@@ -399,13 +404,15 @@ Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BL
 
 `send` runs another round on the same delegate; one round at a time, so a `send` while a round is being awaited exits 1 and types nothing. `wait` without `--after` waits from the cursor the delegate recorded with its latest submit. `result` and `status` read without waiting; a `result` for a round with no reply whose agent no longer exists or is hibernated reports `gone` (exit 4), as `wait` does. `reap` removes only the workspace and checkout recorded at start, reads just the registry so it works even when the agent is gone or the workspace was closed by hand, and leaves the branch decision to `worktree kill`'s merge gate — use that when you want to see the gate first.
 
-`reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
+`reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. If the recorded checkout was removed outside flock, `reap` closes the workspace only when it still belongs to that checkout, prunes stale Git worktree metadata, then clears the entry. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
 
 `pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats.
 
 ### Delegate stall verdicts
 
 `start --await`, `send --await`, and `wait` accept `--silence DURATION` (default `3m`; `0` disables it). Units are `ms`, `s`, `m`, and `h`, including combinations such as `1m 30s`. A working agent whose unscrolled detection screen stays unchanged after removing recognized harness status rows for this duration returns `outcome: "stalled"`, reason `silence`, and exit **7**. Viewport scrolling and recognized spinner, elapsed-counter, and progress-bar rows do not reset the timer; a new transcript line does. Opencode retries return reason/verdict `provider_limit` and `retry_after_ms` only while working or unknown, when the ETA is at least the silence window or the retry persists continuously for that window. With `--silence 0`, only an ETA of at least 5 minutes stalls; short retries continue waiting, and idle means recovery.
+
+Raise `--silence` for long builds or tools that print nothing while running. Recognized Claude, Codex, and opencode spinners do not count as progress; Claude running-tool elapsed counters are normalized while the tool row remains evidence. Unknown harness animations may still reset the timer, so a hung tool in an unknown harness can go undetected.
 
 Readiness still defaults to 60 seconds. On readiness expiry, JSON includes `outcome: "ready_timeout"`, verdict `waiting_on_input`, `stalled`, or `unknown`, and `last_line` (the last nonblank screen line); exit remains 1. Round outcomes include `verdict`, `reason`, `retry_after_ms`, `last_line`, and `s1`. `delegate status` includes the latest persisted verdict for the current round.
 

@@ -96,6 +96,7 @@ pub(crate) enum ServerRuntimeStatus {
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
         session_health: Option<crate::platform::SessionHealth>,
+        api_listener: Option<crate::api::schema::ApiListenerHealth>,
     },
     NotRunning,
 }
@@ -158,13 +159,23 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
+            version,
+            protocol,
+            api_listener,
+            ..
         } => {
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
+            if let Some(health) = api_listener {
+                println!("{indent}api listener stopped: {}", health.stopped);
+                println!("{indent}api accept errors: {}", health.accept_errors);
+                if let Some(err) = &health.last_accept_error {
+                    println!("{indent}last api accept error: {err}");
+                }
+            }
         }
         ServerRuntimeStatus::NotRunning => {
             println!("{indent}status: not running");
@@ -213,6 +224,7 @@ pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatu
             protocol: status.protocol,
             capabilities: status.capabilities,
             session_health: status.session_health,
+            api_listener: status.api_listener,
         }),
         Err(ApiClientError::Io(err)) if server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -296,6 +308,7 @@ struct ServerStatusJson {
     /// report this, and collapsing that into a value would assert something
     /// nobody knows.
     session_health: Option<&'static str>,
+    api_listener: Option<crate::api::schema::ApiListenerHealth>,
 }
 
 #[derive(Serialize)]
@@ -325,6 +338,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             protocol,
             capabilities,
             session_health,
+            api_listener,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -340,6 +354,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
             session_health: session_health_label(*session_health),
+            api_listener: api_listener.clone(),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -352,6 +367,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             session: crate::session::active_name(),
             restart_needed: Some(false),
             session_health: None,
+            api_listener: None,
         },
     }
 }
@@ -415,4 +431,31 @@ fn status_help_text() -> String {
         "  flk status client [--json]  show local client binary status"
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_status_json_retains_accept_error_diagnostics() {
+        let server = ServerRuntimeStatus::Running {
+            version: None,
+            protocol: None,
+            capabilities: None,
+            session_health: None,
+            api_listener: Some(crate::api::schema::ApiListenerHealth {
+                stopped: true,
+                accept_errors: 2,
+                last_accept_error: Some("injected accept failure".into()),
+            }),
+        };
+        let json = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(json["api_listener"]["stopped"], true);
+        assert_eq!(json["api_listener"]["accept_errors"], 2);
+        assert_eq!(
+            json["api_listener"]["last_accept_error"],
+            "injected accept failure"
+        );
+    }
 }

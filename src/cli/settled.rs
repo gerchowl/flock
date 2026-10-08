@@ -7,8 +7,7 @@
 //! agent enter `working` (or the cursor was captured while it was working), and
 //! then saw its reported status hold `idle`/`done` with **no state transition at
 //! all** for the settle window. It is a statement about what flock observed, not
-//! about what the agent did. The result of a turn is `flk agent result`
-//! (once #575 lands), which this package does not ship.
+//! about what the agent did. Read the result of a turn with `flk agent result`.
 //!
 //! ## Why one module
 //!
