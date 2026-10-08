@@ -89,25 +89,12 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
             (rows, start + 1, end)
         }
         Agent::Codex => {
-            let Some(start) = lines
-                .iter()
-                .rposition(|line| line.trim_start().starts_with("› ") || line.trim() == "›")
-            else {
-                return Composer::Unknown;
-            };
-            let Some(end) = lines[start + 1..]
-                .iter()
-                .position(|line| line.contains("? for shortcuts") || line.contains("context left"))
-            else {
+            let Some((start, end)) = crate::detect::codex_composer_region(screen) else {
                 return Composer::Unknown;
             };
             let mut rows = vec![lines[start].trim_start().trim_start_matches('›').trim()];
-            rows.extend(
-                lines[start + 1..start + 1 + end]
-                    .iter()
-                    .map(|line| line.trim()),
-            );
-            (rows, start, start + 1 + end)
+            rows.extend(lines[start + 1..end].iter().map(|line| line.trim()));
+            (rows, start, end)
         }
         Agent::OpenCode => {
             let Some(end) = lines
@@ -683,3 +670,7 @@ mod tests {
         assert_eq!(progress("1:0:2:4:i", "1:1:3:6:i"), Err("execution_changed"));
     }
 }
+
+#[cfg(test)]
+#[path = "guarded_submit/codex_721_tests.rs"]
+mod codex_721_tests;
