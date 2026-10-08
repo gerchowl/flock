@@ -370,8 +370,8 @@ On success `settled` prints one JSON object on stdout:
 flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])
                     [--harness opencode|claude] [--model M] [--await] [--timeout MS] [--settle MS]
                     [--ready-timeout MS] [--max-chars N] [--json]
-flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]
-flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]
+flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]
+flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silence DURATION] [--max-chars N] [--json]
 flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
 flk delegate reap <name> [--force] [--json]
@@ -389,11 +389,19 @@ The delegate runs in a workspace it created and **never requests focus**, so you
 
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
-Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6 and 124 print the same object (a usage error, exit 2, and any other failure, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
+Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
 
 `send` runs another round on the same delegate; one round at a time, so a `send` while a round is being awaited exits 1 and types nothing. `wait` without `--after` waits from the cursor the delegate recorded with its latest submit. `result` and `status` read without waiting; a `result` for a round with no reply whose agent no longer exists or is hibernated reports `gone` (exit 4), as `wait` does. `reap` removes only the workspace and checkout recorded at start, reads just the registry so it works even when the agent is gone or the workspace was closed by hand, and leaves the branch decision to `worktree kill`'s merge gate — use that when you want to see the gate first.
 
 `reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
+
+### Delegate stall verdicts
+
+`start --await`, `send --await`, and `wait` accept `--silence DURATION` (default `3m`; `0` disables it). Units are `ms`, `s`, `m`, and `h`, including combinations such as `1m 30s`. A working agent whose recent bottom screen stays unchanged for this duration returns `outcome: "stalled"`, reason `silence`, and exit **7**. Scrolling the viewport does not count as progress. Opencode's provider retry controls return the same outcome and code with reason/verdict `provider_limit` and `retry_after_ms`, even when its spinner moves.
+
+Readiness still defaults to 60 seconds. On readiness expiry, JSON includes `outcome: "ready_timeout"`, verdict `waiting_on_input`, `stalled`, or `unknown`, and `last_line` (the last nonblank screen line); exit remains 1. Round outcomes include `verdict`, `reason`, `retry_after_ms`, `last_line`, and `s1`. `delegate status` includes the latest persisted verdict for the current round.
+
+System One is optional: configure `[systemone] urls = ["http://127.0.0.1:8000/v1/systemone"]` and `timeout_s = 3`, or set `SYSTEMONE_URL` to comma- or space-separated URLs. The environment variable takes precedence. Only round endings and readiness expiry send the last 4 KB of recent screen text; polls never send requests. A response adds advisory `s1: {fused, verdict}` without changing the exit code. Unavailable endpoints yield `s1: null`. Requests share a bounded timeout (default 3 seconds); an endpoint failing three times is skipped for ten minutes.
 
 ## Notifications
 

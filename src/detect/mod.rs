@@ -398,7 +398,7 @@ fn detect_kilo(content: &str) -> AgentState {
 // ---------------------------------------------------------------------------
 
 /// Check for action confirmations followed by "yes" or "❯".
-fn has_confirmation_prompt(lower_content: &str) -> bool {
+pub(crate) fn has_confirmation_prompt(lower_content: &str) -> bool {
     if let Some(pos) = lower_content
         .find("do you want to")
         .or_else(|| lower_content.find("would you like to"))
@@ -673,6 +673,15 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn detect_compaction_chrome_in_claude_and_opencode_is_working() {
+        assert_eq!(detect_claude("✶ Compacting conversation… (esc to interrupt)\n─────────────────────────\n❯ \n─────────────────────────"), AgentState::Working);
+        assert_eq!(
+            detect_opencode("Compacting conversation\n■■■■⬝⬝  esc interrupt  opencode"),
+            AgentState::Working
+        );
     }
 
     #[test]

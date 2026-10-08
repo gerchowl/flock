@@ -144,6 +144,7 @@ fn codex_working_status_line(line: &str) -> bool {
     let lower = trimmed.to_lowercase();
     trimmed.starts_with('•')
         && (trimmed.contains("Working (")
+            || trimmed.contains("Compacting context (")
             || trimmed.contains("Waiting for background terminal (")
             || lower.contains("reviewing approval request (")
             || (lower.contains("reviewing ") && lower.contains(" approval requests ("))
@@ -217,4 +218,22 @@ fn transcript_control_tail(line: &str) -> bool {
         || lower.contains("esc to edit")
         || lower.contains("esc/← to edit")
         || lower.contains("edit message")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_codex_compaction_remains_working_under_its_visible_prompt() {
+        // #627's owner-provided screen, replayed through an isolated recent
+        // pane read. The bullet and compaction header are working chrome.
+        let screen = "• Compacting context (3s • esc to interrupt) · 1 bac\nkground terminal running · /ps to view · /stop to cl\nose\n  └ Making room to continue.\n› Ask Codex to do anything\n";
+        assert_eq!(detect(screen), AgentState::Working);
+        assert!(has_visible_working(screen));
+        assert_eq!(
+            detect("Compacting context is described in the transcript\n› Ask Codex to do anything"),
+            AgentState::Idle
+        );
+    }
 }

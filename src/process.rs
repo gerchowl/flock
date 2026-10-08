@@ -262,6 +262,23 @@ impl TracedCommand {
     /// someone reads, so polling `try_wait` without draining would hang until
     /// the deadline even for a child that had already finished its work.
     pub(crate) fn output_traced_with_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
+        self.output_traced_with_input_and_timeout(None, timeout)
+    }
+
+    pub(crate) fn output_traced_with_stdin_and_timeout(
+        &mut self,
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<Output> {
+        self.inner.stdin(std::process::Stdio::piped());
+        self.output_traced_with_input_and_timeout(Some(input.to_vec()), timeout)
+    }
+
+    fn output_traced_with_input_and_timeout(
+        &mut self,
+        input: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> io::Result<Output> {
         use std::io::Read;
 
         let args = shape_args(&self.inner);
@@ -273,6 +290,14 @@ impl TracedCommand {
             // Same funnel exemption as `output_traced` — this IS the wrapper.
             #[allow(clippy::disallowed_methods)]
             let mut child = self.inner.spawn()?;
+            if let Some(input) = input {
+                if let Some(mut stdin) = child.stdin.take() {
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        let _ = stdin.write_all(&input);
+                    });
+                }
+            }
             let mut stdout_pipe = child.stdout.take();
             let mut stderr_pipe = child.stderr.take();
             let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();

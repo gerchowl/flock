@@ -18,6 +18,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "session",
     "slots",
     "spawn",
+    "systemone",
     "terminal",
     "theme",
     "title",
@@ -493,6 +494,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.gossip = section,
+    );
+    load_live_section(
+        &table,
+        "systemone",
+        "systemone config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.systemone = section,
     );
     load_live_section(
         &table,

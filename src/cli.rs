@@ -16,6 +16,8 @@ use crate::api::schema::{
 mod agent;
 mod checks;
 mod delegate;
+mod delegate_s1;
+mod delegate_verdict;
 mod digest;
 mod fleet;
 mod help;
