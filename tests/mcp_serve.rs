@@ -239,6 +239,125 @@ impl McpClient {
 // ---- tests ---------------------------------------------------------------
 
 #[test]
+fn mcp_worktree_kill_defaults_to_plan_then_tears_down_a_fixture_space() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let repo = base.join("repo");
+    let checkout = base.join("checkout");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Flock Test",
+                "-c",
+                "user.email=flock@example.invalid",
+            ])
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    fs::write(repo.join("fixture.txt"), "fixture\n").unwrap();
+    git(&["add", "fixture.txt"]);
+    git(&["commit", "--quiet", "-m", "fixture base"]);
+    git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "feature/mcp-kill",
+        checkout.to_str().unwrap(),
+    ]);
+
+    let socket_path = base.join("runtime/flock.sock");
+    let server = spawn_flock(&base.join("config"), &base.join("runtime"), &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let cli = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(args)
+            .env("FLOCK_SOCKET_PATH", &socket_path)
+            .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "flk {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let opened = cli(&[
+        "worktree",
+        "open",
+        "--cwd",
+        repo.to_str().unwrap(),
+        "--path",
+        checkout.to_str().unwrap(),
+        "--json",
+    ]);
+    let ws_id = opened["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let mut mcp = McpClient::spawn(&socket_path);
+    for (id, arguments) in [
+        (1, json!({"workspace": ws_id})),
+        (2, json!({"path": checkout})),
+    ] {
+        mcp.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "flock_worktree_kill", "arguments": arguments}}));
+        let response = mcp.recv(Duration::from_secs(15));
+        assert!(response.get("error").is_none(), "{response}");
+        let plan: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(plan["type"], "worktree_killed");
+        assert_eq!(plan["removed"], false);
+        assert_eq!(plan["would_delete_branch"], true);
+        assert!(checkout.exists());
+        git(&["rev-parse", "--verify", "refs/heads/feature/mcp-kill"]);
+    }
+    mcp.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "flock_worktree_kill", "arguments": {"path": checkout, "dry_run": false}}}));
+    let response = mcp.recv(Duration::from_secs(15));
+    assert!(response.get("error").is_none(), "{response}");
+    let killed: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(killed["type"], "worktree_killed");
+    assert_eq!(killed["workspace_id"], ws_id);
+    assert_eq!(killed["removed"], true);
+    assert_eq!(killed["merged"], true);
+    assert_eq!(killed["branch_deleted"], true);
+    assert!(!checkout.exists());
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", "feature/mcp-kill"])
+        .output()
+        .unwrap();
+    assert!(branches.status.success());
+    assert!(branches.stdout.is_empty());
+    let listed = cli(&["workspace", "list"]);
+    assert!(!listed["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ws| ws["workspace_id"] == ws_id));
+    mcp.shutdown();
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn mcp_stdio_handshake_and_tool_call_round_trip() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -293,6 +412,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_self_compact",
             "flock_pane_read",
             "flock_worktree_list",
+            "flock_worktree_kill",
             "flock_agent_start",
             "flock_agent_history",
             "flock_agent_result",
