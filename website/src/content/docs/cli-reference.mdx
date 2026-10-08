@@ -155,7 +155,7 @@ Worktrees are normal Flock workspaces with Git checkout provenance. `worktree cr
 
 `worktree list` prints a table ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. `AGE` is the last commit on the branch — deliberately not the directory's mtime, which a build that rewrites `target/` makes meaningless. `--scan` adds a `VERDICT` column resolved through the same gate `worktree kill` runs, so a squash-merged branch reads `merged` here exactly as it does there; it is opt-in because it costs local Git plus a `gh` call per checkout. Absence of a verdict means "not scanned", never "not merged". `--json` prints the raw response, where the fields are `last_commit_at` and `kill_verdict`.
 
-`worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into the default branch, remote containment, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The repo's default branch and any `[worktrees] protected_branches` entry are kept under every path.
+`worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into a landing branch, remote containment, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The landing branches (the detected default branch plus `dev`, `main` and `master`, and any `[worktrees] integration_branches` entry) and any `[worktrees] protected_branches` entry are kept under every path. See [Which branch counts as merged](/docs/configuration/#which-branch-counts-as-merged) for how that set is decided.
 
 A kill also sweeps the processes left in the checkout. Removing a worktree unlinks a directory but does not touch the processes whose working directory it was, and a `setsid` child is out of reach of the pane teardown — those keep running against a path that no longer exists. Once the checkout is removed and the workspace is closed, anything still alive from inside it gets `SIGTERM`, a grace period, then `SIGKILL`. Matching is against the leaf checkout exactly, never the parent directory worktrees of a repo share, and the calling process and the shell it was typed into are never signalled. The result JSON carries `processes` (what was standing there when the kill began), `orphans` (what outlived the teardown) and `orphans_surviving` (what outlived `SIGKILL`), each as `pid` plus command name; the same is summarised on stderr. `--keep-procs` reports without signalling anything, and `--dry-run` names what is standing in the checkout without touching it.
 
@@ -183,7 +183,7 @@ flk pane close <pane_id>
 Read output:
 
 ```bash
-flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N]
+flk pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N]
 flk pane read <pane_id> --source visible --ansi
 flk pane read <pane_id> --source recent-unwrapped --lines 120
 ```
@@ -264,7 +264,7 @@ flk pane report-metadata <pane_id> \
 ```bash
 flk agent list
 flk agent get <target>
-flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
+flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 flk agent result <target> [--max-chars N] [--offset N]
 flk agent send <target> <text>
 flk agent rename <target> <name>|--clear
@@ -319,7 +319,7 @@ Detach from direct attach with `ctrl+b q`. Send literal `ctrl+b` with `ctrl+b ct
 Wait for output in a pane:
 
 ```bash
-flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]
+flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--timeout MS] [--regex] [--raw]
 ```
 
 Wait for pane agent state:
@@ -368,14 +368,16 @@ On success `settled` prints one JSON object on stdout:
 
 ```bash
 flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])
-                    [--harness opencode] [--model M] [--await] [--timeout MS] [--settle MS]
+                    [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS] [--settle MS]
                     [--ready-timeout MS] [--max-chars N] [--json]
-flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]
-flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]
+flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]
+flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silence DURATION] [--max-chars N] [--json]
 flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
 flk delegate reap <name> [--force] [--json]
 ```
+
+Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspace-write blocks the network, so a delegate that must `git push` or use `gh` needs `--sandbox danger-full-access`, deliberately chosen by the caller. `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access` for Codex only; opencode and Claude reject it with exit 2.
 
 `delegate` is the sequence above run as one command: create the space, start the harness in it, wait until it is actually up, type the brief, and — with `--await` — wait for the round's outcome and print it. It is composed from socket methods that already existed, so it adds no new protocol; what it adds is the bookkeeping that was previously in somebody's shell history.
 
@@ -383,15 +385,27 @@ The brief is a file, and exactly one sentence is ever typed into the agent: `Rea
 
 The delegate runs in a workspace it created and **never requests focus**, so your focus is unchanged by any of these verbs and a delegate never lands in the workspace you are looking at. With `--worktree` it makes a linked checkout (`--repo`, `--branch`, `--base`; those three mean nothing with `--cwd` and are refused there) and the agent's cwd is that checkout.
 
-**The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash.
+`--harness` is `opencode` (the default) or `claude`, and `--model M` is handed to it as `--model M`. The two differ in where the session comes from, which is what `no_result` reports: opencode's plugin names it mid-turn, Claude's `SessionStart` hook names it from inside the harness.
+
+**The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash. Claude Code asks `Quick safety check: Is this a project you created or one you trust?` the first time it starts in a directory, and a `--worktree` checkout is always such a directory: that dialog has no input box, so the delegate names it (`delegate <name>: Claude Code is waiting on its folder-trust dialog (see #605)`) and refuses instead of typing at it. Accepting it is a human action — #605 is the pre-trust proposal, not a default.
 
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
-Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6 and 124 print the same object (a usage error, exit 2, and any other failure, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
+Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
 
 `send` runs another round on the same delegate; one round at a time, so a `send` while a round is being awaited exits 1 and types nothing. `wait` without `--after` waits from the cursor the delegate recorded with its latest submit. `result` and `status` read without waiting; a `result` for a round with no reply whose agent no longer exists or is hibernated reports `gone` (exit 4), as `wait` does. `reap` removes only the workspace and checkout recorded at start, reads just the registry so it works even when the agent is gone or the workspace was closed by hand, and leaves the branch decision to `worktree kill`'s merge gate — use that when you want to see the gate first.
 
 `reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
+
+`pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats.
+
+### Delegate stall verdicts
+
+`start --await`, `send --await`, and `wait` accept `--silence DURATION` (default `3m`; `0` disables it). Units are `ms`, `s`, `m`, and `h`, including combinations such as `1m 30s`. A working agent whose unscrolled detection screen stays unchanged after removing recognized harness status rows for this duration returns `outcome: "stalled"`, reason `silence`, and exit **7**. Viewport scrolling and recognized spinner, elapsed-counter, and progress-bar rows do not reset the timer; a new transcript line does. Opencode retries return reason/verdict `provider_limit` and `retry_after_ms` only while working or unknown, when the ETA is at least the silence window or the retry persists continuously for that window. With `--silence 0`, only an ETA of at least 5 minutes stalls; short retries continue waiting, and idle means recovery.
+
+Readiness still defaults to 60 seconds. On readiness expiry, JSON includes `outcome: "ready_timeout"`, verdict `waiting_on_input`, `stalled`, or `unknown`, and `last_line` (the last nonblank screen line); exit remains 1. Round outcomes include `verdict`, `reason`, `retry_after_ms`, `last_line`, and `s1`. `delegate status` includes the latest persisted verdict for the current round.
+
+System One is optional: configure `[systemone] urls = ["http://127.0.0.1:8000/v1/systemone"]` and `timeout_s = 3`, or set `SYSTEMONE_URL` to comma- or space-separated URLs. The environment variable takes precedence. Only round endings and readiness expiry send the last 4 KB of the unscrolled detection screen; polls never send requests. A response adds advisory `s1: {fused, verdict}` without changing the exit code. Unavailable endpoints yield `s1: null`. Requests share a bounded timeout (default 3 seconds); an endpoint failing three times is skipped for ten minutes.
 
 ## Notifications
 
@@ -415,7 +429,7 @@ Filing does not depend on `[ui.toast] delivery`. `off` — the default — asks 
 flk integration install pi
 flk integration install omp
 flk integration install claude
-flk integration install codex
+flk integration install codex [--no-trust-hooks]
 flk integration install copilot
 flk integration install kimi
 flk integration install opencode
@@ -432,6 +446,8 @@ flk integration uninstall hermes
 flk integration uninstall qodercli
 flk integration status [--outdated-only]
 ```
+
+Installing the Codex integration records trust for flock’s exact SessionStart hook only. Other hooks still need review. Use `--no-trust-hooks` to leave hook trust untouched.
 
 ## MCP server
 
@@ -488,6 +504,7 @@ Exposed tools:
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
+| `flock_worktree_kill` | `worktree.kill` | Tear down a finished space by `workspace` or `path`. Defaults to `dry_run: true`; pass `dry_run: false` to close the space and remove its checkout. A real kill of your own pane's workspace requires `self: true`. The branch is deleted only when merged; `force` permits dirty checkout removal but never bypasses the merge gate. `keep_branch` and `keep_procs` preserve the branch and remaining processes respectively. |
 
 ### Resources: files handed over to an agent
 
@@ -544,6 +561,7 @@ Flock never files the report itself (ADR-0010 decision 6). The one write path it
 | --- | --- |
 | `visible` | Current rendered screen. Best for UI feedback loops. |
 | `recent` | Recent scrollback with terminal wrapping. |
+| `detection` | Unscrolled live bottom screen, excluding scrollback. |
 | `recent-unwrapped` | Recent scrollback without soft wrapping. Best for logs. |
 
 ## Environment variables
