@@ -1529,12 +1529,14 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
         .env("HOME", &base)
         .env("XDG_CONFIG_HOME", base.join("config"))
         .env("XDG_RUNTIME_DIR", base.join("runtime"))
+        .env("SHELL", "/bin/sh")
+        .env("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS", "5000")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
     register_spawned_flock_pid(Some(child.id()));
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut peer = None;
     let status = loop {
         if peer.is_none() {
@@ -1556,8 +1558,89 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
     };
     unregister_spawned_flock_pid(Some(child.id()));
     assert!(peer.is_some(), "importer must reach the stalled peer");
-    assert!(!status.success());
+    assert_eq!(status.code(), Some(124));
     drop(peer);
     drop(listener);
     fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn handoff_ready_importer_survives_commit_after_startup_deadline() {
+    let base = std::env::temp_dir().join(format!("hc363-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    let socket = base.join("import.sock");
+    let api_socket = base.join("api.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FLOCK_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(["server", "--handoff-import"])
+        .arg(&socket)
+        .arg("late-commit-token")
+        .env("HOME", &base)
+        .env("SHELL", "/bin/sh")
+        .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_RUNTIME_DIR", base.join("runtime"))
+        .env("FLOCK_SOCKET_PATH", &api_socket)
+        .env("FLOCK_CLIENT_SOCKET_PATH", base.join("client.sock"))
+        .env("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS", "5000")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    register_spawned_flock_pid(Some(child.id()));
+    let started = Instant::now();
+    let peer = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("accept importer: {err}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(25));
+    };
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut peer = BufReader::new(peer);
+    let mut line = String::new();
+    peer.read_line(&mut line).unwrap();
+    assert_eq!(line.trim_end(), "late-commit-token");
+    let manifest = serde_json::json!({
+        "version": 1, "source_version": "test", "source_protocol": 0,
+        "expected_version": null, "expected_protocol": null,
+        "snapshot": {"version": 3, "workspaces": [], "active": null, "selected": 0},
+        "panes": []
+    });
+    writeln!(peer.get_mut(), "{manifest}").unwrap();
+    for expected in ["validated", "restored", "ready"] {
+        line.clear();
+        peer.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), expected);
+    }
+    // The same clock would have killed the previous importer before commit.
+    thread::sleep(Duration::from_secs(6));
+    assert!(child.try_wait().unwrap().is_none());
+    peer.get_mut().write_all(b"committed\n").unwrap();
+    line.clear();
+    peer.read_line(&mut line).unwrap();
+    assert_eq!(line.trim_end(), "owned");
+    let response = request(
+        &api_socket,
+        serde_json::json!({"id":"late-commit-stop", "method":"server.stop", "params":{}}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    child.kill().ok();
+    child.wait().unwrap();
+    unregister_spawned_flock_pid(Some(child.id()));
+    drop(peer);
+    drop(listener);
+    cleanup_test_base(&base);
 }

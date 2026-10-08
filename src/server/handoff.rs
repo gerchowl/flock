@@ -25,6 +25,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
+const IMPORT_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+// Restoration includes large scrollback buffers and up to five seconds waiting
+// for public sockets. Give the whole pre-ready import more room than any single
+// 30-second socket exchange, without allowing an indefinite startup stall.
+#[cfg(unix)]
+const IMPORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(unix)]
 pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
@@ -94,21 +101,76 @@ pub(crate) fn spawn_handoff_import(
     })
 }
 
-/// A separate thread enforces the startup deadline even while restoration is
-/// blocked in synchronous filesystem work. It exits without running destructors
-/// because imported pane processes still belong to the exporting server.
 #[cfg(unix)]
-pub(crate) fn start_import_watchdog() -> io::Result<std::sync::mpsc::Sender<()>> {
+const IMPORT_ARMED: u8 = 0;
+#[cfg(unix)]
+const IMPORT_DISARMED: u8 = 1;
+#[cfg(unix)]
+const IMPORT_EXPIRED: u8 = 2;
+
+#[cfg(unix)]
+pub(crate) struct ImportWatchdog {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    cancel: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(unix)]
+impl ImportWatchdog {
+    pub(crate) fn disarm(&self) -> io::Result<()> {
+        transition_import_deadline(&self.state, IMPORT_DISARMED).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handoff import startup deadline expired",
+            )
+        })?;
+        let _ = self.cancel.send(());
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ImportWatchdog {
+    fn drop(&mut self) {
+        let _ = self.disarm();
+    }
+}
+
+#[cfg(unix)]
+fn transition_import_deadline(state: &std::sync::atomic::AtomicU8, next: u8) -> Result<u8, u8> {
+    state.compare_exchange(
+        IMPORT_ARMED,
+        next,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    )
+}
+
+/// Enforce the deadline only while the exporter can still roll back. Atomic
+/// arbitration ensures an expired importer cannot announce readiness.
+#[cfg(unix)]
+pub(crate) fn start_import_watchdog() -> io::Result<ImportWatchdog> {
+    // Isolated integration tests shorten the budget to exercise late commit.
+    let timeout = std::env::var("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(IMPORT_STARTUP_TIMEOUT);
     let (cancel, receiver) = std::sync::mpsc::channel();
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(IMPORT_ARMED));
+    let deadline_state = state.clone();
     std::thread::Builder::new()
         .name("handoff-deadline".into())
         .spawn(move || {
-            if import_deadline_expired(receiver, READY_TIMEOUT) {
-                // Avoid logging or cleanup here: either can touch the stalled FS.
+            if import_deadline_expired(receiver, timeout)
+                && transition_import_deadline(&deadline_state, IMPORT_EXPIRED).is_ok()
+            {
+                // SAFETY: _exit terminates the process without destructors or FS
+                // cleanup. Winning the CAS means ready cannot be sent, so pane
+                // ownership remains with the exporter, which can roll back.
                 unsafe { libc::_exit(124) };
             }
         })?;
-    Ok(cancel)
+    Ok(ImportWatchdog { state, cancel })
 }
 
 #[cfg(unix)]
@@ -136,7 +198,7 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     if let Err(err) = child.kill() {
         crate::logging::handoff_import_rollback_step_failed(pid, "kill", &err.to_string());
     }
-    let deadline = std::time::Instant::now() + OWNED_ACK_TIMEOUT;
+    let deadline = std::time::Instant::now() + IMPORT_REAP_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -147,6 +209,9 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
+                // The child remains unreaped if the kernel has not completed
+                // SIGKILL. When it eventually exits it may remain a zombie until
+                // this exporter exits and the system reaper adopts it.
                 crate::logging::handoff_import_rollback_step_failed(
                     pid,
                     "reap",
@@ -578,13 +643,85 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn import_deadline_disarm_and_expiry_race_has_only_one_winner() {
+        for _ in 0..100 {
+            let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(IMPORT_ARMED));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let expire_state = state.clone();
+            let expire_barrier = barrier.clone();
+            let expire = thread::spawn(move || {
+                expire_barrier.wait();
+                transition_import_deadline(&expire_state, IMPORT_EXPIRED).is_ok()
+            });
+            barrier.wait();
+            let disarmed = transition_import_deadline(&state, IMPORT_DISARMED).is_ok();
+            let expired = expire.join().expect("expiry thread");
+            assert_ne!(disarmed, expired);
+            assert_eq!(
+                state.load(std::sync::atomic::Ordering::SeqCst),
+                if disarmed {
+                    IMPORT_DISARMED
+                } else {
+                    IMPORT_EXPIRED
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn expired_importer_cannot_disarm_and_announce_ready() {
+        let (cancel, _receiver) = std::sync::mpsc::channel();
+        let watchdog = ImportWatchdog {
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(IMPORT_EXPIRED)),
+            cancel,
+        };
+        assert_eq!(
+            watchdog.disarm().expect_err("already expired").kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn importer_stalled_after_manifest_times_out_receiving_fds() {
+        let (mut importer, mut exporter) = UnixStream::pair().expect("socket pair");
+        importer
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("read timeout");
+        exporter
+            .write_all(OLD_SHAPE_MANIFEST.as_bytes())
+            .expect("manifest");
+        exporter.write_all(b"\n").expect("manifest newline");
+        let error = receive_after_token(&mut importer)
+            .err()
+            .expect("missing descriptors");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn wait_committed_returns_eof_when_exporter_closes_stream() {
+        let (mut importer, exporter) = UnixStream::pair().expect("socket pair");
+        exporter
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close exporter write side");
+        assert_eq!(
+            wait_committed(&mut importer)
+                .expect_err("exporter exited")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
     fn import_deadline_expires_while_startup_is_stalled() {
         let (_cancel, receiver) = std::sync::mpsc::channel();
         assert!(import_deadline_expired(receiver, Duration::from_millis(20)));
     }
 
     #[test]
-    fn import_deadline_cancels_after_commit_or_startup_error() {
+    fn import_deadline_cancels_after_disarm_or_startup_error() {
         let (cancel, receiver) = std::sync::mpsc::channel();
         cancel.send(()).expect("cancel deadline");
         assert!(!import_deadline_expired(receiver, Duration::from_secs(1)));

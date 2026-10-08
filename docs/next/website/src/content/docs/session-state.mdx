@@ -77,7 +77,7 @@ Live handoff is for update and remote attach flows that need to replace a runnin
 
 This is different from snapshot restore, pane history replay, and native agent session restore. Handoff tries to keep the current processes alive. The others reconstruct state after the old server has already stopped.
 
-Import startup has a 30-second deadline. If the replacement stalls before the old server commits the transfer, it exits and the old server rolls back the handoff. A host kernel or scheduler stall can delay deadline enforcement; rollback does not wait indefinitely for a killed importer.
+Import startup has a 120-second budget until the replacement is ready. The watchdog is atomically disarmed before readiness is announced, so it cannot terminate a replacement after the old server commits ownership. Before readiness, expiry exits the replacement non-zero and the old server can roll back. Socket reads and writes retain their 30-second timeouts, including the replacement's wait for commit after readiness. Kernel or scheduler stalls can delay deadline enforcement. Rollback waits at most 500 ms to reap a killed importer; a process still waiting in the kernel may remain unreaped until it exits and the exporter exits.
 
 Live handoff is experimental and opt-in:
 

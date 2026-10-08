@@ -159,7 +159,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "read",
         "flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]",
     ),
-    ("agent", "send", "flk agent send <target> <text>"),
+    ("agent", "send", super::agent::AGENT_SEND_USAGE),
     ("agent", "rename", "flk agent rename <target> <name>|--clear"),
     ("agent", "focus", "flk agent focus <target>"),
     ("agent", "wait", super::agent::AGENT_WAIT_USAGE),
