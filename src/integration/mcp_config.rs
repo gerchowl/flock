@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::api::schema::IntegrationTarget;
 
-fn config_path(target: IntegrationTarget) -> io::Result<Option<PathBuf>> {
+pub(super) fn config_path(target: IntegrationTarget) -> io::Result<Option<PathBuf>> {
     Ok(match target {
         IntegrationTarget::Claude => {
             let dir = super::claude_dir()?;
@@ -42,7 +42,7 @@ pub(super) fn externally_owned(target: IntegrationTarget) -> bool {
         .is_some_and(|path| externally_owned_at(&path))
 }
 
-fn externally_owned_at(path: &Path) -> bool {
+pub(super) fn externally_owned_at(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.file_type().is_symlink() || metadata.permissions().readonly()
     })
