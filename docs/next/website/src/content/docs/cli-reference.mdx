@@ -230,7 +230,7 @@ The continuation is checked before anything is typed. A prompt carrying a contro
 
 Both writes go through the same gates. Claude Code auto-compacts mid-turn, so a confirmation can arrive with the agent still working and a human part-way into a prompt; an occupied prompt box is never typed into, because submitting it would submit the human's draft too.
 
-Over MCP the same thing is `flock_self_compact`, which is the only way an agent can affect its own pane — `pane.send_*` stays off the closed MCP table, and this is an allowlisted exception rather than an unlock.
+Over MCP the same thing is `flock_self_compact`, which is an allowlisted way an agent can affect its own pane — `pane.send_*` stays off the closed MCP table, and this is an allowlisted exception rather than an unlock.
 
 Report agent state from custom hooks:
 
@@ -290,6 +290,7 @@ flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]
 flk agent hibernate <target>
 flk agent resume <target>
+flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]
 flk lineage <target> [--json]
 flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--await [--timeout MS]] [-- <text starting with dashes>]
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
@@ -350,6 +351,12 @@ flk wait reply <correlation_id> [--timeout MS] [--json]
 ```
 
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after a `msg send --intent needs-reply`: it prints the reply's body (metadata on stderr, or everything with `--json`) and exits 0 replied, 3 deferred by a muted recipient or dropped unread, 124 timed out. It works for a sender outside any pane, whose reply is held for it under the correlation id. `msg send --await` sends and waits in one command.
+
+`agent restart` returns after scheduling the restart. Finish the requesting turn normally: Flock waits for a settled idle prompt, stops the agent process tree through the runtime, and resumes the same conversation with its original executable, flags, profile environment, cwd, and agent name. `self` requires the caller to be inside the agent pane; an explicit target accepts the usual pane ID, terminal ID, or unique name.
+
+`--continue-with` supplies the next instructions. Prefix a file path with `@` to read them from a file. Instructions must be a single line of plain text, at most 16 KiB; a terminal newline in the file is removed. The default is “You restarted yourself for: <reason>. Continue your task.” Flock queues this through the message inbox/wake path after verifying a fresh report of the same session and an empty idle prompt.
+
+A configured hard limit or the grace deadline can force a restart mid-turn. The continuation then names the limit, warns that the last tool call may be incomplete, and lists stopped processes and reported background tasks. A failed flush check is disclosed. Unknown startup dialogs and credential prompts are left for the operator; verification timeout emits `restart_stuck` with a screen excerpt. Repeated restarts stop the agent at the rate cap; `agent resume` explicitly releases that stop. See [restart configuration](/docs/preview/configuration/#agent-restarts).
 
 ### Waiting for an agent to go quiet
 

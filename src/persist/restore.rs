@@ -545,6 +545,8 @@ fn restore_tab(
                 cwd.clone(),
             )
             .with_pending_agent_resume_plan(plan);
+            terminal.launch_argv = saved_launch_argv.clone();
+            terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
@@ -614,6 +616,7 @@ fn restore_tab(
                     restored_agent_id.clone(),
                     cwd.clone(),
                 );
+                terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
                 terminal.last_prompt = saved_last_prompt.clone();
                 terminal.header_reserved = saved_header_reserved;
                 if was_imported {
@@ -1159,6 +1162,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            launch_env: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -1250,6 +1254,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            launch_env: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -1422,6 +1427,7 @@ mod tests {
                 spawned_by: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
             },
         );
         let history = SessionHistorySnapshot {

@@ -121,6 +121,8 @@ pub enum Method {
     AgentHibernate(AgentTarget),
     #[serde(rename = "agent.resume")]
     AgentResume(AgentTarget),
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentRestartParams),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
     #[serde(rename = "msg.send")]
@@ -824,6 +826,25 @@ pub struct AgentSendParams {
     /// Type as terminal input, wait 120 ms, then send negotiated Enter.
     #[serde(default)]
     pub submit: bool,
+}
+
+/// Queue a server-owned restart. The caller must finish its requesting turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRestartParams {
+    #[serde(default = "restart_self")]
+    pub target: String,
+    pub reason: String,
+    #[serde(default)]
+    pub continue_with: Option<String>,
+    #[serde(default = "restart_after_turn")]
+    pub when: String,
+}
+fn restart_self() -> String {
+    "self".into()
+}
+fn restart_after_turn() -> String {
+    "after_turn".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1961,6 +1982,7 @@ pub enum EventKind {
     /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
     AgentHibernated,
     AgentResumedFromHibernation,
+    AgentRestart,
     /// #175 C4 issue-guard: `TriggerFired` on a matched owner-authored
     /// trigger, `TriggerIgnored` on a non-owner post (audit trail),
     /// `TriggerErrored` on a bad fence / YAML.
@@ -2025,6 +2047,7 @@ impl EventKind {
             | Self::WorktreeQuarantined
             | Self::AgentHibernated
             | Self::AgentResumedFromHibernation
+            | Self::AgentRestart
             | Self::TriggerFired
             | Self::TriggerIgnored
             | Self::TriggerErrored
@@ -2303,6 +2326,12 @@ pub enum ResponseResult {
         /// older than #320, which is why it is `default`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fleet: Vec<FleetAgentInfo>,
+    },
+    AgentRestartQueued {
+        pane_id: String,
+        session: String,
+        #[serde(default)]
+        stop_only: bool,
     },
     AgentHistory {
         history: AgentHistoryResult,
@@ -3237,6 +3266,21 @@ pub enum EventData {
     /// #175 C3: a pane's agent process has been asked to exit and its resume
     /// plan is stashed on the pane; the next focus (or explicit
     /// `agent.resume`) respawns it into the same pane.
+    AgentRestart {
+        pane_id: String,
+        agent_id: String,
+        phase: String,
+        old_pid: Option<u32>,
+        new_pid: Option<u32>,
+        session: String,
+        reason: String,
+        forced: bool,
+        #[serde(default)]
+        stop_only: bool,
+        rss_before: u64,
+        rss_after: Option<u64>,
+        detail: String,
+    },
     AgentHibernated {
         pane_id: String,
         workspace_id: String,

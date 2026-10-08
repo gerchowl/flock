@@ -211,6 +211,8 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         return Ok(0);
     }
 
+    crate::agent_restart::record_checkpoint(&input, &hook_event_name);
+
     // ADR-0008: the inbox is pull, so an idle agent would never learn mail
     // arrived. The stop hook is the wake — a peek (never a consume; the agent
     // reads its own inbox) whose count rides the existing decision:block

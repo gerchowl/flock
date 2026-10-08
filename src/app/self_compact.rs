@@ -498,6 +498,13 @@ impl App {
     /// agent can act on instead of leaving it waiting for a continuation that
     /// was never coming.
     pub(crate) fn self_compact_refusal(&self, pane: &str) -> Option<&'static str> {
+        if self
+            .parse_pane_id(pane)
+            .and_then(|(ws, id)| self.terminal_for_pane(ws, id))
+            .is_some_and(|terminal| terminal.restart_in_progress)
+        {
+            return Some("restart_pending");
+        }
         if !self.state.config.session.self_compact {
             return Some("disabled");
         }

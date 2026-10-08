@@ -2450,6 +2450,8 @@ pub struct AppState {
     pub pane_header: bool,
     /// Show the global machine status line.
     pub status_line: bool,
+    /// Pure pending restart intents and rate-limit history.
+    pub(crate) agent_restarts: super::agent_restart::RestartStates,
     /// Latest sampler snapshot for the status line.
     pub system_stats: Option<crate::system_stats::SystemStats>,
     /// Arrival `Instant` of the sample currently held in [`Self::system_stats`],
@@ -3603,6 +3605,7 @@ impl AppState {
             server_label: crate::config::ServerLabelConfig::Both,
             pane_header: true,
             status_line: true,
+            agent_restarts: Default::default(),
             system_stats: None,
             system_stats_at: None,
             expanded_prompt_pane: None,

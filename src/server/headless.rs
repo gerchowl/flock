@@ -986,6 +986,10 @@ impl HeadlessServer {
             ).into());
         }
 
+        if let Err(err) = self.app.cancel_agent_restarts_for_handoff() {
+            self.rollback_handoff_before_commit(&socket_path, &[]);
+            return Err(err.into());
+        }
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
@@ -3507,6 +3511,7 @@ impl HeadlessServer {
         self.app.tick_idle_wakes(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
+        changed |= self.app.tick_agent_restarts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }

@@ -31,6 +31,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "fork" => agent_fork(&args[1..]),
         "hibernate" => agent_hibernate(&args[1..]),
         "resume" => agent_resume(&args[1..]),
+        "restart" => agent_restart(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
             Ok(0)
@@ -53,6 +54,9 @@ pub(super) const AGENT_HISTORY_USAGE: &str =
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
 pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>";
+
+pub(super) const AGENT_RESTART_USAGE: &str =
+    "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
 
 pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]";
 
@@ -404,6 +408,66 @@ fn agent_resume(args: &[String]) -> std::io::Result<i32> {
         method: Method::AgentResume(AgentTarget {
             target: target.clone(),
         }),
+    })?)
+}
+
+fn parse_agent_restart(args: &[String]) -> Result<crate::api::schema::AgentRestartParams, String> {
+    let target = args
+        .first()
+        .filter(|s| !s.starts_with('-'))
+        .ok_or("restart requires self or a target")?
+        .clone();
+    let mut reason = None;
+    let mut continue_with = None;
+    let mut index = 1;
+    while index < args.len() {
+        let key = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {key}"))?
+            .clone();
+        match key.as_str() {
+            "--reason" if reason.is_none() => reason = Some(value),
+            "--continue-with" if continue_with.is_none() => continue_with = Some(value),
+            _ => return Err(format!("unknown or repeated option {key}")),
+        }
+        index += 2;
+    }
+    let reason = reason
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("--reason is required and cannot be empty")?;
+    Ok(crate::api::schema::AgentRestartParams {
+        target,
+        reason,
+        continue_with,
+        when: "after_turn".into(),
+    })
+}
+
+fn agent_restart(args: &[String]) -> std::io::Result<i32> {
+    let mut params = match parse_agent_restart(args) {
+        Ok(params) => params,
+        Err(err) => {
+            eprintln!("{err}\nusage: {AGENT_RESTART_USAGE}");
+            return Ok(2);
+        }
+    };
+    if let Some(file) = params
+        .continue_with
+        .as_deref()
+        .and_then(|s| s.strip_prefix('@'))
+    {
+        use std::io::Read;
+        let mut body = String::new();
+        std::fs::File::open(file)?
+            .take(16 * 1024 + 1)
+            .read_to_string(&mut body)?;
+        // A terminal newline in a handoff file is not part of the prompt.
+        params.continue_with = Some(body.trim_end_matches(['\r', '\n']).to_string());
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:restart".into(),
+        method: Method::AgentRestart(params),
     })?)
 }
 
@@ -926,6 +990,7 @@ fn print_agent_help() {
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
+    eprintln!("  {AGENT_RESTART_USAGE}");
     eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
     eprintln!(
         "  --cwd also picks the SPACE: a cwd naming an already-open checkout joins that space"
@@ -1111,5 +1176,41 @@ mod tests {
     fn the_usage_line_documents_the_flag_the_parser_accepts() {
         assert!(AGENT_START_USAGE.contains("[--active|--here]"));
         assert!(AGENT_START_USAGE.contains("[--split"));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    #[test]
+    fn restart_cli_carries_target_reason_and_continuation() {
+        let words = [
+            "self",
+            "--reason",
+            "reload MCP config",
+            "--continue-with",
+            "finish the PR",
+        ]
+        .map(String::from);
+        let parsed = parse_agent_restart(&words).unwrap();
+        assert_eq!(parsed.target, "self");
+        assert_eq!(parsed.when, "after_turn");
+        assert_eq!(parsed.continue_with.as_deref(), Some("finish the PR"));
+        assert_eq!(parsed.reason, "reload MCP config");
+    }
+    #[test]
+    fn restart_cli_refuses_missing_reason_repeated_flags_and_unknown_options() {
+        for words in [
+            vec!["self"],
+            vec!["self", "--reason"],
+            vec!["self", "--reason", ""],
+            vec!["self", "--now", "yes"],
+            vec!["self", "--reason", "one", "--reason", "two"],
+        ] {
+            assert!(
+                parse_agent_restart(&words.into_iter().map(String::from).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 }
