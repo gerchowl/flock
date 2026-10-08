@@ -77,6 +77,8 @@ Live handoff is for update and remote attach flows that need to replace a runnin
 
 This is different from snapshot restore, pane history replay, and native agent session restore. Handoff tries to keep the current processes alive. The others reconstruct state after the old server has already stopped.
 
+Import startup has a 30-second deadline. If the replacement stalls before the old server commits the transfer, it exits and the old server rolls back the handoff. A host kernel or scheduler stall can delay deadline enforcement; rollback does not wait indefinitely for a killed importer.
+
 Live handoff is experimental and opt-in:
 
 ```bash

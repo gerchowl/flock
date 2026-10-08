@@ -94,6 +94,31 @@ pub(crate) fn spawn_handoff_import(
     })
 }
 
+/// A separate thread enforces the startup deadline even while restoration is
+/// blocked in synchronous filesystem work. It exits without running destructors
+/// because imported pane processes still belong to the exporting server.
+#[cfg(unix)]
+pub(crate) fn start_import_watchdog() -> io::Result<std::sync::mpsc::Sender<()>> {
+    let (cancel, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("handoff-deadline".into())
+        .spawn(move || {
+            if import_deadline_expired(receiver, READY_TIMEOUT) {
+                // Avoid logging or cleanup here: either can touch the stalled FS.
+                unsafe { libc::_exit(124) };
+            }
+        })?;
+    Ok(cancel)
+}
+
+#[cfg(unix)]
+fn import_deadline_expired(receiver: std::sync::mpsc::Receiver<()>, timeout: Duration) -> bool {
+    matches!(
+        receiver.recv_timeout(timeout),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
 #[cfg(unix)]
 pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
@@ -111,12 +136,28 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     if let Err(err) = child.kill() {
         crate::logging::handoff_import_rollback_step_failed(pid, "kill", &err.to_string());
     }
-    match child.wait() {
-        Ok(status) => {
-            crate::logging::handoff_import_rollback_reaped(pid, &status.to_string());
-        }
-        Err(err) => {
-            crate::logging::handoff_import_rollback_step_failed(pid, "reap", &err.to_string());
+    let deadline = std::time::Instant::now() + OWNED_ACK_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                crate::logging::handoff_import_rollback_reaped(pid, &status.to_string());
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                crate::logging::handoff_import_rollback_step_failed(
+                    pid,
+                    "reap",
+                    "timed out waiting for killed importer to exit",
+                );
+                return;
+            }
+            Err(err) => {
+                crate::logging::handoff_import_rollback_step_failed(pid, "reap", &err.to_string());
+                return;
+            }
         }
     }
 }
@@ -263,6 +304,8 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
     let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(READY_TIMEOUT))?;
+    stream.set_write_timeout(Some(READY_TIMEOUT))?;
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -533,6 +576,22 @@ mod tests {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::thread;
+
+    #[test]
+    fn import_deadline_expires_while_startup_is_stalled() {
+        let (_cancel, receiver) = std::sync::mpsc::channel();
+        assert!(import_deadline_expired(receiver, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn import_deadline_cancels_after_commit_or_startup_error() {
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        cancel.send(()).expect("cancel deadline");
+        assert!(!import_deadline_expired(receiver, Duration::from_secs(1)));
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        drop(cancel);
+        assert!(!import_deadline_expired(receiver, Duration::from_secs(1)));
+    }
 
     /// A paired manifest JSON written by `0.6.8-fork.<rev>` for a two-pane
     /// handoff, captured off the wire from an isolated server. The hostnames

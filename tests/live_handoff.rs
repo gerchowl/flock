@@ -1508,3 +1508,56 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
 }
+
+#[test]
+fn handoff_import_stalled_peer_exits_within_deadline() {
+    let base = std::env::temp_dir().join(format!("hi363-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    let socket = base.join("import.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FLOCK_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(["server", "--handoff-import"])
+        .arg(&socket)
+        .arg("stalled-peer-token")
+        .env("HOME", &base)
+        .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_RUNTIME_DIR", base.join("runtime"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    register_spawned_flock_pid(Some(child.id()));
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut peer = None;
+    let status = loop {
+        if peer.is_none() {
+            match listener.accept() {
+                Ok((stream, _)) => peer = Some(stream),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("accept importer: {err}"),
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("importer exceeded startup deadline");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    unregister_spawned_flock_pid(Some(child.id()));
+    assert!(peer.is_some(), "importer must reach the stalled peer");
+    assert!(!status.success());
+    drop(peer);
+    drop(listener);
+    fs::remove_dir_all(base).unwrap();
+}

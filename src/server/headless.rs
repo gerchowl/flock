@@ -3738,7 +3738,6 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
     reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
 )]
 pub fn run_server() -> io::Result<()> {
-    init_logging();
     crate::platform::raise_server_nofile_limit();
 
     let args: Vec<String> = std::env::args().collect();
@@ -3753,6 +3752,7 @@ pub fn run_server() -> io::Result<()> {
         return run_handoff_import_server(&socket_path, token);
     }
 
+    init_logging();
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
@@ -3821,6 +3821,8 @@ pub fn run_server() -> io::Result<()> {
 
 #[cfg(unix)]
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+    let import_deadline = crate::server::handoff::start_import_watchdog()?;
+    init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
@@ -3887,6 +3889,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         )?;
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        let _ = import_deadline.send(());
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
