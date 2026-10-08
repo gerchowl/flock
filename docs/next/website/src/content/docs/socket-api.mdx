@@ -82,6 +82,8 @@ Raw socket method names use dot notation:
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
+For `pane.read`, `pane.send_text`, `pane.send_keys`, and `pane.close`, the `pane_id` field also accepts a terminal ID or unique agent name. Ambiguous names return `agent_target_ambiguous` with candidate details; unknown targets retain `pane_not_found`.
+
 Some CLI commands are conveniences around these methods. For example, `flk agent wait` resolves an agent target and then subscribes to pane agent state events.
 
 Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
