@@ -1432,6 +1432,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
@@ -1441,6 +1446,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_install.status.code(), Some(0));
@@ -1454,6 +1464,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
@@ -1466,6 +1481,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_uninstall.status.code(), Some(0));
@@ -1498,6 +1518,12 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
         .args(["integration", "status", "--outdated-only"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -1506,6 +1532,8 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("installed flock integrations need updating"));
     assert!(stderr.contains("flk integration install pi"));
+    assert!(!stderr.contains("claude MCP:"));
+    assert!(!stderr.contains("codex MCP:"));
 
     cleanup_test_base(&base);
 }
@@ -1524,6 +1552,12 @@ fn integration_status_rejects_unknown_flags() {
         .args(["integration", "status", "--wat"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -1609,6 +1643,10 @@ fn status_commands_report_client_and_server_versions() {
     );
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
+    assert_eq!(full_json["installed"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(full_json["installed"]["client_drift"], false);
+    assert_eq!(full_json["installed"]["server_drift"], false);
+    assert!(full_json["installed"]["error"].is_null());
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(full_json["client"]["protocol"], support::PROTOCOL_VERSION);
     assert_eq!(full_json["server"]["status"], "running");
@@ -3666,4 +3704,126 @@ fn agent_result_reads_a_codex_rollout_after_session_start() {
     assert_eq!(info["at_ms"], 1_767_225_603_125_u64);
     cleanup_spawned_flock(flock, base);
     std::env::remove_var("CODEX_HOME");
+}
+
+#[test]
+fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
+    use std::os::unix::fs::symlink;
+    let base = unique_test_dir();
+    let home = base.join("home");
+    let claude = home.join("profile");
+    let codex = home.join("codex");
+    let opencode = home.join(".config/opencode");
+    for dir in [&claude, &codex, &opencode] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let launch = base.join("flk");
+    symlink(env!("CARGO_BIN_EXE_flk"), &launch).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(&launch)
+            .args(args)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", &codex)
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("COPILOT_HOME")
+            .env_remove("KIMI_CODE_HOME")
+            .env_remove("QODER_CONFIG_DIR")
+            .env_remove("FLOCK_BIN")
+            .env_remove("FLOCK_ENV")
+            .env("FLOCK_SOCKET_PATH", base.join("absent.sock"))
+            .output()
+            .unwrap()
+    };
+    for target in ["claude", "codex", "opencode"] {
+        let result = run(&["integration", "install", target]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let claude_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(claude.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude_config["mcpServers"]["flock"]["command"],
+        launch.to_str().unwrap()
+    );
+    let codex_config: toml::Value =
+        toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        codex_config["mcp_servers"]["flock"]["command"].as_str(),
+        launch.to_str()
+    );
+    let opencode_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(opencode.join("opencode.json")).unwrap()).unwrap();
+    assert_eq!(
+        opencode_config["mcp"]["flock"]["command"][0],
+        launch.to_str().unwrap()
+    );
+    let custom = serde_json::json!({"mcpServers":{"flock":{"command":"/nix/store/fixture-flock/bin/flk","args":["mcp","serve"],"env":{"KEEP":"yes"}}}}).to_string();
+    fs::write(claude.join(".claude.json"), &custom).unwrap();
+    assert!(run(&["integration", "install", "claude"]).status.success());
+    assert_eq!(
+        fs::read_to_string(claude.join(".claude.json")).unwrap(),
+        custom
+    );
+    for args in [
+        vec!["integration", "status"],
+        vec!["integration", "status", "--outdated-only"],
+    ] {
+        let status = run(&args);
+        assert!(status.status.success());
+        let output = if args.contains(&"--outdated-only") {
+            assert!(status.stdout.is_empty());
+            String::from_utf8_lossy(&status.stderr)
+        } else {
+            String::from_utf8_lossy(&status.stdout)
+        };
+        assert!(output.contains("claude MCP: pinned store path"), "{output}");
+    }
+    let owned = home.join("owned-opencode.json");
+    let owned_content = "{\"mcp\":{}}";
+    fs::write(&owned, owned_content).unwrap();
+    fs::remove_file(opencode.join("opencode.json")).unwrap();
+    symlink(&owned, opencode.join("opencode.json")).unwrap();
+    let result = run(&["integration", "install", "opencode"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("externally owned"));
+    assert_eq!(fs::read_to_string(&owned).unwrap(), owned_content);
+    assert!(fs::symlink_metadata(opencode.join("opencode.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    fs::remove_file(opencode.join("opencode.json")).unwrap();
+    fs::write(opencode.join("opencode.jsonc"), "{ // config owner keeps comments\n \"mcp\": {\"flock\": {\"command\": [\"/nix/store/fixture-flock/bin/flk\", \"mcp\", \"serve\",],},},}\n").unwrap();
+    let status = run(&["integration", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("opencode MCP: pinned store path"));
+    let owned_codex = home.join("owned-codex.toml");
+    let owned_codex_content = "model = 'fixture'\n";
+    fs::write(&owned_codex, owned_codex_content).unwrap();
+    fs::remove_file(codex.join("config.toml")).unwrap();
+    symlink(&owned_codex, codex.join("config.toml")).unwrap();
+    let result = run(&["integration", "install", "codex"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("externally owned"));
+    assert_eq!(
+        fs::read_to_string(&owned_codex).unwrap(),
+        owned_codex_content
+    );
+    let after_hooks: toml::Value =
+        toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert!(after_hooks.get("mcp_servers").is_none());
+    fs::remove_file(opencode.join("opencode.jsonc")).unwrap();
+    let commented = "{ // owner keeps these comments\n \"mcp\": {} }";
+    fs::write(opencode.join("opencode.json"), commented).unwrap();
+    let result = run(&["integration", "install", "opencode"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("MCP registration deferred"));
+    assert_eq!(
+        fs::read_to_string(opencode.join("opencode.json")).unwrap(),
+        commented
+    );
+    assert!(opencode.join("plugins/flock-agent-state.js").is_file());
+    cleanup_test_base(&base);
 }
