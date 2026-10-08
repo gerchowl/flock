@@ -2062,6 +2062,15 @@ pub struct ServerCapabilities {
     pub live_handoff: bool,
 }
 
+/// Accept failures retained for the lifetime of the API listener.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiListenerHealth {
+    #[serde(default)]
+    pub stopped: bool,
+    pub accept_errors: u64,
+    pub last_accept_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
@@ -2080,6 +2089,8 @@ pub enum ResponseResult {
         /// can, and it is the server's context that panes inherit.
         #[serde(default)]
         session_health: Option<crate::platform::SessionHealth>,
+        #[serde(default)]
+        api_listener: Option<ApiListenerHealth>,
     },
     NotificationShow {
         shown: bool,
@@ -4139,6 +4150,7 @@ mod tests {
                 protocol: 6,
                 capabilities: Some(ServerCapabilities { live_handoff: true }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
+                api_listener: None,
             },
         };
 
