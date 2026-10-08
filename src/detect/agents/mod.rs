@@ -50,6 +50,7 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         return AgentDetection {
             state,
             activity: None,
+            provider_limit: None,
             skip_state_update: true,
             visible_blocker: false,
             visible_idle: false,
@@ -57,15 +58,19 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         };
     }
 
+    let provider_limit = (agent == Agent::OpenCode && state == AgentState::Blocked)
+        .then(|| super::provider_limit::opencode(screen_content))
+        .flatten();
     let activity = if agent == Agent::Claude && state == AgentState::Working {
         claude_code::live_activity_text(screen_content)
     } else {
-        None
+        provider_limit.as_ref().map(|wait| wait.description())
     };
 
     AgentDetection {
         state,
         activity,
+        provider_limit,
         skip_state_update: false,
         visible_blocker: has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),

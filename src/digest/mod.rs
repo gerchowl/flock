@@ -159,11 +159,14 @@ where
                 ],
                 run_id: None,
             }),
-            EventData::CheckFired { name, episode } => sections.yellow.push(DigestRow {
+            EventData::CheckFired { name, episode, detail } => sections.yellow.push(DigestRow {
                 seq,
                 ts_ms,
                 kind: "check_fired",
-                summary: format!("check {name} fired (episode {episode})"),
+                summary: match detail {
+                    Some(detail) => format!("check {name}: {detail} (episode {episode})"),
+                    None => format!("check {name} fired (episode {episode})"),
+                },
                 context: vec![
                     ("check".into(), name.clone()),
                     ("episode".into(), episode.clone()),
@@ -549,6 +552,7 @@ mod tests {
                     EventData::CheckFired {
                         name: "blocked_alert".into(),
                         episode: "blocked_alert:w1:p1:1000".into(),
+                        detail: None,
                     },
                 ),
             ),

@@ -1036,13 +1036,9 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
-        let provider_wait = (terminal.detected_agent == Some(crate::detect::Agent::OpenCode)
-            && pane.agent_status == crate::api::schema::AgentStatus::Blocked)
-            .then(|| self.lookup_runtime(ws_idx, pane_id))
-            .flatten()
-            .and_then(|(runtime, _)| {
-                crate::detect::provider_limit::opencode(&runtime.detection_text())
-            });
+        let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,

@@ -24,8 +24,9 @@ pub enum AgentState {
 pub struct AgentDetection {
     pub state: AgentState,
     /// Free-text activity from the agent's own status line (Claude's spinner
-    /// verb, e.g. "Implementing the parser"). Only set while Working.
+    /// verb, e.g. "Implementing the parser"). Also carries a provider-wait caption while Blocked.
     pub activity: Option<String>,
+    pub(crate) provider_limit: Option<provider_limit::ProviderLimit>,
     /// True when the current screen is an agent-owned viewer that shows
     /// transcript/history instead of the live prompt state.
     pub skip_state_update: bool,
@@ -286,6 +287,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
         return AgentDetection {
             state: AgentState::Unknown,
             activity: None,
+            provider_limit: None,
             skip_state_update: false,
             visible_blocker: false,
             visible_idle: false,

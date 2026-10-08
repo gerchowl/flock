@@ -81,9 +81,14 @@ impl Pane {
                         };
                         let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
                         "agent_status": status, "turn_cursor": cursor, "revision": 0}});
-                        if status == "blocked" && frames[frame].1.contains("retrying in 46m 15s") {
+                        if status == "blocked" && frames[frame].1.contains("retrying in ") {
                             record["agent"]["blocked_reason"] = json!("provider_limit");
-                            record["agent"]["retry_after_ms"] = json!(2_775_000);
+                            record["agent"]["retry_after_ms"] =
+                                json!(if frames[frame].1.contains("46m 15s") {
+                                    2_775_000
+                                } else {
+                                    2_000
+                                });
                         }
                         record
                     }
@@ -480,6 +485,41 @@ fn delegate_s1_failure_is_advisory_and_its_breaker_is_per_endpoint() {
     assert!(Pane::json(&out)["s1"].is_object());
     assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
     assert_eq!(s1.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn delegate_blocked_short_provider_retry_keeps_waiting_and_recovers() {
+    let retry = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 5s attempt #1] esc interrupt";
+    let pane = Pane::frames(vec![
+        ("blocked".into(), retry.into()),
+        ("blocked".into(), retry.into()),
+        ("idle".into(), "DONE: recovered".into()),
+    ]);
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "0",
+                "--settle",
+                "0",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
 }
 
 #[test]

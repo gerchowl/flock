@@ -3152,6 +3152,8 @@ pub enum EventData {
     CheckFired {
         name: String,
         episode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// #175 phase 4 check-runner: the last outcome was Error; the runner
     /// leaves the debounce counter untouched but records the reason.
@@ -4496,6 +4498,15 @@ mod tests {
             turn_cursor: Some("term_1:0:3:9:w".into()),
             revision: 4,
         }
+    }
+
+    #[test]
+    fn provider_limit_check_detail_is_optional_for_old_events() {
+        let event: EventData = serde_json::from_str(
+            r#"{"type":"check_fired","name":"blocked_alert","episode":"fixture"}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, EventData::CheckFired { detail: None, .. }));
     }
 
     #[test]

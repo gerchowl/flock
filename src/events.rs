@@ -93,8 +93,9 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
-        /// Free-text activity from the agent's status line while Working.
+        /// Live status text from working chrome or a provider-wait caption.
         activity: Option<String>,
+        provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
         visible_blocker: bool,
         visible_idle: bool,
         visible_working: bool,

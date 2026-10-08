@@ -3895,6 +3895,7 @@ impl AppState {
                 agent,
                 state,
                 activity,
+                provider_limit,
                 visible_blocker,
                 visible_idle,
                 visible_working,
@@ -3902,6 +3903,7 @@ impl AppState {
                 observed_at,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
+                    terminal.provider_limit = provider_limit.clone();
                     terminal.update_live_activity(activity.clone(), state);
                     let mutation = terminal.set_detected_state_with_screen_signals_at(
                         agent,
@@ -4465,6 +4467,14 @@ impl AppState {
         .filter(|_| self.sound_config().allows(known_agent));
 
         let workspace_id = self.workspaces.get(ws_idx)?.id.clone();
+        let provider_detail = self.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .filter(|terminal| {
+                new_state == AgentState::Blocked && terminal.provider_limit.is_some()
+            })
+            .and_then(|terminal| terminal.provider_limit.as_ref())
+            .map(|wait| wait.description());
         let build_toast = || {
             let workspace_label = match terminal_runtimes {
                 Some(runtimes) => {
@@ -4477,7 +4487,7 @@ impl AppState {
                 title: format!(
                     "{} {}",
                     toast_agent_label(agent_label),
-                    toast_event_text(kind)
+                    provider_detail.as_deref().unwrap_or(toast_event_text(kind))
                 ),
                 context: notification_context(
                     &self.workspaces[ws_idx],
@@ -6824,6 +6834,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -6863,6 +6874,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -6917,6 +6929,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: agent_state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
@@ -7076,6 +7089,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7100,6 +7114,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7194,6 +7209,52 @@ mod tests {
     }
 
     #[test]
+    fn provider_limit_event_sets_sidebar_status_and_attention_reason() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let detection = crate::detect::detect_agent(
+            Some(Agent::OpenCode),
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m 15s attempt #1] esc interrupt",
+        );
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::OpenCode),
+            state: detection.state,
+            activity: detection.activity,
+            provider_limit: detection.provider_limit,
+            visible_blocker: detection.visible_blocker,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let detail = state.workspaces[1]
+            .pane_details(&state.terminals)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            detail.custom_status.as_deref(),
+            Some("rate-limited, retry in 46m 15s")
+        );
+        deliver_due_agent_notifications(&mut state);
+        assert!(state
+            .toast
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("rate-limited, retry in 46m 15s"));
+        assert!(!state
+            .toast
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("needs attention"));
+    }
+
+    #[test]
     fn background_waiting_sets_attention_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
@@ -7205,6 +7266,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7244,6 +7306,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7301,6 +7364,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7356,6 +7420,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7382,6 +7447,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: agent_state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
@@ -7419,6 +7485,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7454,6 +7521,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7491,6 +7559,7 @@ mod tests {
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7571,6 +7640,7 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7592,6 +7662,7 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: true,
             visible_idle: false,
             visible_working: false,
@@ -7626,6 +7697,7 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7652,6 +7724,7 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: true,
             visible_working: false,
@@ -7680,6 +7753,7 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: true,
@@ -7751,6 +7825,7 @@ mod tests {
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7800,6 +7875,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7830,6 +7906,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7857,6 +7934,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -7880,6 +7958,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,

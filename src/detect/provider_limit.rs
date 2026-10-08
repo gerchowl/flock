@@ -1,8 +1,22 @@
 //! Provider waits recognized from live status controls, never transcript prose.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProviderLimit {
+pub struct ProviderLimit {
     pub retry_after_ms: Option<u64>,
+}
+
+impl ProviderLimit {
+    pub(crate) fn description(&self) -> String {
+        match self.retry_after_ms {
+            Some(ms) if ms >= 60_000 => format!(
+                "rate-limited, retry in {}m {}s",
+                ms / 60_000,
+                (ms / 1_000) % 60
+            ),
+            Some(ms) => format!("rate-limited, retry in {}s", ms / 1_000),
+            None => "rate-limited".into(),
+        }
+    }
 }
 
 pub(crate) fn opencode(screen: &str) -> Option<ProviderLimit> {

@@ -39,7 +39,15 @@ pub(super) use crate::detect::provider_limit::parse_duration;
 pub(super) fn readiness(screen: &str, status: &str) -> Verdict {
     if matches!(status, "working" | "unknown" | "blocked") {
         if let Some(mut verdict) = provider_limit(screen) {
-            verdict.verdict = "stalled".into();
+            verdict.verdict = if verdict
+                .retry_after_ms
+                .is_some_and(|eta| eta >= DEFAULT_SILENCE_MS)
+            {
+                "stalled"
+            } else {
+                "unknown"
+            }
+            .into();
             return verdict;
         }
     }
@@ -99,10 +107,9 @@ impl Monitor {
             if let Some(verdict) = provider_limit(screen) {
                 let since = *self.retry_since.get_or_insert(now);
                 let threshold = self.silence.unwrap_or(Duration::from_secs(300));
-                if status == "blocked"
-                    || verdict
-                        .retry_after_ms
-                        .is_some_and(|eta| Duration::from_millis(eta) >= threshold)
+                if verdict
+                    .retry_after_ms
+                    .is_some_and(|eta| Duration::from_millis(eta) >= threshold)
                     || self
                         .silence
                         .is_some_and(|window| now.saturating_duration_since(since) >= window)
@@ -167,6 +174,24 @@ mod tests {
         let floor = retry.replace("2s", "5m");
         assert!(!disabled.observe("idle", &floor, now));
         assert!(disabled.observe("unknown", &floor, now));
+    }
+
+    #[test]
+    fn delegate_blocked_provider_retry_uses_eta_and_persistence_thresholds() {
+        let now = Instant::now();
+        let short = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 5s attempt #1] esc interrupt";
+        let mut disabled = Monitor::new(0, now);
+        assert!(!disabled.observe("blocked", short, now));
+        assert!(!disabled.observe("blocked", short, now + Duration::from_secs(600)));
+        assert!(disabled.observe("blocked", &short.replace("5s", "5m"), now));
+        let mut timed = Monitor::new(10_000, now);
+        assert!(!timed.observe("blocked", short, now));
+        assert!(!timed.observe("blocked", short, now + Duration::from_secs(9)));
+        assert!(timed.observe("blocked", short, now + Duration::from_secs(10)));
+        let verdict = readiness(short, "blocked");
+        assert_eq!(verdict.verdict, "unknown");
+        assert_eq!(verdict.reason, "provider_limit");
+        assert_eq!(verdict.retry_after_ms, Some(5_000));
     }
 
     #[test]

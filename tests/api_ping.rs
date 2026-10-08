@@ -853,6 +853,10 @@ fn opencode_provider_limit_screen_reaches_agent_get_and_recovers() {
     .to_string();
     for (screen, expected) in [
         (None, "blocked"),
+        (
+            Some("■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 14s attempt #1] esc interrupt"),
+            "blocked",
+        ),
         (Some("■■⬝⬝⬝⬝⬝⬝ esc interrupt"), "working"),
         (Some("ctrl+p commands"), "idle"),
     ] {
@@ -863,10 +867,23 @@ fn opencode_provider_limit_screen_reaches_agent_get_and_recovers() {
         loop {
             let record = send_request(&socket_path, &target);
             let agent = &record["result"]["agent"];
-            if agent["agent_status"] == expected {
+            if agent["agent_status"] == expected
+                && (expected != "blocked"
+                    || screen.is_none()
+                    || agent["retry_after_ms"] == 2_774_000)
+            {
                 if expected == "blocked" {
                     assert_eq!(agent["blocked_reason"], "provider_limit");
-                    assert_eq!(agent["retry_after_ms"], 2_775_000);
+                    let eta = if screen.is_some() {
+                        2_774_000
+                    } else {
+                        2_775_000
+                    };
+                    assert_eq!(agent["retry_after_ms"], eta);
+                    assert!(agent["custom_status"]
+                        .as_str()
+                        .unwrap()
+                        .contains("rate-limited, retry in 46m"));
                 } else {
                     assert!(agent.get("blocked_reason").is_none());
                     assert!(agent.get("retry_after_ms").is_none());
