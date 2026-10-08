@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## [0.11.0] - 2026-10-08
+
+### Changed
+- **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
+
+### Fixed
+- Remove the Python dependency from Copilot hooks and report missing Flock binaries in shell hooks instead of silently skipping state reports (#238)
+- Bound live-handoff startup before readiness with an atomic 120-second watchdog and socket timeouts, and prevent rollback from waiting indefinitely for a stalled replacement server (#363)
+- Fixed `flk pane report-metadata` swallowing its first flag when no pane id was supplied, with optional `--pane` and calling-pane fallback. (#460)
+- API socket accept errors are classified: transient failures retry with exponential backoff from 50 ms to 2 s, while fatal failures stop the listener. Failure runs log once on onset and recovery, with the error count, latest error, and stopped state retained in server status (#470).
+- Pane read, send-text, send-keys, and close accept unique agent names and terminal IDs without a pane-ID lookup (#552)
+- `flk tab create --workspace` now creates a tab in the requested workspace even in workspace tab mode, with `--cwd` controlling only the new terminal’s directory. (#561)
+- `agent send` and `pane send-text` now use bracketed paste when enabled, stripping embedded paste delimiters so message text cannot end the paste early or trigger agent TUI mode keys. Control bytes are now pasted text in this mode; use `pane send-keys` for Enter, Ctrl-C, and Escape (#566)
+- `flk notification show` now exits 3 when a notification is not shown, preserving its JSON response so callers can detect refused delivery and fall back to another channel. Command help explains `[ui.toast] delivery = "off"` and that refused notifications remain in the notification log. (#589)
+- `flk delegate` and `flk agent result` now diagnose missing capabilities on confirmed pre-0.9.0 servers with the running version and live-handoff or upgrade guidance, preserving the original error when the version cannot confirm the gap and avoiding extra requests on the success path (#634)
+- **OpenCode delegate starts now confirm that the brief started a new turn.** Startup session reports no longer count as submission evidence; a bounded confirmation allows one retry only when the composer visibly holds the brief or is empty. Unconfirmed starts exit non-zero and keep the workspace for inspection (#636).
+- `flk delegate reap` now closes the recorded workspace and clears the delegate entry when its checkout was removed outside flock, pruning stale Git worktree metadata while preserving the workspace identity check (#637).
+- Plain commits from fresh worktrees now run the gates through `nix develop` automatically when hook tooling is missing from PATH (#642).
+- OpenCode provider quota and rate-limit retry screens now report blocked instead of working, with a provider-limit reason and retry ETA in agent and delegate status; sidebar, attention notifications, and blocked-alert digests show the wait details, while delegate waits preserve short-retry tolerance (#649)
+- Delegate silence detection now catches Claude tools whose only visible change is a ticking elapsed counter. (#660)
+- Recognize shared Claude profile hooks instead of reporting them as not installed (#670)
+
+### Added
+- Add `--dry-run` to worktree create, agent fork/start, workspace create, tab create, and pane split to preview server-resolved allocation plans without creating resources (#459)
+- Agents can request a server-owned restart with `flk agent restart` or `flock_agent_restart`: Flock waits for a settled turn boundary, preserves the session and original launch settings, verifies the resumed prompt, and queues the continuation. Failed restarts retain a retry plan, MCP restarts are self-only, explicit rate-limited requests leave agents running, and server handoffs report cancelled requests. Configurable hard limits, signal escalation, restart rate caps, transcript-flush checks, and operator/supervisor reports cover forced restarts and blocked startup dialogs. (#582)
+- Added `flk agent history <target>` with `--detail`, `--cursor`, and `--limit` to read and poll agent conversations from the CLI. (#584)
+- `flk agent send --submit` types terminal input, waits 120 ms, and sends negotiated Enter. Plain `agent send` keeps its literal bytes and never submits; verb help and socket docs now explain both modes. `agent send NAME --submit text` now parses `--submit` as the flag; use `agent send -- NAME --submit text` to send it literally. An older server ignores `submit` and replies ok without pressing Enter. (#638)
+- Register new Claude, Codex and OpenCode MCP entries through stable launch paths without failing hook installs, preserve config key order, report store-pinned commands and installed executable version drift, and recognize shared Claude profile hooks (#662)
+- Added `flk integration sync` with a dry-run plan to refresh installed hooks and owned MCP launch paths, preserve custom settings and Codex trust, and report declarative configs and server drift without stopping sessions (#662)
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

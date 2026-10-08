@@ -1,1 +1,0 @@
-- API socket accept errors are classified: transient failures retry with exponential backoff from 50 ms to 2 s, while fatal failures stop the listener. Failure runs log once on onset and recovery, with the error count, latest error, and stopped state retained in server status (#470).

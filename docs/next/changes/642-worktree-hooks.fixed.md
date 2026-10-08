@@ -1,1 +1,0 @@
-- Plain commits from fresh worktrees now run the gates through `nix develop` automatically when hook tooling is missing from PATH (#642).
