@@ -370,7 +370,7 @@ fn handle_connection(
 
 /// PID of the process at the other end of the unix socket. macOS exposes it
 /// via LOCAL_PEERPID; Linux via SO_PEERCRED. None when unavailable.
-fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -525,6 +525,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgWake(_) => "msg.wake",
         Method::MsgMute(_) => "msg.mute",
         Method::MsgUplinkTake(_) => "msg.uplink_take",
+        Method::MeshHello(_) => "mesh.hello",
+        Method::PeersEnrollReset(_) => "peers.enroll_reset",
+        Method::PeersEnrollment(_) => "peers.enrollment",
         Method::PeersRelayAttach(_) => "peers.relay_attach",
         Method::MsgUplinkResult(_) => "msg.uplink_result",
         Method::PaneSplit(_) => "pane.split",

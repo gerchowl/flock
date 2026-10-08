@@ -37,6 +37,45 @@ flk status client
 
 Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
+## Peer enrollment
+
+`flk peers` and `flk status` show each peer's name, pin direction, short node
+ID, and enrollment state: `pending`, `pinned`, or `refused` with the reason.
+Inbound keys remain bound to their signed remote names. Configured peer aliases
+supply local display names and may differ from those remote names. An inbound
+peer claiming a configured peer's name must match that peer's configured pin.
+If no pin exists, the first authenticated inbound contact pins both the
+configured and inbound identity in one transaction. Fresh mutually configured
+peers can enroll simultaneously.
+With an older running server, the rest of status remains available and
+enrollment reports `unknown (server predates mesh; restart needed)`.
+`flk peers status --json` includes `source`, `node_id`, `enrollment`, and
+`enrollment_reason`; `flk status --json` includes a `peers` array.
+
+Held SSH edges authenticate both node keys using fresh challenges and require
+matching mesh protocol versions (`mesh: 1`). First contact pins the identity.
+Enrollment uses trust on first use (TOFU): possession of a node key proves the
+key holder, not that its claimed name belongs to the intended machine. Inbound
+edges arrive over SSH into this host; a caller with that access who wins first
+contact can claim an unpinned configured name. Both directions then trust that
+first key and refuse a different one. Verify first-contact identities through a
+trusted channel when that risk matters.
+Pins survive restarts. An unexpected key change is refused as a possible
+impersonation or re-key. After verifying the replacement, reset the pin from
+the operator's shell and reconnect:
+
+```bash
+flk peers enroll --reset <peer>
+```
+
+The default reset clears the configured-peer pin. Use
+`flk peers enroll --reset <peer> --direction inbound` for an inbound pin.
+The command shows the direction, name, and node ID before clearing that pin.
+Reset is refused when invoked from an agent pane or over MCP/relay; the
+operator's shell is the trust boundary. Peers using a custom `summary_command`, incompatible versions, or a
+failing relay are refused with a concrete reason. Version refusals include
+`upgrade flk on <peer>` (or `this node` when the local version is older); discovery does not fall back to one-shot SSH.
+
 ## Server
 
 ```bash

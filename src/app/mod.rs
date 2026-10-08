@@ -143,6 +143,8 @@ pub struct App {
     delivery_attempt_registry: std::cell::RefCell<delivery_attempts::DeliveryAttempts>,
     /// Installed from the API listener during server startup.
     pub(crate) node_id: Option<String>,
+    pub(crate) mesh_pending: Option<crate::mesh::hello::Pending>,
+    pub(crate) mesh_inbound: Option<crate::mesh::hello::Enrollment>,
     pub(crate) clone_detection_warning: Option<String>,
     /// Pane-to-pane message queues (#175 M1), seeded from the durable
     /// event log at construction.
@@ -922,6 +924,8 @@ impl App {
             restarts: Default::default(),
             event_hub,
             node_id: None,
+            mesh_pending: None,
+            mesh_inbound: None,
             clone_detection_warning: None,
             last_focus,
             no_session,

@@ -7,6 +7,25 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Mesh edge enrollment
+
+`mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
+`name`, `node_id`, `public_key`, and a fresh `nonce`. The receiver returns a
+`challenge` with its own offer and a signature binding both offers and the
+acceptor direction. `finish` carries the dialer's signature over the same
+transcript with the dialer direction. Both peers pin the proven key after
+successful verification. `check` verifies that the calling relay still holds
+an enrolled attachment, including after a server restart. Relay methods are
+bound to an SSH-descended process and its start time.
+
+`peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
+`source` (`configured` or `inbound`), `state`, and `reason`.
+`peers.enroll_reset { "peer": "<peer>", "source": "configured", "preview": true }`
+shows the affected pin. Repeat with `preview: false` and the returned `node_id`
+as `expected_node_id` to clear it and invalidate its enrollment. Source defaults
+to `configured`. Reset is refused when invoked from an agent pane or over
+MCP/relay; the operator's shell is the trust boundary.
+
 ## Choose an integration layer
 
 | Layer | Use it for |
@@ -210,7 +229,7 @@ Pong capabilities and `peers.summary` expose it as `clone_detection_warning`.
 Identity files must belong to the current OS user. New files receive mode `0600`
 regardless of umask. On the destination machine, move
 the copied identity file aside to generate a new identity; peers must re-enroll
-a replaced identity when mesh enrollment is available. Restore the original
+a replaced identity with `flk peers enroll --reset <peer>`. Restore the original
 file to preserve an existing identity on its original machine.
 
 Event subscriptions keep the connection open after the initial response.
