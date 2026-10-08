@@ -42,7 +42,7 @@ pub trait DiskSpace {
 pub struct SystemDisk;
 impl DiskSpace for SystemDisk {
     fn available(&self, path: &Path) -> std::io::Result<u64> {
-        crate::platform_disk::available(path)
+        crate::platform::disk_space::available(path)
     }
 }
 

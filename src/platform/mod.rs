@@ -106,6 +106,7 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+pub(crate) mod disk_space;
 pub(crate) mod ssh_agent;
 
 #[cfg(target_os = "linux")]
