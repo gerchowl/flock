@@ -35,7 +35,7 @@ serial-pty = { max-threads = 1 }
 # miss its deadline, and it fails as "the MCP pane did not start" — a message
 # that reads like a product bug and is not one.
 # fleet_gossip also exercises multi-node restart and held-edge faults.
-filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging) | binary(fleet_gossip)'
+filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging) | binary(fleet_gossip) | binary(mesh_enrollment)'
 test-group = 'serial-pty'
 retries = 2
 

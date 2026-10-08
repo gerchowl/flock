@@ -968,7 +968,19 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
 /// Hold the actual legacy SSH command until another app-loop API responds.
 /// Ping is served by the socket thread, so workspace.list is the probe.
 fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, relay: &str) {
-    let fleet = fleet::spawn("slow-message-hop", specs);
+    let fleet = fleet::spawn_with_startup_probe("slow-message-hop", specs, |fleet, name| {
+        if relay == "nodeb" && name == "nodea" {
+            // Force the hub's first dial before this spoke exists. The shim
+            // must wait for readiness, not refuse hello and back off for 60s.
+            fleet::wait_until("hub dialing the unstarted spoke", GOSSIP_TIMEOUT, || {
+                fleet
+                    .base
+                    .join("startup-wait-nodeb-nodea")
+                    .exists()
+                    .then_some(())
+            });
+        }
+    });
     let source = fleet.node("nodea");
     let destination = fleet.node(recipient);
     let mut alice = PanedMcp::start(source, &fleet.base);

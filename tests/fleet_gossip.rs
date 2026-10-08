@@ -188,10 +188,9 @@ fn mesh_harness_kills_a_held_edge_and_restores_only_that_direction() {
         .unwrap()
         .success());
     fleet.allow_edge("nodeb", "nodec");
-    // Open a fresh held edge directly, avoiding the production reconnect
-    // backoff without changing its timing constants for the sake of the test.
+    // Transport is restored, but a fresh relay must enroll before ping.
     let reply = relay_probe(&fleet, "nodeb", "nodec", "ping");
-    assert!(reply.get("result").is_some(), "{reply}");
+    assert_eq!(reply["error"]["code"], "mesh_not_enrolled", "{reply}");
 }
 
 fn relay_probe(fleet: &fleet::Fleet, from: &str, to: &str, method: &str) -> serde_json::Value {
@@ -245,10 +244,9 @@ fn relay_probes(
         .collect()
 }
 
-/// Fault modes refuse mesh without preventing legacy traffic from reaching
-/// the real server. These are transport fixtures, not enrollment assertions.
+/// Fault modes refuse mesh and the real relay refuses unauthenticated traffic.
 #[test]
-fn mesh_harness_legacy_and_version_mismatch_keep_ping_working() {
+fn mesh_harness_disabled_and_mismatched_edges_refuse_unauthenticated_ping() {
     use fleet::{MeshMode, NodeSpec};
     let fleet = fleet::spawn(
         "mesh-mixed",
@@ -257,15 +255,12 @@ fn mesh_harness_legacy_and_version_mismatch_keep_ping_working() {
             NodeSpec::new("nodeb", "beta", &[]).with_mesh(MeshMode::VersionMismatch(999)),
         ],
     );
-    for (node, code) in [
-        ("nodea", "invalid_request"),
-        ("nodeb", "mesh_version_mismatch"),
-    ] {
-        let reply = relay_probe(&fleet, "probe", node, "mesh.hello");
-        assert_eq!(reply["id"], "probe");
-        assert_eq!(reply["error"]["code"], code);
+    let reply = relay_probe(&fleet, "probe", "nodea", "mesh.hello");
+    assert_eq!(reply["error"]["code"], "invalid_request");
+    // The version override is exercised by an actual dialer in mesh_enrollment.
+    for node in ["nodea", "nodeb"] {
         let ping = relay_probe(&fleet, "probe", node, "ping");
-        assert!(ping.get("result").is_some(), "{ping}");
+        assert_eq!(ping["error"]["code"], "mesh_not_enrolled", "{ping}");
     }
 }
 
@@ -348,5 +343,9 @@ fn mesh_harness_forwards_non_object_json_and_keeps_the_relay_alive() {
         assert!(reply.get("error").is_some(), "{reply}");
     }
     assert_eq!(replies[4]["id"], "ping");
-    assert!(replies[4].get("result").is_some(), "{}", replies[4]);
+    assert_eq!(
+        replies[4]["error"]["code"], "mesh_not_enrolled",
+        "{}",
+        replies[4]
+    );
 }
