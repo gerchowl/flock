@@ -44,6 +44,40 @@ const PAIR_AB: &[NodeSpec] = &[
     NodeSpec::new("nodeb", "beta", &["nodea"]),
 ];
 
+// A reserved configured name needs an outbound pin before accepting its inbound edge.
+fn spawn_enrolled_pair(tag: &str) -> fleet::Fleet {
+    let mut specs = PAIR_AB.to_vec();
+    specs[1].peers = &[];
+    let fleet = fleet::spawn(tag, &specs);
+    wait_for("first direction enrolled", Duration::from_secs(30), || {
+        let response: Value = serde_json::from_str(&fleet.node("nodea").api(
+            &json!({"id":"enrollment", "method":"peers.enrollment", "params":{}}).to_string(),
+        ))
+        .unwrap();
+        response["result"]["peers"]
+            .as_array()?
+            .iter()
+            .any(|peer| peer["peer"] == "nodeb" && peer["state"] == "pinned")
+            .then_some(())
+    });
+    for app in ["flock", "flock-dev"] {
+        let path = fleet
+            .node("nodeb")
+            .config_home
+            .join(app)
+            .join("config.toml");
+        let mut config = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(config, "\n[[peers]]\nname = \"nodea\"").unwrap();
+    }
+    let response: Value =
+        serde_json::from_str(&fleet.node("nodeb").api(
+            &json!({"id":"reload", "method":"server.reload_config", "params":{}}).to_string(),
+        ))
+        .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    fleet
+}
+
 const GOSSIP_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -329,7 +363,7 @@ fn fleet_row<'a>(listing: &'a Value, agent_id: &str) -> Option<&'a Value> {
 /// has nothing to do with the answer.
 #[test]
 fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
-    let fleet = fleet::spawn("mcp-fleet", PAIR_AB);
+    let fleet = spawn_enrolled_pair("mcp-fleet");
     let node_a = fleet.node("nodea");
     let node_b = fleet.node("nodeb");
 
@@ -524,7 +558,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 ///   would wait on a server that is waiting on it.
 #[test]
 fn a_mute_answers_a_sender_on_another_host() {
-    let fleet = fleet::spawn("mcp-fleet-mute", PAIR_AB);
+    let fleet = spawn_enrolled_pair("mcp-fleet-mute");
     let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
     let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
 
@@ -968,7 +1002,11 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
 /// Hold the actual legacy SSH command until another app-loop API responds.
 /// Ping is served by the socket thread, so workspace.list is the probe.
 fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, relay: &str) {
-    let fleet = fleet::spawn("slow-message-hop", specs);
+    let fleet = if specs.len() == 2 {
+        spawn_enrolled_pair("slow-message-hop")
+    } else {
+        fleet::spawn("slow-message-hop", specs)
+    };
     let source = fleet.node("nodea");
     let destination = fleet.node(recipient);
     let mut alice = PanedMcp::start(source, &fleet.base);

@@ -42,7 +42,12 @@ Server status includes the API socket listener’s accept-error count, latest er
 `flk peers` and `flk status` show each peer's name, pin direction, short node
 ID, and enrollment state: `pending`, `pinned`, or `refused` with the reason.
 Inbound keys remain bound to their signed remote names. Configured peer aliases
-supply local display names and may differ from those remote names.
+supply local display names and may differ from those remote names. An inbound
+peer claiming a configured peer's name must match that peer's configured pin.
+Until this node dials and pins the configured peer, inbound claims to that name
+are refused. For a fresh bidirectional pair whose configured names match the
+remote node names, configure and enroll one direction before adding the reverse
+peer entry; configuring both directions first leaves both waiting for a pin.
 With an older running server, the rest of status remains available and
 enrollment reports `unknown (server predates mesh; restart needed)`.
 `flk peers status --json` includes `source`, `node_id`, `enrollment`, and

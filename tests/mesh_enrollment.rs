@@ -572,3 +572,98 @@ fn bidirectional_alias_enrollment_outbound_first() {
 fn bidirectional_alias_enrollment_inbound_first() {
     bidirectional_aliases(false);
 }
+
+#[test]
+fn own_key_cannot_claim_a_configured_peer_name_before_or_after_pinning() {
+    let specs = [
+        NodeSpec::new("a.test", "reserved-a", &[]),
+        NodeSpec::new("b.test", "reserved-b", &[]),
+        NodeSpec::new("e.test", "reserved-e", &[]),
+    ];
+    let mut fleet = fleet::spawn("mesh-reserved", &specs);
+    fleet.refuse_edge("a.test", "b.test");
+    add_peer(fleet.node("a.test"), ALIAS_A_TO_B);
+    let response = request(fleet.node("a.test"), "server.reload_config", json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    rename_node(fleet.node("e.test"), "b-ts.test");
+    add_peer(
+        fleet.node("e.test"),
+        "[[peers]]\nname = \"a.test\"\nssh = \"a.test\"\n",
+    );
+    fleet.node_mut("e.test").restart();
+    let refused = enrollment(fleet.node("e.test"), "a.test", "refused");
+    assert!(refused["reason"].as_str().unwrap().contains(
+        "name b-ts.test belongs to configured peer b-ts.test; it enrolls when this node dials it"
+    ), "{refused}");
+    assert_single_configured_row(fleet.node("a.test"));
+
+    fleet.allow_edge("a.test", "b.test");
+    fleet.node_mut("a.test").restart();
+    let pinned = enrollment(fleet.node("a.test"), "b-ts.test", "pinned");
+    fleet.node_mut("e.test").restart();
+    let refused = enrollment(fleet.node("e.test"), "a.test", "refused");
+    let reason = refused["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("impersonation of configured peer b-ts.test"),
+        "{refused}"
+    );
+    assert!(
+        reason.contains(pinned["node_id"].as_str().unwrap()),
+        "{refused}"
+    );
+    // Read E's actual identity independently of its untrusted claimed name.
+    let e_id = ["flock", "flock-dev"]
+        .into_iter()
+        .find_map(|app| {
+            let path = fleet
+                .node("e.test")
+                .home
+                .join("state")
+                .join(app)
+                .join("mesh/identity.json");
+            std::fs::read_to_string(path).ok()
+        })
+        .unwrap();
+    let e_id: Value = serde_json::from_str(&e_id).unwrap();
+    use sha2::{Digest, Sha256};
+    let public_key: Vec<u8> = serde_json::from_value(e_id["public_key"].clone()).unwrap();
+    let node_id: String = Sha256::digest(public_key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert!(reason.contains(&node_id), "{refused}");
+    assert_single_configured_row(fleet.node("a.test"));
+    let inbound = enrollment(fleet.node("a.test"), "unidentified SSH peer", "refused");
+    assert!(inbound["node_id"].is_null());
+}
+
+fn assert_single_configured_row(node: &Node) {
+    let preview = request(
+        node,
+        "peers.enroll_reset",
+        json!({"peer":"b-ts.test","source":"inbound","preview":true}),
+    );
+    assert!(preview["result"]["node_id"].is_null(), "{preview}");
+    let status = cli(node, &["status", "--json"]);
+    let peers = status["peers"].as_array().unwrap();
+    let named: Vec<_> = peers.iter().filter(|p| p["peer"] == "b-ts.test").collect();
+    assert_eq!(named.len(), 1, "{status}");
+    assert_eq!(named[0]["source"], "configured", "{status}");
+    let peer_status = cli(node, &["peers", "status", "--json"]);
+    assert_eq!(
+        peer_status
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["name"] == "b-ts.test")
+            .count(),
+        1,
+        "{peer_status}"
+    );
+    assert!(
+        !peers
+            .iter()
+            .any(|p| p["source"] == "inbound" && p["state"] == "pinned"),
+        "{status}"
+    );
+}

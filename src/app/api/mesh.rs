@@ -74,8 +74,13 @@ impl App {
                         .map_err(|e| e.to_string())
                 })?
                 .unwrap_or_else(|| offer.name.clone());
+                let configured_name = self.state.peers.iter().any(|p| p.name == offer.name);
                 self.mesh_inbound = Some(Enrollment {
-                    peer: peer.clone(),
+                    peer: if configured_name {
+                        "unidentified SSH peer".into()
+                    } else {
+                        peer.clone()
+                    },
                     source: PinSource::Inbound,
                     node_id: None,
                     state: "pending".into(),
@@ -83,7 +88,10 @@ impl App {
                 });
                 offer.validate(&peer)?;
                 // The signed remote name stays pinned independently of its local alias.
-                hello::check_pin(&offer.name, &offer, PinSource::Inbound, false)?;
+                hello::check_inbound_pin(&offer, false, configured_name)?;
+                if let Some(status) = self.mesh_inbound.as_mut() {
+                    status.peer = peer;
+                }
                 let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
                 let acceptor = Offer::new(&identity, crate::app::short_host_name())?;
                 let signature = hello::sign(&identity, &offer, &acceptor, "acceptor")?;
@@ -116,11 +124,13 @@ impl App {
                 }
                 hello::verify(&pending.dialer, &pending.acceptor, "dialer", &signature)?;
                 let status = self.mesh_inbound.as_mut().ok_or("no pending enrollment")?;
-                hello::check_pin(
-                    &pending.dialer.name,
+                hello::check_inbound_pin(
                     &pending.dialer,
-                    PinSource::Inbound,
                     true,
+                    self.state
+                        .peers
+                        .iter()
+                        .any(|p| p.name == pending.dialer.name),
                 )?;
                 status.node_id = Some(pending.dialer.node_id);
                 status.state = "pinned".into();

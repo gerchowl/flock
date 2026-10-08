@@ -162,7 +162,38 @@ pub(crate) fn check_pin(
     source: PinSource,
     save: bool,
 ) -> Result<(), String> {
+    check_pin_guarded(peer, offer, source, save, false)
+}
+
+pub(crate) fn check_inbound_pin(
+    offer: &Offer,
+    save: bool,
+    configured_name: bool,
+) -> Result<(), String> {
+    check_pin_guarded(
+        &offer.name,
+        offer,
+        PinSource::Inbound,
+        save,
+        configured_name,
+    )
+}
+
+fn check_pin_guarded(
+    peer: &str,
+    offer: &Offer,
+    source: PinSource,
+    save: bool,
+    configured_name: bool,
+) -> Result<(), String> {
     with_store(|store| {
+        if configured_name {
+            match store.get_pin(peer).map_err(|e| e.to_string())? {
+                None => return Err(format!("name {peer} belongs to configured peer {peer}; it enrolls when this node dials it")),
+                Some(pin) if pin != offer.pin() => return Err(format!("impersonation of configured peer {peer}: presented node {}, configured node {}", offer.node_id, pin.node_id)),
+                Some(_) => {}
+            }
+        }
         if let Some(name) = store
             .conflicting_pin_name(source, peer, &offer.pin())
             .map_err(|e| e.to_string())?
