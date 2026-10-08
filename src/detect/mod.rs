@@ -273,18 +273,32 @@ pub(crate) fn progress_text(screen: &str) -> String {
         .join("\n")
 }
 
-/// Keep Claude's running-tool row as evidence, ignoring only its elapsed suffix.
-fn normalize_running_tool_counter(line: &str) -> &str {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("⎿ Running… (") {
-        return line;
+/// Keep Claude's running-tool row and controls, ignoring only elapsed time.
+fn normalize_running_tool_counter(line: &str) -> String {
+    let Some(activity) = line.trim().strip_prefix('⎿') else {
+        return line.to_owned();
+    };
+    let activity = activity.trim_start();
+    let Some(suffix) = activity
+        .strip_prefix("Running…")
+        .or_else(|| activity.strip_prefix("Running..."))
+    else {
+        return line.to_owned();
+    };
+    if !suffix.trim_start().starts_with('(') {
+        return line.to_owned();
     }
-    let Some((row, elapsed)) = line.trim_end().rsplit_once(" (") else {
-        return line;
+    let Some((row, details)) = line.trim_end().rsplit_once('(') else {
+        return line.to_owned();
     };
-    let Some(elapsed) = elapsed.strip_suffix(')') else {
-        return line;
+    let Some(details) = details.strip_suffix(')') else {
+        return line.to_owned();
     };
+    let (elapsed, controls) = details
+        .split_once('·')
+        .map_or((details, None), |(elapsed, controls)| {
+            (elapsed, Some(controls))
+        });
     let parts: Vec<&str> = elapsed.split_whitespace().collect();
     if parts.is_empty()
         || !parts.iter().all(|part| {
@@ -294,9 +308,12 @@ fn normalize_running_tool_counter(line: &str) -> &str {
             !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         })
     {
-        return line;
+        return line.to_owned();
     }
-    row
+    match controls {
+        Some(controls) => format!("{}({})", row, controls.trim_start()),
+        None => row.trim_end().to_owned(),
+    }
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.
