@@ -1079,6 +1079,7 @@ impl App {
     }
 
     fn restart_message_with_intent(&mut self, agent: String, body: String, intent: MsgIntent) {
+        self.detach_pending_message_relay();
         let peer = self.current_api_peer_pid.take();
         let response = self.send_message(
             "server:restart".into(),
@@ -1095,6 +1096,7 @@ impl App {
             None,
         );
         self.current_api_peer_pid = peer;
+        self.detach_pending_message_relay();
         if serde_json::from_str::<serde_json::Value>(&response)
             .ok()
             .is_some_and(|v| v.get("error").is_some())
