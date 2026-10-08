@@ -261,6 +261,19 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
 
 /// Detect the state of an agent from the live terminal tail snapshot.
 /// If `agent` is `None`, returns `Unknown`.
+/// Transcript evidence with the detectors' recognized live status rows removed.
+pub(crate) fn progress_text(screen: &str) -> String {
+    screen
+        .lines()
+        .filter(|line| {
+            !agents::codex::is_progress_chrome(line)
+                && !agents::claude_code::has_spinner_activity(line)
+                && !agents::opencode::is_progress_chrome(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
     detect_agent(agent, screen_content).state
@@ -403,7 +416,7 @@ fn detect_kilo(content: &str) -> AgentState {
 // ---------------------------------------------------------------------------
 
 /// Check for action confirmations followed by "yes" or "❯".
-fn has_confirmation_prompt(lower_content: &str) -> bool {
+pub(crate) fn has_confirmation_prompt(lower_content: &str) -> bool {
     if let Some(pos) = lower_content
         .find("do you want to")
         .or_else(|| lower_content.find("would you like to"))
@@ -678,6 +691,15 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn detect_compaction_chrome_in_claude_and_opencode_is_working() {
+        assert_eq!(detect_claude("✶ Compacting conversation… (esc to interrupt)\n─────────────────────────\n❯ \n─────────────────────────"), AgentState::Working);
+        assert_eq!(
+            detect_opencode("Compacting conversation\n■■■■⬝⬝  esc interrupt  opencode"),
+            AgentState::Working
+        );
     }
 
     #[test]

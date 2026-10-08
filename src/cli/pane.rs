@@ -117,7 +117,7 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: flk pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
@@ -1329,7 +1329,7 @@ fn pane_help_text() -> String {
     let _ = writeln!(out, "  flk pane list [--workspace <workspace_id>]");
     let _ = writeln!(out, "  flk pane get <pane_id>");
     let _ = writeln!(out, "  flk pane rename <pane_id> <label>|--clear");
-    let _ = writeln!(out, "  flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    let _ = writeln!(out, "  flk pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
         "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"

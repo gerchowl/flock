@@ -80,7 +80,7 @@ use super::settled::{Cursor, PinnedTarget, SettleTarget};
 pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
     "                     [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS]\n",
-    "                     [--settle MS] [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; claude's folder-trust dialog is\n",
@@ -89,6 +89,7 @@ pub(super) const START_USAGE: &str = concat!(
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
+    "  --silence DURATION  unchanged working screen ends the await as stalled; default 3m, 0 disables\n",
     "  --settle MS         how long the agent's quiet must hold, default 5000\n",
     "  --sandbox MODE      codex only: read-only|workspace-write|danger-full-access\n",
     "                      git push and gh need explicit --sandbox danger-full-access\n",
@@ -99,15 +100,19 @@ pub(super) const START_USAGE: &str = concat!(
 
 pub(super) const SEND_USAGE: &str = concat!(
     "flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS]\n",
-    "                    [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "                    [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  one round at a time: a send while another round is being awaited is refused as busy\n",
-    "  --ready-timeout MS  how long the agent may take to reach its prompt, default 60000",
+    "  --ready-timeout MS  how long the agent may take to reach its prompt, default 60000\n",
+    "  --silence DURATION  unchanged working screen during --await; default 3m, 0 disables",
 );
 
 pub(super) const WAIT_USAGE: &str = concat!(
-    "flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--max-chars N] [--json]\n",
+    "flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silence DURATION] [--max-chars N] [--json]\n",
     "  without --after it waits from the cursor the delegate recorded with its latest submit\n",
-    "  --timeout MS        counted from this command, not from the submit that started the round",
+    "  --timeout MS        counted from this command, not from the submit that started the round\n",
+    "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
+    "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
+    "                    6 agent blocked, 7 stalled, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -315,6 +320,7 @@ mod exit {
     /// A finished reply with no `DONE:` / `BLOCKED:` / `VERDICT:` line, or a
     /// settle with no reply at all inside the grace.
     pub(super) const NO_SENTINEL: i32 = 5;
+    pub(super) const STALLED: i32 = 7;
 }
 
 /// Characters a brief path may not contain.
@@ -834,6 +840,7 @@ struct StartFlags {
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
+    silence_ms: Option<u64>,
     ready_timeout_ms: Option<u64>,
     max_chars: Option<u32>,
     json: bool,
@@ -845,6 +852,7 @@ struct SendFlags {
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
+    silence_ms: Option<u64>,
     ready_timeout_ms: Option<u64>,
     max_chars: Option<u32>,
     json: bool,
@@ -855,6 +863,7 @@ struct WaitFlags {
     after: Option<String>,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
+    silence_ms: Option<u64>,
     max_chars: Option<u32>,
     json: bool,
 }
@@ -892,6 +901,7 @@ impl Verb {
             "--max-chars" => !matches!(self, Self::Status | Self::Reap),
             "--await" => matches!(self, Self::Start | Self::Send),
             "--timeout" => matches!(self, Self::Start | Self::Send | Self::Wait),
+            "--silence" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--settle" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--ready-timeout" => matches!(self, Self::Start | Self::Send),
             "--brief" => matches!(self, Self::Start | Self::Send),
@@ -946,6 +956,11 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
                 index += 1;
             }
             "--timeout" => flags.timeout_ms = Some(number(flag, &value(&mut index)?)?),
+            "--silence" => {
+                flags.silence_ms = Some(super::delegate_verdict::parse_duration(&value(
+                    &mut index,
+                )?)?)
+            }
             "--settle" => flags.settle_ms = Some(number(flag, &value(&mut index)?)?),
             "--ready-timeout" => flags.ready_timeout_ms = Some(number(flag, &value(&mut index)?)?),
             "--max-chars" => flags.max_chars = Some(number(flag, &value(&mut index)?)?),
@@ -999,6 +1014,7 @@ struct Parsed {
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
+    silence_ms: Option<u64>,
     ready_timeout_ms: Option<u64>,
     max_chars: Option<u32>,
     force: bool,
@@ -1019,6 +1035,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         ready_timeout_ms: flags.ready_timeout_ms,
         max_chars: flags.max_chars,
         json: flags.json,
@@ -1031,6 +1048,7 @@ fn as_send(flags: &Parsed) -> SendFlags {
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         ready_timeout_ms: flags.ready_timeout_ms,
         max_chars: flags.max_chars,
         json: flags.json,
@@ -1042,6 +1060,7 @@ fn as_wait(flags: &Parsed) -> WaitFlags {
         after: flags.after.clone(),
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         max_chars: flags.max_chars,
         json: flags.json,
     }
@@ -2511,8 +2530,20 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if reason.deadline_reached {
+                emit_ready_timeout(
+                    name,
+                    &pane_id,
+                    &terminal_id,
+                    None,
+                    flags.json,
+                    &reason.reason,
+                );
+                rollback(&cleanup);
+                return Ok(1);
+            }
             rollback(&cleanup);
-            return Ok(fail(reason));
+            return Ok(fail(reason.reason));
         }
     };
     let cursor = match cursor_of(&settled_record) {
@@ -2594,6 +2625,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         submitted_at_ms,
         deadline,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         max_chars: flags.max_chars,
         json: flags.json,
     }
@@ -2717,6 +2749,30 @@ fn harness_for(entry: &Entry) -> &'static HarnessSpec {
         .expect("the default harness is always in the table")
 }
 
+#[derive(Debug)]
+struct ReadyFailure {
+    reason: String,
+    deadline_reached: bool,
+}
+
+impl From<String> for ReadyFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            deadline_reached: false,
+        }
+    }
+}
+
+impl ReadyFailure {
+    fn deadline(reason: String) -> Self {
+        Self {
+            reason,
+            deadline_reached: true,
+        }
+    }
+}
+
 /// Block until the agent is up AND at its prompt, under one deadline, and hand
 /// back the record that proved it.
 ///
@@ -2735,7 +2791,7 @@ fn await_ready(
     agent: &serde_json::Value,
     harness: &HarnessSpec,
     deadline: Instant,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ReadyFailure> {
     let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
     let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
 
@@ -2765,7 +2821,7 @@ fn await_ready(
                         if let Some(refusal) =
                             startup_dialog_refusal(name, harness, &pane_id, deadline)
                         {
-                            return Err(refusal);
+                            return Err(refusal.into());
                         }
                         // A dialog's prompt can arrive before its footer in a
                         // separate PTY read. Confirm readiness on the next poll
@@ -2783,7 +2839,7 @@ fn await_ready(
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
                     {
-                        return Err(refusal);
+                        return Err(refusal.into());
                     }
                 }
                 if expired(Some(deadline)) {
@@ -2791,25 +2847,27 @@ fn await_ready(
                     // prompt (`blocked`, `working`, `unknown`). Name the
                     // status, not the clock — that is what tells the caller
                     // what to look at.
-                    return Err(format!("delegate {name} is {status}"));
+                    return Err(ReadyFailure::deadline(format!(
+                        "delegate {name} is {status}"
+                    )));
                 }
                 last_status = Some(status);
                 sleep_bounded(deadline, READY_POLL);
             }
             AgentFetch::Missing => {
-                return Err(format!("delegate {name}: the agent no longer resolves"))
+                return Err((format!("delegate {name}: the agent no longer resolves")).into())
             }
             AgentFetch::TimedOut => {
                 // The next request refused to send because the deadline had
                 // passed. Report the last status we DID see, so a readiness
                 // that ran out while the agent was `blocked` says `blocked`
                 // rather than hiding the status behind the clock.
-                return Err(match last_status {
+                return Err(ReadyFailure::deadline(match last_status {
                     Some(status) => format!("delegate {name} is {status}"),
                     None => format!("delegate {name} is not ready: timed out"),
-                });
+                }));
             }
-            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
+            AgentFetch::Failed(reason) => return Err((format!("delegate {name}: {reason}")).into()),
         }
     }
 }
@@ -2846,10 +2904,19 @@ fn startup_dialog_refusal(
 /// `false`, so a flaky socket degrades to the plain `blocked` refusal rather
 /// than inventing a diagnosis.
 fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: Instant) -> bool {
-    let response = match bounded(
+    pane_shows_startup_dialog_with(pane_id, dialog, deadline, bounded)
+}
+
+fn pane_shows_startup_dialog_with(
+    pane_id: &str,
+    dialog: &StartupDialog,
+    deadline: Instant,
+    read: impl FnOnce(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> bool {
+    let response = match read(
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.to_owned(),
-            source: ReadSource::Recent,
+            source: ReadSource::Detection,
             lines: Some(STARTUP_DIALOG_LINES),
             format: ReadFormat::Text,
             strip_ansi: true,
@@ -2887,13 +2954,15 @@ fn delegate_wait_for_ready(
     terminal_id: &str,
     pane_id: &str,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<(), ReadyFailure> {
     // One cap for the whole phase, computed once up front. If the deadline
     // has already passed, say "timed out" and skip the subscribe entirely:
     // no request is sent while out of clock.
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(format!("delegate {name} is not ready: timed out"));
+        return Err(ReadyFailure::deadline(format!(
+            "delegate {name} is not ready: timed out"
+        )));
     }
 
     // Subscribe FIRST, then snapshot: a status that lands between the ack
@@ -2913,15 +2982,22 @@ fn delegate_wait_for_ready(
     };
     let (ack, mut stream) = ApiClient::local()
         .subscribe_value(&subscribe, Some(remaining))
-        .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
+        .map_err(|err| {
+            let timed_out = matches!(&err, ApiClientError::Io(io) if super::api_timeout_error(io));
+            ReadyFailure {
+                reason: format!("delegate {name}: readiness could not be watched: {err}"),
+                deadline_reached: timed_out,
+            }
+        })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
-        return Err(match err {
+        return Err((match err {
             ApiClientError::ErrorResponse(response) => format!(
                 "delegate {name}: {}",
                 serde_json::to_string(&response).unwrap_or_else(|_| String::new())
             ),
             _ => format!("delegate {name}: readiness could not be watched: {err}"),
-        });
+        })
+        .into());
     }
 
     // Snapshot after the subscribe is live, bounded by the same deadline.
@@ -2933,15 +3009,18 @@ fn delegate_wait_for_ready(
             }
         }
         AgentFetch::Missing => {
-            return Err(format!(
+            return Err((format!(
                 "delegate {name} never became ready: the agent no longer resolves"
-            ));
+            ))
+            .into());
         }
         AgentFetch::TimedOut => {
-            return Err(format!("delegate {name} is not ready: timed out"));
+            return Err(ReadyFailure::deadline(format!(
+                "delegate {name} is not ready: timed out"
+            )));
         }
         AgentFetch::Failed(reason) => {
-            return Err(format!("delegate {name}: {reason}"));
+            return Err((format!("delegate {name}: {reason}")).into());
         }
     }
 
@@ -2954,33 +3033,39 @@ fn delegate_wait_for_ready(
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
         else {
-            return Err(format!("delegate {name} is not ready: timed out"));
+            return Err(ReadyFailure::deadline(format!(
+                "delegate {name} is not ready: timed out"
+            )));
         };
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
         match stream.next_value() {
             Ok(None) => {
-                return Err(format!(
+                return Err((format!(
                     "delegate {name} never became ready: the readiness subscription closed"
-                ));
+                ))
+                .into());
             }
             Ok(Some(event)) => match classify_ready_event(&event, pane_id) {
                 ReadySignal::Ready(_) => return Ok(()),
                 ReadySignal::Exited => {
-                    return Err(format!(
+                    return Err((format!(
                         "delegate {name}: the agent's pane exited before it became ready"
-                    ));
+                    ))
+                    .into());
                 }
                 ReadySignal::KeepWaiting => continue,
             },
             Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
-                return Err(format!("delegate {name} is not ready: timed out"));
+                return Err(ReadyFailure::deadline(format!(
+                    "delegate {name} is not ready: timed out"
+                )));
             }
             Err(err) => {
-                return Err(format!(
-                    "delegate {name}: readiness could not be watched: {err}"
-                ))
+                return Err(
+                    (format!("delegate {name}: readiness could not be watched: {err}")).into(),
+                )
             }
         }
     }
@@ -3028,7 +3113,20 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
     let record = match await_prompt(name, &entry, ready_deadline) {
         Ok(record) => record,
-        Err(reason) => return Ok(fail(reason)),
+        Err(reason) => {
+            if reason.deadline_reached {
+                emit_ready_timeout(
+                    name,
+                    &entry.pane_id,
+                    &entry.terminal_id,
+                    Some(&entry),
+                    flags.json,
+                    &reason.reason,
+                );
+                return Ok(1);
+            }
+            return Ok(fail(reason.reason));
+        }
     };
 
     let cursor = match cursor_of(&record) {
@@ -3077,6 +3175,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         submitted_at_ms,
         deadline,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         max_chars: flags.max_chars,
         json: flags.json,
     }
@@ -3090,7 +3189,11 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
 /// is narrower — it is not sitting on a dialog. The returned record is the last
 /// one sampled, for the same reason as [`await_ready`]: the cursor has to be the
 /// one this round starts from.
-fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_json::Value, String> {
+fn await_prompt(
+    name: &str,
+    entry: &Entry,
+    deadline: Instant,
+) -> Result<serde_json::Value, ReadyFailure> {
     let mut last_status: Option<String> = None;
     loop {
         match agent_record(&entry.terminal_id, Some(deadline)) {
@@ -3102,21 +3205,23 @@ fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_js
                     return Ok(record);
                 }
                 if expired(Some(deadline)) {
-                    return Err(format!("delegate {name} is {status}"));
+                    return Err(ReadyFailure::deadline(format!(
+                        "delegate {name} is {status}"
+                    )));
                 }
                 last_status = Some(status);
                 sleep_bounded(deadline, READY_POLL);
             }
             AgentFetch::Missing => {
-                return Err(format!("delegate {name}: the agent no longer resolves"))
+                return Err((format!("delegate {name}: the agent no longer resolves")).into())
             }
             AgentFetch::TimedOut => {
-                return Err(match last_status {
+                return Err(ReadyFailure::deadline(match last_status {
                     Some(status) => format!("delegate {name} is {status}"),
                     None => format!("delegate {name} is not ready: timed out"),
-                });
+                }));
             }
-            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
+            AgentFetch::Failed(reason) => return Err((format!("delegate {name}: {reason}")).into()),
         }
     }
 }
@@ -3184,6 +3289,7 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
         submitted_at_ms: entry.submitted_at_ms,
         deadline,
         settle_ms: flags.settle_ms,
+        silence_ms: flags.silence_ms,
         max_chars: flags.max_chars,
         json: flags.json,
     }
@@ -3322,6 +3428,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
             return Ok(fail(format!("delegate {}: {reason}", entry.name)))
         }
     };
+    let latest = load_observation(&entry);
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
         // that appears with its first value is not a field a caller can test for.
@@ -3341,10 +3448,19 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
                 "round": entry.round,
                 "turn_cursor": entry.cursor,
                 "goal": serde_json::Value::Null,
+                "verdict": latest.as_ref().and_then(|v| v.get("verdict")),
+                "latest_verdict": latest,
             })
         );
     } else {
         println!("delegate {name}: {status}");
+        if let Some(verdict) = latest
+            .as_ref()
+            .and_then(|v| v.get("verdict"))
+            .and_then(|v| v.as_str())
+        {
+            println!("  verdict {verdict}");
+        }
         println!("  round {} · {}", entry.round, entry.mode);
         if let Some(sandbox) = &entry.sandbox {
             println!("  sandbox {sandbox}");
@@ -3488,6 +3604,11 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
         }
     };
 
+    if let Err(err) = std::fs::remove_file(observation_path(name)) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Ok(fail(format!("could not remove delegate verdict: {err}")));
+        }
+    }
     if let Err(err) = std::fs::remove_file(entry_path(name)) {
         if err.kind() != io::ErrorKind::NotFound {
             return Ok(fail(format!(
@@ -3541,6 +3662,7 @@ enum Outcome {
     NoSentinel,
     NoResult,
     AgentBlocked,
+    Stalled,
     Timeout,
 }
 
@@ -3554,6 +3676,7 @@ impl Outcome {
             Self::NoSentinel => "no_sentinel",
             Self::NoResult => "no_result",
             Self::AgentBlocked => "agent_blocked",
+            Self::Stalled => "stalled",
             Self::Timeout => "timeout",
         }
     }
@@ -3564,6 +3687,7 @@ impl Outcome {
             Self::Blocked => super::settled::exit::BLOCKED,
             Self::Gone => super::settled::exit::GONE,
             Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
+            Self::Stalled => exit::STALLED,
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
         }
@@ -3659,6 +3783,7 @@ struct Await<'a> {
     submitted_at_ms: u64,
     deadline: Option<Instant>,
     settle_ms: Option<u64>,
+    silence_ms: Option<u64>,
     max_chars: Option<u32>,
     json: bool,
 }
@@ -3677,10 +3802,15 @@ impl Await<'_> {
         // turn rather than starting the search again.
         let reported_cursor = self.after.clone().unwrap_or_default();
         let mut after = self.after.clone();
+        let mut monitor = super::delegate_verdict::Monitor::new(
+            self.silence_ms
+                .unwrap_or(super::delegate_verdict::DEFAULT_SILENCE_MS),
+            Instant::now(),
+        );
 
         loop {
             let remaining = self.remaining_timeout_ms();
-            let settled = super::settled::settled_wait(
+            let settled = super::settled::settled_wait_observed(
                 "delegate",
                 SettleTarget::Pinned(PinnedTarget {
                     terminal_id: self.entry.terminal_id.clone(),
@@ -3689,16 +3819,53 @@ impl Await<'_> {
                 after.as_deref(),
                 self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
                 remaining,
+                &mut |sample| {
+                    let Some(super::settled::Sample::Record {
+                        status, pane_id, ..
+                    }) = sample
+                    else {
+                        monitor.interrupted(Instant::now());
+                        return false;
+                    };
+                    let Some(screen) = detection_screen(pane_id, self.deadline) else {
+                        monitor.interrupted(Instant::now());
+                        return false;
+                    };
+                    let status = match status {
+                        crate::api::schema::AgentStatus::Working => "working",
+                        crate::api::schema::AgentStatus::Blocked => "blocked",
+                        crate::api::schema::AgentStatus::Unknown => "unknown",
+                        _ => "idle",
+                    };
+                    monitor.observe(status, &screen, Instant::now())
+                },
             )?;
 
             let settled_cursor = settled.turn_cursor().unwrap_or_default().to_string();
             match self.after_settle(settled, &settled_cursor) {
                 SettledDecision::Report { outcome, info } => {
                     let code = outcome.exit_code();
+                    let screen = detection_screen(&self.entry.pane_id, None)
+                        .unwrap_or_else(|| monitor.screen.clone());
+                    let verdict = matches!(outcome, Outcome::Stalled)
+                        .then(|| monitor.latest.clone())
+                        .flatten()
+                        .unwrap_or_else(|| super::delegate_verdict::Verdict {
+                            verdict: outcome.as_str().into(),
+                            reason: "round_end".into(),
+                            retry_after_ms: None,
+                            last_line: super::delegate_verdict::last_line(&screen),
+                        });
+                    let observation = event_observation(&self.entry.name, &screen, &verdict);
+                    save_observation(self.entry, &observation);
+                    let mut info = info.unwrap_or_else(|| serde_json::json!({}));
+                    for (key, value) in observation.as_object().into_iter().flatten() {
+                        info[key] = value.clone();
+                    }
                     emit_outcome(
                         self.entry,
                         outcome.as_str(),
-                        info.as_ref(),
+                        Some(&info),
                         self.json,
                         &reported_cursor,
                     );
@@ -3748,6 +3915,10 @@ impl Await<'_> {
         use super::settled::SettledOutcome;
         match settled {
             // A held `blocked` is a human question, not a turn that finished.
+            SettledOutcome::Stalled { .. } => SettledDecision::Report {
+                outcome: Outcome::Stalled,
+                info: None,
+            },
             SettledOutcome::Blocked { .. } => SettledDecision::Report {
                 outcome: Outcome::AgentBlocked,
                 info: None,
@@ -3975,6 +4146,90 @@ fn emit_submit(entry: &Entry, json: bool) {
     }
 }
 
+fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> {
+    let response = bounded(
+        Method::PaneRead(PaneReadParams {
+            pane_id: pane_id.into(),
+            source: ReadSource::Detection,
+            lines: Some(40),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        }),
+        deadline,
+    )
+    .ok()?;
+    response
+        .pointer("/result/read/text")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn event_observation(
+    name: &str,
+    screen: &str,
+    verdict: &super::delegate_verdict::Verdict,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(verdict).unwrap_or_else(|_| serde_json::json!({}));
+    value["s1"] = serde_json::to_value(
+        super::delegate_s1::Client::from_config().judge(&format!("flk delegate {name}"), screen),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    value
+}
+
+fn observation_path(name: &str) -> PathBuf {
+    registry_dir().join(format!("{name}.verdict.json"))
+}
+
+fn save_observation(entry: &Entry, observation: &serde_json::Value) {
+    let value = serde_json::json!({"terminal_id": entry.terminal_id, "round": entry.round,
+        "observed_at_ms": now_ms(), "observation": observation});
+    let path = observation_path(&entry.name);
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&temp, value.to_string()).is_ok() {
+        let _ = std::fs::rename(&temp, path);
+    }
+}
+
+fn load_observation(entry: &Entry) -> Option<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(observation_path(&entry.name)).ok()?).ok()?;
+    (value["terminal_id"] == entry.terminal_id && value["round"] == entry.round)
+        .then(|| value["observation"].clone())
+}
+
+fn emit_ready_timeout(
+    name: &str,
+    pane_id: &str,
+    terminal_id: &str,
+    entry: Option<&Entry>,
+    json: bool,
+    reason: &str,
+) {
+    let screen = detection_screen(pane_id, None).unwrap_or_default();
+    let status = Some(agent_record(terminal_id, None));
+    let status = match &status {
+        Some(AgentFetch::Found(record)) => field(record, "agent_status").unwrap_or("unknown"),
+        _ => "unknown",
+    };
+    let verdict = super::delegate_verdict::readiness(&screen, status);
+    let mut value = event_observation(name, &screen, &verdict);
+    if let Some(entry) = entry {
+        save_observation(entry, &value);
+    }
+    value["name"] = serde_json::json!(name);
+    value["outcome"] = serde_json::json!("ready_timeout");
+    value["pane_id"] = serde_json::json!(pane_id);
+    if json {
+        println!("{value}");
+    } else {
+        eprintln!(
+            "{reason}; ready timeout: {}: {}",
+            verdict.verdict, verdict.last_line
+        );
+    }
+}
+
 /// The one object every OUTCOME prints under `--json`.
 ///
 /// Only outcomes. A usage error, a refused cursor and a refused server call print
@@ -4011,6 +4266,9 @@ fn emit_outcome(
                 "round": entry.round,
                 "turn_cursor": turn_cursor,
                 "session_id": text("session_id"),
+                "verdict": text("verdict"), "reason": text("reason"),
+                "retry_after_ms": text("retry_after_ms"), "last_line": text("last_line"),
+                "s1": text("s1"),
             })
         );
     } else {

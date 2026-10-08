@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Delegate stall and readiness verdicts, `--silence` (default 3m), stalled exit code 7, provider retry ETAs, and optional event-time System One advice (#627). Codex context compaction remains working.
 - `flk delegate --harness codex` now runs the full start, readiness, brief, settle, and result flow using Codex’s SessionStart hook and rollouts (#613). Hook review is refused with a named diagnostic before any brief is typed. Codex delegates default to the workspace-write sandbox with never approvals. Workspace-write blocks the network, so `git push` and `gh` require `--sandbox danger-full-access`, deliberately chosen by the caller. The Codex-only sandbox option also accepts read-only.
 - **`flock_worktree_kill` tears down a finished agent space over MCP** (#631). Address it by `workspace` or `path`; calls default to a dry run. Pass `dry_run: false` for teardown and `self: true` when targeting the calling pane's own workspace. Branch deletion still requires positive merge evidence; `force` never bypasses that gate.
 - `flk agent result` reads Codex rollouts using the session ID reported by its SessionStart hook (#613). Results include the final assistant reply, turn completion, and its recorded timestamp; an active turn returns the previous completed reply.

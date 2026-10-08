@@ -471,3 +471,39 @@ fn w13_find_new_checkout_treats_two_spellings_of_one_path_as_the_same() {
     let new = find_new_checkout(&before, &after, Some("feat/y"));
     assert_eq!(new.as_deref(), Some("/repo/wt/y"));
 }
+
+#[tokio::test]
+async fn delegate_startup_dialog_ignores_scrollback() {
+    let dialog = HARNESSES
+        .iter()
+        .find(|harness| harness.name == "codex")
+        .and_then(|harness| harness.startup_dialog.as_ref())
+        .expect("Codex dialog");
+    let screen = "Hooks need review\r\n1 hook is new or changed.\r\nHooks can run outside the sandbox after you trust them.\r\n› 1. Review hooks\r\n2. Trust all and continue\r\n3. Continue without trusting (hooks won't run)\r\nenter confirm · esc skip";
+    let mut bytes = screen.as_bytes().to_vec();
+    bytes.extend_from_slice("\r\n".repeat(24).as_bytes());
+    bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+    let pane = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 65_536, &bytes);
+    assert!(
+        (dialog.shows)(&pane.recent_text(STARTUP_DIALOG_LINES as usize)),
+        "the old dialog remains in scrollback"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let shown = pane_shows_startup_dialog_with("fixture:p1", dialog, deadline, |method, bound| {
+        assert_eq!(bound, Some(deadline));
+        let Method::PaneRead(params) = method else {
+            panic!("expected pane read")
+        };
+        assert_eq!(params.source, ReadSource::Detection);
+        let text = match params.source {
+            ReadSource::Detection => pane.detection_text(),
+            ReadSource::Recent => pane.recent_text(params.lines.unwrap_or(40) as usize),
+            _ => panic!("unexpected read source"),
+        };
+        Ok(json!({"result": {"read": {"text": text}}}))
+    });
+    assert!(
+        !shown,
+        "a dialog outside the live screen cannot block startup"
+    );
+}

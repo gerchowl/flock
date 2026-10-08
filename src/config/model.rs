@@ -552,6 +552,22 @@ impl Default for WebSectionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SystemOneConfig {
+    pub urls: Vec<String>,
+    pub timeout_s: f64,
+}
+
+impl Default for SystemOneConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            timeout_s: 3.0,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -624,6 +640,7 @@ pub struct Config {
     /// `[spawn]` — what a spawned child's environment is made of (#397).
     pub spawn: super::SpawnConfig,
     pub msg: MsgConfig,
+    pub systemone: SystemOneConfig,
     pub peers: Vec<PeerConfig>,
 }
 

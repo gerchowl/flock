@@ -794,3 +794,15 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+## System One advice
+
+Delegate round endings and readiness expiry can query System One. With no configured URLs, it is disabled.
+
+```toml
+[systemone]
+urls = ["http://127.0.0.1:8000/v1/systemone"]
+timeout_s = 3
+```
+
+`SYSTEMONE_URL` overrides `urls` with comma- or space-separated endpoints. The timeout bounds the whole ordered failover attempt. After three failed attempts, an endpoint is skipped for ten minutes. Advice appears as `s1: {fused, verdict}` in delegate JSON; it never changes the outcome or exit code. Missing or unavailable endpoints produce `s1: null`. No requests occur during polling.

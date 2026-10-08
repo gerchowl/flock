@@ -195,6 +195,10 @@ impl PaneTerminal {
         self.ghostty.detection_text()
     }
 
+    pub fn detection_ansi(&self) -> String {
+        self.ghostty.detection_ansi()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.ghostty.recent_text(lines)
     }
@@ -1002,6 +1006,22 @@ impl GhosttyPaneTerminal {
             .lock()
             .ok()
             .and_then(|core| ghostty_detection_text(&core).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn detection_ansi(&self) -> String {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| {
+                let rows = core
+                    .terminal
+                    .rows()
+                    .ok()
+                    .map(|rows| usize::from(rows).max(1))
+                    .unwrap_or(DEFAULT_DETECTION_ROWS);
+                ghostty_recent_ansi(&core, rows, false).ok()
+            })
             .unwrap_or_default()
     }
 

@@ -52,3 +52,7 @@ fn has_opencode_progress_run(line: &str) -> bool {
     }
     false
 }
+
+pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
+    has_opencode_progress_run(line) || has_opencode_interrupt_footer(line)
+}

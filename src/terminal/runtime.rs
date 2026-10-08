@@ -261,6 +261,14 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
+    pub fn detection_text(&self) -> String {
+        self.0.detection_text()
+    }
+
+    pub fn detection_ansi(&self) -> String {
+        self.0.detection_ansi()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.0.recent_text(lines)
     }

@@ -191,6 +191,8 @@ pub(super) enum SettledOutcome {
     Settled { held_ms: u64, last: LastRecord },
     /// A held `blocked`: a human has to look, so it never settles.
     Blocked { held_ms: u64, last: LastRecord },
+    /// The delegate observer found a stall. Other wait verbs install no observer.
+    Stalled { last: LastRecord },
     /// The pane, the agent or the execution is over.
     Gone {
         reason: GoneReason,
@@ -217,9 +219,10 @@ impl SettledOutcome {
     /// The record the wait last saw.
     pub(super) fn last(&self) -> Option<&LastRecord> {
         match self {
-            Self::Settled { last, .. } | Self::Blocked { last, .. } | Self::Gone { last, .. } => {
-                Some(last)
-            }
+            Self::Settled { last, .. }
+            | Self::Blocked { last, .. }
+            | Self::Gone { last, .. }
+            | Self::Stalled { last } => Some(last),
             Self::Refused(_) | Self::TimedOut | Self::ServerRefused(_) | Self::Error(_) => None,
         }
     }
@@ -235,6 +238,7 @@ impl SettledOutcome {
     /// below is the mapping those verbs had before the split.
     fn exit_code(&self) -> i32 {
         match self {
+            Self::Stalled { .. } => 7,
             Self::Settled { .. } => exit::SETTLED,
             Self::Blocked { .. } => exit::BLOCKED,
             Self::Gone { .. } => exit::GONE,
@@ -649,6 +653,9 @@ pub(super) fn print_settled(verb: &str, outcome: &SettledOutcome) {
         SettledOutcome::Gone { reason, last } => {
             println!("{}", settled_result_line("gone", 0, Some(*reason), last));
         }
+        SettledOutcome::Stalled { last } => {
+            println!("{}", settled_result_line("stalled", 0, None, last));
+        }
         SettledOutcome::Refused(reason) => eprintln!("{verb}: {reason}"),
         SettledOutcome::TimedOut => eprintln!("timed out waiting for the agent to settle"),
         // Verbatim, with no verb prefix: the bytes at the base.
@@ -709,9 +716,20 @@ pub(super) fn settled_wait(
     settle_ms: u64,
     timeout_ms: Option<u64>,
 ) -> std::io::Result<SettledOutcome> {
+    settled_wait_observed(verb, target, after, settle_ms, timeout_ms, &mut |_| false)
+}
+
+pub(super) fn settled_wait_observed(
+    verb: &str,
+    target: SettleTarget<'_>,
+    after: Option<&str>,
+    settle_ms: u64,
+    timeout_ms: Option<u64>,
+    observer: &mut dyn FnMut(Option<&Sample>) -> bool,
+) -> std::io::Result<SettledOutcome> {
     let client = ApiClient::local();
     let mut requests = SocketRequests { client: &client };
-    settled_core(
+    settled_core_observed(
         &mut requests,
         verb,
         target,
@@ -719,6 +737,7 @@ pub(super) fn settled_wait(
         settle_ms,
         timeout_ms,
         UNREACHABLE_LIMIT,
+        observer,
     )
 }
 
@@ -731,6 +750,7 @@ pub(super) fn settled_wait(
 /// mean waiting 30 s for the answer. The shipped window is
 /// [`UNREACHABLE_LIMIT`], and it applies only when the caller passed no
 /// `--timeout` (see [`Interrupted`]).
+#[cfg(test)]
 fn settled_core(
     requests: &mut dyn PinnedRequests,
     verb: &str,
@@ -739,6 +759,29 @@ fn settled_core(
     settle_ms: u64,
     timeout_ms: Option<u64>,
     unreachable_window: Duration,
+) -> std::io::Result<SettledOutcome> {
+    settled_core_observed(
+        requests,
+        verb,
+        target,
+        after,
+        settle_ms,
+        timeout_ms,
+        unreachable_window,
+        &mut |_| false,
+    )
+}
+
+// The transport recovery and cursor checks are the same for every caller.
+fn settled_core_observed(
+    requests: &mut dyn PinnedRequests,
+    verb: &str,
+    target: SettleTarget<'_>,
+    after: Option<&str>,
+    settle_ms: u64,
+    timeout_ms: Option<u64>,
+    unreachable_window: Duration,
+    observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let now = Instant::now();
     let timeout = timeout_ms.map(Duration::from_millis);
@@ -848,8 +891,14 @@ fn settled_core(
                 // The server answered, so the run of failures this wait was
                 // surviving is over however long it had lasted.
                 interrupted.reached();
+                let stalled = observer(Some(&sample));
                 if let Some(outcome) = settle(&mut wait, sample) {
                     return Ok(outcome);
+                }
+                if stalled {
+                    return Ok(SettledOutcome::Stalled {
+                        last: wait.last_record(),
+                    });
                 }
             }
             // Retried rather than reported: a live handoff that replaces the
@@ -861,6 +910,7 @@ fn settled_core(
             // answering entirely would keep a supervisor waiting indefinitely
             // (#614). With one, the deadline is the bound and it keeps that.
             Err(PinnedFailure::Retry) => {
+                observer(None);
                 interrupted.note(verb);
                 if let Some(window) = interrupted.spent_window() {
                     return Ok(SettledOutcome::Error(unreachable_reason(window)));

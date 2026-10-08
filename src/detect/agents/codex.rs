@@ -145,6 +145,7 @@ fn codex_working_status_line(line: &str) -> bool {
     let lower = trimmed.to_lowercase();
     trimmed.starts_with('•')
         && (trimmed.contains("Working (")
+            || trimmed.contains("Compacting context (")
             || trimmed.contains("Waiting for background terminal (")
             || lower.contains("reviewing approval request (")
             || (lower.contains("reviewing ") && lower.contains(" approval requests ("))
@@ -220,6 +221,10 @@ fn transcript_control_tail(line: &str) -> bool {
         || lower.contains("edit message")
 }
 
+pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
+    codex_working_status_line(line)
+}
+
 pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
     let bottom = bottom_non_empty_lines(content, 10);
     bottom
@@ -232,6 +237,19 @@ pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_codex_compaction_remains_working_under_its_visible_prompt() {
+        // #627's owner-provided screen, replayed through an isolated recent
+        // pane read. The bullet and compaction header are working chrome.
+        let screen = "• Compacting context (3s • esc to interrupt) · 1 bac\nkground terminal running · /ps to view · /stop to cl\nose\n  └ Making room to continue.\n› Ask Codex to do anything\n";
+        assert_eq!(detect(screen), AgentState::Working);
+        assert!(has_visible_working(screen));
+        assert_eq!(
+            detect("Compacting context is described in the transcript\n› Ask Codex to do anything"),
+            AgentState::Idle
+        );
+    }
 
     const REVIEW: &str = "  Hooks need review\n  1 hook is new or changed.\n  Hooks can run outside the sandbox after you trust them.\n\n\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm · esc skip";
 
