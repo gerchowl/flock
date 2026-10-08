@@ -2162,7 +2162,13 @@ fn tab_management_commands_work() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
 
-    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    let flock = spawn_flock_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "onboarding = false\n[ui]\ntab_mode = \"workspace\"\n",
+    );
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = run_cli(
@@ -2182,7 +2188,17 @@ fn tab_management_commands_work() {
 
     let created_tab = run_cli(
         &socket_path,
-        &["tab", "create", "--workspace", &workspace_id],
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            config_home.to_str().unwrap(),
+            "--label",
+            "review",
+            "--no-focus",
+        ],
     );
     assert!(created_tab.status.success());
     let created_tab_json: serde_json::Value = serde_json::from_slice(&created_tab.stdout).unwrap();
@@ -2191,6 +2207,8 @@ fn tab_management_commands_work() {
         .unwrap()
         .to_string();
     assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
+    assert_eq!(created_tab_json["result"]["tab"]["label"], "review");
+    assert_eq!(created_tab_json["result"]["tab"]["focused"], false);
 
     let listed_tabs = run_cli(&socket_path, &["tab", "list", "--workspace", &workspace_id]);
     assert!(listed_tabs.status.success());

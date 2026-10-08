@@ -170,6 +170,8 @@ flk tab rename <tab_id> <label>
 flk tab close <tab_id>
 ```
 
+`tab create --workspace ID` creates an inner tab in that workspace, including in workspace tab mode. `--cwd` sets the new terminal’s working directory without changing the target workspace. An unknown workspace ID returns an error. Without `--workspace`, workspace tab mode creates a sibling workspace from the active workspace.
+
 ## Panes
 
 ```bash
