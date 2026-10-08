@@ -189,6 +189,7 @@ fn spawn_flock_with_options(
 struct JsonLineReader {
     stream: UnixStream,
     buf: Vec<u8>,
+    pending_events: Vec<serde_json::Value>,
 }
 
 impl JsonLineReader {
@@ -196,6 +197,7 @@ impl JsonLineReader {
         Self {
             stream: UnixStream::connect(socket_path).unwrap(),
             buf: Vec::new(),
+            pending_events: Vec::new(),
         }
     }
 
@@ -307,14 +309,48 @@ fn wait_for_event_matching<F>(
 where
     F: FnMut(&serde_json::Value) -> bool,
 {
+    // Creation and focus events can interleave while the server drains work.
+    // Preserve other subscribed events for the test's later assertions.
+    if let Some(index) = reader
+        .pending_events
+        .iter()
+        .position(|value| value["event"] == expected && matches(value))
+    {
+        return reader.pending_events.remove(index);
+    }
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let value = reader.read_json_line(remaining.max(Duration::from_millis(1)));
+        let value = reader
+            .try_read_json_line(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|| panic!("timed out waiting for {expected}"));
         if value["event"] == expected && matches(&value) {
             return value;
         }
+        reader.pending_events.push(value);
     }
+}
+
+#[test]
+fn event_wait_preserves_interleaved_creation_events() {
+    let (stream, mut sender) = UnixStream::pair().unwrap();
+    sender
+        .write_all(b"{\"event\":\"tab_created\"}\n{\"event\":\"workspace_focused\"}\n")
+        .unwrap();
+    let mut reader = JsonLineReader {
+        stream,
+        buf: Vec::new(),
+        pending_events: Vec::new(),
+    };
+    let timeout = Duration::from_secs(1);
+    assert_eq!(
+        wait_for_event(&mut reader, "workspace_focused", timeout)["event"],
+        "workspace_focused"
+    );
+    assert_eq!(
+        wait_for_event(&mut reader, "tab_created", timeout)["event"],
+        "tab_created"
+    );
 }
 
 #[test]

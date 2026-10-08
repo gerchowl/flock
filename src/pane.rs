@@ -387,6 +387,12 @@ fn detection_update_for_publish(
         });
     }
 
+    // Exec exposes the agent's argv before its runtime paints anything. A blank
+    // buffer cannot establish readiness, even for detectors that default to idle.
+    if content.trim().is_empty() {
+        return None;
+    }
+
     let detection = crate::detect::detect_agent(agent, content);
     (!detection.skip_state_update).then_some(detection)
 }
@@ -2669,6 +2675,29 @@ mod tests {
         let content = "/ T R A N S C R I P T /\n\n› yeah go ahead\n────────────────────────────────────────────────────────────────────────────────── 100% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc to edit prev";
 
         assert!(detection_update_for_publish(Some(Agent::Codex), content, true).is_none());
+    }
+
+    #[test]
+    fn blank_startup_screen_does_not_publish_idle() {
+        for agent in [Agent::OpenCode, Agent::Codex, Agent::Pi] {
+            assert!(detection_update_for_publish(Some(agent), " \n", false).is_none());
+        }
+        assert_eq!(
+            detection_update_for_publish(Some(Agent::OpenCode), "opencode ready >", false)
+                .expect("painted prompt")
+                .state,
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn process_exit_with_a_blank_screen_still_reports_idle() {
+        assert_eq!(
+            detection_update_for_publish(Some(Agent::OpenCode), "", true)
+                .expect("process exit")
+                .state,
+            AgentState::Idle
+        );
     }
 
     #[test]
