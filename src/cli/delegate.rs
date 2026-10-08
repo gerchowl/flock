@@ -2904,10 +2904,19 @@ fn startup_dialog_refusal(
 /// `false`, so a flaky socket degrades to the plain `blocked` refusal rather
 /// than inventing a diagnosis.
 fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: Instant) -> bool {
-    let response = match bounded(
+    pane_shows_startup_dialog_with(pane_id, dialog, deadline, bounded)
+}
+
+fn pane_shows_startup_dialog_with(
+    pane_id: &str,
+    dialog: &StartupDialog,
+    deadline: Instant,
+    read: impl FnOnce(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> bool {
+    let response = match read(
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.to_owned(),
-            source: ReadSource::Recent,
+            source: ReadSource::Detection,
             lines: Some(STARTUP_DIALOG_LINES),
             format: ReadFormat::Text,
             strip_ansi: true,
