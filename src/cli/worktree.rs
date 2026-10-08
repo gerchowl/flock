@@ -607,6 +607,8 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
             // have their own cwd in the checkout when a kill is run from
             // inside it.
             caller_pid: Some(std::process::id()),
+            // CLI callers explicitly choose a real kill and need no MCP guard.
+            self_kill_confirmed: None,
         }),
     })?;
 

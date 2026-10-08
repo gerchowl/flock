@@ -330,6 +330,8 @@ opencode's session database (read-only); for any other agent it refuses with
 flk agent result reviewer
 ```
 
+Codex results are read from `$CODEX_HOME/sessions` (default `~/.codex/sessions`) using the session ID reported by its SessionStart hook. The reader checks the newest 1 MiB of a rollout and requires a recorded turn completion. An active turn returns the previous completed reply with `finished: false`. Codex history and delegate support are separate follow-ups.
+
 `agent result` returns the reply the agent's newest turn ended on, plus the
 status of a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line
 (`status: "verdict"`, `status_text: "approve"`), and `finished`, which is false
@@ -377,4 +379,4 @@ Use `flk terminal attach <terminal_id>` when you want the same direct attach beh
 
 ## Give an agent read-mostly access to the flock
 
-Point an MCP-capable agent at `flk mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, and — for Claude — fork a conversation or send/reply pane-to-pane messages. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table. The same server exposes files a human has dropped on a pane as MCP **resources**, so an agent can list and read what it was handed instead of scraping the path out of its own input surface.
+Point an MCP-capable agent at `flk mcp serve` to hand it a closed set of read-mostly tools over the local socket: list agents and worktrees, read pane output, walk fork lineage, tear down finished worktree spaces, and — for Claude — fork a conversation or send/reply pane-to-pane messages. `flock_worktree_kill` defaults to a dry run; pass `dry_run: false` to remove the checkout, and `self: true` for a real kill of the calling pane's own workspace. Branch deletion requires positive merge evidence. Mutating verbs (`pane.close`, `worktree.remove`, pane `send_*`, `agent.start`/`rename`/`focus`, `server.*`, …) are deliberately not exposed and refuse with `data.refusal = "not_exposed_via_mcp"`. See the [CLI reference](/docs/preview/cli-reference/#mcp-server) for the tool table. The same server exposes files a human has dropped on a pane as MCP **resources**, so an agent can list and read what it was handed instead of scraping the path out of its own input surface.
