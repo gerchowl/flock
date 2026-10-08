@@ -2015,6 +2015,75 @@ fn workspace_and_pane_management_commands_work() {
 }
 
 #[test]
+fn allocation_dry_run_cli_returns_plans_without_allocating() {
+    let base = unique_test_dir();
+    let socket_path = base.join("runtime/flock.sock");
+    let repo = base.join("repo");
+    create_committed_repo(&repo);
+    let flock = spawn_flock(&base.join("config"), &base.join("runtime"), &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", repo.to_str().unwrap()],
+    );
+    let ws = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let before = run_cli_json(&socket_path, &["workspace", "list"]);
+    let commands = vec![
+        vec![
+            "workspace",
+            "create",
+            "--dry-run",
+            "--cwd",
+            repo.to_str().unwrap(),
+        ],
+        vec!["tab", "create", "--dry-run", "--workspace", ws],
+        vec!["pane", "split", pane, "--direction", "right", "--dry-run"],
+        vec![
+            "agent",
+            "start",
+            "preview",
+            "--workspace",
+            ws,
+            "--dry-run",
+            "--wait-ready",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 99",
+        ],
+        vec![
+            "worktree",
+            "create",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ];
+    for command in commands {
+        let response = run_cli_json(&socket_path, &command);
+        assert_eq!(
+            response["result"]["type"], "allocation_plan",
+            "{command:?}: {response}"
+        );
+    }
+    let fork = run_cli(&socket_path, &["agent", "fork", pane, "--dry-run"]);
+    assert!(!fork.status.success());
+    let fork: serde_json::Value = serde_json::from_slice(&fork.stderr).unwrap();
+    assert_eq!(fork["error"]["code"], "no_agent_session");
+    let after = run_cli_json(&socket_path, &["workspace", "list"]);
+    assert_eq!(
+        before["result"]["workspaces"].as_array().unwrap().len(),
+        after["result"]["workspaces"].as_array().unwrap().len()
+    );
+    let panes = run_cli_json(&socket_path, &["pane", "list", "--workspace", ws]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
+    cleanup_spawned_flock(flock, base);
+}
+
+#[test]
 fn worktree_management_commands_work() {
     let base = unique_test_dir();
     let config_home = base.join("config");

@@ -1462,6 +1462,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
     let bounded_res = match mode {
         Mode::Worktree => bounded(
             Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some(repo.clone()),
                 branch: flags.branch.clone(),
                 base: flags.base.clone(),
@@ -1477,6 +1478,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 .expect("placement was validated before anything was created");
             bounded(
                 Method::WorkspaceCreate(WorkspaceCreateParams {
+                    dry_run: false,
                     cwd: Some(cwd),
                     focus: false,
                     label: None,
@@ -2923,6 +2925,7 @@ fn start_the_agent(
     let argv = (harness.argv)(options);
     let response = request(
         Method::AgentStart(AgentStartParams {
+            dry_run: false,
             name: name.to_string(),
             cwd: Some(placement.cwd.clone()),
             workspace_id: Some(placement.workspace_id.clone()),

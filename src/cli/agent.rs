@@ -52,9 +52,9 @@ pub(super) const AGENT_HISTORY_USAGE: &str =
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>";
 
-pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]";
 
 pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "flk agent wait <target> --status <",
@@ -94,6 +94,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
 /// into them never reaches the request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgentStartFlags {
+    dry_run: bool,
     cwd: Option<String>,
     workspace_id: Option<String>,
     tab_id: Option<String>,
@@ -175,6 +176,10 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.focus = false;
                 index += 1;
             }
+            "--dry-run" => {
+                flags.dry_run = true;
+                index += 1;
+            }
             "--wait-ready" => {
                 flags.wait_ready = true;
                 index += 1;
@@ -220,6 +225,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let AgentStartFlags {
+        dry_run,
         cwd,
         workspace_id,
         tab_id,
@@ -234,6 +240,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            dry_run,
             name: name.clone(),
             cwd,
             workspace_id,
@@ -245,7 +252,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             argv: args[separator + 1..].to_vec(),
         }),
     })?;
-    if !wait_ready || response.get("error").is_some() {
+    if dry_run || !wait_ready || response.get("error").is_some() {
         return super::print_response(&response);
     }
 
@@ -279,6 +286,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     let mut label = None;
     let mut pivot = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 1;
     while index < args.len() {
@@ -327,6 +335,10 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
                 pivot = Some(String::new());
                 index += 1;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -345,6 +357,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:fork".into(),
         method: Method::AgentFork(AgentForkParams {
+            dry_run,
             target: target.clone(),
             branch,
             base,
@@ -910,7 +923,7 @@ fn print_agent_help() {
     eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
-    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
+    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
     eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
