@@ -222,7 +222,7 @@ pub struct PeerSummaryState {
     /// polls only; a carried or relayed row has no dial of ours to judge.
     pub dial: PeerDialHealth,
     /// Why this peer has no held relay stream, when establishing one failed
-    /// (#418). Set even while polls succeed over the one-shot fallback.
+    /// (#418). Kept visible while mesh enrollment is refused.
     pub stream_error: Option<String>,
 }
 
@@ -1050,28 +1050,11 @@ fn parse_checkout_prepare_response(stdout: &str) -> Result<PeerCheckoutOutcome, 
 }
 
 fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
-    // The held connection carries an API request; `summary_command` is a
-    // shell string. They only mean the same thing while the command is the
-    // shipped default, so a customized one keeps the one-shot path rather
-    // than being silently reinterpreted as `peers.summary`.
-    if peer.summary_command == crate::config::model::default_peer_summary_command() {
-        // A push already answered this poll — the peer told us the moment its
-        // state changed, so the round trip would only re-fetch what is
-        // already here.
-        if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
-            crate::logging::peer_push_consumed(&peer.name);
-            return Ok(pushed);
-        }
-        match crate::peer_stream::request(peer, "peers.summary", serde_json::json!({})) {
-            Ok(response) => return Ok(response),
-            // Every failure mode ends here — old `flk` without `peers relay`,
-            // asleep, wedged relay — and the answer is the same for all of
-            // them: take the path that already works.
-            Err(err) => crate::logging::peer_stream_fallback(&peer.name, &err),
-        }
+    if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
+        crate::logging::peer_push_consumed(&peer.name);
+        return Ok(pushed);
     }
-    run_peer_ssh_with(peer, &peer.summary_command, DialCadence::Poll)
-        .map_err(|failure| failure.detail)
+    crate::peer_stream::request(peer, "peers.summary", serde_json::json!({}))
 }
 
 /// Fetch the tail of a peer's session logs over SSH for the cross-host log view

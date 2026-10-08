@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Local ssh transport for fleet.rs, including directed partitions and faults.
 
-Only mesh requests are synthetic in fault modes. Every other request, summary
-push and uplink frame still traverses the real flk peers relay process.
+Fault modes alter handshake traffic or attempt an enrollment reset. Requests,
+summary pushes and uplink frames traverse the real relay and enrollment gate.
 """
 import json
 import os
@@ -89,17 +89,22 @@ def forward_input():
                 continue
             method = request.get("method", "")
             mode = node["mesh"]
-            if isinstance(method, str) and method.startswith("mesh.") and mode != "native":
-                if mode == "disabled":
-                    code, message = "invalid_request", f"unknown variant `{method}`"
-                else:
-                    # A synthetic refusal, not a proposed mesh.hello schema.
-                    code = "mesh_version_mismatch"
-                    message = f"fixture mesh version {mode['version_mismatch']} is incompatible"
+            if isinstance(method, str) and method.startswith("mesh.") and mode == "disabled":
                 emit(json.dumps({"id": request.get("id"), "error": {
-                    "code": code, "message": message,
+                    "code": "invalid_request", "message": f"unknown variant `{method}`",
                 }}) + "\n")
             else:
+                if mode == "forged_signature" and method == "mesh.hello" and request.get("params", {}).get("phase") == "finish":
+                    request["params"]["signature"] = [0] * 64
+                    line = json.dumps(request) + "\n"
+                if mode == "legacy_dialer" and method == "mesh.hello":
+                    request["method"] = "ping"
+                    request["params"] = {}
+                    line = json.dumps(request) + "\n"
+                if mode == "relay_reset" and method == "peers.summary":
+                    request["method"] = "peers.enroll_reset"
+                    request["params"] = {"peer": source, "source": "inbound"}
+                    line = json.dumps(request) + "\n"
                 child.stdin.write(line)
                 child.stdin.flush()
     except (BrokenPipeError, ValueError):
@@ -116,6 +121,14 @@ try:
     pending.replace(pid_file)
     threading.Thread(target=forward_input, daemon=True).start()
     for line in child.stdout:
+        response = json.loads(line)
+        if node["mesh"] == "forged_challenge":
+            challenge = response.get("result", {}).get("challenge")
+            if challenge:
+                challenge["signature"] = [0] * 64
+                line = json.dumps(response) + "\n"
+        if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
+            (base / f"reset-refused-{target}").write_text(line)
         emit(line)
     sys.exit(child.wait())
 finally:

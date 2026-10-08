@@ -166,8 +166,8 @@ struct AttachedRelay {
     /// pair names one process, so a new process that inherits a dead relay's
     /// pid is not the relay.
     started: u64,
-    /// The hub's name, recorded once from the first frame this relay carried
-    /// and then fixed for the attachment: a later frame cannot rename it.
+    /// The locally pinned name established by the verified mesh handshake.
+    /// A later frame cannot rename the attachment.
     hub: Option<String>,
 }
 
@@ -229,11 +229,27 @@ impl Uplink {
         pid == Some(relay.pid)
     }
 
-    /// The hub's name for this attachment: the first `claimed` wins, and every
-    /// later claim is ignored in its favour.
-    pub(crate) fn record_hub(&mut self, claimed: &str) -> Option<String> {
-        let relay = self.relay.as_mut()?;
-        Some(relay.hub.get_or_insert_with(|| claimed.to_string()).clone())
+    /// Only the verified handshake may bind an attachment to an enrolled name.
+    pub(crate) fn enroll_hub(&mut self, peer: String) {
+        if let Some(relay) = self.relay.as_mut() {
+            relay.hub = Some(peer);
+            // The authenticated edge is ready even before its first pull.
+            self.last_take_at = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn enrolled_hub(&self) -> Option<String> {
+        self.relay.as_ref()?.hub.clone()
+    }
+
+    pub(crate) fn reset_enrollment(&mut self, peer: &str) {
+        if let Some(relay) = self.relay.as_mut() {
+            if relay.hub.as_deref() == Some(peer) {
+                relay.hub = None;
+                self.last_take_at = None;
+                self.takes.clear();
+            }
+        }
     }
 
     /// Queue a frame nobody waits on — flock's own automatic reply, such as a
@@ -498,19 +514,22 @@ mod tests {
         assert!(!uplink.is_relay(Some(200), alive));
         assert!(!uplink.is_relay(None, alive), "an unreadable pid is nobody");
 
-        assert_eq!(uplink.record_hub("hopper").as_deref(), Some("hopper"));
-        assert_eq!(
-            uplink.record_hub("attacker").as_deref(),
-            Some("hopper"),
-            "a later frame cannot rename the hub"
-        );
+        assert!(uplink.enrolled_hub().is_none());
+        uplink.enroll_hub("hopper".into());
+        assert_eq!(uplink.enrolled_hub().as_deref(), Some("hopper"));
+        uplink.reset_enrollment("other.test");
+        assert_eq!(uplink.enrolled_hub().as_deref(), Some("hopper"));
+        uplink.reset_enrollment("hopper");
+        assert!(uplink.enrolled_hub().is_none());
 
         // The real relay died (the hub reconnected): its successor attaches,
         // and names its hub afresh.
         let dead = |_: u32| None;
         assert!(uplink.attach_relay(300, 11, dead).is_ok());
         assert!(uplink.is_relay(Some(300), |pid| (pid == 300).then_some(11)));
-        assert_eq!(uplink.record_hub("hopper").as_deref(), Some("hopper"));
+        assert!(uplink.enrolled_hub().is_none());
+        uplink.enroll_hub("hopper".into());
+        assert_eq!(uplink.enrolled_hub().as_deref(), Some("hopper"));
     }
 
     #[test]
