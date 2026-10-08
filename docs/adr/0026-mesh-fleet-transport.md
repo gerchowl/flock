@@ -1,4 +1,3 @@
-
 # ADR 0026 — Mesh fleet transport and durable message custody
 
 - Status: Proposed
@@ -39,11 +38,14 @@ travel both ways on those channels, as existing uplink traffic already does.
 ## Topology and routing
 
 Every node is a peer. A **dial-capable** node has configured SSH authority
-and can initiate an edge. An **undialable** node cannot accept inbound SSH,
-but may still be dial-capable. A **spoke with no outbound edges** initiates
-none and relies on an inbound edge opened by a hub. A hub forwards or holds
-custody for others, rather than being a distinct identity class. A laptop
-need not be a spoke: ADR-0009's Macs hold outbound edges.
+and can initiate an edge. A **dialable** node accepts inbound SSH from an
+authorized peer. An **undialable** node cannot accept inbound SSH, but may
+still be dial-capable. These are independent properties. A **spoke with no
+outbound edges** initiates none and must be dialable by its hub to receive
+the edge that hub opens. An undialable node with no outbound edges has no
+transport path until one of those conditions changes. A hub forwards or
+holds custody for others, rather than being a distinct identity class. A
+laptop need not be a spoke: ADR-0009's Macs hold outbound edges.
 
 Any dial-capable node may dial reachable configured peers. An authenticated,
 mesh-capable held edge carries traffic in both directions regardless of its
@@ -133,23 +135,27 @@ restart reconstructs outstanding forwarding and collection from the store.
 
 Retry transient disconnection with bounded concurrency and exponential
 backoff with jitter, starting at the existing 60-second failed-edge backoff,
-capped at five minutes and reset when an authenticated edge reconnects.
-Use a seven-day TTL budget rather than comparing clocks across hosts.
-Each custodian starts a local deadline at receipt using the transferred
-remaining budget, subtracts elapsed residence time before forwarding, and
-persists that deadline for restart. Duplicate receipt never resets it. Nodes
-must maintain a nondecreasing local expiry clock across restarts (clamp wall
+capped at five minutes and reset when an authenticated edge reconnects. Use
+a seven-day TTL budget rather than comparing clocks across hosts. Each
+custodian starts a local deadline at receipt using the transferred remaining
+budget, subtracts elapsed residence time before forwarding, and persists
+that deadline for restart. Duplicate receipt never resets it. Nodes must
+maintain a nondecreasing local expiry clock across restarts (clamp wall
 clock rollback to the last persisted value), so clock rollback cannot revive
-expired mail. No inter-host skew bound is required. Each origin, hub and
-receiver expires its copy independently, without assuming a synchronous
-fleet-wide expiry instant. Reject exhausted budgets. Keep local dedupe
-records at least through the admitted remaining TTL plus 24 hours, and
-retain final outcomes for seven days after local termination. A receiver's
-retry budget cannot be increased by duplicate transfers. Quota admission
-reserves the metadata needed to honor these deadlines.
-There is no cross-message ordering guarantee, including within a conversation:
-`in_reply_to` supplies causality, not FIFO. Hold an answer whose request has
-not yet been imported until the reference can be attached, without losing it.
+expired mail. The clamp prevents rollback, not forward wall-clock jumps: a
+forward jump can expire mail early and later correction cannot revive it.
+This conservative failure is acceptable to preserve bounded retention, and
+produces an explicit expiry outcome rather than a delivery claim. No
+inter-host skew bound is required. Each origin, hub and receiver expires its
+copy independently, without assuming a synchronous fleet-wide expiry
+instant. Reject exhausted budgets. Keep local dedupe records at least
+through the admitted remaining TTL plus 24 hours, and retain final outcomes
+for seven days after local termination. A receiver's retry budget cannot be
+increased by duplicate transfers. Quota admission reserves the metadata
+needed to honor these deadlines. There is no cross-message ordering
+guarantee, including within a conversation: `in_reply_to` supplies
+causality, not FIFO. Hold an answer whose request has not yet been imported
+until the reference can be attached, without losing it.
 
 | Evidence | Sender-visible meaning |
 | --- | --- |
@@ -174,13 +180,14 @@ queued/expired outcomes without doing synchronous remote polling.
 ## Replies and sender-side collection
 
 At request acceptance, retain a return capability bound to authenticated
-origin, recipient and full request key in both queued and delivered metadata.
-A correlation id is caller-chosen and is not a secret. Mint an unguessable
-collection token, authenticate each collection caller and scope results to
-that conversation. With same-user SSH, this token scopes requests but is not
-a secrecy boundary against trusted peers or the same OS user. A forwarded capability is delegated only to authenticated
-custodians on the recorded path. Never dial an inbound host label or treat a
-caller-supplied hub assertion as attestation.
+origin, recipient and full request key in both queued and delivered
+metadata. A correlation id is caller-chosen and is not a secret. Mint an
+unguessable collection token, authenticate each collection caller and scope
+results to that conversation. With same-user SSH, this token scopes requests
+but is not a secrecy boundary against trusted peers or the same OS user. A
+forwarded capability is delegated only to authenticated custodians on the
+recorded path. Never dial an inbound host label or treat a caller-supplied
+hub assertion as attestation.
 
 `route_msg_reply` uses this durable return binding before directory lookup.
 Persist the answer even if the sender is absent from the current directory or
@@ -226,15 +233,16 @@ receipt lifetime and expose expiry when the sender returns too late.
 
 ## Identity, directory and vanished agents
 
-ADR-0008's AgentId is identity, not an SSH address or a server-local pane id.
-`src/app/directory.rs` remains the single resolution surface. Extend its peer
-summaries with owning node identity, incarnation/generation and edge-bound
-route provenance. Local authoritative identity wins over cached entries. A
-closed advertising edge withdraws its routes, not the agent's existence: known identity plus stale location is
-queued/offline. A never-known fresh target may still be refused as unknown,
-while a reply uses its retained return binding even when directory discovery
-fails. Movement requires authenticated owner updates, not reinterpretation
-of the host substring in an AgentId.
+ADR-0008's AgentId is identity, not an SSH address or a server-local pane
+id. `src/app/directory.rs` remains the single resolution surface. Extend its
+peer summaries with owning node identity, incarnation/generation and
+edge-bound route provenance. Local authoritative identity wins over cached
+entries. A closed advertising edge withdraws its routes, not the agent's
+existence: known identity plus stale location is queued/offline. A
+never-known fresh target may still be refused as unknown, while a reply uses
+its retained return binding even when directory discovery fails. Movement
+requires authenticated owner updates, not reinterpretation of the host
+substring in an AgentId.
 
 The owning server's agent lifecycle handler emits and persists an explicit
 removal tombstone for that AgentId/incarnation on explicit kill, permanent
@@ -301,17 +309,22 @@ These are implementation responsibilities, not claims of existing APIs:
   route or permission to turn every remote session into a router.
 - `src/api/reply_wait.rs`: consume imported local facts, without networking.
 
-**Step-1 prerequisite: node identity bootstrap and persistence.** Recommended:
-generate an Ed25519 keypair once in the state directory with mode 0600 and
-fsync, derive node id from the public key, and pin the public key/node id
-exchanged on the first authenticated held SSH edge. Reconnect proves
-possession against that pinned binding. Reject unexpected replacement and
-require operator re-enrollment, rather than silently trusting a new host label.
-Retain identity across server restarts and upgrades, and bind any one-shot
-collection fallback to the enrolled node. Prevent cloned state directories
-from concurrently claiming the same identity. Final provisioning and key
-format remain an owner decision, but step 1 cannot defer stable identity to
-step 2 because its dedupe and collection authorization depend on it.
+**Step-1 prerequisite: node identity bootstrap and persistence.**
+Recommended: generate an Ed25519 keypair once in the state directory with
+mode 0600 and fsync, derive node id from the public key, and pin the public
+key/node id exchanged on the first authenticated held SSH edge. Reconnect
+proves possession against that pinned binding. Reject unexpected replacement
+and require operator re-enrollment, rather than silently trusting a new host
+label. Retain identity across server restarts and upgrades, and bind any
+one-shot collection fallback to the enrolled node. One-shot direct paths
+require prior enrollment on an authenticated held edge, even if that edge is
+subsequently closed. A direct peer that has never held an edge must
+establish one for enrollment before using step-1 durable delivery or
+collection. Until then, only explicitly opted-in legacy sends have the
+weaker contract below. Prevent cloned state directories from concurrently
+claiming the same identity. Final provisioning and key format remain an
+owner decision, but step 1 cannot defer stable identity to step 2 because
+its dedupe and collection authorization depend on it.
 
 **Step 1 (#623):** dedicated store, minted message ids, durable reply outbox
 and authenticated sender-side collection on existing direct or one-hub logical
