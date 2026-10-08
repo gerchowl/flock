@@ -268,7 +268,7 @@ flk agent list
 flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 flk agent result <target> [--max-chars N] [--offset N]
-flk agent send <target> <text>
+flk agent send [--submit] <target> <text>
 flk agent rename <target> <name>|--clear
 flk agent focus <target>
 flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]
@@ -290,7 +290,7 @@ flk checks run <name>
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
 
-`agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
+`agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream **without submitting**. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
@@ -346,7 +346,7 @@ Both wait verbs take the same seven statuses and mean the same things by them. `
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
-flk agent send worker "..." && flk pane send-keys <pane> Enter
+flk agent send --submit worker "..."
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 

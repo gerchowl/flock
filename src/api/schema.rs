@@ -798,6 +798,9 @@ pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 pub struct AgentSendParams {
     pub target: String,
     pub text: String,
+    /// Type as terminal input, wait 120 ms, then send negotiated Enter.
+    #[serde(default)]
+    pub submit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

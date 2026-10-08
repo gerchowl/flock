@@ -104,6 +104,8 @@ Remove a linked checkout:
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
+`agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Omit `submit` (or set it to `false`) to write literal bytes without submitting. With `submit: true`, text uses bracketed paste when enabled, followed by a 120 ms gap and a negotiated Enter key event. The response waits until Enter is queued and reports transport success, not confirmed harness acceptance. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead.
+
 `agent.fork` branches a pane's agent conversation into a new linked worktree: it resolves `target` with the same grammar as `agent.send`, creates a worktree (optional `branch`, `base`, `path`, `label`), and starts a pane resuming a fork of the session, optionally seeded with a `pivot` prompt (omitted ⇒ the configured template; empty string ⇒ no seed). Only Claude sessions can fork; other agents return `unsupported_for_agent`, panes without a stored session return `no_agent_session`, and a session whose transcript is missing from disk returns `transcript_not_found` (the fork would resume nothing and exit). The `agent_forked` response carries `run_id`, `parent_pane_id`, the new `workspace`/`tab`/`root_pane`/`worktree` records, the spawned `argv`, and `seeded`. Each fork also emits an `agent_forked` event with the fork lineage (parent and child identifiers, repo key, branch, seeded).
 
 ```json

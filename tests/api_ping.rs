@@ -2400,3 +2400,163 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
 
     cleanup_spawned_flock(child, base);
 }
+
+/// Socket -> PTY -> fake composer: raw writes stay raw, submission is a
+/// separate negotiated key after the paste has settled.
+#[test]
+fn agent_send_submit_over_socket_and_cli_preserves_raw_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let config_home = base.join("config");
+    std::env::set_var("HOME", &config_home);
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let script = base.join("composer.py");
+    let shell = base.join("composer-shell");
+    let log = base.join("input.jsonl");
+    fs::write(
+        &script,
+        r#"import json, os, sys, time, tty
+from pathlib import Path
+tty.setraw(0)
+log = Path(__file__).with_name('input.jsonl')
+os.write(1, b'\x1b[?2004h\x1b[>9uREADY')
+with log.open('w') as out:
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
+        out.flush()
+        os.write(1, b'INPUT RECEIVED')
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        shell.to_str().unwrap(),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "read", "method": "pane.read", "params": {"pane_id": pane, "source": "recent"}
+            })
+            .to_string(),
+        );
+        if read.to_string().contains("READY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake composer never became ready: {read}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let raw = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "raw", "method": "agent.send", "params": {"target": pane, "text": "raw"}
+        })
+        .to_string(),
+    );
+    assert_eq!(raw["result"]["type"], "ok");
+    let read_log = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_log().is_empty() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(180));
+    let bytes = |rows: &[serde_json::Value]| -> Vec<u8> {
+        rows.iter()
+            .flat_map(|row| {
+                row["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+            })
+            .collect()
+    };
+    assert_eq!(bytes(&read_log()), b"raw");
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "submit", "method": "agent.send",
+            "params": {"target": pane, "text": "socket prompt", "submit": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(submitted["result"]["type"], "ok");
+    let cli = run_flk(
+        &socket_path,
+        &["agent", "send", "--submit", pane, "cli prompt"],
+    );
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let expected =
+        b"raw\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while bytes(&read_log()).len() < expected.len() {
+        assert!(
+            Instant::now() < deadline,
+            "missing submitted input: {:?}",
+            bytes(&read_log())
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let rows = read_log();
+    assert_eq!(bytes(&rows), expected);
+    for prompt in [b"socket prompt".as_slice(), b"cli prompt".as_slice()] {
+        let paste = rows
+            .iter()
+            .position(|row| {
+                bytes(std::slice::from_ref(row))
+                    .windows(prompt.len())
+                    .any(|part| part == prompt)
+            })
+            .unwrap();
+        let enter = &rows[paste + 1];
+        assert_eq!(bytes(std::slice::from_ref(enter)), b"\x1b[13u");
+        assert!(
+            enter["at"].as_f64().unwrap() - rows[paste]["at"].as_f64().unwrap() >= 0.10,
+            "Enter must arrive after the paste settling gap"
+        );
+    }
+    cleanup_spawned_flock(child, base);
+}
