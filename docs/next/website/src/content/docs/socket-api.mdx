@@ -192,7 +192,19 @@ The key and machine binding live in `mesh/identity.json` beneath Flock's per-use
 state directory (`$XDG_STATE_HOME/flock`, or `~/.local/state/flock`; development
 builds use `flock-dev`). Creation is locked and durable, with mode `0600`.
 Keep this directory local rather than syncing it with dotfiles. Startup refuses
-a key copied from another machine or OS user. On the destination machine, move
+a key copied from another machine or OS user when both stored and current
+machine bindings are available. Missing, empty, `uninitialized`, or invalid Linux
+machine IDs disable clone detection. IDs created or modified during the current
+boot are also treated as unverified, so an impermanent root that regenerates
+`/etc/machine-id` each boot does not prevent startup. A persistent ID becomes
+eligible after surviving a boot. An identity originally created without a
+binding remains unbound until the operator replaces it.
+
+When clone detection is unavailable, the server retains its node ID and logs
+one startup warning. `flk status` displays `clone detection unavailable: <reason>`;
+Pong capabilities and `peers.summary` expose it as `clone_detection_warning`.
+Identity files must belong to the current OS user. New files receive mode `0600`
+regardless of umask. On the destination machine, move
 the copied identity file aside to generate a new identity; peers must re-enroll
 a replaced identity when mesh enrollment is available. Restore the original
 file to preserve an existing identity on its original machine.

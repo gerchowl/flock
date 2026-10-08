@@ -2709,6 +2709,7 @@ mod tests {
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
                     node_id: None,
+                    clone_detection_warning: None,
                 }),
                 session_health: None,
                 api_listener: None,

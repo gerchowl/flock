@@ -167,14 +167,24 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+fn clone_detection_warning(
+    capabilities: Option<&crate::api::schema::ServerCapabilities>,
+) -> Option<&str> {
+    capabilities.and_then(|caps| caps.clone_detection_warning.as_deref())
+}
+
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
             version,
             protocol,
             api_listener,
+            capabilities,
             ..
         } => {
+            if let Some(warning) = clone_detection_warning(capabilities.as_ref()) {
+                println!("{indent}{warning}");
+            }
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
             println!("{indent}protocol: {}", protocol_label(*protocol));
@@ -408,6 +418,8 @@ struct ServerStatusJson {
 struct ServerCapabilitiesJson {
     live_handoff: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    clone_detection_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     node_id: Option<String>,
 }
 
@@ -444,6 +456,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
                     node_id: capabilities.node_id.clone(),
+                    clone_detection_warning: capabilities.clone_detection_warning.clone(),
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),

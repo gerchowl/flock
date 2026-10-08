@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,7 +31,7 @@ impl Fixture {
     fn command(&self, session: &str, state: &Path) -> Command {
         let config = self.0.join("config");
         for app_dir in ["flock", "flock-dev"] {
-            fs::create_dir_all(config.join(app_dir)).unwrap();
+            fs::create_dir_all(config.join(app_dir).join("sessions").join(session)).unwrap();
             fs::write(
                 config.join(app_dir).join("config.toml"),
                 "onboarding = false\n[checks]\nenable = false\n",
@@ -54,18 +55,17 @@ impl Fixture {
             .env("FLOCK_HOST_NAME", "node.example")
             .env("SHELL", "/bin/sh")
             .env("FLOCK_SESSION", session)
-            .arg("server")
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         cmd
     }
 
     fn start(&self, session: &str, state: &Path) -> Server {
-        let child = self
-            .command(session, state)
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        self.start_command(session, self.command(session, state))
+    }
+
+    fn start_command(&self, session: &str, mut cmd: Command) -> Server {
+        let child = cmd.arg("server").stderr(Stdio::null()).spawn().unwrap();
         support::register_spawned_flock_pid(Some(child.id()));
         let mut server = Server {
             child,
@@ -168,20 +168,111 @@ fn mesh_identity_survives_server_restart_and_is_shared_by_named_sessions() {
 }
 
 #[test]
-fn mesh_identity_boot_refuses_foreign_machine_binding() {
+fn mesh_identity_boot_refuses_corrupt_file_with_its_path() {
     let fixture = Fixture::new();
     let state = fixture.0.join("state");
     drop(fixture.start("first", &state));
     let path = fixture.identity_path();
-    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    record["machine_binding"] = json!("a-fictional-foreign-machine-binding");
-    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(&path, b"corrupt identity").unwrap();
     let output = fixture
         .command("refused", &state)
+        .arg("server")
         .stderr(Stdio::piped())
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cloned node identity refused"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&path.display().to_string()));
     assert!(!fixture.0.join("refused.sock").exists());
+}
+
+#[test]
+fn mesh_identity_strict_umask_still_creates_private_writable_files() {
+    let fixture = Fixture::new();
+    let state = fixture.0.join("state");
+    let mut cmd = fixture.command("strict", &state);
+    // SAFETY: umask is async-signal-safe and changes only the forked child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o277);
+            Ok(())
+        });
+    }
+    let first = fixture.start_command("strict", cmd);
+    let id = first.identity();
+    drop(first);
+    let path = fixture.identity_path();
+    for file in [&path, &path.with_file_name("identity.lock")] {
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(fixture.start("reopened", &state).identity(), id);
+}
+
+#[test]
+fn mesh_identity_unbound_warning_reaches_ping_summary_and_status() {
+    let fixture = Fixture::new();
+    let state = fixture.0.join("state");
+    let initial = fixture.start("initial", &state);
+    let id = initial.identity();
+    drop(initial);
+    let path = fixture.identity_path();
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["machine_binding"] = Value::Null;
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let server = fixture.start("unbound", &state);
+    assert_eq!(server.identity(), id);
+    let warning = server.request("ping")["capabilities"]["clone_detection_warning"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(warning.starts_with("clone detection unavailable: "));
+    for _ in 0..3 {
+        assert_eq!(
+            server.request("peers.summary")["clone_detection_warning"],
+            warning
+        );
+    }
+    for json_output in [false, true] {
+        let mut cmd = fixture.command("unbound", &state);
+        cmd.args(["status", "server"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if json_output {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        if json_output {
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap()["capabilities"]
+                    ["clone_detection_warning"],
+                warning
+            );
+        } else {
+            assert!(text.contains(&warning));
+        }
+    }
+
+    let app_dir = if cfg!(debug_assertions) {
+        "flock-dev"
+    } else {
+        "flock"
+    };
+    let log = fs::read_to_string(
+        fixture
+            .0
+            .join("config")
+            .join(app_dir)
+            .join("sessions/unbound/flock-server.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("mesh.clone_detection.unavailable"))
+            .count(),
+        1
+    );
 }

@@ -108,6 +108,9 @@ pub(crate) fn read_limited_reader(
 
 pub(crate) mod ssh_agent;
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod machine_id;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

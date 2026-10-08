@@ -1487,6 +1487,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let pid_text = fs::read_to_string(&marker).unwrap();
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
 
+    let before = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-before","method":"ping","params":{}}),
+    );
+    let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
+    fs::write(&identity_path, b"corrupt during handoff").unwrap();
     let failed = request(
         &api_socket,
         serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
@@ -1497,6 +1503,15 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     );
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
+    let after = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-after","method":"ping","params":{}}),
+    );
+    assert_eq!(
+        before["result"]["capabilities"],
+        after["result"]["capabilities"]
+    );
+    assert_eq!(fs::read(identity_path).unwrap(), b"corrupt during handoff");
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
 
     assert_ok(request(

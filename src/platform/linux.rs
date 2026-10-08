@@ -465,17 +465,10 @@ pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
 
 /// OS installation identity, independent of hostname and flock's state dir.
 pub(crate) fn machine_identity() -> std::io::Result<String> {
-    let id = std::fs::read_to_string("/etc/machine-id")?;
-    let id = id.trim();
-    if id.len() != 32
-        || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || id.bytes().all(|byte| byte == b'0')
-    {
-        return Err(std::io::Error::other(
-            "cannot bind node identity: invalid /etc/machine-id",
-        ));
-    }
-    Ok(id.to_ascii_lowercase())
+    super::machine_id::read_machine_id(
+        std::path::Path::new("/etc/machine-id"),
+        sysinfo::System::boot_time(),
+    )
 }
 
 #[cfg(test)]

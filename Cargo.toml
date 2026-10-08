@@ -64,3 +64,6 @@ unicode-width = "0.2"
 sysinfo = "0.39.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml_edit = "0.25.15"
+
+# Wipe node-key seeds and serialized private-key buffers after use.
+zeroize = { version = "1.9", features = ["serde"] }
