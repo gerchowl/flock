@@ -523,7 +523,11 @@ impl App {
         pane: &str,
         wake: bool,
     ) -> Result<crate::api::schema::DeliveryAttempt, &'static str> {
-        let id = self.delivery_attempt_registry.borrow_mut().reserve_id()?;
+        let queued_ids = self.mailboxes.queued_correlation_ids();
+        let id = self
+            .delivery_attempt_registry
+            .borrow_mut()
+            .reserve_id(|id| queued_ids.contains(id))?;
         let ids = if wake {
             self.mailboxes
                 .queued_infos(Some(pane))

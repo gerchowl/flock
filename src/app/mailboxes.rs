@@ -442,6 +442,15 @@ impl MailboxRegistry {
         self.history.get(correlation_id)
     }
 
+    /// All local inboxes, for one bounded delivery-attempt admission check.
+    pub(super) fn queued_correlation_ids(&self) -> HashSet<&str> {
+        self.queues
+            .values()
+            .flat_map(|queue| queue.iter())
+            .map(|message| message.correlation_id.as_str())
+            .collect()
+    }
+
     /// Metadata for a message that is still queued (reply-before-delivery).
     pub(crate) fn queued_message(&self, correlation_id: &str) -> Option<&PendingMessage> {
         self.queues

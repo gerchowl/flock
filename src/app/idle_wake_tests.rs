@@ -1497,3 +1497,46 @@ async fn delivery_attempt_handoff_import_restores_interrupted_evidence() {
     assert!(drain(&mut pty).is_empty());
     std::fs::remove_file(log).unwrap();
 }
+
+#[tokio::test]
+async fn delivery_attempt_unconfirmed_without_queued_mail_cannot_wedge_new_wakes() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    for index in 0..crate::app::mailboxes::MAX_SEEN {
+        let mut evidence = super::super::guarded_submit::Attempt::test_new().evidence;
+        evidence.attempt_id = format!("retired-attempt-{index}");
+        evidence.pane = pane.clone();
+        evidence.wake = true;
+        evidence.correlation_ids = vec![format!("gone-mail-{index}")];
+        evidence.state = "unconfirmed".into();
+        evidence.reason = Some("confirm_timeout".into());
+        evidence.queued_at_ms = index as u64;
+        evidence.finished_at_ms = Some(index as u64);
+        app.record_delivery_attempt(&evidence);
+    }
+    assert_eq!(
+        app.delivery_attempts().len(),
+        crate::app::mailboxes::MAX_SEEN
+    );
+    assert_eq!(app.mailboxes.queued_len(&pane), 0);
+    claude_idle_for(&mut app, settled());
+    send(
+        &mut app,
+        &pane,
+        "new-wake-after-expired-mail",
+        MsgIntent::NeedsReply,
+    );
+    assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
+    tick_past_gap(&mut app);
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    let attempts = app.delivery_attempts();
+    assert_eq!(attempts.len(), crate::app::mailboxes::MAX_SEEN);
+    assert!(!attempts.iter().any(|a| a.attempt_id == "retired-attempt-0"));
+    assert!(attempts
+        .iter()
+        .any(|a| a.state == "submit_sent" && a.correlation_ids == ["new-wake-after-expired-mail"]));
+    assert_eq!(app.mailboxes.queued_len(&pane), 1);
+}

@@ -16,19 +16,26 @@ impl DeliveryAttempts {
         }
     }
 
-    fn evict_oldest_terminal(&mut self) -> bool {
+    fn evict_oldest_terminal(&mut self, is_queued: &impl Fn(&str) -> bool) -> bool {
         let oldest = self
             .by_id
             .values()
-            .filter(|a| a.finished_at_ms.is_some() && a.state != "unconfirmed")
+            .filter(|a| {
+                a.finished_at_ms.is_some()
+                    && (a.state != "unconfirmed"
+                        || !a.correlation_ids.iter().any(|id| is_queued(id)))
+            })
             .min_by_key(|a| (a.queued_at_ms, &a.attempt_id))
             .map(|a| a.attempt_id.clone());
         oldest.is_some_and(|id| self.by_id.remove(&id).is_some())
     }
 
-    pub(super) fn reserve_id(&mut self) -> Result<String, &'static str> {
+    pub(super) fn reserve_id(
+        &mut self,
+        is_queued: impl Fn(&str) -> bool,
+    ) -> Result<String, &'static str> {
         while self.by_id.len() >= super::mailboxes::MAX_SEEN {
-            if !self.evict_oldest_terminal() {
+            if !self.evict_oldest_terminal(&is_queued) {
                 return Err("delivery_attempt_capacity");
             }
         }
@@ -46,7 +53,9 @@ impl DeliveryAttempts {
         }
         self.by_id.insert(attempt.attempt_id.clone(), attempt);
         while self.by_id.len() > super::mailboxes::MAX_SEEN {
-            if !self.evict_oldest_terminal() {
+            // Admission checks the live mailbox snapshot. Updates conservatively
+            // retain correlated unconfirmed evidence until that check.
+            if !self.evict_oldest_terminal(&|_| true) {
                 break;
             }
         }
@@ -69,7 +78,7 @@ mod tests {
         DeliveryAttempt {
             attempt_id: format!("attempt:{id:020}"),
             pane: "fixture-pane".into(),
-            correlation_ids: Vec::new(),
+            correlation_ids: vec!["queued-mail".into()],
             wake: false,
             state: state.into(),
             reason: None,
@@ -89,7 +98,7 @@ mod tests {
         for id in 2..super::super::mailboxes::MAX_SEEN as u64 {
             registry.record(attempt(id, "accepted"));
         }
-        let id = registry.reserve_id().unwrap();
+        let id = registry.reserve_id(|_| true).unwrap();
         let mut new = attempt(5000, "typed");
         new.attempt_id = id;
         registry.record(new);
@@ -106,20 +115,39 @@ mod tests {
         for id in 0..super::super::mailboxes::MAX_SEEN as u64 {
             registry.record(attempt(id, "unconfirmed"));
         }
-        assert_eq!(registry.reserve_id(), Err("delivery_attempt_capacity"));
+        assert_eq!(
+            registry.reserve_id(|_| true),
+            Err("delivery_attempt_capacity")
+        );
         assert_eq!(registry.snapshot().len(), super::super::mailboxes::MAX_SEEN);
+    }
+
+    #[test]
+    fn any_queued_correlation_protects_unconfirmed_but_missing_mail_releases_it() {
+        let mut registry = DeliveryAttempts::new(0);
+        for id in 0..super::super::mailboxes::MAX_SEEN as u64 {
+            let mut evidence = attempt(id, "unconfirmed");
+            evidence.correlation_ids = vec!["gone-mail".into(), "queued-mail".into()];
+            registry.record(evidence);
+        }
+        assert_eq!(
+            registry.reserve_id(|id| id == "queued-mail"),
+            Err("delivery_attempt_capacity")
+        );
+        assert!(registry.reserve_id(|_| false).is_ok());
+        assert!(!registry.snapshot().iter().any(|a| a.queued_at_ms == 0));
     }
 
     #[test]
     fn ids_advance_without_event_publication_and_past_restored_ids() {
         let mut registry = DeliveryAttempts::new(0);
-        let first = registry.reserve_id().unwrap();
-        let second = registry.reserve_id().unwrap();
+        let first = registry.reserve_id(|_| true).unwrap();
+        let second = registry.reserve_id(|_| true).unwrap();
         assert_ne!(first, second);
         registry.record(attempt(99, "accepted"));
         registry.clear();
         assert_eq!(
-            registry.reserve_id().unwrap(),
+            registry.reserve_id(|_| true).unwrap(),
             "attempt:00000000000000000100"
         );
     }
