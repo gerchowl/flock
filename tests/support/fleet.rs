@@ -3,7 +3,7 @@
 //! and read their rendered frames like screenshots.
 //!
 //! This is the "real network setup" vehicle without containers: every node is
-//! the actual binary with its own config home, runtime dir, API socket and
+//! the actual binary with its own HOME, XDG directories, API socket and
 //! client socket. The only fake is `ssh` — a shim that maps a peer NAME onto
 //! that node's socket and execs the command locally. Everything above it (the
 //! poll round, the relay merge, the snapshot pass-through, the sidebar render,
@@ -38,10 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
 
-use super::{
-    read_server_message, register_runtime_dir, register_spawned_flock_pid, wait_for_file,
-    wait_for_socket,
-};
+use super::{read_server_message, register_runtime_dir, register_spawned_flock_pid, wait_for_file};
 
 /// ServerMessage bincode variant indices (declaration order in wire.rs).
 pub const VARIANT_FRAME: u32 = 1;
@@ -64,6 +61,7 @@ pub struct NodeSpec {
     /// Extra TOML appended to this node's config, for a case that needs a
     /// setting the shared fixture does not carry.
     pub extra_config: &'static str,
+    pub mesh: MeshMode,
 }
 
 impl NodeSpec {
@@ -77,7 +75,13 @@ impl NodeSpec {
             repo,
             peers,
             extra_config: "",
+            mesh: MeshMode::Native,
         }
+    }
+
+    pub const fn with_mesh(mut self, mesh: MeshMode) -> Self {
+        self.mesh = mesh;
+        self
     }
 
     pub const fn with_config(mut self, extra_config: &'static str) -> Self {
@@ -86,36 +90,124 @@ impl NodeSpec {
     }
 }
 
+/// Transport fixtures until the production mesh handshake lands. Native runs
+/// the real relay unchanged. The other modes inject explicit mesh refusals
+/// while continuing to forward every legacy method to the real server.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshMode {
+    Native,
+    Disabled,
+    VersionMismatch(u32),
+}
+
 /// A spawned node, with everything a test needs to talk to it.
 pub struct Node {
     pub name: String,
+    pub home: PathBuf,
     pub config_home: PathBuf,
     pub runtime_dir: PathBuf,
     pub api_socket: PathBuf,
     pub client_socket: PathBuf,
     pub repo: PathBuf,
-    _master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    shim_dir: PathBuf,
+    _master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let pid = self.child.process_id();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // Belt and braces: a server that never finished starting can outlive
-        // `kill` long enough to hold its runtime dir, and a wedged fixture
-        // that leaks servers is worse than a failing test.
-        if let Some(pid) = pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
-        super::unregister_spawned_flock_pid(pid);
+        self.stop();
     }
 }
 
 impl Node {
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let pid = child.process_id();
+            let _ = child.kill();
+            let _ = child.wait();
+            super::unregister_spawned_flock_pid(pid);
+        }
+        self._master = None;
+    }
+
+    /// Restart only this sandbox server, preserving its config and state.
+    pub fn restart(&mut self) {
+        self.stop();
+        // A hard stop can leave socket files behind. Readiness must observe
+        // the replacement listener, never a stale filesystem entry.
+        for socket in [&self.api_socket, &self.client_socket] {
+            let _ = fs::remove_file(socket);
+        }
+        self.start();
+        self.wait_ready();
+    }
+
+    fn start(&mut self) {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 30,
+                cols: 90,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+        cmd.arg("server");
+        cmd.cwd(&self.repo);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("FLOCK_") {
+                cmd.env_remove(key);
+            }
+        }
+        cmd.env("HOME", &self.home);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        cmd.env("XDG_DATA_HOME", self.home.join("data"));
+        cmd.env("XDG_STATE_HOME", self.home.join("state"));
+        cmd.env("XDG_CACHE_HOME", self.home.join("cache"));
+        cmd.env("FLOCK_SOCKET_PATH", &self.api_socket);
+        cmd.env("SHELL", "/bin/sh");
+        cmd.env("FLOCK_DISABLE_SOUND", "1");
+        // Debug-only substitute for sshd ancestry in the local ssh fixture.
+        cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
+        cmd.env("FLOCK_FLEET_SOURCE", &self.name);
+        let outer_path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{outer_path}", self.shim_dir.display()));
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        register_spawned_flock_pid(child.process_id());
+        drop(pair.slave);
+        // Drain output so a full PTY cannot block a headless fixture server.
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
+        self.child = Some(child);
+        self._master = Some(pair.master);
+    }
+
+    fn wait_ready(&self) {
+        wait_until("server ping", Duration::from_secs(30), || {
+            let mut stream = UnixStream::connect(&self.api_socket).ok()?;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .ok()?;
+            stream
+                .set_write_timeout(Some(Duration::from_millis(200)))
+                .ok()?;
+            stream
+                .write_all(b"{\"id\":\"ready\",\"method\":\"ping\",\"params\":{}}\n")
+                .ok()?;
+            let mut response = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut response)
+                .ok()?;
+            let value: serde_json::Value = serde_json::from_str(&response).ok()?;
+            value.get("result").map(|_| ())
+        });
+        wait_for_file(&self.client_socket, Duration::from_secs(30));
+    }
+
     /// Attach a protocol client and complete the handshake. Returns the
     /// connected stream, ready to read frames from.
     pub fn attach(&self) -> UnixStream {
@@ -181,6 +273,7 @@ pub struct Fleet {
 impl Drop for Fleet {
     fn drop(&mut self) {
         self.nodes.clear();
+        self.kill_edges(None);
         super::cleanup_test_base(&self.base);
     }
 }
@@ -193,10 +286,90 @@ impl Fleet {
             .unwrap_or_else(|| panic!("no node named {name} in the fleet"))
     }
 
+    pub fn node_mut(&mut self, name: &str) -> &mut Node {
+        self.nodes
+            .iter_mut()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| panic!("no node named {name} in the fleet"))
+    }
+
+    /// Block new dials along one directed edge, leaving the reverse untouched.
+    pub fn refuse_edge(&self, from: &str, to: &str) {
+        self.node(from);
+        self.node(to);
+        fs::write(self.base.join(format!("refuse-edge-{from}-{to}")), b"").unwrap();
+    }
+
+    pub fn allow_edge(&self, from: &str, to: &str) {
+        fs::remove_file(self.base.join(format!("refuse-edge-{from}-{to}"))).unwrap();
+    }
+
+    /// Wait until the shim has spawned the held relay, before partitioning it.
+    pub fn wait_for_edge(&self, from: &str, to: &str, timeout: Duration) {
+        wait_until("held edge", timeout, || {
+            (!self.edge_pids(Some(&format!("{from}-{to}-"))).is_empty()).then_some(())
+        });
+    }
+
+    /// Wait for a held ssh child, then cut it and its relay subprocesses.
+    /// Refuse the edge first when a test needs the partition to persist.
+    pub fn kill_edge(&self, from: &str, to: &str, timeout: Duration) -> usize {
+        wait_until("held edge to kill", timeout, || {
+            let count = self.kill_edges(Some(&format!("{from}-{to}-")));
+            (count > 0).then_some(count)
+        })
+    }
+
+    fn edge_pids(&self, prefix: Option<&str>) -> Vec<(PathBuf, i32)> {
+        let mut live = Vec::new();
+        for entry in fs::read_dir(self.base.join("edges"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".pending") || prefix.is_some_and(|p| !name.starts_with(p)) {
+                continue;
+            }
+            let pid = fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|p| p.parse::<i32>().ok());
+            if let Some(pid) = pid.filter(|pid| *pid > 1) {
+                // A stale pid file must never authorize killing a reused pid.
+                // The unique script path identifies this fleet's ssh proxy.
+                let script = self.base.join("bin/ssh");
+                let ours = super::process_table::process_info(pid as u32)
+                    .is_ok_and(|info| info.argv.iter().any(|arg| Path::new(arg) == script));
+                if ours {
+                    live.push((entry.path(), pid));
+                    continue;
+                }
+            }
+            let _ = fs::remove_file(entry.path());
+        }
+        live
+    }
+
+    fn kill_edges(&self, prefix: Option<&str>) -> usize {
+        let mut count = 0;
+        for (path, pid) in self.edge_pids(prefix) {
+            if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+                count += 1;
+            }
+            let _ = fs::remove_file(path);
+        }
+        count
+    }
+
     /// Make every new ssh dial to `name` fail with "Connection refused", as a
     /// broken edge would (#410). Held connections are unaffected.
     pub fn refuse_ssh_to(&self, name: &str) {
         fs::write(self.base.join(format!("refuse-ssh-{name}")), b"").unwrap();
+    }
+
+    pub fn allow_ssh_to(&self, name: &str) {
+        fs::remove_file(self.base.join(format!("refuse-ssh-{name}"))).unwrap();
     }
 
     /// The `<namespace>/<repo>` identity a node's workspace renders under.
@@ -227,7 +400,7 @@ fn unique_base(tag: &str) -> PathBuf {
 fn init_repo(path: &Path, slug: &str) {
     fs::create_dir_all(path).unwrap();
     let status = std::process::Command::new("git")
-        .args(["init", "-q"])
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .current_dir(path)
         .status()
         .unwrap();
@@ -258,6 +431,7 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
 
     // --- Paths first: the shim must know every node before any node starts.
     struct Paths {
+        home: PathBuf,
         config_home: PathBuf,
         runtime_dir: PathBuf,
         api_socket: PathBuf,
@@ -267,6 +441,7 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
     let paths: Vec<Paths> = specs
         .iter()
         .map(|spec| Paths {
+            home: base.join(format!("home-{}", spec.name)),
             config_home: base.join(format!("config-{}", spec.name)),
             runtime_dir: base.join(format!("runtime-{}", spec.name)),
             api_socket: base.join(format!("{}.sock", spec.name)),
@@ -276,31 +451,34 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
         })
         .collect();
 
-    // --- The dispatching fake ssh. Real invocations look like
-    //     `ssh -o BatchMode=yes … <target> "sh -lc '<cmd>'"`, so the LAST arg
-    //     is the command and the one before it is the target.
+    // The shim owns a process group per held edge and records its pid. Its
+    // dispatch table contains only this fixture's sockets and sandbox paths.
     let shim_dir = base.join("bin");
     fs::create_dir_all(&shim_dir).unwrap();
-    let mut shim = String::from("#!/bin/sh\nprev=\"\"; last=\"\"\nfor a in \"$@\"; do prev=\"$last\"; last=\"$a\"; done\ncase \"$prev\" in\n");
-    for (spec, path) in specs.iter().zip(&paths) {
-        shim.push_str(&format!(
-            "  {}) SOCK='{}'; CFG='{}' ;;\n",
-            spec.name,
-            path.api_socket.display(),
-            path.config_home.display(),
-        ));
-    }
-    // An edge can be broken mid-test (#410): a marker file named for the
-    // target makes every NEW dial to it fail the way a real refused connect
-    // does — ssh's own words, ssh's own exit status. Connections already held
-    // stay up, exactly as a real network partition would leave them.
-    shim.push_str(&format!(
-        "  *) echo \"fake-ssh: unknown target $prev\" >&2; exit 255 ;;\nesac\nif [ -e '{}'/\"refuse-ssh-$prev\" ]; then echo \"ssh: connect to host $prev port 22: Connection refused\" >&2; exit 255; fi\nFLOCK_SOCKET_PATH=\"$SOCK\" XDG_CONFIG_HOME=\"$CFG\" PATH='{}':\"$PATH\" exec sh -c \"$last\"\n",
-        base.display(),
-        bin_dir.display(),
-    ));
+    fs::create_dir_all(base.join("edges")).unwrap();
+    let manifest: serde_json::Map<String, serde_json::Value> = specs
+        .iter()
+        .zip(&paths)
+        .map(|(spec, path)| {
+            (
+                spec.name.to_string(),
+                serde_json::json!({
+                    "home": path.home, "config": path.config_home, "runtime": path.runtime_dir,
+                    "socket": path.api_socket, "mesh": spec.mesh,
+                }),
+            )
+        })
+        .collect();
+    fs::write(
+        base.join("nodes.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "nodes": manifest, "bin": bin_dir,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let shim_path = shim_dir.join("ssh");
-    fs::write(&shim_path, shim).unwrap();
+    fs::write(&shim_path, include_str!("fleet_ssh.py")).unwrap();
     fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o755)).unwrap();
 
     // --- Configs + repos.
@@ -324,82 +502,36 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
         }
     }
 
-    // --- Spawn, leaf-first.
-    let mut nodes: Vec<Node> = Vec::new();
-    for (spec, path) in specs.iter().zip(&paths).rev() {
-        fs::create_dir_all(&path.runtime_dir).unwrap();
-        register_runtime_dir(&path.runtime_dir);
-
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 30,
-                cols: 90,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
-        cmd.arg("server");
-        cmd.cwd(&path.repo);
-        cmd.env("XDG_CONFIG_HOME", &path.config_home);
-        cmd.env("XDG_RUNTIME_DIR", &path.runtime_dir);
-        cmd.env("FLOCK_SOCKET_PATH", &path.api_socket);
-        cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
-        cmd.env("SHELL", "/bin/sh");
-        cmd.env_remove("FLOCK_ENV");
-        cmd.env("FLOCK_DISABLE_SOUND", "1");
-        // A spoke binds only a relay descended from sshd (#410). Here the fake
-        // ssh runs the relay as a descendant of the POLLING node's own `flk`
-        // server instead, and macOS will not run a copied system shell under
-        // another name, so the harness names that ancestor. Honoured by debug
-        // builds only; a release build always requires sshd.
-        cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
-        let outer_path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{outer_path}", shim_dir.display()));
-
-        let child = pair.slave.spawn_command(cmd).unwrap();
-        register_spawned_flock_pid(child.process_id());
-        drop(pair.slave);
-
-        // Drain the PTY like a real terminal would. Nobody reads a test
-        // node's screen, and a server whose PTY buffer fills up BLOCKS on
-        // write — which looks exactly like a server that never finished
-        // starting, and wedges the fixture rather than failing it.
-        if let Ok(mut reader) = pair.master.try_clone_reader() {
-            std::thread::spawn(move || {
-                let mut sink = [0u8; 8192];
-                while let Ok(n) = std::io::Read::read(&mut reader, &mut sink) {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            });
-        }
-
-        nodes.push(Node {
-            name: spec.name.to_string(),
-            config_home: path.config_home.clone(),
-            runtime_dir: path.runtime_dir.clone(),
-            api_socket: path.api_socket.clone(),
-            client_socket: path.client_socket.clone(),
-            repo: path.repo.clone(),
-            _master: pair.master,
-            child,
-        });
+    // Construct the owner before starting children so startup failures clean up.
+    let nodes = specs
+        .iter()
+        .zip(&paths)
+        .map(|(spec, path)| {
+            for dir in [&path.home, &path.config_home, &path.runtime_dir] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            register_runtime_dir(&path.runtime_dir);
+            Node {
+                name: spec.name.to_string(),
+                home: path.home.clone(),
+                config_home: path.config_home.clone(),
+                runtime_dir: path.runtime_dir.clone(),
+                api_socket: path.api_socket.clone(),
+                client_socket: path.client_socket.clone(),
+                repo: path.repo.clone(),
+                shim_dir: shim_dir.clone(),
+                _master: None,
+                child: None,
+            }
+        })
+        .collect();
+    let mut fleet = Fleet { base, nodes };
+    for node in fleet.nodes.iter_mut().rev() {
+        node.start();
+        node.wait_ready();
+        node.create_workspace(&node.repo);
     }
-    nodes.reverse();
-
-    // Startup patience: a fleet of real servers coming up next to a parallel
-    // test suite is slower than a single one, and the failure mode of being
-    // too impatient here is a confusing panic in an unrelated assertion.
-    for node in &nodes {
-        wait_for_socket(&node.api_socket, Duration::from_secs(30));
-        node.create_workspace(&node.repo.clone());
-        wait_for_file(&node.client_socket, Duration::from_secs(30));
-    }
-
-    Fleet { base, nodes }
+    fleet
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +546,39 @@ pub const CHAIN_ABC: &[NodeSpec] = &[
     NodeSpec::new("nodeb", "beta", &["nodec"]),
     NodeSpec::new("nodec", "gamma", &[]),
 ];
+
+/// Laptop and edge-less spoke reached by one hub. The wide laptop sidebar
+/// keeps legacy `via nodeb` routing evidence visible in the MCP regression.
+pub const HUB_SPOKES: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
+    NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
+    NodeSpec::new("nodec", "gamma", &[]),
+];
+
+/// Laptop dials a hub that dials an edge-less spoke.
+pub const LAPTOP_HUB_SPOKE: &[NodeSpec] = CHAIN_ABC;
+
+/// Two independent hubs can dial the same spoke (multi-edge enrollment is a
+/// later mesh slice, so this describes topology rather than promising success).
+pub const TWO_HUBS: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "alpha", &["nodec"]),
+    NodeSpec::new("nodeb", "beta", &["nodec"]),
+    NodeSpec::new("nodec", "gamma", &[]),
+];
+
+/// Poll an observable condition up to a deadline. Each probe must itself be
+/// bounded (socket probes should set read/write timeouts).
+pub fn wait_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for {what}");
+        std::thread::sleep(left.min(Duration::from_millis(25)));
+    }
+}
 
 static SHARED: OnceLock<Mutex<Option<Fleet>>> = OnceLock::new();
 

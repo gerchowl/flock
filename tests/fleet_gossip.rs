@@ -119,3 +119,134 @@ fn focus_workspace_message_lands_the_arriving_client_on_that_space() {
         "FocusWorkspace should land the client on the space the switch named"
     );
 }
+
+/// Restart uses the same durable directories, and the isolated shell sees
+/// the sandbox rather than the developer's HOME or XDG state.
+#[test]
+fn mesh_harness_restart_preserves_state_and_sandboxes_remote_commands() {
+    let mut fleet = fleet::spawn("mesh-restart", fleet::LAPTOP_HUB_SPOKE);
+    let node = fleet.node("nodec");
+    let before = fleet::workspace_ids(node);
+    let marker = node.home.join("state/retained");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "retained").unwrap();
+    let output = shim_command(
+        &fleet,
+        "nodea",
+        "nodec",
+        "printf '%s\\n' \"$HOME\" \"$XDG_STATE_HOME\" \"$FLOCK_SOCKET_PATH\"",
+    )
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}\n{}\n{}\n",
+            node.home.display(),
+            node.home.join("state").display(),
+            node.api_socket.display()
+        )
+    );
+    fleet.node_mut("nodec").restart();
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "retained");
+    assert_eq!(fleet::workspace_ids(fleet.node("nodec")), before);
+}
+
+fn shim_command(
+    fleet: &fleet::Fleet,
+    from: &str,
+    to: &str,
+    command: &str,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(fleet.base.join("bin/ssh"));
+    cmd.env("FLOCK_FLEET_SOURCE", from).args([to, command]);
+    cmd
+}
+
+/// Cut an actual held relay while a reverse edge remains usable. The marker
+/// prevents reconnects until the test explicitly restores this direction.
+#[test]
+fn mesh_harness_kills_a_held_edge_and_restores_only_that_direction() {
+    let fleet = fleet::spawn("mesh-cut", fleet::HUB_SPOKES);
+    fleet.wait_for_edge("nodeb", "nodec", Duration::from_secs(30));
+    fleet.refuse_edge("nodeb", "nodec");
+    assert!(fleet.kill_edge("nodeb", "nodec", Duration::from_secs(30)) > 0);
+    assert_eq!(
+        shim_command(&fleet, "nodeb", "nodec", "exit 0")
+            .status()
+            .unwrap()
+            .code(),
+        Some(255)
+    );
+    assert!(shim_command(&fleet, "nodec", "nodeb", "exit 0")
+        .status()
+        .unwrap()
+        .success());
+    assert!(shim_command(&fleet, "nodeb", "nodea", "exit 0")
+        .status()
+        .unwrap()
+        .success());
+    fleet.allow_edge("nodeb", "nodec");
+    // Open a fresh held edge directly, avoiding the production reconnect
+    // backoff without changing its timing constants for the sake of the test.
+    let reply = relay_probe(&fleet, "nodeb", "nodec", "ping");
+    assert!(reply.get("result").is_some(), "{reply}");
+}
+
+fn relay_probe(fleet: &fleet::Fleet, from: &str, to: &str, method: &str) -> serde_json::Value {
+    use std::io::{BufRead, Write};
+    use std::process::Stdio;
+    let mut child = shim_command(fleet, from, to, "flk peers relay")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"id":"probe", "method":method, "params":{}})
+    )
+    .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let line = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        let _ = tx.send(line);
+    });
+    let response = rx.recv_timeout(Duration::from_secs(10));
+    drop(stdin);
+    fleet::wait_until("relay exit", Duration::from_secs(10), || {
+        child.try_wait().unwrap()
+    });
+    serde_json::from_str(&response.expect("relay probe deadline")).unwrap()
+}
+
+/// Fault modes refuse mesh without preventing legacy traffic from reaching
+/// the real server. These are transport fixtures, not enrollment assertions.
+#[test]
+fn mesh_harness_legacy_and_version_mismatch_keep_ping_working() {
+    use fleet::{MeshMode, NodeSpec};
+    let fleet = fleet::spawn(
+        "mesh-mixed",
+        &[
+            NodeSpec::new("nodea", "alpha", &[]).with_mesh(MeshMode::Disabled),
+            NodeSpec::new("nodeb", "beta", &[]).with_mesh(MeshMode::VersionMismatch(999)),
+        ],
+    );
+    for (node, code) in [
+        ("nodea", "invalid_request"),
+        ("nodeb", "mesh_version_mismatch"),
+    ] {
+        let reply = relay_probe(&fleet, "probe", node, "mesh.hello");
+        assert_eq!(reply["id"], "probe");
+        assert_eq!(reply["error"]["code"], code);
+        let ping = relay_probe(&fleet, "probe", node, "ping");
+        assert!(ping.get("result").is_some(), "{ping}");
+    }
+}
