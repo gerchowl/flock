@@ -33,6 +33,8 @@ flk status server
 flk status client
 ```
 
+`flk status` also probes the selected installed launch path with `--version`, bounded to two seconds. It shows client, running server and installed executable versions, the launch path, and `client_drift` / `server_drift`. JSON includes an `installed` object. Missing, failed or timed-out probes report an error and unknown drift rather than claiming the versions match. `restart_needed` retains its client/server comparison.
+
 ## Server
 
 ```bash
