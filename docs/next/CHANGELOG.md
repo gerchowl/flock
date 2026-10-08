@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

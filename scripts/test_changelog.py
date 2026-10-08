@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -30,10 +31,13 @@ from scripts.changelog import (
     manifest_from_release_payload,
     NO_STABLE_RELEASE_VERSION,
     prepare_release,
+    cmd_prepare,
+    collect_fragments,
+    fold_fragments,
     read_protocol_version,
     resolve_release_base,
 )
-from scripts.test_support import commit, make_repo, tag
+from scripts.test_support import commit, make_repo, tag, run_git
 
 FOREIGN_REPO = "example.invalid/another-project"
 
@@ -55,6 +59,62 @@ class ChangelogScriptTests(unittest.TestCase):
 
         self.assertIn("## Unreleased\n\n## [0.1.1] - 2026-03-28", updated)
         self.assertIn("### Added\n- Added sounds.", updated)
+
+    def test_fragment_branches_merge_and_release_prepare_consumes_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp))
+            changelog = repo / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## Unreleased\n\n### Fixed\n- Legacy entry.\n")
+            run_git(repo, "add", ".")
+            base = commit(repo, "chore: seed changelog")
+            for branch, name, entry in (("first", "101.fixed.md", "First fix"),
+                                        ("second", "102.added.md", "Second feature")):
+                run_git(repo, "switch", "-c", branch, base)
+                directory = repo / "docs/next/changes"
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / name).write_text(f"- {entry}.\n")
+                run_git(repo, "add", ".")
+                commit(repo, f"feat: {entry}")
+            run_git(repo, "merge", "first", "--no-edit")
+            directory = repo / "docs/next/changes"
+            cmd_prepare(argparse.Namespace(path=str(changelog), fragments=str(directory),
+                                           version="1.0.0", date="2026-10-08"))
+            body = extract_section_body(changelog.read_text(), "1.0.0")
+            self.assertEqual(body, "### Fixed\n- Legacy entry.\n- First fix.\n\n### Added\n- Second feature.\n")
+            self.assertEqual(list(directory.glob("*.md")), [])
+
+    def test_fragment_only_release_and_deterministic_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "2.fixed.md").write_text("- Second.\n")
+            (directory / "1.fixed.md").write_text("- First.\n")
+            text = fold_fragments("## Unreleased\n", collect_fragments(directory))
+            result = prepare_release(text, "1.0.0", "2026-10-08")
+            self.assertEqual(extract_section_body(result, "1.0.0"),
+                             "### Fixed\n- First.\n- Second.\n")
+
+    def test_invalid_fragment_and_failed_prepare_preserve_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "changes"
+            directory.mkdir()
+            fragment = directory / "1.unknown.md"
+            fragment.write_text("- Entry.\n")
+            with self.assertRaises(ChangelogError):
+                collect_fragments(directory)
+            fragment.unlink()
+            fragment = directory / "1.fixed.md"
+            fragment.write_text("### Fixed\n- Entry.\n")
+            with self.assertRaises(ChangelogError):
+                collect_fragments(directory)
+            fragment.write_text("- Entry.\n")
+            changelog = Path(tmp) / "CHANGELOG.md"
+            original = "## Unreleased\n\n## [1.0.0] - 2026-10-08\n- Old.\n"
+            changelog.write_text(original)
+            with self.assertRaises(ChangelogError):
+                cmd_prepare(argparse.Namespace(path=str(changelog), fragments=str(directory),
+                                               version="1.0.0", date="2026-10-08"))
+            self.assertEqual(changelog.read_text(), original)
+            self.assertTrue(fragment.exists())
 
     def test_extract_section_body_returns_requested_version_only(self) -> None:
         changelog = """# Changelog\n\n## Unreleased\n\n## [0.1.1] - 2026-03-28\n\n### Fixed\n- Smoothed Claude flapping.\n\n## [0.1.0] - 2026-03-27\n\n### Added\n- Initial release.\n"""
