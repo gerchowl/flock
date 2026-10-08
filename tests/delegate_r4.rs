@@ -361,6 +361,12 @@ fn report(server: &Server, pane_id: &str, state: &str) {
             server,
             &format!(r#"{{"id":"ag","method":"agent.get","params":{{"target":"{pane_id}"}}}}"#),
         );
+        // Callers already observed registration. A missing agent here has
+        // disappeared, so waiting for another status cannot make progress.
+        if got.get("error").is_some() {
+            let agents = request(server, r#"{"id":"al","method":"agent.list","params":{}}"#);
+            panic!("pane {pane_id} cannot show {state}: {got}; agent.list: {agents}");
+        }
         let status = got["result"]["agent"]["agent_status"]
             .as_str()
             .unwrap_or("");
@@ -1034,19 +1040,54 @@ fn a30_a_failed_registry_write_keeps_the_existing_entry() {
     fs::create_dir_all(entry.parent().unwrap().join(".d1.json.tmp")).unwrap();
 
     let mut again = start_cwd(&server, "d1", &b, &["--json"]);
-    let ready_by = Instant::now() + WITHIN;
-    while agent_get(&server, "d1").is_none() && Instant::now() < ready_by {
-        thread::sleep(Duration::from_millis(50));
-    }
-    if agent_get(&server, "d1").is_some() {
-        make_ready(&server, "d1");
-    }
-    let status = exited_within(&mut again, WITHIN).expect("the second start returns");
+    // The harness still draws idle from the first start. The second start
+    // can reach the failed write and remove its pane before we observe it.
+    // Wait for the command's outcome instead of racing rollback for readiness.
+    let status = exited_within(&mut again, WITHIN);
     let out = finish(again);
+    assert!(
+        status.is_some(),
+        "the second start did not return: {}; agent.list: {}",
+        stderr(&out),
+        request(&server, r#"{"id":"al","method":"agent.list","params":{}}"#)
+    );
+    let status = status.unwrap();
     assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not write the delegate registry entry"),
+        "the second start must reach the registry write: {}",
+        stderr(&out)
+    );
     assert_eq!(
         fs::read(&entry).ok(),
         Some(before),
         "the entry this start did not write is still there, unchanged"
     );
+}
+
+#[test]
+fn report_a_removed_agent_fails_with_the_agent_list() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let started = stdout_json(&out);
+    let ws = started["workspace_id"].as_str().unwrap();
+    let closed = request(
+        &server,
+        &format!(r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{ws}"}}}}"#),
+    );
+    assert!(closed.get("error").is_none(), "workspace.close: {closed}");
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        report(&server, &pane, "idle");
+    }))
+    .expect_err("a removed agent cannot become idle");
+    let message = failure.downcast_ref::<String>().expect("panic diagnostic");
+    assert!(message.contains("agent_not_found"), "{message}");
+    assert!(message.contains("agent.list:"), "{message}");
 }
