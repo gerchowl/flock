@@ -69,7 +69,7 @@ The root `README.md`, root `CHANGELOG.md`, and website docs describe the latest 
 
 If your PR changes user-facing behavior, mention the needed public-doc update in the PR. Update `docs/next/README.md` only when the root README needs to change for the next release. Update the full website-doc mirror under `docs/next/website/src/content/docs/` when website docs need to change for the next release.
 
-You do not need to edit the changelog for normal PRs. Maintainers prepare `docs/next/CHANGELOG.md` during release review.
+For a user-facing PR, add `docs/next/changes/<issue-or-pr>.<kind>.md` with Markdown bullets and no headings. Use added, changed, deprecated, removed, fixed, security, or maintenance for the kind. Release preparation combines these fragments with existing Unreleased entries and deletes the consumed fragments.
 
 If you are unsure whether docs are needed, mention it in the PR.
 

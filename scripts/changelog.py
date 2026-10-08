@@ -156,6 +156,38 @@ def prepare_release(text: str, version: str, release_date: str) -> str:
     return rebuilt + "\n"
 
 
+FRAGMENT_KINDS = ("added", "changed", "deprecated", "removed", "fixed", "security", "maintenance")
+
+
+def collect_fragments(directory: Path) -> list[tuple[Path, str, str]]:
+    fragments = []
+    for path in sorted(directory.glob("*.md")):
+        match = re.fullmatch(r"[A-Za-z0-9_-]+\.([a-z]+)\.md", path.name)
+        if not match or match[1] not in FRAGMENT_KINDS:
+            raise ChangelogError(f"invalid changelog fragment name: {path}")
+        body = path.read_text(encoding="utf-8").strip()
+        if not body.startswith("- ") or re.search(r"^#", body, re.MULTILINE):
+            raise ChangelogError(f"fragment must contain Markdown bullets without headings: {path}")
+        fragments.append((path, match[1].title(), body))
+    return fragments
+
+
+def fold_fragments(text: str, fragments: list[tuple[Path, str, str]]) -> str:
+    if not fragments:
+        return text
+    section = find_section(text, "Unreleased")
+    body = text[section.body_start:section.end].strip()
+    for _, heading, entry in fragments:
+        match = re.search(rf"^### {heading}\s*$", body, re.MULTILINE)
+        if match:
+            following = re.search(r"^### ", body[match.end():], re.MULTILINE)
+            end = match.end() + following.start() if following else len(body)
+            body = body[:end].rstrip() + "\n" + entry + "\n\n" + body[end:]
+        else:
+            body = body.rstrip() + f"\n\n### {heading}\n{entry}"
+    return text[:section.body_start] + "\n" + body.strip() + "\n\n" + text[section.end:]
+
+
 def read_protocol_version(source_path: Path = PROTOCOL_SOURCE_PATH) -> int:
     content = source_path.read_text(encoding="utf-8")
     match = re.search(r"pub const PROTOCOL_VERSION: u32 = (\d+);", content)
@@ -849,8 +881,11 @@ def git_status_lines(path: Path) -> list[str]:
 def cmd_prepare(args: argparse.Namespace) -> int:
     path = Path(args.path)
     original = load_text(path)
-    updated = prepare_release(original, normalize_version(args.version), args.date)
+    fragments = collect_fragments(Path(args.fragments))
+    updated = prepare_release(fold_fragments(original, fragments), normalize_version(args.version), args.date)
     write_text(path, updated)
+    for fragment, _, _ in fragments:
+        fragment.unlink()
     return 0
 
 
@@ -1056,6 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = subparsers.add_parser("prepare", help="Move Unreleased into a versioned section")
     prepare.add_argument("--path", default="CHANGELOG.md")
+    prepare.add_argument("--fragments", default="docs/next/changes")
     prepare.add_argument("--version", required=True)
     prepare.add_argument("--date", default=str(date.today()))
     prepare.set_defaults(func=cmd_prepare)

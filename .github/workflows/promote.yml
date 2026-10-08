@@ -81,7 +81,7 @@ jobs:
           cp docs/next/CHANGELOG.md CHANGELOG.md
           cp -R docs/next/website/src/content/docs/. website/src/content/docs/
           python3 scripts/changelog.py validate-product-announcement
-          python3 scripts/changelog.py prepare --version "$VERSION"
+          python3 scripts/changelog.py prepare --fragments docs/next/changes --version "$VERSION"
           cp CHANGELOG.md docs/next/CHANGELOG.md
           sed -i 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
           python3 - "$VERSION" <<'EOF'
