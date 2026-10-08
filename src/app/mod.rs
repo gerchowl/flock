@@ -143,6 +143,10 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    /// Deferred submit set by `handle_agent_send` and consumed by
+    /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
+    /// request. A response path bypassing `respond_or_park` would reply ok
+    /// without pressing Enter, so dispatch asserts the previous slot was consumed.
     pub(crate) pending_agent_submit: Option<(String, String, Option<u32>)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,

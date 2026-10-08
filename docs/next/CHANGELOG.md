@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-### Added
-- `flk agent send --submit` types terminal input, waits 120 ms, and sends negotiated Enter. Plain `agent send` keeps its literal bytes and never submits; verb help and socket docs now explain both modes. (#638)
 ### Changed
 - **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
 

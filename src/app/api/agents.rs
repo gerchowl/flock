@@ -573,6 +573,14 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        let submit_pane = if params.submit {
+            let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
+                return agent_not_found(id, &params.target);
+            };
+            Some(pane_id)
+        } else {
+            None
+        };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -586,11 +594,7 @@ impl App {
             return encode_error(id, "agent_send_failed", err.to_string());
         }
 
-        if params.submit {
-            let pane_id = self.public_pane_id(resolved.ws_idx, resolved.pane_id);
-            let Some(pane_id) = pane_id else {
-                return agent_not_found(id, &params.target);
-            };
+        if let Some(pane_id) = submit_pane {
             self.pending_agent_submit = Some((id.clone(), pane_id, child_pid));
         }
         encode_success(id, ResponseResult::Ok {})
@@ -667,6 +671,17 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app
+    }
+
+    #[test]
+    #[should_panic(expected = "deferred agent submit must be consumed by respond_or_park")]
+    fn agent_send_submit_cannot_be_silently_cleared_by_the_next_request() {
+        let mut app = test_app();
+        app.pending_agent_submit = Some(("send".into(), "1:p1".into(), None));
+        app.handle_api_request(Request {
+            id: "next".into(),
+            method: Method::Ping(crate::api::schema::PingParams {}),
+        });
     }
 
     fn focused_terminal_id(app: &App) -> crate::terminal::TerminalId {

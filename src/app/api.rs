@@ -1277,6 +1277,10 @@ impl App {
         };
         // #410: a park is only ever for the request that set it.
         let _ = self.uplink.take_pending_park();
+        debug_assert!(
+            self.pending_agent_submit.is_none(),
+            "deferred agent submit must be consumed by respond_or_park before the next request"
+        );
         self.pending_agent_submit = None;
 
         let response = match request.method {
