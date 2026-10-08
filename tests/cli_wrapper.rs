@@ -960,34 +960,41 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
 
 #[test]
 fn pane_report_metadata_sends_presentation_request() {
-    let base = unique_test_dir();
-    fs::create_dir_all(&base).unwrap();
-    let socket_path = base.join("flock.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
+    for (pane_args, calling_pane, expected_pane) in [
+        (vec!["1-1"], Some("p_calling"), "1-1"),
+        (vec!["--pane", "1-2"], Some("p_calling"), "1-2"),
+        (vec![], Some("p_calling"), "p_calling"),
+        (vec![], None, ""),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("flock.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
 
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        reader.read_line(&mut line).unwrap();
-        stream
-            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-            .unwrap();
-        stream.write_all(b"\n").unwrap();
-        stream.flush().unwrap();
-        line
-    });
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut line).unwrap();
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            line
+        });
 
-    let run = run_cli(
-        &socket_path,
-        &[
-            "pane",
-            "report-metadata",
-            "1-1",
+        let mut args = vec!["pane", "report-metadata"];
+        args.extend(pane_args);
+        args.extend_from_slice(&[
             "--source",
             "user:claude-title",
             "--agent",
             "claude",
+            "--applies-to-source",
+            "flock:claude",
+            "--seq",
+            "7",
             "--title",
             "Refactor auth",
             "--display-agent",
@@ -998,30 +1005,72 @@ fn pane_report_metadata_sends_presentation_request() {
             "working=deep in the mines",
             "--ttl-ms",
             "3600000",
-        ],
-    );
-    assert!(
-        run.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        ]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+        command.args(args).env("FLOCK_SOCKET_PATH", &socket_path);
+        if let Some(pane) = calling_pane {
+            command.env("FLOCK_PANE_ID", pane);
+        } else {
+            command.env_remove("FLOCK_PANE_ID");
+        }
+        let run = command.output().unwrap();
+        assert!(
+            run.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
 
-    let line = server.join().unwrap();
-    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(request["method"], "pane.report_metadata");
-    assert_eq!(request["params"]["pane_id"], "1-1");
-    assert_eq!(request["params"]["source"], "user:claude-title");
-    assert_eq!(request["params"]["agent"], "claude");
-    assert!(request["params"]["applies_to_source"].is_null());
-    assert_eq!(request["params"]["title"], "Refactor auth");
-    assert_eq!(request["params"]["display_agent"], "Claude auth");
-    assert_eq!(request["params"]["custom_status"], "middleware");
-    assert_eq!(
-        request["params"]["state_labels"]["working"],
-        "deep in the mines"
-    );
-    assert_eq!(request["params"]["ttl_ms"], 3_600_000);
+        let line = server.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "pane.report_metadata");
+        assert_eq!(request["params"]["pane_id"], expected_pane);
+        assert_eq!(request["params"]["source"], "user:claude-title");
+        assert_eq!(request["params"]["agent"], "claude");
+        assert_eq!(request["params"]["applies_to_source"], "flock:claude");
+        assert_eq!(request["params"]["seq"], 7);
+        assert_eq!(request["params"]["title"], "Refactor auth");
+        assert_eq!(request["params"]["display_agent"], "Claude auth");
+        assert_eq!(request["params"]["custom_status"], "middleware");
+        assert_eq!(
+            request["params"]["state_labels"]["working"],
+            "deep in the mines"
+        );
+        assert_eq!(request["params"]["ttl_ms"], 3_600_000);
 
+        cleanup_test_base(&base);
+    }
+}
+
+#[test]
+fn pane_report_metadata_rejects_invalid_pane_arguments() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+    for (args, expected) in [
+        (vec!["--pane"], "missing value for --pane"),
+        (
+            vec!["--pane", "--source", "user:title"],
+            "missing value for --pane",
+        ),
+        (
+            vec!["1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--pane", "1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--source", "user:title", "stray"],
+            "unknown option: stray",
+        ),
+    ] {
+        let mut command_args = vec!["pane", "report-metadata"];
+        command_args.extend(args);
+        let run = run_cli(&socket_path, &command_args);
+        assert_eq!(run.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(expected));
+    }
     cleanup_test_base(&base);
 }
 
