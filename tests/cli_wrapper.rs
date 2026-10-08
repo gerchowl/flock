@@ -1698,13 +1698,15 @@ fn server_stop_then_restart_restores_pane_history() {
         .to_string();
     let sent = run_cli(
         &socket_path,
-        &["pane", "send-text", &pane_id, &format!("echo {marker}\n")],
+        &["pane", "send-text", &pane_id, &format!("echo {marker}")],
     );
     assert!(
         sent.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&sent.stderr)
     );
+    let enter = run_cli(&socket_path, &["pane", "send-keys", &pane_id, "Enter"]);
+    assert!(enter.status.success());
     assert!(
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
             pane_read_recent_contains(&socket_path, &pane_id, marker)
@@ -2162,7 +2164,13 @@ fn tab_management_commands_work() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
 
-    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    let flock = spawn_flock_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "onboarding = false\n[ui]\ntab_mode = \"workspace\"\n",
+    );
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = run_cli(
@@ -2182,7 +2190,17 @@ fn tab_management_commands_work() {
 
     let created_tab = run_cli(
         &socket_path,
-        &["tab", "create", "--workspace", &workspace_id],
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            config_home.to_str().unwrap(),
+            "--label",
+            "review",
+            "--no-focus",
+        ],
     );
     assert!(created_tab.status.success());
     let created_tab_json: serde_json::Value = serde_json::from_slice(&created_tab.stdout).unwrap();
@@ -2191,6 +2209,8 @@ fn tab_management_commands_work() {
         .unwrap()
         .to_string();
     assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
+    assert_eq!(created_tab_json["result"]["tab"]["label"], "review");
+    assert_eq!(created_tab_json["result"]["tab"]["focused"], false);
 
     let listed_tabs = run_cli(&socket_path, &["tab", "list", "--workspace", &workspace_id]);
     assert!(listed_tabs.status.success());
@@ -3481,21 +3501,45 @@ fn agent_result_and_history_read_an_opencode_session() {
     assert_eq!(info["status_text"], "approve", "{json}");
 
     let history = run_cli(&socket_path, &["agent", "history", "1-1"]);
-    let history_json: serde_json::Value = if history.status.success() {
-        serde_json::from_slice(&history.stdout).unwrap()
-    } else {
-        // `flk agent history` is documented but not wired as a CLI verb;
-        // drive the socket method it would call.
-        send_request(
-            &socket_path,
-            r#"{"id":"req_575_history","method":"agent.history","params":{"target":"1-1"}}"#,
-        )
-    };
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     let turns = history_json["result"]["history"]["turns"]
         .as_array()
         .unwrap_or_else(|| panic!("{history_json}"));
     assert_eq!(turns.len(), 2, "{history_json}");
     assert_eq!(turns[0]["text"], "review PR 12");
+
+    for detail in ["reply", "collapsed", "full"] {
+        let page = run_cli_json(
+            &socket_path,
+            &[
+                "agent", "history", "1-1", "--detail", detail, "--limit", "1",
+            ],
+        );
+        assert_eq!(page["result"]["history"]["detail"], detail, "{page}");
+        assert_eq!(
+            page["result"]["history"]["turns"].as_array().unwrap().len(),
+            1,
+            "{page}"
+        );
+        let cursor = page["result"]["history"]["next_cursor"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        let next = run_cli_json(
+            &socket_path,
+            &["agent", "history", "1-1", "--cursor", &cursor],
+        );
+        assert_eq!(
+            next["result"]["history"]["turns"],
+            serde_json::json!([]),
+            "{next}"
+        );
+    }
 
     cleanup_spawned_flock(flock, base);
 }
