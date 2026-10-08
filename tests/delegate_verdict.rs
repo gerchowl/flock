@@ -29,14 +29,6 @@ impl Pane {
     }
 
     fn frames(frames: Vec<(String, String)>) -> Self {
-        Self::scripted(frames, false)
-    }
-
-    fn cycling_frames(frames: Vec<(String, String)>) -> Self {
-        Self::scripted(frames, true)
-    }
-
-    fn scripted(frames: Vec<(String, String)>, cycle: bool) -> Self {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -64,11 +56,11 @@ impl Pane {
                     continue;
                 };
                 // Accepted sockets can inherit the listener's nonblocking mode.
-                stream.set_nonblocking(false).unwrap();
-                // A connected CLI can be descheduled before writing its request.
-                if stream
-                    .set_read_timeout(Some(Duration::from_secs(60)))
-                    .is_err()
+                // A connected CLI can be descheduled or disconnect during setup.
+                if stream.set_nonblocking(false).is_err()
+                    || stream
+                        .set_read_timeout(Some(Duration::from_secs(60)))
+                        .is_err()
                 {
                     // Session liveness probes connect and close without a request.
                     continue;
@@ -83,11 +75,7 @@ impl Pane {
                 counted.fetch_add(1, Ordering::SeqCst);
                 let result = match request["method"].as_str().unwrap() {
                     "agent.get" => {
-                        frame = if cycle {
-                            sampled % frames.len()
-                        } else {
-                            sampled.min(frames.len() - 1)
-                        };
+                        frame = sampled.min(frames.len() - 1);
                         sampled += 1;
                         let status = &frames[frame].0;
                         let cursor = if status == "idle" {
@@ -121,6 +109,8 @@ impl Pane {
                             "{}",
                             json!({"id": request["id"], "error": {"code": "workspace_not_found", "message": "fixture already gone"}})
                         );
+                        // Error replies must also outlive the client read.
+                        let _ = stream.read(&mut [0_u8; 1]);
                         continue;
                     }
                     other => panic!("unexpected request: {other}"),
@@ -367,22 +357,7 @@ fn delegate_blocked_provider_retry_is_stalled_with_eta() {
     let live = Pane::json(&live);
     assert_eq!(live["blocked_reason"], "provider_limit");
     assert_eq!(live["retry_after_ms"], 2_775_000);
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "0",
-                "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
+    let out = pane.wait_for_verdict(&["delegate", "wait", "fixture", "--silence", "0", "--json"]);
     assert_eq!(
         out.status.code(),
         Some(7),
@@ -406,22 +381,7 @@ fn delegate_blocked_provider_retry_is_stalled_with_eta() {
 #[test]
 fn delegate_long_provider_retry_stalls_with_silence_disabled() {
     let pane = Pane::new("working", "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retrying in 46m 15s attempt #1] esc interrupt");
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "0",
-                "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
+    let out = pane.wait_for_verdict(&["delegate", "wait", "fixture", "--silence", "0", "--json"]);
     assert_eq!(
         out.status.code(),
         Some(7),
@@ -618,14 +578,17 @@ fn delegate_short_provider_retry_persisting_outlasts_silence() {
 
 #[test]
 fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
-    let pane = Pane::cycling_frames(
-        (0..2)
+    // A changed-screen bug reaches idle after these polls instead of relying
+    // on a wall-clock command timeout to distinguish it from silence.
+    let pane = Pane::frames(
+        (0..5)
             .map(|i| {
                 (
                     "working".into(),
                     format!("tool waiting\n• Working ({i}s • esc to interrupt)"),
                 )
             })
+            .chain(std::iter::once(("idle".into(), "DONE: recovered".into())))
             .collect(),
     );
     let out = pane.wait_for_verdict(&[
@@ -633,14 +596,14 @@ fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
         "wait",
         "fixture",
         "--silence",
-        "400ms",
+        // The settled loop waits 200ms between samples.
+        "1ms",
         "--json",
     ]);
     assert_eq!(
         out.status.code(),
         Some(7),
-        "stdout {}; stderr {}",
-        String::from_utf8_lossy(&out.stdout),
+        "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(Pane::json(&out)["reason"], "silence");
@@ -648,38 +611,73 @@ fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
 
 #[test]
 fn delegate_new_transcript_lines_reset_silence() {
+    // Every working sample advances the transcript, then a bounded number
+    // of polls reaches idle. Scheduling delays cannot exhaust the frames.
     let pane = Pane::frames(
-        (0..50)
+        (0..5)
             .map(|i| {
                 (
                     "working".into(),
                     format!("new transcript line {i}\n• Working ({i}s • esc to interrupt)"),
                 )
             })
+            .chain(std::iter::once(("idle".into(), "DONE: recovered".into())))
             .collect(),
     );
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "400ms",
-                "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        // The settled loop waits 200ms between samples.
+        "1ms",
+        "--json",
+    ]);
     assert_eq!(
         out.status.code(),
-        Some(124),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
+}
+
+#[test]
+fn delegate_workspace_error_waits_for_complete_request_and_client_close() {
+    let pane = Pane::new("working", "fixture");
+    let mut stream = std::os::unix::net::UnixStream::connect(&pane.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    write!(
+        stream,
+        "{}",
+        json!({"id": "fixture", "method": "workspace.get", "params": {"workspace_id": "ws_fixture"}})
+    )
+    .unwrap();
+    let error = stream.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(stream).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["error"]["code"], "workspace_not_found");
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = reader.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
 }
 
 #[test]
