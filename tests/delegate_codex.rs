@@ -549,6 +549,110 @@ fn codex_delegate_hook_review_is_refused_without_typing_the_brief() {
     assert!(agent_get(&server, "blocked").is_none());
 }
 
+/// Log every byte, including input without Enter, so a menu cannot silently
+/// receive a brief while the CLI still reports a refusal.
+fn startup_screen_harness(server: &Server, screen: &str) {
+    fs::write(server.base.join("screen"), screen).unwrap();
+    fs::create_dir_all(server.base.join("raw")).unwrap();
+    let script = server.base.join("raw/codex");
+    fs::write(
+        &script,
+        r#"import os, sys, tty
+from pathlib import Path
+base = Path(__file__).parent.parent
+tty.setraw(0)
+log = base / 'startup-input'
+log.write_bytes(b'')
+screen = (base / 'screen').read_text()
+sys.stdout.write('\x1b[2J\x1b[H' + screen.replace('\n', '\r\n'))
+sys.stdout.flush()
+while True:
+    byte = os.read(0, 1)
+    with log.open('ab') as out:
+        out.write(byte)
+    if byte == b'\r':
+        sys.stdout.write('\x1b[2J\x1b[H• Working (1s • esc to interrupt)\r\n')
+        sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+    fs::write(
+        bin_dir(&server.base).join("codex"),
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn codex_delegate_startup_passive_banners_submit_and_confirm() {
+    let server = start_server();
+    operator_workspace(&server);
+    startup_screen_harness(
+        &server,
+        include_str!("fixtures/codex/startup-passive-banners.txt"),
+    );
+    let b = brief(&server, "task.md", "do it\n");
+    let mut child = start_codex(
+        &server,
+        "banners",
+        &b,
+        &["--ready-timeout", "10000", "--json"],
+    );
+    let status = exited_within(&mut child, WITHIN).expect("confirmed submission");
+    let out = finish(child);
+    assert!(status.success(), "{} / {}", stdout(&out), stderr(&out));
+    assert_eq!(stdout_json(&out)["name"], "banners");
+    assert_eq!(stdout_json(&out)["round"], 1);
+    assert_eq!(
+        fs::read(server.base.join("startup-input")).unwrap(),
+        format!("{}\r", expected_line(&b)).as_bytes()
+    );
+    // Only the child's receipt of Enter paints Working. A successful start
+    // therefore proves the guarded submit observed that transition.
+    assert_eq!(
+        agent_get(&server, "banners").unwrap()["agent_status"],
+        "working"
+    );
+}
+
+#[test]
+fn codex_delegate_startup_update_dialog_refuses_without_typing() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    startup_screen_harness(
+        &server,
+        include_str!("fixtures/codex/startup-update-dialog.txt"),
+    );
+    let b = brief(&server, "task.md", "do it\n");
+    let mut child = start_codex(
+        &server,
+        "update",
+        &b,
+        &["--ready-timeout", "10000", "--json"],
+    );
+    let status = exited_within(&mut child, WITHIN).expect("update dialog refusal");
+    let out = finish(child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{} / {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("the brief was not submitted"));
+    assert!(
+        stderr(&out).contains("unknown_composer"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fs::read(server.base.join("startup-input"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(workspaces(&server).len(), before);
+    assert!(agent_get(&server, "update").is_none());
+}
+
 #[test]
 fn codex_delegate_session_hook_can_arrive_after_submit() {
     let server = start_server();

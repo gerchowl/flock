@@ -597,6 +597,32 @@ impl Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_startup_passive_banners_leave_composer_ready() {
+        let screen = include_str!("../../tests/fixtures/codex/startup-passive-banners.txt");
+        let detection = crate::detect::detect_agent(Some(Agent::Codex), screen);
+        assert_eq!(detection.state, crate::detect::AgentState::Idle);
+        assert!(detection.visible_idle);
+        assert!(!detection.visible_blocker);
+        assert!(detection.provider_limit.is_none());
+        assert_eq!(composer(Agent::Codex, screen, "brief"), Composer::Empty);
+        assert_eq!(
+            composer(
+                Agent::Codex,
+                &screen.replace("Ask Codex to do anything", "brief"),
+                "brief"
+            ),
+            Composer::Owned
+        );
+    }
+
+    #[test]
+    fn codex_startup_update_dialog_is_not_a_composer() {
+        let screen = include_str!("../../tests/fixtures/codex/startup-update-dialog.txt");
+        assert_eq!(composer(Agent::Codex, screen, "brief"), Composer::Unknown);
+    }
+
     #[test]
     fn guarded_composer_requires_complete_exact_editor() {
         let screen = "──────\n❯ hello world\n──────\n? for shortcuts";
