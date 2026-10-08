@@ -55,9 +55,15 @@ impl Pane {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                // A deadline can also close the client before setup completes.
+                if stream.set_nonblocking(false).is_err()
+                    || stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .is_err()
+                {
+                    continue;
+                }
                 let mut line = String::new();
                 if BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
@@ -95,6 +101,8 @@ impl Pane {
                             "{}",
                             json!({"id": request["id"], "error": {"code": "workspace_not_found", "message": "fixture already gone"}})
                         );
+                        // Error replies must also outlive the client read.
+                        let _ = stream.read(&mut [0_u8; 1]);
                         continue;
                     }
                     other => panic!("unexpected request: {other}"),
@@ -490,14 +498,17 @@ fn delegate_short_provider_retry_persisting_outlasts_silence() {
 
 #[test]
 fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
+    // A changed-screen bug reaches idle after these polls instead of relying
+    // on a wall-clock command timeout to distinguish it from silence.
     let pane = Pane::frames(
-        (0..50)
+        (0..5)
             .map(|i| {
                 (
                     "working".into(),
                     format!("tool waiting\n• Working ({i}s • esc to interrupt)"),
                 )
             })
+            .chain(std::iter::once(("idle".into(), "DONE: recovered".into())))
             .collect(),
     );
     let out = pane
@@ -507,41 +518,10 @@ fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
                 "wait",
                 "fixture",
                 "--silence",
-                "400ms",
+                // The settled loop waits 200ms between samples.
+                "1ms",
                 "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(7));
-    assert_eq!(Pane::json(&out)["reason"], "silence");
-}
-
-#[test]
-fn delegate_new_transcript_lines_reset_silence() {
-    let pane = Pane::frames(
-        (0..50)
-            .map(|i| {
-                (
-                    "working".into(),
-                    format!("new transcript line {i}\n• Working ({i}s • esc to interrupt)"),
-                )
-            })
-            .collect(),
-    );
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "400ms",
-                "--timeout",
-                "5000",
+                "30000",
                 "--json",
             ],
             None,
@@ -550,10 +530,89 @@ fn delegate_new_transcript_lines_reset_silence() {
         .unwrap();
     assert_eq!(
         out.status.code(),
-        Some(124),
+        Some(7),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(Pane::json(&out)["reason"], "silence");
+}
+
+#[test]
+fn delegate_new_transcript_lines_reset_silence() {
+    // Every working sample advances the transcript, then a bounded number
+    // of polls reaches idle. Scheduling delays cannot exhaust the frames.
+    let pane = Pane::frames(
+        (0..5)
+            .map(|i| {
+                (
+                    "working".into(),
+                    format!("new transcript line {i}\n• Working ({i}s • esc to interrupt)"),
+                )
+            })
+            .chain(std::iter::once(("idle".into(), "DONE: recovered".into())))
+            .collect(),
+    );
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "1ms",
+                "--timeout",
+                "30000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
+}
+
+#[test]
+fn delegate_workspace_error_waits_for_complete_request_and_client_close() {
+    let pane = Pane::new("working", "fixture");
+    let mut stream = std::os::unix::net::UnixStream::connect(&pane.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    write!(
+        stream,
+        "{}",
+        json!({"id": "fixture", "method": "workspace.get", "params": {"workspace_id": "ws_fixture"}})
+    )
+    .unwrap();
+    let error = stream.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(stream).unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["error"]["code"], "workspace_not_found");
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let error = reader.read(&mut [0_u8; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
 }
 
 #[test]
