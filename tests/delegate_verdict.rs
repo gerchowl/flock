@@ -12,7 +12,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Pane {
     base: PathBuf,
@@ -29,6 +29,14 @@ impl Pane {
     }
 
     fn frames(frames: Vec<(String, String)>) -> Self {
+        Self::scripted(frames, false)
+    }
+
+    fn cycling_frames(frames: Vec<(String, String)>) -> Self {
+        Self::scripted(frames, true)
+    }
+
+    fn scripted(frames: Vec<(String, String)>, cycle: bool) -> Self {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -55,14 +63,18 @@ impl Pane {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut line = String::new();
-                if BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                stream.set_nonblocking(false).unwrap();
+                // A connected CLI can be descheduled before writing its request.
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
                     .is_err()
                 {
+                    // Session liveness probes connect and close without a request.
+                    continue;
+                }
+                let mut line = String::new();
+                if BufReader::new(&mut stream).read_line(&mut line).is_err() {
                     continue;
                 }
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
@@ -71,7 +83,11 @@ impl Pane {
                 counted.fetch_add(1, Ordering::SeqCst);
                 let result = match request["method"].as_str().unwrap() {
                     "agent.get" => {
-                        frame = sampled.min(frames.len() - 1);
+                        frame = if cycle {
+                            sampled % frames.len()
+                        } else {
+                            sampled.min(frames.len() - 1)
+                        };
                         sampled += 1;
                         let status = &frames[frame].0;
                         let cursor = if status == "idle" {
@@ -79,8 +95,18 @@ impl Pane {
                         } else {
                             "term_fixture:0:1:1:w"
                         };
-                        json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
-                        "agent_status": status, "turn_cursor": cursor, "revision": 0}})
+                        let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
+                        "agent_status": status, "turn_cursor": cursor, "revision": 0}});
+                        if status == "blocked" && frames[frame].1.contains("retrying in ") {
+                            record["agent"]["blocked_reason"] = json!("provider_limit");
+                            record["agent"]["retry_after_ms"] =
+                                json!(if frames[frame].1.contains("46m 15s") {
+                                    2_775_000
+                                } else {
+                                    2_000
+                                });
+                        }
+                        record
                     }
                     "pane.read" => {
                         assert_eq!(request["params"]["source"], "detection");
@@ -99,9 +125,15 @@ impl Pane {
                     }
                     other => panic!("unexpected request: {other}"),
                 };
-                let _ = writeln!(stream, "{}", json!({"id": request["id"], "result": result}));
+                let response = format!("{}\n", json!({"id": request["id"], "result": result}));
+                let _ = stream.write_all(response.as_bytes());
                 // Keep the response socket alive until the client finishes its read.
-                let _ = stream.read(&mut [0_u8; 1]);
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .is_ok()
+                {
+                    let _ = stream.read(&mut [0_u8; 1]);
+                }
             }
         });
         let hash = socket
@@ -159,6 +191,29 @@ impl Pane {
         command
     }
 
+    // Poll completion rather than racing verdict sampling against a CLI timeout.
+    // Exact timer boundaries are covered by Monitor tests with injected Instants.
+    fn wait_for_verdict(&self, args: &[&str]) -> Output {
+        let mut child = self.command(args, None).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let out = child.wait_with_output().unwrap();
+                panic!(
+                    "verdict did not arrive after {} requests: stdout {}; stderr {}",
+                    self.calls.load(Ordering::SeqCst),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn json(output: &Output) -> Value {
         serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
             panic!(
@@ -204,6 +259,7 @@ impl S1 {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -298,6 +354,56 @@ fn delegate_silence_stalls_a_working_pane_and_status_remembers_the_verdict() {
 }
 
 #[test]
+fn delegate_blocked_provider_retry_is_stalled_with_eta() {
+    let pane = Pane::new(
+        "blocked",
+        "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt",
+    );
+    let live = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert!(live.status.success());
+    let live = Pane::json(&live);
+    assert_eq!(live["blocked_reason"], "provider_limit");
+    assert_eq!(live["retry_after_ms"], 2_775_000);
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "0",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let value = Pane::json(&out);
+    assert_eq!(value["reason"], "provider_limit");
+    assert_eq!(value["retry_after_ms"], 2_775_000);
+    let status = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(
+        Pane::json(&status)["latest_verdict"]["reason"],
+        "provider_limit"
+    );
+}
+
+#[test]
 fn delegate_long_provider_retry_stalls_with_silence_disabled() {
     let pane = Pane::new("working", "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retrying in 46m 15s attempt #1] esc interrupt");
     let out = pane
@@ -316,7 +422,13 @@ fn delegate_long_provider_retry_stalls_with_silence_disabled() {
         )
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stdout {}; stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let value = Pane::json(&out);
     assert_eq!(value["verdict"], "provider_limit");
     assert_eq!(value["reason"], "provider_limit");
@@ -421,10 +533,43 @@ fn delegate_s1_failure_is_advisory_and_its_breaker_is_per_endpoint() {
         .command(&args, Some(&format!("{}, {}", s1.url, healthy.url)))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stdout {}; stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(Pane::json(&out)["s1"].is_object());
     assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
     assert_eq!(s1.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn delegate_blocked_short_provider_retry_keeps_waiting_and_recovers() {
+    let retry = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 5s attempt #1] esc interrupt";
+    let pane = Pane::frames(vec![
+        ("blocked".into(), retry.into()),
+        ("blocked".into(), retry.into()),
+        ("idle".into(), "DONE: recovered".into()),
+    ]);
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "0",
+        "--settle",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
 }
 
 #[test]
@@ -435,24 +580,16 @@ fn delegate_short_provider_retry_recovers_and_settles_normally() {
         ("working".into(), retry.into()),
         ("idle".into(), "DONE: recovered".into()),
     ]);
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "0",
-                "--settle",
-                "0",
-                "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "0",
+        "--settle",
+        "0",
+        "--json",
+    ]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -468,30 +605,21 @@ fn delegate_short_provider_retry_persisting_outlasts_silence() {
         "working",
         "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt",
     );
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "3s",
-                "--timeout",
-                "8000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(7));
+    let out = pane.wait_for_verdict(&["delegate", "wait", "fixture", "--silence", "3s", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stdout {}; stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(Pane::json(&out)["reason"], "provider_limit");
 }
 
 #[test]
 fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
-    let pane = Pane::frames(
-        (0..50)
+    let pane = Pane::cycling_frames(
+        (0..2)
             .map(|i| {
                 (
                     "working".into(),
@@ -500,23 +628,21 @@ fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
             })
             .collect(),
     );
-    let out = pane
-        .command(
-            &[
-                "delegate",
-                "wait",
-                "fixture",
-                "--silence",
-                "400ms",
-                "--timeout",
-                "5000",
-                "--json",
-            ],
-            None,
-        )
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(7));
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "400ms",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stdout {}; stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(Pane::json(&out)["reason"], "silence");
 }
 

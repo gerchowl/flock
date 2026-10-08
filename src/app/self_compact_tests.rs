@@ -801,9 +801,9 @@ async fn the_idle_wake_in_flight_defers_the_compaction_rather_than_interleaving(
     assert_eq!(armed_continuation(&app).as_deref(), Some("carry on"));
 }
 
-/// B4: the continuation reaches a real PTY and `encode_api_text` does not
-/// escape what it wraps, so these are the difference between an arming and a
-/// send-text-to-your-own-pane.
+/// B4: a saved continuation must survive intact. Even though `encode_api_text`
+/// strips paste delimiters, arming refuses controls rather than changing the
+/// continuation, and also protects the non-bracketed raw-byte path.
 #[test]
 fn a_continuation_cannot_break_out_of_the_paste_or_run_as_a_command() {
     use crate::agent_self_compact::{check_continuation, ContinuationProblem as P};

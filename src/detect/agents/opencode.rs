@@ -2,7 +2,10 @@ use super::super::{has_interrupt_pattern, AgentState};
 
 pub(super) fn detect(content: &str) -> AgentState {
     // Blocked
-    if content.contains("△ Permission required") || has_opencode_question_prompt(content) {
+    if super::super::provider_limit::opencode(content).is_some()
+        || content.contains("△ Permission required")
+        || has_opencode_question_prompt(content)
+    {
         return AgentState::Blocked;
     }
 

@@ -112,18 +112,53 @@ fn write_fake_opencode(base: &Path) {
     let bin = bin_dir(base);
     fs::create_dir_all(&bin).unwrap();
     let script = format!(
-        "#!/bin/sh\n\
-         if [ -e '{base}/starting' ]; then\n\
-         : > '{base}/startup-entered'\n\
-         while [ -e '{base}/starting' ]; do sleep 0.05; done\n\
-         fi\n\
-         printf '%s\\n' \"$*\" >> '{base}/argv.log'\n\
-         printf '%s\\n' \"$PWD\" >> '{base}/cwd.log'\n\
-         if [ -e '{base}/die' ]; then exit 1; fi\n\
-         ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
-         if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
-         sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+        r#"#!/bin/sh
+if [ -e '{base}/starting' ]; then
+  : > '{base}/startup-entered'
+  while [ -e '{base}/starting' ]; do sleep 0.05; done
+fi
+printf '%s\n' "$*" >> '{base}/argv.log'
+printf '%s\n' "$PWD" >> '{base}/cwd.log'
+if [ -e '{base}/die' ]; then exit 1; fi
+( last=; while :; do
+  now=$(cat '{base}/screen' 2>/dev/null)
+  if [ "$now" != "$last" ]; then
+    printf '\033[2J\033[H%s\n' "$now"
+    last=$now
+    : > '{base}/first-draw'
+  fi
+  sleep 0.05
+done ) &
+if [ -e '{base}/ignore-input-ms' ]; then
+  ( while [ ! -e '{base}/first-draw' ]; do sleep 0.01; done
+    sleep "$(awk '{{print $1 / 1000}}' '{base}/ignore-input-ms')"
+    : > '{base}/accept-input' ) &
+fi
+pending=
+first=1
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{base}/input.log'
+  if [ -e '{base}/ignore-input-ms' ] && [ ! -e '{base}/accept-input' ]; then continue; fi
+  if [ -e '{base}/hold-first-enter' ] && [ -z "$pending" ]; then
+    pending=$line
+    ( printf '┃\n'
+      printf '%s\n' "$pending" | fold -s -w 40 | sed 's/^/┃  /'
+      printf '┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n' ) > '{base}/screen'
+    continue
+  fi
+  if [ -n "$pending" ]; then line=$pending; pending=; rm '{base}/hold-first-enter'; fi
+  if [ -e '{base}/late-submit-ms' ]; then
+    sleep "$(awk '{{print $1 / 1000}}' '{base}/late-submit-ms')"
+  fi
+  printf '%s\n' "$line" >> '{base}/typed.log'
+  if [ ! -e '{base}/manual-submit' ] && [ -n "$first" ]; then
+    first=
+    printf '\033[2J\033[H■■■■⬝⬝  esc interrupt  opencode\n'
+    sleep 0.4
+    printf '\033[2J\033[H%s\n' "$(cat '{base}/screen')"
+  fi
+done
+"#,
         base = base.display()
     );
     let path = bin.join("opencode");
@@ -977,6 +1012,7 @@ fn a6_start_without_await_returns_after_submit() {
         .expect("turn_cursor")
         .to_string();
 
+    report(&server, &pane, "idle");
     let mut waiter = cli_spawn(
         &server,
         &[
@@ -1344,6 +1380,8 @@ fn a13_closed_pane_is_gone() {
     let pane = make_ready(&server, "d1");
     wait_typed(&server, 1);
     report(&server, &pane, "working");
+    // Allow start's confirmation poll to hand off to the await before closing.
+    thread::sleep(Duration::from_millis(500));
     let closed = request(
         &server,
         &format!(r#"{{"id":"pc","method":"pane.close","params":{{"pane_id":"{pane}"}}}}"#),
@@ -1617,8 +1655,148 @@ fn a20_start_waits_for_the_first_screen_paint() {
         premature.is_none(),
         "a blank startup screen must not receive the brief"
     );
+    wait_typed(&server, 1);
+    report(&server, &pane, "working");
     let status = exited_within(&mut child, WITHIN).expect("start returns after first paint");
     let out = finish(child);
     assert_eq!(status.code(), Some(0), "{}", stderr(&out));
     wait_typed(&server, 1);
+}
+
+/// A startup session cannot confirm a brief that the input handler discarded.
+#[test]
+fn opencode_start_fails_loudly_when_startup_discards_brief() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("ignore-input-ms"), "60000").unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let before = workspaces(&server).len();
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status =
+        exited_within(&mut child, Duration::from_secs(40)).expect("confirmation is bounded");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("brief submission could not be confirmed"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("flk delegate reap d1"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!server.base.join("typed.log").exists());
+    assert_eq!(workspaces(&server).len(), before + 1);
+    assert!(walk(&server.base.join("state"))
+        .iter()
+        .any(|p| p.ends_with("d1.json")));
+}
+
+#[test]
+fn opencode_late_submission_confirms_without_teardown() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("late-submit-ms"), "4000").unwrap();
+    let b = brief(&server, "late.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    assert!(exited_within(&mut child, Duration::from_secs(2)).is_none());
+    let status = exited_within(&mut child, WITHIN).expect("late turn confirms");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(typed(&server), vec![expected_line(&b)]);
+    assert_eq!(agent_get(&server, "d1").unwrap()["pane_id"], pane);
+}
+
+#[test]
+fn opencode_held_composer_retries_enter_only_once() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("hold-first-enter"), "").unwrap();
+    let b = brief(&server, "held.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    let deadline = Instant::now() + WITHIN;
+    while !fs::read_to_string(server.base.join("screen"))
+        .unwrap_or_default()
+        .contains("╹")
+    {
+        assert!(Instant::now() < deadline, "the composer is drawn");
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(200));
+    let painted = cli(
+        &server,
+        &[
+            "pane", "read", &pane, "--source", "recent", "--format", "text",
+        ],
+    );
+
+    let status = exited_within(&mut child, Duration::from_secs(40)).expect("retry confirms");
+    let out = finish(child);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{}\ncomposer:\n{}",
+        stderr(&out),
+        stdout(&painted)
+    );
+    assert_eq!(typed(&server), vec![expected_line(&b)]);
+    assert_eq!(
+        read_lines(&server.base.join("input.log")),
+        vec![expected_line(&b), String::new()]
+    );
+}
+
+#[test]
+fn opencode_empty_composer_retypes_once_after_dropped_input() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("ignore-input-ms"), "10000").unwrap();
+    let b = brief(&server, "empty.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    fs::write(
+        server.base.join("screen"),
+        "┃\n┃  Ask anything…\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n",
+    )
+    .unwrap();
+    report_session(&server, &pane);
+    let status = exited_within(&mut child, Duration::from_secs(40)).expect("retry confirms");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(typed(&server), vec![expected_line(&b)]);
+    assert_eq!(
+        read_lines(&server.base.join("input.log")),
+        vec![expected_line(&b), expected_line(&b)]
+    );
+}
+
+#[test]
+fn opencode_ambiguous_submission_keeps_workspace_and_does_not_retry() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("manual-submit"), "").unwrap();
+    let b = brief(&server, "ambiguous.md", "x\n");
+    let before = workspaces(&server).len();
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status = exited_within(&mut child, Duration::from_secs(40))
+        .expect("ambiguous confirmation is bounded");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Workspace kept for inspection"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(workspaces(&server).len(), before + 1);
+    assert!(agent_get(&server, "d1").is_some());
+    assert_eq!(typed(&server), vec![expected_line(&b)]);
+    assert_eq!(
+        read_lines(&server.base.join("input.log")),
+        vec![expected_line(&b)]
+    );
 }

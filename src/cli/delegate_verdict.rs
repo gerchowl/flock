@@ -25,76 +25,29 @@ pub(super) fn last_line(screen: &str) -> String {
 }
 
 pub(super) fn provider_limit(screen: &str) -> Option<Verdict> {
-    // The provider status row needs BOTH the error and retry controls. A quoted
-    // error in the agent's transcript is not evidence of a provider wait.
-    let line = screen.lines().rev().take(40).find(|line| {
-        let lower = line.to_lowercase();
-        (lower.contains("usage exceeded") || lower.contains("rate limit"))
-            && lower.contains("retrying in ")
-            && lower.contains("attempt #")
-            && lower.contains("esc interrupt")
-    })?;
-    let lower = line.to_lowercase();
-    let eta = lower
-        .split_once("retrying in ")?
-        .1
-        .split_once(" attempt #")?
-        .0;
+    let wait = crate::detect::provider_limit::opencode(screen)?;
     Some(Verdict {
         verdict: "provider_limit".into(),
         reason: "provider_limit".into(),
-        retry_after_ms: parse_duration(eta).ok(),
+        retry_after_ms: wait.retry_after_ms,
         last_line: last_line(screen),
     })
 }
 
-pub(super) fn parse_duration(value: &str) -> Result<u64, String> {
-    let value = value.trim();
-    if value == "0" {
-        return Ok(0);
-    }
-    let mut total = 0_u64;
-    let mut rest = value;
-    while !rest.is_empty() {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        let count = rest.bytes().take_while(u8::is_ascii_digit).count();
-        if count == 0 {
-            return Err(format!("invalid duration: {value}"));
-        }
-        let number = rest[..count]
-            .parse::<u64>()
-            .map_err(|_| format!("invalid duration: {value}"))?;
-        rest = &rest[count..];
-        let (unit, factor) = if rest.starts_with("ms") {
-            (2, 1)
-        } else if rest.starts_with('s') {
-            (1, 1_000)
-        } else if rest.starts_with('m') {
-            (1, 60_000)
-        } else if rest.starts_with('h') {
-            (1, 3_600_000)
-        } else {
-            return Err(format!("duration needs ms, s, m or h: {value}"));
-        };
-        total = number
-            .checked_mul(factor)
-            .and_then(|n| total.checked_add(n))
-            .ok_or_else(|| format!("duration too large: {value}"))?;
-        rest = &rest[unit..];
-    }
-    if value.is_empty() {
-        return Err("duration is empty".into());
-    }
-    Ok(total)
-}
+pub(super) use crate::detect::provider_limit::parse_duration;
 
 pub(super) fn readiness(screen: &str, status: &str) -> Verdict {
-    if matches!(status, "working" | "unknown") {
+    if matches!(status, "working" | "unknown" | "blocked") {
         if let Some(mut verdict) = provider_limit(screen) {
-            verdict.verdict = "stalled".into();
+            verdict.verdict = if verdict
+                .retry_after_ms
+                .is_some_and(|eta| eta >= DEFAULT_SILENCE_MS)
+            {
+                "stalled"
+            } else {
+                "unknown"
+            }
+            .into();
             return verdict;
         }
     }
@@ -150,7 +103,7 @@ impl Monitor {
 
     pub fn observe(&mut self, status: &str, screen: &str, now: Instant) -> bool {
         self.screen = screen.to_string();
-        if matches!(status, "working" | "unknown") {
+        if matches!(status, "working" | "unknown" | "blocked") {
             if let Some(verdict) = provider_limit(screen) {
                 let since = *self.retry_since.get_or_insert(now);
                 let threshold = self.silence.unwrap_or(Duration::from_secs(300));
@@ -224,6 +177,28 @@ mod tests {
     }
 
     #[test]
+    fn delegate_blocked_provider_retry_uses_eta_and_persistence_thresholds() {
+        let now = Instant::now();
+        let short = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 5s attempt #1] esc interrupt";
+        let mut disabled = Monitor::new(0, now);
+        assert!(!disabled.observe("blocked", short, now));
+        assert!(!disabled.observe("blocked", short, now + Duration::from_secs(600)));
+        assert!(!disabled.observe("idle", "DONE: recovered", now + Duration::from_secs(601)));
+        assert!(disabled.observe("blocked", &short.replace("5s", "5m"), now));
+        let mut timed = Monitor::new(10_000, now);
+        assert!(!timed.observe("blocked", short, now));
+        for second in 1..10 {
+            let changing = short.replace("attempt #1", &format!("attempt #{}", second + 1));
+            assert!(!timed.observe("blocked", &changing, now + Duration::from_secs(second)));
+        }
+        assert!(timed.observe("blocked", short, now + Duration::from_secs(10)));
+        let verdict = readiness(short, "blocked");
+        assert_eq!(verdict.verdict, "unknown");
+        assert_eq!(verdict.reason, "provider_limit");
+        assert_eq!(verdict.retry_after_ms, Some(5_000));
+    }
+
+    #[test]
     fn delegate_harness_chrome_is_not_transcript_progress() {
         let now = Instant::now();
         for (one, two) in [
@@ -251,6 +226,77 @@ mod tests {
     }
 
     #[test]
+    fn delegate_running_tool_counter_stalls_without_hiding_progress() {
+        // Derived from captured two-space tool-result rows in detect::tests.
+        let now = Instant::now();
+        for spacing in [" ", "  ", "\t"] {
+            for ellipsis in ["…", "..."] {
+                for (first_suffix, ticking_suffix, normalized_suffix) in [
+                    ("(5s)", "(6s)", ""),
+                    ("(2m 5s)", "(2m 6s)", ""),
+                    ("(1h 2m 3s)", "(1h 2m 4s)", ""),
+                    ("(5s · timeout 2m)", "(6s · timeout 2m)", " (timeout 2m)"),
+                    (
+                        "(ctrl+b to run in background)",
+                        "(2m 5s · ctrl+b to run in background)",
+                        " (ctrl+b to run in background)",
+                    ),
+                    (
+                        "(2m 5s · ctrl+b to run in background)",
+                        "(2m 6s · ctrl+b to run in background)",
+                        " (ctrl+b to run in background)",
+                    ),
+                ] {
+                    let row = format!("Bash(build)\n  ⎿{spacing}Running{ellipsis}");
+                    let first = format!("{row} {first_suffix}");
+                    let ticking = format!("{row} {ticking_suffix}");
+                    let mut monitor = Monitor::new(100, now);
+                    assert!(!monitor.observe("working", &first, now));
+                    assert!(monitor.observe("working", &ticking, now + Duration::from_millis(100)));
+                    assert_eq!(monitor.latest.as_ref().unwrap().reason, "silence");
+                    assert_eq!(
+                        crate::detect::progress_text(&first),
+                        format!("{row}{normalized_suffix}")
+                    );
+                    assert_eq!(
+                        crate::detect::progress_text(&ticking),
+                        format!("{row}{normalized_suffix}")
+                    );
+                    for progress in [
+                        format!("{ticking}\ncompiled module"),
+                        ticking.replace("Bash(build)", "Bash(test)"),
+                        format!("Bash(build)\n  ⎿{spacing}Finished"),
+                    ] {
+                        let mut monitor = Monitor::new(100, now);
+                        assert!(!monitor.observe("working", &first, now));
+                        assert!(!monitor.observe(
+                            "working",
+                            &progress,
+                            now + Duration::from_millis(100)
+                        ));
+                    }
+                }
+                let row = format!("Bash(build)\n  ⎿{spacing}Running{ellipsis}");
+                let mut monitor = Monitor::new(100, now);
+                assert!(!monitor.observe("working", &format!("{row} (5s · timeout 2m)"), now));
+                assert!(!monitor.observe(
+                    "working",
+                    &format!("{row} (6s · timeout 3m)"),
+                    now + Duration::from_millis(100)
+                ));
+            }
+        }
+        for transcript in [
+            "The tool was Running… (2m 5s)",
+            "⎿  Running… (build output)",
+            "⎿  Running… (2m 5s) more output",
+            "⎿  Running… (ctrl+b to run in background)",
+        ] {
+            assert_eq!(crate::detect::progress_text(transcript), transcript);
+        }
+    }
+
+    #[test]
     fn delegate_silence_requires_unchanged_working_screen() {
         let now = Instant::now();
         let mut monitor = Monitor::new(100, now);
@@ -273,6 +319,15 @@ mod tests {
             "The transcript mentions usage exceeded and retrying in 46m attempt #1"
         )
         .is_none());
+    }
+
+    #[test]
+    fn delegate_blocked_provider_readiness_retains_retry_eta() {
+        let screen = "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt";
+        let verdict = readiness(screen, "blocked");
+        assert_eq!(verdict.verdict, "stalled");
+        assert_eq!(verdict.reason, "provider_limit");
+        assert_eq!(verdict.retry_after_ms, Some(2_775_000));
     }
 
     #[test]

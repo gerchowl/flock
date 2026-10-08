@@ -3463,9 +3463,9 @@ fn render_agent_detail(
         let ordinal = local_ordinals.get(idx).copied().flatten();
 
         // Single-row grammar (#62): `<icon> <agent> <server> <proj> <target>`.
-        // The status symbol carries the state — no status text, no activity /
-        // custom-status / header-field chips (those live in the pane header,
-        // navigator, and member rows). Remote agent rows render identically.
+        // The status symbol carries ordinary state. Provider waits additionally
+        // name the limit and retry time, so the blocked symbol cannot imply input.
+        // Other activity and custom-status chips live in the pane header.
         // The active-pane highlight only applies to LOCAL rows; remote rows are
         // never the focused local pane.
         let is_active = detail.remote.is_none()
@@ -3517,8 +3517,20 @@ fn render_agent_detail(
         // location run past the row's edge. #550 hit exactly this from the other
         // direction — two of its own symbols were East Asian Wide — and the
         // `symbol` mode budget is only safe because the registry is width-gated.
-        let prefix_cols =
-            jump_cols + 4 + agent_code.width() + usize::from(!agent_code.is_empty()) + mail_cols;
+        let provider_status = (detail.state == AgentState::Blocked)
+            .then_some(detail.custom_status.as_deref())
+            .flatten()
+            .filter(|status| status.starts_with("rate-limited"))
+            .map(|status| status.replace(", retry in ", " "));
+        let provider_cols = provider_status
+            .as_ref()
+            .map_or(0, |status| status.width() + 1);
+        let prefix_cols = jump_cols
+            + 4
+            + agent_code.width()
+            + usize::from(!agent_code.is_empty())
+            + mail_cols
+            + provider_cols;
         let location_budget = (body.width as usize).saturating_sub(prefix_cols);
         // #303: the server segment follows the viewer's `server_label` mode,
         // so the panel names a server exactly as the band and the spaces list
@@ -3567,6 +3579,10 @@ fn render_agent_detail(
                 label,
                 Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
             ));
+            spans.push(Span::styled(" ", Style::default()));
+        }
+        if let Some(status) = provider_status {
+            spans.push(Span::styled(status, Style::default().fg(p.red)));
             spans.push(Span::styled(" ", Style::default()));
         }
         spans.push(Span::styled(location, location_style));
@@ -7489,6 +7505,33 @@ mod tests {
     /// alias. Asserted on the RENDERED buffer, not on the entry: the drop was
     /// in `render_agent_detail`, so a test that stopped at
     /// `agent_panel_entries` would have stayed green through the whole bug.
+    #[test]
+    fn agents_band_renders_provider_limit_reason_and_retry_time() {
+        let mut app = multi_tab_agent_app(AgentPanelScope::AllWorkspaces);
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let detection = crate::detect::detect_agent(
+            Some(Agent::OpenCode),
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m 15s attempt #1] esc interrupt",
+        );
+        app.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::OpenCode),
+            state: detection.state,
+            activity: detection.activity,
+            provider_limit: detection.provider_limit,
+            visible_blocker: true,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let rows = agents_band_row_texts(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("rate-limited 46m 15s")),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn agents_band_renders_each_rows_tab_label_in_a_multi_tab_workspace() {
         let app = multi_tab_agent_app(AgentPanelScope::AllWorkspaces);

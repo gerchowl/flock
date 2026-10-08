@@ -196,7 +196,7 @@ A hook running inside the pane's agent can leave the pane id out: `report-agent`
 User hooks that run next to a Flock-managed integration should use metadata instead of `report-agent`. Metadata changes presentation without taking over the integration's `idle`, `working`, `blocked`, or session restore authority. `--agent` guards the report so it only applies while that authoritative agent is active. `--applies-to-source` guards the report so it only applies while that lifecycle authority source is active. `--display-agent` changes the visible name.
 
 ```bash
-flk pane report-metadata "$FLOCK_PANE_ID" \
+flk pane report-metadata \
   --source user:claude-title \
   --agent claude \
   --title "Refactor auth middleware" \
@@ -205,6 +205,8 @@ flk pane report-metadata "$FLOCK_PANE_ID" \
   --state-label working="refactoring auth" \
   --ttl-ms 3600000
 ```
+
+`report-metadata` defaults to the calling pane. Pass `--pane <pane_id>` or a legacy leading pane id when reporting from outside the pane.
 
 Custom status and state labels are visual-only. Waits, notifications, and workspace rollups still use the semantic state.
 

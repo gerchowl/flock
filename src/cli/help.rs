@@ -131,7 +131,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "tab",
         "create",
-        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]\n  --workspace places the tab in that workspace; --cwd only sets the directory.",
     ),
     ("tab", "get", "flk tab get <tab_id>"),
     ("tab", "focus", "flk tab focus <tab_id>"),
@@ -140,7 +140,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "notification",
         "show",
-        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]",
+        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]\nUses [ui.toast] delivery in the server config. delivery = \"off\" (the default) disables popups and returns reason \"disabled\".\nExit 0: shown; exit 3: not shown (disabled, busy, rate_limited, or no_foreground_client). JSON is printed in either case.\nNotifications are still recorded when not shown. Use flk notification list to read them.",
     ),
     (
         "notification",
@@ -168,6 +168,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("agent", "fork", super::agent::AGENT_FORK_USAGE),
     ("agent", "hibernate", "flk agent hibernate <target>"),
     ("agent", "resume", "flk agent resume <target>"),
+    ("agent", "history", super::agent::AGENT_HISTORY_USAGE),
     ("agent", "result", super::agent::AGENT_RESULT_USAGE),
     (
         "msg",
@@ -223,7 +224,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "report-metadata",
-        "flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
+        "flk pane report-metadata [<pane_id>] [--pane <pane_id>] --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
     ),
     (
         "pane",
