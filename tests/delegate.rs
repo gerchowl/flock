@@ -121,9 +121,12 @@ fn write_fake_opencode(base: &Path) {
          printf '%s\\n' \"$PWD\" >> '{base}/cwd.log'\n\
          if [ -e '{base}/die' ]; then exit 1; fi\n\
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
-         if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
+         if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; : > '{base}/first-draw'; fi; \
          sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+         if [ -e '{base}/ignore-input-ms' ]; then\n\
+         ( while [ ! -e '{base}/first-draw' ]; do sleep 0.01; done; sleep \"$(awk '{{print $1 / 1000}}' '{base}/ignore-input-ms')\"; : > '{base}/accept-input' ) &\n\
+         fi\n\
+         while IFS= read -r line; do if [ -e '{base}/ignore-input-ms' ] && [ ! -e '{base}/accept-input' ]; then continue; fi; printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
         base = base.display()
     );
     let path = bin.join("opencode");
@@ -1617,8 +1620,37 @@ fn a20_start_waits_for_the_first_screen_paint() {
         premature.is_none(),
         "a blank startup screen must not receive the brief"
     );
+    wait_typed(&server, 1);
+    report(&server, &pane, "working");
     let status = exited_within(&mut child, WITHIN).expect("start returns after first paint");
     let out = finish(child);
     assert_eq!(status.code(), Some(0), "{}", stderr(&out));
     wait_typed(&server, 1);
+}
+
+/// A prompt drawn before input is accepted must not produce a successful start.
+#[test]
+fn opencode_start_fails_loudly_when_startup_discards_brief() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("ignore-input-ms"), "10000").unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = delegate_pane(&server, "d1");
+    report(&server, &pane, "idle");
+    let status = exited_within(&mut child, WITHIN).expect("confirmation is bounded");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the brief was not submitted"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!server.base.join("typed.log").exists());
+    assert!(
+        !walk(&server.base.join("state"))
+            .iter()
+            .any(|p| p.ends_with("d1.json")),
+        "the unconfirmed round is removed"
+    );
 }

@@ -2598,7 +2598,13 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
+    if let Err(reason) = submit_brief(&pane_id, &sentence, None).and_then(|()| {
+        if harness.name == "opencode" {
+            confirm_opencode_submit(&terminal_id)
+        } else {
+            Ok(())
+        }
+    }) {
         // The sentence did not land, so this start did not happen. Undo it
         // rather than leave a workspace, a checkout and a registry entry
         // describing a round nobody is running. The entry WAS written by
@@ -2678,6 +2684,34 @@ fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<
         deadline,
     )?;
     Ok(())
+}
+
+/// OpenCode can draw its prompt before its input handler accepts the brief.
+/// A successful PTY write alone cannot confirm that startup submission.
+fn confirm_opencode_submit(terminal_id: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match agent_record(terminal_id, Some(deadline)) {
+            AgentFetch::Found(record) => {
+                if field(&record, "agent_status") == Some("working")
+                    || record
+                        .pointer("/agent_session/value")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| !id.is_empty())
+                {
+                    return Ok(());
+                }
+            }
+            AgentFetch::Failed(reason) => return Err(reason),
+            AgentFetch::Missing => return Err("the agent no longer resolves".into()),
+            AgentFetch::TimedOut => break,
+        }
+        if expired(Some(deadline)) {
+            break;
+        }
+        sleep_bounded(deadline, READY_POLL);
+    }
+    Err("no agent session or working status appeared after submission".into())
 }
 
 /// Make a `bounded` request, map a timeout to a readable "timed out" string,

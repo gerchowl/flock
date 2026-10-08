@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **OpenCode delegate starts now fail loudly when startup swallows the brief.** After typing the brief, `start` waits up to two seconds for an agent session or working status before reporting success; an unconfirmed submission rolls back the delegate instead of leaving a wait to time out (#636).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added
