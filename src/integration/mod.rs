@@ -1,3 +1,5 @@
+mod atomic_write;
+mod codex_hook_trust;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -508,6 +510,13 @@ fn take_pending_run_id() -> Option<String> {
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
 ) -> io::Result<Vec<String>> {
+    install_target_with_hook_trust(target, true)
+}
+
+pub(crate) fn install_target_with_hook_trust(
+    target: crate::api::schema::IntegrationTarget,
+    trust_hooks: bool,
+) -> io::Result<Vec<String>> {
     let messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
@@ -551,7 +560,7 @@ pub(crate) fn install_target(
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
-            let installed = install_codex()?;
+            let installed = install_codex_with_trust(trust_hooks)?;
             vec![
                 format!(
                     "installed codex integration hook to {}",
@@ -1497,7 +1506,12 @@ pub(crate) fn integration_manifest(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
+    install_codex_with_trust(true)
+}
+
+fn install_codex_with_trust(trust_hooks: bool) -> io::Result<CodexInstallPaths> {
     let dir = codex_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1507,8 +1521,6 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     }
 
     let hook_path = dir.join(CODEX_HOOK_INSTALL_NAME);
-    fs::write(&hook_path, CODEX_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut hooks_file = if hooks_path.is_file() {
@@ -1555,7 +1567,7 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
         None,
     )?;
 
-    fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
+    let new_hooks = serde_json::to_string_pretty(&hooks_file)?;
 
     let config_path = dir.join("config.toml");
     let existing_config = if config_path.is_file() {
@@ -1563,9 +1575,23 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     } else {
         String::new()
     };
-    let new_config = build_codex_config_with_hooks(&existing_config);
+    existing_config
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(io::Error::other)?;
+    let mut new_config = build_codex_config_with_hooks(&existing_config)?;
+    if trust_hooks {
+        new_config = codex_hook_trust::trust_flock_hook(
+            &new_config,
+            &hooks_path,
+            &hooks_file,
+            &format!("bash {quoted_hook_path} session"),
+        )?;
+    }
+    fs::write(&hook_path, CODEX_HOOK_ASSET)?;
+    make_executable(&hook_path)?;
+    atomic_write::replace(&hooks_path, new_hooks.as_bytes())?;
     if new_config != existing_config {
-        fs::write(&config_path, new_config)?;
+        atomic_write::replace(&config_path, new_config.as_bytes())?;
     }
 
     Ok(CodexInstallPaths {
@@ -2598,58 +2624,47 @@ fn join_yaml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     result
 }
 
-fn build_codex_config_with_hooks(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let trailing_newline = content.ends_with('\n');
-    let mut in_top_level_features = false;
-    let mut features_header_index = None;
-    let mut hooks_index = None;
-    let mut deprecated_hooks_indexes = Vec::new();
-
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(header) = toml_table_header(line) {
-            in_top_level_features = header == "[features]";
-            if in_top_level_features && features_header_index.is_none() {
-                features_header_index = Some(index);
+fn build_codex_config_with_hooks(content: &str) -> io::Result<String> {
+    let mut doc: toml_edit::DocumentMut = content.parse().map_err(io::Error::other)?;
+    let item = doc
+        .entry("features")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let features = item
+        .as_table_like_mut()
+        .ok_or_else(|| io::Error::other("invalid Codex features table"))?;
+    let order: Vec<String> = features
+        .iter()
+        .map(|(key, _)| {
+            if key == "codex_hooks" {
+                "hooks".to_string()
+            } else {
+                key.to_string()
             }
-            continue;
+        })
+        .collect();
+    if features.get("hooks").and_then(toml_edit::Item::as_bool) != Some(true) {
+        let mut value = toml_edit::Value::from(true);
+        if let Some(previous) = features.get("hooks").and_then(toml_edit::Item::as_value) {
+            *value.decor_mut() = previous.decor().clone();
         }
-
-        if !in_top_level_features {
-            continue;
-        }
-
-        if is_toml_key(line, "codex_hooks") {
-            deprecated_hooks_indexes.push(index);
-        } else if is_toml_key(line, "hooks") {
-            hooks_index = Some(index);
-        }
+        features.insert("hooks", toml_edit::Item::Value(value));
     }
-
-    if let Some(index) = hooks_index {
-        lines[index] = "hooks = true".to_string();
+    features.remove("codex_hooks");
+    if let Some(table) = item.as_table_mut() {
+        table.sort_values_by(|a, _, b, _| {
+            order
+                .iter()
+                .position(|key| key == a.get())
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &order
+                        .iter()
+                        .position(|key| key == b.get())
+                        .unwrap_or(usize::MAX),
+                )
+        });
     }
-
-    for index in deprecated_hooks_indexes.into_iter().rev() {
-        lines.remove(index);
-    }
-
-    if hooks_index.is_none() {
-        if let Some(index) = features_header_index {
-            lines.insert(index + 1, "hooks = true".to_string());
-            return join_toml_lines(lines, trailing_newline);
-        }
-
-        let mut result = content.trim_end_matches('\n').to_string();
-        if !result.is_empty() {
-            result.push('\n');
-            result.push('\n');
-        }
-        result.push_str("[features]\nhooks = true\n");
-        return result;
-    }
-
-    join_toml_lines(lines, trailing_newline)
+    Ok(doc.to_string())
 }
 
 fn build_kimi_config_with_hooks(content: &str, hook_path: &Path) -> String {
@@ -2747,35 +2762,6 @@ fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
         result.push('\n');
     }
     result
-}
-
-fn toml_table_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') || !trimmed.starts_with('[') {
-        return None;
-    }
-
-    let header_end = if trimmed.starts_with("[[") {
-        trimmed.find("]]").map(|index| index + 2)?
-    } else {
-        trimmed.find(']').map(|index| index + 1)?
-    };
-    let header = &trimmed[..header_end];
-    let rest = trimmed[header_end..].trim_start();
-    if !rest.is_empty() && !rest.starts_with('#') {
-        return None;
-    }
-
-    Some(header)
-}
-
-fn is_toml_key(line: &str, key: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || !trimmed.starts_with(key) {
-        return false;
-    }
-
-    trimmed[key.len()..].trim_start().starts_with('=')
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -4412,6 +4398,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_install_trusts_only_its_hook_and_can_opt_out() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        fs::write(
+            base.join("config.toml"),
+            "[hooks.state.other]\nenabled = false\ntrusted_hash = \"keep\"\n",
+        )
+        .unwrap();
+        fs::write(base.join("hooks.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo unrelated","timeout":10}]}]}}"#).unwrap();
+        install_codex_with_trust(false).unwrap();
+        let before = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(!before.contains("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        let after = fs::read_to_string(base.join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&after).unwrap();
+        let states = config["hooks"]["state"].as_table().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states["other"]["trusted_hash"].as_str(), Some("keep"));
+        assert_eq!(states["other"]["enabled"].as_bool(), Some(false));
+        let key = format!(
+            "{}:session_start:1:0",
+            base.join("hooks.json").canonicalize().unwrap().display()
+        );
+        assert!(states[&key]["trusted_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        assert_eq!(after, fs::read_to_string(base.join("config.toml")).unwrap());
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn install_codex_uses_codex_home_env() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -4463,6 +4485,56 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn codex_install_preserves_comments_key_order_and_existing_trust_format() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        let original = "# keep this header\nz_custom = 'last alphabetically, first in file'\nmodel = \"gpt-5.4\" # keep inline comment\n\n[features]\nother = true # before hooks\nhooks  =  true # keep spacing\n\n[profiles.work.features]\nhooks = false\n";
+        fs::write(base.join("config.toml"), original).unwrap();
+        install_codex().unwrap();
+        let installed = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(installed.starts_with(original), "{installed}");
+        let decorated = installed.replace("trusted_hash = ", "# trust comment\ntrusted_hash  =  ");
+        fs::write(base.join("config.toml"), &decorated).unwrap();
+        install_codex().unwrap();
+        assert_eq!(
+            fs::read_to_string(base.join("config.toml")).unwrap(),
+            decorated
+        );
+        assert!(!fs::read_dir(&base).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".flock-write-")));
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_codex_config_leaves_both_registration_files_untouched() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        let config = "# broken config\nmodel = [\n";
+        let hooks = r#"{ "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo keep", "timeout": 10}]}]} }"#;
+        fs::write(base.join("config.toml"), config).unwrap();
+        fs::write(base.join("hooks.json"), hooks).unwrap();
+        for trust in [true, false] {
+            assert!(install_codex_with_trust(trust).is_err());
+            assert_eq!(
+                fs::read_to_string(base.join("config.toml")).unwrap(),
+                config
+            );
+            assert_eq!(fs::read_to_string(base.join("hooks.json")).unwrap(), hooks);
+            assert!(!base.join(CODEX_HOOK_INSTALL_NAME).exists());
+        }
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

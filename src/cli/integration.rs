@@ -177,11 +177,21 @@ fn print_integration_manifest_summary(manifest: &serde_json::Value) {
 }
 
 fn integration_install(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = parse_integration_target(args, "install")? else {
+    let trust_hooks = !args.iter().any(|arg| arg == "--no-trust-hooks");
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--no-trust-hooks")
+        .cloned()
+        .collect();
+    let Some(target) = parse_integration_target(&rest, "install")? else {
         return Ok(2);
     };
 
-    match crate::integration::install_target(target) {
+    if !trust_hooks && target != IntegrationTarget::Codex {
+        eprintln!("--no-trust-hooks is only supported for codex");
+        return Ok(2);
+    }
+    match crate::integration::install_target_with_hook_trust(target, trust_hooks) {
         Ok(messages) => {
             print_integration_messages(messages);
             Ok(0)
@@ -260,7 +270,7 @@ fn print_integration_help() {
     eprintln!("  flk integration install pi");
     eprintln!("  flk integration install omp");
     eprintln!("  flk integration install claude");
-    eprintln!("  flk integration install codex");
+    eprintln!("  flk integration install codex [--no-trust-hooks]");
     eprintln!("  flk integration install copilot");
     eprintln!("  flk integration install kimi");
     eprintln!("  flk integration install opencode");
@@ -278,4 +288,15 @@ fn print_integration_help() {
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
     eprintln!("  flk integration verify");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hook_trust_opt_out_is_rejected_for_other_integrations() {
+        assert_eq!(
+            super::integration_install(&["claude".into(), "--no-trust-hooks".into()]).unwrap(),
+            2
+        );
+    }
 }
