@@ -711,7 +711,7 @@ pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(Strin
 
 fn wait_output(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex]");
+        eprintln!("usage: flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--timeout MS] [--regex]");
         return Ok(2);
     };
 
@@ -1036,6 +1036,7 @@ pub(super) fn parse_read_source(value: &str) -> std::io::Result<ReadSource> {
         "visible" => Ok(ReadSource::Visible),
         "recent" => Ok(ReadSource::Recent),
         "recent-unwrapped" | "recent_unwrapped" => Ok(ReadSource::RecentUnwrapped),
+        "detection" => Ok(ReadSource::Detection),
         _ => Err(std::io::Error::other(format!(
             "invalid read source: {value}"
         ))),
@@ -1156,7 +1157,7 @@ fn print_terminal_help() {
 
 fn print_wait_help() {
     eprintln!("flk wait commands:");
-    eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
+    eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--timeout MS] [--regex] [--raw]");
     eprintln!("  {WAIT_AGENT_STATUS_USAGE}");
     eprintln!("  flk wait reply <correlation_id> [--timeout MS] [--json]");
     eprintln!(

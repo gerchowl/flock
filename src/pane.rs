@@ -1966,6 +1966,14 @@ impl PaneRuntime {
         self.terminal.visible_ansi()
     }
 
+    pub fn detection_text(&self) -> String {
+        self.terminal.detection_text()
+    }
+
+    pub fn detection_ansi(&self) -> String {
+        self.terminal.detection_ansi()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.terminal.recent_text(lines)
     }

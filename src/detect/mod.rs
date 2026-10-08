@@ -261,6 +261,19 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
 
 /// Detect the state of an agent from the live terminal tail snapshot.
 /// If `agent` is `None`, returns `Unknown`.
+/// Transcript evidence with the detectors' recognized live status rows removed.
+pub(crate) fn progress_text(screen: &str) -> String {
+    screen
+        .lines()
+        .filter(|line| {
+            !agents::codex::is_progress_chrome(line)
+                && !agents::claude_code::has_spinner_activity(line)
+                && !agents::opencode::is_progress_chrome(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
     detect_agent(agent, screen_content).state

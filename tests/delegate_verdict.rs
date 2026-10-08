@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Pane {
     base: PathBuf,
+    registry: PathBuf,
     socket: PathBuf,
     calls: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -24,6 +25,10 @@ struct Pane {
 
 impl Pane {
     fn new(status: &str, screen: &str) -> Self {
+        Self::frames(vec![(status.to_string(), screen.to_string())])
+    }
+
+    fn frames(frames: Vec<(String, String)>) -> Self {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -41,9 +46,10 @@ impl Pane {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let counted = calls.clone();
-        let screen = screen.to_string();
-        let status = status.to_string();
+
         let worker = thread::spawn(move || {
+            let mut frame = 0usize;
+            let mut sampled = 0usize;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(5));
@@ -65,16 +71,37 @@ impl Pane {
                 counted.fetch_add(1, Ordering::SeqCst);
                 let result = match request["method"].as_str().unwrap() {
                     "agent.get" => {
+                        frame = sampled.min(frames.len() - 1);
+                        sampled += 1;
+                        let status = &frames[frame].0;
+                        let cursor = if status == "idle" {
+                            "term_fixture:0:1:2:i"
+                        } else {
+                            "term_fixture:0:1:1:w"
+                        };
                         json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
-                        "agent_status": status, "turn_cursor": "term_fixture:0:1:1:w", "revision": 0}})
+                        "agent_status": status, "turn_cursor": cursor, "revision": 0}})
                     }
                     "pane.read" => {
-                        assert_eq!(request["params"]["source"], "recent");
-                        json!({"read": {"text": screen}})
+                        assert_eq!(request["params"]["source"], "detection");
+                        json!({"read": {"text": frames[frame].1}})
+                    }
+                    "agent.result" => {
+                        json!({"result": {"finished": true, "at_ms": 2, "status": "done", "text": "DONE: recovered"}})
+                    }
+                    "workspace.get" => {
+                        let _ = writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"], "error": {"code": "workspace_not_found", "message": "fixture already gone"}})
+                        );
+                        continue;
                     }
                     other => panic!("unexpected request: {other}"),
                 };
                 let _ = writeln!(stream, "{}", json!({"id": request["id"], "result": result}));
+                // Keep the response socket alive until the client finishes its read.
+                let _ = stream.read(&mut [0_u8; 1]);
             }
         });
         let hash = socket
@@ -101,6 +128,7 @@ impl Pane {
             "cursor": "term_fixture:0:0:0:i", "created_at_ms": 1,
         }).to_string()).unwrap();
         Self {
+            registry,
             base,
             socket,
             calls,
@@ -270,7 +298,7 @@ fn delegate_silence_stalls_a_working_pane_and_status_remembers_the_verdict() {
 }
 
 #[test]
-fn delegate_provider_wait_stalls_even_with_silence_disabled() {
+fn delegate_long_provider_retry_stalls_with_silence_disabled() {
     let pane = Pane::new("working", "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retrying in 46m 15s attempt #1] esc interrupt");
     let out = pane
         .command(
@@ -343,7 +371,7 @@ fn delegate_s1_is_called_once_at_round_end_and_never_on_polls() {
         )
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while pane.calls.load(Ordering::SeqCst) < 5 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -353,7 +381,12 @@ fn delegate_s1_is_called_once_at_round_end_and_never_on_polls() {
     }
     assert_eq!(s1.calls.load(Ordering::SeqCst), 0);
     let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(124));
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let value = Pane::json(&out);
     assert!(value["s1"]["fused"].as_f64().unwrap() >= 0.5);
     assert_eq!(s1.calls.load(Ordering::SeqCst), 1);
@@ -392,4 +425,152 @@ fn delegate_s1_failure_is_advisory_and_its_breaker_is_per_endpoint() {
     assert!(Pane::json(&out)["s1"].is_object());
     assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
     assert_eq!(s1.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn delegate_short_provider_retry_recovers_and_settles_normally() {
+    let retry = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt";
+    let pane = Pane::frames(vec![
+        ("working".into(), retry.into()),
+        ("working".into(), retry.into()),
+        ("idle".into(), "DONE: recovered".into()),
+    ]);
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "0",
+                "--settle",
+                "0",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
+}
+
+#[test]
+fn delegate_short_provider_retry_persisting_outlasts_silence() {
+    let pane = Pane::new(
+        "working",
+        "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt",
+    );
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "3s",
+                "--timeout",
+                "8000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(Pane::json(&out)["reason"], "provider_limit");
+}
+
+#[test]
+fn delegate_spinner_and_elapsed_changes_do_not_reset_silence() {
+    let pane = Pane::frames(
+        (0..50)
+            .map(|i| {
+                (
+                    "working".into(),
+                    format!("tool waiting\n• Working ({i}s • esc to interrupt)"),
+                )
+            })
+            .collect(),
+    );
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "400ms",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(Pane::json(&out)["reason"], "silence");
+}
+
+#[test]
+fn delegate_new_transcript_lines_reset_silence() {
+    let pane = Pane::frames(
+        (0..50)
+            .map(|i| {
+                (
+                    "working".into(),
+                    format!("new transcript line {i}\n• Working ({i}s • esc to interrupt)"),
+                )
+            })
+            .collect(),
+    );
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--silence",
+                "400ms",
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+            None,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn delegate_reap_removes_persisted_verdict() {
+    let pane = Pane::new("working", "fixture");
+    let verdict = pane.registry.join("fixture.verdict.json");
+    std::fs::write(&verdict, "{}").unwrap();
+    let out = pane
+        .command(&["delegate", "reap", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!verdict.exists());
+    assert!(!pane.registry.join("fixture.json").exists());
 }

@@ -92,9 +92,11 @@ pub(super) fn parse_duration(value: &str) -> Result<u64, String> {
 }
 
 pub(super) fn readiness(screen: &str, status: &str) -> Verdict {
-    if let Some(mut verdict) = provider_limit(screen) {
-        verdict.verdict = "stalled".into();
-        return verdict;
+    if matches!(status, "working" | "unknown") {
+        if let Some(mut verdict) = provider_limit(screen) {
+            verdict.verdict = "stalled".into();
+            return verdict;
+        }
     }
     let line = last_line(screen);
     let prompt = crate::detect::has_confirmation_prompt(&line.to_lowercase())
@@ -121,6 +123,7 @@ pub(super) struct Monitor {
     hash: Option<u64>,
     working: bool,
     changed: Instant,
+    retry_since: Option<Instant>,
     pub screen: String,
     pub latest: Option<Verdict>,
 }
@@ -132,6 +135,7 @@ impl Monitor {
             hash: None,
             working: false,
             changed: now,
+            retry_since: None,
             screen: String::new(),
             latest: None,
         }
@@ -139,17 +143,38 @@ impl Monitor {
 
     pub fn interrupted(&mut self, now: Instant) {
         self.hash = None;
+        self.retry_since = None;
         self.working = false;
         self.changed = now;
     }
 
     pub fn observe(&mut self, status: &str, screen: &str, now: Instant) -> bool {
         self.screen = screen.to_string();
-        if let Some(verdict) = provider_limit(screen) {
-            self.latest = Some(verdict);
-            return true;
+        if matches!(status, "working" | "unknown") {
+            if let Some(verdict) = provider_limit(screen) {
+                let since = *self.retry_since.get_or_insert(now);
+                let threshold = self.silence.unwrap_or(Duration::from_secs(300));
+                if verdict
+                    .retry_after_ms
+                    .is_some_and(|eta| Duration::from_millis(eta) >= threshold)
+                    || self
+                        .silence
+                        .is_some_and(|window| now.saturating_duration_since(since) >= window)
+                {
+                    self.latest = Some(verdict);
+                    return true;
+                }
+                // A transient retry owns its own continuous timer, independent
+                // of animated chrome and transcript silence.
+                self.changed = now;
+                self.hash = None;
+                self.working = false;
+                return false;
+            }
         }
-        let hash = screen
+        self.retry_since = None;
+        let normalized = crate::detect::progress_text(screen);
+        let hash = normalized
             .bytes()
             .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -179,6 +204,51 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_retry_threshold_and_recovery_are_continuous() {
+        let now = Instant::now();
+        let retry = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt";
+        let mut monitor = Monitor::new(3000, now);
+        assert!(!monitor.observe("unknown", retry, now));
+        assert!(!monitor.observe("working", retry, now + Duration::from_millis(2999)));
+        assert!(!monitor.observe("idle", retry, now + Duration::from_secs(3)));
+        assert!(!monitor.observe("working", retry, now + Duration::from_secs(4)));
+        assert!(monitor.observe("working", retry, now + Duration::from_secs(7)));
+        let mut disabled = Monitor::new(0, now);
+        assert!(!disabled.observe("working", retry, now));
+        assert!(!disabled.observe("working", retry, now + Duration::from_secs(600)));
+        let floor = retry.replace("2s", "5m");
+        assert!(!disabled.observe("idle", &floor, now));
+        assert!(disabled.observe("unknown", &floor, now));
+    }
+
+    #[test]
+    fn delegate_harness_chrome_is_not_transcript_progress() {
+        let now = Instant::now();
+        for (one, two) in [
+            (
+                "• Working (1s • esc to interrupt)",
+                "• Working (2s • esc to interrupt)",
+            ),
+            (
+                "✶ Thinking… (1s · esc to interrupt)",
+                "✽ Thinking… (2s · esc to interrupt)",
+            ),
+            (
+                "■■■■⬝⬝ 1s esc interrupt opencode",
+                "■■■⬝⬝⬝ 2s esc interrupt opencode",
+            ),
+        ] {
+            let mut monitor = Monitor::new(100, now);
+            assert!(!monitor.observe("working", &format!("tool waiting\n{one}"), now));
+            assert!(monitor.observe(
+                "working",
+                &format!("tool waiting\n{two}"),
+                now + Duration::from_millis(100)
+            ));
+        }
+    }
 
     #[test]
     fn delegate_silence_requires_unchanged_working_screen() {

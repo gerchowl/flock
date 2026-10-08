@@ -1682,6 +1682,8 @@ pub enum ReadSource {
     Visible,
     Recent,
     RecentUnwrapped,
+    /// The unscrolled screen used by agent detection, excluding scrollback.
+    Detection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

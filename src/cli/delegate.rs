@@ -2455,13 +2455,20 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
-            if Instant::now() >= ready_deadline {
-                emit_ready_timeout(name, &pane_id, &terminal_id, None, flags.json, &reason);
+            if reason.deadline_reached {
+                emit_ready_timeout(
+                    name,
+                    &pane_id,
+                    &terminal_id,
+                    None,
+                    flags.json,
+                    &reason.reason,
+                );
                 rollback(&cleanup);
                 return Ok(1);
             }
             rollback(&cleanup);
-            return Ok(fail(reason));
+            return Ok(fail(reason.reason));
         }
     };
     let cursor = match cursor_of(&settled_record) {
@@ -2661,6 +2668,30 @@ fn harness_for(entry: &Entry) -> &'static HarnessSpec {
         .expect("the default harness is always in the table")
 }
 
+#[derive(Debug)]
+struct ReadyFailure {
+    reason: String,
+    deadline_reached: bool,
+}
+
+impl From<String> for ReadyFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            deadline_reached: false,
+        }
+    }
+}
+
+impl ReadyFailure {
+    fn deadline(reason: String) -> Self {
+        Self {
+            reason,
+            deadline_reached: true,
+        }
+    }
+}
+
 /// Block until the agent is up AND at its prompt, under one deadline, and hand
 /// back the record that proved it.
 ///
@@ -2679,7 +2710,7 @@ fn await_ready(
     agent: &serde_json::Value,
     harness: &HarnessSpec,
     deadline: Instant,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ReadyFailure> {
     let pane_id = field(agent, "pane_id").unwrap_or_default().to_string();
     let terminal_id = field(agent, "terminal_id").unwrap_or_default().to_string();
 
@@ -2710,7 +2741,7 @@ fn await_ready(
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
                     {
-                        return Err(refusal);
+                        return Err(refusal.into());
                     }
                 }
                 if expired(Some(deadline)) {
@@ -2718,25 +2749,27 @@ fn await_ready(
                     // prompt (`blocked`, `working`, `unknown`). Name the
                     // status, not the clock — that is what tells the caller
                     // what to look at.
-                    return Err(format!("delegate {name} is {status}"));
+                    return Err(ReadyFailure::deadline(format!(
+                        "delegate {name} is {status}"
+                    )));
                 }
                 last_status = Some(status);
                 sleep_bounded(deadline, READY_POLL);
             }
             AgentFetch::Missing => {
-                return Err(format!("delegate {name}: the agent no longer resolves"))
+                return Err((format!("delegate {name}: the agent no longer resolves")).into())
             }
             AgentFetch::TimedOut => {
                 // The next request refused to send because the deadline had
                 // passed. Report the last status we DID see, so a readiness
                 // that ran out while the agent was `blocked` says `blocked`
                 // rather than hiding the status behind the clock.
-                return Err(match last_status {
+                return Err(ReadyFailure::deadline(match last_status {
                     Some(status) => format!("delegate {name} is {status}"),
                     None => format!("delegate {name} is not ready: timed out"),
-                });
+                }));
             }
-            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
+            AgentFetch::Failed(reason) => return Err((format!("delegate {name}: {reason}")).into()),
         }
     }
 }
@@ -2776,7 +2809,7 @@ fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: In
     let response = match bounded(
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.to_owned(),
-            source: ReadSource::Recent,
+            source: ReadSource::Detection,
             lines: Some(STARTUP_DIALOG_LINES),
             format: ReadFormat::Text,
             strip_ansi: true,
@@ -2814,13 +2847,15 @@ fn delegate_wait_for_ready(
     terminal_id: &str,
     pane_id: &str,
     deadline: Instant,
-) -> Result<(), String> {
+) -> Result<(), ReadyFailure> {
     // One cap for the whole phase, computed once up front. If the deadline
     // has already passed, say "timed out" and skip the subscribe entirely:
     // no request is sent while out of clock.
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(format!("delegate {name} is not ready: timed out"));
+        return Err(ReadyFailure::deadline(format!(
+            "delegate {name} is not ready: timed out"
+        )));
     }
 
     // Subscribe FIRST, then snapshot: a status that lands between the ack
@@ -2840,15 +2875,22 @@ fn delegate_wait_for_ready(
     };
     let (ack, mut stream) = ApiClient::local()
         .subscribe_value(&subscribe, Some(remaining))
-        .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
+        .map_err(|err| {
+            let timed_out = matches!(&err, ApiClientError::Io(io) if super::api_timeout_error(io));
+            ReadyFailure {
+                reason: format!("delegate {name}: readiness could not be watched: {err}"),
+                deadline_reached: timed_out,
+            }
+        })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
-        return Err(match err {
+        return Err((match err {
             ApiClientError::ErrorResponse(response) => format!(
                 "delegate {name}: {}",
                 serde_json::to_string(&response).unwrap_or_else(|_| String::new())
             ),
             _ => format!("delegate {name}: readiness could not be watched: {err}"),
-        });
+        })
+        .into());
     }
 
     // Snapshot after the subscribe is live, bounded by the same deadline.
@@ -2860,15 +2902,18 @@ fn delegate_wait_for_ready(
             }
         }
         AgentFetch::Missing => {
-            return Err(format!(
+            return Err((format!(
                 "delegate {name} never became ready: the agent no longer resolves"
-            ));
+            ))
+            .into());
         }
         AgentFetch::TimedOut => {
-            return Err(format!("delegate {name} is not ready: timed out"));
+            return Err(ReadyFailure::deadline(format!(
+                "delegate {name} is not ready: timed out"
+            )));
         }
         AgentFetch::Failed(reason) => {
-            return Err(format!("delegate {name}: {reason}"));
+            return Err((format!("delegate {name}: {reason}")).into());
         }
     }
 
@@ -2881,33 +2926,39 @@ fn delegate_wait_for_ready(
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
         else {
-            return Err(format!("delegate {name} is not ready: timed out"));
+            return Err(ReadyFailure::deadline(format!(
+                "delegate {name} is not ready: timed out"
+            )));
         };
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|err| format!("delegate {name}: readiness could not be watched: {err}"))?;
         match stream.next_value() {
             Ok(None) => {
-                return Err(format!(
+                return Err((format!(
                     "delegate {name} never became ready: the readiness subscription closed"
-                ));
+                ))
+                .into());
             }
             Ok(Some(event)) => match classify_ready_event(&event, pane_id) {
                 ReadySignal::Ready(_) => return Ok(()),
                 ReadySignal::Exited => {
-                    return Err(format!(
+                    return Err((format!(
                         "delegate {name}: the agent's pane exited before it became ready"
-                    ));
+                    ))
+                    .into());
                 }
                 ReadySignal::KeepWaiting => continue,
             },
             Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
-                return Err(format!("delegate {name} is not ready: timed out"));
+                return Err(ReadyFailure::deadline(format!(
+                    "delegate {name} is not ready: timed out"
+                )));
             }
             Err(err) => {
-                return Err(format!(
-                    "delegate {name}: readiness could not be watched: {err}"
-                ))
+                return Err(
+                    (format!("delegate {name}: readiness could not be watched: {err}")).into(),
+                )
             }
         }
     }
@@ -2956,18 +3007,18 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     let record = match await_prompt(name, &entry, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
-            if Instant::now() >= ready_deadline {
+            if reason.deadline_reached {
                 emit_ready_timeout(
                     name,
                     &entry.pane_id,
                     &entry.terminal_id,
                     Some(&entry),
                     flags.json,
-                    &reason,
+                    &reason.reason,
                 );
                 return Ok(1);
             }
-            return Ok(fail(reason));
+            return Ok(fail(reason.reason));
         }
     };
 
@@ -3031,7 +3082,11 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
 /// is narrower — it is not sitting on a dialog. The returned record is the last
 /// one sampled, for the same reason as [`await_ready`]: the cursor has to be the
 /// one this round starts from.
-fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_json::Value, String> {
+fn await_prompt(
+    name: &str,
+    entry: &Entry,
+    deadline: Instant,
+) -> Result<serde_json::Value, ReadyFailure> {
     let mut last_status: Option<String> = None;
     loop {
         match agent_record(&entry.terminal_id, Some(deadline)) {
@@ -3043,21 +3098,23 @@ fn await_prompt(name: &str, entry: &Entry, deadline: Instant) -> Result<serde_js
                     return Ok(record);
                 }
                 if expired(Some(deadline)) {
-                    return Err(format!("delegate {name} is {status}"));
+                    return Err(ReadyFailure::deadline(format!(
+                        "delegate {name} is {status}"
+                    )));
                 }
                 last_status = Some(status);
                 sleep_bounded(deadline, READY_POLL);
             }
             AgentFetch::Missing => {
-                return Err(format!("delegate {name}: the agent no longer resolves"))
+                return Err((format!("delegate {name}: the agent no longer resolves")).into())
             }
             AgentFetch::TimedOut => {
-                return Err(match last_status {
+                return Err(ReadyFailure::deadline(match last_status {
                     Some(status) => format!("delegate {name} is {status}"),
                     None => format!("delegate {name} is not ready: timed out"),
-                });
+                }));
             }
-            AgentFetch::Failed(reason) => return Err(format!("delegate {name}: {reason}")),
+            AgentFetch::Failed(reason) => return Err((format!("delegate {name}: {reason}")).into()),
         }
     }
 }
@@ -3436,6 +3493,11 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
         }
     };
 
+    if let Err(err) = std::fs::remove_file(observation_path(name)) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Ok(fail(format!("could not remove delegate verdict: {err}")));
+        }
+    }
     if let Err(err) = std::fs::remove_file(entry_path(name)) {
         if err.kind() != io::ErrorKind::NotFound {
             return Ok(fail(format!(
@@ -3654,13 +3716,14 @@ impl Await<'_> {
                         monitor.interrupted(Instant::now());
                         return false;
                     };
-                    let Some(screen) = recent_screen(pane_id, self.deadline) else {
+                    let Some(screen) = detection_screen(pane_id, self.deadline) else {
                         monitor.interrupted(Instant::now());
                         return false;
                     };
                     let status = match status {
                         crate::api::schema::AgentStatus::Working => "working",
                         crate::api::schema::AgentStatus::Blocked => "blocked",
+                        crate::api::schema::AgentStatus::Unknown => "unknown",
                         _ => "idle",
                     };
                     monitor.observe(status, &screen, Instant::now())
@@ -3671,7 +3734,7 @@ impl Await<'_> {
             match self.after_settle(settled, &settled_cursor) {
                 SettledDecision::Report { outcome, info } => {
                     let code = outcome.exit_code();
-                    let screen = recent_screen(&self.entry.pane_id, None)
+                    let screen = detection_screen(&self.entry.pane_id, None)
                         .unwrap_or_else(|| monitor.screen.clone());
                     let verdict = matches!(outcome, Outcome::Stalled)
                         .then(|| monitor.latest.clone())
@@ -3972,11 +4035,11 @@ fn emit_submit(entry: &Entry, json: bool) {
     }
 }
 
-fn recent_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> {
+fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> {
     let response = bounded(
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.into(),
-            source: ReadSource::Recent,
+            source: ReadSource::Detection,
             lines: Some(40),
             format: ReadFormat::Text,
             strip_ansi: true,
@@ -4032,7 +4095,7 @@ fn emit_ready_timeout(
     json: bool,
     reason: &str,
 ) {
-    let screen = recent_screen(pane_id, None).unwrap_or_default();
+    let screen = detection_screen(pane_id, None).unwrap_or_default();
     let status = Some(agent_record(terminal_id, None));
     let status = match &status {
         Some(AgentFetch::Found(record)) => field(record, "agent_status").unwrap_or("unknown"),

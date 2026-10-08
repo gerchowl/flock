@@ -573,11 +573,13 @@ impl App {
                 ReadSource::Visible => pane.visible_text(),
                 ReadSource::Recent => pane.recent_text(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
+                ReadSource::Detection => pane.detection_text(),
             },
             ReadFormat::Ansi => match params.source {
                 ReadSource::Visible => pane.visible_ansi(),
                 ReadSource::Recent => pane.recent_ansi(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
+                ReadSource::Detection => pane.detection_ansi(),
             },
         };
 
@@ -1324,6 +1326,43 @@ mod tests {
     /// steered agents off a read that never moved the attention queue. Driven
     /// off the wire, both verbs, from both starting values: an "unchanged"
     /// that only held for one of them would be a read that sets `seen`.
+    #[tokio::test]
+    async fn detect_pane_read_excludes_scrollback_and_reads_bottom_screen() {
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("detection");
+        let pane_id = ws.tabs[0].root_pane;
+        let mut bytes = "old history\r\n".repeat(40).into_bytes();
+        bytes.extend_from_slice(b"\x1b[2J\x1b[Hlive bottom");
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 0, &bytes),
+        );
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let public = app.public_pane_id(0, pane_id).expect("public id");
+        for format in ["text", "ansi"] {
+            let request = serde_json::json!({"id": "detection", "method": "pane.read",
+                "params": {"pane_id": public, "source": "detection", "lines": 1000, "format": format}});
+            let response: serde_json::Value = serde_json::from_str(
+                &app.handle_api_request(serde_json::from_value(request).expect("request")),
+            )
+            .expect("response");
+            let text = response
+                .pointer("/result/read/text")
+                .and_then(serde_json::Value::as_str)
+                .expect("read text");
+            assert!(text.contains("live bottom"));
+            assert!(!text.contains("old history"));
+        }
+    }
+
     #[tokio::test]
     async fn api_pane_read_leaves_seen_untouched() {
         let mut app = App::new(

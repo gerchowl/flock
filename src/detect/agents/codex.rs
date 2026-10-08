@@ -220,6 +220,10 @@ fn transcript_control_tail(line: &str) -> bool {
         || lower.contains("edit message")
 }
 
+pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
+    codex_working_status_line(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
