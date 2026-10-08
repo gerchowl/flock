@@ -1698,13 +1698,15 @@ fn server_stop_then_restart_restores_pane_history() {
         .to_string();
     let sent = run_cli(
         &socket_path,
-        &["pane", "send-text", &pane_id, &format!("echo {marker}\n")],
+        &["pane", "send-text", &pane_id, &format!("echo {marker}")],
     );
     assert!(
         sent.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&sent.stderr)
     );
+    let enter = run_cli(&socket_path, &["pane", "send-keys", &pane_id, "Enter"]);
+    assert!(enter.status.success());
     assert!(
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
             pane_read_recent_contains(&socket_path, &pane_id, marker)

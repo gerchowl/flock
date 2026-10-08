@@ -1098,11 +1098,20 @@ fn agent_methods_round_trip_over_socket() {
     let sent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok\n"}}}}"#,
+            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok"}}}}"#,
             terminal_id
         ),
     );
     assert_eq!(sent["result"]["type"], "ok");
+    let enter = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "agent_enter", "method": "pane.send_keys",
+            "params": {"pane_id": pane_id, "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert_eq!(enter["result"]["type"], "ok");
 
     let tab_created = send_request(
         &socket_path,
@@ -2478,14 +2487,14 @@ with log.open('w') as out:
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let raw = send_request(
+    let pasted = send_request(
         &socket_path,
         &serde_json::json!({
-            "id": "raw", "method": "agent.send", "params": {"target": pane, "text": "Ship it!\nworld!"}
+            "id": "paste", "method": "agent.send", "params": {"target": pane, "text": "Ship it!\nworld!"}
         })
         .to_string(),
     );
-    assert_eq!(raw["result"]["type"], "ok");
+    assert_eq!(pasted["result"]["type"], "ok");
     let read_log = || -> Vec<serde_json::Value> {
         fs::read_to_string(&log)
             .unwrap_or_default()
