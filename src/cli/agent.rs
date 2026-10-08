@@ -809,14 +809,21 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    super::print_response(&super::send_request(&Request {
+    super::compatibility::require_turn_server("flk agent result")?;
+    let response = super::send_request(&Request {
         id: "cli:agent:result".into(),
         method: Method::AgentResult(crate::api::schema::AgentResultParams {
             target: target.clone(),
             max_chars,
             offset,
         }),
-    })?)
+    })?;
+    if let Some(message) =
+        super::compatibility::unknown_variant_message(&response, "flk agent result")
+    {
+        return Err(std::io::Error::other(message));
+    }
+    super::print_response(&response)
 }
 
 fn print_agent_help() {

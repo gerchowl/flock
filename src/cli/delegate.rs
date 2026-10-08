@@ -300,6 +300,14 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
         }
     }
 
+    if let Some(message) = super::compatibility::unknown_variant_message(&response, "flk delegate")
+    {
+        return Ok(serde_json::json!({
+            "id": response["id"],
+            "error": { "code": "server_version_gap", "message": message },
+        }));
+    }
+
     // Return raw response; caller handles server errors.
     Ok(response)
 }
@@ -602,6 +610,13 @@ pub(super) fn run_delegate_command(args: &[String]) -> io::Result<i32> {
         print_delegate_help();
         return Ok(exit::USAGE);
     };
+
+    if matches!(
+        subcommand,
+        "start" | "send" | "wait" | "result" | "status" | "reap"
+    ) {
+        super::compatibility::require_turn_server("flk delegate")?;
+    }
 
     match subcommand {
         "start" => delegate_start(&args[1..]),
