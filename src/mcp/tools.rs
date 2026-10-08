@@ -9,6 +9,9 @@
 //! is how the design keeps mutating verbs (`pane.close`, `worktree.remove`,
 //! `agent.start`, pane `send_*`, …) off the MCP surface.
 //!
+//! `flock_worktree_kill` exposes teardown with a dry-run default and a caller
+//! workspace guard. Branch deletion still requires positive merge evidence.
+//!
 //! One name deserves care: the tool `flock_agent_start` does NOT build
 //! `Method::AgentStart`. That verb takes raw `argv` and stays excluded, exactly
 //! as the line above says. The tool builds the narrowed `Method::AgentSpawn`,
@@ -22,7 +25,7 @@ use serde_json::{json, Value};
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentTarget, EmptyParams, LineageParams, MessageTarget,
     Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams, ReadFormat, ReadSource,
-    WorktreeListParams,
+    WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -282,6 +285,23 @@ pub(super) fn table() -> &'static [Tool] {
                           cross-repo ⇒ `flock_msg_send`.",
             input_schema: schema_no_args,
             build: build_worktree_list,
+        },
+        Tool {
+            name: "flock_worktree_kill",
+            description: "Tear down a finished worktree space and return its \
+                          `worktree_killed` record. Exactly one of `workspace` \
+                          or `path` is required. `dry_run` defaults to true: \
+                          inspect the plan, then pass `dry_run: false` for a \
+                          real kill. A real kill closes the workspace, removes \
+                          the checkout, and ends remaining processes unless \
+                          `keep_procs: true`. Killing the calling pane's own \
+                          workspace requires `self: true`, otherwise it refuses \
+                          with `self_kill_unconfirmed`. The branch is deleted \
+                          only when merged and `keep_branch` is false. \
+                          `force` permits a dirty checkout but never bypasses \
+                          the merge gate for branch deletion.",
+            input_schema: schema_worktree_kill,
+            build: build_worktree_kill,
         },
         Tool {
             name: "flock_agent_start",
@@ -656,6 +676,75 @@ fn build_worktree_list(_args: Value) -> Result<Method, McpError> {
     // there", and `workspace_id`/`cwd` would narrow the one call an agent
     // makes to orient itself (#320 P1 audit).
     Ok(Method::WorktreeList(WorktreeListParams::default()))
+}
+
+fn schema_worktree_kill() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "workspace": {
+                "type": "string",
+                "description": "The open workspace to tear down, by its public workspace id.",
+            },
+            "path": {
+                "type": "string",
+                "description": "The checkout to tear down, by path — the `path` from `flock_worktree_list`. Use this for a checkout nobody has open. Exactly one of `workspace` and `path`.",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "default": true,
+                "description": "Report the plan and touch nothing. DEFAULTS TO TRUE HERE, unlike the CLI: pass `false` to actually remove anything.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Remove the checkout even with uncommitted or untracked changes in it. Never widens the branch decision.",
+            },
+            "keep_branch": {
+                "type": "boolean",
+                "description": "Remove the checkout but keep the local branch, whatever the merge gate says.",
+            },
+            "keep_procs": {
+                "type": "boolean",
+                "description": "Report the processes still standing in the removed checkout without signalling them. They are always reported either way.",
+            },
+            "self": {
+                "type": "boolean",
+                "description": "Confirm that the target may be YOUR OWN space. Without it, a kill aimed at the workspace you are calling from is refused (`self_kill_unconfirmed`) — you would be closing your own terminal mid-call.",
+            },
+        },
+        "oneOf": [{"required": ["workspace"]}, {"required": ["path"]}],
+        "additionalProperties": false,
+    })
+}
+
+fn build_worktree_kill(args: Value) -> Result<Method, McpError> {
+    // MCP defaults to inspection. A destructive call must opt in explicitly.
+    let dry_run = match args.get("dry_run") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(dry_run)) => *dry_run,
+        Some(_) => {
+            return Err(McpError::invalid_params("`dry_run` must be a boolean"));
+        }
+    };
+    let workspace_id = optional_string(&args, "workspace")?;
+    let path = optional_string(&args, "path")?;
+    if workspace_id.is_some() == path.is_some() {
+        return Err(McpError::invalid_params(
+            "exactly one of `workspace` or `path` is required",
+        ));
+    }
+    Ok(Method::WorktreeKill(WorktreeKillParams {
+        workspace_id,
+        path,
+        force: optional_bool(&args, "force")?,
+        keep_branch: optional_bool(&args, "keep_branch")?,
+        dry_run,
+        keep_processes: optional_bool(&args, "keep_procs")?,
+        // Exclude the MCP process and its ancestors from orphan cleanup.
+        caller_pid: Some(std::process::id()),
+        // Omission arms the guard. The CLI leaves this field absent.
+        self_kill_confirmed: Some(optional_bool(&args, "self")?),
+    }))
 }
 
 fn build_agent_get(args: Value) -> Result<Method, McpError> {
@@ -1149,6 +1238,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worktree_kill_defaults_to_dry_run_with_self_guard_armed() {
+        let tool = find("flock_worktree_kill").unwrap();
+        let Method::WorktreeKill(params) =
+            (tool.build)(json!({"workspace": "ws_fixture"})).unwrap()
+        else {
+            panic!("expected worktree kill");
+        };
+        assert!(params.dry_run);
+        assert_eq!(params.self_kill_confirmed, Some(false));
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_fixture"));
+        assert_eq!(params.caller_pid, Some(std::process::id()));
+        assert!(!params.force && !params.keep_branch && !params.keep_processes);
+        assert_eq!(
+            tool.descriptor()["inputSchema"]["properties"]["dry_run"]["default"],
+            true
+        );
+    }
+
+    #[test]
+    fn worktree_kill_maps_explicit_teardown_options() {
+        let Method::WorktreeKill(params) = build_worktree_kill(json!({
+            "path": "fixture-checkout", "dry_run": false, "self": true,
+            "force": true, "keep_branch": true, "keep_procs": true,
+        }))
+        .unwrap() else {
+            panic!("expected worktree kill");
+        };
+        assert!(!params.dry_run);
+        assert_eq!(params.self_kill_confirmed, Some(true));
+        assert_eq!(params.path.as_deref(), Some("fixture-checkout"));
+        assert!(params.force && params.keep_branch && params.keep_processes);
+    }
+
+    #[test]
+    fn worktree_kill_rejects_ambiguous_addresses_and_non_boolean_options() {
+        for args in [
+            json!({}),
+            json!({"workspace": "ws_fixture", "path": "fixture-checkout"}),
+            json!({"path": "fixture-checkout", "dry_run": "false"}),
+            json!({"path": "fixture-checkout", "self": "true"}),
+        ] {
+            assert!(build_worktree_kill(args).is_err());
+        }
+    }
+
+    #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
         // tools/list output stays load-bearing for agents that cache it.
@@ -1170,6 +1305,7 @@ mod tests {
                 "flock_self_compact",
                 "flock_pane_read",
                 "flock_worktree_list",
+                "flock_worktree_kill",
                 "flock_agent_start",
                 "flock_agent_history",
                 "flock_agent_result",

@@ -674,6 +674,10 @@ pub struct WorktreeKillParams {
     /// cwd inside the checkout when a kill is run from in there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pid: Option<u32>,
+    /// MCP self-kill confirmation: Some(false) guards the caller's workspace,
+    /// Some(true) permits it. None preserves the CLI's existing behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_kill_confirmed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

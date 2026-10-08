@@ -490,6 +490,7 @@ Exposed tools:
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
+| `flock_worktree_kill` | `worktree.kill` | Tear down a finished space by `workspace` or `path`. Defaults to `dry_run: true`; pass `dry_run: false` to close the space and remove its checkout. A real kill of your own pane's workspace requires `self: true`. The branch is deleted only when merged; `force` permits dirty checkout removal but never bypasses the merge gate. `keep_branch` and `keep_procs` preserve the branch and remaining processes respectively. |
 
 ### Resources: files handed over to an agent
 
