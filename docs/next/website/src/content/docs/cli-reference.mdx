@@ -35,6 +35,8 @@ flk status client
 
 `flk status` also probes the selected installed launch path with `--version`, bounded to two seconds. It shows client, running server and installed executable versions, the launch path, and `client_drift` / `server_drift`. JSON includes an `installed` object. Missing, failed or timed-out probes report an error and unknown drift rather than claiming the versions match. Server drift is unknown when no server is running. `restart_needed` retains its client/server comparison.
 
+Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
+
 ## Server
 
 ```bash
