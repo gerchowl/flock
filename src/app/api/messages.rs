@@ -664,19 +664,23 @@ impl App {
             },
             None => None,
         };
-        encode_success(
-            id,
-            ResponseResult::MsgList {
-                messages: self.mailboxes.queued_infos(pane_filter.as_deref()),
-            },
-        )
+        let attempts = self.delivery_attempts();
+        let mut messages = self.mailboxes.queued_infos(pane_filter.as_deref());
+        for message in &mut messages {
+            message.attempts = attempts
+                .iter()
+                .filter(|a| a.correlation_ids.contains(&message.correlation_id))
+                .cloned()
+                .collect();
+        }
+        encode_success(id, ResponseResult::MsgList { messages })
     }
 
     /// `msg.status` — what became of one message, asked by whoever sent it.
     ///
-    /// Read from the durable log rather than the mailbox: a message that was
-    /// already consumed, aged out, or relayed away is gone from the queue,
-    /// and those are precisely the outcomes a sender wants to ask about.
+    /// Read retained receipt events and the live mailbox without disk I/O.
+    /// Consumed or relayed messages leave the queue, while queued messages
+    /// must remain queryable even after their receipt event leaves the ring.
     ///
     /// The last event for a correlation id wins. Ordering is by sequence, and
     /// #175 O1 makes that monotonic across restarts, so "last" is a real
@@ -689,6 +693,7 @@ impl App {
                     if *correlation_id == params.correlation_id =>
                 {
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "queued".into(),
                         outcome_known: true,
@@ -718,6 +723,7 @@ impl App {
                         ),
                     };
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "relayed".into(),
                         // The receiving node owns the outcome. Saying so beats
@@ -739,6 +745,7 @@ impl App {
                     ..
                 } if *correlation_id == params.correlation_id => {
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: if *delivered { "read" } else { "dropped" }.into(),
                         outcome_known: true,
@@ -751,6 +758,24 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if found.is_none()
+            && self
+                .mailboxes
+                .queued_message(&params.correlation_id)
+                .is_some()
+        {
+            found = Some(ResponseResult::MsgStatus {
+                attempts: Vec::new(),
+                correlation_id: params.correlation_id.clone(),
+                state: "queued".into(),
+                outcome_known: true,
+                to_host: None,
+                route: None,
+                path: None,
+                detail: Some("waiting in a local inbox, not yet read".into()),
+                reply: None,
+            });
         }
         // #576: and what came back. A held reply (the sender had no inbox)
         // can be the only trace of the exchange on this server.
@@ -766,6 +791,13 @@ impl App {
             (found.as_mut(), answer)
         {
             *reply = Some(answer);
+        }
+        if let Some(ResponseResult::MsgStatus { attempts, .. }) = found.as_mut() {
+            *attempts = self
+                .delivery_attempts()
+                .into_iter()
+                .filter(|a| a.correlation_ids.contains(&params.correlation_id))
+                .collect();
         }
         match found {
             Some(result) => encode_success(id, result),

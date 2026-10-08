@@ -104,7 +104,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// v26 adds allocation previews (#459). JSON API clients check this version
 /// before sending `dry_run`, so an older server cannot ignore it and allocate.
-pub const PROTOCOL_VERSION: u32 = 26;
+/// v27 adds durable local submission attempt evidence (#640).
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -1845,7 +1846,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 26;
+    const PINNED_PROTOCOL_VERSION: u32 = 27;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
