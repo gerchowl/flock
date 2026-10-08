@@ -183,10 +183,14 @@ mod tests {
         let mut disabled = Monitor::new(0, now);
         assert!(!disabled.observe("blocked", short, now));
         assert!(!disabled.observe("blocked", short, now + Duration::from_secs(600)));
+        assert!(!disabled.observe("idle", "DONE: recovered", now + Duration::from_secs(601)));
         assert!(disabled.observe("blocked", &short.replace("5s", "5m"), now));
         let mut timed = Monitor::new(10_000, now);
         assert!(!timed.observe("blocked", short, now));
-        assert!(!timed.observe("blocked", short, now + Duration::from_secs(9)));
+        for second in 1..10 {
+            let changing = short.replace("attempt #1", &format!("attempt #{}", second + 1));
+            assert!(!timed.observe("blocked", &changing, now + Duration::from_secs(second)));
+        }
         assert!(timed.observe("blocked", short, now + Duration::from_secs(10)));
         let verdict = readiness(short, "blocked");
         assert_eq!(verdict.verdict, "unknown");
