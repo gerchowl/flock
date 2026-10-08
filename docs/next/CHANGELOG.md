@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-- `flk delegate reap` now closes the recorded workspace and clears the delegate entry when its checkout was removed outside flock, while preserving the workspace identity check (#637).
-
 ### Changed
 - **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
 

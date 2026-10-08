@@ -1990,6 +1990,26 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                 Err(err) => return Err(err),
             }
         }
+        if !Path::new(&checkout).exists() {
+            if let Some(repo_root) = &target.repo_root {
+                // Directory deletion can leave Git's worktree registration behind.
+                let command = crate::worktree::WorktreeCommand {
+                    program: "git".to_string(),
+                    args: vec![
+                        "-C".to_string(),
+                        repo_root.clone(),
+                        "worktree".to_string(),
+                        "prune".to_string(),
+                        "--expire".to_string(),
+                        "now".to_string(),
+                    ],
+                };
+                crate::worktree::run_worktree_command(&command).map_err(|message| ServerError {
+                    code: "worktree_prune_failed".to_string(),
+                    message,
+                })?;
+            }
+        }
     }
 
     if close_parent {
