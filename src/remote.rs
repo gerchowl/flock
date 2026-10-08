@@ -1656,6 +1656,7 @@ mv "$tmp" "$dest"
     let mut child = TracedCommand::new("ssh", "remote")
         .args(control_plane_jump_args(target)?)
         .arg("-T")
+        .arg("-C")
         .arg(target)
         .arg(format!("/bin/sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
@@ -1699,6 +1700,7 @@ mv "$tmp" "$dest"
 /// flock" failure mode. `BatchMode` refuses to prompt, `ConnectTimeout` bounds
 /// the TCP connect, and `accept-new` trusts first-seen host keys without asking.
 const SSH_NONINTERACTIVE_OPTS: &[&str] = &[
+    "-C",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -3128,6 +3130,41 @@ mod tests {
         {
             let _route = route_control_plane("ws00860001", None);
             assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn bridge_dial_argv_compresses_managed_and_plain_connections() {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let config = std::env::temp_dir().join("flock-compression-ssh-config");
+        for ssh_config in [None, Some(config.as_path())] {
+            let argv = bridge_dial_argv(
+                "operator@example.com",
+                &remote_flock,
+                crate::session::DEFAULT_SESSION_NAME,
+                ssh_config,
+                None,
+            )
+            .expect("valid bridge dial");
+            let compression = argv
+                .iter()
+                .position(|arg| arg == "-C")
+                .expect("compression flag");
+            let target = argv
+                .iter()
+                .position(|arg| arg == "operator@example.com")
+                .expect("target");
+            assert!(
+                compression < target,
+                "compression must be an SSH option: {argv:?}"
+            );
+            assert_eq!(
+                argv.first().map(String::as_str),
+                Some(if ssh_config.is_some() { "-F" } else { "-T" })
+            );
         }
     }
 
