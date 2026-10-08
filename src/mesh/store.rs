@@ -1,0 +1,727 @@
+//! SQLite custody, inbox import, and outcome retention (ADR-0026).
+//!
+//! The caller authenticates origin and return bindings before admission. This
+//! library does no transport, directory lookup, or audit-body publication.
+use super::{clock::Clock, key::MessageKey};
+mod schema;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+};
+
+pub const DAY_MS: i64 = 86_400_000;
+pub const CUSTODY_TTL_MS: i64 = 7 * DAY_MS;
+// Charged at admission, including space for future import/receipt metadata.
+const ROW_RESERVE: u64 = 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub logical_bytes: u64,
+    pub metadata_reserve: u64,
+    pub active_envelopes: u64,
+    pub disk_reserve: u64,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            logical_bytes: 256 << 20,
+            metadata_reserve: 16 << 20,
+            active_envelopes: 10_000,
+            disk_reserve: 32 << 20,
+        }
+    }
+}
+
+/// Injectable filesystem observation for deterministic disk-full tests.
+pub trait DiskSpace {
+    fn available(&self, path: &Path) -> std::io::Result<u64>;
+}
+pub struct SystemDisk;
+impl DiskSpace for SystemDisk {
+    fn available(&self, path: &Path) -> std::io::Result<u64> {
+        crate::platform_disk::available(path)
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Sql(rusqlite::Error),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    MailStoreFull,
+    Paused,
+    InvalidEnvelope,
+    ConflictingKey,
+    NotFound,
+    InvalidState,
+    NewerSchema { found: i64, supported: i64 },
+    IdentityPinConflict,
+}
+impl Error {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MailStoreFull => "mail_store_full",
+            Self::Paused => "fleet_paused",
+            Self::InvalidEnvelope => "invalid_envelope",
+            Self::ConflictingKey => "message_key_conflict",
+            Self::NotFound => "message_not_found",
+            Self::InvalidState => "invalid_custody_state",
+            Self::NewerSchema { .. } => "mail_store_schema_too_new",
+            Self::IdentityPinConflict => "identity_pin_conflict",
+            _ => "mail_store_unavailable",
+        }
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::NewerSchema { found, supported } = self {
+            return write!(
+                f,
+                "{}: database schema version {found} is newer than supported version {supported}",
+                self.code()
+            );
+        }
+        write!(f, "{}: {self:?}", self.code())
+    }
+}
+impl std::error::Error for Error {}
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sql(e)
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
+}
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnBinding {
+    pub request: MessageKey,
+    pub recipient_node: String,
+    pub collection_token: Vec<u8>,
+    pub collection_peers: Vec<String>,
+}
+impl ReturnBinding {
+    pub fn mint(
+        request: MessageKey,
+        recipient_node: String,
+        collection_peers: Vec<String>,
+    ) -> std::result::Result<Self, getrandom::Error> {
+        let mut collection_token = vec![0; 32];
+        getrandom::fill(&mut collection_token)?;
+        Ok(Self {
+            request,
+            recipient_node,
+            collection_token,
+            collection_peers,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub key: MessageKey,
+    pub sender: String,
+    pub target_agent: String,
+    pub target_session: String,
+    pub correlation_id: String,
+    pub in_reply_to: Option<String>,
+    pub request_key: Option<MessageKey>,
+    pub return_binding: ReturnBinding,
+    pub intent: String,
+    pub body: Vec<u8>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Custody,
+    Inbox,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Accepted {
+    New,
+    Duplicate,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Transferred,
+    Delivered,
+    Read,
+    Expired,
+    InboxExpired,
+    RecipientGone,
+}
+impl Outcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Transferred => "transferred",
+            Self::Delivered => "delivered",
+            Self::Read => "read",
+            Self::Expired => "expired",
+            Self::InboxExpired => "inbox_expired",
+            Self::RecipientGone => "recipient_gone",
+        }
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct Record {
+    pub envelope: Envelope,
+    pub state: String,
+    pub remaining_ms: i64,
+    pub delivered: bool,
+    pub retry_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityPin {
+    pub node_id: String,
+    pub public_key: Vec<u8>,
+}
+
+/// `Store` with the default disk provider is `Send` but not `Sync`. Share it
+/// between workers through a `Mutex`, never concurrent unsynchronized access.
+/// Message order within the same millisecond is arbitrary, with no FIFO promise.
+pub struct Store<D = SystemDisk> {
+    connection: Connection,
+    path: PathBuf,
+    limits: Limits,
+    disk: D,
+}
+impl Store<SystemDisk> {
+    /// `path` is normally `config::state_dir()/mesh-mail.sqlite`. Its parent
+    /// must already exist. Writer handoff is the runtime owner's responsibility.
+    pub fn open(path: &Path, wall_ms: i64) -> Result<Self> {
+        Self::open_with(path, wall_ms, Limits::default(), SystemDisk)
+    }
+}
+impl<D: DiskSpace> Store<D> {
+    pub fn open_with(path: &Path, wall_ms: i64, limits: Limits, disk: D) -> Result<Self> {
+        if limits.metadata_reserve > limits.logical_bytes || limits.logical_bytes > i64::MAX as u64
+        {
+            return Err(Error::InvalidEnvelope);
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut connection = Connection::open(path)?;
+        schema::check_version(&connection)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch(
+            "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+            PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;",
+        )?;
+        schema::migrate(&mut connection)?;
+        connection.execute("INSERT OR IGNORE INTO clock VALUES(1,?1,0,0)", [wall_ms])?;
+        fs::File::open(path)?.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
+        let mut store = Self {
+            connection,
+            path: parent.canonicalize()?,
+            limits,
+            disk,
+        };
+        store.advance(wall_ms, None)?;
+        Ok(store)
+    }
+
+    fn guard_disk(&self, extra: u64) -> Result<()> {
+        // Allow for both database and WAL pages, including a conservative
+        // transaction/page overhead allowance. Never acknowledge after failure.
+        if self.disk.available(&self.path)?
+            < self
+                .limits
+                .disk_reserve
+                .saturating_add(extra.saturating_mul(2))
+                .saturating_add(1 << 20)
+        {
+            return Err(Error::MailStoreFull);
+        }
+        Ok(())
+    }
+
+    pub fn clock(&self) -> Result<Clock> {
+        Ok(self.connection.query_row(
+            "SELECT wall,elapsed,paused FROM clock WHERE singleton=1",
+            [],
+            |r| {
+                Ok(Clock {
+                    wall_ms: r.get(0)?,
+                    elapsed_ms: r.get(1)?,
+                    paused: r.get(2)?,
+                })
+            },
+        )?)
+    }
+
+    fn advance(&mut self, wall_ms: i64, paused: Option<bool>) -> Result<Clock> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut clock = tx.query_row(
+            "SELECT wall,elapsed,paused FROM clock WHERE singleton=1",
+            [],
+            |r| {
+                Ok(Clock {
+                    wall_ms: r.get(0)?,
+                    elapsed_ms: r.get(1)?,
+                    paused: r.get(2)?,
+                })
+            },
+        )?;
+        if let Some(paused) = paused {
+            clock.set_paused(paused, wall_ms);
+        } else {
+            clock.advance(wall_ms);
+        }
+        tx.execute(
+            "UPDATE clock SET wall=?1,elapsed=?2,paused=?3 WHERE singleton=1",
+            params![clock.wall_ms, clock.elapsed_ms, clock.paused],
+        )?;
+        tx.commit()?;
+        Ok(clock)
+    }
+
+    pub fn set_paused(&mut self, paused: bool, wall_ms: i64) -> Result<()> {
+        self.advance(wall_ms, Some(paused))?;
+        Ok(())
+    }
+
+    fn writable(&mut self, wall_ms: i64) -> Result<i64> {
+        let clock = self.advance(wall_ms, None)?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        Ok(clock.elapsed_ms)
+    }
+
+    /// Atomic custody acceptance and, when requested, inbox/dedupe import.
+    /// Remaining TTL is transport state, not part of immutable identity.
+    pub fn accept(
+        &mut self,
+        envelope: &Envelope,
+        ttl_ms: i64,
+        admission: Admission,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        let now = self.writable(wall_ms)?;
+        if !envelope.key.is_valid()
+            || !(1..=CUSTODY_TTL_MS).contains(&ttl_ms)
+            || !envelope.return_binding.request.is_valid()
+            || envelope.return_binding.collection_token.len() < 32
+        {
+            return Err(Error::InvalidEnvelope);
+        }
+        let mut metadata = envelope.clone();
+        metadata.body.clear();
+        let metadata = serde_json::to_string(&metadata)?;
+        let mut hash = Sha256::new();
+        hash.update(metadata.as_bytes());
+        hash.update(&envelope.body);
+        let fingerprint = hash.finalize().to_vec();
+        let charge = metadata.len() as u64
+            + envelope.key.origin_node.len() as u64
+            + envelope.key.message_id.len() as u64
+            + envelope.correlation_id.len() as u64
+            + ROW_RESERVE;
+        self.guard_disk(charge.saturating_add(envelope.body.len() as u64))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT fingerprint FROM envelopes WHERE origin=?1 AND id=?2",
+                params![envelope.key.origin_node, envelope.key.message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            if prior != fingerprint {
+                return Err(Error::ConflictingKey);
+            }
+            // No TTL or inbox lifetime renewal on retry. Import of existing
+            // custody is explicit through import(), not implicit retransmission.
+            tx.commit()?;
+            return Ok(Accepted::Duplicate);
+        }
+        let (total, bodies, active): (i64, i64, i64) = tx.query_row(
+            "SELECT total_bytes,body_bytes,active FROM usage WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let body_size = envelope.body.len() as u64;
+        if (total as u64)
+            .saturating_add(charge)
+            .saturating_add(body_size)
+            > self.limits.logical_bytes
+            || (bodies as u64).saturating_add(body_size)
+                > self.limits.logical_bytes - self.limits.metadata_reserve
+            || active as u64 >= self.limits.active_envelopes
+        {
+            return Err(Error::MailStoreFull);
+        }
+        let deadline = now.saturating_add(ttl_ms);
+        let inbox = admission == Admission::Inbox;
+        tx.execute("INSERT INTO envelopes(origin,id,correlation,metadata,fingerprint,body,state,custody_deadline,
+            inbox_deadline,dedupe_until,delivered,retry_at,metadata_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![envelope.key.origin_node,envelope.key.message_id,envelope.correlation_id,metadata,fingerprint,envelope.body,
+                if inbox { "inbox" } else { "custody" },deadline, if inbox {Some(now.saturating_add(DAY_MS))} else {None},
+                deadline.saturating_add(DAY_MS),inbox,now,charge as i64])?;
+        if inbox {
+            tx.execute(
+                "INSERT INTO inbox_imports VALUES(?1,?2)",
+                params![envelope.key.origin_node, envelope.key.message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Accepted::New)
+    }
+
+    /// Final mailbox import is one transaction. A full mailbox should leave
+    /// custody untouched and retry later, before calling this method. This only
+    /// references the existing body, so it does not require disk-reserve admission.
+    pub fn import(&mut self, key: &MessageKey, wall_ms: i64) -> Result<Accepted> {
+        let now = self.writable(wall_ms)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, deadline, delivered): (String, i64, bool) = tx
+            .query_row(
+                "SELECT state,custody_deadline,delivered FROM envelopes WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        if delivered {
+            return Ok(Accepted::Duplicate);
+        }
+        if state != "custody" || deadline <= now {
+            return Err(Error::InvalidState);
+        }
+        tx.execute(
+            "INSERT INTO inbox_imports VALUES(?1,?2)",
+            params![key.origin_node, key.message_id],
+        )?;
+        tx.execute("UPDATE envelopes SET state='inbox',delivered=1,inbox_deadline=?3 WHERE origin=?1 AND id=?2",
+            params![key.origin_node,key.message_id,now.saturating_add(DAY_MS)])?;
+        tx.commit()?;
+        Ok(Accepted::New)
+    }
+
+    /// Terminal transitions remove bodies but keep immutable fingerprints,
+    /// dedupe, return bindings and receipts. Transferred is for hubs only:
+    /// origins retain custody until final delivery or expiry.
+    pub fn finish(&mut self, key: &MessageKey, outcome: Outcome, wall_ms: i64) -> Result<()> {
+        let now = self.writable(wall_ms)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, custody, inbox): (String,i64,Option<i64>) = tx.query_row(
+            "SELECT state,custody_deadline,inbox_deadline FROM envelopes WHERE origin=?1 AND id=?2", params![key.origin_node,key.message_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or(Error::NotFound)?;
+        if state == outcome.name() {
+            return Ok(());
+        }
+        let valid = match outcome {
+            Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
+            Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
+            Outcome::Expired => state == "custody" && custody <= now,
+            _ => state == "custody" && custody > now,
+        };
+        if !valid {
+            return Err(Error::InvalidState);
+        }
+        tx.execute(
+            "UPDATE envelopes SET state=?3,body=X'',outcome_until=?4,
+            delivered=CASE WHEN ?3='delivered' THEN 1 ELSE delivered END WHERE origin=?1 AND id=?2",
+            params![
+                key.origin_node,
+                key.message_id,
+                outcome.name(),
+                now.saturating_add(CUSTODY_TTL_MS)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Scheduler deadlines use the same unpaused clock as expiry. The caller
+    /// supplies its jittered backoff; the durable deadline survives restart.
+    pub fn schedule_retry(&mut self, key: &MessageKey, delay_ms: i64, wall_ms: i64) -> Result<()> {
+        let now = self.writable(wall_ms)?;
+        if !(60_000..=300_000).contains(&delay_ms) {
+            return Err(Error::InvalidEnvelope);
+        }
+        let changed = self.connection.execute("UPDATE envelopes SET retry_at=?3 WHERE origin=?1 AND id=?2 AND state='custody' AND custody_deadline>?4",
+            params![key.origin_node,key.message_id,now.saturating_add(delay_ms),now])?;
+        if changed == 0 {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// Read the last persisted snapshot. `maintain` advances expiry. Absence
+    /// alone proves no delivery outcome: a caller with an expired authenticated
+    /// reference must report `outcome_retention_elapsed` after GC.
+    pub fn get(&self, key: &MessageKey) -> Result<Option<Record>> {
+        let now = self.clock()?.elapsed_ms;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT metadata,body,state,custody_deadline,inbox_deadline,delivered,retry_at
+            FROM envelopes WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, bool>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(metadata, body, state, custody, inbox, delivered, retry_at_ms)| {
+                let mut envelope: Envelope = serde_json::from_str(&metadata)?;
+                envelope.body = body;
+                let remaining_ms = if state == "inbox" {
+                    inbox.unwrap_or(custody)
+                } else {
+                    custody
+                }
+                .saturating_sub(now)
+                .max(0);
+                Ok(Record {
+                    envelope,
+                    state,
+                    remaining_ms,
+                    delivered,
+                    retry_at_ms,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// Correlation ids are nonunique threading labels scoped to an origin.
+    pub fn conversation(&self, origin: &str, correlation: &str) -> Result<Vec<MessageKey>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT id FROM envelopes WHERE origin=?1 AND correlation=?2 ORDER BY id")?;
+        let keys = stmt
+            .query_map(params![origin, correlation], |r| {
+                Ok(MessageKey {
+                    origin_node: origin.to_owned(),
+                    message_id: r.get(0)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Replies referencing a full request identity, independently of threading labels.
+    pub fn by_request_key(&self, request: &MessageKey) -> Result<Vec<MessageKey>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.request_key.origin_node')=?1
+             AND json_extract(metadata,'$.request_key.message_id')=?2 ORDER BY origin,id",
+        )?;
+        let keys = stmt
+            .query_map(params![request.origin_node, request.message_id], |r| {
+                Ok(MessageKey {
+                    origin_node: r.get(0)?,
+                    message_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Token lookup is not authorization. The transport must also authenticate
+    /// the caller and verify the stored conversation's origin/recipient binding.
+    pub fn by_collection_token(&self, token: &[u8]) -> Result<Vec<MessageKey>> {
+        let encoded = serde_json::to_string(token)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.return_binding.collection_token')=?1 ORDER BY origin,id",
+        )?;
+        let keys = stmt
+            .query_map([encoded], |r| {
+                Ok(MessageKey {
+                    origin_node: r.get(0)?,
+                    message_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    pub fn get_pin(&self, peer: &str) -> Result<Option<IdentityPin>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT node_id,public_key FROM identity_pins WHERE peer=?1",
+                [peer],
+                |r| {
+                    Ok(IdentityPin {
+                        node_id: r.get(0)?,
+                        public_key: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Enrollment is idempotent, but never silently replaces a pin or aliases
+    /// an already pinned node. Replacement requires an explicit operator reset.
+    pub fn put_pin(&mut self, peer: &str, pin: &IdentityPin) -> Result<()> {
+        if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
+            return Err(Error::InvalidEnvelope);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT peer,node_id,public_key FROM identity_pins WHERE peer=?1 OR node_id=?2",
+                params![peer, pin.node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((name, node_id, key)) = existing {
+            if name != peer || node_id != pin.node_id || key != pin.public_key {
+                return Err(Error::IdentityPinConflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO identity_pins VALUES(?1,?2,?3)",
+                params![peer, pin.node_id, pin.public_key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Only the operator's explicit re-enrollment path should call this.
+    pub fn reset_pin(&mut self, peer: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM identity_pins WHERE peer=?1", [peer])?
+            != 0)
+    }
+
+    /// Rebuild the unread mailbox projection after restart, including while
+    /// paused. Reading this list never consumes a message or changes custody.
+    pub fn inbox_keys(&self) -> Result<Vec<MessageKey>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT origin,id FROM envelopes WHERE state='inbox' ORDER BY origin,id")?;
+        let keys = stmt
+            .query_map([], |r| {
+                Ok(MessageKey {
+                    origin_node: r.get(0)?,
+                    message_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Atomically claim at most 500 ready keys for 60 seconds of unpaused
+    /// time. A second worker cannot select them until that lease expires.
+    /// Workers must finish their attempt within the lease. Crashed workers'
+    /// claims become retryable after expiry, including across restart.
+    pub fn retry_ready(&mut self, wall_ms: i64) -> Result<Vec<MessageKey>> {
+        let now = self.writable(wall_ms)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let keys = {
+            let mut stmt = tx.prepare(
+                "SELECT origin,id FROM envelopes WHERE state='custody' AND retry_at<=?1
+                 AND custody_deadline>?1 AND lease_until<=?1 ORDER BY retry_at,origin,id LIMIT 500",
+            )?;
+            let keys = stmt
+                .query_map([now], |r| {
+                    Ok(MessageKey {
+                        origin_node: r.get(0)?,
+                        message_id: r.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keys
+        };
+        for key in &keys {
+            tx.execute(
+                "UPDATE envelopes SET lease_until=?3 WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id, now.saturating_add(60_000)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(keys)
+    }
+
+    /// Explicit maintenance records expiry before collection of terminal rows.
+    /// Keep dedupe through admitted TTL + 24h even after outcome retention ends.
+    pub fn maintain(&mut self, wall_ms: i64) -> Result<usize> {
+        let now = self.writable(wall_ms)?;
+        // Each transaction changes at most 500 rows, releasing the writer lock
+        // between batches so other work can make progress.
+        loop {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let expired = tx.execute("UPDATE envelopes SET state=CASE WHEN state='inbox' THEN 'inbox_expired' ELSE 'expired' END,
+                body=X'',outcome_until=?1 WHERE rowid IN (SELECT rowid FROM envelopes
+                WHERE (state='custody' AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
+                params![now.saturating_add(CUSTODY_TTL_MS),now])?;
+            tx.commit()?;
+            if expired < 500 {
+                break;
+            }
+        }
+        let mut deleted = 0;
+        loop {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let batch = tx.execute("DELETE FROM envelopes WHERE rowid IN
+                (SELECT rowid FROM envelopes WHERE outcome_until<=?1 AND dedupe_until<=?1 LIMIT 500)", [now])?;
+            tx.commit()?;
+            deleted += batch;
+            if batch < 500 {
+                break;
+            }
+        }
+        self.checkpoint()?;
+        Ok(deleted)
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        if self.clock()?.paused {
+            return Err(Error::Paused);
+        }
+        self.connection.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
