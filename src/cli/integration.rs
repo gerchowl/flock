@@ -68,17 +68,31 @@ fn integration_verify(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn integration_sync(args: &[String]) -> std::io::Result<i32> {
-    let dry_run = match args {
-        [] => false,
-        [flag] if flag == "--dry-run" => true,
-        _ => {
-            eprintln!("usage: flk integration sync [--dry-run]");
-            return Ok(2);
-        }
-    };
-    let outcomes = crate::integration::sync::run(dry_run)?;
-    let failed = outcomes.iter().any(|outcome| outcome.failed);
-    for outcome in outcomes {
+    if args.iter().any(|arg| arg != "--dry-run" && arg != "--json")
+        || args
+            .iter()
+            .filter(|arg| arg.as_str() == "--dry-run")
+            .count()
+            > 1
+        || args.iter().filter(|arg| arg.as_str() == "--json").count() > 1
+    {
+        eprintln!("usage: flk integration sync [--dry-run] [--json]");
+        return Ok(2);
+    }
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let json = args.iter().any(|arg| arg == "--json");
+    let report = crate::integration::sync::run(dry_run);
+    let failed = report.outcomes.iter().any(|outcome| outcome.failed);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(i32::from(failed));
+    }
+    if let Some(path) = &report.launch_path {
+        println!("MCP launch path: {}", path.display());
+    } else if let Some(error) = &report.launch_error {
+        println!("MCP launch path: unavailable ({error})");
+    }
+    for outcome in report.outcomes {
         println!("{}", outcome.message);
     }
     if let Err(err) = super::status::run_status_command(&[]) {
@@ -315,7 +329,7 @@ fn print_integration_help() {
     eprintln!("  flk integration uninstall opencode");
     eprintln!("  flk integration uninstall hermes");
     eprintln!("  flk integration uninstall qodercli");
-    eprintln!("  flk integration sync [--dry-run]");
+    eprintln!("  flk integration sync [--dry-run] [--json]");
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
     eprintln!("  flk integration verify");

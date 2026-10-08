@@ -3,6 +3,7 @@
 #![allow(clippy::disallowed_methods)]
 use std::{
     fs,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Output},
 };
@@ -21,12 +22,37 @@ impl Sandbox {
         for dir in ["codex", "claude", ".config/opencode"] {
             fs::create_dir_all(path.join(dir)).unwrap();
         }
+        fs::create_dir_all(path.join("profile/bin")).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), path.join("profile/bin/flk"))
+            .unwrap();
         Self(path)
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_flk"))
+        self.run_with_launch(args, false)
+    }
+    fn run_with_launch(&self, args: &[&str], store_only: bool) -> Output {
+        let executable = if store_only {
+            PathBuf::from(env!("CARGO_BIN_EXE_flk"))
+        } else {
+            self.0.join("profile/bin/flk")
+        };
+        let mut command = Command::new(executable);
+        if store_only {
+            // Simulate a store invocation/PATH without creating a Nix store.
+            // The real test image must not be accepted as a fallback either.
+            command.arg0("/nix/store/fixture-flock/bin/flk");
+        }
+        command
             .args(args)
             .env_clear()
+            .env(
+                "PATH",
+                if store_only {
+                    PathBuf::from("/nix/store/fixture-flock/bin")
+                } else {
+                    self.0.join("profile/bin")
+                },
+            )
             .env("HOME", &self.0)
             .env("CODEX_HOME", self.0.join("codex"))
             .env("CLAUDE_CONFIG_DIR", self.0.join("claude"))
@@ -75,6 +101,23 @@ fn integration_sync_cli_refreshes_selected_profiles_and_preserves_trust() {
     fs::write(unselected.join(".claude.json"), claude_raw).unwrap();
     let plan = sandbox.run(&["integration", "sync", "--dry-run"]);
     assert_eq!(plan.status.code(), Some(1));
+    let plan_text = String::from_utf8_lossy(&plan.stdout);
+    assert!(plan_text.starts_with("MCP launch path:"));
+    assert!(plan_text.contains(": would-update"));
+    assert!(!plan_text.contains(": updated"));
+    let json_plan = sandbox.run(&["integration", "sync", "--dry-run", "--json"]);
+    assert_eq!(json_plan.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json_plan.stdout).unwrap();
+    assert!(report["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|outcome| outcome["state"] == "would-update"));
+    assert!(!report["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|outcome| outcome["state"] == "updated"));
     assert_eq!(fs::read_to_string(&config).unwrap(), before);
     assert_eq!(
         fs::read_to_string(&hook).unwrap(),
@@ -143,4 +186,77 @@ fn integration_sync_cli_skips_declarative_hook_configs() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+#[test]
+fn integration_sync_cli_store_only_launch_still_refreshes_hooks() {
+    let sandbox = Sandbox::new();
+    assert!(sandbox
+        .run(&["integration", "install", "codex", "--no-trust-hooks"])
+        .status
+        .success());
+    let hook = sandbox.0.join("codex/flock-agent-state.sh");
+    fs::write(&hook, "# FLOCK_INTEGRATION_VERSION=0\n").unwrap();
+    let output = sandbox.run_with_launch(&["integration", "sync"], true);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.starts_with("MCP launch path: unavailable"), "{text}");
+    assert!(text.contains("codex: updated"), "{text}");
+    assert!(text.contains("refusing to pin MCP configs to current executable"));
+    for target in ["claude", "codex", "opencode"] {
+        assert!(text.contains(&format!("{target}: failed")), "{text}");
+    }
+    assert_ne!(
+        fs::read_to_string(&hook).unwrap(),
+        "# FLOCK_INTEGRATION_VERSION=0\n"
+    );
+}
+
+#[test]
+fn integration_sync_cli_reports_each_claude_local_scope() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.0.join("claude/.claude.json");
+    let project = sandbox.0.join("project").display().to_string();
+    let other = sandbox.0.join("other").display().to_string();
+    let pinned = "/nix/store/fixture-flock/bin/flk";
+    let raw = serde_json::json!({"projects":{
+        project.clone():{"mcpServers":{"flock":{"command":pinned,"args":["mcp","serve"],"env":{"KEEP":"yes"}},"unrelated":{"command":pinned,"args":["mcp","serve"]}}},
+        other.clone():{"mcpServers":{"flock":{"command":"flk","args":["mcp","serve"]}}}
+    }}).to_string();
+    fs::write(&path, &raw).unwrap();
+    let output = sandbox.run(&["integration", "sync"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!(
+            "claude:{}#projects.{project}: updated",
+            path.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "claude:{}#projects.{other}: already-current",
+            path.display()
+        )),
+        "{text}"
+    );
+    let updated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        updated["projects"][&project]["mcpServers"]["flock"]["command"],
+        sandbox.0.join("profile/bin/flk").display().to_string()
+    );
+    assert_eq!(
+        updated["projects"][&project]["mcpServers"]["unrelated"]["command"],
+        pinned
+    );
+    assert_eq!(
+        updated["projects"][&other]["mcpServers"]["flock"]["command"],
+        "flk"
+    );
 }

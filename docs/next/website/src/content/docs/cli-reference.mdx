@@ -470,7 +470,7 @@ flk integration uninstall kimi
 flk integration uninstall opencode
 flk integration uninstall hermes
 flk integration uninstall qodercli
-flk integration sync [--dry-run]
+flk integration sync [--dry-run] [--json]
 flk integration status [--outdated-only]
 ```
 
@@ -478,9 +478,9 @@ Installing the Codex integration records trust for flock’s exact SessionStart 
 
 ### Sync after an upgrade
 
-Run `flk integration sync --dry-run` to review the plan, then `flk integration sync` with the newly installed binary to refresh installed Claude, Codex and OpenCode hook assets and flock MCP launch paths. This works for package-manager installs and when the binary is already current. Each target reports `updated`, `already-current`, `skipped-declarative`, or `failed`; failures return exit code 1 and do not prevent other targets from being checked.
+Run `flk integration sync --dry-run` to review the plan, then `flk integration sync` with the newly installed binary to refresh installed Claude, Codex and OpenCode hook assets and flock MCP launch paths. This works for package-manager installs and when the binary is already current. Each target reports `updated` (`would-update` in dry-run, including JSON output), `already-current`, `skipped-declarative`, or `failed`; failures return exit code 1 and do not prevent other targets from being checked.
 
-Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their defaults) and the user OpenCode config; it does not search other homes or profiles. Only MCP entries named flock launching a bare or store-pinned flk executable (including the legacy flock name) with `mcp serve` are migrated; explicit stable custom paths are preserved. Custom commands and unrelated entries are preserved, as are arguments, environment, permissions, comments and Codex hook trust. Symlinked or read-only configs are skipped with a fragment to merge through their Nix/Home Manager configuration owner.
+Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their defaults) and the user OpenCode config; it does not search other homes or profiles. Only MCP entries named flock launching a store-pinned flk executable (including the legacy flock name) with `mcp serve` are migrated; bare PATH commands and explicit stable custom paths are preserved. Claude project-local registrations under `projects.*.mcpServers` are reported and updated individually. The chosen launch path is printed first; development executable fallbacks are refused, and a missing stable path fails MCP targets while allowing hook refreshes. Custom commands and unrelated entries are preserved, as are arguments, environment, permissions, comments and Codex hook trust. Symlinked or read-only configs are skipped with a fragment to merge through their Nix/Home Manager configuration owner.
 
 Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.
 
