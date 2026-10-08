@@ -576,10 +576,55 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        let text = if params.submit {
+            crate::app::api_helpers::encode_api_text(runtime, &params.text)
+        } else {
+            params.text.into_bytes()
+        };
+        let child_pid = runtime.child_pid();
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "agent_send_failed", err.to_string());
         }
 
+        if params.submit {
+            let pane_id = self.public_pane_id(resolved.ws_idx, resolved.pane_id);
+            let Some(pane_id) = pane_id else {
+                return agent_not_found(id, &params.target);
+            };
+            self.pending_agent_submit = Some((id.clone(), pane_id, child_pid));
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(crate) fn complete_agent_submit(
+        &mut self,
+        id: String,
+        pane: &str,
+        child_pid: Option<u32>,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
+            return agent_not_found(id, pane);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return agent_not_found(id, pane);
+        };
+        if runtime.child_pid() != child_pid {
+            return encode_error(
+                id,
+                "agent_send_failed",
+                "agent execution changed before submit",
+            );
+        }
+        let enter = runtime.encode_terminal_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::empty(),
+            )
+            .into(),
+        );
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(enter)) {
+            return encode_error(id, "agent_send_failed", err.to_string());
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 }

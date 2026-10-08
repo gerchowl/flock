@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `flk agent send --submit` types terminal input, waits 120 ms, and sends negotiated Enter. Plain `agent send` keeps its literal bytes and never submits; verb help and socket docs now explain both modes. (#638)
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

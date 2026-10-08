@@ -162,6 +162,17 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if let AppEvent::AgentSubmit {
+            request_id,
+            pane_id,
+            child_pid,
+            respond_to,
+        } = ev
+        {
+            let response = self.complete_agent_submit(request_id, &pane_id, child_pid);
+            let _ = respond_to.send(response);
+            return;
+        }
         if let AppEvent::UplinkForwarded {
             spoke,
             message,
@@ -1266,6 +1277,7 @@ impl App {
         };
         // #410: a park is only ever for the request that set it.
         let _ = self.uplink.take_pending_park();
+        self.pending_agent_submit = None;
 
         let response = match request.method {
             Method::ServerStop(_) => {

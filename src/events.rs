@@ -77,6 +77,13 @@ pub struct WorktreeKillAllResult {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
+    /// Complete an explicit agent submission after its paste settling gap.
+    AgentSubmit {
+        request_id: String,
+        pane_id: String,
+        child_pid: Option<u32>,
+        respond_to: std::sync::mpsc::Sender<String>,
+    },
     /// A pane's child process exited.
     PaneDied {
         pane_id: PaneId,

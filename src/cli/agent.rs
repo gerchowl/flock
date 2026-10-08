@@ -44,6 +44,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Plain send types literal text without submitting. --submit types terminal input, waits 120 ms, then sends Enter.\n  Use -- before the target to send text beginning with --submit literally.\n  Success reports input queued, not confirmation that the agent accepted it.";
+
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
 pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
@@ -673,18 +675,41 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_send(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: flk agent send <target> <text>");
-        return Ok(2);
+fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
+    let mut words = args;
+    let mut submit = false;
+    if words.first().is_some_and(|word| word == "--submit") {
+        submit = true;
+        words = &words[1..];
     }
+    let literal = words.first().is_some_and(|word| word == "--");
+    if literal {
+        words = &words[1..];
+    }
+    let target = words.first()?.clone();
+    let mut text = &words[1..];
+    if !literal && text.first().is_some_and(|word| word == "--submit") {
+        submit = true;
+        text = &text[1..];
+    }
+    if text.is_empty() {
+        return None;
+    }
+    Some(AgentSendParams {
+        target,
+        text: text.join(" "),
+        submit,
+    })
+}
 
+fn agent_send(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = parse_agent_send_args(args) else {
+        eprintln!("usage: {AGENT_SEND_USAGE}");
+        return Ok(2);
+    };
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send".into(),
-        method: Method::AgentSend(AgentSendParams {
-            target: args[0].clone(),
-            text: args[1..].join(" "),
-        }),
+        method: Method::AgentSend(params),
     })?)
 }
 
@@ -806,7 +831,7 @@ fn print_agent_help() {
     eprintln!(
         "    a final DONE: / BLOCKED: / VERDICT: line; `finished` says whether that turn is over"
     );
-    eprintln!("  flk agent send <target> <text>");
+    eprintln!("  {AGENT_SEND_USAGE}");
     eprintln!("  flk agent rename <target> <name>|--clear");
     eprintln!("  flk agent focus <target>");
     eprintln!("  {AGENT_WAIT_USAGE}");
@@ -841,7 +866,7 @@ fn print_agent_help() {
     eprintln!("    pass --workspace/--tab/--cwd, or --active, instead of being placed at random;");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send writes literal text; use pane run when you want command text plus Enter"
+        "  agent send types without submitting; use agent send --submit to type and send Enter"
     );
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
@@ -862,6 +887,45 @@ fn print_agent_help() {
 #[cfg(test)]
 mod tests {
     use super::{parse_agent_start_flags, AGENT_START_USAGE};
+
+    #[test]
+    fn agent_send_preserves_raw_text_and_parses_explicit_submit() {
+        let parse = |words: &[&str]| {
+            super::parse_agent_send_args(
+                &words
+                    .iter()
+                    .map(|word| word.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("valid send")
+        };
+        let raw = parse(&["worker", "hello\nworld", "--submit"]);
+        assert!(!raw.submit);
+        assert_eq!(raw.text, "hello\nworld --submit");
+        for words in [
+            vec!["--submit", "worker", "hello"],
+            vec!["worker", "--submit", "hello"],
+        ] {
+            let parsed = parse(&words);
+            assert!(parsed.submit);
+            assert_eq!(parsed.target, "worker");
+            assert_eq!(parsed.text, "hello");
+        }
+        let literal = parse(&["--", "worker", "--submit", "hello"]);
+        assert!(!literal.submit);
+        assert_eq!(literal.text, "--submit hello");
+        assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
+        assert!(super::parse_agent_send_args(&["worker".into(), "--submit".into()]).is_none());
+        assert!(super::AGENT_SEND_USAGE.contains("without submitting"));
+    }
+
+    #[test]
+    fn agent_send_socket_defaults_to_raw() {
+        let raw: crate::api::schema::AgentSendParams =
+            serde_json::from_value(serde_json::json!({"target": "worker", "text": "hello"}))
+                .expect("existing client request");
+        assert!(!raw.submit);
+    }
 
     /// `-- active` is the terminator in these tests, so the parser sees exactly
     /// what it would see on the command line before the child's argv.

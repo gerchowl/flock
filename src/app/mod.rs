@@ -143,6 +143,7 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    pub(crate) pending_agent_submit: Option<(String, String, Option<u32>)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
@@ -893,6 +894,7 @@ impl App {
                 mailboxes
             },
             uplink: Default::default(),
+            pending_agent_submit: None,
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,
             event_hub,
