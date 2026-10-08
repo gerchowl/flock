@@ -857,16 +857,21 @@ async fn guarded_submit_refuses_drafts_and_concurrent_input() {
 #[tokio::test]
 async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
     use super::super::guarded_submit::Outcome;
-    for hook in [true, false] {
+    for (text, hook) in [
+        ("hello", true),
+        ("  hello\n world  ", true),
+        ("hello", false),
+    ] {
         let Rig {
             mut app,
             pane,
             mut pty,
         } = rig();
         claude_idle_for(&mut app, settled());
+        runtime(&app).test_process_pty_bytes(b"\x1b[?2004h");
         let now = Instant::now();
         let mut attempt = app
-            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
             .unwrap();
         drain(&mut pty);
         if hook {
@@ -876,7 +881,7 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
                     pane_id: pane.clone(),
                     source: "flock:claude".into(),
                     agent: "claude".into(),
-                    prompt: "hello".into(),
+                    prompt: text.into(),
                     seq: Some(1),
                 }),
             });
@@ -955,4 +960,73 @@ async fn guarded_client_submit_is_atomic_with_session_settle_and_serialization_g
     let competing = app.handle_api_request(submit("competing"));
     assert!(competing.contains("injection_pending"), "{competing}");
     assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+}
+
+#[tokio::test]
+async fn guarded_client_rechecks_session_and_settle_before_enter() {
+    use super::super::guarded_submit::Outcome;
+    for session_change in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let report = |session: &str, seq| Request {
+            id: "session".into(),
+            method: Method::PaneReportAgentSession(
+                crate::api::schema::PaneReportAgentSessionParams {
+                    pane_id: pane.clone(),
+                    source: "flock:claude".into(),
+                    agent: "claude".into(),
+                    seq: Some(seq),
+                    agent_session_id: Some(session.into()),
+                    agent_session_path: None,
+                    session_start_source: Some("resume".into()),
+                },
+            ),
+        };
+        assert!(app
+            .handle_api_request(report("first-session", 1))
+            .contains("\"ok\""));
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(
+                &pane,
+                "hello",
+                Some("first-session"),
+                Duration::from_secs(1),
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        if session_change {
+            assert!(app
+                .handle_api_request(report("second-session", 2))
+                .contains("\"ok\""));
+        } else {
+            for state in [AgentState::Blocked, AgentState::Idle] {
+                terminal(&mut app).set_detected_state_with_screen_signals_at(
+                    Some(Agent::Claude),
+                    state,
+                    false,
+                    state == AgentState::Idle,
+                    false,
+                    false,
+                    now,
+                );
+            }
+        }
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(Outcome::Abandoned(if session_change {
+                "session_mismatch"
+            } else {
+                "not_settled"
+            }))
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
 }

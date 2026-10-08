@@ -21,6 +21,8 @@ pub(crate) struct Attempt {
     sent: bool,
     retried: bool,
     wake: bool,
+    session: Option<String>,
+    settle: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,7 +58,7 @@ fn matches_rows(rows: &[&str], text: &str) -> bool {
 
 pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
     let lines: Vec<_> = screen.lines().collect();
-    let rows: Vec<&str> = match agent {
+    let (rows, body_start, body_end): (Vec<&str>, usize, usize) = match agent {
         Agent::Claude => {
             if crate::detect::claude_composer(screen).is_none() {
                 return Composer::Unknown;
@@ -83,7 +85,7 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
             };
             let mut rows = vec![body[prompt].trim_start().trim_start_matches('❯').trim()];
             rows.extend(body[prompt + 1..].iter().map(|line| line.trim()));
-            rows
+            (rows, start + 1, end)
         }
         Agent::Codex => {
             let Some(start) = lines
@@ -104,7 +106,7 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
                     .iter()
                     .map(|line| line.trim()),
             );
-            rows
+            (rows, start, start + 1 + end)
         }
         Agent::OpenCode => {
             let Some(end) = lines
@@ -127,25 +129,30 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
             else {
                 return Composer::Unknown;
             };
-            lines[start..end]
+            let rows = lines[start..end]
                 .iter()
                 .map(|line| line.trim_start().trim_start_matches('┃').trim())
                 .skip_while(|line| line.is_empty())
                 .take_while(|line| !line.is_empty())
-                .collect()
+                .collect();
+            (rows, start, end)
         }
         _ => return Composer::Unknown,
     };
     // Only the live controls around the editor can authorize input. Menu controls
     // make even a retained empty composer unsafe.
-    let tail = lines
-        .iter()
-        .rev()
-        .take(12)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
+    let mut chrome = lines[..body_start].to_vec();
+    chrome.push(match agent {
+        Agent::Claude => "❯",
+        Agent::Codex => "›",
+        _ => "┃",
+    });
+    chrome.extend_from_slice(&lines[body_end..]);
+    let detection = crate::detect::detect_agent(Some(agent), &chrome.join("\n"));
+    if detection.state != crate::detect::AgentState::Idle || detection.visible_blocker {
+        return Composer::Unknown;
+    }
+    let tail = lines[body_end..].join("\n").to_lowercase();
     if [
         "enter to select",
         "enter to confirm",
@@ -304,6 +311,8 @@ impl App {
             sent: false,
             retried: false,
             wake,
+            session: session.map(str::to_owned),
+            settle,
         })
     }
 
@@ -325,18 +334,28 @@ impl App {
         if runtime.child_pid() != attempt.child_pid || terminal.restart_in_progress {
             return Some(Outcome::Abandoned("execution_changed"));
         }
+        if attempt
+            .session
+            .as_deref()
+            .is_some_and(|session| terminal.submission_session_id().as_deref() != Some(session))
+        {
+            return Some(Outcome::Abandoned("session_mismatch"));
+        }
         if runtime.last_operator_input_at() != attempt.operator_input {
             return Some(Outcome::Abandoned("operator_active"));
         }
-        match progress(&attempt.cursor, &terminal.turn_cursor()) {
-            Ok(true) => return Some(Outcome::ObservedAccepted),
+        let started = match progress(&attempt.cursor, &terminal.turn_cursor()) {
+            Ok(started) => started,
             Err(reason) => return Some(Outcome::Abandoned(reason)),
-            _ => (),
-        }
+        };
+        let reported_text = crate::control_bytes::strip(&attempt.text);
         if terminal.prompt_report_generation > attempt.prompt_generation
-            && terminal.last_prompt.as_deref() == Some(attempt.text.as_str())
+            && terminal.last_prompt.as_deref() == Some(reported_text.trim())
         {
             return Some(Outcome::Accepted);
+        }
+        if started {
+            return Some(Outcome::ObservedAccepted);
         }
         if now < attempt.due {
             return None;
@@ -346,7 +365,7 @@ impl App {
         }
         if let Some(reason) = terminal.guarded_submit_blocker(
             now,
-            Duration::ZERO,
+            attempt.settle,
             if attempt.wake {
                 Duration::from_millis(self.state.config.msg.idle_wake_fresh_ms)
             } else {
@@ -444,6 +463,8 @@ impl Attempt {
             sent: false,
             retried: false,
             wake: false,
+            session: None,
+            settle: Duration::ZERO,
         }
     }
 }
@@ -456,6 +477,14 @@ mod tests {
         let screen = "──────\n❯ hello world\n──────\n? for shortcuts";
         assert_eq!(
             composer(Agent::Claude, screen, "hello world"),
+            Composer::Owned
+        );
+        assert_eq!(
+            composer(
+                Agent::Claude,
+                &screen.replace("hello world", "enter to confirm"),
+                "enter to confirm"
+            ),
             Composer::Owned
         );
         assert_eq!(composer(Agent::Claude, screen, "hello"), Composer::Other);
