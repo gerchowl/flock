@@ -132,14 +132,17 @@ release-prepare version *flags:
         echo "error: tag v{{version}} already exists"; \
         exit 1; \
     fi
-    just release-docs-check
+    cp docs/next/README.md README.md
+    cp docs/next/CHANGELOG.md CHANGELOG.md
+    cp -R docs/next/website/src/content/docs/. website/src/content/docs/
     python3 scripts/changelog.py check-version --version {{version}} {{flags}}
-    python3 scripts/changelog.py prepare --version {{version}}
+    python3 scripts/changelog.py prepare --fragments docs/next/changes --version {{version}}
     cp CHANGELOG.md docs/next/CHANGELOG.md
+    just release-docs-check
     sed -i.bak 's/^version = ".*"/version = "{{version}}"/' Cargo.toml && rm -f Cargo.toml.bak
     cargo update -p flock-ai --offline
     just check
-    git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
+    git add README.md CHANGELOG.md docs/next website/src/content/docs Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
     @echo "v{{version}} release commit prepared locally as a dry run. Cut the real release with: just release {{version}}"
 
