@@ -63,14 +63,18 @@ impl Pane {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut line = String::new();
-                if BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                stream.set_nonblocking(false).unwrap();
+                // A connected CLI can be descheduled before writing its request.
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
                     .is_err()
                 {
+                    // Session liveness probes connect and close without a request.
+                    continue;
+                }
+                let mut line = String::new();
+                if BufReader::new(&mut stream).read_line(&mut line).is_err() {
                     continue;
                 }
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
@@ -121,9 +125,15 @@ impl Pane {
                     }
                     other => panic!("unexpected request: {other}"),
                 };
-                let _ = writeln!(stream, "{}", json!({"id": request["id"], "result": result}));
+                let response = format!("{}\n", json!({"id": request["id"], "result": result}));
+                let _ = stream.write_all(response.as_bytes());
                 // Keep the response socket alive until the client finishes its read.
-                let _ = stream.read(&mut [0_u8; 1]);
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .is_ok()
+                {
+                    let _ = stream.read(&mut [0_u8; 1]);
+                }
             }
         });
         let hash = socket
@@ -249,6 +259,7 @@ impl S1 {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
