@@ -611,12 +611,79 @@ fn pane_run_steps(pane_id: &str, text: &str) -> Vec<PaneRunStep> {
     ]
 }
 
+fn parse_guarded_pane_run(
+    args: &[String],
+) -> Result<Option<crate::api::schema::PaneSubmitParams>, String> {
+    let flag = if args.first().is_some_and(|arg| arg == "--if-input-empty") {
+        0
+    } else if args.get(1).is_some_and(|arg| arg == "--if-input-empty") {
+        1
+    } else {
+        return Ok(None);
+    };
+    let mut at = flag + 1;
+    let mut pane = (flag == 1).then(|| super::normalize_pane_id(&args[0]));
+    let mut session = None;
+    let mut min_age_secs = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--if-session" | "--min-age-secs" => {
+                let name = &args[at];
+                let value = args
+                    .get(at + 1)
+                    .ok_or_else(|| format!("missing value for {name}"))?;
+                if name == "--if-session" {
+                    session = Some(value.clone());
+                } else {
+                    min_age_secs = value
+                        .parse()
+                        .map_err(|_| "--min-age-secs requires a nonnegative integer")?;
+                }
+                at += 2;
+            }
+            "--" => {
+                at += 1;
+                break;
+            }
+            "--if-status" => {
+                return Err(
+                    "--if-status is unsupported; guarded submit requires idle or done".into(),
+                )
+            }
+            _ => break,
+        }
+    }
+    if pane.is_none() {
+        pane = args.get(at).map(|arg| super::normalize_pane_id(arg));
+        at += 1;
+    }
+    let pane_id = pane.ok_or("missing pane id")?;
+    if at >= args.len() {
+        return Err("missing text".into());
+    }
+    Ok(Some(crate::api::schema::PaneSubmitParams {
+        self_submit_confirmed: None,
+        pane_id,
+        text: args[at..].join(" "),
+        if_session: session,
+        min_age_secs,
+    }))
+}
+
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
         eprintln!("usage: flk pane run <pane_id> <command>");
         return Ok(2);
     }
 
+    match parse_guarded_pane_run(args) {
+        Ok(Some(params)) => return super::send_ok_request(Method::PaneSubmit(params)),
+        Err(reason) => {
+            eprintln!("pane run: {reason}");
+            return Ok(2);
+        }
+        Ok(None) => (),
+    }
     let pane_id = super::normalize_pane_id(&args[0]);
     let text = args[1..].join(" ");
     submit_sequence(&pane_id, &text)
@@ -1531,6 +1598,41 @@ mod tests {
             .expect("aborts a named pane");
         assert!(named.abort);
         assert_eq!(named.pane.as_deref(), Some("w2:p1"));
+    }
+
+    #[test]
+    fn guarded_pane_run_parses_options_before_and_after_target() {
+        for words in [
+            vec![
+                "--if-input-empty",
+                "--min-age-secs",
+                "3",
+                "--if-session",
+                "session",
+                "1-1",
+                "hello",
+            ],
+            vec![
+                "1-1",
+                "--if-input-empty",
+                "--min-age-secs",
+                "3",
+                "--if-session",
+                "session",
+                "hello",
+            ],
+        ] {
+            let args = words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>();
+            let parsed = super::parse_guarded_pane_run(&args).unwrap().unwrap();
+            assert_eq!(parsed.text, "hello");
+            assert_eq!(parsed.min_age_secs, 3);
+            assert_eq!(parsed.if_session.as_deref(), Some("session"));
+        }
+        let args = ["1-1", "--if-input-empty", "--if-status", "working", "hello"].map(String::from);
+        assert!(super::parse_guarded_pane_run(&args).is_err());
     }
 
     #[test]

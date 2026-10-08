@@ -11,7 +11,7 @@ mod lineage;
 pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
-mod responses;
+pub(super) mod responses;
 mod revert;
 mod spawn;
 mod tabs;
@@ -165,12 +165,11 @@ impl App {
         if let AppEvent::AgentSubmit {
             request_id,
             pane_id,
-            child_pid,
+            attempt,
             respond_to,
         } = ev
         {
-            let response = self.complete_agent_submit(request_id, &pane_id, child_pid);
-            let _ = respond_to.send(response);
+            self.advance_guarded_request(request_id, pane_id, attempt, respond_to);
             return;
         }
         if let AppEvent::UplinkForwarded {
@@ -1286,7 +1285,9 @@ impl App {
             self.pending_agent_submit.is_none(),
             "deferred agent submit must be consumed by respond_or_park before the next request"
         );
-        self.pending_agent_submit = None;
+        if let Some((_, pane, _)) = self.pending_agent_submit.take() {
+            self.active_submissions.remove(&pane);
+        }
 
         let response = match request.method {
             Method::ServerStop(_) => {
@@ -1399,6 +1400,7 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentResult(params) => return self.handle_agent_result(request.id, params),
+            Method::PaneSubmit(params) => return self.handle_pane_submit(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),

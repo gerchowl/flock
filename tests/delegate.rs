@@ -151,7 +151,7 @@ while IFS= read -r line; do
     sleep "$(awk '{{print $1 / 1000}}' '{base}/late-submit-ms')"
   fi
   printf '%s\n' "$line" >> '{base}/typed.log'
-  if [ ! -e '{base}/manual-submit' ] && [ -n "$first" ]; then
+  if [ ! -e '{base}/manual-submit' ]; then
     first=
     printf '\033[2J\033[H■■■■⬝⬝  esc interrupt  opencode\n'
     sleep 0.4
@@ -391,7 +391,7 @@ fn screen_for(state: &str) -> &'static str {
     match state {
         "working" => "\u{25a0}\u{25a0}\u{25a0}\u{25a0}\u{2b1d}\u{2b1d}  esc interrupt  opencode",
         "blocked" => "\u{25b3} Permission required",
-        "idle" => "opencode ready >",
+        "idle" => "┃\n┃  Ask anything…\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n",
         other => panic!("no screen for {other}"),
     }
 }
@@ -1698,11 +1698,11 @@ fn opencode_start_fails_loudly_when_startup_discards_brief() {
 fn opencode_late_submission_confirms_without_teardown() {
     let server = start_server();
     operator_workspace(&server);
-    fs::write(server.base.join("late-submit-ms"), "4000").unwrap();
+    fs::write(server.base.join("late-submit-ms"), "1500").unwrap();
     let b = brief(&server, "late.md", "x\n");
     let mut child = start_cwd(&server, "d1", &b, &["--json"]);
     let pane = make_ready(&server, "d1");
-    assert!(exited_within(&mut child, Duration::from_secs(2)).is_none());
+    assert!(exited_within(&mut child, Duration::from_millis(500)).is_none());
     let status = exited_within(&mut child, WITHIN).expect("late turn confirms");
     let out = finish(child);
     assert_eq!(status.code(), Some(0), "{}", stderr(&out));
@@ -1751,7 +1751,7 @@ fn opencode_held_composer_retries_enter_only_once() {
 }
 
 #[test]
-fn opencode_empty_composer_retypes_once_after_dropped_input() {
+fn opencode_empty_composer_never_retypes_after_dropped_input() {
     let server = start_server();
     operator_workspace(&server);
     fs::write(server.base.join("ignore-input-ms"), "10000").unwrap();
@@ -1764,13 +1764,19 @@ fn opencode_empty_composer_retypes_once_after_dropped_input() {
     )
     .unwrap();
     report_session(&server, &pane);
-    let status = exited_within(&mut child, Duration::from_secs(40)).expect("retry confirms");
+    let status =
+        exited_within(&mut child, Duration::from_secs(10)).expect("confirmation is bounded");
     let out = finish(child);
-    assert_eq!(status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(typed(&server), vec![expected_line(&b)]);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("submission could not be confirmed"));
+    assert!(typed(&server).is_empty());
     assert_eq!(
         read_lines(&server.base.join("input.log")),
-        vec![expected_line(&b), expected_line(&b)]
+        vec![expected_line(&b)]
+    );
+    assert!(
+        agent_get(&server, "d1").is_some(),
+        "workspace is kept for inspection"
     );
 }
 

@@ -155,6 +155,7 @@ pub struct TerminalState {
     /// the byte-identical render path for the legacy single-prompt case is
     /// preserved).
     pub last_prompt: Option<String>,
+    pub(crate) prompt_report_generation: u64,
     /// Per-pane prompt + recap scrollback (issue #96). Chronological,
     /// timestamped entries; capped at
     /// [`MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
@@ -322,6 +323,7 @@ impl TerminalState {
             fallback_visible_working: false,
             fallback_observed_at: None,
             last_prompt: None,
+            prompt_report_generation: 0,
             prompt_history: Vec::new(),
             prompt_history_generation: 0,
             hydrated_transcript: None,
@@ -711,6 +713,11 @@ impl TerminalState {
                 session.session_ref.value.clone(),
             )
         })
+    }
+
+    pub(crate) fn submission_session_id(&self) -> Option<String> {
+        self.current_session_identity_for_persistence()
+            .map(|(_, _, _, value)| value)
     }
 
     /// When the incoming `session_ref` came from a child terminal that
@@ -1188,6 +1195,30 @@ impl TerminalState {
         (!observed_recently).then_some("stale_screen")
     }
 
+    /// OpenCode has no detector idle flag. Its affirmative composer is checked
+    /// by the submit guard, while the detector timestamp still bounds freshness.
+    pub(crate) fn guarded_submit_blocker(
+        &self,
+        now: Instant,
+        settle: Duration,
+        fresh: Duration,
+    ) -> Option<&'static str> {
+        let blocker = self.idle_wake_blocker(now, settle, fresh);
+        if blocker == Some("not_idle") {
+            return Some("not_settled");
+        }
+        if matches!(blocker, Some("idle_not_visible" | "stale_hook"))
+            && self.effective_known_agent() == Some(crate::detect::Agent::OpenCode)
+        {
+            return self
+                .fallback_observed_at
+                .and_then(|at| now.checked_duration_since(at))
+                .is_none_or(|age| age > fresh)
+                .then_some("stale_screen");
+        }
+        blocker
+    }
+
     /// When the settle window of the current state ends, if the state has a
     /// known start — the moment an unsettled `Idle` becomes wakeable.
     pub(crate) fn state_settles_at(&self, settle: Duration) -> Option<Instant> {
@@ -1663,6 +1694,7 @@ impl TerminalState {
     }
 
     pub fn record_prompt_at(&mut self, prompt: String, now: Instant) {
+        self.prompt_report_generation = self.prompt_report_generation.wrapping_add(1);
         self.last_prompt = Some(prompt.clone());
         // The agent just wrote a turn boundary, so the transcript on disk has
         // moved: mark hydration due so the panel re-reads the authoritative
