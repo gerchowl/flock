@@ -36,6 +36,11 @@ pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: 
         .map(|state| state.bracketed_paste)
         .unwrap_or(false);
     if bracketed {
+        // Remove delimiters until stripping nested ones cannot expose another.
+        let mut text = text.to_string();
+        while text.contains("\x1b[200~") || text.contains("\x1b[201~") {
+            text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        }
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
         text.as_bytes().to_vec()
@@ -133,4 +138,32 @@ pub(super) fn normalize_custom_status(status: Option<String>) -> Option<String> 
         normalized.push(ch);
     }
     (!normalized.trim().is_empty()).then(|| normalized.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_api_text;
+    use crate::terminal::TerminalRuntime;
+
+    #[tokio::test]
+    async fn api_text_strips_embedded_paste_delimiters() {
+        let runtime = TerminalRuntime::test_with_screen_bytes(80, 24, b"\x1b[?2004h");
+        for text in [
+            "Ship\x1b[200~ it!\x1b[201~\nworld!",
+            "Ship\x1b[2\x1b[200~01~ it!\nworld!",
+            "Ship it!\nworld!",
+        ] {
+            assert_eq!(
+                encode_api_text(&runtime, text),
+                b"\x1b[200~Ship it!\nworld!\x1b[201~"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_text_without_bracketed_paste_preserves_bytes() {
+        let runtime = TerminalRuntime::test_with_screen_bytes(80, 24, b"\x1b[?2004l");
+        let text = "literal!\n\r\x03\x1b[200~\x1b[201~";
+        assert_eq!(encode_api_text(&runtime, text), text.as_bytes());
+    }
 }

@@ -448,9 +448,11 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <pane_id> <text>\n  Pastes text (bracketed when enabled), without sending Enter.\n  Use pane send-keys for control keys (Enter, C-c, Esc).";
+
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flk pane send-text <pane_id> <text>");
+        eprintln!("usage: {PANE_SEND_TEXT_USAGE}");
         return Ok(2);
     }
 
@@ -1361,7 +1363,7 @@ fn pane_help_text() -> String {
         "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(out, "  flk pane close <pane_id>");
-    let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
+    let _ = writeln!(out, "  {PANE_SEND_TEXT_USAGE}");
     let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
     let _ = writeln!(
         out,
