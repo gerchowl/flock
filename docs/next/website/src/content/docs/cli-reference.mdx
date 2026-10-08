@@ -425,7 +425,7 @@ flk notification list [--unread] [--limit N]
 flk notification read <notification-id> | --all
 ```
 
-`show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
+`show` raises a notification through the configured `[ui.toast]` delivery. It exits 0 when `shown:true` and 3 when `shown:false`, preserving the JSON response so callers can inspect `reason` and fall back to another channel. `reason:"disabled"` means the server config has `[ui.toast] delivery = "off"` (the default), which disables popups. Other refusal reasons are `busy`, `rate_limited`, and `no_foreground_client`. API errors exit 1; invalid arguments exit 2. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
 
 The notification log panel inside the TUI (`prefix+i`, or the sidebar `menu` row → `notifications`) lists and acknowledges the same records: all three surfaces read one filter over one projection, so `--unread` and the panel's `u` filter can never disagree about what is unread.
 
