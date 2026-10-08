@@ -202,7 +202,7 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
 fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!(
-            "usage: flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+            "usage: flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
         );
         return Ok(2);
     };
@@ -211,6 +211,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let mut direction = None;
     let mut cwd = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 1;
     while index < args.len() {
@@ -230,6 +231,10 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
                 };
                 cwd = Some(value.clone());
                 index += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
             }
             "--focus" => {
                 focus = true;
@@ -254,6 +259,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:split".into(),
         method: Method::PaneSplit(PaneSplitParams {
+            dry_run,
             workspace_id: None,
             target_pane_id: pane_id,
             direction,
@@ -1353,7 +1359,7 @@ fn pane_help_text() -> String {
     let _ = writeln!(out, "  flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
-        "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+        "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
     );
     let _ = writeln!(
         out,

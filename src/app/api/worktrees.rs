@@ -138,6 +138,18 @@ impl App {
             ),
         };
 
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "worktree.create",
+                serde_json::json!({
+                    "source_workspace_id": source.workspace_idx.map(|idx| self.public_workspace_id(idx)), "source_checkout_path": source.source_checkout_path,
+                    "branch": branch, "base": base, "path": checkout_path,
+                    "label": params.label, "focus": params.focus,
+                }),
+            );
+        }
+
         if let Some(parent_dir) = checkout_path.parent() {
             if let Err(err) = std::fs::create_dir_all(parent_dir) {
                 return encode_error(id, "worktree_create_failed", err.to_string());
@@ -370,6 +382,29 @@ impl App {
                 &branch,
             ),
         };
+        // #106/#159 pivot: explicit param wins; omitted falls back to the
+        // configured template; empty string opts out.
+        let pivot_template = params
+            .pivot
+            .unwrap_or_else(|| self.state.branch_pivot_message.clone());
+        let pivot = pivot_template.replace("<branch>", branch.trim());
+        let argv_len_before = plan.argv.len();
+        crate::agent_resume::append_pivot_message(&mut plan, &pivot);
+        let seeded = plan.argv.len() > argv_len_before;
+
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "agent.fork",
+                serde_json::json!({
+                    "source_workspace_id": source_workspace_id, "source_checkout_path": source_checkout_path,
+                    "target_pane_id": self.public_pane_id(resolved.ws_idx, resolved.pane_id),
+                    "branch": branch, "base": base, "path": checkout_path,
+                    "argv": plan.argv, "seeded": seeded, "label": params.label, "focus": params.focus,
+                }),
+            );
+        }
+
         if let Some(parent_dir) = checkout_path.parent() {
             if let Err(err) = std::fs::create_dir_all(parent_dir) {
                 return encode_error(id, "worktree_create_failed", err.to_string());
@@ -388,16 +423,6 @@ impl App {
                 crate::worktree::explain_worktree_add_failure(&base, &err),
             );
         }
-
-        // #106/#159 pivot: explicit param wins; omitted falls back to the
-        // configured template; empty string opts out.
-        let pivot_template = params
-            .pivot
-            .unwrap_or_else(|| self.state.branch_pivot_message.clone());
-        let pivot = pivot_template.replace("<branch>", branch.trim());
-        let argv_len_before = plan.argv.len();
-        crate::agent_resume::append_pivot_message(&mut plan, &pivot);
-        let seeded = plan.argv.len() > argv_len_before;
 
         let (rows, cols) = self.state.estimate_pane_size();
         // #175 S3 commit 4 (ops): compute the run_id BEFORE spawn so we
@@ -1720,6 +1745,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allocation_dry_run_resolves_worktree_without_creating_resources() {
+        let repo = create_committed_repo("allocation-preview-repo");
+        let root = unique_temp_path("allocation-preview-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = root.clone();
+        let before_terminals = app.state.terminals.len();
+        let response = app.handle_api_request(Request {
+            id: "preview".into(),
+            method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: true,
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                ..WorktreeCreateParams::default()
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["operation"], "worktree.create");
+        let plan = &response["result"]["plan"];
+        let branch = plan["branch"].as_str().unwrap();
+        assert!(!branch.is_empty());
+        assert_eq!(plan["base"], "HEAD");
+        assert!(Path::new(plan["path"].as_str().unwrap()).starts_with(&root));
+        assert!(!root.exists());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.terminals.len(), before_terminals);
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app.state.workspaces[0].worktree_space().is_none());
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(branches.stdout.is_empty());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn allocation_dry_run_previews_fork_with_resolved_pivot() {
+        let home = fake_claude_home("allocation-fork-preview-home", "sess-fork");
+        let repo = create_committed_repo("allocation-fork-preview-repo");
+        let root = unique_temp_path("allocation-fork-preview-root");
+        let mut app = app_with_parent(&repo);
+        app.state.worktree_directory = root.clone();
+        let target = stamp_agent_session(&mut app, "flock:claude", "claude");
+        let mut request = fork_request(&target, "preview-fork");
+        if let crate::api::schema::Method::AgentFork(params) = &mut request.method {
+            params.dry_run = true;
+            params.pivot = Some("try <branch>".into());
+        }
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(response["result"]["operation"], "agent.fork");
+        assert_eq!(
+            response["result"]["plan"]["argv"],
+            serde_json::json!([
+                "claude",
+                "--resume",
+                "sess-fork",
+                "--fork-session",
+                "try preview-fork"
+            ])
+        );
+        assert!(!root.exists());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn allocation_dry_run_previews_terminal_allocations_without_spawning() {
+        let repo = create_committed_repo("allocation-terminal-preview-repo");
+        let mut app = app_with_parent(&repo);
+        let ws = app.public_workspace_id(0);
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+            .unwrap();
+        let before_terminals = app.state.terminals.len();
+        for (method, operation) in [
+            ("workspace.create", "workspace.create"),
+            ("tab.create", "tab.create"),
+            ("pane.split", "pane.split"),
+            ("agent.start", "agent.start"),
+        ] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "id": "preview", "method": method, "params": {
+                    "dry_run": true, "cwd": repo, "workspace_id": ws,
+                    "target_pane_id": pane, "direction": "right", "focus": true,
+                    "name": "preview-worker", "argv": ["/bin/sh", "-c", "exit 99"]
+                }
+            }))
+            .unwrap();
+            assert!(!crate::api::request_changes_ui(&request));
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response["result"]["operation"], operation, "{response}");
+            assert_eq!(response["result"]["plan"]["cwd"], repo.to_str().unwrap());
+            assert_eq!(app.state.workspaces.len(), 1);
+            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+            assert_eq!(app.state.terminals.len(), before_terminals);
+            assert_eq!(app.terminal_runtimes.len(), 0);
+        }
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
     async fn api_worktree_create_opens_workspace_and_marks_membership() {
         let repo = create_committed_repo("api-worktree-create-repo");
         let worktree_root = unique_temp_path("api-worktree-create-root");
@@ -1729,6 +1860,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 branch: Some("worktree/api-create".into()),
                 ..WorktreeCreateParams::default()
@@ -1783,6 +1915,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some(repo.display().to_string()),
                 branch: Some("worktree/api-create-cwd".into()),
                 ..WorktreeCreateParams::default()
@@ -1826,6 +1959,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some(repo.display().to_string()),
                 branch: Some("   ".into()),
                 ..WorktreeCreateParams::default()
@@ -1867,6 +2001,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 branch: Some("worktree/relative".into()),
                 path: Some("relative-checkout".into()),
@@ -1887,6 +2022,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some("relative-repo".into()),
                 branch: Some("worktree/relative-cwd".into()),
                 ..WorktreeCreateParams::default()
@@ -2573,6 +2709,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 workspace_id: Some(workspace_id),
                 branch: Some("worktree/from-linked".into()),
                 focus: false,
@@ -3731,6 +3868,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target: target.clone(),
                 branch: Some("fork/alt-approach".into()),
                 base: None,
@@ -3892,6 +4030,7 @@ mod tests {
         Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target: target.to_string(),
                 branch: Some(branch.to_string()),
                 base: None,
@@ -4121,6 +4260,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target,
                 branch: Some("fork/no-seed".into()),
                 base: None,
@@ -4191,6 +4331,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target,
                 branch: Some("fork/from-linked".into()),
                 base: None,
@@ -4241,6 +4382,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target,
                 branch: Some("fork/never".into()),
                 base: None,
@@ -4282,6 +4424,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target,
                 branch: Some("fork/doomed".into()),
                 base: None,
@@ -4320,6 +4463,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentFork(crate::api::schema::AgentForkParams {
+                dry_run: false,
                 target: terminal_id.to_string(),
                 branch: None,
                 base: None,
@@ -4348,6 +4492,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 cwd: Some(repo.display().to_string()),
                 branch: Some("worktree/api-parent-id-created".into()),
                 ..WorktreeCreateParams::default()
@@ -4407,6 +4552,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                dry_run: false,
                 workspace_id: Some(app.state.workspaces[0].id.clone()),
                 branch: Some("worktree/api-parent-id-none".into()),
                 ..WorktreeCreateParams::default()

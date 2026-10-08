@@ -305,6 +305,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut path = None;
     let mut label = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -357,6 +358,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
                 label = Some(value.clone());
                 index += 2;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -374,7 +379,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]"
         );
         return Ok(2);
     }
@@ -382,6 +387,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:worktree:create".into(),
         method: Method::WorktreeCreate(WorktreeCreateParams {
+            dry_run,
             workspace_id,
             cwd,
             branch,
@@ -716,7 +722,7 @@ fn print_worktree_help() {
     eprintln!("flk worktree commands:");
     eprintln!("  flk worktree list [--workspace ID | --cwd PATH] [--scan] [--json]");
     eprintln!(
-        "  flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]"
     );
     eprintln!(
         "  flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"

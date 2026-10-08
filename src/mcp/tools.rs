@@ -801,6 +801,7 @@ fn build_agent_history(args: Value) -> Result<Method, McpError> {
 
 fn build_agent_fork(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentFork(AgentForkParams {
+        dry_run: false,
         target: required_string(&args, "target")?,
         branch: optional_string(&args, "branch")?,
         // Deliberate narrowings, not dropped fields (#320 P1 audit): `base`

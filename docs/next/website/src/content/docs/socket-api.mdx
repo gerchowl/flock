@@ -86,6 +86,8 @@ For `pane.read`, `pane.send_text`, `pane.send_keys`, and `pane.close`, the `pane
 
 Some CLI commands are conveniences around these methods. For example, `flk agent wait` resolves an agent target and then subscribes to pane agent state events.
 
+The allocation methods `worktree.create`, `agent.fork`, `agent.start`, `workspace.create`, `tab.create`, and `pane.split` accept `dry_run: true` (default `false`). They return `{"type":"allocation_plan","operation":"<method>","plan":{...}}` with resolved allocation inputs and create no resources. Plans contain the resolved cwd or checkout path, source/placement identifiers, branch/base for worktrees, and argv for agents. A `pane.split` preview cannot predict a size refusal when the split is executed. Fork previews retain admission, resumability, transcript, and profile checks. Generated branch names are per-request; pass the returned branch/path explicitly to execute that plan. Raw API clients must check `ping` reports protocol 26 or newer before requesting previews, because older servers ignore unknown JSON fields. The bundled API client and CLI do this automatically.
+
 Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
 
 Create a worktree from a source workspace:
