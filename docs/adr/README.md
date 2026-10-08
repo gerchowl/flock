@@ -36,6 +36,8 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0024](0024-accept-the-implemented-proposed-adrs.md) | The eleven implemented `Proposed` ADRs are decided; what each acceptance does and does not assert | Accepted |
 | [0025](0025-version-identity-and-release-automation.md) | Version identity: this project restarts its version line, and the deterministic `just release` path stays | Accepted |
 
+| [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody | Proposed |
+
 ## Conventions
 
 - Next id = highest existing + 1, zero-padded to four digits;

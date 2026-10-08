@@ -121,42 +121,4 @@ be revisited if the guarantee firms up.
 federation already exists for cross-host traffic. If it cannot carry a message
 record, that is the thing to fix.
 
-## Clarification (2026-10-08): cross-host replies and confirmations
-
-The [Proposed mesh amendment to ADR-0009](0009-fleet-transport.md#amendment-2026-10-08-mesh-mode-and-durable-message-custody)
-addresses [#623](https://github.com/gerchowl/flock/issues/623) and
-[#661](https://github.com/gerchowl/flock/issues/661). It leaves this ADR's tool
-inbox and sender-authority boundary intact. The following is the proposed
-transport contract, not a claim that collection already ships.
-
-Agent identity, current location and reachability are distinct. An envelope's
-sender AgentId permits a reply to name its recipient, but cannot prove that a
-live return channel exists. `from_host` is an origin label, never authority to
-dial. Preserve a transport-attested, conversation-bound return capability in
-queued and delivered metadata, so replying to accepted mail does not require
-finding the sender anew in a stale directory.
-
-Requests and answers are durable records. If immediate reply delivery fails,
-the receiver or authenticated custodian retains the answer. The originating
-server collects it over an edge it can open, including on reconnect, imports
-it once into its local inbox/event model and acknowledges that import. A
-sleeping or NATed laptop therefore needs no inbound SSH reachability. A sender
-without an inbox still gets its answer through local wait/status. A sender
-agent that has been removed is not replaced by another occupant of its pane.
-
-Delivery confirmations and genuine read receipts travel through that same
-store-and-forward/collection mechanism and become local facts at the origin.
-"Delivered" means the target server durably imported the message into the
-recipient's inbox, not that SSH succeeded, a hub took custody, a wake was
-accepted or the agent read it. [#640](https://github.com/gerchowl/flock/issues/640)
-tracks wake/submit evidence separately from mailbox read state. `wait_reply`
-and `msg.status` consume imported local outcomes instead of polling remote
-servers inside the waiter.
-
-`msg.read`'s `replyable` must distinguish a valid durable return binding from
-immediate connectivity. A disconnected bound sender is replyable with a
-queued/collection-pending explanation. A legacy envelope without that contract
-must report its weaker reachability honestly. Unknown identities, authoritative
-agent removal and expiry are distinct from temporary offline routing. Neither
-transport attestation nor a collection capability makes an agent message an
-operator instruction.
+See [ADR-0026](0026-mesh-fleet-transport.md) (proposed) for mesh mode.
