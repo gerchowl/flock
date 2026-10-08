@@ -3483,21 +3483,45 @@ fn agent_result_and_history_read_an_opencode_session() {
     assert_eq!(info["status_text"], "approve", "{json}");
 
     let history = run_cli(&socket_path, &["agent", "history", "1-1"]);
-    let history_json: serde_json::Value = if history.status.success() {
-        serde_json::from_slice(&history.stdout).unwrap()
-    } else {
-        // `flk agent history` is documented but not wired as a CLI verb;
-        // drive the socket method it would call.
-        send_request(
-            &socket_path,
-            r#"{"id":"req_575_history","method":"agent.history","params":{"target":"1-1"}}"#,
-        )
-    };
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     let turns = history_json["result"]["history"]["turns"]
         .as_array()
         .unwrap_or_else(|| panic!("{history_json}"));
     assert_eq!(turns.len(), 2, "{history_json}");
     assert_eq!(turns[0]["text"], "review PR 12");
+
+    for detail in ["reply", "collapsed", "full"] {
+        let page = run_cli_json(
+            &socket_path,
+            &[
+                "agent", "history", "1-1", "--detail", detail, "--limit", "1",
+            ],
+        );
+        assert_eq!(page["result"]["history"]["detail"], detail, "{page}");
+        assert_eq!(
+            page["result"]["history"]["turns"].as_array().unwrap().len(),
+            1,
+            "{page}"
+        );
+        let cursor = page["result"]["history"]["next_cursor"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        let next = run_cli_json(
+            &socket_path,
+            &["agent", "history", "1-1", "--cursor", &cursor],
+        );
+        assert_eq!(
+            next["result"]["history"]["turns"],
+            serde_json::json!([]),
+            "{next}"
+        );
+    }
 
     cleanup_spawned_flock(flock, base);
 }

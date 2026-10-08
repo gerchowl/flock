@@ -320,9 +320,11 @@ flk agent history reviewer --detail full --cursor "$next"
 
 `agent history` reads the agent's own session transcript, one entry per turn,
 unwrapped, with a cursor so a poll reads only what was appended. It touches no
-pane state, so polling it is safe. It reads Claude's session transcript and
-opencode's session database (read-only); for any other agent it refuses with
-`unsupported_for_agent` rather than inventing an answer.
+pane state, so polling it is safe. `--detail` accepts `reply` (the default),
+`collapsed`, or `full`; `--limit` defaults to 20 and is capped at 200. Pass the
+response's `next_cursor` as `--cursor` to continue reading. It reads Claude's
+session transcript and opencode's session database (read-only); for any other
+agent it refuses with `unsupported_for_agent` rather than inventing an answer.
 
 **To learn how a delegated task went, read its result:**
 
