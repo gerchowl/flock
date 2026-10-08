@@ -948,6 +948,7 @@ impl App {
         // ADR-0018 §4: blocking mail restored from the log is still waiting on
         // its recipient, so the attention surface shows it from the first frame.
         this.sync_blocking_mail();
+        this.restore_delivery_attempts();
         // #372 / ADR-0016: rebuild the operator's notification list from the
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.

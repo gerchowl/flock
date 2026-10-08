@@ -934,6 +934,20 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
                 Outcome::ObservedAccepted
             })
         );
+        let evidence = app.delivery_attempts();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].state,
+            if !sent {
+                "abandoned"
+            } else if hook {
+                "accepted"
+            } else {
+                "observed_accepted"
+            }
+        );
+        assert!(evidence[0].finished_at_ms.is_some());
+        assert_eq!(evidence[0].submit_sent_at_ms.is_some(), sent);
         assert!(drain(&mut pty).is_empty());
     }
 }
@@ -1097,7 +1111,11 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
     runtime(&app).test_stamp_operator_input_at(Instant::now());
     app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
-    assert!(receiver.recv().unwrap().contains("abandoned"));
+    let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
+    assert_eq!(response["result"]["outcome"], "abandoned");
+    assert_eq!(response["result"]["attempt"]["reason"], "operator_active");
+    assert_eq!(response["result"]["attempt"]["pane"], pane);
+    assert!(response["result"]["attempt"]["attempt_id"].is_string());
 }
 
 #[tokio::test]
@@ -1161,5 +1179,177 @@ async fn guarded_mcp_submit_requires_calling_workspace_confirmation() {
     });
     assert!(response.contains("self_submit_unconfirmed"), "{response}");
     assert_eq!(app.caller_workspace_idx(), Some(ws));
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_late_read_wins() {
+    use super::super::guarded_submit::CONFIRM_WINDOW;
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let log = std::env::temp_dir().join(format!(
+        "flock-attempt-{}-{}.jsonl",
+        std::process::id(),
+        crate::app::api::messages::now_ms()
+    ));
+    app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "attempt-mail", MsgIntent::NeedsReply);
+    let now = Instant::now();
+    app.tick_idle_wakes(now);
+    assert!(!drain(&mut pty).is_empty());
+    let text = super::idle_wake_text(1);
+    runtime(&app).test_process_pty_bytes(&claude_screen(&text));
+    for at in [
+        now + GAP,
+        now + GAP + CONFIRM_WINDOW,
+        now + GAP + CONFIRM_WINDOW * 2,
+    ] {
+        app.tick_idle_wakes(at);
+        drain(&mut pty);
+    }
+    let attempts = app.delivery_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, "unconfirmed");
+    assert_eq!(attempts[0].reason.as_deref(), Some("confirm_timeout"));
+    assert!(attempts[0].retried);
+    assert_eq!(app.mailboxes.queued_len(&pane), 1);
+    let status = |app: &mut App| -> serde_json::Value {
+        serde_json::from_str(&app.handle_api_request(Request {
+            id: "status".into(),
+            method: Method::MsgStatus(crate::api::schema::MsgStatusParams {
+                correlation_id: "attempt-mail".into(),
+            }),
+        }))
+        .unwrap()
+    };
+    let before = status(&mut app);
+    assert_eq!(before["result"]["state"], "queued");
+    assert_eq!(before["result"]["attempts"][0]["state"], "unconfirmed");
+    let listing = app.handle_api_request(Request {
+        id: "list".into(),
+        method: Method::MsgList(crate::api::schema::MsgListParams { pane: None }),
+    });
+    assert!(listing.contains("confirm_timeout"));
+    let persisted = std::fs::read_to_string(&log).unwrap();
+    for line in persisted
+        .lines()
+        .filter(|line| line.contains("delivery_attempt_updated"))
+    {
+        assert!(!line.contains(MARKER));
+        assert!(!line.contains(&text));
+    }
+    app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+    let restored = app.event_hub.persisted_events_after(0);
+    app.mailboxes = crate::app::mailboxes::MailboxRegistry::default();
+    app.mailboxes
+        .seed_from_events(restored.iter().map(|(_, _, event)| event));
+    app.idle_wake = super::IdleWakeTracker::default();
+    app.restore_delivery_attempts();
+    assert_eq!(app.delivery_attempts(), attempts);
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
+    claude_idle_for(&mut app, settled());
+    app.tick_idle_wakes(Instant::now());
+    assert!(drain(&mut pty).is_empty());
+    let read = app.handle_api_request(Request {
+        id: "read".into(),
+        method: Method::MsgRead(MsgReadParams {
+            pane: Some(pane.clone()),
+        }),
+    });
+    assert!(read.contains("attempt-mail"), "{read}");
+    assert_eq!(status(&mut app)["result"]["state"], "read");
+    let events = app.event_hub.persisted_events_after(0);
+    let digest =
+        crate::digest::categorize(events.iter().map(|(seq, ts, event)| (*seq, *ts, event)));
+    assert!(digest
+        .yellow
+        .iter()
+        .any(|row| row.summary.contains("confirm_timeout")
+            && row.context.contains(&("pane".into(), pane.clone()))));
+    assert_eq!(app.mailboxes.queued_len(&pane), 0);
+    std::fs::remove_file(log).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_attempt_interrupted_restart_is_unconfirmed_and_deduplicated() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let log = std::env::temp_dir().join(format!(
+        "flock-attempt-{}-{}.jsonl",
+        std::process::id(),
+        crate::app::api::messages::now_ms()
+    ));
+    app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "interrupted-mail", MsgIntent::NeedsReply);
+    app.tick_idle_wakes(Instant::now());
+    assert!(!drain(&mut pty).is_empty());
+    assert_eq!(app.delivery_attempts()[0].state, "typed");
+    app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+    let restored = app.event_hub.persisted_events_after(0);
+    app.mailboxes = crate::app::mailboxes::MailboxRegistry::default();
+    app.mailboxes
+        .seed_from_events(restored.iter().map(|(_, _, event)| event));
+    app.idle_wake = super::IdleWakeTracker::default();
+    app.restore_delivery_attempts();
+    app.restore_delivery_attempts();
+    let attempts = app.delivery_attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, "unconfirmed");
+    assert_eq!(attempts[0].reason.as_deref(), Some("server_restarted"));
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        None,
+        AgentState::Idle,
+        false,
+        true,
+        false,
+        false,
+        Instant::now(),
+    );
+    app.tick_idle_wakes(Instant::now());
+    claude_idle_for(&mut app, settled());
+    runtime(&app).test_process_pty_bytes(&claude_screen(""));
+    app.tick_idle_wakes(Instant::now() + GAP);
+    assert!(drain(&mut pty).is_empty());
+    assert_eq!(app.mailboxes.queued_len(&pane), 1);
+    std::fs::remove_file(log).unwrap();
+}
+
+#[tokio::test]
+async fn delivery_attempt_accepted_wake_does_not_read_mail() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "accepted-mail", MsgIntent::NeedsReply);
+    let now = Instant::now();
+    app.tick_idle_wakes(now);
+    drain(&mut pty);
+    let text = super::idle_wake_text(1);
+    runtime(&app).test_process_pty_bytes(&claude_screen(&text));
+    app.tick_idle_wakes(now + GAP);
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    app.handle_api_request(Request {
+        id: "prompt".into(),
+        method: Method::PaneReportPrompt(crate::api::schema::PaneReportPromptParams {
+            pane_id: pane.clone(),
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            prompt: text,
+            seq: Some(1),
+        }),
+    });
+    app.tick_idle_wakes(now + GAP + Duration::from_millis(60));
+    assert_eq!(app.delivery_attempts()[0].state, "accepted");
+    assert_eq!(app.mailboxes.queued_len(&pane), 1);
     assert!(drain(&mut pty).is_empty());
 }

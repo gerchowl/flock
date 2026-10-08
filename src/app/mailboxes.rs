@@ -764,6 +764,7 @@ impl MailboxRegistry {
             .filter(|(to_pane, _)| pane.is_none_or(|filter| filter == to_pane.as_str()))
             .flat_map(|(_, queue)| queue.iter())
             .map(|message| crate::api::schema::QueuedMessageInfo {
+                attempts: Vec::new(),
                 correlation_id: message.correlation_id.clone(),
                 to_pane: message.to_pane.clone(),
                 from_pane: message.from_pane.clone(),

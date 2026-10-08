@@ -1369,8 +1369,26 @@ pub struct MsgMuteParams {
     pub reason: Option<String>,
 }
 
+/// Local keyboard submission evidence, independent of mailbox read receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAttempt {
+    pub attempt_id: String,
+    pub pane: String,
+    pub correlation_ids: Vec<String>,
+    pub wake: bool,
+    pub state: String,
+    pub reason: Option<String>,
+    pub queued_at_ms: u64,
+    pub typed_at_ms: Option<u64>,
+    pub submit_sent_at_ms: Option<u64>,
+    pub finished_at_ms: Option<u64>,
+    pub retried: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessageInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<DeliveryAttempt>,
     pub correlation_id: String,
     pub to_pane: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1976,6 +1994,7 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     AgentForked,
+    DeliveryAttemptUpdated,
     MessageQueued,
     MessageDelivered,
     MessageReplied,
@@ -2051,6 +2070,7 @@ impl EventKind {
             | Self::PaneAgentDetected
             | Self::PaneAgentStatusChanged
             | Self::AgentForked
+            | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
             | Self::MessageReplied
@@ -2120,6 +2140,7 @@ pub struct ApiListenerHealth {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
     GuardedSubmit {
+        attempt: DeliveryAttempt,
         outcome: String,
         reason: Option<String>,
         retried: bool,
@@ -2401,6 +2422,8 @@ pub enum ResponseResult {
         messages: Vec<QueuedMessageInfo>,
     },
     MsgStatus {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attempts: Vec<DeliveryAttempt>,
         correlation_id: String,
         /// `queued` (waiting in a local inbox), `read` (the recipient took
         /// it), `dropped` (aged out unread), or `relayed` (handed to another
@@ -3126,6 +3149,9 @@ pub enum EventData {
         state_labels: HashMap<String, String>,
     },
     /// Message telemetry (#175 O2 message-side, emitted with the verbs).
+    DeliveryAttemptUpdated {
+        attempt: DeliveryAttempt,
+    },
     MessageQueued {
         correlation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

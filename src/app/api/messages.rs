@@ -664,12 +664,16 @@ impl App {
             },
             None => None,
         };
-        encode_success(
-            id,
-            ResponseResult::MsgList {
-                messages: self.mailboxes.queued_infos(pane_filter.as_deref()),
-            },
-        )
+        let attempts = self.delivery_attempts();
+        let mut messages = self.mailboxes.queued_infos(pane_filter.as_deref());
+        for message in &mut messages {
+            message.attempts = attempts
+                .iter()
+                .filter(|a| a.correlation_ids.contains(&message.correlation_id))
+                .cloned()
+                .collect();
+        }
+        encode_success(id, ResponseResult::MsgList { messages })
     }
 
     /// `msg.status` — what became of one message, asked by whoever sent it.
@@ -683,12 +687,18 @@ impl App {
     /// ordering rather than whatever the file happened to yield.
     pub(super) fn handle_msg_status(&mut self, id: String, params: MsgStatusParams) -> String {
         let mut found: Option<ResponseResult> = None;
-        for (_, event) in self.event_hub.events_after(0) {
+        let mut history = std::collections::BTreeMap::new();
+        for (seq, _, event) in self.event_hub.persisted_events_after(0) {
+            history.insert(seq, event);
+        }
+        history.extend(self.event_hub.events_after(0));
+        for event in history.values() {
             match &event.data {
                 EventData::MessageQueued { correlation_id, .. }
                     if *correlation_id == params.correlation_id =>
                 {
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "queued".into(),
                         outcome_known: true,
@@ -718,6 +728,7 @@ impl App {
                         ),
                     };
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "relayed".into(),
                         // The receiving node owns the outcome. Saying so beats
@@ -739,6 +750,7 @@ impl App {
                     ..
                 } if *correlation_id == params.correlation_id => {
                     found = Some(ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: if *delivered { "read" } else { "dropped" }.into(),
                         outcome_known: true,
@@ -766,6 +778,13 @@ impl App {
             (found.as_mut(), answer)
         {
             *reply = Some(answer);
+        }
+        if let Some(ResponseResult::MsgStatus { attempts, .. }) = found.as_mut() {
+            *attempts = self
+                .delivery_attempts()
+                .into_iter()
+                .filter(|a| a.correlation_ids.contains(&params.correlation_id))
+                .collect();
         }
         match found {
             Some(result) => encode_success(id, result),
