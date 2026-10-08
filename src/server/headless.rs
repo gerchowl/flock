@@ -360,11 +360,17 @@ impl HeadlessServer {
     /// 2. Binds the client socket listener
     /// 3. Returns the server ready to run
     pub fn new(
-        app: app::App,
+        mut app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
+        app.node_id = api_server
+            .as_ref()
+            .and_then(|server| server.node_id.clone());
+        app.clone_detection_warning = api_server
+            .as_ref()
+            .and_then(|server| server.clone_detection_warning.clone());
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
@@ -1196,7 +1202,15 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server(api_tx, self.app.event_hub.clone())?;
+        let api_server = api::start_server_with_capabilities(
+            api_tx,
+            self.app.event_hub.clone(),
+            Some(crate::api::schema::ServerCapabilities {
+                live_handoff: true,
+                node_id: self.app.node_id.clone(),
+                clone_detection_warning: self.app.clone_detection_warning.clone(),
+            }),
+        )?;
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;

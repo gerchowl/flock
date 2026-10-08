@@ -463,6 +463,14 @@ pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
     &[]
 }
 
+/// OS installation identity, independent of hostname and flock's state dir.
+pub(crate) fn machine_identity() -> std::io::Result<String> {
+    super::machine_id::read_machine_id(
+        std::path::Path::new("/etc/machine-id"),
+        sysinfo::System::boot_time(),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {

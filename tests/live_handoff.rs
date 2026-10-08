@@ -109,6 +109,7 @@ fn spawn_server_with_env(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("FLOCK_SOCKET_PATH", api_socket);
     cmd.env(
@@ -152,6 +153,7 @@ fn spawn_named_session_server(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("FLOCK_SESSION", session_name);
     cmd.env_remove("FLOCK_SOCKET_PATH");
@@ -186,6 +188,7 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env_remove("FLOCK_SESSION");
     cmd.env_remove("FLOCK_SOCKET_PATH");
@@ -565,6 +568,14 @@ fn live_handoff_preserves_named_session_socket_paths() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
+    let before = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-before","method":"ping","params":{}}),
+    );
+    let node_id = before["result"]["capabilities"]["node_id"]
+        .as_str()
+        .expect("persisted node id");
+
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
@@ -576,6 +587,12 @@ fn live_handoff_preserves_named_session_socket_paths() {
         !config_home.join("flock-dev/flock.sock").exists(),
         "named handoff unexpectedly bound the default session API socket"
     );
+
+    let after = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-after","method":"ping","params":{}}),
+    );
+    assert_eq!(after["result"]["capabilities"]["node_id"], node_id);
 
     let _ = request(
         &api_socket,
@@ -1470,6 +1487,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let pid_text = fs::read_to_string(&marker).unwrap();
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
 
+    let before = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-before","method":"ping","params":{}}),
+    );
+    let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
+    fs::write(&identity_path, b"corrupt during handoff").unwrap();
     let failed = request(
         &api_socket,
         serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
@@ -1480,6 +1503,15 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     );
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
+    let after = request(
+        &api_socket,
+        serde_json::json!({"id":"identity-after","method":"ping","params":{}}),
+    );
+    assert_eq!(
+        before["result"]["capabilities"],
+        after["result"]["capabilities"]
+    );
+    assert_eq!(fs::read(identity_path).unwrap(), b"corrupt during handoff");
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
 
     assert_ok(request(
@@ -1528,6 +1560,7 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
         .arg("stalled-peer-token")
         .env("HOME", &base)
         .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_STATE_HOME", base.join("state"))
         .env("XDG_RUNTIME_DIR", base.join("runtime"))
         .env("SHELL", "/bin/sh")
         .env("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS", "5000")
@@ -1585,6 +1618,7 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
         .env("HOME", &base)
         .env("SHELL", "/bin/sh")
         .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_STATE_HOME", base.join("state"))
         .env("XDG_RUNTIME_DIR", base.join("runtime"))
         .env("FLOCK_SOCKET_PATH", &api_socket)
         .env("FLOCK_CLIENT_SOCKET_PATH", base.join("client.sock"))

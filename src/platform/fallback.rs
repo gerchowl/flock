@@ -96,3 +96,10 @@ pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::
 pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
     &[]
 }
+
+pub(crate) fn machine_identity() -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "node identity machine binding is unsupported on this platform",
+    ))
+}
