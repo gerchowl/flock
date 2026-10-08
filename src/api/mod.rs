@@ -45,6 +45,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentStart(_)
             | Method::AgentFork(_)
             | Method::AgentSpawn(_)
+            | Method::AgentRestart(_)
             | Method::MsgSend(_)
             | Method::MsgRead(_)
             | Method::MsgReply(_)

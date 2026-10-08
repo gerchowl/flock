@@ -23,6 +23,7 @@ const NESTED_FLOCK_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod agent_restart;
 mod agent_resume;
 mod agent_self_compact;
 mod agent_symbols;

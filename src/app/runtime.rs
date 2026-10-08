@@ -289,6 +289,7 @@ impl App {
         // #540: an armed self-compaction's turn boundary, its Enter, or its
         // timeout — mirrored in the headless loop (#25).
         self.tick_self_compacts(now);
+        changed |= self.tick_agent_restarts(now);
         for update in &settled {
             self.emit_pane_state_update(update);
         }
@@ -707,6 +708,10 @@ impl App {
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
+            self.restarts
+                .next_deadline(&self.state.config.session, Instant::now()),
+            (!self.state.agent_restarts.is_empty())
+                .then(|| Instant::now() + Duration::from_millis(250)),
             // #36: a notification held behind `[ui.toast] delay_seconds` must
             // wake an otherwise quiet loop, or it lands only on the next
             // unrelated tick.

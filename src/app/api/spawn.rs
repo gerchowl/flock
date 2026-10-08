@@ -278,7 +278,7 @@ impl App {
         // Armed after the allowlist, and dropped with it: the profile the
         // requester runs under is handed down deliberately, and the server
         // never had it to allow through in the first place.
-        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
 
         let (rows, cols) = self.state.estimate_pane_size();
         let spawned = self.spawn_agent_workspace(cwd, rows, cols, &argv, params.focus);
@@ -294,6 +294,13 @@ impl App {
                 );
             }
         };
+
+        if let Some(terminal) = self.state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .and_then(|id| self.state.terminals.get_mut(id))
+        {
+            terminal.launch_env = spawn_env;
+        }
 
         // Stamp the child's lineage BEFORE anything can read it. The run id
         // is what its commits will carry; depth and parent are what the

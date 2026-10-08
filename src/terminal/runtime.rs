@@ -19,6 +19,14 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    pub(crate) fn shutdown_for_restart(
+        self,
+        pids: Vec<u32>,
+        grace: std::time::Duration,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        self.0.shutdown_for_restart(pids, grace)
+    }
+
     /// PID of the pane's direct child process, when alive.
     pub fn child_pid(&self) -> Option<u32> {
         self.0.child_pid()

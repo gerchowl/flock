@@ -242,6 +242,11 @@ pub struct TerminalState {
     pub state: AgentState,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    pub launch_env: Vec<(String, String)>,
+    pub restart_in_progress: bool,
+    pub restart_stopped: bool,
+    pub(crate) restart_confirmation_pid: Option<u32>,
+    pub(crate) restart_retry: Option<crate::agent_restart::RestartRetry>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     /// #175 C3: stashed resume plan for a pane the operator (or the
@@ -344,6 +349,11 @@ impl TerminalState {
             state: AgentState::Unknown,
             revision: 0,
             launch_argv: None,
+            launch_env: Vec::new(),
+            restart_in_progress: false,
+            restart_stopped: false,
+            restart_confirmation_pid: None,
+            restart_retry: None,
             respawn_shell_on_exit: false,
             pending_agent_resume_plan: None,
             hibernated_resume_plan: None,
@@ -1234,7 +1244,44 @@ impl TerminalState {
         self.agent_name = None;
     }
 
+    /// Invalidate evidence from the old execution while keeping its launch
+    /// settings and stable agent/session identities for restart verification.
+    pub(crate) fn prepare_restart_resume(&mut self) {
+        self.restart_retry = None;
+        self.restart_confirmation_pid = None;
+        self.session_ref_hook_confirmed = false;
+        self.hook_authority = None;
+        self.hook_report_sequences.clear();
+        self.detected_agent = None;
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_visible_idle = false;
+        self.fallback_visible_working = false;
+        self.fallback_observed_at = None;
+        self.stale_hook_idle_since = None;
+        self.state = AgentState::Unknown;
+        self.state_changed_at = None;
+    }
+
+    pub(crate) fn restart_idle_observed_since(&self, since: Instant) -> bool {
+        self.state == AgentState::Idle
+            && (self.fallback_visible_idle
+                && self.fallback_observed_at.is_some_and(|at| at >= since)
+                || self.hook_authority.as_ref().is_some_and(|hook| {
+                    hook.state == AgentState::Idle && hook.reported_at >= since
+                }))
+    }
+
+    pub(crate) fn restart_session_confirmed(&self) -> bool {
+        self.session_ref_hook_confirmed
+            || self
+                .hook_authority
+                .as_ref()
+                .is_some_and(|hook| hook.session_ref.is_some())
+    }
+
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.restart_retry = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -1278,6 +1325,10 @@ impl TerminalState {
         &mut self,
         plan: Option<crate::agent_resume::AgentResumePlan>,
     ) {
+        if plan.is_some() {
+            // A deliberate park supersedes any failed restart's deferred retry.
+            self.restart_retry = None;
+        }
         let flips = self.hibernated_resume_plan.is_some() != plan.is_some();
         self.hibernated_resume_plan = plan;
         if flips {

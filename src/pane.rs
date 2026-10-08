@@ -1115,6 +1115,84 @@ impl PaneRuntime {
         self.preserve_processes_on_drop = true;
     }
 
+    /// Stop a snapshotted agent tree off-loop and report whether it was reaped.
+    /// Runtime I/O and detection are detached before any signal is sent.
+    pub(crate) fn shutdown_for_restart(
+        mut self,
+        mut pids: Vec<u32>,
+        grace: std::time::Duration,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        self.detect_handle.abort();
+        self.io.shutdown();
+        let child_pid = self.child_pid.load(Ordering::Acquire);
+        pids.extend(crate::platform::session_processes(child_pid));
+        pids.push(child_pid);
+        pids.retain(|pid| *pid > 1);
+        pids.sort_unstable();
+        pids.dedup();
+        let mut identities: Vec<_> = pids
+            .into_iter()
+            .map(|pid| (pid, crate::platform::process_start_time(pid)))
+            .collect();
+        let child_exit = self.child_exit.clone();
+        self.preserve_processes_on_drop = true;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let living = |identities: &[(u32, Option<u64>)]| {
+                identities
+                    .iter()
+                    .filter(|(pid, birth)| {
+                        crate::platform::process_start_time(*pid) == *birth
+                            && process_alive_for_shutdown(
+                                *pid,
+                                child_pid,
+                                child_exit.as_deref().is_some_and(ChildExit::is_reaped),
+                                crate::platform::process_exists,
+                            )
+                    })
+                    .map(|(pid, _)| *pid)
+                    .collect::<Vec<_>>()
+            };
+            crate::platform::signal_processes(
+                &living(&identities),
+                crate::platform::Signal::Terminate,
+            );
+            let deadline = std::time::Instant::now() + grace;
+            while !living(&identities).is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // A TERM-resistant child can create descendants during the grace
+            // window. Expand from the still-matching process identities again
+            // before KILL so those children do not outlive the restart.
+            let mut active = living(&identities);
+            let processes: Vec<_> = crate::platform::all_process_ids()
+                .into_iter()
+                .map(|pid| (pid, crate::platform::process_parent_id(pid)))
+                .collect();
+            loop {
+                let before = active.len();
+                for (pid, parent) in &processes {
+                    if !active.contains(pid)
+                        && parent.is_some_and(|parent| active.contains(&parent))
+                    {
+                        active.push(*pid);
+                        identities.push((*pid, crate::platform::process_start_time(*pid)));
+                    }
+                }
+                if active.len() == before {
+                    break;
+                }
+            }
+            crate::platform::signal_processes(&living(&identities), crate::platform::Signal::Kill);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !living(&identities).is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = tx.send(living(&identities).is_empty());
+        });
+        rx
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.io.duplicate_handoff_fd()

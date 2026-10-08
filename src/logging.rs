@@ -4622,6 +4622,15 @@ fn rotated_log_path(path: &Path, index: usize) -> PathBuf {
 
 /// Capture everything the facade emits on THIS thread as plain fmt text.
 /// Test-only, crate-wide: call-site modules assert their facade wiring with it.
+/// A configured hard limit could not be handled without losing the session.
+pub(crate) fn agent_restart_refused(terminal: &str, code: &str) {
+    tracing::warn!(terminal = terminal, refusal = code, "agent restart refused");
+}
+
+pub(crate) fn agent_restart_message_failed() {
+    tracing::warn!("agent restart continuation could not be queued");
+}
+
 #[cfg(test)]
 pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
     use std::sync::{Arc, Mutex};

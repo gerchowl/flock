@@ -28,13 +28,16 @@ use super::App;
 pub(crate) enum HibernationError {
     /// The pane's agent has no resumable session (no `agent_resume::plan`)
     /// — hibernating would lose the conversation forever.
-    Unsupported { reason: String },
+    Unsupported {
+        reason: String,
+    },
     /// `agent.resume` on a pane that isn't hibernated.
     NotHibernated,
     /// `agent.hibernate` on a pane that's already hibernated.
     AlreadyHibernated,
     /// The target pane could not be resolved.
     NotFound,
+    RestartPending,
 }
 
 impl HibernationError {
@@ -44,6 +47,7 @@ impl HibernationError {
             Self::NotHibernated => "not_hibernated",
             Self::AlreadyHibernated => "already_hibernated",
             Self::NotFound => "not_found",
+            Self::RestartPending => "restart_pending",
         }
     }
 
@@ -55,6 +59,7 @@ impl HibernationError {
                 "pane is already hibernated; call agent.resume to bring it back".to_string()
             }
             Self::NotFound => "no pane matches that target".to_string(),
+            Self::RestartPending => "a restart is stopping this pane; wait for verification".into(),
         }
     }
 }
@@ -167,6 +172,9 @@ impl App {
                 .terminals
                 .get(&terminal_id)
                 .ok_or(HibernationError::NotFound)?;
+            if terminal.restart_in_progress {
+                return Err(HibernationError::RestartPending);
+            }
             let plan = terminal
                 .hibernated_resume_plan
                 .clone()

@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
@@ -14,7 +15,7 @@ pub(crate) mod idle_wake;
 pub(crate) mod self_compact;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
-mod api_helpers;
+pub(crate) mod api_helpers;
 pub(crate) mod config_io;
 mod creation;
 pub(crate) mod directory;
@@ -154,6 +155,7 @@ pub struct App {
     /// of a typed write, a settle that lifts, or the timeout. `None` when
     /// nothing is armed anywhere, which is the state the loop is quiet in.
     pub(crate) self_compact_deadline: Option<Instant>,
+    pub(crate) restarts: agent_restart::RestartRuntime,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -732,6 +734,7 @@ impl App {
             server_label: config.ui.server_label,
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
+            agent_restarts: Default::default(),
             system_stats: None,
             system_stats_at: None,
             expanded_prompt_pane: None,
@@ -901,6 +904,7 @@ impl App {
             pending_agent_submit: None,
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,
+            restarts: Default::default(),
             event_hub,
             last_focus,
             no_session,

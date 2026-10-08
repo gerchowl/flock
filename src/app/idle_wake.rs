@@ -310,6 +310,9 @@ impl App {
         if !has_inbox_tool(agent) {
             return Decision::Suppressed("no_inbox_tool");
         }
+        if terminal.restart_in_progress {
+            return Decision::Suppressed("restart_pending");
+        }
         if let Some(blocker) = terminal.idle_wake_blocker(now, settle, fresh) {
             if blocker == "not_settled" {
                 if let Some(settles_at) = terminal.state_settles_at(settle) {

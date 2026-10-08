@@ -600,6 +600,11 @@ impl App {
                 self.render_notify.notify_one();
                 return;
             }
+            if self.handle_restart_runtime_exit(*pane_id) {
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+                return;
+            }
             match self.runtime_exit_action(*pane_id) {
                 RuntimeExitAction::RespawnShell => {
                     if self.respawn_shell_for_launch_pane(*pane_id) {
@@ -894,7 +899,7 @@ impl App {
         // #175 C3: hibernation wins over the respawn-shell path. The stashed
         // resume plan means the child died BECAUSE we asked it to; keeping
         // the pane empty is the whole point.
-        if terminal.hibernated_resume_plan.is_some() {
+        if terminal.hibernated_resume_plan.is_some() || terminal.restart_in_progress {
             RuntimeExitAction::HoldHibernated
         } else if terminal.respawn_shell_on_exit {
             RuntimeExitAction::RespawnShell
@@ -1375,6 +1380,7 @@ impl App {
                 return self.handle_agent_hibernate(request.id, target)
             }
             Method::AgentResume(target) => return self.handle_agent_resume(request.id, target),
+            Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),

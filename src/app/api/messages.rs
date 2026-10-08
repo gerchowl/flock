@@ -206,7 +206,7 @@ impl App {
     /// this is the hub delivering a frame that spoke handed up (#410). Passed
     /// as an argument, never read from params or left in shared state, so no
     /// wire caller can claim it and no early return can leak it.
-    pub(super) fn send_message(
+    pub(crate) fn send_message(
         &mut self,
         id: String,
         params: MsgSendParams,
