@@ -37,6 +37,20 @@ if "msg send" in command and gate.is_dir():
             sys.exit(255)
         time.sleep(0.01)
 
+# A topology cannot always start every pollee before its poller. Keep the
+# initial relay from reporting no_local_server and entering enrollment backoff
+# while the harness is still starting that target. Readiness markers survive
+# restarts, so this does not hide later outages or alter partition fault modes.
+ready = base / f"ready-{target}"
+if "peers relay" in command and not ready.exists():
+    (base / f"startup-wait-{source}-{target}").touch()
+    deadline = time.monotonic() + 10
+    while not ready.exists():
+        if time.monotonic() >= deadline:
+            sys.stderr.write(f"fake-ssh: initial server readiness timed out for {target}\n")
+            sys.exit(255)
+        time.sleep(0.01)
+
 # Start empty and admit only the process basics, then set sandbox paths.
 env = {
     key: value for key, value in os.environ.items()

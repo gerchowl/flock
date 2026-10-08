@@ -474,6 +474,15 @@ fn init_repo(path: &Path, slug: &str) {
 /// so a pollee is usually listening before its poller's first round, then every
 /// node gets one workspace in its own repo.
 pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
+    spawn_with_startup_probe(tag, specs, |_, _| {})
+}
+
+/// Observe startup before a named node starts, to exercise transport readiness races.
+pub fn spawn_with_startup_probe(
+    tag: &str,
+    specs: &[NodeSpec],
+    mut before_start: impl FnMut(&Fleet, &str),
+) -> Fleet {
     let base = unique_base(tag);
     fs::create_dir_all(&base).unwrap();
     let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
@@ -592,9 +601,13 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
         })
         .collect();
     let mut fleet = Fleet { base, nodes };
-    for node in fleet.nodes.iter_mut().rev() {
+    for index in (0..fleet.nodes.len()).rev() {
+        before_start(&fleet, &fleet.nodes[index].name);
+        let node = &mut fleet.nodes[index];
         node.start();
         node.wait_ready();
+        // Initial startup only: later outages must still reach the real relay.
+        fs::write(fleet.base.join(format!("ready-{}", node.name)), b"").unwrap();
         node.create_workspace(&node.repo);
     }
     fleet
