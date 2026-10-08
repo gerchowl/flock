@@ -78,7 +78,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
 
     if outdated_only {
         for notice in crate::integration::pinned_path_notices() {
-            println!("  ! {notice}");
+            eprintln!("  ! {notice}");
         }
         crate::integration::print_outdated_update_notice();
         return Ok(0);

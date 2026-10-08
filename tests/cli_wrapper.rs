@@ -1383,6 +1383,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
@@ -1392,6 +1397,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_install.status.code(), Some(0));
@@ -1405,6 +1415,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
@@ -1417,6 +1432,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_uninstall.status.code(), Some(0));
@@ -1449,6 +1469,12 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
         .args(["integration", "status", "--outdated-only"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -1457,6 +1483,8 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("installed flock integrations need updating"));
     assert!(stderr.contains("flk integration install pi"));
+    assert!(!stderr.contains("claude MCP:"));
+    assert!(!stderr.contains("codex MCP:"));
 
     cleanup_test_base(&base);
 }
@@ -1475,6 +1503,12 @@ fn integration_status_rejects_unknown_flags() {
         .args(["integration", "status", "--wat"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -3598,6 +3632,10 @@ fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
             .env("HOME", &home)
             .env("CLAUDE_CONFIG_DIR", &claude)
             .env("CODEX_HOME", &codex)
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("COPILOT_HOME")
+            .env_remove("KIMI_CODE_HOME")
+            .env_remove("QODER_CONFIG_DIR")
             .env_remove("FLOCK_BIN")
             .env_remove("FLOCK_ENV")
             .env("FLOCK_SOCKET_PATH", base.join("absent.sock"))
@@ -3643,7 +3681,12 @@ fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
     ] {
         let status = run(&args);
         assert!(status.status.success());
-        let output = String::from_utf8_lossy(&status.stdout);
+        let output = if args.contains(&"--outdated-only") {
+            assert!(status.stdout.is_empty());
+            String::from_utf8_lossy(&status.stderr)
+        } else {
+            String::from_utf8_lossy(&status.stdout)
+        };
         assert!(output.contains("claude MCP: pinned store path"), "{output}");
     }
     let owned = home.join("owned-opencode.json");

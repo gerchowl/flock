@@ -141,7 +141,9 @@ fn install_at(
         fs::create_dir_all(parent)?;
     }
     // Claude Code can update this file while installation is preparing an
-    // entry. Re-read at the write boundary and defer rather than lose its edit.
+    // entry. Re-read at the write boundary and defer if its edit is detected.
+    // This narrows the race, but is not a lock: another writer can still change
+    // the file between this read and the atomic replacement.
     let latest = match fs::read_to_string(path) {
         Ok(latest) => latest,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
