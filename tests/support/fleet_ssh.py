@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 base = Path(__file__).resolve().parent.parent
 manifest = json.loads((base / "nodes.json").read_text())
@@ -23,6 +24,18 @@ if (base / f"refuse-ssh-{target}").exists() or (
 ).exists():
     sys.stderr.write(f"ssh: connect to host {target} port 22: Connection refused\n")
     sys.exit(255)
+
+# Gate only message sends on this directed edge. Discovery and held relays
+# remain live, so a test can distinguish a blocked app loop from a slow hop.
+gate = base / f"gate-message-{source}-{target}"
+if "msg send" in command and gate.is_dir():
+    (gate / "entered").touch()
+    deadline = time.monotonic() + 30
+    while not (gate / "release").exists():
+        if not gate.is_dir() or time.monotonic() >= deadline:
+            sys.stderr.write("fake-ssh: message gate was not released before its deadline\n")
+            sys.exit(255)
+        time.sleep(0.01)
 
 # Start empty and admit only the process basics, then set sandbox paths.
 env = {

@@ -275,6 +275,30 @@ impl Node {
     }
 }
 
+/// Hold legacy message SSH commands on one edge while other traffic proceeds.
+/// Dropping the gate also releases it, including when a test assertion fails.
+pub struct MessageGate {
+    path: PathBuf,
+}
+
+impl MessageGate {
+    pub fn wait_entered(&self, timeout: Duration) {
+        wait_until("SSH message command to enter gate", timeout, || {
+            self.path.join("entered").exists().then_some(())
+        });
+    }
+
+    pub fn release(&self) {
+        fs::write(self.path.join("release"), b"").unwrap();
+    }
+}
+
+impl Drop for MessageGate {
+    fn drop(&mut self) {
+        let _ = fs::write(self.path.join("release"), b"");
+    }
+}
+
 /// A spawned fleet. Dropping it kills every node and removes the base dir.
 pub struct Fleet {
     pub base: PathBuf,
@@ -313,6 +337,16 @@ impl Fleet {
 
     pub fn allow_edge(&self, from: &str, to: &str) {
         fs::remove_file(self.base.join(format!("refuse-edge-{from}-{to}"))).unwrap();
+    }
+
+    /// Arm a message-only gate once per directed edge. The shim acknowledges
+    /// entry before waiting, so tests can probe responsiveness without sleeps.
+    pub fn gate_message_edge(&self, from: &str, to: &str) -> MessageGate {
+        self.node(from);
+        self.node(to);
+        let path = self.base.join(format!("gate-message-{from}-{to}"));
+        fs::create_dir(&path).unwrap();
+        MessageGate { path }
     }
 
     /// Wait until the shim has spawned the held relay, before partitioning it.

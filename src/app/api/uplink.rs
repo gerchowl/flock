@@ -109,6 +109,11 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         response: String,
     ) {
+        if let Some(mut relay) = self.message_relays.pending.take() {
+            relay.respond_to = Some(respond_to);
+            self.enqueue_message_relay(relay.into_work());
+            return;
+        }
         if let Some((request_id, pane_id, attempt)) = self.pending_agent_submit.take() {
             self.schedule_guarded_request(request_id, pane_id, attempt, respond_to);
             return;

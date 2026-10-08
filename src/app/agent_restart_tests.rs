@@ -880,3 +880,47 @@ async fn restart_live_retry_does_not_override_deliberate_hibernation() {
         "an operator's deliberate park supersedes the deferred restart retry"
     );
 }
+
+#[tokio::test]
+async fn restart_messages_detach_leftover_relays_before_the_next_request() {
+    let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(
+        &crate::config::Config::default(),
+        true,
+        None,
+        api_rx,
+        crate::api::EventHub::default(),
+    );
+    app.message_relays.pending = Some(crate::app::message_relay::RelaySend {
+        id: "detached".into(),
+        peer: crate::config::PeerConfig::default(),
+        // Refused locally, without dialing a peer.
+        to_agent: "invalid recipient".into(),
+        host: "nodeb".into(),
+        direct: true,
+        from_agent: "agent_nodea_sender".into(),
+        from_host: "nodea".into(),
+        body: "test".into(),
+        correlation_id: "detached".into(),
+        in_reply_to: None,
+        intent: MsgIntent::Fyi,
+        settle_original: None,
+        respond_to: None,
+    });
+    app.restart_message_with_intent(
+        "agent_nodea_gone".into(),
+        "restart notice".into(),
+        MsgIntent::Fyi,
+    );
+    assert!(app.message_relays.pending.is_none());
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
+        .await
+        .unwrap()
+        .expect("detached relay completes");
+    let crate::events::AppEvent::MsgRelayCompleted(completion) = &event else {
+        panic!("expected relay completion");
+    };
+    assert_eq!(completion.send.id, "detached");
+    assert!(completion.send.respond_to.is_none());
+    app.handle_internal_event(event);
+}
