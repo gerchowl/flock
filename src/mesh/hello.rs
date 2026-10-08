@@ -189,9 +189,8 @@ fn check_pin_guarded(
     with_store(|store| {
         if configured_name {
             match store.get_pin(peer).map_err(|e| e.to_string())? {
-                None => return Err(format!("name {peer} belongs to configured peer {peer}; it enrolls when this node dials it")),
                 Some(pin) if pin != offer.pin() => return Err(format!("impersonation of configured peer {peer}: presented node {}, configured node {}", offer.node_id, pin.node_id)),
-                Some(_) => {}
+                Some(_) | None => {}
             }
         }
         if let Some(name) = store
@@ -213,9 +212,12 @@ fn check_pin_guarded(
             return Err(format!("identity changed for {peer}: possible impersonation or re-key; run flk peers enroll --reset {peer}{direction}"));
         }
         if save {
-            store
-                .put_pin_from(source, peer, &offer.pin())
-                .map_err(|e| e.to_string())?;
+            if configured_name {
+                store.put_inbound_configured_pin(peer, &offer.pin())
+            } else {
+                store.put_pin_from(source, peer, &offer.pin())
+            }
+            .map_err(|e| e.to_string())?;
         }
         Ok(())
     })

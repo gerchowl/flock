@@ -574,67 +574,120 @@ fn bidirectional_alias_enrollment_inbound_first() {
 }
 
 #[test]
-fn own_key_cannot_claim_a_configured_peer_name_before_or_after_pinning() {
-    let specs = [
-        NodeSpec::new("a.test", "reserved-a", &[]),
-        NodeSpec::new("b.test", "reserved-b", &[]),
-        NodeSpec::new("e.test", "reserved-e", &[]),
-    ];
-    let mut fleet = fleet::spawn("mesh-reserved", &specs);
-    fleet.refuse_edge("a.test", "b.test");
-    add_peer(fleet.node("a.test"), ALIAS_A_TO_B);
-    let response = request(fleet.node("a.test"), "server.reload_config", json!({}));
-    assert!(response.get("error").is_none(), "{response}");
-    rename_node(fleet.node("e.test"), "b-ts.test");
-    add_peer(
-        fleet.node("e.test"),
-        "[[peers]]\nname = \"a.test\"\nssh = \"a.test\"\n",
-    );
-    fleet.node_mut("e.test").restart();
-    let refused = enrollment(fleet.node("e.test"), "a.test", "refused");
-    assert!(refused["reason"].as_str().unwrap().contains(
-        "name b-ts.test belongs to configured peer b-ts.test; it enrolls when this node dials it"
-    ), "{refused}");
-    assert_single_configured_row(fleet.node("a.test"));
+fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
+    for pinned_first in [false, true] {
+        let specs = [
+            NodeSpec::new("a.test", "reserved-a", &[]),
+            NodeSpec::new("b.test", "reserved-b", &[]),
+            NodeSpec::new("e.test", "reserved-e", &[]),
+        ];
+        let mut fleet = fleet::spawn("mesh-reserved", &specs);
+        if !pinned_first {
+            fleet.refuse_edge("a.test", "b.test");
+        }
+        add_peer(fleet.node("a.test"), ALIAS_A_TO_B);
+        let response = request(fleet.node("a.test"), "server.reload_config", json!({}));
+        assert!(response.get("error").is_none(), "{response}");
+        let legitimate =
+            pinned_first.then(|| enrollment(fleet.node("a.test"), "b-ts.test", "pinned"));
+        rename_node(fleet.node("e.test"), "b-ts.test");
+        add_peer(
+            fleet.node("e.test"),
+            "[[peers]]\nname = \"a.test\"\nssh = \"a.test\"\n",
+        );
+        fleet.node_mut("e.test").restart();
+        let attacker_id = identity_id(fleet.node("e.test"));
+        if let Some(pinned) = legitimate {
+            let refused = enrollment(fleet.node("e.test"), "a.test", "refused");
+            let reason = refused["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("impersonation of configured peer b-ts.test"),
+                "{refused}"
+            );
+            assert!(
+                reason.contains(pinned["node_id"].as_str().unwrap()),
+                "{refused}"
+            );
+            assert!(reason.contains(&attacker_id), "{refused}");
+            assert_single_configured_row(fleet.node("a.test"));
+            let inbound = enrollment(fleet.node("a.test"), "unidentified SSH peer", "refused");
+            assert!(inbound["node_id"].is_null());
+        } else {
+            // A caller with SSH access can win the first-contact trust decision.
+            enrollment(fleet.node("e.test"), "a.test", "pinned");
+            let inbound = enrollment(fleet.node("a.test"), "b-ts.test", "pinned");
+            assert_eq!(inbound["node_id"], attacker_id);
+            for source in ["configured", "inbound"] {
+                let preview = request(
+                    fleet.node("a.test"),
+                    "peers.enroll_reset",
+                    json!({"peer":"b-ts.test","source":source,"preview":true}),
+                );
+                assert_eq!(preview["result"]["node_id"], attacker_id, "{preview}");
+            }
+            fleet.allow_edge("a.test", "b.test");
+            fleet.node_mut("a.test").restart();
+            let refused = enrollment(fleet.node("a.test"), "b-ts.test", "refused");
+            assert!(
+                refused["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("identity changed"),
+                "{refused}"
+            );
+        }
+    }
+}
 
-    fleet.allow_edge("a.test", "b.test");
-    fleet.node_mut("a.test").restart();
-    let pinned = enrollment(fleet.node("a.test"), "b-ts.test", "pinned");
-    fleet.node_mut("e.test").restart();
-    let refused = enrollment(fleet.node("e.test"), "a.test", "refused");
-    let reason = refused["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("impersonation of configured peer b-ts.test"),
-        "{refused}"
-    );
-    assert!(
-        reason.contains(pinned["node_id"].as_str().unwrap()),
-        "{refused}"
-    );
-    // Read E's actual identity independently of its untrusted claimed name.
+fn identity_id(node: &Node) -> String {
+    // Derive the identity independently of the node's claimed name.
     let e_id = ["flock", "flock-dev"]
         .into_iter()
         .find_map(|app| {
-            let path = fleet
-                .node("e.test")
-                .home
-                .join("state")
-                .join(app)
-                .join("mesh/identity.json");
+            let path = node.home.join("state").join(app).join("mesh/identity.json");
             std::fs::read_to_string(path).ok()
         })
         .unwrap();
     let e_id: Value = serde_json::from_str(&e_id).unwrap();
     use sha2::{Digest, Sha256};
     let public_key: Vec<u8> = serde_json::from_value(e_id["public_key"].clone()).unwrap();
-    let node_id: String = Sha256::digest(public_key)
+    Sha256::digest(public_key)
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
-    assert!(reason.contains(&node_id), "{refused}");
-    assert_single_configured_row(fleet.node("a.test"));
-    let inbound = enrollment(fleet.node("a.test"), "unidentified SSH peer", "refused");
-    assert!(inbound["node_id"].is_null());
+        .collect()
+}
+
+#[test]
+fn fresh_exact_name_peers_enroll_simultaneously() {
+    let specs = [
+        NodeSpec::new("a.test", "simultaneous-a", &["b.test"]),
+        NodeSpec::new("b.test", "simultaneous-b", &["a.test"]),
+    ];
+    let fleet = fleet::spawn("mesh-simultaneous", &specs);
+    for (local, remote) in [("a.test", "b.test"), ("b.test", "a.test")] {
+        let expected = identity_id(fleet.node(remote));
+        fleet::wait_until(
+            "both exact-name directions enrolled",
+            Duration::from_secs(90),
+            || {
+                let response = request(fleet.node(local), "peers.enrollment", json!({}));
+                let peers = response["result"]["peers"].as_array()?;
+                (peers.len() == 2
+                    && peers.iter().all(|p| {
+                        p["peer"] == remote && p["state"] == "pinned" && p["node_id"] == expected
+                    }))
+                .then_some(())
+            },
+        );
+        for source in ["configured", "inbound"] {
+            let preview = request(
+                fleet.node(local),
+                "peers.enroll_reset",
+                json!({"peer":remote,"source":source,"preview":true}),
+            );
+            assert_eq!(preview["result"]["node_id"], expected, "{preview}");
+        }
+    }
 }
 
 fn assert_single_configured_row(node: &Node) {

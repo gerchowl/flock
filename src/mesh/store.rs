@@ -638,26 +638,37 @@ impl<D: DiskSpace> Store<D> {
     /// Transactionally bind inbound claims and refuse key replacement in
     /// either direction. A configured alias cannot rename an inbound claim.
     pub fn put_pin_from(&mut self, source: PinSource, peer: &str, pin: &IdentityPin) -> Result<()> {
+        self.put_pins(&[source], peer, pin)
+    }
+
+    /// First authenticated inbound contact to a configured name pins both directions atomically.
+    pub fn put_inbound_configured_pin(&mut self, peer: &str, pin: &IdentityPin) -> Result<()> {
+        self.put_pins(&[PinSource::Configured, PinSource::Inbound], peer, pin)
+    }
+
+    fn put_pins(&mut self, sources: &[PinSource], peer: &str, pin: &IdentityPin) -> Result<()> {
         if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
             return Err(Error::InvalidEnvelope);
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let conflict: bool = tx.query_row(
+        for source in sources {
+            let conflict: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM identity_pins WHERE
                 (?1='inbound' AND source='inbound' AND peer!=?2 AND (node_id=?3 OR public_key=?4)) OR
                 (source=?1 AND peer=?2 AND (node_id!=?3 OR public_key!=?4)))",
             params![source.as_str(), peer, pin.node_id, pin.public_key],
             |r| r.get(0),
         )?;
-        if conflict {
-            return Err(Error::IdentityPinConflict);
+            if conflict {
+                return Err(Error::IdentityPinConflict);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO identity_pins VALUES(?1,?2,?3,?4)",
+                params![source.as_str(), peer, pin.node_id, pin.public_key],
+            )?;
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO identity_pins VALUES(?1,?2,?3,?4)",
-            params![source.as_str(), peer, pin.node_id, pin.public_key],
-        )?;
         tx.commit()?;
         Ok(())
     }

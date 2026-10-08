@@ -877,3 +877,77 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
         Err(Error::IdentityPinConflict)
     ));
 }
+
+#[test]
+fn first_contact_both_pins_roll_back_on_inbound_conflict() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let original = IdentityPin {
+        node_id: "original.example".into(),
+        public_key: vec![1; 32],
+    };
+    let replacement = IdentityPin {
+        node_id: "replacement.example".into(),
+        public_key: vec![2; 32],
+    };
+    s.put_pin_from(PinSource::Inbound, "peer.example", &original)
+        .unwrap();
+    assert!(matches!(
+        s.put_inbound_configured_pin("peer.example", &replacement),
+        Err(Error::IdentityPinConflict)
+    ));
+    assert_eq!(s.get_pin("peer.example").unwrap(), None);
+    assert_eq!(
+        s.get_pin_from(PinSource::Inbound, "peer.example").unwrap(),
+        Some(original)
+    );
+}
+
+#[test]
+fn concurrent_first_contact_and_outbound_pins_match_or_refuse() {
+    for matching in [false, true] {
+        let f = Fixture::new();
+        let mut inbound = f.open(0);
+        let mut outbound = f.open(0);
+        let first = IdentityPin {
+            node_id: "first.example".into(),
+            public_key: vec![1; 32],
+        };
+        let second = if matching {
+            first.clone()
+        } else {
+            IdentityPin {
+                node_id: "second.example".into(),
+                public_key: vec![2; 32],
+            }
+        };
+        let barrier = std::sync::Barrier::new(2);
+        let (incoming, outgoing) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                inbound.put_inbound_configured_pin("peer.example", &first)
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                outbound.put_pin("peer.example", &second)
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        if matching {
+            incoming.unwrap();
+            outgoing.unwrap();
+        } else {
+            assert_ne!(incoming.is_ok(), outgoing.is_ok());
+            let error = incoming.err().or(outgoing.err()).unwrap();
+            assert!(matches!(error, Error::IdentityPinConflict));
+        }
+        let s = f.open(1);
+        let configured = s.get_pin("peer.example").unwrap().unwrap();
+        if let Some(claimed) = s.get_pin_from(PinSource::Inbound, "peer.example").unwrap() {
+            assert_eq!(claimed, configured);
+        } else {
+            assert!(!matching);
+            assert_eq!(configured, second);
+        }
+    }
+}
