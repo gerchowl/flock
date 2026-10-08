@@ -245,6 +245,7 @@ pub struct TerminalState {
     pub restart_in_progress: bool,
     pub restart_stopped: bool,
     pub(crate) restart_confirmation_pid: Option<u32>,
+    pub(crate) restart_retry: Option<crate::agent_restart::RestartRetry>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     /// #175 C3: stashed resume plan for a pane the operator (or the
@@ -350,6 +351,7 @@ impl TerminalState {
             restart_in_progress: false,
             restart_stopped: false,
             restart_confirmation_pid: None,
+            restart_retry: None,
             respawn_shell_on_exit: false,
             pending_agent_resume_plan: None,
             hibernated_resume_plan: None,
@@ -1243,6 +1245,7 @@ impl TerminalState {
     /// Invalidate evidence from the old execution while keeping its launch
     /// settings and stable agent/session identities for restart verification.
     pub(crate) fn prepare_restart_resume(&mut self) {
+        self.restart_retry = None;
         self.restart_confirmation_pid = None;
         self.session_ref_hook_confirmed = false;
         self.hook_authority = None;
@@ -1276,6 +1279,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.restart_retry = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -1318,6 +1322,10 @@ impl TerminalState {
         &mut self,
         plan: Option<crate::agent_resume::AgentResumePlan>,
     ) {
+        if plan.is_some() {
+            // A deliberate park supersedes any failed restart's deferred retry.
+            self.restart_retry = None;
+        }
         let flips = self.hibernated_resume_plan.is_some() != plan.is_some();
         self.hibernated_resume_plan = plan;
         if flips {

@@ -263,7 +263,7 @@ async fn restart_api_resumes_same_session_flags_env_and_delivers_continuation() 
 
 #[tokio::test]
 async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing() {
-    let mut rig = rig();
+    let mut rig = rig_with_script("#!/bin/sh\nwhile IFS= read -r line; do exit 0; done\n");
     assert!(request(&mut rig).get("result").is_some());
     idle(&mut rig, Instant::now(), "");
     advance_until_verifying(&mut rig).await;
@@ -272,6 +272,51 @@ async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing(
     assert!(has_phase(&rig, "restart_stuck"));
     assert!(!has_phase(&rig, "restarted"));
     assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
+    assert_live_retry(&mut rig);
+    assert_eq!(
+        rig.app
+            .state
+            .terminals
+            .get(&rig.id)
+            .unwrap()
+            .persisted_agent_session
+            .as_ref()
+            .unwrap()
+            .session_ref
+            .value,
+        "wrong-session"
+    );
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("requester's session restart-session"))));
+    rig.app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .try_send_bytes(bytes::Bytes::from_static(b"exit\r"))
+        .unwrap();
+    wait_for_dead_runtime(&rig).await;
+    while let Ok(event) = rig.app.event_rx.try_recv() {
+        rig.app.handle_internal_event(event);
+    }
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(terminal.restart_retry.is_none());
+    assert_eq!(
+        terminal
+            .persisted_agent_session
+            .as_ref()
+            .unwrap()
+            .session_ref
+            .value,
+        "restart-session"
+    );
+    assert!(terminal
+        .hibernated_resume_plan
+        .as_ref()
+        .unwrap()
+        .argv
+        .contains(&"restart-session".into()));
+    assert_eq!(reported_status(&mut rig), "hibernated");
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
 }
 
 #[tokio::test]
@@ -753,6 +798,7 @@ async fn restart_failed_live_verification_can_retry_after_process_exits() {
     advance_until_verifying(&mut rig).await;
     rig.app.tick_agent_restarts(Instant::now() + TICK);
     assert!(has_phase(&rig, "restart_stuck"));
+    assert_live_retry(&mut rig);
     rig.app
         .terminal_runtimes
         .get(&rig.id)
@@ -764,6 +810,73 @@ async fn restart_failed_live_verification_can_retry_after_process_exits() {
         rig.app.handle_internal_event(event);
     }
     assert!(rig.app.terminal_runtimes.get(&rig.id).is_none());
+    assert!(rig
+        .app
+        .state
+        .terminals
+        .get(&rig.id)
+        .unwrap()
+        .restart_retry
+        .is_none());
+    assert_eq!(reported_status(&mut rig), "hibernated");
     let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
     assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
+}
+
+fn reported_status(rig: &mut Rig) -> serde_json::Value {
+    let response = rig.app.handle_api_request(Request {
+        id: "restart-status".into(),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: rig.pane.clone(),
+        }),
+    });
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert!(value.get("error").is_none(), "{value}");
+    let status = value["result"]["agent"]["agent_status"].clone();
+    assert!(status.is_string(), "missing agent status: {value}");
+    status
+}
+
+fn assert_live_retry(rig: &mut Rig) {
+    assert_ne!(reported_status(rig), "hibernated");
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(!terminal.restart_in_progress);
+    assert!(terminal.hibernated_resume_plan.is_none());
+    assert!(terminal.restart_retry.is_some());
+    assert!(!rig.app.restart_runtime_gone(&rig.id));
+    let response = rig.app.handle_api_request(Request {
+        id: "resume-live-retry".into(),
+        method: Method::AgentResume(crate::api::schema::AgentTarget {
+            target: rig.pane.clone(),
+        }),
+    });
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["error"]["code"], "not_hibernated");
+}
+
+#[tokio::test]
+async fn restart_live_retry_does_not_override_deliberate_hibernation() {
+    let mut rig = rig();
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    report_session(&mut rig, "wrong-session", 1);
+    rig.app.tick_agent_restarts(Instant::now() + TICK);
+    assert_live_retry(&mut rig);
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    rig.app.hibernate_pane(0, pane).unwrap();
+    while let Ok(event) = rig.app.event_rx.try_recv() {
+        rig.app.handle_internal_event(event);
+    }
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(terminal.restart_retry.is_none());
+    assert!(
+        terminal
+            .hibernated_resume_plan
+            .as_ref()
+            .unwrap()
+            .argv
+            .contains(&"wrong-session".into()),
+        "an operator's deliberate park supersedes the deferred restart retry"
+    );
 }

@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_resume::{AgentResumePlan, PersistedAgentSession};
 
+/// A failed restart's requested identity and launch plan, held separately
+/// while the replacement is alive and promoted to hibernation on exit.
+#[derive(Debug, Clone)]
+pub(crate) struct RestartRetry {
+    pub session: PersistedAgentSession,
+    pub plan: AgentResumePlan,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RestartPolicy {

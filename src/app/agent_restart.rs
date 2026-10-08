@@ -271,6 +271,7 @@ impl App {
             },
         );
         if let Some(terminal) = self.state.terminals.get_mut(&id) {
+            terminal.restart_retry = None;
             terminal.restart_in_progress = true;
         }
         Ok((pane, value, stop_only))
@@ -812,8 +813,7 @@ impl App {
                         id,
                         request,
                         "restart_stuck",
-                        "resumed harness reported a different session; continuation withheld; resume plan retained; close the running harness before flk agent resume <pane>"
-                            .into(),
+                        format!("resumed harness reported a different session; continuation withheld; the running session remains live. After it exits, flk agent resume <pane> will retry the requester's session {}", request.session.session_ref.value),
                     );
                     return false;
                 }
@@ -878,7 +878,7 @@ impl App {
                         .map(|r| r.recent_text(20))
                         .unwrap_or_default();
                     self.recover_restart(id, request);
-                    self.report_restart(id, request, "restart_stuck", format!("verification timed out; resume plan retained; close the running harness before flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
+                    self.report_restart(id, request, "restart_stuck", format!("verification timed out; the running harness remains live; retry plan deferred until it exits, then use flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
                     return false;
                 }
                 true
@@ -944,18 +944,31 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn recover_restart(&mut self, id: &TerminalId, request: &RestartRequest) {
-        self.finish_restart_lock(id);
-        if self.restart_runtime_gone(id) {
-            if let Some(runtime) = self.terminal_runtimes.remove(id) {
-                runtime.shutdown();
-            }
+    fn park_restart_retry(&mut self, id: &TerminalId, retry: crate::agent_restart::RestartRetry) {
+        if let Some(runtime) = self.terminal_runtimes.remove(id) {
+            runtime.shutdown();
         }
         if let Some(terminal) = self.state.terminals.get_mut(id) {
-            terminal.set_hibernated_resume_plan(Some(request.plan.clone()));
+            terminal.prepare_restart_resume();
+            terminal.set_persisted_agent_session(retry.session);
+            terminal.set_hibernated_resume_plan(Some(retry.plan));
             terminal.respawn_shell_on_exit = false;
         }
         self.state.mark_session_dirty();
+    }
+
+    fn recover_restart(&mut self, id: &TerminalId, request: &RestartRequest) {
+        self.finish_restart_lock(id);
+        let retry = crate::agent_restart::RestartRetry {
+            session: request.session.clone(),
+            plan: request.plan.clone(),
+        };
+        if self.restart_runtime_gone(id) {
+            self.park_restart_retry(id, retry);
+        } else if let Some(terminal) = self.state.terminals.get_mut(id) {
+            terminal.restart_retry = Some(retry);
+            self.state.mark_session_dirty();
+        }
     }
 
     pub(crate) fn handle_restart_runtime_exit(&mut self, pane: crate::layout::PaneId) -> bool {
@@ -967,6 +980,15 @@ impl App {
             return false;
         }
         let Some(mut request) = self.state.agent_restarts.pending.remove(&id) else {
+            if let Some(retry) = self
+                .state
+                .terminals
+                .get_mut(&id)
+                .and_then(|t| t.restart_retry.take())
+            {
+                self.park_restart_retry(&id, retry);
+                return true;
+            }
             if self
                 .state
                 .terminals

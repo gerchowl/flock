@@ -862,7 +862,11 @@ hook. Without that evidence, Flock refuses before stopping the process.
 A stop failure, missing runtime, failed resume, or verification failure releases
 the restart lock and retains the resume plan. Reports explain how to retry with
 `flk agent resume <target>`; stop any surviving old processes or close a running
-startup dialog first. A resumed process that exits reports its last output.
+startup dialog first. A live replacement retains its normal status: its retry
+plan is held separately and only becomes a hibernation plan after it exits.
+For a session mismatch, the report identifies the requester's original session
+as the retry target; that session becomes the pane's stored identity on exit.
+A resumed process that exits reports its last output.
 
 Pending and verifying requests are cancelled before server handoff. Flock
 reports `restart_cancelled` in the requester's inbox, the pane's notification,
