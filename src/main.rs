@@ -61,6 +61,8 @@ mod kitty_graphics;
 mod layout;
 mod logging;
 mod mcp;
+// Slice 1-B provides custody primitives ahead of runtime integration.
+#[allow(dead_code)]
 mod mesh;
 mod pane;
 mod peer_stream;

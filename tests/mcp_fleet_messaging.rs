@@ -33,7 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use support::fleet::{self, NodeSpec};
+use support::fleet::{self, NodeSpec, HUB_SPOKES};
 
 /// Two nodes that poll EACH OTHER. A one-way chain is enough to send, but a
 /// reply has to resolve the original sender through the replier's own
@@ -42,16 +42,6 @@ use support::fleet::{self, NodeSpec};
 const PAIR_AB: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &["nodeb"]),
     NodeSpec::new("nodeb", "beta", &["nodea"]),
-];
-
-/// Hub and spokes, the fleet's real shape (#410): only `nodeb` carries
-/// `[[peers]]`, and the two spokes carry none — no reverse trust, no N×N keys.
-/// The only way off a spoke is the relay the hub holds INTO it.
-const HUB_SPOKES: &[NodeSpec] = &[
-    // Wide enough that a relayed server row's `via nodeb` is not truncated.
-    NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
-    NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),
-    NodeSpec::new("nodec", "gamma", &[]),
 ];
 
 const GOSSIP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -988,19 +978,7 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
         fleet_row(&listing, &bob.agent_id).map(|_| ())
     });
 
-    let entered = fleet.base.join("message-ssh-entered");
-    let release = fleet.base.join("message-ssh-release");
-    let shim = fleet.base.join("bin/ssh");
-    let original = std::fs::read_to_string(&shim).unwrap();
-    let gate = format!(
-        "case \"$last\" in *'msg send'*) touch '{}'; n=0; while [ ! -e '{}' ] && [ \"$n\" -lt 100 ]; do sleep 0.1; n=$((n+1)); done ;; esac\n",
-        entered.display(), release.display(),
-    );
-    std::fs::write(
-        &shim,
-        original.replace("FLOCK_SOCKET_PATH=", &format!("{gate}FLOCK_SOCKET_PATH=")),
-    )
-    .unwrap();
+    let gate = fleet.gate_message_edge(relay, recipient);
     let target = bob.agent_id.clone();
     let send = thread::spawn(move || {
         alice.call_tool(
@@ -1012,9 +990,7 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
             }),
         )
     });
-    wait_for("SSH message command to enter", GOSSIP_TIMEOUT, || {
-        entered.exists().then_some(())
-    });
+    gate.wait_entered(GOSSIP_TIMEOUT);
 
     let mut socket =
         std::os::unix::net::UnixStream::connect(&fleet.node(relay).api_socket).unwrap();
@@ -1030,7 +1006,7 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
     let mut answer = String::new();
     let result = BufReader::new(socket).read_line(&mut answer);
     // Release even on failure so the test never leaves a held SSH process.
-    std::fs::write(&release, "go").unwrap();
+    gate.release();
     result.expect("workspace.list must complete while the message SSH is held");
     assert_eq!(
         serde_json::from_str::<Value>(&answer).unwrap()["id"],
