@@ -289,11 +289,20 @@ async fn restart_api_grace_expiry_forces_a_busy_agent_and_reports_reason() {
 }
 
 #[tokio::test]
-async fn restart_api_rate_cap_stops_and_focus_cannot_resume() {
+async fn restart_hard_limit_rate_cap_stops_and_focus_cannot_resume() {
     let mut rig = rig();
     rig.app.state.config.session.restart.max_restarts = 0;
-    rig.app.state.config.session.restart.restart_grace_secs = 0;
-    assert!(request(&mut rig).get("result").is_some());
+    let params = AgentRestartParams {
+        target: rig.pane.clone(),
+        reason: "hard_rss_cap".into(),
+        continue_with: None,
+        when: "after_turn".into(),
+    };
+    let response = rig
+        .app
+        .queue_agent_restart_inner(params, Instant::now(), Some("hard_rss_cap".into()))
+        .unwrap();
+    assert!(response.2, "forced rate cap must report stop_only");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !has_phase(&rig, "restart_stopped") {
         rig.app.tick_agent_restarts(Instant::now());
@@ -405,4 +414,356 @@ async fn restart_shutdown_kills_term_resistant_detached_children() {
         !crate::platform::process_exists(child),
         "detached child survived restart"
     );
+}
+
+#[tokio::test]
+async fn restart_explicit_rate_cap_refuses_without_stopping() {
+    let mut rig = rig();
+    let now = Instant::now();
+    let agent = rig
+        .app
+        .state
+        .terminals
+        .get(&rig.id)
+        .unwrap()
+        .agent_id
+        .to_string();
+    rig.app.state.config.session.restart.max_restarts = 1;
+    rig.app
+        .state
+        .agent_restarts
+        .history
+        .insert(agent, vec![now]);
+    let original = rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid();
+    let result = request(&mut rig);
+    assert_eq!(result["error"]["code"], "restart_rate_limited");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("retry_after_secs="));
+    assert!(rig.app.state.agent_restarts.pending.is_empty());
+    assert!(
+        !rig.app
+            .state
+            .terminals
+            .get(&rig.id)
+            .unwrap()
+            .restart_in_progress
+    );
+    assert_eq!(
+        rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn restart_stop_failure_unlocks_and_keeps_retry_plan() {
+    let mut rig = rig();
+    assert!(request(&mut rig).get("result").is_some());
+    let mut request = rig
+        .app
+        .state
+        .agent_restarts
+        .pending
+        .remove(&rig.id)
+        .unwrap();
+    request.phase = Phase::Stopping;
+    rig.app
+        .terminal_runtimes
+        .remove(&rig.id)
+        .unwrap()
+        .shutdown();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rig.app.restarts.shutdowns.insert(rig.id.clone(), rx);
+    tx.send(false).unwrap();
+    assert!(!rig
+        .app
+        .advance_restart(&rig.id, &mut request, Instant::now()));
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(!terminal.restart_in_progress);
+    assert_eq!(
+        terminal.hibernated_resume_plan.as_ref(),
+        Some(&request.plan)
+    );
+    assert!(has_phase(&rig, "restart_stuck"));
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
+}
+
+async fn wait_for_dead_runtime(rig: &Rig) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rig.app.restart_runtime_gone(&rig.id) {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn restart_waiting_agent_exit_cancels_immediately_and_allows_retry() {
+    let mut rig = rig_with_script("#!/bin/sh\nwhile IFS= read -r line; do exit 0; done\n");
+    assert!(request(&mut rig).get("result").is_some());
+    rig.app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .try_send_bytes(bytes::Bytes::from_static(b"exit\r"))
+        .unwrap();
+    wait_for_dead_runtime(&rig).await;
+    while let Ok(event) = rig.app.event_rx.try_recv() {
+        rig.app.handle_internal_event(event);
+    }
+    assert!(has_phase(&rig, "restart_cancelled"));
+    assert!(rig.app.state.agent_restarts.pending.is_empty());
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(!terminal.restart_in_progress);
+    assert!(terminal.hibernated_resume_plan.is_some());
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
+}
+
+#[tokio::test]
+async fn restart_resumed_agent_exit_retains_output_and_retry_plan() {
+    let mut rig = rig_with_script("#!/bin/sh\nif [ \"$1\" = --resume ]; then printf 'No conversation found\\n'; exit 1; fi\nwhile IFS= read -r line; do :; done\n");
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    wait_for_dead_runtime(&rig).await;
+    while let Ok(event) = rig.app.event_rx.try_recv() {
+        rig.app.handle_internal_event(event);
+    }
+    assert!(rig.app.state.agent_restarts.pending.is_empty());
+    let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
+    assert!(!terminal.restart_in_progress);
+    assert!(terminal.hibernated_resume_plan.is_some());
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("No conversation found") && detail.contains("flk agent resume"))));
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
+}
+
+#[tokio::test]
+async fn restart_grace_expiry_waits_for_operator_quiet() {
+    let mut rig = rig();
+    rig.app.state.config.session.restart.restart_grace_secs = 0;
+    rig.app.state.config.session.restart.operator_quiet_ms = 1000;
+    assert!(request(&mut rig).get("result").is_some());
+    let now = Instant::now();
+    rig.app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .test_stamp_operator_input_at(now);
+    idle(&mut rig, now, "human draft");
+    rig.app.tick_agent_restarts(now);
+    assert!(!has_phase(&rig, "restart_stopping"));
+    rig.app.tick_agent_restarts(now + Duration::from_secs(1));
+    assert!(has_phase(&rig, "restart_stopping"));
+}
+
+#[tokio::test]
+async fn restart_handoff_cancels_pending_and_verifying_requests() {
+    for verifying in [false, true] {
+        let mut rig = rig();
+        assert!(request(&mut rig).get("result").is_some());
+        if verifying {
+            idle(&mut rig, Instant::now(), "");
+            advance_until_verifying(&mut rig).await;
+        }
+        rig.app.cancel_agent_restarts_for_handoff().unwrap();
+        assert!(rig.app.state.agent_restarts.pending.is_empty());
+        assert!(
+            !rig.app
+                .state
+                .terminals
+                .get(&rig.id)
+                .unwrap()
+                .restart_in_progress
+        );
+        assert!(has_phase(&rig, "restart_cancelled"));
+        let events = rig.app.event_hub.events_after(0);
+        let mut notifications = super::super::notifications::NotificationLog::default();
+        notifications.seed_from_events(events.iter().map(|(_, event)| event));
+        assert!(notifications
+            .newest_first()
+            .any(|entry| entry.pane_id.as_deref() == Some(&rig.pane)
+                && entry
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.contains("restart_cancelled"))));
+        let mut inbox = super::super::mailboxes::MailboxRegistry::default();
+        inbox.seed_from_events(events.iter().map(|(_, event)| event));
+        assert!(inbox.pop_next(&rig.pane).unwrap().body.contains("handoff"));
+        assert!(rig
+            .app
+            .mailboxes
+            .pop_next(&rig.pane)
+            .unwrap()
+            .body
+            .contains("handoff"));
+        assert!(rig
+            .app
+            .state
+            .terminals
+            .get(&rig.id)
+            .unwrap()
+            .prompt_history
+            .iter()
+            .any(|entry| entry.text.contains("restart_cancelled")));
+        assert!(rig.app.terminal_runtimes.get(&rig.id).is_some());
+    }
+}
+
+#[tokio::test]
+async fn restart_handoff_refuses_during_process_teardown() {
+    let mut rig = rig();
+    assert!(request(&mut rig).get("result").is_some());
+    rig.app
+        .state
+        .agent_restarts
+        .pending
+        .get_mut(&rig.id)
+        .unwrap()
+        .phase = Phase::Stopping;
+    assert_eq!(
+        rig.app
+            .cancel_agent_restarts_for_handoff()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        rig.app
+            .state
+            .terminals
+            .get(&rig.id)
+            .unwrap()
+            .restart_in_progress
+    );
+    assert!(!has_phase(&rig, "restart_cancelled"));
+}
+
+#[tokio::test]
+async fn restart_refuses_harness_without_confirmed_session_hooks() {
+    let mut rig = rig();
+    rig.app
+        .state
+        .terminals
+        .get_mut(&rig.id)
+        .unwrap()
+        .prepare_restart_resume();
+    let original = rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid();
+    assert_eq!(request(&mut rig)["error"]["code"], "restart_unsupported");
+    assert_eq!(
+        rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid(),
+        original
+    );
+    assert!(
+        !rig.app
+            .state
+            .terminals
+            .get(&rig.id)
+            .unwrap()
+            .restart_in_progress
+    );
+}
+
+#[tokio::test]
+async fn restart_grace_after_completed_turn_reports_idle_grace() {
+    let mut rig = rig();
+    rig.app.state.config.session.restart.restart_grace_secs = 0;
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    report_session(&mut rig, "restart-session", 1);
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "");
+    rig.app.tick_agent_restarts(now);
+    let message = rig.app.mailboxes.pop_next(&rig.pane).unwrap();
+    assert!(message
+        .body
+        .contains("force-restarted after the idle grace"));
+    assert!(!message.body.contains("force-restarted mid-turn"));
+}
+
+#[tokio::test]
+async fn restart_lost_process_report_excludes_harness_and_mcp_subtrees() {
+    let mut rig = rig_with_script("#!/bin/sh\npython3 -c 'import os,time;open(\"mcp.pid\",\"w\").write(str(os.getpid()));time.sleep(100)' mcp &\n/bin/sh -c 'echo $$ > background.pid; sleep 100' &\nwhile IFS= read -r line; do :; done\n");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mcp, background) = loop {
+        if let (Ok(mcp), Ok(background)) = (
+            std::fs::read_to_string(rig.directory.join("mcp.pid")),
+            std::fs::read_to_string(rig.directory.join("background.pid")),
+        ) {
+            if let (Ok(mcp), Ok(background)) =
+                (mcp.trim().parse::<u32>(), background.trim().parse::<u32>())
+            {
+                break (mcp, background);
+            }
+        }
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    rig.app.sample_restart_vitals(Instant::now());
+    let vitals = rig.app.restarts.samples.get(&rig.id).unwrap();
+    let root = rig
+        .app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .child_pid()
+        .unwrap();
+    assert!(
+        vitals.pids.contains(&root)
+            && vitals.pids.contains(&mcp)
+            && vitals.pids.contains(&background),
+        "filtering loss reports must not shrink kill scope"
+    );
+    let losses = vitals.processes.join(", ");
+    assert!(!losses.contains(&format!("pid {root})")));
+    assert!(!losses.contains(&format!("pid {mcp})")));
+    assert!(losses.contains(&format!("pid {background})")));
+    assert!(request(&mut rig).get("result").is_some());
+    let mut request = rig
+        .app
+        .state
+        .agent_restarts
+        .pending
+        .remove(&rig.id)
+        .unwrap();
+    request.lost = rig
+        .app
+        .restarts
+        .samples
+        .get(&rig.id)
+        .unwrap()
+        .processes
+        .clone();
+    request.lost.push("fixture background watcher".into());
+    rig.app
+        .report_restart(&rig.id, &request, "restarted", "verified".into());
+    rig.app.drain_pending_ui_events();
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::NotificationFiled { body: Some(body), .. } if body.contains("Lost background") && body.contains("fixture background watcher") && body.contains(&format!("pid {background})")))));
+}
+
+#[tokio::test]
+async fn restart_failed_live_verification_can_retry_after_process_exits() {
+    let mut rig = rig_with_script("#!/bin/sh\nwhile IFS= read -r line; do exit 0; done\n");
+    rig.app.state.config.session.restart.verify_timeout_secs = 0;
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    rig.app.tick_agent_restarts(Instant::now() + TICK);
+    assert!(has_phase(&rig, "restart_stuck"));
+    rig.app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .try_send_bytes(bytes::Bytes::from_static(b"exit\r"))
+        .unwrap();
+    wait_for_dead_runtime(&rig).await;
+    while let Ok(event) = rig.app.event_rx.try_recv() {
+        rig.app.handle_internal_event(event);
+    }
+    assert!(rig.app.terminal_runtimes.get(&rig.id).is_none());
+    let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
 }

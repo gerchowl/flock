@@ -244,7 +244,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_agent_restart",
-            description: "Ask flock to stop and resume the same agent session after your turn ends. Returns immediately: finish this turn normally. Preserves the original launch flags and environment. Flock verifies the resumed session before queuing continue_with (default: continue your task). A grace timeout may force the restart; restart loops are stopped. Unknown startup dialogs need the operator.",
+            description: "Ask flock to stop and resume YOUR OWN agent session after your turn ends. Returns immediately: finish this turn normally. Preserves the original launch flags and environment. Flock verifies the resumed session before queuing continue_with (default: continue your task). A grace timeout may force the restart; explicit requests at the rate cap are refused. Unknown startup dialogs need the operator.",
             input_schema: schema_agent_restart,
             build: build_agent_restart,
         },
@@ -1043,7 +1043,7 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
 
 fn schema_agent_restart() -> Value {
     json!({"type": "object", "properties": {
-        "target": {"type": "string", "default": "self"},
+        "target": {"type": "string", "enum": ["self"], "default": "self"},
         "reason": {"type": "string", "minLength": 1, "maxLength": 1024},
         "continue_with": {"type": "string", "minLength": 1, "maxLength": 16384},
         "when": {"type": "string", "enum": ["after_turn"], "default": "after_turn"}
@@ -1053,6 +1053,11 @@ fn schema_agent_restart() -> Value {
 fn build_agent_restart(args: Value) -> Result<Method, McpError> {
     let params: crate::api::schema::AgentRestartParams =
         serde_json::from_value(args).map_err(|err| McpError::invalid_params(err.to_string()))?;
+    if params.target != "self" {
+        return Err(McpError::invalid_params(
+            "MCP agent restart is self-only; arbitrary targets require the CLI",
+        ));
+    }
     if params.reason.trim().is_empty()
         || params.reason.len() > 1024
         || params.reason.chars().any(char::is_control)
@@ -2077,6 +2082,7 @@ mod restart_tests {
         assert!(params.continue_with.is_none());
         for args in [
             json!({"reason": ""}),
+            json!({"reason":"reload", "target":"another-agent"}),
             json!({"reason":"reload", "when":"now"}),
             json!({"reason":"reload", "text":"/exit"}),
             json!({"reason":"reload", "continue_with":"/exit"}),

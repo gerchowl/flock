@@ -2294,6 +2294,8 @@ pub enum ResponseResult {
     AgentRestartQueued {
         pane_id: String,
         session: String,
+        #[serde(default)]
+        stop_only: bool,
     },
     AgentHistory {
         history: AgentHistoryResult,
@@ -3230,6 +3232,8 @@ pub enum EventData {
         session: String,
         reason: String,
         forced: bool,
+        #[serde(default)]
+        stop_only: bool,
         rss_before: u64,
         rss_after: Option<u64>,
         detail: String,

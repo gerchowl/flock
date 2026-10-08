@@ -843,17 +843,40 @@ can exceed 100% on multiple cores. Host-floor recovery stops the heaviest agent
 first and waits for its shutdown before choosing another.
 
 A graceful restart requires an empty, freshly observed idle prompt and operator
-quiet. Once a hard limit or grace expiry is reached, Flock stops through the
-runtime, sends SIGTERM to the tree, then SIGKILL after `kill_grace_secs`, and
-waits for termination before launching the replacement. The default cap allows
-three restarts per agent in thirty minutes within the running server; at the
-cap, the pane stays stopped until an explicit `flk agent resume <target>`.
+quiet. Grace expiry still waits for operator quiet; hard resource limits may
+interrupt a busy process. Flock sends SIGTERM to the tree, then SIGKILL after
+`kill_grace_secs`, and waits for termination before launching the replacement.
+The default cap allows three restarts per agent in thirty minutes within the
+running server. Explicit requests at the cap return `restart_rate_limited`
+with `retry_after_secs` and leave the agent running. Only a forced hard-limit
+restart at the cap stops without resuming; its report includes `stop_only: true`.
+The pane can then be recovered with explicit `flk agent resume <target>`.
+
+Agents with background shells may not reach settled idle even after their turn
+ends ([known limitation #697](https://github.com/gerchowl/flock/issues/697)).
+When the grace deadline forces that case, the continuation says the restart
+happened after the idle grace, rather than claiming an interrupted turn.
+Restart requests require a supported harness and a confirmed session-reporting
+hook. Without that evidence, Flock refuses before stopping the process.
+
+A stop failure, missing runtime, failed resume, or verification failure releases
+the restart lock and retains the resume plan. Reports explain how to retry with
+`flk agent resume <target>`; stop any surviving old processes or close a running
+startup dialog first. A resumed process that exits reports its last output.
+
+Pending and verifying requests are cancelled before server handoff. Flock
+reports `restart_cancelled` in the requester's inbox, the pane's notification,
+and its recap panel; the notification and inbox report survive the handoff.
+Request a new restart after handoff if it is still needed. A handoff attempted
+while a restart's process tree is being torn down is refused until teardown
+finishes, so the new server cannot race an old reaper.
 
 Flock checks Claude's last Stop-hook reply against its transcript, opencode's
 completed final database row, or Codex's latest persisted assistant message. It
 waits up to `flush_wait_ms`; an unavailable or unconfirmed store is disclosed in
 the continuation. Background tasks reported by the last Claude Stop hook and
-snapshotted process names/PIDs are included so the resumed agent can recreate
+snapshotted background process names/PIDs are included in agent and supervisor
+reports, excluding the harness itself and MCP server descendants, so it can recreate
 what it still needs. Other harnesses without a flush reader get the same warning.
 
 The Claude development-channel warning recorded in ADR-0019 may receive Enter

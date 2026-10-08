@@ -262,11 +262,18 @@ Omit `--continue-with` to receive “You restarted yourself for: <reason>. Conti
 your task.” Use `--continue-with @FILE` for a file containing one line of plain
 instructions, at most 16 KiB. A duplicate pending restart is refused.
 
-A configured hard limit or the grace deadline can force a restart mid-turn.
-The continuation warns about potentially incomplete tools, unconfirmed transcript
+MCP restart requests are self-only. A configured hard limit can force a restart
+mid-turn; grace expiry still waits for operator quiet and identifies completed
+turns that could not reach settled idle because of background activity. The
+continuation warns about potentially incomplete tools, unconfirmed transcript
 flushes and stopped background tasks/processes. Verify those before continuing.
-Unknown startup dialogs need the operator. A restart loop stops at the configured
-cap; an explicit `flk agent resume <target>` releases that stop.
+Unknown startup dialogs need the operator. Explicit requests at the configured
+cap are refused with `restart_rate_limited` and a retry-after, leaving you running.
+Only forced hard-limit loops stop without resuming; their reports say
+`stop_only: true`. An explicit `flk agent resume <target>` releases that stop.
+Failures retain a retry plan and release the restart lock. Server handoff cancels
+pending/verifying requests and reports it in your inbox and pane notification;
+request a new restart after handoff if it is still needed.
 
 ## compact your own context and carry on
 

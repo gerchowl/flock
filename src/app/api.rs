@@ -600,6 +600,11 @@ impl App {
                 self.render_notify.notify_one();
                 return;
             }
+            if self.handle_restart_runtime_exit(*pane_id) {
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+                return;
+            }
             match self.runtime_exit_action(*pane_id) {
                 RuntimeExitAction::RespawnShell => {
                     if self.respawn_shell_for_launch_pane(*pane_id) {

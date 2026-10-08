@@ -391,7 +391,7 @@ An agent can ask Flock to restart its own process without changing conversations
 flk agent restart self --reason "reload MCP configuration" --continue-with "finish the assigned task"
 ```
 
-Over MCP, call `flock_agent_restart` with `reason`, optional `continue_with`,
+Over MCP, call the self-only `flock_agent_restart` with `reason`, optional `continue_with`,
 and `when: "after_turn"`. Both forms return immediately; finish the turn so
 Flock can stop at a settled idle boundary. The replacement retains the native
 session, original launch flags and profile environment, cwd, agent name, and
@@ -401,5 +401,8 @@ prompt before queuing the continuation through the inbox wake path.
 A grace deadline or configured resource limit may force the restart. Its first
 message warns about incomplete tools, unconfirmed transcript flushes, and lost
 background tasks/processes. Unknown startup dialogs require the operator.
+Failures retain a resume plan and release the restart lock so an operator can
+retry with `flk agent resume <target>`. Explicit rate-limited requests leave the
+agent running. Pending restarts are cancelled and reported during server handoff.
 Operator notifications, durable lifecycle events, and messages to the spawning
 supervisor report the result. See [restart configuration](/docs/preview/configuration/#agent-restarts).

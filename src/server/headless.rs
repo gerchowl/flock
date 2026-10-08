@@ -986,6 +986,10 @@ impl HeadlessServer {
             ).into());
         }
 
+        if let Err(err) = self.app.cancel_agent_restarts_for_handoff() {
+            self.rollback_handoff_before_commit(&socket_path, &[]);
+            return Err(err.into());
+        }
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);

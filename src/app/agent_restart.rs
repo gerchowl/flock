@@ -39,6 +39,8 @@ struct RestartRequest {
     flushed: bool,
     answered_dialog: bool,
     stop_only: bool,
+    grace_after_turn: bool,
+    requester: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +115,16 @@ impl App {
         &mut self,
         params: AgentRestartParams,
         now: Instant,
-    ) -> Result<(String, String), ErrorBody> {
+    ) -> Result<(String, String, bool), ErrorBody> {
+        self.queue_agent_restart_inner(params, now, None)
+    }
+
+    fn queue_agent_restart_inner(
+        &mut self,
+        params: AgentRestartParams,
+        now: Instant,
+        forced: Option<String>,
+    ) -> Result<(String, String, bool), ErrorBody> {
         let refuse = |code: &str, message: String| ErrorBody {
             code: code.into(),
             message,
@@ -191,6 +202,13 @@ impl App {
                 "agent has no stored native session".into(),
             )
         })?;
+        if !matches!(
+            session.agent.as_str(),
+            "claude" | "codex" | "opencode" | "copilot" | "pi" | "hermes"
+        ) || !terminal.restart_session_confirmed()
+        {
+            return Err(refuse("restart_unsupported", "restart requires a supported harness with live session-reporting hooks; no confirmed session hook is available".into()));
+        }
         let plan = resume_launch(
             &session,
             terminal.launch_argv.as_deref().unwrap_or_default(),
@@ -208,14 +226,27 @@ impl App {
         {
             return Err(refuse("invalid_params", "continue_with must be one line of plain instructions, at most 16 KiB, and cannot start with / or !".into()));
         }
-        // A refused loop is stopped on the same out-of-band teardown seam.
-        // The response is still immediate, so the caller can finish its tool.
         let agent = terminal.agent_id.to_string();
-        let stop_only = rate_limited(
-            self.state.agent_restarts.history.entry(agent).or_default(),
-            now,
-            &policy,
-        );
+        let requester = self
+            .parse_pane_id_or_peer("", self.current_api_peer_pid)
+            .and_then(|(ws, pane)| self.state.workspaces[ws].terminal_id(pane))
+            .and_then(|id| self.state.terminals.get(id))
+            .map(|t| t.agent_id.to_string());
+        let history = self.state.agent_restarts.history.entry(agent).or_default();
+        let stop_only = rate_limited(history, now, &policy);
+        if stop_only && forced.is_none() {
+            let retry_after = history
+                .iter()
+                .min()
+                .map(|at| {
+                    let wait = Duration::from_secs(policy.window_secs)
+                        .saturating_sub(now.saturating_duration_since(*at));
+                    wait.as_secs()
+                        .saturating_add(u64::from(wait.subsec_nanos() != 0))
+                })
+                .unwrap_or(policy.window_secs);
+            return Err(refuse("restart_rate_limited", format!("restart rate limit reached; retry_after_secs={retry_after}; max_restarts={} (zero disables restarts)", policy.max_restarts)));
+        }
         let value = session.session_ref.value.clone();
         self.state.agent_restarts.pending.insert(
             id.clone(),
@@ -227,7 +258,7 @@ impl App {
                 requested_at: now,
                 requested_ms: super::notifications::now_ms(),
                 phase: Phase::Waiting,
-                forced: None,
+                forced,
                 old_pid: None,
                 rss_before: 0,
                 lost: Vec::new(),
@@ -235,12 +266,14 @@ impl App {
                 flushed: false,
                 answered_dialog: false,
                 stop_only,
+                grace_after_turn: false,
+                requester,
             },
         );
         if let Some(terminal) = self.state.terminals.get_mut(&id) {
             terminal.restart_in_progress = true;
         }
-        Ok((pane, value))
+        Ok((pane, value, stop_only))
     }
 
     pub(crate) fn tick_agent_restarts(&mut self, now: Instant) -> bool {
@@ -317,7 +350,8 @@ impl App {
                     continue_with: None,
                     when: "after_turn".into(),
                 };
-                if let Err(err) = self.queue_agent_restart(params, now) {
+                if let Err(err) = self.queue_agent_restart_inner(params, now, Some(reason.clone()))
+                {
                     if self.restarts.refusals.get(&id) != Some(&err.code) {
                         crate::logging::agent_restart_refused(&id.to_string(), &err.code);
                         self.restarts.refusals.insert(id.clone(), err.code);
@@ -407,7 +441,8 @@ impl App {
             true,
             sysinfo::ProcessRefreshKind::nothing()
                 .with_memory()
-                .with_cpu(),
+                .with_cpu()
+                .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
         );
         self.restarts.system.refresh_memory();
         let mut samples = HashMap::new();
@@ -447,7 +482,37 @@ impl App {
                 if let Some(process) = self.restarts.system.process(sysinfo::Pid::from_u32(*pid)) {
                     rss = rss.saturating_add(process.memory());
                     cpu += process.cpu_usage();
-                    processes.push(format!("{} (pid {pid})", process.name().to_string_lossy()));
+                    let mut ancestor = Some(*pid);
+                    let mut mcp = false;
+                    while let Some(parent) = ancestor {
+                        if parent == root {
+                            break;
+                        }
+                        let Some(node) =
+                            self.restarts.system.process(sysinfo::Pid::from_u32(parent))
+                        else {
+                            break;
+                        };
+                        let args = node
+                            .cmd()
+                            .iter()
+                            .map(|arg| arg.to_string_lossy())
+                            .collect::<Vec<_>>();
+                        if args.iter().any(|arg| {
+                            arg == "mcp" || arg.contains("mcp-server") || arg.contains("/mcp/")
+                        }) {
+                            mcp = true;
+                            break;
+                        }
+                        ancestor = node.parent().map(|p| p.as_u32());
+                    }
+                    if *pid != root
+                        && !mcp
+                        && crate::detect::identify_agent(&process.name().to_string_lossy())
+                            .is_none()
+                    {
+                        processes.push(format!("{} (pid {pid})", process.name().to_string_lossy()));
+                    }
                 }
             }
             let output = fingerprint(&runtime.recent_text(100));
@@ -527,11 +592,17 @@ impl App {
     ) -> bool {
         let Some((_ws_idx, pane_id)) = self.restart_location(id) else {
             self.restarts.shutdowns.remove(id);
+            self.recover_restart(id, request);
             return false;
         };
         let policy = self.restart_policy(id);
         match request.phase {
             Phase::Waiting => {
+                if self.restart_runtime_gone(id) {
+                    self.recover_restart(id, request);
+                    self.report_restart(id, request, "restart_cancelled", "agent exited before stop; resume plan retained; retry with flk agent resume <pane>".into());
+                    return false;
+                }
                 if !policy.enabled {
                     self.finish_restart_lock(id);
                     self.report_restart(
@@ -558,6 +629,12 @@ impl App {
                 if now.saturating_duration_since(request.requested_at)
                     >= Duration::from_secs(policy.restart_grace_secs)
                 {
+                    if request.forced.is_none() {
+                        request.grace_after_turn =
+                            self.state.terminals.get(id).is_some_and(|t| {
+                                t.restart_idle_observed_since(request.requested_at)
+                            }) || self.restart_transcript_flushed(request);
+                    }
                     request.forced.get_or_insert_with(|| {
                         format!(
                             "restart_grace: {} seconds expired",
@@ -570,8 +647,32 @@ impl App {
                 {
                     return true;
                 }
+                if request
+                    .forced
+                    .as_ref()
+                    .is_some_and(|reason| reason.starts_with("restart_grace:"))
+                    && self.terminal_runtimes.get(id).is_some_and(|runtime| {
+                        runtime.last_operator_input_at().is_some_and(|at| {
+                            now.saturating_duration_since(at)
+                                < Duration::from_millis(policy.operator_quiet_ms)
+                        })
+                    })
+                {
+                    return true;
+                }
                 let start = *request.flush_started.get_or_insert(now);
                 request.flushed = self.restart_transcript_flushed(request);
+                if request
+                    .forced
+                    .as_ref()
+                    .is_some_and(|reason| reason.starts_with("restart_grace:"))
+                {
+                    request.grace_after_turn |=
+                        request.flushed
+                            || self.state.terminals.get(id).is_some_and(|t| {
+                                t.restart_idle_observed_since(request.requested_at)
+                            });
+                }
                 if !request.flushed
                     && now.saturating_duration_since(start)
                         < Duration::from_millis(policy.flush_wait_ms)
@@ -579,12 +680,8 @@ impl App {
                     return true;
                 }
                 let Some(runtime) = self.terminal_runtimes.remove(id) else {
-                    self.report_restart(
-                        id,
-                        request,
-                        "restart_stuck",
-                        "runtime disappeared before stop".into(),
-                    );
+                    self.recover_restart(id, request);
+                    self.report_restart(id, request, "restart_cancelled", "runtime disappeared before stop; resume plan retained; retry with flk agent resume <pane>".into());
                     return false;
                 };
                 request.old_pid = runtime.child_pid();
@@ -639,12 +736,8 @@ impl App {
                     Some(Ok(true)) => {}
                     _ => {
                         self.restarts.shutdowns.remove(id);
-                        self.report_restart(
-                            id,
-                            request,
-                            "restart_stuck",
-                            "process tree did not stop; resume withheld".into(),
-                        );
+                        self.recover_restart(id, request);
+                        self.report_restart(id, request, "restart_stuck", "process tree did not stop; resume plan retained and restart lock released; stop remaining processes before retrying with flk agent resume <pane>".into());
                         return false;
                     }
                 }
@@ -670,7 +763,15 @@ impl App {
                     return false;
                 }
                 if let Err(reason) = self.resume_restart(id, pane_id, &request.plan) {
-                    self.report_restart(id, request, "restart_stuck", reason);
+                    self.recover_restart(id, request);
+                    self.report_restart(
+                        id,
+                        request,
+                        "restart_stuck",
+                        format!(
+                            "{reason}; resume plan retained; retry with flk agent resume <pane>"
+                        ),
+                    );
                     return false;
                 }
                 if let Some(terminal) = self.state.terminals.get_mut(id) {
@@ -686,6 +787,12 @@ impl App {
                 true
             }
             Phase::Verifying(started) => {
+                if self.restart_runtime_gone(id) {
+                    let output = self.restart_last_output(id);
+                    self.recover_restart(id, request);
+                    self.report_restart(id, request, "restart_stuck", format!("resumed process exited; resume plan retained; retry with flk agent resume <pane>. Last output: {output}"));
+                    return false;
+                }
                 let new_pid = self.terminal_runtimes.get(id).and_then(|r| r.child_pid());
                 let same = self.state.terminals.get(id).is_some_and(|t| {
                     t.restart_confirmation_pid == new_pid
@@ -700,12 +807,12 @@ impl App {
                         && t.persisted_agent_session.as_ref() != Some(&request.session)
                 });
                 if different {
-                    self.finish_restart_lock(id);
+                    self.recover_restart(id, request);
                     self.report_restart(
                         id,
                         request,
                         "restart_stuck",
-                        "resumed harness reported a different session; continuation withheld"
+                        "resumed harness reported a different session; continuation withheld; resume plan retained; close the running harness before flk agent resume <pane>"
                             .into(),
                     );
                     return false;
@@ -730,7 +837,11 @@ impl App {
                             })
                         })
                         .unwrap_or_else(|| "unknown; the harness did not report it".into());
-                        body = format!("You were force-restarted mid-turn (reason: {limit}). Your last tool call ({tool}) may be incomplete; verify the working-tree and process state before continuing. {body}");
+                        if request.grace_after_turn {
+                            body = format!("You were force-restarted after the idle grace (reason: {limit}); your turn had ended but background activity prevented settled idle. Verify background tasks before continuing. {body}");
+                        } else {
+                            body = format!("You were force-restarted mid-turn (reason: {limit}). Your last tool call ({tool}) may be incomplete; verify the working-tree and process state before continuing. {body}");
+                        }
                     }
                     if !request.flushed {
                         body.push_str(" The last turn could not be confirmed flushed before stop; verify the transcript and working-tree state.");
@@ -766,13 +877,8 @@ impl App {
                         .get(id)
                         .map(|r| r.recent_text(20))
                         .unwrap_or_default();
-                    self.finish_restart_lock(id);
-                    self.report_restart(
-                        id,
-                        request,
-                        "restart_stuck",
-                        screen.chars().take(1024).collect(),
-                    );
+                    self.recover_restart(id, request);
+                    self.report_restart(id, request, "restart_stuck", format!("verification timed out; resume plan retained; close the running harness before flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
                     return false;
                 }
                 true
@@ -823,6 +929,96 @@ impl App {
         Ok(())
     }
 
+    fn restart_runtime_gone(&self, id: &TerminalId) -> bool {
+        self.terminal_runtimes.get(id).is_none_or(|runtime| {
+            runtime
+                .child_exit()
+                .is_some_and(crate::pane::ChildExit::is_reaped)
+        })
+    }
+
+    fn restart_last_output(&self, id: &TerminalId) -> String {
+        self.terminal_runtimes
+            .get(id)
+            .map(|runtime| runtime.recent_text(100).chars().take(4096).collect())
+            .unwrap_or_default()
+    }
+
+    fn recover_restart(&mut self, id: &TerminalId, request: &RestartRequest) {
+        self.finish_restart_lock(id);
+        if self.restart_runtime_gone(id) {
+            if let Some(runtime) = self.terminal_runtimes.remove(id) {
+                runtime.shutdown();
+            }
+        }
+        if let Some(terminal) = self.state.terminals.get_mut(id) {
+            terminal.set_hibernated_resume_plan(Some(request.plan.clone()));
+            terminal.respawn_shell_on_exit = false;
+        }
+        self.state.mark_session_dirty();
+    }
+
+    pub(crate) fn handle_restart_runtime_exit(&mut self, pane: crate::layout::PaneId) -> bool {
+        let Some((_, state)) = self.find_pane(pane) else {
+            return false;
+        };
+        let id = state.attached_terminal_id.clone();
+        if !self.restart_runtime_gone(&id) {
+            return false;
+        }
+        let Some(mut request) = self.state.agent_restarts.pending.remove(&id) else {
+            if self
+                .state
+                .terminals
+                .get(&id)
+                .is_some_and(|t| t.hibernated_resume_plan.is_some())
+            {
+                if let Some(runtime) = self.terminal_runtimes.remove(&id) {
+                    runtime.shutdown();
+                }
+                return true;
+            }
+            return false;
+        };
+        if request.phase == Phase::Stopping {
+            self.state.agent_restarts.pending.insert(id, request);
+            return true;
+        }
+        self.advance_restart(&id, &mut request, Instant::now());
+        true
+    }
+
+    /// Cancellation is durable before snapshotting. Do not transfer a tree
+    /// while its asynchronous reaper is still sending signals.
+    pub(crate) fn cancel_agent_restarts_for_handoff(&mut self) -> std::io::Result<()> {
+        if self
+            .state
+            .agent_restarts
+            .pending
+            .values()
+            .any(|r| r.phase == Phase::Stopping)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "agent restart process teardown is in progress; retry handoff after it finishes",
+            ));
+        }
+        let pending = std::mem::take(&mut self.state.agent_restarts.pending);
+        for (id, request) in pending {
+            self.finish_restart_lock(&id);
+            if self.restart_runtime_gone(&id) {
+                self.recover_restart(&id, &request);
+            }
+            let detail = "server handoff cancelled the restart; continuation was not delivered; request agent.restart again after handoff".to_string();
+            self.report_restart(&id, &request, "restart_cancelled", detail.clone());
+            if let Some(terminal) = self.state.terminals.get_mut(&id) {
+                terminal.record_recap(format!("restart_cancelled: {detail}"));
+            }
+        }
+        self.drain_pending_ui_events();
+        Ok(())
+    }
+
     fn finish_restart_lock(&mut self, id: &TerminalId) {
         if let Some(terminal) = self.state.terminals.get_mut(id) {
             terminal.restart_in_progress = false;
@@ -857,13 +1053,17 @@ impl App {
     }
 
     fn restart_message_to(&mut self, agent: String, body: String) {
+        self.restart_message_with_intent(agent, body, MsgIntent::NeedsReply);
+    }
+
+    fn restart_message_with_intent(&mut self, agent: String, body: String, intent: MsgIntent) {
         let peer = self.current_api_peer_pid.take();
         let response = self.send_message(
             "server:restart".into(),
             MsgSendParams {
                 to: MessageTarget::Agent { agent },
                 body,
-                intent: MsgIntent::NeedsReply,
+                intent,
                 correlation_id: None,
                 in_reply_to: None,
                 from_agent: None,
@@ -917,6 +1117,7 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| request.reason.clone()),
                 forced: request.forced.is_some(),
+                stop_only: request.stop_only,
                 rss_before: request.rss_before,
                 rss_after,
                 detail: detail.clone(),
@@ -925,7 +1126,7 @@ impl App {
         if phase == "restart_stopping" && request.forced.is_none() && !request.stop_only {
             return;
         }
-        let summary = format!(
+        let mut summary = format!(
             "{phase}: {agent_id}, session {}, pid {:?} → {:?}, RSS {} → {:?}, reason {}: {detail}",
             request.session.session_ref.value,
             request.old_pid,
@@ -934,6 +1135,17 @@ impl App {
             rss_after,
             request.forced.as_deref().unwrap_or(&request.reason)
         );
+        if !request.lost.is_empty() {
+            summary.push_str(&format!(
+                " Lost background tasks/processes: {}",
+                request
+                    .lost
+                    .join(", ")
+                    .chars()
+                    .take(2048)
+                    .collect::<String>()
+            ));
+        }
         self.state
             .file_notification(super::notifications::NotificationEntry {
                 id: super::notifications::mint_notification_id(),
@@ -951,6 +1163,13 @@ impl App {
                 filed_at_ms: super::notifications::now_ms(),
                 seen: false,
             });
+        if matches!(phase, "restart_cancelled" | "restart_stuck") {
+            self.restart_message_with_intent(
+                request.requester.clone().unwrap_or(agent_id),
+                summary.clone(),
+                MsgIntent::Fyi,
+            );
+        }
         if let Some(parent) = parent {
             self.restart_message_to(parent, summary);
         }

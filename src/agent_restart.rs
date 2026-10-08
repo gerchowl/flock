@@ -196,6 +196,14 @@ pub(crate) fn resume_launch(
             break;
         }
         if matches!(arg.as_str(), "--resume" | "--session" | "--session-id") {
+            if launch
+                .get(index + 1)
+                .is_none_or(|value| value.starts_with('-'))
+            {
+                return Err(format!(
+                    "cannot safely preserve {arg}: session value is missing or is another flag"
+                ));
+            }
             index += 2;
             continue;
         }
@@ -417,6 +425,16 @@ mod tests {
         )
         .is_err());
         assert!(resume_launch(&session, &["wrapper".into()]).is_err());
+        assert!(resume_launch(
+            &session,
+            &[
+                "claude".into(),
+                "--resume".into(),
+                "--model".into(),
+                "x".into()
+            ]
+        )
+        .is_err());
     }
 
     #[test]

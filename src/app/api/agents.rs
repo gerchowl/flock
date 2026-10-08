@@ -528,9 +528,14 @@ impl App {
         params: crate::api::schema::AgentRestartParams,
     ) -> String {
         match self.queue_agent_restart(params, std::time::Instant::now()) {
-            Ok((pane_id, session)) => {
-                encode_success(id, ResponseResult::AgentRestartQueued { pane_id, session })
-            }
+            Ok((pane_id, session, stop_only)) => encode_success(
+                id,
+                ResponseResult::AgentRestartQueued {
+                    pane_id,
+                    session,
+                    stop_only,
+                },
+            ),
             Err(err) => encode_error_body(id, err),
         }
     }
