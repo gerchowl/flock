@@ -1098,11 +1098,20 @@ fn agent_methods_round_trip_over_socket() {
     let sent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok\n"}}}}"#,
+            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok"}}}}"#,
             terminal_id
         ),
     );
     assert_eq!(sent["result"]["type"], "ok");
+    let enter = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "agent_enter", "method": "pane.send_keys",
+            "params": {"pane_id": pane_id, "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert_eq!(enter["result"]["type"], "ok");
 
     let tab_created = send_request(
         &socket_path,
@@ -2401,10 +2410,10 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     cleanup_spawned_flock(child, base);
 }
 
-/// Socket -> PTY -> fake composer: raw writes stay raw, submission is a
+/// Socket -> PTY -> fake composer: text uses negotiated paste, submission is a
 /// separate negotiated key after the paste has settled.
 #[test]
-fn agent_send_submit_over_socket_and_cli_preserves_raw_bytes() {
+fn agent_send_and_pane_send_text_use_bracketed_paste() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = test_lock();
@@ -2478,14 +2487,14 @@ with log.open('w') as out:
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let raw = send_request(
+    let pasted = send_request(
         &socket_path,
         &serde_json::json!({
-            "id": "raw", "method": "agent.send", "params": {"target": pane, "text": "raw"}
+            "id": "paste", "method": "agent.send", "params": {"target": pane, "text": "Ship it!\nworld!"}
         })
         .to_string(),
     );
-    assert_eq!(raw["result"]["type"], "ok");
+    assert_eq!(pasted["result"]["type"], "ok");
     let read_log = || -> Vec<serde_json::Value> {
         fs::read_to_string(&log)
             .unwrap_or_default()
@@ -2510,7 +2519,11 @@ with log.open('w') as out:
             })
             .collect()
     };
-    assert_eq!(bytes(&read_log()), b"raw");
+    assert_eq!(bytes(&read_log()), b"\x1b[200~Ship it!\nworld!\x1b[201~");
+    let plain_cli = run_flk(&socket_path, &["agent", "send", pane, "cli!"]);
+    assert!(plain_cli.status.success());
+    let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
+    assert!(pane_cli.status.success());
     let submitted = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2530,7 +2543,7 @@ with log.open('w') as out:
         String::from_utf8_lossy(&cli.stderr)
     );
     let expected =
-        b"raw\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
+        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~socket prompt\x1b[201~\x1b[13u\x1b[200~cli prompt\x1b[201~\x1b[13u";
     let deadline = Instant::now() + Duration::from_secs(5);
     while bytes(&read_log()).len() < expected.len() {
         assert!(

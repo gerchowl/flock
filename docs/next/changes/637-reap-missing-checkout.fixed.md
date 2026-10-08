@@ -1,0 +1,1 @@
+- `flk delegate reap` now closes the recorded workspace and clears the delegate entry when its checkout was removed outside flock, pruning stale Git worktree metadata while preserving the workspace identity check (#637).
