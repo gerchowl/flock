@@ -1117,3 +1117,102 @@ fn r18_flk_help_lists_delegate() {
         "flk --help must describe what delegate does: {stdout}"
     );
 }
+
+fn reap_external_removal(force: bool, mismatch: bool, remove_directory: bool) {
+    let server = start_server();
+    let operator = operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w1",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/external-removal",
+            "--json",
+        ],
+    );
+    make_ready(&server, "w1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "start: {}", stderr(&out));
+    let started = stdout_json(&out);
+    let ws = started["workspace_id"].as_str().unwrap();
+    let checkout = started["worktree"].as_str().unwrap();
+    if remove_directory {
+        fs::remove_dir_all(checkout).unwrap();
+        assert!(fs::read_dir(repo.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .is_some());
+    } else {
+        git(&repo, &["worktree", "remove", "--force", checkout]);
+    }
+    assert!(!Path::new(checkout).exists());
+    assert!(workspaces(&server).iter().any(|w| w["workspace_id"] == ws));
+
+    if mismatch {
+        rewrite_entry_workspace(&server, "w1", &operator);
+    }
+    let mut args = vec!["delegate", "reap", "w1", "--json"];
+    if force {
+        args.push("--force");
+    }
+    let reaped = cli(&server, &args);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    let result = stdout_json(&reaped);
+    assert_eq!(result["workspace_closed"], !mismatch);
+    assert_eq!(result["checkout_removed"], true);
+    assert_eq!(
+        workspaces(&server).iter().any(|w| w["workspace_id"] == ws),
+        mismatch && !remove_directory,
+    );
+    assert!(workspaces(&server)
+        .iter()
+        .any(|w| w["workspace_id"] == operator));
+    if let Ok(mut entries) = fs::read_dir(repo.join(".git/worktrees")) {
+        assert!(entries.next().is_none(), "stale Git metadata was pruned");
+    }
+    assert!(!registry_entry_path(&server, "w1").exists());
+    let repeated = cli(&server, &args);
+    assert_eq!(repeated.status.code(), Some(2));
+    assert!(stderr(&repeated).contains("not a delegate"));
+}
+
+#[test]
+fn reap_after_git_remove() {
+    reap_external_removal(false, false, false);
+}
+
+#[test]
+fn reap_after_git_remove_force() {
+    reap_external_removal(true, false, false);
+}
+
+#[test]
+fn reap_after_git_remove_mismatched_workspace() {
+    reap_external_removal(false, true, false);
+}
+
+#[test]
+fn reap_after_deleted_directory() {
+    reap_external_removal(false, false, true);
+}
+
+#[test]
+fn reap_after_deleted_directory_force() {
+    reap_external_removal(true, false, true);
+}
+
+#[test]
+fn reap_after_deleted_directory_mismatched_workspace() {
+    reap_external_removal(false, true, true);
+}
