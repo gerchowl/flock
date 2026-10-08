@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::debug;
@@ -18,6 +18,8 @@ use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -78,31 +80,31 @@ pub fn start_server_with_capabilities(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                        ) {
-                            crate::logging::api_connection_failed(&err.to_string());
-                        }
-                    });
-                }
-                Err(err) => {
-                    crate::logging::api_listener_accept_failed(&err.to_string());
-                    break;
-                }
-            }
-        }
+        let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
+        run_accept_loop(
+            || listener.accept().map(|(stream, _)| stream),
+            &listener_running,
+            &health,
+            |stream| {
+                let api_tx = api_tx.clone();
+                let event_hub = event_hub.clone();
+                let capabilities = capabilities.clone();
+                let connection_running = Arc::clone(&listener_running);
+                let health = Arc::clone(&health);
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        &health,
+                    ) {
+                        crate::logging::api_connection_failed(&err.to_string());
+                    }
+                });
+            },
+        );
         debug!("api server thread exiting");
     });
 
@@ -112,6 +114,29 @@ pub fn start_server_with_capabilities(
         identity,
         running,
     })
+}
+
+fn run_accept_loop<T>(
+    mut accept: impl FnMut() -> io::Result<T>,
+    running: &AtomicBool,
+    health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    mut serve: impl FnMut(T),
+) {
+    while running.load(Ordering::Relaxed) {
+        match accept() {
+            Ok(stream) => serve(stream),
+            Err(err) => {
+                crate::logging::api_listener_accept_failed(&err.to_string());
+                let mut status = health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.accept_errors = status.accept_errors.saturating_add(1);
+                status.last_accept_error = Some(err.to_string());
+                drop(status);
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+            }
+        }
+    }
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
@@ -130,6 +155,7 @@ fn handle_connection(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -251,6 +277,7 @@ fn handle_connection(
                 api_tx,
                 capabilities,
                 peer_pid,
+                listener_health,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
@@ -321,6 +348,7 @@ fn handle_request(
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
     peer_pid: Option<u32>,
+    listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -339,6 +367,12 @@ fn handle_request(
                 // unavailable opendirectoryd would hang `flk status` for
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
+                api_listener: Some(
+                    listener_health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                ),
             },
         })
         .unwrap_or_else(|_| {
@@ -744,6 +778,75 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
 
+    #[test]
+    fn accept_error_then_success_serves_ping_and_reports_health() {
+        let path = unique_test_path("accept");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(b"{\"id\":\"retry\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let running = AtomicBool::new(true);
+        let connection_running = Arc::new(AtomicBool::new(true));
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let hub = EventHub::default();
+        let mut fail = true;
+        let started = Instant::now();
+        run_accept_loop(
+            || {
+                if std::mem::take(&mut fail) {
+                    Err(io::Error::other("injected accept failure"))
+                } else {
+                    listener.accept().map(|(stream, _)| stream)
+                }
+            },
+            &running,
+            &health,
+            |stream| {
+                handle_connection(stream, &tx, &hub, &connection_running, None, &health).unwrap();
+                running.store(false, Ordering::Relaxed);
+            },
+        );
+        assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF);
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "retry");
+        assert_eq!(response["result"]["type"], "pong");
+        assert_eq!(response["result"]["api_listener"]["accept_errors"], 1);
+        assert_eq!(
+            response["result"]["api_listener"]["last_accept_error"],
+            "injected accept failure"
+        );
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_accept_errors_back_off_and_observe_shutdown() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut attempts = 0;
+        let started = Instant::now();
+        run_accept_loop(
+            || {
+                attempts += 1;
+                if attempts == 2 {
+                    running.store(false, Ordering::Relaxed);
+                }
+                Err::<(), _>(io::Error::other("injected accept failure"))
+            },
+            &running,
+            &health,
+            |_| panic!("failed accepts must not dispatch a connection"),
+        );
+        assert_eq!(attempts, 2);
+        assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF * 2);
+        assert_eq!(health.lock().unwrap().accept_errors, 2);
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -871,6 +974,7 @@ mod tests {
             &tx,
             Some(ServerCapabilities { live_handoff: true }),
             None,
+            &Mutex::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -887,8 +991,9 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(request_for_thread, &tx, None, None, &Mutex::default())
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
@@ -954,7 +1059,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -986,7 +1098,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1042,7 +1161,14 @@ mod tests {
         event_hub.push(queued_for("ws_1:p1", "c-before"));
         let hub = event_hub.clone();
         let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            )
         });
 
         // ONE reader for the whole stream: a burst lands in a single read, and
@@ -1090,7 +1216,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 

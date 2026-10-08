@@ -6350,7 +6350,7 @@ mod tests {
         assert!(accept.contains("event=\"api.listener.accept\""), "{accept}");
         assert!(
             accept.contains("ERROR"),
-            "accept-loop dying is ERROR — the server can no longer take new clients: {accept}"
+            "accept failure is ERROR — new clients must wait for the listener to retry: {accept}"
         );
 
         let timeout = capture_logs(|| api_connection_write_timeout_unavailable("ENOTSOCK"));

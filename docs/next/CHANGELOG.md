@@ -5,6 +5,9 @@
 ### Changed
 - **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
 
+### Fixed
+- API accept errors no longer stop the listener and disconnect the host from the fleet. Failed accepts are logged and retried after 50 ms, with the error count and latest error retained in server status (#470).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added
