@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- Guardrails hooks in fresh worktrees now explain how to load missing tooling with `nix develop` or `direnv allow`, instead of failing with “No such file or directory” (#642).
+- Plain commits from fresh worktrees now run the gates through `nix develop` automatically when hook tooling is missing from PATH (#642).
 
 ## [0.10.0] - 2026-10-08
 

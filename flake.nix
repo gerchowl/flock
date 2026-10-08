@@ -123,6 +123,8 @@
               pkg-config
               rustc
               rustfmt
+              # Maintenance tests parse hook YAML with Ruby’s standard library.
+              ruby
               zig_0_15
             ];
             # sccache (worktree/compile-cache inheritance) comes from the

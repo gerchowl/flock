@@ -1,6 +1,7 @@
 """Hook tooling diagnostics and transparent execution without a devShell."""
 
 from pathlib import Path
+import json
 import shlex
 import subprocess
 import tempfile
@@ -21,7 +22,9 @@ class RunGuardrailTests(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertEqual(result.stdout, "")
         self.assertIn("guardrails-no-fake-impl not on PATH", result.stderr)
-        self.assertIn("nix develop --command git commit", result.stderr)
+        self.assertIn("nix develop", result.stderr)
+        self.assertIn("hook tooling", result.stderr)
+        self.assertNotIn("git commit", result.stderr)
         self.assertIn("direnv allow", result.stderr)
         self.assertIn("direnv-enabled shell", result.stderr)
 
@@ -41,26 +44,79 @@ class RunGuardrailTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), ["*/logging.rs", "file with spaces.rs", "--flag"])
         self.assertEqual(result.stderr, "")
 
-    def test_every_guardrails_hook_uses_wrapper_and_diagnoses_missing_tool(self):
-        entries = [
-            shlex.split(line.split("entry:", 1)[1])
-            for line in (ROOT / ".pre-commit-config.yaml").read_text().splitlines()
-            if "entry:" in line and "guardrails-" in line
-        ]
-        self.assertGreater(len(entries), 0)
+    def test_missing_tool_runs_nix_with_repo_arguments_and_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            for entry in entries:
-                with self.subTest(entry=entry):
-                    index = entry.index("sh")
-                    self.assertEqual(entry[index + 1], "scripts/run_guardrail.sh")
-                    tool = entry[index + 2]
-                    env = {"PATH": directory}
-                    if entry[0] == "env":
-                        key, value = entry[1].split("=", 1)
-                        env[key] = value
-                    result = subprocess.run(
-                        ["/bin/sh", str(WRAPPER), tool], env=env,
-                        capture_output=True, text=True,
-                    )
-                    self.assertEqual(result.returncode, 127)
-                    self.assertIn(f"{tool} not on PATH", result.stderr)
+            nix = Path(directory) / "nix"
+            nix.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$FLOCK_GUARDRAIL_IN_DEVSHELL" '
+                '"$GUARDRAILS_TRACE_ALLOW_GLOBS" "$@"\nexit 23\n'
+            )
+            nix.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/sh", str(WRAPPER), "guardrails-no-fake-impl", "file with spaces.rs", "--flag"],
+                cwd=directory,
+                env={"PATH": directory + ":/usr/bin:/bin", "GUARDRAILS_TRACE_ALLOW_GLOBS": "*/logging.rs"},
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout.splitlines(), [
+            "1", "*/logging.rs", "develop", str(ROOT), "--command",
+            "guardrails-no-fake-impl", "file with spaces.rs", "--flag",
+        ])
+        self.assertEqual(result.stderr, "")
+
+    def test_old_python_uses_dev_shell(self):
+        with tempfile.TemporaryDirectory() as directory:
+            python = Path(directory) / "python3"
+            python.write_text("#!/bin/sh\nexit 1\n")
+            python.chmod(0o755)
+            nix = Path(directory) / "nix"
+            nix.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            nix.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/sh", str(WRAPPER), "python3", "scripts/fixture_hosts.py"],
+                env={"PATH": directory + ":/usr/bin:/bin"},
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), [
+            "develop", str(ROOT), "--command", "python3", "scripts/fixture_hosts.py",
+        ])
+
+    def test_dev_shell_guard_prevents_recursive_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nix = Path(directory) / "nix"
+            nix.write_text('#!/bin/sh\nprintf "unexpected nix invocation\\n"\nexit 42\n')
+            nix.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/sh", str(WRAPPER), "guardrails-no-fake-impl"],
+                env={"PATH": directory, "FLOCK_GUARDRAIL_IN_DEVSHELL": "1"},
+                capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("hook tooling", result.stderr)
+
+    def test_every_dev_shell_only_hook_uses_wrapper(self):
+        # Psych parses the YAML structure, including quoted and multiline entries.
+        parsed = subprocess.run(
+            ["ruby", "-ryaml", "-rjson", "-e",
+             "puts JSON.generate(YAML.load_file(ARGV.fetch(0)))",
+             str(ROOT / ".pre-commit-config.yaml")],
+            capture_output=True, text=True, check=True,
+        )
+        config = json.loads(parsed.stdout)
+        hooks = [hook for repo in config["repos"] for hook in repo["hooks"]]
+        wrapped = []
+        for hook in hooks:
+            entry = shlex.split(hook["entry"])
+            if entry[0] == "env":
+                entry = entry[1:]
+                while entry and "=" in entry[0]:
+                    entry = entry[1:]
+            with self.subTest(hook=hook["id"]):
+                self.assertEqual(entry[:2], ["sh", "scripts/run_guardrail.sh"])
+                self.assertTrue(entry[2].startswith("guardrails-") or entry[2] in {"cargo", "gitleaks", "python3"})
+                wrapped.append(hook["id"])
+        self.assertTrue({"gitleaks", "rustfmt", "clippy", "cargo-deny"}.issubset(wrapped))
+        self.assertEqual(len(wrapped), 21)
