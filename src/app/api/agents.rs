@@ -613,11 +613,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        let text = if params.submit {
-            crate::app::api_helpers::encode_api_text(runtime, &params.text)
-        } else {
-            params.text.into_bytes()
-        };
+        let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
         let child_pid = runtime.child_pid();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "agent_send_failed", err.to_string());
