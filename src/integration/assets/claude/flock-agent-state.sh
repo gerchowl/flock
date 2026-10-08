@@ -14,12 +14,16 @@
 #
 # FLOCK_BIN is stamped into the pane env by flock (falls back to `flk` on PATH).
 # Outside a flock pane this is a clean no-op. A missing binary inside a pane
-# is a dependency error, reported once without failing the parent agent.
+# prints a diagnostic on each hook call without failing the parent agent.
 [ "${FLOCK_ENV:-}" = "1" ] || exit 0
 [ -n "${FLOCK_SOCKET_PATH:-}" ] || exit 0
 [ -n "${FLOCK_PANE_ID:-}" ] || exit 0
 flock_bin="${FLOCK_BIN:-flk}"
-if ! command -v "$flock_bin" >/dev/null 2>&1; then
+flock_bin_executable=1
+case "$flock_bin" in
+    */*) [ -x "$flock_bin" ] || flock_bin_executable=0 ;;
+esac
+if [ "$flock_bin_executable" = 0 ] || ! command -v "$flock_bin" >/dev/null 2>&1; then
     printf 'flock hook: required binary %s not found or not executable\n' "$flock_bin" >&2
     exit 0
 fi

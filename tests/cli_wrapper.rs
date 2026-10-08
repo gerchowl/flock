@@ -590,15 +590,22 @@ fn run_copilot_hook(hook_input: &str) -> Option<serde_json::Value> {
 }
 
 #[test]
-fn shell_hooks_report_missing_binary_once_only_inside_flock() {
+fn shell_hooks_report_unavailable_binary_per_call_only_inside_flock() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
+    let non_executable = base.join("non-executable-flk");
+    fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        &non_executable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
     for agent in ["claude", "codex", "copilot", "kimi", "qodercli"] {
         let asset = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
             "src/integration/assets/{agent}/flock-agent-state.sh"
         ));
         for inside in [false, true] {
-            for explicit in [false, true] {
+            for binary in ["flk", "missing-flk", "non-executable-flk"] {
                 let mut command = Command::new("/bin/sh");
                 command
                     .arg(&asset)
@@ -608,8 +615,8 @@ fn shell_hooks_report_missing_binary_once_only_inside_flock() {
                     .env("FLOCK_PANE_ID", "p_test")
                     .env("FLOCK_SOCKET_PATH", base.join("unused.sock"))
                     .env_remove("FLOCK_BIN");
-                if explicit {
-                    command.env("FLOCK_BIN", base.join("missing-flk"));
+                if binary != "flk" {
+                    command.env("FLOCK_BIN", base.join(binary));
                 }
                 let output = command.output().unwrap();
                 assert!(output.status.success(), "{agent}");
@@ -621,7 +628,7 @@ fn shell_hooks_report_missing_binary_once_only_inside_flock() {
                         stderr.contains("flock hook: required binary"),
                         "{agent}: {stderr}"
                     );
-                    assert!(stderr.contains(if explicit { "missing-flk" } else { "flk" }));
+                    assert!(stderr.contains(binary));
                 } else {
                     assert!(stderr.is_empty(), "{agent}: {stderr}");
                 }
@@ -629,6 +636,21 @@ fn shell_hooks_report_missing_binary_once_only_inside_flock() {
         }
     }
     cleanup_test_base(&base);
+}
+
+#[test]
+fn copilot_non_object_stdin_through_run_hook_command_reports_nothing() {
+    // The installed stub invokes the binary's run_hook_command dispatcher,
+    // exercising stdin parsing before Copilot's pure event planner runs.
+    for input in [
+        "null",
+        "[]",
+        r#"[{"toolName":"ask_user"}]"#,
+        "42",
+        r#""ask_user""#,
+    ] {
+        assert!(run_copilot_hook(input).is_none(), "{input}");
+    }
 }
 
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {

@@ -123,7 +123,7 @@ Copilot state is reported through the same local socket API used by other integr
 
 Flock uses `~/.copilot` by default, or `COPILOT_HOME` when set. The Copilot config directory must already exist. Install writes `hooks/flock-agent-state.sh` and updates `settings.json` with Flock hook entries. The hook maps prompt submission, tool use, post-tool progress after approvals, `ask_user` prompts, `exit_plan_mode` plan review prompts, permission notifications, agent idle notifications, turn stops, and session exits into Flock state. Uninstall removes Flock entries from `settings.json` and deletes the hook script.
 
-The shell hooks for Claude, Codex, Copilot, Kimi, and Qoder CLI delegate to `flk hook` and require no Python interpreter. Inside a Flock pane, a missing Flock binary produces one stderr diagnostic. Reinstall the integration to update an older hook script.
+The shell hooks for Claude, Codex, Copilot, Kimi, and Qoder CLI delegate to `flk hook` and require no Python interpreter. Inside a Flock pane, a missing or non-executable Flock binary prints a stderr diagnostic on each hook call. Reinstall the integration to update an older hook script.
 
 After Copilot emits a session-bearing event, Flock can use the reported session id to resume the pane with `copilot --resume=<id>`.
 

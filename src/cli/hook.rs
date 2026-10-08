@@ -1258,6 +1258,14 @@ mod tests {
                 PaneAgentState::Idle,
             ),
             (
+                json!({"session_id": "s", "hook_event_name": "agentStop", "stop_reason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hookEventName": "agentStop", "stopReason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
                 json!({"session_id": "s", "hookEventName": "USER-PROMPT_SUBMITTED"}),
                 PaneAgentState::Working,
             ),
