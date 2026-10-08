@@ -226,6 +226,77 @@ mod tests {
     }
 
     #[test]
+    fn delegate_running_tool_counter_stalls_without_hiding_progress() {
+        // Derived from captured two-space tool-result rows in detect::tests.
+        let now = Instant::now();
+        for spacing in [" ", "  ", "\t"] {
+            for ellipsis in ["…", "..."] {
+                for (first_suffix, ticking_suffix, normalized_suffix) in [
+                    ("(5s)", "(6s)", ""),
+                    ("(2m 5s)", "(2m 6s)", ""),
+                    ("(1h 2m 3s)", "(1h 2m 4s)", ""),
+                    ("(5s · timeout 2m)", "(6s · timeout 2m)", " (timeout 2m)"),
+                    (
+                        "(ctrl+b to run in background)",
+                        "(2m 5s · ctrl+b to run in background)",
+                        " (ctrl+b to run in background)",
+                    ),
+                    (
+                        "(2m 5s · ctrl+b to run in background)",
+                        "(2m 6s · ctrl+b to run in background)",
+                        " (ctrl+b to run in background)",
+                    ),
+                ] {
+                    let row = format!("Bash(build)\n  ⎿{spacing}Running{ellipsis}");
+                    let first = format!("{row} {first_suffix}");
+                    let ticking = format!("{row} {ticking_suffix}");
+                    let mut monitor = Monitor::new(100, now);
+                    assert!(!monitor.observe("working", &first, now));
+                    assert!(monitor.observe("working", &ticking, now + Duration::from_millis(100)));
+                    assert_eq!(monitor.latest.as_ref().unwrap().reason, "silence");
+                    assert_eq!(
+                        crate::detect::progress_text(&first),
+                        format!("{row}{normalized_suffix}")
+                    );
+                    assert_eq!(
+                        crate::detect::progress_text(&ticking),
+                        format!("{row}{normalized_suffix}")
+                    );
+                    for progress in [
+                        format!("{ticking}\ncompiled module"),
+                        ticking.replace("Bash(build)", "Bash(test)"),
+                        format!("Bash(build)\n  ⎿{spacing}Finished"),
+                    ] {
+                        let mut monitor = Monitor::new(100, now);
+                        assert!(!monitor.observe("working", &first, now));
+                        assert!(!monitor.observe(
+                            "working",
+                            &progress,
+                            now + Duration::from_millis(100)
+                        ));
+                    }
+                }
+                let row = format!("Bash(build)\n  ⎿{spacing}Running{ellipsis}");
+                let mut monitor = Monitor::new(100, now);
+                assert!(!monitor.observe("working", &format!("{row} (5s · timeout 2m)"), now));
+                assert!(!monitor.observe(
+                    "working",
+                    &format!("{row} (6s · timeout 3m)"),
+                    now + Duration::from_millis(100)
+                ));
+            }
+        }
+        for transcript in [
+            "The tool was Running… (2m 5s)",
+            "⎿  Running… (build output)",
+            "⎿  Running… (2m 5s) more output",
+            "⎿  Running… (ctrl+b to run in background)",
+        ] {
+            assert_eq!(crate::detect::progress_text(transcript), transcript);
+        }
+    }
+
+    #[test]
     fn delegate_silence_requires_unchanged_working_screen() {
         let now = Instant::now();
         let mut monitor = Monitor::new(100, now);

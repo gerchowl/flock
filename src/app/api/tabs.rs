@@ -46,7 +46,7 @@ impl App {
         encode_success(id, ResponseResult::TabInfo { tab })
     }
 
-    /// `tab.create` under workspace tab mode: spawn the sibling workspace the
+    /// Untargeted `tab.create` under workspace tab mode: spawn the sibling workspace the
     /// keyboard would have, then answer with ITS root tab. The caller asked for
     /// a tab and gets a real tab id — it simply lives in the sibling, which is
     /// exactly what the human sees happen.
@@ -89,6 +89,7 @@ impl App {
             focus,
             label,
         } = params;
+        let explicit_workspace = workspace_id.is_some();
         let ws_idx = if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
@@ -99,11 +100,8 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
-        // Workspace-as-unit tab mode (#25): a "tab" IS a sibling workspace.
-        // The keyboard path branches here; this one did not, so an agent
-        // calling tab.create grew an inner tab that the workspace-mode strip
-        // never shows and that carries none of the space grouping.
-        if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+        // Explicit placement wins over the UI's workspace-as-unit tab mode.
+        if !explicit_workspace && self.state.tab_mode == crate::config::TabModeConfig::Workspace {
             return self.create_sibling_workspace_for_api(id, ws_idx, cwd, label, focus);
         }
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
@@ -312,7 +310,6 @@ mod tests {
             checkout_path: "/repo/flock".into(),
             is_linked_worktree: false,
         });
-        let source_id = ws.id.clone();
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
         app.state.ensure_test_terminals();
@@ -320,7 +317,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::TabCreate(TabCreateParams {
-                workspace_id: Some(source_id.clone()),
+                workspace_id: None,
                 cwd: None,
                 focus: false,
                 label: None,
@@ -344,6 +341,67 @@ mod tests {
                 .map(|space| space.key.as_str()),
             Some("/repo/flock/.git")
         );
+    }
+
+    #[tokio::test]
+    async fn tab_create_explicit_workspace_wins_over_workspace_mode_and_cwd() {
+        for cwd in [None, Some(std::env::temp_dir().display().to_string())] {
+            for focus in [false, true] {
+                let mut app = test_app();
+                app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+                let ws = crate::workspace::Workspace::test_new("target");
+                let source_id = ws.id.clone();
+                app.state.workspaces = vec![ws, crate::workspace::Workspace::test_new("active")];
+                app.state.active = Some(1);
+                app.state.ensure_test_terminals();
+
+                let response = app.handle_api_request(Request {
+                    id: "req".into(),
+                    method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                        workspace_id: Some(source_id.clone()),
+                        cwd: cwd.clone(),
+                        focus,
+                        label: Some("review".into()),
+                    }),
+                });
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["result"]["type"], "tab_created", "{response}");
+                assert_eq!(response["result"]["tab"]["workspace_id"], source_id);
+                assert_eq!(response["result"]["tab"]["label"], "review");
+                assert_eq!(response["result"]["tab"]["focused"], focus);
+                assert_eq!(app.state.workspaces.len(), 2);
+                assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+                assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+                assert_eq!(app.state.active, Some(if focus { 0 } else { 1 }));
+                if let Some(cwd) = &cwd {
+                    let root = app.state.workspaces[0].tabs[1].root_pane;
+                    let terminal_id = app.state.workspaces[0].tabs[1].terminal_id(root).unwrap();
+                    assert_eq!(app.state.terminals[terminal_id].cwd, PathBuf::from(cwd));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_create_unknown_workspace_does_not_allocate() {
+        let mut app = test_app();
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("active")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                workspace_id: Some("w_999999".into()),
+                cwd: Some(std::env::temp_dir().display().to_string()),
+                focus: false,
+                label: Some("review".into()),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "workspace_not_found");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     }
 
     /// The default mode is unchanged: a tab is still a tab.

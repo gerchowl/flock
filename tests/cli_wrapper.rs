@@ -960,34 +960,41 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
 
 #[test]
 fn pane_report_metadata_sends_presentation_request() {
-    let base = unique_test_dir();
-    fs::create_dir_all(&base).unwrap();
-    let socket_path = base.join("flock.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
+    for (pane_args, calling_pane, expected_pane) in [
+        (vec!["1-1"], Some("p_calling"), "1-1"),
+        (vec!["--pane", "1-2"], Some("p_calling"), "1-2"),
+        (vec![], Some("p_calling"), "p_calling"),
+        (vec![], None, ""),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("flock.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
 
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        reader.read_line(&mut line).unwrap();
-        stream
-            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-            .unwrap();
-        stream.write_all(b"\n").unwrap();
-        stream.flush().unwrap();
-        line
-    });
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut line).unwrap();
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            line
+        });
 
-    let run = run_cli(
-        &socket_path,
-        &[
-            "pane",
-            "report-metadata",
-            "1-1",
+        let mut args = vec!["pane", "report-metadata"];
+        args.extend(pane_args);
+        args.extend_from_slice(&[
             "--source",
             "user:claude-title",
             "--agent",
             "claude",
+            "--applies-to-source",
+            "flock:claude",
+            "--seq",
+            "7",
             "--title",
             "Refactor auth",
             "--display-agent",
@@ -998,30 +1005,72 @@ fn pane_report_metadata_sends_presentation_request() {
             "working=deep in the mines",
             "--ttl-ms",
             "3600000",
-        ],
-    );
-    assert!(
-        run.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        ]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+        command.args(args).env("FLOCK_SOCKET_PATH", &socket_path);
+        if let Some(pane) = calling_pane {
+            command.env("FLOCK_PANE_ID", pane);
+        } else {
+            command.env_remove("FLOCK_PANE_ID");
+        }
+        let run = command.output().unwrap();
+        assert!(
+            run.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
 
-    let line = server.join().unwrap();
-    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(request["method"], "pane.report_metadata");
-    assert_eq!(request["params"]["pane_id"], "1-1");
-    assert_eq!(request["params"]["source"], "user:claude-title");
-    assert_eq!(request["params"]["agent"], "claude");
-    assert!(request["params"]["applies_to_source"].is_null());
-    assert_eq!(request["params"]["title"], "Refactor auth");
-    assert_eq!(request["params"]["display_agent"], "Claude auth");
-    assert_eq!(request["params"]["custom_status"], "middleware");
-    assert_eq!(
-        request["params"]["state_labels"]["working"],
-        "deep in the mines"
-    );
-    assert_eq!(request["params"]["ttl_ms"], 3_600_000);
+        let line = server.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "pane.report_metadata");
+        assert_eq!(request["params"]["pane_id"], expected_pane);
+        assert_eq!(request["params"]["source"], "user:claude-title");
+        assert_eq!(request["params"]["agent"], "claude");
+        assert_eq!(request["params"]["applies_to_source"], "flock:claude");
+        assert_eq!(request["params"]["seq"], 7);
+        assert_eq!(request["params"]["title"], "Refactor auth");
+        assert_eq!(request["params"]["display_agent"], "Claude auth");
+        assert_eq!(request["params"]["custom_status"], "middleware");
+        assert_eq!(
+            request["params"]["state_labels"]["working"],
+            "deep in the mines"
+        );
+        assert_eq!(request["params"]["ttl_ms"], 3_600_000);
 
+        cleanup_test_base(&base);
+    }
+}
+
+#[test]
+fn pane_report_metadata_rejects_invalid_pane_arguments() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+    for (args, expected) in [
+        (vec!["--pane"], "missing value for --pane"),
+        (
+            vec!["--pane", "--source", "user:title"],
+            "missing value for --pane",
+        ),
+        (
+            vec!["1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--pane", "1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--source", "user:title", "stray"],
+            "unknown option: stray",
+        ),
+    ] {
+        let mut command_args = vec!["pane", "report-metadata"];
+        command_args.extend(args);
+        let run = run_cli(&socket_path, &command_args);
+        assert_eq!(run.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(expected));
+    }
     cleanup_test_base(&base);
 }
 
@@ -1698,13 +1747,15 @@ fn server_stop_then_restart_restores_pane_history() {
         .to_string();
     let sent = run_cli(
         &socket_path,
-        &["pane", "send-text", &pane_id, &format!("echo {marker}\n")],
+        &["pane", "send-text", &pane_id, &format!("echo {marker}")],
     );
     assert!(
         sent.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&sent.stderr)
     );
+    let enter = run_cli(&socket_path, &["pane", "send-keys", &pane_id, "Enter"]);
+    assert!(enter.status.success());
     assert!(
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
             pane_read_recent_contains(&socket_path, &pane_id, marker)
@@ -2162,7 +2213,13 @@ fn tab_management_commands_work() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
 
-    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    let flock = spawn_flock_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "onboarding = false\n[ui]\ntab_mode = \"workspace\"\n",
+    );
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = run_cli(
@@ -2182,7 +2239,17 @@ fn tab_management_commands_work() {
 
     let created_tab = run_cli(
         &socket_path,
-        &["tab", "create", "--workspace", &workspace_id],
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            config_home.to_str().unwrap(),
+            "--label",
+            "review",
+            "--no-focus",
+        ],
     );
     assert!(created_tab.status.success());
     let created_tab_json: serde_json::Value = serde_json::from_slice(&created_tab.stdout).unwrap();
@@ -2191,6 +2258,8 @@ fn tab_management_commands_work() {
         .unwrap()
         .to_string();
     assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
+    assert_eq!(created_tab_json["result"]["tab"]["label"], "review");
+    assert_eq!(created_tab_json["result"]["tab"]["focused"], false);
 
     let listed_tabs = run_cli(&socket_path, &["tab", "list", "--workspace", &workspace_id]);
     assert!(listed_tabs.status.success());
@@ -3481,21 +3550,45 @@ fn agent_result_and_history_read_an_opencode_session() {
     assert_eq!(info["status_text"], "approve", "{json}");
 
     let history = run_cli(&socket_path, &["agent", "history", "1-1"]);
-    let history_json: serde_json::Value = if history.status.success() {
-        serde_json::from_slice(&history.stdout).unwrap()
-    } else {
-        // `flk agent history` is documented but not wired as a CLI verb;
-        // drive the socket method it would call.
-        send_request(
-            &socket_path,
-            r#"{"id":"req_575_history","method":"agent.history","params":{"target":"1-1"}}"#,
-        )
-    };
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     let turns = history_json["result"]["history"]["turns"]
         .as_array()
         .unwrap_or_else(|| panic!("{history_json}"));
     assert_eq!(turns.len(), 2, "{history_json}");
     assert_eq!(turns[0]["text"], "review PR 12");
+
+    for detail in ["reply", "collapsed", "full"] {
+        let page = run_cli_json(
+            &socket_path,
+            &[
+                "agent", "history", "1-1", "--detail", detail, "--limit", "1",
+            ],
+        );
+        assert_eq!(page["result"]["history"]["detail"], detail, "{page}");
+        assert_eq!(
+            page["result"]["history"]["turns"].as_array().unwrap().len(),
+            1,
+            "{page}"
+        );
+        let cursor = page["result"]["history"]["next_cursor"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        let next = run_cli_json(
+            &socket_path,
+            &["agent", "history", "1-1", "--cursor", &cursor],
+        );
+        assert_eq!(
+            next["result"]["history"]["turns"],
+            serde_json::json!([]),
+            "{next}"
+        );
+    }
 
     cleanup_spawned_flock(flock, base);
 }
