@@ -195,6 +195,21 @@ fn mesh_harness_kills_a_held_edge_and_restores_only_that_direction() {
 }
 
 fn relay_probe(fleet: &fleet::Fleet, from: &str, to: &str, method: &str) -> serde_json::Value {
+    relay_probes(
+        fleet,
+        from,
+        to,
+        &[serde_json::json!({"id":"probe", "method":method, "params":{}})],
+    )
+    .remove(0)
+}
+
+fn relay_probes(
+    fleet: &fleet::Fleet,
+    from: &str,
+    to: &str,
+    requests: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
     use std::io::{BufRead, Write};
     use std::process::Stdio;
     let mut child = shim_command(fleet, from, to, "flk peers relay")
@@ -203,28 +218,31 @@ fn relay_probe(fleet: &fleet::Fleet, from: &str, to: &str, method: &str) -> serd
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"id":"probe", "method":method, "params":{}})
-    )
-    .unwrap();
+    for request in requests {
+        writeln!(stdin, "{request}").unwrap();
+    }
     let stdout = child.stdout.take().unwrap();
+    let count = requests.len();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let line = std::io::BufReader::new(stdout)
+        let lines: Vec<String> = std::io::BufReader::new(stdout)
             .lines()
-            .next()
-            .unwrap()
-            .unwrap();
-        let _ = tx.send(line);
+            .take(count)
+            .map(Result::unwrap)
+            .collect();
+        let _ = tx.send(lines);
     });
     let response = rx.recv_timeout(Duration::from_secs(10));
     drop(stdin);
     fleet::wait_until("relay exit", Duration::from_secs(10), || {
         child.try_wait().unwrap()
     });
-    serde_json::from_str(&response.expect("relay probe deadline")).unwrap()
+    let lines = response.expect("relay probe deadline");
+    assert_eq!(lines.len(), requests.len(), "relay stopped forwarding");
+    lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 /// Fault modes refuse mesh without preventing legacy traffic from reaching
@@ -249,4 +267,86 @@ fn mesh_harness_legacy_and_version_mismatch_keep_ping_working() {
         let ping = relay_probe(&fleet, "probe", node, "ping");
         assert!(ping.get("result").is_some(), "{ping}");
     }
+}
+
+/// Poison only a subprocess's environment, avoiding global environment edits
+/// while the test runner and server watchdog have other threads running.
+#[test]
+fn mesh_harness_does_not_inherit_agent_profile_overrides() {
+    const TEST: &str = "mesh_harness_does_not_inherit_agent_profile_overrides";
+    const KEYS: [&str; 3] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "KIMI_CODE_HOME"];
+    if std::env::var_os("FLOCK_FLEET_ENV_TEST").is_none() {
+        let profiles = std::env::temp_dir().join(format!("{TEST}-{}", std::process::id()));
+        std::fs::create_dir_all(&profiles).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env("FLOCK_FLEET_ENV_TEST", "1");
+        for key in KEYS {
+            command.env(key, profiles.join(key));
+        }
+        let output = command.output().unwrap();
+        std::fs::remove_dir_all(profiles).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for key in KEYS {
+        assert!(std::env::var_os(key).is_some(), "missing poison {key}");
+    }
+    let fleet = fleet::spawn("mesh-env", &[fleet::NodeSpec::new("nodea", "alpha", &[])]);
+    let node = fleet.node("nodea");
+    let environment = support::process_table::process_environment(node.process_id()).unwrap();
+    assert!(environment
+        .iter()
+        .any(|entry| entry == &format!("HOME={}", node.home.display())));
+    for key in KEYS {
+        assert!(
+            !environment
+                .iter()
+                .any(|entry| entry.starts_with(&format!("{key}="))),
+            "node inherited {key}"
+        );
+    }
+    // The shim is invoked from the poisoned process as well, independently
+    // testing its boundary rather than inheriting the server's clean env.
+    let output = shim_command(&fleet, "probe", "nodea", "sh -lc 'env'")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let environment = String::from_utf8(output.stdout).unwrap();
+    for key in KEYS {
+        assert!(
+            !environment
+                .lines()
+                .any(|entry| entry.starts_with(&format!("{key}="))),
+            "shim inherited {key}"
+        );
+    }
+}
+
+#[test]
+fn mesh_harness_forwards_non_object_json_and_keeps_the_relay_alive() {
+    let fleet = fleet::spawn("mesh-json", &[fleet::NodeSpec::new("nodea", "alpha", &[])]);
+    let replies = relay_probes(
+        &fleet,
+        "probe",
+        "nodea",
+        &[
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!("text"),
+            serde_json::json!({"id":"bad-method", "method":42}),
+            serde_json::json!({"id":"ping", "method":"ping", "params":{}}),
+        ],
+    );
+    for reply in &replies[..4] {
+        assert!(reply.get("error").is_some(), "{reply}");
+    }
+    assert_eq!(replies[4]["id"], "ping");
+    assert!(replies[4].get("result").is_some(), "{}", replies[4]);
 }

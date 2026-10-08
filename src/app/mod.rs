@@ -10,6 +10,7 @@ mod agent_resume;
 mod agents;
 mod api;
 pub(crate) mod fleet_pause;
+pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
 pub(crate) mod self_compact;
@@ -144,11 +145,13 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    /// Canonical pane ids reserved by a guarded client submission.
+    pub(crate) active_submissions: std::collections::HashSet<String>,
     /// Deferred submit set by `handle_agent_send` and consumed by
     /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
     /// request. A response path bypassing `respond_or_park` would reply ok
     /// without pressing Enter, so dispatch asserts the previous slot was consumed.
-    pub(crate) pending_agent_submit: Option<(String, String, Option<u32>)>,
+    pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
@@ -902,6 +905,7 @@ impl App {
             },
             uplink: Default::default(),
             pending_agent_submit: None,
+            active_submissions: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,
             restarts: Default::default(),

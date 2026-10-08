@@ -132,6 +132,13 @@ impl Node {
         self._master = None;
     }
 
+    pub fn process_id(&self) -> u32 {
+        self.child
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .expect("running node")
+    }
+
     /// Restart only this sandbox server, preserving its config and state.
     pub fn restart(&mut self) {
         self.stop();
@@ -156,9 +163,13 @@ impl Node {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
         cmd.arg("server");
         cmd.cwd(&self.repo);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("FLOCK_") {
-                cmd.env_remove(key);
+        cmd.env_clear();
+        for (key, value) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if matches!(name.as_ref(), "PATH" | "TMPDIR" | "USER" | "LANG")
+                || name.starts_with("LC_")
+            {
+                cmd.env(key, value);
             }
         }
         cmd.env("HOME", &self.home);
@@ -510,6 +521,19 @@ pub fn spawn(tag: &str, specs: &[NodeSpec]) -> Fleet {
             for dir in [&path.home, &path.config_home, &path.runtime_dir] {
                 fs::create_dir_all(dir).unwrap();
             }
+            // Remote commands use a login shell. System profiles can reset
+            // PATH, so the sandbox supplies its own path to the test binary.
+            let fixture_path = format!(
+                "{}:{}:{}",
+                bin_dir.display(),
+                shim_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            fs::write(
+                path.home.join(".profile"),
+                format!("export PATH='{}'\n", fixture_path.replace('\'', "'\\''")),
+            )
+            .unwrap();
             register_runtime_dir(&path.runtime_dir);
             Node {
                 name: spec.name.to_string(),

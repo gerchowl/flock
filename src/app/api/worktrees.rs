@@ -987,7 +987,7 @@ impl App {
     /// The workspace holding the pane this API call is being made from, from
     /// process ancestry. `None` for a caller in no pane — an ssh shell, a
     /// supervisor script, a hand-run command.
-    fn caller_workspace_idx(&mut self) -> Option<usize> {
+    pub(crate) fn caller_workspace_idx(&mut self) -> Option<usize> {
         self.parse_pane_id_or_peer("", self.current_api_peer_pid)
             .map(|(ws_idx, _pane_id)| ws_idx)
     }

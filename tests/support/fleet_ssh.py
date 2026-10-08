@@ -24,7 +24,11 @@ if (base / f"refuse-ssh-{target}").exists() or (
     sys.stderr.write(f"ssh: connect to host {target} port 22: Connection refused\n")
     sys.exit(255)
 
-env = {key: value for key, value in os.environ.items() if not key.startswith("FLOCK_")}
+# Start empty and admit only the process basics, then set sandbox paths.
+env = {
+    key: value for key, value in os.environ.items()
+    if key in {"PATH", "TMPDIR", "USER", "LANG"} or key.startswith("LC_")
+}
 env.update(
     HOME=node["home"],
     XDG_CONFIG_HOME=node["config"],
@@ -60,10 +64,19 @@ def emit(line):
 def forward_input():
     try:
         for line in sys.stdin:
-            request = json.loads(line)
+            try:
+                request = json.loads(line)
+            except ValueError:
+                request = None
+            if not isinstance(request, dict):
+                sys.stderr.write("fake-ssh: non-object JSON request forwarded unchanged\n")
+                sys.stderr.flush()
+                child.stdin.write(line)
+                child.stdin.flush()
+                continue
             method = request.get("method", "")
             mode = node["mesh"]
-            if method.startswith("mesh.") and mode != "native":
+            if isinstance(method, str) and method.startswith("mesh.") and mode != "native":
                 if mode == "disabled":
                     code, message = "invalid_request", f"unknown variant `{method}`"
                 else:
