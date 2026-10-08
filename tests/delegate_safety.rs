@@ -124,7 +124,9 @@ fn write_fake_opencode(base: &Path) {
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+         first=1; while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; \
+         if [ -n \"$first\" ]; then first=; printf '\\033[2J\\033[H■■■■⬝⬝  esc interrupt  opencode\\n'; sleep 0.4; \
+         printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; fi; done\n",
         base = base.display()
     );
     let path = bin.join("opencode");

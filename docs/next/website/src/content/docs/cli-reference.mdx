@@ -33,6 +33,8 @@ flk status server
 flk status client
 ```
 
+Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
+
 ## Server
 
 ```bash
@@ -170,6 +172,8 @@ flk tab rename <tab_id> <label>
 flk tab close <tab_id>
 ```
 
+`tab create --workspace ID` creates an inner tab in that workspace, including in workspace tab mode. `--cwd` sets the new terminal’s working directory without changing the target workspace. An unknown workspace ID returns an error. Without `--workspace`, workspace tab mode creates a sibling workspace from the active workspace.
+
 ## Panes
 
 ```bash
@@ -197,6 +201,8 @@ flk pane send-text <pane_id> <text>
 flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <pane_id> <command>
 ```
+
+`pane send-text` uses bracketed paste when the terminal enables it and does not send Enter. Terminals without bracketed paste receive the text bytes directly. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys; control bytes passed to `send-text` are pasted as text when bracketed paste is enabled.
 
 `pane run` types the command and then presses Enter, as two separate writes with a short pause between them. It is deliberately *not* atomic: a program reading a raw-mode stdin sees read boundaries rather than keystrokes, and agent TUIs use those boundaries to tell typing from pasting — text and a carriage return arriving in one read look like a pasted block containing a newline, so the newline is inserted and nothing is submitted. The pause is a heuristic, not a guarantee. A TUI that has not started reading stdin at all misses the text as well as the Enter; wait for the pane to be ready (`agent start --wait-ready`, `agent wait --ready`) before typing into a freshly started agent. `send-keys <pane_id> Enter` still submits a line that is already sitting in an input box.
 
@@ -244,7 +250,7 @@ Those commands include `foreground_cwd` when Flock can resolve the cwd of the fo
 Report display-only pane metadata without taking over semantic state:
 
 ```bash
-flk pane report-metadata <pane_id> \
+flk pane report-metadata [--pane <pane_id>] \
   --source ID \
   [--agent LABEL] \
   [--applies-to-source ID] \
@@ -257,6 +263,8 @@ flk pane report-metadata <pane_id> \
   [--ttl-ms N]
 ```
 
+The pane defaults to the calling pane. Use `--pane <pane_id>` or a legacy leading pane id to report from outside the pane.
+
 `STATUS` is one of `idle`, `working`, `blocked`, `done`, or `unknown`. `--agent` is a guard for the authoritative agent label. `--applies-to-source` is a guard for the active lifecycle authority source. Use `--display-agent` to change the visible name.
 
 ## Agents
@@ -265,6 +273,7 @@ flk pane report-metadata <pane_id> \
 flk agent list
 flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
+flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]
 flk agent result <target> [--max-chars N] [--offset N]
 flk agent send [--submit] <target> <text>
 flk agent rename <target> <name>|--clear
@@ -288,7 +297,7 @@ flk checks run <name>
 
 Agent targets can be terminal IDs, unique agent names, detected or reported agent labels, or legacy pane IDs. Names and labels are agent identities. Terminal IDs and legacy pane IDs are low-level escape hatches.
 
-`agent read` reads the resolved terminal stream. `agent send` writes literal text to that stream **without submitting**. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
+`agent read` reads the resolved terminal stream. `agent send` pastes text to that stream **without submitting**, using bracketed paste when the terminal enables it so punctuation such as `!` stays literal input. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), wait 120 ms, and send a negotiated Enter key event. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys instead of embedding control bytes in the text. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Success reports input queued, not confirmation that the harness accepted it. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
@@ -403,7 +412,9 @@ Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BL
 
 ### Delegate stall verdicts
 
-`start --await`, `send --await`, and `wait` accept `--silence DURATION` (default `3m`; `0` disables it). Units are `ms`, `s`, `m`, and `h`, including combinations such as `1m 30s`. A working agent whose unscrolled detection screen stays unchanged after removing recognized harness status rows for this duration returns `outcome: "stalled"`, reason `silence`, and exit **7**. Viewport scrolling and recognized spinner, elapsed-counter, and progress-bar rows do not reset the timer; a new transcript line does. Opencode retries return reason/verdict `provider_limit` and `retry_after_ms` only while working or unknown, when the ETA is at least the silence window or the retry persists continuously for that window. With `--silence 0`, only an ETA of at least 5 minutes stalls; short retries continue waiting, and idle means recovery.
+`start --await`, `send --await`, and `wait` accept `--silence DURATION` (default `3m`; `0` disables it). Units are `ms`, `s`, `m`, and `h`, including combinations such as `1m 30s`. A working agent whose unscrolled detection screen stays unchanged after removing recognized harness status rows for this duration returns `outcome: "stalled"`, reason `silence`, and exit **7**. Viewport scrolling and recognized spinner, elapsed-counter, and progress-bar rows do not reset the timer; a new transcript line does. OpenCode provider retry screens report blocked with reason `provider_limit`. `agent get` and `delegate status` expose the live `blocked_reason` and `retry_after_ms`. Delegate waits tolerate short retries: they return reason/verdict `provider_limit` and exit **7** only when the ETA is at least the silence window or the retry persists continuously for that window. With `--silence 0`, only an ETA of at least 5 minutes stalls; short retries continue waiting, and idle means recovery. These rules also apply to older servers reporting working or unknown. Readiness timeout verdicts retain the provider reason and ETA, with `unknown` for a short retry rather than a human-input verdict.
+
+Raise `--silence` for long builds or tools that print nothing while running. Recognized Claude, Codex, and opencode spinners do not count as progress; Claude running-tool elapsed counters are normalized while the tool row remains evidence. Unknown harness animations may still reset the timer, so a hung tool in an unknown harness can go undetected.
 
 Readiness still defaults to 60 seconds. On readiness expiry, JSON includes `outcome: "ready_timeout"`, verdict `waiting_on_input`, `stalled`, or `unknown`, and `last_line` (the last nonblank screen line); exit remains 1. Round outcomes include `verdict`, `reason`, `retry_after_ms`, `last_line`, and `s1`. `delegate status` includes the latest persisted verdict for the current round.
 
@@ -417,7 +428,7 @@ flk notification list [--unread] [--limit N]
 flk notification read <notification-id> | --all
 ```
 
-`show` raises a notification through the configured `[ui.toast]` delivery. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
+`show` raises a notification through the configured `[ui.toast]` delivery. It exits 0 when `shown:true` and 3 when `shown:false`, preserving the JSON response so callers can inspect `reason` and fall back to another channel. `reason:"disabled"` means the server config has `[ui.toast] delivery = "off"` (the default), which disables popups. Other refusal reasons are `busy`, `rate_limited`, and `no_foreground_client`. API errors exit 1; invalid arguments exit 2. `list` reads what Flock has filed — every outcome it decided was worth saying, newest first: an agent that blocked or finished, and every `show` call, including the ones it refused to display. `read` acknowledges one or all of them.
 
 The notification log panel inside the TUI (`prefix+i`, or the sidebar `menu` row → `notifications`) lists and acknowledges the same records: all three surfaces read one filter over one projection, so `--unread` and the panel's `u` filter can never disagree about what is unread.
 

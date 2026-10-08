@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::debug;
@@ -18,6 +18,10 @@ use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const ACCEPT_UNKNOWN_ERROR_LIMIT: u64 = 5;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -78,31 +82,31 @@ pub fn start_server_with_capabilities(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                        ) {
-                            crate::logging::api_connection_failed(&err.to_string());
-                        }
-                    });
-                }
-                Err(err) => {
-                    crate::logging::api_listener_accept_failed(&err.to_string());
-                    break;
-                }
-            }
-        }
+        let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
+        run_accept_loop(
+            || listener.accept().map(|(stream, _)| stream),
+            &listener_running,
+            &health,
+            |stream| {
+                let api_tx = api_tx.clone();
+                let event_hub = event_hub.clone();
+                let capabilities = capabilities.clone();
+                let connection_running = Arc::clone(&listener_running);
+                let health = Arc::clone(&health);
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        &health,
+                    ) {
+                        crate::logging::api_connection_failed(&err.to_string());
+                    }
+                });
+            },
+        );
         debug!("api server thread exiting");
     });
 
@@ -112,6 +116,83 @@ pub fn start_server_with_capabilities(
         identity,
         running,
     })
+}
+
+fn run_accept_loop<T>(
+    accept: impl FnMut() -> io::Result<T>,
+    running: &AtomicBool,
+    health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    serve: impl FnMut(T),
+) {
+    run_accept_loop_with_sleep(accept, running, health, serve, std::thread::sleep);
+}
+
+fn run_accept_loop_with_sleep<T>(
+    mut accept: impl FnMut() -> io::Result<T>,
+    running: &AtomicBool,
+    health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    mut serve: impl FnMut(T),
+    mut sleep: impl FnMut(Duration),
+) {
+    let mut failures = 0u64;
+    let mut backoff = ACCEPT_ERROR_BACKOFF;
+    while running.load(Ordering::Relaxed) {
+        match accept() {
+            Ok(stream) => {
+                if failures > 0 {
+                    crate::logging::api_listener_accept_recovered(failures);
+                }
+                failures = 0;
+                backoff = ACCEPT_ERROR_BACKOFF;
+                serve(stream);
+            }
+            Err(err) => {
+                failures = failures.saturating_add(1);
+                let fatal = accept_error_is_fatal(&err, failures);
+                let mut status = health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.accept_errors = status.accept_errors.saturating_add(1);
+                status.last_accept_error = Some(err.to_string());
+                status.stopped = fatal;
+                drop(status);
+                if fatal {
+                    crate::logging::api_listener_accept_failed(&err.to_string(), failures, true);
+                    break;
+                }
+                if failures == 1 {
+                    crate::logging::api_listener_accept_failed(&err.to_string(), failures, false);
+                }
+                sleep(backoff);
+                backoff = (backoff * 2).min(ACCEPT_ERROR_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+fn accept_error_is_fatal(err: &io::Error, failures: u64) -> bool {
+    match err.raw_os_error() {
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => true,
+        Some(
+            libc::EMFILE
+            | libc::ENFILE
+            | libc::ECONNABORTED
+            | libc::EINTR
+            | libc::EAGAIN
+            | libc::ENOBUFS
+            | libc::ENOMEM,
+        ) => false,
+        _ if matches!(
+            err.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::ConnectionAborted
+        ) =>
+        {
+            false
+        }
+        _ => failures >= ACCEPT_UNKNOWN_ERROR_LIMIT,
+    }
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
@@ -130,6 +211,7 @@ fn handle_connection(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -251,6 +333,7 @@ fn handle_connection(
                 api_tx,
                 capabilities,
                 peer_pid,
+                listener_health,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
@@ -321,6 +404,7 @@ fn handle_request(
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
     peer_pid: Option<u32>,
+    listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -339,6 +423,12 @@ fn handle_request(
                 // unavailable opendirectoryd would hang `flk status` for
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
+                api_listener: Some(
+                    listener_health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                ),
             },
         })
         .unwrap_or_else(|_| {
@@ -744,6 +834,211 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
 
+    #[test]
+    fn accept_error_then_success_serves_ping_and_reports_health() {
+        let path = unique_test_path("accept");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .write_all(b"{\"id\":\"retry\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let running = AtomicBool::new(true);
+        let connection_running = Arc::new(AtomicBool::new(true));
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let hub = EventHub::default();
+        let mut fail = true;
+        let started = Instant::now();
+        run_accept_loop(
+            || {
+                if std::mem::take(&mut fail) {
+                    Err(io::Error::from_raw_os_error(libc::EMFILE))
+                } else {
+                    listener.accept().map(|(stream, _)| stream)
+                }
+            },
+            &running,
+            &health,
+            |stream| {
+                handle_connection(stream, &tx, &hub, &connection_running, None, &health).unwrap();
+                running.store(false, Ordering::Relaxed);
+            },
+        );
+        assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF);
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["id"], "retry");
+        assert_eq!(response["result"]["type"], "pong");
+        assert_eq!(response["result"]["api_listener"]["accept_errors"], 1);
+        assert_eq!(
+            response["result"]["api_listener"]["last_accept_error"],
+            io::Error::from_raw_os_error(libc::EMFILE).to_string()
+        );
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_accept_errors_back_off_and_observe_shutdown() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut attempts = 0;
+        let started = Instant::now();
+        run_accept_loop(
+            || {
+                attempts += 1;
+                if attempts == 2 {
+                    running.store(false, Ordering::Relaxed);
+                }
+                Err::<(), _>(io::Error::other("injected accept failure"))
+            },
+            &running,
+            &health,
+            |_| panic!("failed accepts must not dispatch a connection"),
+        );
+        assert_eq!(attempts, 2);
+        assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF * 2);
+        assert_eq!(health.lock().unwrap().accept_errors, 2);
+    }
+
+    #[test]
+    fn transient_accept_errors_grow_cap_and_reset_backoff_without_log_flood() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let mut served = 0;
+        let logs = crate::logging::capture_logs(|| {
+            run_accept_loop_with_sleep(
+                || {
+                    attempts += 1;
+                    if attempts == 9 || attempts == 11 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from_raw_os_error(libc::EMFILE))
+                    }
+                },
+                &running,
+                &health,
+                |_| {
+                    served += 1;
+                    if served == 2 {
+                        running.store(false, Ordering::Relaxed);
+                    }
+                },
+                |duration| sleeps.push(duration),
+            );
+        });
+        assert_eq!(
+            sleeps,
+            [50, 100, 200, 400, 800, 1600, 2000, 2000, 50].map(Duration::from_millis)
+        );
+        assert_eq!(health.lock().unwrap().accept_errors, 9);
+        assert!(!health.lock().unwrap().stopped);
+        assert_eq!(
+            logs.matches("event=\"api.listener.accept\"").count(),
+            4,
+            "{logs}"
+        );
+        assert_eq!(logs.matches("WARN").count(), 2, "{logs}");
+        assert_eq!(logs.matches("INFO").count(), 2, "{logs}");
+        assert!(!logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("failures=8"), "{logs}");
+    }
+
+    #[test]
+    fn fatal_accept_errors_stop_once_and_surface_in_ping() {
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let running = AtomicBool::new(true);
+            let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+            let mut attempts = 0;
+            let logs = crate::logging::capture_logs(|| {
+                run_accept_loop_with_sleep(
+                    || {
+                        attempts += 1;
+                        Err::<(), _>(io::Error::from_raw_os_error(code))
+                    },
+                    &running,
+                    &health,
+                    |_| panic!("fatal accepts cannot serve"),
+                    |_| panic!("fatal accepts cannot retry"),
+                );
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(logs.matches("ERROR").count(), 1, "{logs}");
+            assert_eq!(
+                logs.matches("event=\"api.listener.accept\"").count(),
+                1,
+                "{logs}"
+            );
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let response = handle_request(
+                Request {
+                    id: "fatal-status".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                None,
+                &health,
+            );
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["api_listener"]["stopped"], true);
+            assert_eq!(response["result"]["api_listener"]["accept_errors"], 1);
+            assert_eq!(
+                response["result"]["api_listener"]["last_accept_error"],
+                io::Error::from_raw_os_error(code).to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn unclassified_accept_errors_stop_after_bounded_failures() {
+        let running = AtomicBool::new(true);
+        let health = Mutex::new(crate::api::schema::ApiListenerHealth::default());
+        let mut sleeps = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            run_accept_loop_with_sleep(
+                || Err::<(), _>(io::Error::other("injected unknown accept error")),
+                &running,
+                &health,
+                |_| panic!("failed accepts cannot serve"),
+                |duration| sleeps.push(duration),
+            );
+        });
+        assert_eq!(sleeps.len() as u64, ACCEPT_UNKNOWN_ERROR_LIMIT - 1);
+        assert_eq!(
+            health.lock().unwrap().accept_errors,
+            ACCEPT_UNKNOWN_ERROR_LIMIT
+        );
+        assert!(health.lock().unwrap().stopped);
+        assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+        assert_eq!(logs.matches("ERROR").count(), 1, "{logs}");
+    }
+
+    #[test]
+    fn documented_transient_accept_errors_keep_retrying() {
+        for code in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+        ] {
+            assert!(!accept_error_is_fatal(
+                &io::Error::from_raw_os_error(code),
+                100
+            ));
+        }
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            assert!(!accept_error_is_fatal(&io::Error::from(kind), 100));
+        }
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -871,6 +1166,7 @@ mod tests {
             &tx,
             Some(ServerCapabilities { live_handoff: true }),
             None,
+            &Mutex::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -887,8 +1183,9 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(request_for_thread, &tx, None, None, &Mutex::default())
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
@@ -954,7 +1251,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -986,7 +1290,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1042,7 +1353,14 @@ mod tests {
         event_hub.push(queued_for("ws_1:p1", "c-before"));
         let hub = event_hub.clone();
         let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            )
         });
 
         // ONE reader for the whole stream: a burst lands in a single read, and
@@ -1090,7 +1408,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &Mutex::default(),
+            );
             done_tx.send(result).unwrap();
         });
 

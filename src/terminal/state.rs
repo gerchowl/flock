@@ -195,6 +195,7 @@ pub struct TerminalState {
     /// (e.g. Claude's "Implementing the parser"). Cleared by the detector
     /// when the agent stops working.
     pub live_activity: Option<String>,
+    pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
     /// change so the log names the source rather than only the outcome.
@@ -326,6 +327,7 @@ impl TerminalState {
             header_reserved: false,
             state_changed_at: None,
             live_activity: None,
+            provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
             hook_authority: None,
@@ -381,10 +383,10 @@ impl TerminalState {
     /// and the bare state label ("ours"). Hold the last activity until the
     /// agent actually leaves the working state.
     pub fn update_live_activity(&mut self, activity: Option<String>, detected_state: AgentState) {
-        if activity.is_some() {
-            self.live_activity = activity;
-        } else if detected_state != AgentState::Working {
+        if detected_state != AgentState::Working {
             self.live_activity = None;
+        } else if activity.is_some() {
+            self.live_activity = activity;
         }
     }
 
@@ -1241,6 +1243,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.stale_hook_idle_since = None;
         self.live_activity = None;
+        self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
         self.agent_metadata.clear();
@@ -2360,6 +2363,7 @@ mod tests {
             AgentDetection {
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: false,
@@ -2384,6 +2388,7 @@ mod tests {
             AgentDetection {
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: true,
