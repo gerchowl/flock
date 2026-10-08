@@ -3983,6 +3983,7 @@ impl AppState {
             | AppEvent::PeerSummaryFetched(_)
             // #410: delivered at the App layer, which owns the mailbox.
             | AppEvent::UplinkForwarded { .. }
+            | AppEvent::AgentSubmit { .. }
             // Cross-machine checkout (#125) legs are handled at the App layer
             // (it owns the git side-effects); they never reach state-level.
             | AppEvent::PeerCheckoutProbed { .. }

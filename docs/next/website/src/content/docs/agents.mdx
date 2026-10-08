@@ -255,7 +255,7 @@ change it; `--settle 0` settles on the sample after the first qualifying one).
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
-flk agent send worker "review the auth module" && flk pane send-keys 1-2 Enter
+flk agent send --submit worker "review the auth module"
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
