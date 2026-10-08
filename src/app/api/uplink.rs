@@ -109,6 +109,21 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         response: String,
     ) {
+        if let Some((request_id, pane_id, child_pid)) = self.pending_agent_submit.take() {
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::cli::pane::PANE_RUN_SUBMIT_GAP).await;
+                let _ = event_tx
+                    .send(crate::events::AppEvent::AgentSubmit {
+                        request_id,
+                        pane_id,
+                        child_pid,
+                        respond_to,
+                    })
+                    .await;
+            });
+            return;
+        }
         let Some(park) = self.uplink.take_pending_park() else {
             let _ = respond_to.send(response);
             return;
