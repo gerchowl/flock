@@ -170,7 +170,7 @@ pub(crate) enum EnqueueOutcome {
 
 pub(crate) const MAX_QUEUED_PER_PANE: usize = 32;
 pub(crate) const RATE_LIMIT_PER_MINUTE: usize = 20;
-const MAX_SEEN: usize = 4096;
+pub(super) const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -440,6 +440,15 @@ impl MailboxRegistry {
 
     pub(crate) fn reply_meta(&self, correlation_id: &str) -> Option<&DeliveredMeta> {
         self.history.get(correlation_id)
+    }
+
+    /// All local inboxes, for one bounded delivery-attempt admission check.
+    pub(super) fn queued_correlation_ids(&self) -> HashSet<&str> {
+        self.queues
+            .values()
+            .flat_map(|queue| queue.iter())
+            .map(|message| message.correlation_id.as_str())
+            .collect()
     }
 
     /// Metadata for a message that is still queued (reply-before-delivery).
@@ -764,6 +773,7 @@ impl MailboxRegistry {
             .filter(|(to_pane, _)| pane.is_none_or(|filter| filter == to_pane.as_str()))
             .flat_map(|(_, queue)| queue.iter())
             .map(|message| crate::api::schema::QueuedMessageInfo {
+                attempts: Vec::new(),
                 correlation_id: message.correlation_id.clone(),
                 to_pane: message.to_pane.clone(),
                 from_pane: message.from_pane.clone(),

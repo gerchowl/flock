@@ -406,6 +406,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_msg_send",
             "flock_msg_reply",
             "flock_msg_list",
+            "flock_msg_status",
             "flock_msg_read",
             "flock_msg_mute",
             "flock_msg_wait_reply",
