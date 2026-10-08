@@ -584,6 +584,49 @@ impl Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_startup_passive_banners_leave_composer_ready() {
+        let screen = include_str!("../../tests/fixtures/codex/startup-passive-banners.txt");
+        let captured = include_str!("../../tests/fixtures/codex-submit-721/inline-idle.txt");
+        let prompt = "› Ask Codex to do anything";
+        // Preserve the real prompt, blank row and model/effort/directory footer.
+        assert_eq!(
+            screen.split_once(prompt).unwrap().1,
+            captured.split_once(prompt).unwrap().1
+        );
+        let (_, footer) = crate::detect::codex_composer_region(screen).expect("live composer");
+        assert_eq!(screen.lines().nth(footer), captured.lines().last());
+        let detection = crate::detect::detect_agent(Some(Agent::Codex), screen);
+        assert_eq!(detection.state, crate::detect::AgentState::Idle);
+        assert!(detection.visible_idle);
+        assert!(!detection.visible_blocker);
+        assert!(detection.provider_limit.is_none());
+        assert_eq!(composer(Agent::Codex, screen, "brief"), Composer::Empty);
+        assert_eq!(
+            composer(
+                Agent::Codex,
+                &screen.replace("Ask Codex to do anything", "brief"),
+                "brief"
+            ),
+            Composer::Owned
+        );
+    }
+
+    #[test]
+    fn codex_startup_update_dialog_is_not_a_composer() {
+        let screen = include_str!("../../tests/fixtures/codex/startup-update-dialog.txt");
+        let captured = include_str!("../../tests/fixtures/codex-submit-721/alt-idle.txt");
+        let (history, _) = captured.split_once("› Ask Codex to do anything").unwrap();
+        assert!(screen.starts_with(history));
+        // Like the captured /model picker, an active menu replaces the editor
+        // and its footer rather than retaining an editable prompt underneath.
+        let picker = include_str!("../../tests/fixtures/codex-submit-721/alt-model.txt");
+        assert!(crate::detect::codex_composer_region(picker).is_none());
+        assert!(crate::detect::codex_composer_region(screen).is_none());
+        assert_eq!(composer(Agent::Codex, screen, "brief"), Composer::Unknown);
+    }
+
     #[test]
     fn guarded_composer_requires_complete_exact_editor() {
         let screen = "──────\n❯ hello world\n──────\n? for shortcuts";
