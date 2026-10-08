@@ -747,7 +747,14 @@ fn cross_area_detach_and_reattach_preserves_state() {
     drop(client_a);
 
     // Simulate activity while detached.
-    pane_send_text(&api_socket, &pane_id, "echo DETACHED_UPDATE\n");
+    pane_send_text(&api_socket, &pane_id, "echo DETACHED_UPDATE");
+    let enter = send_json_request(
+        &api_socket,
+        "detached_enter",
+        "pane.send_keys",
+        json!({"pane_id": pane_id, "keys": ["Enter"]}),
+    );
+    assert!(enter.get("error").is_none());
     assert!(pane_read_recent_contains(
         &api_socket,
         &pane_id,

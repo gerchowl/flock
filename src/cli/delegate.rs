@@ -131,6 +131,9 @@ const RESULT_POLL: Duration = Duration::from_millis(250);
 /// How often the readiness gate asks whether the agent is at its prompt.
 const READY_POLL: Duration = Duration::from_millis(200);
 
+/// Confirmation budget for each attempt, including one guarded composer retry.
+const SUBMIT_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
+
 /// Cap on any single socket request this module makes.
 ///
 /// A delegate is a long-lived client and a live handoff replaces the socket
@@ -365,12 +368,12 @@ const TRUST_DIALOG_SCREEN: &str = concat!(
 /// All harnesses report through the same `pane.report_agent_session` method,
 /// but they report it from different places, and that is the whole reason the
 /// delegate cannot assume a session exists the moment a pane looks ready: the
-/// opencode plugin reports asynchronously (mid-turn, when it commits), and a
+/// opencode plugin reports session lifecycle events asynchronously, and a
 /// Claude or Codex `SessionStart` hook reports from inside the process, so by the time
 /// the TUI is up the report is merely in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionSource {
-    /// opencode's plugin, reporting the session mid-turn as it commits it.
+    /// OpenCode's plugin, reporting creation, update and status lifecycle events.
     Plugin,
     /// The agent's `SessionStart` hook, reporting from inside the harness.
     Hook,
@@ -424,6 +427,8 @@ struct HarnessSpec {
     /// flag name.
     argv: fn(HarnessOptions<'_>) -> Vec<String>,
     supports_sandbox: bool,
+    /// Require a turn after the pre-submit cursor and guard any composer retry.
+    confirm_submit: bool,
     /// Where the session id comes from — read for what the operator has to be
     /// told when a turn produces no reply at all.
     session_source: SessionSource,
@@ -477,6 +482,7 @@ const HARNESSES: [HarnessSpec; 3] = [
         name: "opencode",
         argv: opencode_argv,
         supports_sandbox: false,
+        confirm_submit: true,
         session_source: SessionSource::Plugin,
         result_grace: Duration::from_secs(10),
         startup_dialog: None,
@@ -485,6 +491,7 @@ const HARNESSES: [HarnessSpec; 3] = [
         name: "claude",
         argv: claude_argv,
         supports_sandbox: false,
+        confirm_submit: false,
         session_source: SessionSource::Hook,
         // The TUI clears its spinner before Claude has flushed its last
         // transcript entry, so the gap this covers is the same one it covers
@@ -499,6 +506,7 @@ const HARNESSES: [HarnessSpec; 3] = [
         name: "codex",
         argv: codex_argv,
         supports_sandbox: true,
+        confirm_submit: false,
         session_source: SessionSource::Hook,
         result_grace: Duration::from_secs(10),
         startup_dialog: Some(StartupDialog {
@@ -2647,11 +2655,19 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
-        // The sentence did not land, so this start did not happen. Undo it
-        // rather than leave a workspace, a checkout and a registry entry
-        // describing a round nobody is running. The entry WAS written by
-        // this process on the line above, so removing it here is correct.
+    if let Err(reason) = submit_brief(&pane_id, &sentence, None).and_then(|()| {
+        if harness.confirm_submit {
+            confirm_submit(&entry, &sentence)
+        } else {
+            Ok(())
+        }
+    }) {
+        if harness.confirm_submit {
+            return Ok(fail(format!(
+                "delegate {name}: brief submission could not be confirmed: {reason}. \
+                 Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
+            )));
+        }
         let _ = std::fs::remove_file(entry_path(name));
         rollback(&cleanup);
         return Ok(fail(format!(
@@ -2727,6 +2743,162 @@ fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<
         deadline,
     )?;
     Ok(())
+}
+
+/// Session lifecycle reports can precede input. Only a new working entry
+/// in this terminal's pre-submit cursor proves that a turn followed the brief.
+fn submit_turn_started(record: &serde_json::Value, baseline: &str) -> Result<bool, String> {
+    let before = Cursor::parse(baseline).map_err(|err| err.to_string())?;
+    let now = Cursor::parse(&cursor_of(record)?).map_err(|err| err.to_string())?;
+    if now.terminal_id != before.terminal_id || now.epoch != before.epoch {
+        return Err("the agent execution changed during submission".into());
+    }
+    Ok(now.entries > before.entries)
+}
+
+fn poll_submit_turn(entry: &Entry, deadline: Instant) -> Result<bool, String> {
+    loop {
+        match agent_record(&entry.terminal_id, Some(deadline)) {
+            AgentFetch::Found(record) => {
+                if submit_turn_started(&record, &entry.cursor)? {
+                    return Ok(true);
+                }
+            }
+            AgentFetch::Failed(reason) => return Err(reason),
+            AgentFetch::Missing => return Err("the agent no longer resolves".into()),
+            AgentFetch::TimedOut => return Ok(false),
+        }
+        if expired(Some(deadline)) {
+            return Ok(false);
+        }
+        sleep_bounded(deadline, READY_POLL);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Composer {
+    Brief,
+    Empty,
+    Ambiguous,
+}
+
+/// Read only the final complete OpenCode composer, bounded by its left border
+/// and bottom cap. Transcript copies of the sentence never authorize a retry.
+/// Unknown layouts, partial text and wrapped empty-prompt hints stay ambiguous.
+fn composer_state(screen: &str, sentence: &str) -> Composer {
+    let lines: Vec<_> = screen.lines().map(str::trim_start).collect();
+    let Some(end) = lines.iter().rposition(|line| line.starts_with('╹')) else {
+        return Composer::Ambiguous;
+    };
+    if !lines[end + 1..]
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.contains(" commands") && !line.contains("interrupt"))
+    {
+        return Composer::Ambiguous;
+    }
+    let start = (0..end)
+        .rev()
+        .take_while(|&i| lines[i].starts_with('┃'))
+        .last();
+    let Some(start) = start else {
+        return Composer::Ambiguous;
+    };
+    let body: Vec<_> = lines[start..end]
+        .iter()
+        .map(|line| line.trim_start_matches('┃').trim())
+        .skip_while(|line| line.is_empty())
+        .take_while(|line| !line.is_empty())
+        .collect();
+    // A composer can wrap in the middle of the brief path. Match each visible
+    // fragment against the remaining sentence, allowing space at a row break.
+    let mut remaining = sentence;
+    let holds_brief = !body.is_empty()
+        && body.iter().all(|line| {
+            if let Some(rest) = remaining.strip_prefix(line) {
+                remaining = rest.trim_start();
+                true
+            } else {
+                false
+            }
+        })
+        && remaining.is_empty();
+    let input = body.join(" ");
+    if holds_brief {
+        Composer::Brief
+    } else if body.len() == 1
+        && (input == "Ask anything…"
+            || (input.starts_with("Ask anything… \"") && input.ends_with('\"')))
+    {
+        Composer::Empty
+    } else {
+        Composer::Ambiguous
+    }
+}
+
+fn read_composer(entry: &Entry, sentence: &str, deadline: Instant) -> Result<Composer, String> {
+    let response = bounded(
+        Method::PaneRead(PaneReadParams {
+            pane_id: entry.pane_id.clone(),
+            source: ReadSource::Detection,
+            lines: Some(STARTUP_DIALOG_LINES),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        }),
+        Some(deadline),
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(error) = response.get("error") {
+        return Err(server_error(error));
+    }
+    let text = response
+        .pointer("/result/read/text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "the composer read contained no text".to_string())?;
+    Ok(composer_state(text, sentence))
+}
+
+fn confirm_submit(entry: &Entry, sentence: &str) -> Result<(), String> {
+    if poll_submit_turn(entry, Instant::now() + SUBMIT_CONFIRM_WINDOW)? {
+        return Ok(());
+    }
+    let deadline = Instant::now() + SUBMIT_CONFIRM_WINDOW;
+    let composer = read_composer(entry, sentence, deadline)?;
+    if composer == Composer::Ambiguous {
+        return Err("no new turn observed and the composer is ambiguous".into());
+    }
+    // Require a stable composer, then query the turn again immediately before
+    // retrying. Any work, replacement, blocked status or uncertainty stops it.
+    sleep_bounded(deadline, READY_POLL);
+    if read_composer(entry, sentence, deadline)? != composer {
+        return Err("the composer changed before retry".into());
+    }
+    let record = match agent_record(&entry.terminal_id, Some(deadline)) {
+        AgentFetch::Found(record) => record,
+        _ => return Err("could not guard the submission retry".into()),
+    };
+    if submit_turn_started(&record, &entry.cursor)? {
+        return Ok(());
+    }
+    if !matches!(field(&record, "agent_status"), Some("idle" | "done")) {
+        return Err("the agent is no longer at its prompt".into());
+    }
+    match composer {
+        Composer::Brief => bounded_submit(
+            Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id: entry.pane_id.clone(),
+                keys: vec!["Enter".into()],
+            }),
+            Some(deadline),
+        )?,
+        Composer::Empty => submit_brief(&entry.pane_id, sentence, Some(deadline))?,
+        Composer::Ambiguous => return Err("the composer is ambiguous".into()),
+    }
+    if poll_submit_turn(entry, deadline)? {
+        Ok(())
+    } else {
+        Err("no new turn observed after the single guarded retry".into())
+    }
 }
 
 /// Make a `bounded` request, map a timeout to a readable "timed out" string,
@@ -3473,16 +3645,15 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     };
     // `agent_record`, not `_opt`: an unreachable server is a FAILURE, never
     // a cheerful "unknown" at exit 0 (W13 / G5).
-    let status = match agent_record(&entry.terminal_id, None) {
-        AgentFetch::Found(record) => field(&record, "agent_status")
-            .unwrap_or("unknown")
-            .to_string(),
-        AgentFetch::Missing => "unknown".to_string(),
+    let record = match agent_record(&entry.terminal_id, None) {
+        AgentFetch::Found(record) => record,
+        AgentFetch::Missing => serde_json::json!({}),
         AgentFetch::TimedOut => return Ok(fail(format!("delegate {}: timed out", entry.name))),
         AgentFetch::Failed(reason) => {
             return Ok(fail(format!("delegate {}: {reason}", entry.name)))
         }
     };
+    let status = field(&record, "agent_status").unwrap_or("unknown");
     let latest = load_observation(&entry);
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
@@ -3492,6 +3663,8 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
             serde_json::json!({
                 "name": entry.name,
                 "agent_status": status,
+                "blocked_reason": record.get("blocked_reason"),
+                "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
                 "workspace_id": entry.workspace_id,
                 "mode": entry.mode,
@@ -3509,6 +3682,16 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         );
     } else {
         println!("delegate {name}: {status}");
+        if let Some(reason) = field(&record, "blocked_reason") {
+            if let Some(eta) = record
+                .get("retry_after_ms")
+                .and_then(serde_json::Value::as_u64)
+            {
+                println!("  {reason}, retry in {}s", eta / 1_000);
+            } else {
+                println!("  {reason}");
+            }
+        }
         if let Some(verdict) = latest
             .as_ref()
             .and_then(|v| v.get("verdict"))
@@ -4210,7 +4393,7 @@ fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> 
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.into(),
             source: ReadSource::Detection,
-            lines: Some(40),
+            lines: None,
             format: ReadFormat::Text,
             strip_ansi: true,
         }),
@@ -4361,6 +4544,58 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_confirmation_requires_a_new_working_entry() {
+        let baseline = "term_fixture:0:3:8:i";
+        for cursor in [baseline, "term_fixture:0:3:10:i"] {
+            let record = serde_json::json!({
+                "turn_cursor": cursor,
+                "agent_session": {"value": "startup-session"},
+                "agent_status": "idle",
+            });
+            assert!(!submit_turn_started(&record, baseline).unwrap());
+        }
+        for cursor in ["term_fixture:0:4:9:w", "term_fixture:0:4:10:i"] {
+            assert!(
+                submit_turn_started(&serde_json::json!({"turn_cursor": cursor}), baseline).unwrap()
+            );
+        }
+        for cursor in ["term_fixture:1:4:9:w", "term_other:0:4:9:w"] {
+            assert!(
+                submit_turn_started(&serde_json::json!({"turn_cursor": cursor}), baseline).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn composer_retry_requires_complete_prompt_and_exact_input() {
+        let sentence = "Read task.md and execute it exactly.";
+        let screen =
+            format!("┃\n┃  {sentence}\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n");
+        assert_eq!(composer_state(&screen, sentence), Composer::Brief);
+        assert_eq!(
+            composer_state(
+                &screen.replace(sentence, "Read task\n┃  .md and execute it exactly."),
+                sentence
+            ),
+            Composer::Brief
+        );
+        assert_eq!(
+            composer_state(&screen.replace(sentence, "Ask anything…"), sentence),
+            Composer::Empty
+        );
+        for screen in [
+            sentence.to_string(),
+            screen.replace("╹", ""),
+            screen.replace("tab agents ctrl+p commands", ""),
+            screen.replace(sentence, "Read task.md"),
+            screen.replace(sentence, "Ask anything… unfinished input"),
+            format!("{sentence}\n┃\n┃  unrelated input\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n"),
+        ] {
+            assert_eq!(composer_state(&screen, sentence), Composer::Ambiguous);
+        }
+    }
 
     /// The double-quote byte, named once so the check below does not have to
     /// write a lone quote character literal — which is the very thing it counts.

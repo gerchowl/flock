@@ -4,6 +4,7 @@
 //! against known agent output patterns to determine state.
 
 mod agents;
+pub(crate) mod provider_limit;
 
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +24,9 @@ pub enum AgentState {
 pub struct AgentDetection {
     pub state: AgentState,
     /// Free-text activity from the agent's own status line (Claude's spinner
-    /// verb, e.g. "Implementing the parser"). Only set while Working.
+    /// verb, e.g. "Implementing the parser"). Also carries a provider-wait caption while Blocked.
     pub activity: Option<String>,
+    pub(crate) provider_limit: Option<provider_limit::ProviderLimit>,
     /// True when the current screen is an agent-owned viewer that shows
     /// transcript/history instead of the live prompt state.
     pub skip_state_update: bool,
@@ -259,8 +261,6 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
     best.map(|(_, agent, name)| (agent, name))
 }
 
-/// Detect the state of an agent from the live terminal tail snapshot.
-/// If `agent` is `None`, returns `Unknown`.
 /// Transcript evidence with the detectors' recognized live status rows removed.
 pub(crate) fn progress_text(screen: &str) -> String {
     screen
@@ -270,10 +270,56 @@ pub(crate) fn progress_text(screen: &str) -> String {
                 && !agents::claude_code::has_spinner_activity(line)
                 && !agents::opencode::is_progress_chrome(line)
         })
+        .map(normalize_running_tool_counter)
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// Keep Claude's running-tool row and controls, ignoring only elapsed time.
+fn normalize_running_tool_counter(line: &str) -> String {
+    let Some(activity) = line.trim().strip_prefix('⎿') else {
+        return line.to_owned();
+    };
+    let activity = activity.trim_start();
+    let Some(suffix) = activity
+        .strip_prefix("Running…")
+        .or_else(|| activity.strip_prefix("Running..."))
+    else {
+        return line.to_owned();
+    };
+    if !suffix.trim_start().starts_with('(') {
+        return line.to_owned();
+    }
+    let Some((row, details)) = line.trim_end().rsplit_once('(') else {
+        return line.to_owned();
+    };
+    let Some(details) = details.strip_suffix(')') else {
+        return line.to_owned();
+    };
+    let (elapsed, controls) = details
+        .split_once('·')
+        .map_or((details, None), |(elapsed, controls)| {
+            (elapsed, Some(controls))
+        });
+    let parts: Vec<&str> = elapsed.split_whitespace().collect();
+    if parts.is_empty()
+        || !parts.iter().all(|part| {
+            let Some(digits) = part.strip_suffix(['h', 'm', 's']) else {
+                return false;
+            };
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return line.to_owned();
+    }
+    match controls {
+        Some(controls) => format!("{}({})", row, controls.trim_start()),
+        None => row.trim_end().to_owned(),
+    }
+}
+
+/// Detect the state of an agent from the live terminal tail snapshot.
+/// If `agent` is `None`, returns `Unknown`.
 #[cfg(test)]
 pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
     detect_agent(agent, screen_content).state
@@ -285,6 +331,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
         return AgentDetection {
             state: AgentState::Unknown,
             activity: None,
+            provider_limit: None,
             skip_state_update: false,
             visible_blocker: false,
             visible_idle: false,
@@ -1977,6 +2024,57 @@ mod tests {
     }
 
     // ---- OpenCode ----
+
+    #[test]
+    fn opencode_provider_limit_is_blocked_before_progress() {
+        for error in [
+            "Free usage exceeded, subscribe to Go",
+            "rate limit",
+            "usage limit reached",
+        ] {
+            let screen = format!("■■⬝⬝⬝⬝⬝⬝ {error} [retrying in 46m 15s attempt #1] esc interrupt");
+            let detection = detect_agent(Some(Agent::OpenCode), &screen);
+            assert_eq!(detection.state, AgentState::Blocked, "{error}");
+            assert!(detection.visible_blocker);
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_wrapped_capture_retains_eta() {
+        let screen = "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retry\ning in 46m 15s attempt #1]      esc interrupt";
+        assert_eq!(detect_opencode(screen), AgentState::Blocked);
+        assert_eq!(
+            provider_limit::opencode(screen).unwrap().retry_after_ms,
+            Some(2_775_000)
+        );
+    }
+
+    #[test]
+    fn opencode_provider_limit_requires_live_controls_on_same_row() {
+        for screen in [
+            "Free usage exceeded [retrying in 46m attempt #1]\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+            "Free usage exceeded [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝ tool failed [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit esc interrupt",
+            "A quoted status: ■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ esc interrupt\nrate limit [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝\n\nrate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+        ] {
+            assert_ne!(detect_opencode(screen), AgentState::Blocked, "{screen}");
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_recovers_on_next_screen() {
+        let wait = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt";
+        assert_eq!(detect_opencode(wait), AgentState::Blocked);
+        assert_eq!(
+            detect_opencode("■■⬝⬝⬝⬝⬝⬝ esc interrupt"),
+            AgentState::Working
+        );
+        assert_eq!(detect_opencode("ctrl+p commands"), AgentState::Idle);
+    }
 
     #[test]
     fn opencode_waiting_permission() {

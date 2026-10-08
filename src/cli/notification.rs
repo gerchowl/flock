@@ -44,10 +44,15 @@ fn notification_show(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    super::print_response(&super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: "cli:notification:show".into(),
         method: Method::NotificationShow(params),
-    })?)
+    })?;
+    let exit = super::print_response(&response)?;
+    if exit == 0 && response["result"]["shown"] == false {
+        return Ok(3);
+    }
+    Ok(exit)
 }
 
 /// `flk notification list` (#372) — the outcomes that outlived their toasts.

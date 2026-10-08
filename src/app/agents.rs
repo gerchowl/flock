@@ -1068,6 +1068,9 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
@@ -1076,6 +1079,8 @@ impl App {
             title: pane.title,
             display_agent: pane.display_agent,
             agent_status: pane.agent_status,
+            blocked_reason: provider_wait.as_ref().map(|_| "provider_limit".into()),
+            retry_after_ms: provider_wait.and_then(|wait| wait.retry_after_ms),
             custom_status: pane.custom_status,
             state_labels: pane.state_labels,
             agent_session: pane.agent_session,

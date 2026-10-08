@@ -3001,6 +3001,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
