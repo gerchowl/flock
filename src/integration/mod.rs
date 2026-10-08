@@ -29,7 +29,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 9;
+const CLAUDE_INTEGRATION_VERSION: u32 = 10;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -49,11 +49,11 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
 pub(crate) const CLAUDE_HOOK_TIMEOUT: u64 = 10;
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 6;
+const CODEX_INTEGRATION_VERSION: u32 = 7;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/flock-agent-state.sh");
-const KIMI_INTEGRATION_VERSION: u32 = 2;
+const KIMI_INTEGRATION_VERSION: u32 = 3;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> flock kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< flock kimi integration";
@@ -72,7 +72,7 @@ const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
 ];
 const COPILOT_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const COPILOT_HOOK_ASSET: &str = include_str!("assets/copilot/flock-agent-state.sh");
-const COPILOT_INTEGRATION_VERSION: u32 = 1;
+const COPILOT_INTEGRATION_VERSION: u32 = 2;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
@@ -85,7 +85,7 @@ const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py")
 const HERMES_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/flock-agent-state.sh");
-const QODERCLI_INTEGRATION_VERSION: u32 = 2;
+const QODERCLI_INTEGRATION_VERSION: u32 = 3;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
 const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
@@ -4324,7 +4324,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4354,7 +4354,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4935,7 +4935,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_v1_integration_status_is_current() {
+    fn copilot_v1_integration_status_is_outdated() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -4957,8 +4957,8 @@ mod tests {
 
         assert_eq!(copilot.path, hook_path);
         assert_eq!(copilot.installed_version, Some(1));
-        assert_eq!(copilot.expected_version, 1);
-        assert_eq!(copilot.state, IntegrationStatusKind::Current);
+        assert_eq!(copilot.expected_version, COPILOT_INTEGRATION_VERSION);
+        assert_eq!(copilot.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -5246,7 +5246,7 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        // Codex, kimi and qodercli are thin stubs now too (#238): their bodies
+        // Codex, Copilot, kimi and qodercli are thin stubs now too (#238): their bodies
         // were an embedded python3 heredoc and now live in `flk hook <agent>`
         // (cli::hook::tests). The stubs only delegate — and crucially no longer
         // need an interpreter resolved from ambient PATH.
@@ -5257,19 +5257,19 @@ mod tests {
         assert!(QODERCLI_HOOK_ASSET.contains("hook qodercli"));
         assert!(!QODERCLI_HOOK_ASSET.contains("pane.report_agent"));
         for (name, asset) in [
+            ("claude", CLAUDE_HOOK_ASSET),
+            ("copilot", COPILOT_HOOK_ASSET),
             ("codex", CODEX_HOOK_ASSET),
             ("kimi", KIMI_HOOK_ASSET),
             ("qodercli", QODERCLI_HOOK_ASSET),
         ] {
             assert!(
-                !asset.contains("command -v python3"),
+                !asset.contains("command -v python3") && !asset.contains("python3 -"),
                 "{name} still guards on an ambient python3 (#238)"
             );
         }
-        assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
-        assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
-        assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
-        assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
+        assert!(COPILOT_HOOK_ASSET.contains("hook copilot event"));
+        assert!(!COPILOT_HOOK_ASSET.contains("pane.report_agent"));
         // Opencode is a thin plugin now (#158): it maps session events and
         // delegates to `flk hook opencode session`; the report lives in Rust.
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));

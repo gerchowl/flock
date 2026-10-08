@@ -4,7 +4,7 @@
 )]
 //! `flk hook <agent> <action>` — the single-source-of-truth agent hook body.
 //!
-//! The per-agent shim assets (claude `sh`+`python`, opencode `js`, pi/omp `ts`,
+//! The per-agent shim assets (claude/copilot `sh`, opencode `js`, pi/omp `ts`,
 //! …) each reimplement the same wire protocol — parse the hook JSON, open the
 //! flock socket, speak `pane.report_*`, and (for Claude's Stop) scrape the
 //! transcript and emit a self-heal nudge. That logic belongs in the binary
@@ -69,6 +69,7 @@ enum Agent {
     Codex,
     Kimi,
     Qodercli,
+    Copilot,
 }
 
 impl Agent {
@@ -79,6 +80,7 @@ impl Agent {
             "codex" => Some(Self::Codex),
             "kimi" => Some(Self::Kimi),
             "qodercli" => Some(Self::Qodercli),
+            "copilot" => Some(Self::Copilot),
             _ => None,
         }
     }
@@ -90,6 +92,7 @@ impl Agent {
             Self::Codex => "flock:codex",
             Self::Kimi => "flock:kimi",
             Self::Qodercli => "flock:qodercli",
+            Self::Copilot => "flock:copilot",
         }
     }
 
@@ -100,6 +103,7 @@ impl Agent {
             Self::Codex => "codex",
             Self::Kimi => "kimi",
             Self::Qodercli => "qodercli",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -119,6 +123,8 @@ impl Agent {
 
 #[derive(Clone, Copy)]
 enum Action {
+    /// Copilot supplies the lifecycle event in its JSON payload.
+    Event,
     Session,
     Prompt,
     Stop,
@@ -135,6 +141,7 @@ enum Action {
 impl Action {
     fn parse(raw: &str) -> Option<Self> {
         match raw {
+            "event" => Some(Self::Event),
             "session" => Some(Self::Session),
             "prompt" => Some(Self::Prompt),
             "stop" => Some(Self::Stop),
@@ -166,12 +173,16 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     if super::help::asks_for_help(args) {
         // stdout, like `flk --help`: the request was honoured, so this is the
         // command's output and can be redirected or paged.
-        println!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
+        println!(
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release>"
+        );
         return Ok(0);
     }
 
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
+        eprintln!(
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release>"
+        );
         return Ok(2);
     };
 
@@ -259,6 +270,8 @@ fn plan(
     config_dir: Option<&str>,
 ) -> HookOutcome {
     match action {
+        Action::Event if matches!(agent, Agent::Copilot) => plan_copilot(input, pane_id),
+        Action::Event => HookOutcome::default(),
         Action::Session => plan_session(agent, input, hook_event_name, pane_id, config_dir),
         Action::Prompt => plan_prompt(agent, input, pane_id),
         // Only Claude carries a scrapable transcript + nudge protocol on Stop.
@@ -272,6 +285,119 @@ fn plan(
         Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
         Action::State(state) => plan_state(agent, state, input, pane_id),
         Action::Release => plan_release(agent, input, pane_id),
+    }
+}
+
+/// Copilot's event vocabulary and inference order match its installed hook.
+/// Explicit event names win over payload clues, including unknown events.
+fn plan_copilot(input: &serde_json::Value, pane_id: &str) -> HookOutcome {
+    let field = |snake, camel| str_field(input, snake).or_else(|| str_field(input, camel));
+    let tool = field("tool_name", "toolName");
+    let notification = field("notification_type", "notificationType");
+    let stop_reason = field("stop_reason", "stopReason");
+    let reason = str_field(input, "reason");
+    let session_id = field("session_id", "sessionId");
+    let event = field("hook_event_name", "hookEventName").unwrap_or_else(|| {
+        if notification.is_some() {
+            "notification"
+        } else if input.get("toolResult").is_some() || input.get("tool_result").is_some() {
+            "postToolUse"
+        } else if input.get("error").is_some() && tool.is_some() {
+            "postToolUseFailure"
+        } else if tool.is_some() {
+            "preToolUse"
+        } else if stop_reason.is_some() {
+            "agentStop"
+        } else if reason.is_some() {
+            "sessionEnd"
+        } else if input.get("prompt").is_some() {
+            "userPromptSubmitted"
+        } else if input.get("initial_prompt").is_some()
+            || input.get("initialPrompt").is_some()
+            || input.get("source").is_some()
+            || session_id.is_some()
+        {
+            "sessionStart"
+        } else {
+            ""
+        }
+        .to_string()
+    });
+    let event: String = event
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let state = match event.as_str() {
+        "sessionstart" => {
+            let has_prompt = input
+                .get("initial_prompt")
+                .or_else(|| input.get("initialPrompt"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|prompt| !prompt.trim().is_empty());
+            if has_prompt {
+                PaneAgentState::Working
+            } else {
+                PaneAgentState::Idle
+            }
+        }
+        "userpromptsubmit" | "userpromptsubmitted" => PaneAgentState::Working,
+        "pretooluse" => match tool.as_deref() {
+            Some("ask_user" | "exit_plan_mode") => PaneAgentState::Blocked,
+            _ => PaneAgentState::Working,
+        },
+        "posttooluse" | "posttoolusefailure" => {
+            // report_intent may follow ask_user before the user has answered.
+            if tool.as_deref() == Some("report_intent") {
+                return HookOutcome::default();
+            }
+            PaneAgentState::Working
+        }
+        "notification" => match notification.as_deref() {
+            Some("permission_prompt" | "elicitation_dialog") => PaneAgentState::Blocked,
+            Some("agent_idle") => PaneAgentState::Idle,
+            _ => return HookOutcome::default(),
+        },
+        "stop" | "agentstop" | "sessionstop" => {
+            if stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason != "end_turn")
+            {
+                return HookOutcome::default();
+            }
+            PaneAgentState::Idle
+        }
+        "sessionend" => {
+            // complete is a turn boundary, not an ownership release.
+            return if matches!(reason.as_deref(), Some("user_exit" | "abort")) {
+                HookOutcome {
+                    reports: vec![Method::PaneReleaseAgent(PaneReleaseAgentParams {
+                        pane_id: pane_id.to_string(),
+                        source: Agent::Copilot.source().to_string(),
+                        agent: Agent::Copilot.agent().to_string(),
+                        seq: Some(seq()),
+                    })],
+                    ..HookOutcome::default()
+                }
+            } else {
+                HookOutcome::default()
+            };
+        }
+        _ => return HookOutcome::default(),
+    };
+    HookOutcome {
+        reports: vec![Method::PaneReportAgent(PaneReportAgentParams {
+            pane_id: pane_id.to_string(),
+            source: Agent::Copilot.source().to_string(),
+            agent: Agent::Copilot.agent().to_string(),
+            state,
+            message: None,
+            custom_status: None,
+            seq: Some(seq()),
+            agent_session_id: session_id,
+            agent_session_path: None,
+        })],
+        ..HookOutcome::default()
     }
 }
 
@@ -1067,14 +1193,148 @@ mod tests {
             ("codex", "flock:codex", "codex"),
             ("kimi", "flock:kimi", "kimi"),
             ("qodercli", "flock:qodercli", "qodercli"),
+            ("copilot", "flock:copilot", "copilot"),
         ] {
             let parsed = Agent::parse(raw).expect("agent parses");
             assert_eq!(parsed.source(), source);
             assert_eq!(parsed.agent(), agent);
         }
-        // copilot still ships its own shim (its event state machine is not
-        // ported yet) — it must NOT resolve here and silently do nothing.
-        assert!(Agent::parse("copilot").is_none());
+    }
+
+    #[test]
+    fn copilot_event_reports_preserve_state_and_session_identity() {
+        for (input, state) in [
+            (json!({"session_id": "s"}), PaneAgentState::Idle),
+            (
+                json!({"sessionId": "s", "initialPrompt": "go"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"sessionId": "s", "initialPrompt": "  "}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "prompt": "go"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "ask_user"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"sessionId": "s", "toolName": "exit_plan_mode"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "bash"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"sessionId": "s", "toolName": "ask_user", "toolResult": null}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "exit_plan_mode", "error": null}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "notification_type": "permission_prompt"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"sessionId": "s", "notificationType": "elicitation_dialog"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"session_id": "s", "notification_type": "agent_idle"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"sessionId": "s", "stopReason": "end_turn"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hook_event_name": "Stop"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hook_event_name": "agentStop", "stop_reason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hookEventName": "agentStop", "stopReason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hookEventName": "USER-PROMPT_SUBMITTED"}),
+                PaneAgentState::Working,
+            ),
+        ] {
+            let out = plan(Agent::Copilot, Action::Event, &input, "", "p_1", 0, None);
+            assert_eq!(out.reports.len(), 1, "{input}");
+            let Method::PaneReportAgent(report) = &out.reports[0] else {
+                panic!("expected state report for {input}");
+            };
+            assert_eq!(report.state, state, "{input}");
+            assert_eq!(report.agent_session_id.as_deref(), Some("s"));
+            assert_eq!(report.source, "flock:copilot");
+            assert_eq!(report.agent, "copilot");
+            assert_eq!(report.pane_id, "p_1");
+            assert!(report.seq.is_some());
+            assert!(out.stdout.is_none());
+        }
+    }
+
+    #[test]
+    fn copilot_ignores_incidental_events_and_keeps_turn_ownership() {
+        for input in [
+            json!({}),
+            json!(null),
+            json!({"hookEventName": "unknown", "prompt": "go"}),
+            json!({"tool_name": "report_intent", "tool_result": {}}),
+            json!({"toolName": "report_intent", "error": "failed"}),
+            json!({"notification_type": "other"}),
+            json!({"stop_reason": "tool_use"}),
+            json!({"reason": "complete"}),
+            json!({"reason": "other"}),
+        ] {
+            assert!(plan_copilot(&input, "p_1").reports.is_empty(), "{input}");
+        }
+        for reason in ["user_exit", "abort"] {
+            let out = plan_copilot(&json!({"reason": reason}), "p_1");
+            assert_eq!(out.reports.len(), 1);
+            let Method::PaneReleaseAgent(report) = &out.reports[0] else {
+                panic!("expected release for {reason}");
+            };
+            assert_eq!(report.source, "flock:copilot");
+            assert_eq!(report.agent, "copilot");
+            assert_eq!(report.pane_id, "p_1");
+        }
+    }
+
+    #[test]
+    fn copilot_field_precedence_matches_the_shell_hook() {
+        let out = plan_copilot(
+            &json!({
+                "hook_event_name": "session-start", "hookEventName": "PreToolUse",
+                "session_id": "snake", "sessionId": "camel",
+                "initial_prompt": null, "initialPrompt": "go", "tool_name": "ask_user"
+            }),
+            "p_1",
+        );
+        let Method::PaneReportAgent(report) = &out.reports[0] else {
+            panic!("expected state report");
+        };
+        assert_eq!(report.state, PaneAgentState::Idle);
+        assert_eq!(report.agent_session_id.as_deref(), Some("snake"));
+        let out = plan_copilot(
+            &json!({"hookEventName": "SessionStop", "session_id": 42}),
+            "p_1",
+        );
+        let Method::PaneReportAgent(report) = &out.reports[0] else {
+            panic!("expected state report without session id");
+        };
+        assert_eq!(report.agent_session_id, None);
     }
 
     // --- run_hook_command guards (all trip before stdin is read) ---------

@@ -589,16 +589,84 @@ fn run_copilot_hook(hook_input: &str) -> Option<serde_json::Value> {
     )
 }
 
+#[test]
+fn shell_hooks_report_unavailable_binary_per_call_only_inside_flock() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let non_executable = base.join("non-executable-flk");
+    fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        &non_executable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    for agent in ["claude", "codex", "copilot", "kimi", "qodercli"] {
+        let asset = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "src/integration/assets/{agent}/flock-agent-state.sh"
+        ));
+        for inside in [false, true] {
+            for binary in ["flk", "missing-flk", "non-executable-flk"] {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .arg(&asset)
+                    .arg("session")
+                    .env("PATH", &base)
+                    .env("FLOCK_ENV", if inside { "1" } else { "0" })
+                    .env("FLOCK_PANE_ID", "p_test")
+                    .env("FLOCK_SOCKET_PATH", base.join("unused.sock"))
+                    .env_remove("FLOCK_BIN");
+                if binary != "flk" {
+                    command.env("FLOCK_BIN", base.join(binary));
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{agent}");
+                assert!(output.stdout.is_empty(), "{agent}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                if inside {
+                    assert_eq!(stderr.lines().count(), 1, "{agent}: {stderr}");
+                    assert!(
+                        stderr.contains("flock hook: required binary"),
+                        "{agent}: {stderr}"
+                    );
+                    assert!(stderr.contains(binary));
+                } else {
+                    assert!(stderr.is_empty(), "{agent}: {stderr}");
+                }
+            }
+        }
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn copilot_non_object_stdin_through_run_hook_command_reports_nothing() {
+    // The installed stub invokes the binary's run_hook_command dispatcher,
+    // exercising stdin parsing before Copilot's pure event planner runs.
+    for input in [
+        "null",
+        "[]",
+        r#"[{"toolName":"ask_user"}]"#,
+        "42",
+        r#""ask_user""#,
+    ] {
+        assert!(run_copilot_hook(input).is_none(), "{input}");
+    }
+}
+
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("flock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
+    // Wait until the hook exits rather than racing binary startup against a
+    // short timer. Once it exits, no further reports can reach the listener.
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_finished = finished.clone();
     let server = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(700);
-        while Instant::now() < deadline {
+        loop {
+            let hook_exited = hook_finished.load(std::sync::atomic::Ordering::Acquire);
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let mut line = String::new();
@@ -610,18 +678,21 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
                     return Some(line);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if hook_exited {
+                        return None;
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => panic!("accept failed: {err}"),
             }
         }
-        None
     });
 
     let hook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(asset_path);
-    let mut child = Command::new("bash")
+    let mut child = Command::new("/bin/sh")
         .arg(hook_path)
         .args(args)
+        .env("PATH", &base)
         .env("FLOCK_ENV", "1")
         .env("FLOCK_SOCKET_PATH", &socket_path)
         .env("FLOCK_PANE_ID", "p_test")
@@ -639,6 +710,7 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
     drop(stdin);
 
     let output = child.wait_with_output().unwrap();
+    finished.store(true, std::sync::atomic::Ordering::Release);
     assert!(
         output.status.success(),
         "hook failed: status={:?} stderr={} stdout={}",
