@@ -48,14 +48,39 @@ fn externally_owned_at(path: &Path) -> bool {
     })
 }
 
-pub(super) fn install(
+pub(super) fn install(target: IntegrationTarget, originally_owned: bool) -> Option<String> {
+    let result = config_path(target).and_then(|path| match path {
+        Some(path) => install_at(
+            &path,
+            target,
+            originally_owned,
+            super::launch::stable_launch_path,
+        ),
+        None => Ok(None),
+    });
+    registration_outcome(target, result)
+}
+
+fn registration_outcome(
+    target: IntegrationTarget,
+    result: io::Result<Option<String>>,
+) -> Option<String> {
+    match result {
+        Ok(message) => message,
+        Err(err) => Some(format!(
+            "{} MCP registration deferred: {err}; hooks remain installed. Merge a flock MCP entry through the configuration owner using an absolute profile/user-local flk path with args mcp serve",
+            super::integration_target_label(target)
+        )),
+    }
+}
+
+fn install_at(
+    path: &Path,
     target: IntegrationTarget,
     originally_owned: bool,
+    launch: impl FnOnce() -> io::Result<PathBuf>,
 ) -> io::Result<Option<String>> {
-    let Some(path) = config_path(target)? else {
-        return Ok(None);
-    };
-    let content = match fs::read_to_string(&path) {
+    let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
@@ -84,7 +109,7 @@ pub(super) fn install(
             path.display()
         )));
     }
-    let launch = super::launch::stable_launch_path()?;
+    let launch = launch()?;
     let updated = if target == IntegrationTarget::Codex {
         add_toml_entry(&content, &launch)?
     } else {
@@ -105,7 +130,7 @@ pub(super) fn install(
             path.display()
         )));
     };
-    if originally_owned || externally_owned_at(&path) {
+    if originally_owned || externally_owned_at(path) {
         return Ok(Some(format!(
             "MCP config {} is externally owned; merge command {} with args mcp serve",
             path.display(),
@@ -115,7 +140,19 @@ pub(super) fn install(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    super::atomic_write::replace(&path, updated.as_bytes())?;
+    // Claude Code can update this file while installation is preparing an
+    // entry. Re-read at the write boundary and defer rather than lose its edit.
+    let latest = match fs::read_to_string(path) {
+        Ok(latest) => latest,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+    if latest != content {
+        return Err(io::Error::other(
+            "MCP config changed during registration; retry installation",
+        ));
+    }
+    super::atomic_write::replace(path, updated.as_bytes())?;
     Ok(Some(format!(
         "registered flock MCP in {} using {}",
         path.display(),
@@ -141,15 +178,50 @@ fn add_json_entry(content: &str, launch: &Path, opencode: bool) -> io::Result<Op
     if servers.contains_key("flock") {
         return Ok(None);
     }
-    servers.insert(
-        "flock".into(),
-        if opencode {
-            json!({"type": "local", "command": [launch, "mcp", "serve"], "enabled": true})
-        } else {
-            json!({"type": "stdio", "command": launch, "args": ["mcp", "serve"]})
-        },
-    );
-    Ok(Some(format!("{}\n", serde_json::to_string_pretty(&doc)?)))
+    let entry = if opencode {
+        json!({"type": "local", "command": [launch, "mcp", "serve"], "enabled": true})
+    } else {
+        json!({"type": "stdio", "command": launch, "args": ["mcp", "serve"]})
+    };
+    // Borrow raw member text solely to locate the insertion point. Existing
+    // objects retain their byte order and formatting without a global change
+    // to serde_json's map ordering semantics.
+    let original = if content.trim().is_empty() {
+        "{}"
+    } else {
+        content
+    };
+    let members: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(original).map_err(io::Error::other)?;
+    let fragment = format!("\"flock\":{}", serde_json::to_string(&entry)?);
+    let (offset, addition) = if let Some(raw) = members.get(key) {
+        let start = raw.get().as_ptr() as usize - original.as_ptr() as usize;
+        let end = raw
+            .get()
+            .rfind('}')
+            .ok_or_else(|| io::Error::other("missing MCP object boundary"))?;
+        (
+            start + end,
+            format!("{}{fragment}", if servers.is_empty() { "" } else { "," }),
+        )
+    } else {
+        let end = original
+            .rfind('}')
+            .ok_or_else(|| io::Error::other("missing config object boundary"))?;
+        (
+            end,
+            format!(
+                "{}\"{key}\":{{{fragment}}}",
+                if members.is_empty() { "" } else { "," }
+            ),
+        )
+    };
+    Ok(Some(format!(
+        "{}{}{}",
+        &original[..offset],
+        addition,
+        &original[offset..]
+    )))
 }
 
 fn add_toml_entry(content: &str, launch: &Path) -> io::Result<Option<String>> {
@@ -269,6 +341,66 @@ fn configured_commands(raw: &str, target: IntegrationTarget) -> io::Result<Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_registration_preserves_json_key_order_and_existing_bytes() {
+        let launch = crate::test_support::unique_temp_path("ordered-flk");
+        for original in [
+            r#"{"zRoot":1,"mcpServers":{"zServer":{"command":"z"},"aServer":{"command":"a"}},"aRoot":2}"#,
+            r#"{"zRoot":{"mcpServers":"incidental"},"aRoot":2}"#,
+            r#"{"mcpServers":{},"zRoot":1,"aRoot":2}"#,
+        ] {
+            let updated = add_json_entry(original, &launch, false).unwrap().unwrap();
+            assert!(updated.find("zRoot").unwrap() < updated.find("aRoot").unwrap());
+            assert!(
+                updated.contains(r#""zRoot":1"#)
+                    || updated.contains(r#""zRoot":{"mcpServers":"incidental"}"#)
+            );
+            if original.contains("zServer") {
+                assert!(updated.find("zServer").unwrap() < updated.find("aServer").unwrap());
+                assert!(updated.find("aServer").unwrap() < updated.find("flock").unwrap());
+            }
+            let parsed: Value = serde_json::from_str(&updated).unwrap();
+            assert_eq!(
+                parsed["mcpServers"]["flock"]["command"],
+                launch.to_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_registration_defers_store_only_parse_and_concurrent_write_failures() {
+        let dir = crate::test_support::unique_temp_path("deferred-mcp");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let target = IntegrationTarget::Opencode;
+        let pinned = Path::new("/nix/store/fixture-flock/bin/flk");
+        let result = install_at(&path, target, false, || {
+            super::super::launch::select_launch_path(Some(pinned), pinned, &[])
+        });
+        let guidance = registration_outcome(target, result).unwrap();
+        assert!(guidance.contains("no stable flk launch path"));
+        assert!(!path.exists());
+        for content in ["{ // owner's comments\n \"mcp\": {} }", "invalid JSON"] {
+            fs::write(&path, content).unwrap();
+            let result = install_at(&path, target, false, || Ok(dir.join("flk")));
+            assert!(registration_outcome(target, result)
+                .unwrap()
+                .contains("MCP registration deferred"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        }
+        fs::write(&path, "{}").unwrap();
+        let changed = r#"{"claudeWrites":"keep"}"#;
+        let result = install_at(&path, IntegrationTarget::Claude, false, || {
+            fs::write(&path, changed)?;
+            Ok(dir.join("flk"))
+        });
+        assert!(registration_outcome(IntegrationTarget::Claude, result)
+            .unwrap()
+            .contains("changed during registration"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn mcp_registrations_use_stable_path_and_preserve_custom_targets() {

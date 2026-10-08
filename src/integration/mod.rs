@@ -17,7 +17,8 @@ use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
 /// Stable absolute launch path for hook stubs, without resolving profile
-/// symlinks into immutable store paths. Explicit non-store overrides survive.
+/// symlinks into immutable store paths where possible, with the server's own
+/// executable as the fallback for installations without a stable path.
 pub(crate) const FLOCK_BIN_ENV_VAR: &str = "FLOCK_BIN";
 const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
@@ -281,16 +282,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     }
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
-    // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
-    let explicit = cmd.get_env(FLOCK_BIN_ENV_VAR).map(PathBuf::from);
-    if explicit
-        .as_ref()
-        .is_none_or(|path| launch::is_store_path(path))
-    {
-        cmd.env_remove(FLOCK_BIN_ENV_VAR);
-        if let Ok(exe) = launch::stable_launch_path() {
-            cmd.env(FLOCK_BIN_ENV_VAR, exe);
-        }
+    // Stamp this server's executable rather than an outer pane's inherited
+    // FLOCK_BIN. Keep the current executable as a Nix-only fallback (#158).
+    if let Ok(current) = std::env::current_exe() {
+        cmd.env(
+            FLOCK_BIN_ENV_VAR,
+            launch::pane_launch_path(&current, launch::stable_launch_path()),
+        );
     }
     // #175 S3 commit 4 (ops): consume the one-shot FLOCK_RUN_ID set by
     // the caller right before spawn. Thread-local because pane spawn is
@@ -643,7 +641,7 @@ pub(crate) fn install_target_with_hook_trust(
         }
     };
 
-    if let Some(message) = mcp_config::install(target, mcp_config_externally_owned)? {
+    if let Some(message) = mcp_config::install(target, mcp_config_externally_owned) {
         messages.push(message);
     }
 
@@ -3540,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_env_preserves_custom_launch_and_replaces_inherited_store_pin() {
+    fn pane_env_supersedes_outer_launch_and_replaces_inherited_store_pin() {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.env(FLOCK_BIN_ENV_VAR, "/nix/store/fixture-flock/bin/flk");
         apply_pane_env(&mut cmd, PaneId::from_raw(7));
@@ -3549,7 +3547,8 @@ mod tests {
         let custom = crate::test_support::unique_temp_path("custom-flk");
         cmd.env(FLOCK_BIN_ENV_VAR, &custom);
         apply_pane_env(&mut cmd, PaneId::from_raw(7));
-        assert_eq!(cmd.get_env(FLOCK_BIN_ENV_VAR), Some(custom.as_os_str()));
+        let own = std::env::current_exe().unwrap();
+        assert_eq!(cmd.get_env(FLOCK_BIN_ENV_VAR), Some(own.as_os_str()));
     }
 
     fn kimi_hook_command(hook_path: &Path, action: &str) -> String {

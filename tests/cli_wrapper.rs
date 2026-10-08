@@ -3678,5 +3678,16 @@ fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
     let after_hooks: toml::Value =
         toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
     assert!(after_hooks.get("mcp_servers").is_none());
+    fs::remove_file(opencode.join("opencode.jsonc")).unwrap();
+    let commented = "{ // owner keeps these comments\n \"mcp\": {} }";
+    fs::write(opencode.join("opencode.json"), commented).unwrap();
+    let result = run(&["integration", "install", "opencode"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("MCP registration deferred"));
+    assert_eq!(
+        fs::read_to_string(opencode.join("opencode.json")).unwrap(),
+        commented
+    );
+    assert!(opencode.join("plugins/flock-agent-state.js").is_file());
     cleanup_test_base(&base);
 }

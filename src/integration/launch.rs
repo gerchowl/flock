@@ -23,7 +23,7 @@ pub(crate) fn stable_launch_path() -> io::Result<PathBuf> {
     select_launch_path(invocation.as_deref(), &current, &paths)
 }
 
-fn select_launch_path(
+pub(super) fn select_launch_path(
     invocation: Option<&Path>,
     current: &Path,
     paths: &[PathBuf],
@@ -53,9 +53,27 @@ fn select_launch_path(
     ))
 }
 
+/// Hook calls must keep working even when a Nix-only installation has no
+/// stable profile entry. A non-store server executable also supersedes any
+/// FLOCK_BIN inherited from an outer pane, including development builds.
+pub(super) fn pane_launch_path(current: &Path, stable: io::Result<PathBuf>) -> PathBuf {
+    if !is_store_path(current) {
+        current.to_owned()
+    } else {
+        stable.unwrap_or_else(|_| current.to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_launch_path_keeps_store_executable_without_a_profile() {
+        let current = Path::new("/nix/store/fixture-flock/bin/flk");
+        let stable = select_launch_path(Some(current), current, &[]);
+        assert_eq!(pane_launch_path(current, stable), current);
+    }
 
     #[test]
     fn stable_launch_path_keeps_profile_symlink_after_retarget() {

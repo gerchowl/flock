@@ -331,7 +331,7 @@ fn installed_status_at(
                 ServerRuntimeStatus::Running {
                     version: running, ..
                 } => running.as_ref().map(|running| running != &version),
-                ServerRuntimeStatus::NotRunning => Some(false),
+                ServerRuntimeStatus::NotRunning => None,
             };
             status.version = Some(version);
         }
@@ -555,6 +555,13 @@ mod installed_tests {
         assert_eq!(after.server_drift, Some(true));
         assert_eq!(after.binary.as_deref(), Some(launch.to_str().unwrap()));
         assert!(after.error.is_none());
+        let absent = installed_status_at(
+            Ok(launch),
+            &ServerRuntimeStatus::NotRunning,
+            std::time::Duration::from_secs(10),
+        );
+        assert!(absent.server_drift.is_none());
+        assert!(absent.version.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
