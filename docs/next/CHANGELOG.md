@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-- Plain commits from fresh worktrees now run the gates through `nix develop` automatically when hook tooling is missing from PATH (#642).
 ### Changed
 - **Release notes accept per-PR changelog fragments**, avoiding conflicts between concurrent PRs; release preparation combines them with existing Unreleased entries and removes the consumed fragments (#635).
 
