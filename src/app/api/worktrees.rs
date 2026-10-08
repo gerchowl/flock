@@ -785,6 +785,15 @@ impl App {
             Err(err) => return encode_error(id, err.code, err.message),
         };
 
+        // #631's self-guard, BEFORE the merge gate: the gate can spend a `gh`
+        // round trip, and a call that is going to be refused must not also pay
+        // for an answer nobody asked for.
+        if !params.dry_run {
+            if let Err(err) = self.refuse_unguarded_self_kill(&target, &params) {
+                return encode_error(id, err.code, err.message);
+            }
+        }
+
         // ONE resolver, shared with the kill dialog, the fleet sweep and
         // `worktree.list --scan` (#396). A second "is this merged" next to any
         // of them would drift — and would drift wrong, since the obvious
@@ -924,10 +933,42 @@ impl App {
         )
     }
 
+    /// Real MCP kills require confirmation when the peer belongs to the target.
+    fn refuse_unguarded_self_kill(
+        &mut self,
+        target: &KillTarget,
+        params: &WorktreeKillParams,
+    ) -> Result<(), ApiFailure> {
+        if params.self_kill_confirmed != Some(false) {
+            return Ok(());
+        }
+        let Some(target_ws) = target.workspace_idx else {
+            return Ok(());
+        };
+        let Some(caller_ws) = self.caller_workspace_idx() else {
+            return Ok(());
+        };
+        if caller_ws != target_ws {
+            return Ok(());
+        }
+        Err(ApiFailure::new(
+            "self_kill_unconfirmed",
+            "this space is the one you are calling from: killing it closes your own terminal \
+             mid-call. Re-send with `self: true` if you meant it, or `dry_run: true` to see \
+             what it would do.",
+        ))
+    }
+
+    /// The workspace holding the pane this API call is being made from, from
+    /// process ancestry. `None` for a caller in no pane — an ssh shell, a
+    /// supervisor script, a hand-run command.
+    fn caller_workspace_idx(&mut self) -> Option<usize> {
+        self.parse_pane_id_or_peer("", self.current_api_peer_pid)
+            .map(|(ws_idx, _pane_id)| ws_idx)
+    }
+
     /// Which checkout a kill is about, and the workspace holding it when there
-    /// is one.
-    ///
-    /// Two addresses, one target. `workspace_id` is the original; `path`
+    /// is one. Exactly one of workspace_id and path addresses the target.
     /// (#396) exists because the checkouts most worth pruning are the ones
     /// nobody has open, and they were reachable by no flock verb at all — so
     /// they got removed with raw `git worktree remove` instead, which is the
@@ -2686,6 +2727,7 @@ mod tests {
                 dry_run: false,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2766,6 +2808,7 @@ mod tests {
                 dry_run: false,
                 keep_processes: true,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2827,6 +2870,7 @@ mod tests {
                 dry_run: false,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2868,6 +2912,7 @@ mod tests {
                 dry_run: false,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2884,6 +2929,82 @@ mod tests {
         assert!(!branch_exists(&repo, "feature/merged"));
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn mcp_worktree_kill_guards_the_attested_callers_workspace() {
+        let repo = create_committed_repo("mcp-self-kill-repo");
+        let checkout = unique_temp_path("mcp-self-kill-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/self-kill",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let pane_id = app.state.workspaces[1].focused_pane_id().unwrap();
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+
+        // These are the socket requests produced by MCP. Both addresses must
+        // resolve to the attested peer's workspace before anything is removed.
+        for address in [
+            serde_json::json!({"workspace_id": ws_id}),
+            serde_json::json!({"path": checkout}),
+        ] {
+            let mut params = address;
+            params["dry_run"] = serde_json::json!(false);
+            params["self_kill_confirmed"] = serde_json::json!(false);
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "id": "mcp:self-guard", "method": "worktree.kill", "params": params,
+            }))
+            .unwrap();
+            let response = app.handle_api_request(request);
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "self_kill_unconfirmed");
+            assert!(checkout.exists());
+            assert_eq!(app.state.workspaces.len(), 2);
+        }
+
+        let mut params = WorktreeKillParams {
+            workspace_id: Some(ws_id),
+            dry_run: true,
+            self_kill_confirmed: Some(false),
+            keep_processes: true,
+            caller_pid: Some(std::process::id()),
+            ..WorktreeKillParams::default()
+        };
+        let response = app.handle_api_request(Request {
+            id: "mcp:plan".into(),
+            method: crate::api::schema::Method::WorktreeKill(params.clone()),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorktreeKilled { removed: false, .. }
+        ));
+        assert!(checkout.exists());
+        params.dry_run = false;
+        params.self_kill_confirmed = Some(true);
+        let response = app.handle_api_request(Request {
+            id: "mcp:confirmed".into(),
+            method: crate::api::schema::Method::WorktreeKill(params),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorktreeKilled { removed: true, .. }
+        ));
+        assert!(!checkout.exists());
+        assert_eq!(app.state.workspaces.len(), 1);
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     /// A dry run resolves the same plan and touches nothing.
@@ -2915,6 +3036,7 @@ mod tests {
                 dry_run: true,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -2977,6 +3099,7 @@ mod tests {
                 dry_run: true,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -3023,6 +3146,7 @@ mod tests {
                 dry_run: true,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -3098,6 +3222,7 @@ mod tests {
                 dry_run: true,
                 keep_processes: false,
                 caller_pid: None,
+                self_kill_confirmed: None,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
