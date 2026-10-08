@@ -300,6 +300,14 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
         }
     }
 
+    if let Some(message) = super::compatibility::capability_error_message(&response, "flk delegate")
+    {
+        return Ok(serde_json::json!({
+            "id": response["id"],
+            "error": { "code": "server_version_gap", "message": message },
+        }));
+    }
+
     // Return raw response; caller handles server errors.
     Ok(response)
 }
@@ -3231,7 +3239,12 @@ fn cursor_of(record: &serde_json::Value) -> Result<String, String> {
         .get("turn_cursor")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| "the server's record carried no turn cursor".to_string())
+        .ok_or_else(|| {
+            super::compatibility::diagnose_failure(
+                "flk delegate",
+                "the server's record carried no turn cursor",
+            )
+        })
 }
 
 // ------------------------------------------------------------ wait/result
@@ -3935,10 +3948,14 @@ impl Await<'_> {
             // exit 2 and no object, so nothing downstream can read it as a turn
             // that ran.
             SettledOutcome::Refused(reason) => SettledDecision::Usage(reason),
-            // The server's own refusal to the INITIAL resolve, which the two wait
-            // verbs print verbatim. The delegate has no reason to reword it.
-            SettledOutcome::ServerRefused(body) => SettledDecision::Failed(body),
-            SettledOutcome::Error(reason) => SettledDecision::Failed(reason),
+            // Diagnose missing capabilities on an older server, preserving
+            // other initial-resolve refusals and malformed-record errors.
+            SettledOutcome::ServerRefused(body) => SettledDecision::Failed(
+                super::compatibility::diagnose_failure("flk delegate", &body),
+            ),
+            SettledOutcome::Error(reason) => SettledDecision::Failed(
+                super::compatibility::diagnose_failure("flk delegate", &reason),
+            ),
             SettledOutcome::Settled { .. } => match self.await_reply(settled_cursor) {
                 Grace::Reply { outcome, info } => SettledDecision::Report {
                     outcome,
