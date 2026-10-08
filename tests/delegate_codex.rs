@@ -78,7 +78,7 @@ fn write_fake_codex(base: &Path) {
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; printf '\\033[2J\\033[H• Working (1s • esc to interrupt)\\n'; sleep 0.4; printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; done\n",
         base = base.display()
     );
     let path = bin.join("codex");
@@ -418,7 +418,7 @@ const HOOK_REVIEW: &str = "Hooks need review\n1 hook is new or changed.\nHooks c
 fn screen_for(state: &str) -> String {
     match state {
         "working" => "OpenAI Codex\n• Working (1s • esc to interrupt)\n› \n".into(),
-        "idle" => "OpenAI Codex\n› Ask Codex to do anything\n".into(),
+        "idle" => "OpenAI Codex\n› Ask Codex to do anything\n  ? for shortcuts\n".into(),
         other => panic!("unexpected state {other}"),
     }
 }
@@ -715,4 +715,172 @@ fn assert_recorded_sandbox(server: &Server, sandbox: &str) {
         .expect("delegate registry entry");
     let entry: serde_json::Value = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
     assert_eq!(entry["sandbox"], sandbox);
+}
+
+/// Drive the real API and PTY. The child ignores the first Enter and accepts only
+/// the guarded retry, leaving the owned composer visible during confirmation.
+#[test]
+fn guarded_submit_socket_pty_retries_enter_without_retyping() {
+    guarded_socket("codex", false, false);
+}
+
+#[test]
+fn guarded_submit_slow_reader_confirms_with_one_enter_retry() {
+    guarded_socket("codex", true, false);
+}
+
+#[test]
+fn guarded_submit_claude_socket_pty_retries_without_retyping() {
+    guarded_socket("claude", false, false);
+}
+
+#[test]
+fn guarded_submit_opencode_socket_pty_retries_without_retyping() {
+    guarded_socket("opencode", false, false);
+}
+
+#[test]
+fn guarded_submit_first_enter_works_with_late_composer_repaint() {
+    guarded_socket("codex", false, true);
+}
+
+fn guarded_socket(kind: &str, slow: bool, first_works: bool) {
+    let server = start_server();
+    let script = r#"import os, sys, tty, time
+from pathlib import Path
+tty.setraw(0)
+log = Path(__file__).parent.parent / 'guarded-bytes'
+text = b''
+enters = 0
+paste = False
+pending = b''
+def draw(working=False):
+    body = text.decode()
+    chrome = '• Working (1s • esc to interrupt)\r\n' if working else ''
+    sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n' + chrome + '› ' + body + '\r\n  ? for shortcuts\r\n')
+    sys.stdout.flush()
+sys.stdout.write('\x1b[?2004h')
+draw()
+if (log.parent / 'slow-reader').exists():
+    while not (log.parent / 'idle-detected').exists(): time.sleep(0.01)
+    time.sleep(0.35)
+while True:
+    byte = os.read(0, 1)
+    with log.open('ab') as out: out.write(byte)
+    if byte == b'\x1b' or pending:
+        pending += byte
+        if pending == b'\x1b[200~': paste = True; pending = b''
+        elif pending == b'\x1b[201~': paste = False; pending = b''; draw()
+        continue
+    if byte == b'\r' and not paste:
+        enters += 1
+        if (log.parent / 'first-works').exists() and enters == 1:
+            draw(True)
+            time.sleep(2.3)
+            text = b''
+            draw()
+        elif enters == 2: draw(True)
+    else:
+        text += byte
+        if not paste: draw()
+"#;
+    let script = match kind {
+        "claude" => script.replace("chrome = '• Working (1s • esc to interrupt)\\r\\n'", "chrome = '✻ Crunching… (esc to interrupt)\\r\\n'")
+            .replace("'› ' + body + '\\r\\n  ? for shortcuts\\r\\n'", "'────────────────────────────────────────\\r\\n❯ ' + body + '\\r\\n────────────────────────────────────────\\r\\n  ? for shortcuts\\r\\n'"),
+        "opencode" => script.replace("chrome = '• Working (1s • esc to interrupt)\\r\\n'", "chrome = '■■■■⬝⬝ esc interrupt opencode\\r\\n'")
+            .replace("'› ' + body + '\\r\\n  ? for shortcuts\\r\\n'", "'┃\\r\\n┃  ' + (body or 'Ask anything…') + '\\r\\n┃\\r\\n┃  Build test-model\\r\\n╹\\r\\ntab agents ctrl+p commands\\r\\n'"),
+        _ => script.to_owned(),
+    };
+    let path = bin_dir(&server.base).join(kind);
+    fs::create_dir_all(server.base.join("raw")).unwrap();
+    let python = server.base.join("raw").join(kind);
+    fs::write(&python, script).unwrap();
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nexec python3 '{}'\n", python.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    if slow {
+        fs::write(server.base.join("slow-reader"), "").unwrap();
+    }
+    if first_works {
+        fs::write(server.base.join("first-works"), "").unwrap();
+    }
+    let ws = operator_workspace(&server);
+    let started = request(
+        &server,
+        &serde_json::json!({
+            "id":"start", "method":"agent.start", "params":{
+                "name":"guarded", "workspace_id":ws, "argv":[kind], "focus":true
+            }
+        })
+        .to_string(),
+    );
+    assert!(started.get("error").is_none(), "{started}");
+    let pane = delegate_pane(&server, "guarded");
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let agent = agent_get(&server, "guarded").unwrap();
+        if matches!(agent["agent_status"].as_str(), Some("idle" | "done")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{agent}");
+        thread::sleep(Duration::from_millis(30));
+    }
+    // Capture the isolated bottom-buffer fixture through the public CLI.
+    let capture = cli(
+        &server,
+        &[
+            "pane", "read", &pane, "--source", "recent", "--format", "text",
+        ],
+    );
+    assert!(capture.status.success(), "{}", stderr(&capture));
+    assert!(stdout(&capture).contains(if kind == "opencode" {
+        "commands"
+    } else {
+        "? for shortcuts"
+    }));
+    let ansi = cli(
+        &server,
+        &[
+            "pane", "read", &pane, "--source", "recent", "--format", "ansi",
+        ],
+    );
+    assert!(ansi.status.success());
+    fs::write(server.base.join("idle-detected"), "").unwrap();
+    let response = request(&server, &serde_json::json!({
+        "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
+    }).to_string());
+    assert_eq!(
+        response["result"]["outcome"], "observed_accepted",
+        "{response}"
+    );
+    assert_eq!(response["result"]["retried"], !first_works, "{response}");
+    if first_works {
+        thread::sleep(Duration::from_millis(2400));
+    }
+    let bytes = fs::read(server.base.join("guarded-bytes")).unwrap();
+    assert_eq!(
+        bytes,
+        if first_works {
+            b"\x1b[200~hello\x1b[201~\r".as_slice()
+        } else {
+            b"\x1b[200~hello\x1b[201~\r\r".as_slice()
+        }
+    );
+    let read = cli(
+        &server,
+        &[
+            "pane", "read", &pane, "--source", "recent", "--format", "text",
+        ],
+    );
+    assert!(
+        first_works
+            || stdout(&read).contains(if kind == "opencode" {
+                "esc interrupt"
+            } else {
+                "esc to interrupt"
+            })
+    );
 }

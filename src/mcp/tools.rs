@@ -9,6 +9,9 @@
 //! is how the design keeps mutating verbs (`pane.close`, `worktree.remove`,
 //! `agent.start`, pane `send_*`, …) off the MCP surface.
 //!
+//! `flock_pane_submit` is the guarded exception: it requires a fresh idle
+//! composer and confirms acceptance, with no raw key or dialog override.
+//!
 //! `flock_worktree_kill` exposes teardown with a dry-run default and a caller
 //! workspace guard. Branch deletion still requires positive merge evidence.
 //!
@@ -282,6 +285,12 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_pane_read,
         },
         Tool {
+            name: "flock_pane_submit",
+            description: "Submit to a fresh idle agent with an empty recognized composer. The server serializes input, checks for dialogs and operator edits, and confirms a new turn with at most one Enter retry. Your calling workspace requires self: true. Returns accepted, observed_accepted, unconfirmed or abandoned. Does not mark mail read.",
+            input_schema: schema_pane_submit,
+            build: build_pane_submit,
+        },
+        Tool {
             name: "flock_worktree_list",
             description: "List worktree checkouts and their branches. Feeds \
                           the three-way spawn rule: same repo and you want \
@@ -449,6 +458,24 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
         // An MCP-spawned child never steals the operator's focus.
         focus: false,
     }))
+}
+
+fn schema_pane_submit() -> Value {
+    json!({"type": "object", "required": ["pane_id", "text"], "additionalProperties": false,
+        "properties": {"pane_id": {"type": "string"}, "text": {"type": "string"},
+            "self": {"type": "boolean", "description": "Confirm submission to your own workspace."}, "if_session": {"type": "string"}, "min_age_secs": {"type": "integer", "minimum": 0}}})
+}
+
+fn build_pane_submit(args: Value) -> Result<Method, McpError> {
+    let confirmed = optional_bool(&args, "self")?;
+    let mut args = args;
+    if let Some(object) = args.as_object_mut() {
+        object.remove("self");
+    }
+    let mut params: crate::api::schema::PaneSubmitParams =
+        serde_json::from_value(args).map_err(|err| McpError::invalid_params(err.to_string()))?;
+    params.self_submit_confirmed = Some(confirmed);
+    Ok(Method::PaneSubmit(params))
 }
 
 fn schema_no_args() -> Value {
@@ -1330,6 +1357,25 @@ mod tests {
     }
 
     #[test]
+    fn pane_submit_guards_the_calling_workspace() {
+        for confirmed in [false, true] {
+            let Method::PaneSubmit(params) =
+                build_pane_submit(json!({"pane_id":"1-1", "text":"hello", "self":confirmed}))
+                    .unwrap()
+            else {
+                panic!("expected submit")
+            };
+            assert_eq!(params.self_submit_confirmed, Some(confirmed));
+        }
+        let Method::PaneSubmit(params) =
+            build_pane_submit(json!({"pane_id":"1-1", "text":"hello"})).unwrap()
+        else {
+            panic!("expected submit")
+        };
+        assert_eq!(params.self_submit_confirmed, Some(false));
+    }
+
+    #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
         // tools/list output stays load-bearing for agents that cache it.
@@ -1351,6 +1397,7 @@ mod tests {
                 "flock_agent_restart",
                 "flock_self_compact",
                 "flock_pane_read",
+                "flock_pane_submit",
                 "flock_worktree_list",
                 "flock_worktree_kill",
                 "flock_agent_start",

@@ -115,7 +115,7 @@ fn write_fake_claude(base: &Path) {
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
-         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; done\n",
+         while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; printf '\\033[2J\\033[H✻ Crunching… (esc to interrupt)\\n'; sleep 0.4; printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; done\n",
         base = base.display()
     );
     let path = bin.join("claude");
@@ -889,4 +889,30 @@ fn c4_an_unsupported_harness_is_a_usage_error() {
         read_lines(&server.base.join("argv.log")).is_empty(),
         "no harness was launched"
     );
+}
+
+#[test]
+fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let b = brief(&server, "refused.md", "brief\n");
+    let mut child = start_claude(&server, "refused", &b, &["--json"]);
+    let pane = delegate_pane(&server, "refused");
+    report_session(&server, &pane);
+    fs::write(
+        server.base.join("screen"),
+        claude_prompt_box().replace("❯ ", "❯ operator draft"),
+    )
+    .unwrap();
+    let status = exited_within(&mut child, WITHIN).expect("refusal returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("input_not_empty"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("Workspace kept"));
+    assert_eq!(workspaces(&server).len(), before);
+    assert!(agent_get(&server, "refused").is_none());
+    assert!(typed(&server).is_empty());
+    let list = cli(&server, &["delegate", "list", "--json"]);
+    assert!(!stdout(&list).contains("refused"), "{}", stdout(&list));
 }
