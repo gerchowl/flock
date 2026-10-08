@@ -381,6 +381,8 @@ flk delegate reap <name> [--force] [--json]
 
 Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspace-write blocks the network, so a delegate that must `git push` or use `gh` needs `--sandbox danger-full-access`, deliberately chosen by the caller. `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access` for Codex only; opencode and Claude reject it with exit 2.
 
+`flk delegate` and `flk agent result` use capabilities first shipped in **0.9.0**. If a request fails because a capability is missing, they check the server version best-effort. A confirmed older server gets a diagnostic naming the required and running versions and `flk server live-handoff` or upgrade guidance. If the version is unknown or already 0.9.0 or newer, the original error is preserved.
+
 `delegate` is the sequence above run as one command: create the space, start the harness in it, wait until it is actually up, type the brief, and — with `--await` — wait for the round's outcome and print it. It is composed from socket methods that already existed, so it adds no new protocol; what it adds is the bookkeeping that was previously in somebody's shell history.
 
 The brief is a file, and exactly one sentence is ever typed into the agent: `Read <absolute path> and execute it exactly.` The path is made absolute without resolving symlinks, and is refused if it contains whitespace, a control character, or any of `` ! $ ` " ' \ `` — the path crosses the agent's shell, and a quote that survives that hop names a different file by the time the agent reads it. Put the instructions in the file; the typed text carries nothing else.
