@@ -27,6 +27,7 @@ mod input;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
+pub(crate) mod message_relay;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
 mod peer_checkout;
@@ -148,6 +149,7 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    pub(crate) message_relays: message_relay::MessageRelays,
     /// Canonical pane ids reserved by a guarded client submission.
     pub(crate) active_submissions: std::collections::HashSet<String>,
     /// Deferred submit set by `handle_agent_send` and consumed by
@@ -907,6 +909,7 @@ impl App {
                 mailboxes
             },
             uplink: Default::default(),
+            message_relays: Default::default(),
             pending_agent_submit: None,
             active_submissions: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
