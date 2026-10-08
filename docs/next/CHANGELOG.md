@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- `flk delegate reap` now closes the recorded workspace and clears the delegate entry when its checkout was removed outside flock, while preserving the workspace identity check (#637).
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

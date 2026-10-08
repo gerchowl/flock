@@ -1115,3 +1115,65 @@ fn r18_flk_help_lists_delegate() {
         "flk --help must describe what delegate does: {stdout}"
     );
 }
+
+/// An externally removed checkout still leaves a workspace for reap to close.
+#[test]
+fn reap_closes_workspace_after_external_checkout_removal() {
+    for (force, mismatch) in [(false, false), (true, false), (false, true)] {
+        let server = start_server();
+        let operator = operator_workspace(&server);
+        let repo = committed_repo(&server);
+        let repo_s = repo.to_string_lossy().into_owned();
+        let b = brief(&server, "task.md", "x\n");
+        let mut child = cli_spawn(
+            &server,
+            &[
+                "delegate",
+                "start",
+                "w1",
+                "--brief",
+                &b,
+                "--worktree",
+                "--repo",
+                &repo_s,
+                "--branch",
+                "feat/external-removal",
+                "--json",
+            ],
+        );
+        make_ready(&server, "w1");
+        let status = exited_within(&mut child, WITHIN).expect("start returns");
+        let out = finish(child);
+        assert_eq!(status.code(), Some(0), "start: {}", stderr(&out));
+        let started = stdout_json(&out);
+        let ws = started["workspace_id"].as_str().unwrap();
+        let checkout = started["worktree"].as_str().unwrap();
+        git(&repo, &["worktree", "remove", "--force", checkout]);
+        assert!(!Path::new(checkout).exists());
+        assert!(workspaces(&server).iter().any(|w| w["workspace_id"] == ws));
+
+        if mismatch {
+            rewrite_entry_workspace(&server, "w1", &operator);
+        }
+        let mut args = vec!["delegate", "reap", "w1", "--json"];
+        if force {
+            args.push("--force");
+        }
+        let reaped = cli(&server, &args);
+        assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+        let result = stdout_json(&reaped);
+        assert_eq!(result["workspace_closed"], !mismatch);
+        assert_eq!(result["checkout_removed"], true);
+        assert_eq!(
+            workspaces(&server).iter().any(|w| w["workspace_id"] == ws),
+            mismatch,
+        );
+        assert!(workspaces(&server)
+            .iter()
+            .any(|w| w["workspace_id"] == operator));
+        assert!(!registry_entry_path(&server, "w1").exists());
+        let repeated = cli(&server, &args);
+        assert_eq!(repeated.status.code(), Some(2));
+        assert!(stderr(&repeated).contains("not a delegate"));
+    }
+}

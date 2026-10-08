@@ -1910,6 +1910,25 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                             done.workspace_closed = true;
                             done.checkout_removed = true;
                         }
+                        Err(err)
+                            if err.code == "worktree_remove_failed"
+                                && is_already_gone(&err, target.worktree.as_deref()) =>
+                        {
+                            // Git may have removed the checkout outside flock.
+                            // Re-check ownership before closing its remaining workspace.
+                            match identity(target) {
+                                Identity::Ours => match close_workspace(&target.workspace_id) {
+                                    Ok(_) => done.workspace_closed = true,
+                                    Err(err) if err.code == "workspace_not_found" => {
+                                        done.workspace_closed = true;
+                                    }
+                                    Err(err) => return Err(err),
+                                },
+                                Identity::NotOurs => {}
+                                Identity::Unknown(_) => return Err(err),
+                            }
+                            done.checkout_removed = true;
+                        }
                         Err(err) if is_already_gone(&err, None) => {
                             // The workspace is gone; the checkout might
                             // still be there and the path kill below will
