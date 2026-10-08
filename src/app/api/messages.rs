@@ -380,10 +380,19 @@ impl App {
         // #438: under channel push an agent can answer mail it was shown but
         // never pulled. The reply is the only acknowledgement a push gets, so
         // a reply that went out settles the original: at once when it was
-        // queued here or relayed over a peer's ssh, and only on the hub's
-        // answer when it was handed up. A reply that failed settles nothing,
+        // queued here, and on completion when relayed over SSH or handed
+        // up to the hub. A reply that failed settles nothing,
         // so the message stays unread and the wakes knock for it again.
         if self.state.config.msg.channel_push {
+            let replier_pane = self.replier_pane();
+            if let Some(relay) = self.message_relays.pending.as_mut() {
+                relay.settle_original =
+                    replier_pane.map(|pane| crate::app::uplink::SettleOnDelivery {
+                        pane,
+                        correlation_id,
+                    });
+                return response;
+            }
             match ReplyOutcome::of(&response) {
                 ReplyOutcome::Sent => self.settle_replied_original(&correlation_id),
                 ReplyOutcome::HandedUp {
@@ -1190,9 +1199,8 @@ impl App {
         let cap = self.state.config.msg.deferral_relay_concurrency.max(1);
         for hop in self.mailboxes.start_deferral_hops(cap) {
             let crate::app::mailboxes::DeferralHop { peer, body, relay } = hop;
-            let event_tx = self.event_tx.clone();
             let from_host = crate::app::short_host_name();
-            std::thread::spawn(move || {
+            self.enqueue_message_relay(Box::new(move || {
                 let result = crate::peers::send_peer_message(
                     &peer,
                     &relay.to_agent,
@@ -1207,10 +1215,11 @@ impl App {
                     let reason = crate::peers::SshFailureReason::classify(failure.detail());
                     failure.hop_message(&from_host, &relay.to_host, reason)
                 });
-                let _ = event_tx.blocking_send(crate::events::AppEvent::MsgDeferralRelayed(
-                    crate::events::MsgDeferralRelay { result, ..relay },
-                ));
-            });
+                crate::events::AppEvent::MsgDeferralRelayed(crate::events::MsgDeferralRelay {
+                    result,
+                    ..relay
+                })
+            }));
         }
     }
 
@@ -1413,16 +1422,50 @@ impl App {
             .as_deref()
             .filter(|explicit| !explicit.trim().is_empty());
 
-        match crate::peers::send_peer_message(
-            &peer,
+        if params.intent.wakes() {
+            self.mailboxes.start_relaying_question(&correlation_id);
+        }
+        self.message_relays.pending = Some(crate::app::message_relay::RelaySend {
+            id,
+            peer,
+            to_agent: to_agent.to_string(),
+            host: host.to_string(),
+            direct: location.direct,
+            from_agent,
+            from_host,
+            body: body.to_string(),
+            correlation_id,
+            in_reply_to: in_reply_to.map(str::to_string),
+            intent: params.intent,
+            settle_original: None,
+            respond_to: None,
+        });
+        // The transport parks its responder before the worker is started.
+        String::new()
+    }
+
+    pub(crate) fn handle_msg_relay_completed(
+        &mut self,
+        completion: crate::app::message_relay::RelayCompletion,
+    ) {
+        let crate::app::message_relay::RelayCompletion { send, result } = completion;
+        let crate::app::message_relay::RelaySend {
+            id,
+            peer,
             to_agent,
-            &from_agent,
-            &from_host,
-            body,
-            &correlation_id,
-            in_reply_to,
-            params.intent,
-        ) {
+            host,
+            direct,
+            from_agent,
+            correlation_id,
+            intent,
+            settle_original,
+            respond_to,
+            ..
+        } = send;
+        if intent.wakes() {
+            self.mailboxes.finish_relaying_question(&correlation_id);
+        }
+        let response = match result {
             Ok(()) => {
                 // Without this the sender's durable log has NO record that a
                 // cross-host message was ever sent — the relay path returned
@@ -1439,11 +1482,11 @@ impl App {
                         to_host: host.to_string(),
                         route: peer.name.clone(),
                         relayed_at_ms: now_ms(),
-                        intent: params.intent,
-                        via: (!location.direct).then(|| peer.name.clone()),
+                        intent,
+                        via: (!direct).then(|| peer.name.clone()),
                     },
                 });
-                if params.intent.wakes() {
+                if intent.wakes() {
                     self.mailboxes
                         .record_relayed_question(correlation_id.clone());
                 }
@@ -1454,7 +1497,7 @@ impl App {
                         state: "relayed".into(),
                         warnings: Vec::new(),
                         to_host: Some(host.to_string()),
-                        path: Some(if location.direct {
+                        path: Some(if direct {
                             "direct".into()
                         } else {
                             format!("via {}", peer.name)
@@ -1477,7 +1520,7 @@ impl App {
                 encode_error_with_data(
                     id,
                     failure.code(),
-                    failure.hop_message(&me, host, reason),
+                    failure.hop_message(&me, &host, reason),
                     serde_json::json!({
                         "retryable": failure.retryable(),
                         "peer": peer.name,
@@ -1487,6 +1530,14 @@ impl App {
                     }),
                 )
             }
+        };
+        if matches!(ReplyOutcome::of(&response), ReplyOutcome::Sent) {
+            if let Some(original) = settle_original {
+                self.settle_original_in(&original.pane, &original.correlation_id);
+            }
+        }
+        if let Some(respond_to) = respond_to {
+            let _ = respond_to.send(response);
         }
     }
 
@@ -2506,15 +2557,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_relay_that_never_left_the_machine_writes_no_audit_record() {
-        // `MessageRelayed` has to mean "this message left, and went there".
-        // Emitting it on the attempt rather than the success would make the
-        // audit trail claim delivery for messages that never crossed the
-        // wire — worse than the missing record it replaces, because a wrong
-        // record reads as a true one.
-        let hub = crate::api::EventHub::default();
-        let mut app = test_app_with_hub(hub.clone());
+    fn configure_unreachable_message_peer(app: &mut crate::app::App) {
         app.state.peers = vec![crate::config::PeerConfig {
             name: "kiln".into(),
             // Unresolvable, so the ssh attempt fails fast without a network.
@@ -2547,6 +2590,18 @@ mod tests {
             }];
             peer
         }];
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_never_left_the_machine_writes_no_audit_record() {
+        // `MessageRelayed` has to mean "this message left, and went there".
+        // Emitting it on the attempt rather than the success would make the
+        // audit trail claim delivery for messages that never crossed the
+        // wire — worse than the missing record it replaces, because a wrong
+        // record reads as a true one.
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        configure_unreachable_message_peer(&mut app);
 
         let response = app.handle_api_request(Request {
             id: "req".into(),
@@ -2563,10 +2618,24 @@ mod tests {
                 intent_unrecognised: None,
             }),
         });
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.respond_or_park(tx, response);
+        assert!(rx.try_recv().is_err(), "the request is parked during SSH");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = app.event_rx.recv().await.expect("relay completion");
+                app.handle_internal_event(event);
+                if let Ok(response) = rx.try_recv() {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("SSH failure must answer the caller");
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
             error.error.code, "peer_unreachable",
-            "the send fails synchronously, so the caller learns immediately"
+            "the parked caller receives the original failure code"
         );
         // #380 split this from a refusal, so the code alone is now a claim
         // about which of the two happened — and it comes with the advice that
@@ -3107,6 +3176,152 @@ mod tests {
             } else {
                 assert_eq!(still_queued, 1, "flag off: behaviour unchanged");
                 assert!(!settled);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_arriving_before_ssh_completion_still_wakes_its_sender() {
+        for succeeds in [false, true] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            configure_unreachable_message_peer(&mut app);
+            let asker = pane_target(&app, 0);
+            let mut attempts = Vec::new();
+            for _ in 0..2 {
+                let response = send(
+                    &mut app,
+                    MsgSendParams {
+                        from_agent: Some("agent_atlas_cafe".into()),
+                        from_host: None,
+                        to: MessageTarget::Agent {
+                            agent: "agent_kiln-dev_beef".into(),
+                        },
+                        body: "question".into(),
+                        correlation_id: Some("in-flight-question".into()),
+                        in_reply_to: None,
+                        intent: MsgIntent::NeedsReply,
+                        intent_unrecognised: None,
+                    },
+                );
+                assert!(response.is_empty());
+                attempts.push(app.message_relays.pending.take().expect("pending send"));
+            }
+            let response = send(
+                &mut app,
+                MsgSendParams {
+                    from_agent: Some("agent_kiln-dev_beef".into()),
+                    from_host: Some("kiln-dev".into()),
+                    to: MessageTarget::Pane {
+                        pane: asker.clone(),
+                    },
+                    body: "answer before SSH exits".into(),
+                    correlation_id: Some("early-answer".into()),
+                    in_reply_to: Some("in-flight-question".into()),
+                    intent: MsgIntent::Fyi,
+                    intent_unrecognised: None,
+                },
+            );
+            assert!(!response.contains("\"error\""), "{response}");
+            assert_eq!(app.mailboxes.wake_count(&asker), 1, "an early answer wakes");
+            app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
+                send: attempts.pop().unwrap(),
+                result: Err(crate::peers::PeerMessageFailure::Unreachable(
+                    "timeout".into(),
+                )),
+            });
+            assert_eq!(
+                app.mailboxes.wake_count(&asker),
+                1,
+                "the other attempt still runs"
+            );
+            app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
+                send: attempts.pop().unwrap(),
+                result: if succeeds {
+                    Ok(())
+                } else {
+                    Err(crate::peers::PeerMessageFailure::Unreachable(
+                        "timeout".into(),
+                    ))
+                },
+            });
+            assert_eq!(
+                app.mailboxes.wake_count(&asker),
+                usize::from(succeeds),
+                "only a successful relay retains question evidence after completion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_reply_settles_only_after_success_in_the_attested_inbox() {
+        for succeeds in [false, true] {
+            for owns_inbox in [false, true] {
+                let hub = crate::api::EventHub::default();
+                let mut app = test_app_with_hub(hub.clone());
+                app.state.config.msg.channel_push = true;
+                configure_unreachable_message_peer(&mut app);
+                let answerer = pane_target(&app, 1);
+                let received = send(
+                    &mut app,
+                    MsgSendParams {
+                        from_agent: Some("agent_kiln-dev_beef".into()),
+                        from_host: Some("kiln-dev".into()),
+                        to: MessageTarget::Pane {
+                            pane: answerer.clone(),
+                        },
+                        body: "can you answer?".into(),
+                        correlation_id: Some("remote-question".into()),
+                        in_reply_to: None,
+                        intent: MsgIntent::NeedsReply,
+                        intent_unrecognised: None,
+                    },
+                );
+                assert!(!received.contains("\"error\""), "{received}");
+                let caller = usize::from(owns_inbox);
+                let caller_pane = app.state.workspaces[caller].focused_pane_id().unwrap();
+                app.test_pane_child_pids
+                    .insert(caller_pane, std::process::id());
+                app.current_api_peer_pid = Some(std::process::id());
+                let response = app.handle_api_request(wire_request(serde_json::json!({
+                    "id": "remote-reply", "method": "msg.reply",
+                    "params": {"correlation_id": "remote-question", "body": "yes"}
+                })));
+                assert!(response.is_empty(), "remote reply must park");
+                assert_eq!(app.mailboxes.queued_len(&answerer), 1);
+                let mut relay = app.message_relays.pending.take().expect("parked SSH send");
+                app.current_api_peer_pid = None;
+                let (tx, rx) = std::sync::mpsc::channel();
+                relay.respond_to = Some(tx);
+                // Complete at the worker boundary after caller ancestry is gone.
+                app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
+                    send: relay,
+                    result: if succeeds {
+                        Ok(())
+                    } else {
+                        Err(crate::peers::PeerMessageFailure::Refused(
+                            "remote refusal".into(),
+                        ))
+                    },
+                });
+                let response: serde_json::Value =
+                    serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+                assert_eq!(response["id"], "remote-reply");
+                if succeeds {
+                    assert_eq!(response["result"]["state"], "relayed");
+                } else {
+                    assert_eq!(response["error"]["code"], "peer_refused_message");
+                    assert_eq!(response["error"]["data"]["retryable"], false);
+                }
+                assert_eq!(
+                    app.mailboxes.queued_len(&answerer),
+                    usize::from(!(succeeds && owns_inbox))
+                );
+                let relayed = hub
+                    .events_after(0)
+                    .iter()
+                    .filter(|(_, event)| matches!(event.data, EventData::MessageRelayed { .. }))
+                    .count();
+                assert_eq!(relayed, usize::from(succeeds));
             }
         }
     }

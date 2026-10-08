@@ -290,6 +290,8 @@ pub enum AppEvent {
     /// sender's server, which may be the very server still waiting on THIS
     /// one to answer the relayed send that triggered it.
     MsgDeferralRelayed(MsgDeferralRelay),
+    /// A legacy cross-host send finished on the relay worker.
+    MsgRelayCompleted(Box<crate::app::message_relay::RelayCompletion>),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
     WorktreeKillAllFinished(WorktreeKillAllResult),
     /// One script check completed on a runner-spawned worker thread

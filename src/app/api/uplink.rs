@@ -109,6 +109,11 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         response: String,
     ) {
+        if let Some(mut relay) = self.message_relays.pending.take() {
+            relay.respond_to = Some(respond_to);
+            self.enqueue_message_relay(Box::new(move || relay.run()));
+            return;
+        }
         if let Some((request_id, pane_id, child_pid)) = self.pending_agent_submit.take() {
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {

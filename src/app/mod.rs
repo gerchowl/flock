@@ -26,6 +26,7 @@ mod input;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
+pub(crate) mod message_relay;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
 mod peer_checkout;
@@ -144,6 +145,7 @@ pub struct App {
     /// on them (#410). In memory on purpose: a parked request dies with the
     /// connection that made it, so there is nothing a restart could resume.
     pub(crate) uplink: crate::app::uplink::Uplink,
+    pub(crate) message_relays: message_relay::MessageRelays,
     /// Deferred submit set by `handle_agent_send` and consumed by
     /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
     /// request. A response path bypassing `respond_or_park` would reply ok
@@ -901,6 +903,7 @@ impl App {
                 mailboxes
             },
             uplink: Default::default(),
+            message_relays: Default::default(),
             pending_agent_submit: None,
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,

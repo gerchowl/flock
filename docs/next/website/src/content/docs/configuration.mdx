@@ -714,12 +714,12 @@ The `[msg]` section governs agent-to-agent messages delivered on this node (ADR-
 enabled = true                   # accept agent messages at all
 allow_from = ["*"]               # hosts whose agents may message this node's agents
 mute_reason_max_chars = 200      # longest `reason` a mute may carry
-deferral_relay_concurrency = 4   # mute deferrals to other hosts in flight at once
+deferral_relay_concurrency = 4   # cross-host sends, replies and deferrals in flight at once
 ```
 
 `enabled` and `allow_from` are enforced by the receiver, which is the only party that cannot be bypassed. A node with `enabled = false` still sends. `allow_from` is open by default because a flock fleet is already one trust domain. Narrow it with host names, for example `allow_from = ["hopper"]`.
 
-A mute answers (`flock_msg_mute`, `flk msg mute`). Every `needs_reply` sender it defers gets one automatic reply with the mute's `reason` and the time it lifts. `mute_reason_max_chars` bounds that reason: a longer one is truncated, never refused, so a mute cannot fail over its own explanation. A deferral to a sender on another host is an ssh hop, and one mute over a full inbox can owe many of them. `deferral_relay_concurrency` caps how many run at once, and the rest wait their turn.
+A mute answers (`flock_msg_mute`, `flk msg mute`). Every `needs_reply` sender it defers gets one automatic reply with the mute's `reason` and the time it lifts. `mute_reason_max_chars` bounds that reason: a longer one is truncated, never refused, so a mute cannot fail over its own explanation. A deferral to a sender on another host is an ssh hop, and one mute over a full inbox can owe many of them. `deferral_relay_concurrency` caps the shared worker pool for cross-host sends, replies and mute deferrals; the rest wait their turn. SSH runs off the server loop, so a slow peer does not stall other API requests. The sending caller receives the delivery result when its hop finishes.
 ## Waking idle agents
 
 An agent that has already stopped cannot be told about new mail by its own stop hook — the hook only fires at the end of a turn. So when a message that wants an answer (any intent but `fyi`) is queued for an **idle Claude pane**, flock types one fixed sentence into that pane and presses Enter (ADR-0018):

@@ -974,3 +974,85 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "never the generic peers refusal: {text}"
     );
 }
+
+/// Hold the actual legacy SSH command until another app-loop API responds.
+/// Ping is served by the socket thread, so workspace.list is the probe.
+fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, relay: &str) {
+    let fleet = fleet::spawn("slow-message-hop", specs);
+    let source = fleet.node("nodea");
+    let destination = fleet.node(recipient);
+    let mut alice = PanedMcp::start(source, &fleet.base);
+    let mut bob = PanedMcp::start(destination, &fleet.base);
+    wait_for("remote agent discovery", GOSSIP_TIMEOUT, || {
+        let listing = alice.call_tool("flock_agent_list", json!({}));
+        fleet_row(&listing, &bob.agent_id).map(|_| ())
+    });
+
+    let entered = fleet.base.join("message-ssh-entered");
+    let release = fleet.base.join("message-ssh-release");
+    let shim = fleet.base.join("bin/ssh");
+    let original = std::fs::read_to_string(&shim).unwrap();
+    let gate = format!(
+        "case \"$last\" in *'msg send'*) touch '{}'; n=0; while [ ! -e '{}' ] && [ \"$n\" -lt 100 ]; do sleep 0.1; n=$((n+1)); done ;; esac\n",
+        entered.display(), release.display(),
+    );
+    std::fs::write(
+        &shim,
+        original.replace("FLOCK_SOCKET_PATH=", &format!("{gate}FLOCK_SOCKET_PATH=")),
+    )
+    .unwrap();
+    let target = bob.agent_id.clone();
+    let send = thread::spawn(move || {
+        alice.call_tool(
+            "flock_msg_send",
+            json!({
+                "to": {"type": "agent", "agent": target},
+                "body": "slow peer question", "intent": "needs_reply",
+                "correlation_id": "slow-hop-question"
+            }),
+        )
+    });
+    wait_for("SSH message command to enter", GOSSIP_TIMEOUT, || {
+        entered.exists().then_some(())
+    });
+
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(&fleet.node(relay).api_socket).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        json!({"id":"responsive", "method":"workspace.list", "params": {}})
+    )
+    .unwrap();
+    let mut answer = String::new();
+    let result = BufReader::new(socket).read_line(&mut answer);
+    // Release even on failure so the test never leaves a held SSH process.
+    std::fs::write(&release, "go").unwrap();
+    result.expect("workspace.list must complete while the message SSH is held");
+    assert_eq!(
+        serde_json::from_str::<Value>(&answer).unwrap()["id"],
+        "responsive"
+    );
+    let sent = send.join().unwrap();
+    assert_eq!(sent["state"], "relayed", "{sent}");
+    assert_eq!(sent["correlation_id"], "slow-hop-question");
+    let read = bob.call_tool("flock_msg_read", json!({}));
+    assert!(read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["correlation_id"] == "slow-hop-question"));
+}
+
+#[test]
+fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
+    slow_message_hop_keeps_api_responsive(PAIR_AB, "nodeb", "nodea");
+}
+
+#[test]
+fn a_slow_forwarded_message_peer_does_not_stall_the_hub_api() {
+    slow_message_hop_keeps_api_responsive(HUB_SPOKES, "nodec", "nodeb");
+}

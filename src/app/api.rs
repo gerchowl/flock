@@ -180,7 +180,7 @@ impl App {
         } = ev
         {
             let response = self.forward_uplinked_message(&spoke, message);
-            let _ = respond_to.send(response);
+            self.respond_or_park(respond_to, response);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -559,8 +559,15 @@ impl App {
             return;
         }
 
+        if let AppEvent::MsgRelayCompleted(completion) = ev {
+            self.handle_msg_relay_completed(*completion);
+            self.finish_message_relay();
+            return;
+        }
+
         if let AppEvent::MsgDeferralRelayed(relay) = ev {
             self.handle_msg_deferral_relayed(relay);
+            self.finish_message_relay();
             return;
         }
 
@@ -1280,6 +1287,10 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        debug_assert!(
+            self.message_relays.pending.is_none(),
+            "message relay must be consumed by respond_or_park before the next request"
+        );
         // #410: a park is only ever for the request that set it.
         let _ = self.uplink.take_pending_park();
         debug_assert!(
