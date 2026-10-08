@@ -180,7 +180,7 @@ flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-foc
 flk pane close <pane_id>
 ```
 
-`pane read`, `pane send-text`, `pane send-keys`, and `pane close` also accept a terminal ID or a unique agent name. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one.
+`pane read`, `pane send-text`, `pane send-keys`, and `pane close` also accept a terminal ID or a unique agent name/label. A pane ID takes precedence over a same-named agent. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one.
 
 Read output:
 

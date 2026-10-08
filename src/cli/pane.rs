@@ -115,9 +115,16 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+
+pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: {PANE_READ_USAGE}");
         return Ok(2);
     };
 
@@ -432,11 +439,11 @@ fn parse_move_split_direction(value: &str) -> Result<SplitDirection, String> {
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane close <pane_id>");
+        eprintln!("usage: {PANE_CLOSE_USAGE}");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flk pane close <pane_id>");
+        eprintln!("usage: {PANE_CLOSE_USAGE}");
         return Ok(2);
     }
 
@@ -450,7 +457,7 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flk pane send-text <pane_id> <text>");
+        eprintln!("usage: {PANE_SEND_TEXT_USAGE}");
         return Ok(2);
     }
 
@@ -461,7 +468,7 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flk pane send-keys <pane_id> <key> [key ...]");
+        eprintln!("usage: {PANE_SEND_KEYS_USAGE}");
         return Ok(2);
     }
 
@@ -1329,7 +1336,7 @@ fn pane_help_text() -> String {
     let _ = writeln!(out, "  flk pane list [--workspace <workspace_id>]");
     let _ = writeln!(out, "  flk pane get <pane_id>");
     let _ = writeln!(out, "  flk pane rename <pane_id> <label>|--clear");
-    let _ = writeln!(out, "  flk pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+    let _ = writeln!(out, "  flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
         "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
@@ -1346,9 +1353,13 @@ fn pane_help_text() -> String {
         out,
         "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
-    let _ = writeln!(out, "  flk pane close <pane_id>");
-    let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
-    let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
+    let _ = writeln!(out, "  flk pane close <target>");
+    let _ = writeln!(out, "  flk pane send-text <target> <text>");
+    let _ = writeln!(out, "  flk pane send-keys <target> <key> [key ...]");
+    let _ = writeln!(
+        out,
+        "  read, send-text, send-keys, close: {PANE_TARGET_HELP}"
+    );
     let _ = writeln!(
         out,
         "  flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>"
@@ -1534,6 +1545,17 @@ mod tests {
             !super::PANE_RUN_SUBMIT_GAP.is_zero(),
             "a zero gap puts the Enter back in the same read as the text"
         );
+    }
+
+    #[test]
+    fn pane_help_documents_agent_targets_and_pane_id_precedence() {
+        let help = super::pane_help_text();
+        for verb in ["read", "send-text", "send-keys", "close"] {
+            assert!(help.contains(&format!("flk pane {verb} <target>")));
+        }
+        assert!(help.contains(super::PANE_TARGET_HELP));
+        assert!(help.contains("pane id, terminal id, or unique agent name/label"));
+        assert!(help.contains("A pane id wins over a same-named agent"));
     }
 
     #[test]

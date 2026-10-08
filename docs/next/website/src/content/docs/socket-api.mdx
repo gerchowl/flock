@@ -82,7 +82,7 @@ Raw socket method names use dot notation:
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
-For `pane.read`, `pane.send_text`, `pane.send_keys`, and `pane.close`, the `pane_id` field also accepts a terminal ID or unique agent name. Ambiguous names return `agent_target_ambiguous` with candidate details; unknown targets retain `pane_not_found`.
+For `pane.read`, `pane.send_text`, `pane.send_keys`, and `pane.close`, the `pane_id` field also accepts a terminal ID or unique agent name/label. A pane ID takes precedence over a same-named agent. Ambiguous names return `agent_target_ambiguous` with candidate details; unknown targets retain `pane_not_found`.
 
 Some CLI commands are conveniences around these methods. For example, `flk agent wait` resolves an agent target and then subscribes to pane agent state events.
 

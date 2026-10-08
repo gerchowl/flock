@@ -989,7 +989,10 @@ impl App {
             Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
@@ -1222,7 +1225,10 @@ impl App {
             Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
@@ -1323,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_verbs_accept_agent_targets() {
-        for target_kind in ["name", "terminal", "pane"] {
+        for target_kind in ["name", "terminal", "pane", "legacy"] {
             let (mut app, terminal_id, public) = app_with_terminal();
             app.state
                 .terminals
@@ -1345,6 +1351,7 @@ mod tests {
             let target = match target_kind {
                 "name" => "builder".to_string(),
                 "terminal" => terminal_id.to_string(),
+                "legacy" => public.replace(":p", "-"),
                 _ => public.clone(),
             };
             for (method, extra) in [
@@ -1378,6 +1385,69 @@ mod tests {
                     _ => assert!(app.state.workspaces.is_empty()),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn pane_target_id_wins_over_same_named_agent() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].terminal_id(other).unwrap().clone();
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .agent_name = Some(public.clone());
+        assert_eq!(app.resolve_pane_target(&public).unwrap(), (0, pane_id));
+        let response = app.handle_pane_close("precedence".into(), PaneTarget { pane_id: public });
+        assert!(response.contains("\"result\""), "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(other),
+            Some(&other_terminal)
+        );
+    }
+
+    #[test]
+    fn pane_target_accepts_legacy_workspace_pane_form() {
+        let (app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let legacy = public.replace(":p", "-");
+        assert_ne!(legacy, public);
+        assert_eq!(app.resolve_pane_target(&legacy).unwrap(), (0, pane_id));
+    }
+
+    #[test]
+    fn pane_send_missing_runtime_names_resolved_pane() {
+        let (mut app, terminal_id, public) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_name = Some("builder".into());
+        for (method, extra) in [
+            ("pane.send_text", serde_json::json!({"text": "prompt"})),
+            ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+        ] {
+            let mut params = extra;
+            params["pane_id"] = "builder".into();
+            let response: serde_json::Value = serde_json::from_str(
+                &app.handle_api_request(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "missing-runtime", "method": method, "params": params,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], "pane_not_found");
+            assert_eq!(
+                response["error"]["message"],
+                format!("pane {public} not found")
+            );
         }
     }
 
