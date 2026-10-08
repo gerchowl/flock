@@ -3,6 +3,7 @@
 //! The caller authenticates origin and return bindings before admission. This
 //! library does no transport, directory lookup, or audit-body publication.
 use super::{clock::Clock, key::MessageKey};
+mod schema;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,14 +42,7 @@ pub trait DiskSpace {
 pub struct SystemDisk;
 impl DiskSpace for SystemDisk {
     fn available(&self, path: &Path) -> std::io::Result<u64> {
-        let path = path.canonicalize()?;
-        sysinfo::Disks::new_with_refreshed_list()
-            .list()
-            .iter()
-            .filter(|disk| path.starts_with(disk.mount_point()))
-            .max_by_key(|disk| disk.mount_point().components().count())
-            .map(|disk| disk.available_space())
-            .ok_or_else(|| std::io::Error::other("custody filesystem free space unavailable"))
+        crate::platform_disk::available(path)
     }
 }
 
@@ -63,6 +57,8 @@ pub enum Error {
     ConflictingKey,
     NotFound,
     InvalidState,
+    NewerSchema { found: i64, supported: i64 },
+    IdentityPinConflict,
 }
 impl Error {
     pub fn code(&self) -> &'static str {
@@ -73,12 +69,21 @@ impl Error {
             Self::ConflictingKey => "message_key_conflict",
             Self::NotFound => "message_not_found",
             Self::InvalidState => "invalid_custody_state",
+            Self::NewerSchema { .. } => "mail_store_schema_too_new",
+            Self::IdentityPinConflict => "identity_pin_conflict",
             _ => "mail_store_unavailable",
         }
     }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::NewerSchema { found, supported } = self {
+            return write!(
+                f,
+                "{}: database schema version {found} is newer than supported version {supported}",
+                self.code()
+            );
+        }
         write!(f, "{}: {self:?}", self.code())
     }
 }
@@ -177,6 +182,15 @@ pub struct Record {
     pub retry_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityPin {
+    pub node_id: String,
+    pub public_key: Vec<u8>,
+}
+
+/// `Store` with the default disk provider is `Send` but not `Sync`. Share it
+/// between workers through a `Mutex`, never concurrent unsynchronized access.
+/// Message order within the same millisecond is arbitrary, with no FIFO promise.
 pub struct Store<D = SystemDisk> {
     connection: Connection,
     path: PathBuf,
@@ -200,40 +214,21 @@ impl<D: DiskSpace> Store<D> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        if disk.available(parent)? < limits.disk_reserve.saturating_add(1 << 20) {
-            return Err(Error::MailStoreFull);
-        }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
+        schema::check_version(&connection)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL;
+        connection.execute_batch(
+            "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-            PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;
-            BEGIN IMMEDIATE;
-            CREATE TABLE IF NOT EXISTS clock (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                wall INTEGER NOT NULL, elapsed INTEGER NOT NULL, paused INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS envelopes (
-                origin TEXT NOT NULL, id TEXT NOT NULL, correlation TEXT NOT NULL,
-                metadata TEXT NOT NULL, fingerprint BLOB NOT NULL, body BLOB NOT NULL,
-                state TEXT NOT NULL, custody_deadline INTEGER NOT NULL,
-                inbox_deadline INTEGER, dedupe_until INTEGER NOT NULL,
-                outcome_until INTEGER, delivered INTEGER NOT NULL DEFAULT 0,
-                retry_at INTEGER NOT NULL, metadata_bytes INTEGER NOT NULL,
-                PRIMARY KEY(origin,id));
-            CREATE INDEX IF NOT EXISTS conversation ON envelopes(origin,correlation);
-            CREATE INDEX IF NOT EXISTS expiry ON envelopes(state,custody_deadline);
-            CREATE TABLE IF NOT EXISTS inbox_imports (
-                origin TEXT NOT NULL, id TEXT NOT NULL,
-                PRIMARY KEY(origin,id), FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);
-            CREATE TABLE IF NOT EXISTS identity_pins (
-                peer TEXT PRIMARY KEY, node_id TEXT NOT NULL UNIQUE, public_key BLOB NOT NULL);
-            COMMIT;")?;
+            PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;",
+        )?;
+        schema::migrate(&mut connection)?;
         connection.execute("INSERT OR IGNORE INTO clock VALUES(1,?1,0,0)", [wall_ms])?;
         fs::File::open(path)?.sync_all()?;
         fs::File::open(parent)?.sync_all()?;
         let mut store = Self {
             connection,
-            path: path.to_owned(),
+            path: parent.canonicalize()?,
             limits,
             disk,
         };
@@ -271,7 +266,6 @@ impl<D: DiskSpace> Store<D> {
     }
 
     fn advance(&mut self, wall_ms: i64, paused: Option<bool>) -> Result<Clock> {
-        self.guard_disk(0)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -362,8 +356,7 @@ impl<D: DiskSpace> Store<D> {
             return Ok(Accepted::Duplicate);
         }
         let (total, bodies, active): (i64, i64, i64) = tx.query_row(
-            "SELECT COALESCE(SUM(metadata_bytes+length(body)),0), COALESCE(SUM(length(body)),0),
-             COALESCE(SUM(state IN ('custody','inbox')),0) FROM envelopes",
+            "SELECT total_bytes,body_bytes,active FROM usage WHERE singleton=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -396,7 +389,8 @@ impl<D: DiskSpace> Store<D> {
     }
 
     /// Final mailbox import is one transaction. A full mailbox should leave
-    /// custody untouched and retry later, before calling this method.
+    /// custody untouched and retry later, before calling this method. This only
+    /// references the existing body, so it does not require disk-reserve admission.
     pub fn import(&mut self, key: &MessageKey, wall_ms: i64) -> Result<Accepted> {
         let now = self.writable(wall_ms)?;
         let tx = self
@@ -541,6 +535,95 @@ impl<D: DiskSpace> Store<D> {
         Ok(keys)
     }
 
+    /// Replies referencing a full request identity, independently of threading labels.
+    pub fn by_request_key(&self, request: &MessageKey) -> Result<Vec<MessageKey>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.request_key.origin_node')=?1
+             AND json_extract(metadata,'$.request_key.message_id')=?2 ORDER BY origin,id",
+        )?;
+        let keys = stmt
+            .query_map(params![request.origin_node, request.message_id], |r| {
+                Ok(MessageKey {
+                    origin_node: r.get(0)?,
+                    message_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    /// Token lookup is not authorization. The transport must also authenticate
+    /// the caller and verify the stored conversation's origin/recipient binding.
+    pub fn by_collection_token(&self, token: &[u8]) -> Result<Vec<MessageKey>> {
+        let encoded = serde_json::to_string(token)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.return_binding.collection_token')=?1 ORDER BY origin,id",
+        )?;
+        let keys = stmt
+            .query_map([encoded], |r| {
+                Ok(MessageKey {
+                    origin_node: r.get(0)?,
+                    message_id: r.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
+    pub fn get_pin(&self, peer: &str) -> Result<Option<IdentityPin>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT node_id,public_key FROM identity_pins WHERE peer=?1",
+                [peer],
+                |r| {
+                    Ok(IdentityPin {
+                        node_id: r.get(0)?,
+                        public_key: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Enrollment is idempotent, but never silently replaces a pin or aliases
+    /// an already pinned node. Replacement requires an explicit operator reset.
+    pub fn put_pin(&mut self, peer: &str, pin: &IdentityPin) -> Result<()> {
+        if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
+            return Err(Error::InvalidEnvelope);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT peer,node_id,public_key FROM identity_pins WHERE peer=?1 OR node_id=?2",
+                params![peer, pin.node_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((name, node_id, key)) = existing {
+            if name != peer || node_id != pin.node_id || key != pin.public_key {
+                return Err(Error::IdentityPinConflict);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO identity_pins VALUES(?1,?2,?3)",
+                params![peer, pin.node_id, pin.public_key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Only the operator's explicit re-enrollment path should call this.
+    pub fn reset_pin(&mut self, peer: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM identity_pins WHERE peer=?1", [peer])?
+            != 0)
+    }
+
     /// Rebuild the unread mailbox projection after restart, including while
     /// paused. Reading this list never consumes a message or changes custody.
     pub fn inbox_keys(&self) -> Result<Vec<MessageKey>> {
@@ -558,22 +641,37 @@ impl<D: DiskSpace> Store<D> {
         Ok(keys)
     }
 
-    /// Recover queued work after restart. A paused store refuses scheduling.
-    /// Transport completion must still commit a receipt before releasing custody.
+    /// Atomically claim at most 500 ready keys for 60 seconds of unpaused
+    /// time. A second worker cannot select them until that lease expires.
+    /// Workers must finish their attempt within the lease. Crashed workers'
+    /// claims become retryable after expiry, including across restart.
     pub fn retry_ready(&mut self, wall_ms: i64) -> Result<Vec<MessageKey>> {
         let now = self.writable(wall_ms)?;
-        let mut stmt = self.connection.prepare(
-            "SELECT origin,id FROM envelopes WHERE state='custody' AND retry_at<=?1
-             AND custody_deadline>?1 ORDER BY retry_at,origin,id",
-        )?;
-        let keys = stmt
-            .query_map([now], |r| {
-                Ok(MessageKey {
-                    origin_node: r.get(0)?,
-                    message_id: r.get(1)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let keys = {
+            let mut stmt = tx.prepare(
+                "SELECT origin,id FROM envelopes WHERE state='custody' AND retry_at<=?1
+                 AND custody_deadline>?1 AND lease_until<=?1 ORDER BY retry_at,origin,id LIMIT 500",
+            )?;
+            let keys = stmt
+                .query_map([now], |r| {
+                    Ok(MessageKey {
+                        origin_node: r.get(0)?,
+                        message_id: r.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            keys
+        };
+        for key in &keys {
+            tx.execute(
+                "UPDATE envelopes SET lease_until=?3 WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id, now.saturating_add(60_000)],
+            )?;
+        }
+        tx.commit()?;
         Ok(keys)
     }
 
@@ -581,17 +679,34 @@ impl<D: DiskSpace> Store<D> {
     /// Keep dedupe through admitted TTL + 24h even after outcome retention ends.
     pub fn maintain(&mut self, wall_ms: i64) -> Result<usize> {
         let now = self.writable(wall_ms)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE envelopes SET state=CASE WHEN state='inbox' THEN 'inbox_expired' ELSE 'expired' END,
-            body=X'',outcome_until=?1 WHERE (state='custody' AND custody_deadline<=?2)
-            OR (state='inbox' AND inbox_deadline<=?2)", params![now.saturating_add(CUSTODY_TTL_MS),now])?;
-        let deleted = tx.execute(
-            "DELETE FROM envelopes WHERE outcome_until<=?1 AND dedupe_until<=?1",
-            [now],
-        )?;
-        tx.commit()?;
+        // Each transaction changes at most 500 rows, releasing the writer lock
+        // between batches so other work can make progress.
+        loop {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let expired = tx.execute("UPDATE envelopes SET state=CASE WHEN state='inbox' THEN 'inbox_expired' ELSE 'expired' END,
+                body=X'',outcome_until=?1 WHERE rowid IN (SELECT rowid FROM envelopes
+                WHERE (state='custody' AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
+                params![now.saturating_add(CUSTODY_TTL_MS),now])?;
+            tx.commit()?;
+            if expired < 500 {
+                break;
+            }
+        }
+        let mut deleted = 0;
+        loop {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let batch = tx.execute("DELETE FROM envelopes WHERE rowid IN
+                (SELECT rowid FROM envelopes WHERE outcome_until<=?1 AND dedupe_until<=?1 LIMIT 500)", [now])?;
+            tx.commit()?;
+            deleted += batch;
+            if batch < 500 {
+                break;
+            }
+        }
         self.checkpoint()?;
         Ok(deleted)
     }
@@ -600,7 +715,6 @@ impl<D: DiskSpace> Store<D> {
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
-        self.guard_disk(0)?;
         self.connection.execute_batch(
             "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum;
             PRAGMA wal_checkpoint(TRUNCATE);",

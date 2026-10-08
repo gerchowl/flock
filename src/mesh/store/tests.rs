@@ -291,10 +291,7 @@ fn disk_reserve_refuses_writes_without_acknowledgment() {
         Err(Error::MailStoreFull)
     ));
     assert!(s.get(&e.key).unwrap().is_none());
-    assert!(matches!(
-        Store::open_with(&f.path, 0, Limits::default(), f.disk.clone()),
-        Err(Error::MailStoreFull)
-    ));
+    assert!(Store::open_with(&f.path, 0, Limits::default(), f.disk.clone()).is_ok());
 }
 
 #[test]
@@ -486,4 +483,236 @@ fn collection_tokens_are_independently_minted() {
     let b = ReturnBinding::mint(key, "receiver.example".into(), vec![]).unwrap();
     assert_eq!(a.collection_token.len(), 32);
     assert_ne!(a.collection_token, b.collection_token);
+}
+
+#[test]
+fn reserve_never_blocks_reclamation_pause_reopen_or_existing_body_import() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let expired = envelope();
+    let imported = envelope();
+    let finished = envelope();
+    for e in [&expired, &imported, &finished] {
+        s.accept(e, 1000, Admission::Custody, 0).unwrap();
+    }
+    f.disk.0.store(0, Ordering::Relaxed);
+    s.set_paused(true, 0).unwrap();
+    drop(s);
+    let mut s = f.open(100);
+    assert!(s.clock().unwrap().paused);
+    s.set_paused(false, 100).unwrap();
+    s.import(&imported.key, 100).unwrap();
+    s.finish(&finished.key, Outcome::Delivered, 100).unwrap();
+    s.checkpoint().unwrap();
+    s.maintain(1100).unwrap();
+    assert_eq!(s.get(&expired.key).unwrap().unwrap().state, "expired");
+    s.maintain(100 + DAY_MS).unwrap();
+    assert_eq!(s.maintain(100 + DAY_MS + CUSTODY_TTL_MS).unwrap(), 3);
+    drop(s);
+    let s = f.open(100 + DAY_MS + CUSTODY_TTL_MS);
+    assert!(s.get(&expired.key).unwrap().is_none());
+}
+
+fn usage(s: &Store<Disk>) -> (i64, i64, i64) {
+    s.connection
+        .query_row("SELECT total_bytes,body_bytes,active FROM usage", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+}
+
+#[test]
+fn unversioned_store_migrates_once_and_counters_track_rollback_release_and_gc() {
+    let f = Fixture::new();
+    let e = envelope();
+    {
+        let c = Connection::open(&f.path).unwrap();
+        c.execute_batch(schema::BASE).unwrap();
+        let mut metadata = e.clone();
+        metadata.body.clear();
+        c.execute("INSERT INTO envelopes VALUES(?1,?2,?3,?4,X'',?5,'custody',1000,NULL,1000,NULL,0,0,100)",
+            params![e.key.origin_node,e.key.message_id,e.correlation_id,serde_json::to_string(&metadata).unwrap(),e.body]).unwrap();
+    }
+    let mut s = f.open(0);
+    assert_eq!(
+        usage(&s),
+        (100 + e.body.len() as i64, e.body.len() as i64, 1)
+    );
+    assert_eq!(
+        s.connection
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        schema::VERSION
+    );
+    assert_eq!(
+        s.by_collection_token(&e.return_binding.collection_token)
+            .unwrap(),
+        vec![e.key.clone()]
+    );
+    s.finish(&e.key, Outcome::Delivered, 0).unwrap();
+    assert_eq!(usage(&s), (100, 0, 0));
+    let before = usage(&s);
+    s.connection.execute_batch("CREATE TRIGGER fail_import BEFORE INSERT ON inbox_imports BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(s.accept(&envelope(), 1000, Admission::Inbox, 0).is_err());
+    assert_eq!(usage(&s), before);
+    drop(s);
+    let mut s = f.open(0);
+    assert_eq!(usage(&s), before);
+    s.maintain(CUSTODY_TTL_MS).unwrap();
+    assert_eq!(usage(&s), (0, 0, 0));
+}
+
+#[test]
+fn newer_schema_is_refused_without_changing_version() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    s.connection
+        .pragma_update(None, "user_version", schema::VERSION + 1)
+        .unwrap();
+    drop(s);
+    let result = Store::open_with(&f.path, 0, Limits::default(), f.disk.clone());
+    assert!(
+        matches!(result, Err(Error::NewerSchema { found, supported }) if found == schema::VERSION + 1 && supported == schema::VERSION)
+    );
+    let c = Connection::open(&f.path).unwrap();
+    assert_eq!(
+        c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        schema::VERSION + 1
+    );
+}
+
+#[test]
+fn gc_processes_multiple_batches_and_counters_remain_exact() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    // Seed more than two batches through real admission, then verify every
+    // transition and cascade using the durable aggregate counters.
+    for _ in 0..1001 {
+        s.accept(&envelope(), 1, Admission::Inbox, 0).unwrap();
+    }
+    assert_eq!(usage(&s).2, 1001);
+    s.maintain(DAY_MS).unwrap();
+    assert_eq!(usage(&s).1, 0);
+    assert_eq!(usage(&s).2, 0);
+    assert_eq!(s.maintain(DAY_MS + CUSTODY_TTL_MS).unwrap(), 1001);
+    assert_eq!(usage(&s), (0, 0, 0));
+    assert_eq!(
+        s.connection
+            .query_row("SELECT count(*) FROM inbox_imports", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn retry_claims_exclude_other_workers_and_survive_reopen_until_expiry() {
+    let f = Fixture::new();
+    let mut a = f.open(0);
+    let e = envelope();
+    a.accept(&e, CUSTODY_TTL_MS, Admission::Custody, 0).unwrap();
+    let mut b = f.open(0);
+    assert_eq!(a.retry_ready(0).unwrap(), vec![e.key.clone()]);
+    assert!(b.retry_ready(0).unwrap().is_empty());
+    drop(a);
+    drop(b);
+    let mut c = f.open(59_999);
+    assert!(c.retry_ready(59_999).unwrap().is_empty());
+    assert_eq!(c.retry_ready(60_000).unwrap(), vec![e.key]);
+}
+
+#[test]
+fn request_and_token_lookups_are_scoped_and_survive_restart() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let request = envelope();
+    let mut reply = envelope();
+    reply.request_key = Some(request.key.clone());
+    reply.return_binding = request.return_binding.clone();
+    let mut unrelated = envelope();
+    unrelated.return_binding.collection_token = vec![7; 32];
+    for e in [&request, &reply, &unrelated] {
+        s.accept(e, 1000, Admission::Custody, 0).unwrap();
+    }
+    drop(s);
+    let s = f.open(0);
+    assert_eq!(
+        s.by_request_key(&request.key).unwrap(),
+        vec![reply.key.clone()]
+    );
+    assert!(s.by_request_key(&unrelated.key).unwrap().is_empty());
+    let keys = s
+        .by_collection_token(&request.return_binding.collection_token)
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&request.key));
+    assert!(keys.contains(&reply.key));
+    assert!(s.by_collection_token(&[0; 32]).unwrap().is_empty());
+}
+
+#[test]
+fn pins_require_explicit_reset_and_persist() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let pin = IdentityPin {
+        node_id: "node.example".into(),
+        public_key: vec![1; 32],
+    };
+    s.put_pin("peer.example", &pin).unwrap();
+    s.put_pin("peer.example", &pin).unwrap();
+    assert!(matches!(
+        s.put_pin("other.example", &pin),
+        Err(Error::IdentityPinConflict)
+    ));
+    let replacement = IdentityPin {
+        node_id: "new.example".into(),
+        public_key: vec![2; 32],
+    };
+    assert!(matches!(
+        s.put_pin("peer.example", &replacement),
+        Err(Error::IdentityPinConflict)
+    ));
+    drop(s);
+    let mut s = f.open(0);
+    assert_eq!(s.get_pin("peer.example").unwrap(), Some(pin));
+    assert!(s.reset_pin("peer.example").unwrap());
+    s.put_pin("peer.example", &replacement).unwrap();
+    assert_eq!(s.get_pin("peer.example").unwrap(), Some(replacement));
+}
+
+#[test]
+fn system_disk_queries_the_store_directory_and_reports_bad_paths() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Store>();
+    let f = Fixture::new();
+    assert!(SystemDisk.available(f.path.parent().unwrap()).is_ok());
+    assert!(SystemDisk.available(&f.path.join("missing")).is_err());
+}
+
+#[test]
+fn concurrent_workers_claim_a_message_only_once() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, CUSTODY_TTL_MS, Admission::Custody, 0).unwrap();
+    drop(s);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = f.path.clone();
+            let disk = f.disk.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut s = Store::open_with(&path, 0, Limits::default(), disk).unwrap();
+                barrier.wait();
+                s.retry_ready(0).unwrap()
+            })
+        })
+        .collect();
+    let keys: Vec<_> = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(keys, vec![e.key]);
 }
