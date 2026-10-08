@@ -41,7 +41,8 @@ Server status includes the API socket listener’s accept-error count, latest er
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node
 ID, and enrollment state: `pending`, `pinned`, or `refused` with the reason.
-Each enrolled key is bound to one name, including when it reconnects inbound.
+Inbound keys remain bound to their signed remote names. Configured peer aliases
+supply local display names and may differ from those remote names.
 With an older running server, the rest of status remains available and
 enrollment reports `unknown (server predates mesh; restart needed)`.
 `flk peers status --json` includes `source`, `node_id`, `enrollment`, and
@@ -50,8 +51,8 @@ enrollment reports `unknown (server predates mesh; restart needed)`.
 Held SSH edges authenticate both node keys using fresh challenges and require
 matching mesh protocol versions (`mesh: 1`). First contact pins the identity.
 Pins survive restarts. An unexpected key change is refused as a possible
-impersonation or re-key. After verifying the replacement, a local operator
-outside agent panes can clear that peer's pin and reconnect:
+impersonation or re-key. After verifying the replacement, reset the pin from
+the operator's shell and reconnect:
 
 ```bash
 flk peers enroll --reset <peer>

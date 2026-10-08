@@ -26,7 +26,9 @@ impl App {
             Ok(None) => encode_success(id, ResponseResult::Ok {}),
             Err(reason) => {
                 if let Some(status) = self.mesh_inbound.as_mut() {
-                    self.uplink.reset_enrollment(&status.peer);
+                    if let Some(hub) = self.uplink.enrolled_hub() {
+                        self.uplink.reset_enrollment(&hub);
+                    }
                     status.state = "refused".into();
                     status.reason = Some(reason.clone());
                 }
@@ -66,7 +68,12 @@ impl App {
                 if let Some(peer) = self.uplink.enrolled_hub() {
                     self.uplink.reset_enrollment(&peer);
                 }
-                let peer = offer.name.clone();
+                let peer = hello::with_store(|store| {
+                    store
+                        .pin_name_from(PinSource::Configured, &offer.pin())
+                        .map_err(|e| e.to_string())
+                })?
+                .unwrap_or_else(|| offer.name.clone());
                 self.mesh_inbound = Some(Enrollment {
                     peer: peer.clone(),
                     source: PinSource::Inbound,
@@ -75,7 +82,8 @@ impl App {
                     reason: None,
                 });
                 offer.validate(&peer)?;
-                hello::check_pin(&peer, &offer, PinSource::Inbound, false)?;
+                // The signed remote name stays pinned independently of its local alias.
+                hello::check_pin(&offer.name, &offer, PinSource::Inbound, false)?;
                 let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
                 let acceptor = Offer::new(&identity, crate::app::short_host_name())?;
                 let signature = hello::sign(&identity, &offer, &acceptor, "acceptor")?;
@@ -108,7 +116,12 @@ impl App {
                 }
                 hello::verify(&pending.dialer, &pending.acceptor, "dialer", &signature)?;
                 let status = self.mesh_inbound.as_mut().ok_or("no pending enrollment")?;
-                hello::check_pin(&status.peer, &pending.dialer, PinSource::Inbound, true)?;
+                hello::check_pin(
+                    &pending.dialer.name,
+                    &pending.dialer,
+                    PinSource::Inbound,
+                    true,
+                )?;
                 status.node_id = Some(pending.dialer.node_id);
                 status.state = "pinned".into();
                 status.reason = None;
@@ -145,8 +158,19 @@ impl App {
             );
         }
         match hello::with_store(|store| {
+            let mut pin_peer = peer.clone();
+            if source == PinSource::Inbound {
+                if let Some(configured) = store.get_pin(&peer).map_err(|e| e.to_string())? {
+                    if let Some(name) = store
+                        .pin_name_from(PinSource::Inbound, &configured)
+                        .map_err(|e| e.to_string())?
+                    {
+                        pin_peer = name;
+                    }
+                }
+            }
             let node_id = store
-                .get_pin_from(source, &peer)
+                .get_pin_from(source, &pin_peer)
                 .map_err(|e| e.to_string())?
                 .map(|pin| pin.node_id);
             if !preview {
@@ -154,22 +178,23 @@ impl App {
                     return Err("pin changed since preview; inspect it before resetting".into());
                 }
                 store
-                    .reset_pin_from(source, &peer)
+                    .reset_pin_from(source, &pin_peer)
                     .map_err(|e| e.to_string())?;
             }
-            Ok(node_id)
+            Ok((pin_peer, node_id))
         }) {
-            Ok(node_id) => {
+            Ok((pin_peer, node_id)) => {
                 if !preview {
                     if source == PinSource::Configured {
                         crate::peer_stream::reset_enrollment(&peer);
                     } else {
-                        self.uplink.reset_enrollment(&peer);
-                        if self
-                            .mesh_inbound
-                            .as_ref()
-                            .is_some_and(|status| status.peer == peer)
-                        {
+                        self.uplink.reset_enrollment(&pin_peer);
+                        if self.mesh_inbound.as_ref().is_some_and(|status| {
+                            status.peer == peer || (node_id.is_some() && status.node_id == node_id)
+                        }) {
+                            if let Some(hub) = self.uplink.enrolled_hub() {
+                                self.uplink.reset_enrollment(&hub);
+                            }
                             self.mesh_pending = None;
                             self.mesh_inbound = None;
                         }
@@ -196,7 +221,14 @@ impl App {
             .map(crate::peer_stream::enrollment)
             .collect();
         if let Some(inbound) = self.mesh_inbound.as_ref() {
-            peers.push(inbound.clone());
+            let mut inbound = inbound.clone();
+            if let Some(configured) = peers
+                .iter()
+                .find(|peer| inbound.node_id.is_some() && peer.node_id == inbound.node_id)
+            {
+                inbound.peer = configured.peer.clone();
+            }
+            peers.push(inbound);
         }
         encode_success(id, ResponseResult::PeersEnrollment { peers })
     }

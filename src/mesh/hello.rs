@@ -164,7 +164,7 @@ pub(crate) fn check_pin(
 ) -> Result<(), String> {
     with_store(|store| {
         if let Some(name) = store
-            .conflicting_pin_name(peer, &offer.pin())
+            .conflicting_pin_name(source, peer, &offer.pin())
             .map_err(|e| e.to_string())?
         {
             return Err(format!("node {} is enrolled as {name}", offer.node_id));

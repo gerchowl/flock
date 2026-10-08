@@ -470,3 +470,105 @@ fn old_dialer_is_visible_as_refused_on_acceptor() {
     );
     assert!(refused["node_id"].is_null());
 }
+
+const ALIAS_A_TO_B: &str = "[[peers]]\nname = \"b-ts.test\"\nssh = \"b.test\"\n";
+const ALIAS_B_TO_A: &str = "[[peers]]\nname = \"a-ts.test\"\nssh = \"a.test\"\n";
+
+fn add_peer(node: &Node, config: &str) {
+    use std::io::Write;
+    for app in ["flock", "flock-dev"] {
+        let path = node.config_home.join(app).join("config.toml");
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "\n{config}").unwrap();
+    }
+}
+
+fn bidirectional_aliases(a_dials_first: bool) {
+    let specs = [
+        NodeSpec::new("a.test", "alias-a", &[]).with_config(if a_dials_first {
+            ALIAS_A_TO_B
+        } else {
+            ""
+        }),
+        NodeSpec::new("b.test", "alias-b", &[]).with_config(if a_dials_first {
+            ""
+        } else {
+            ALIAS_B_TO_A
+        }),
+    ];
+    let mut fleet = fleet::spawn("mesh-alias", &specs);
+    if a_dials_first {
+        enrollment(fleet.node("a.test"), "b-ts.test", "pinned");
+        enrollment(fleet.node("b.test"), "a.test", "pinned");
+        add_peer(fleet.node("b.test"), ALIAS_B_TO_A);
+        let reloaded = request(fleet.node("b.test"), "server.reload_config", json!({}));
+        assert!(reloaded.get("error").is_none(), "{reloaded}");
+    } else {
+        enrollment(fleet.node("b.test"), "a-ts.test", "pinned");
+        enrollment(fleet.node("a.test"), "b.test", "pinned");
+        add_peer(fleet.node("a.test"), ALIAS_A_TO_B);
+        let reloaded = request(fleet.node("a.test"), "server.reload_config", json!({}));
+        assert!(reloaded.get("error").is_none(), "{reloaded}");
+    }
+    for (name, alias) in [("a.test", "b-ts.test"), ("b.test", "a-ts.test")] {
+        let node = fleet.node(name);
+        let peers = fleet::wait_until(
+            "both alias directions enrolled",
+            Duration::from_secs(90),
+            || {
+                let response = request(node, "peers.enrollment", json!({}));
+                let peers = response["result"]["peers"].as_array()?;
+                (peers.len() == 2
+                    && peers
+                        .iter()
+                        .all(|p| p["peer"] == alias && p["state"] == "pinned"))
+                .then(|| peers.clone())
+            },
+        );
+        assert_eq!(peers[0]["node_id"], peers[1]["node_id"]);
+        assert!(peers.iter().any(|p| p["source"] == "configured"));
+        assert!(peers.iter().any(|p| p["source"] == "inbound"));
+        let status = cli(node, &["status", "--json"]);
+        assert!(status["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["peer"] == alias));
+        let status = cli(node, &["peers", "status", "--json"]);
+        assert!(status
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["name"] == alias));
+        let preview = request(
+            node,
+            "peers.enroll_reset",
+            json!({"peer":alias,"source":"inbound","preview":true}),
+        );
+        assert_eq!(
+            preview["result"]["node_id"], peers[0]["node_id"],
+            "{preview}"
+        );
+    }
+    // An existing configured alias must not authorize a new inbound name.
+    rename_node(fleet.node("b.test"), "impostor.test");
+    fleet.node_mut("b.test").restart();
+    let refused = enrollment(fleet.node("a.test"), "b-ts.test", "refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is enrolled as b.test"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn bidirectional_alias_enrollment_outbound_first() {
+    bidirectional_aliases(true);
+}
+
+#[test]
+fn bidirectional_alias_enrollment_inbound_first() {
+    bidirectional_aliases(false);
+}

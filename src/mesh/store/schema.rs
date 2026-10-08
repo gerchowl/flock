@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 3;
+pub(super) const VERSION: i64 = 4;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -41,6 +41,20 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
             DROP TABLE legacy_identity_pins;
         "#,
         )?;
+        version = 3;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    if version == 3 {
+        tx.execute_batch(r#"
+            ALTER TABLE identity_pins RENAME TO directional_identity_pins;
+            CREATE TABLE identity_pins (
+                source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
+                public_key BLOB NOT NULL, PRIMARY KEY(source,peer));
+            INSERT INTO identity_pins SELECT * FROM directional_identity_pins;
+            DROP TABLE directional_identity_pins;
+            CREATE UNIQUE INDEX inbound_node_name ON identity_pins(node_id) WHERE source='inbound';
+            CREATE UNIQUE INDEX inbound_key_name ON identity_pins(public_key) WHERE source='inbound';
+        "#)?;
         tx.pragma_update(None, "user_version", VERSION)?;
     }
     tx.commit()?;

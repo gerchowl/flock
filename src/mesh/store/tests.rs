@@ -677,10 +677,8 @@ fn pins_require_explicit_reset_and_persist() {
     };
     s.put_pin("peer.example", &pin).unwrap();
     s.put_pin("peer.example", &pin).unwrap();
-    assert!(matches!(
-        s.put_pin("other.example", &pin),
-        Err(Error::IdentityPinConflict)
-    ));
+    s.put_pin("other.example", &pin).unwrap();
+    assert_eq!(s.get_pin("other.example").unwrap(), Some(pin.clone()));
     let replacement = IdentityPin {
         node_id: "new.example".into(),
         public_key: vec![2; 32],
@@ -749,11 +747,17 @@ fn pin_directions_reset_independently_and_identity_cannot_gain_an_alias() {
     s.put_pin_from(PinSource::Inbound, "peer.example", &inbound)
         .unwrap();
     assert_eq!(
-        s.conflicting_pin_name("other.example", &inbound).unwrap(),
+        s.conflicting_pin_name(PinSource::Inbound, "other.example", &inbound)
+            .unwrap(),
         Some("peer.example".into())
     );
+    s.put_pin("other.example", &inbound).unwrap();
+    assert_eq!(
+        s.pin_name_from(PinSource::Configured, &inbound).unwrap(),
+        Some("other.example".into())
+    );
     assert!(matches!(
-        s.put_pin("other.example", &inbound),
+        s.put_pin_from(PinSource::Inbound, "other.example", &inbound),
         Err(Error::IdentityPinConflict)
     ));
     let reused_key = IdentityPin {
@@ -777,4 +781,99 @@ fn pin_directions_reset_independently_and_identity_cannot_gain_an_alias() {
         s.get_pin_from(PinSource::Inbound, "peer.example").unwrap(),
         None
     );
+}
+
+#[test]
+fn configured_alias_and_inbound_name_enroll_in_either_order_and_survive_reopen() {
+    for inbound_first in [false, true] {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let pin = IdentityPin {
+            node_id: "node.example".into(),
+            public_key: vec![9; 32],
+        };
+        let entries = if inbound_first {
+            [
+                (PinSource::Inbound, "remote.example"),
+                (PinSource::Configured, "alias.example"),
+            ]
+        } else {
+            [
+                (PinSource::Configured, "alias.example"),
+                (PinSource::Inbound, "remote.example"),
+            ]
+        };
+        for (source, name) in entries {
+            assert!(s
+                .conflicting_pin_name(source, name, &pin)
+                .unwrap()
+                .is_none());
+            s.put_pin_from(source, name, &pin).unwrap();
+        }
+        drop(s);
+        let mut s = f.open(0);
+        assert_eq!(s.get_pin("alias.example").unwrap(), Some(pin.clone()));
+        assert_eq!(
+            s.get_pin_from(PinSource::Inbound, "remote.example")
+                .unwrap(),
+            Some(pin.clone())
+        );
+        assert_eq!(
+            s.conflicting_pin_name(PinSource::Inbound, "impostor.example", &pin)
+                .unwrap(),
+            Some("remote.example".into())
+        );
+        assert!(matches!(
+            s.put_pin_from(PinSource::Inbound, "impostor.example", &pin),
+            Err(Error::IdentityPinConflict)
+        ));
+    }
+}
+
+#[test]
+fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliases() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    s.connection
+        .execute_batch(
+            "DROP TABLE identity_pins;
+         CREATE TABLE identity_pins (
+             source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
+             public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
+             UNIQUE(source,node_id), UNIQUE(source,public_key));
+         PRAGMA user_version=3;",
+        )
+        .unwrap();
+    let pin = IdentityPin {
+        node_id: "node.example".into(),
+        public_key: vec![5; 32],
+    };
+    for (source, name) in [
+        ("configured", "alias.example"),
+        ("inbound", "remote.example"),
+    ] {
+        s.connection
+            .execute(
+                "INSERT INTO identity_pins VALUES(?1,?2,?3,?4)",
+                params![source, name, pin.node_id, pin.public_key],
+            )
+            .unwrap();
+    }
+    drop(s);
+    let mut s = f.open(0);
+    assert_eq!(s.get_pin("alias.example").unwrap(), Some(pin.clone()));
+    assert_eq!(
+        s.get_pin_from(PinSource::Inbound, "remote.example")
+            .unwrap(),
+        Some(pin.clone())
+    );
+    s.put_pin("second-alias.example", &pin).unwrap();
+    assert_eq!(
+        s.get_pin("second-alias.example").unwrap(),
+        Some(pin.clone())
+    );
+    assert!(matches!(
+        s.put_pin_from(PinSource::Inbound, "impostor.example", &pin),
+        Err(Error::IdentityPinConflict)
+    ));
 }

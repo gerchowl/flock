@@ -607,10 +607,26 @@ impl<D: DiskSpace> Store<D> {
             .optional()?)
     }
 
-    /// Look up both identity components before issuing a challenge.
-    pub fn conflicting_pin_name(&self, peer: &str, pin: &IdentityPin) -> Result<Option<String>> {
+    /// Configured labels are local aliases, not remote identity claims.
+    pub fn pin_name_from(&self, source: PinSource, pin: &IdentityPin) -> Result<Option<String>> {
         Ok(self.connection.query_row(
-            "SELECT peer FROM identity_pins WHERE peer!=?1 AND (node_id=?2 OR public_key=?3) LIMIT 1",
+            "SELECT peer FROM identity_pins WHERE source=?1 AND node_id=?2 AND public_key=?3 ORDER BY peer LIMIT 1",
+            params![source.as_str(), pin.node_id, pin.public_key], |r| r.get(0),
+        ).optional()?)
+    }
+
+    /// Only inbound claims bind a key to a remote name.
+    pub fn conflicting_pin_name(
+        &self,
+        source: PinSource,
+        peer: &str,
+        pin: &IdentityPin,
+    ) -> Result<Option<String>> {
+        if source == PinSource::Configured {
+            return Ok(None);
+        }
+        Ok(self.connection.query_row(
+            "SELECT peer FROM identity_pins WHERE source='inbound' AND peer!=?1 AND (node_id=?2 OR public_key=?3) LIMIT 1",
             params![peer, pin.node_id, pin.public_key], |r| r.get(0),
         ).optional()?)
     }
@@ -619,8 +635,8 @@ impl<D: DiskSpace> Store<D> {
         self.put_pin_from(PinSource::Configured, peer, pin)
     }
 
-    /// Transactionally enforce name binding in both directions, without
-    /// allowing one direction to overwrite the other's pin.
+    /// Transactionally bind inbound claims and refuse key replacement in
+    /// either direction. A configured alias cannot rename an inbound claim.
     pub fn put_pin_from(&mut self, source: PinSource, peer: &str, pin: &IdentityPin) -> Result<()> {
         if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
             return Err(Error::InvalidEnvelope);
@@ -630,7 +646,7 @@ impl<D: DiskSpace> Store<D> {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let conflict: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM identity_pins WHERE
-                (peer!=?2 AND (node_id=?3 OR public_key=?4)) OR
+                (?1='inbound' AND source='inbound' AND peer!=?2 AND (node_id=?3 OR public_key=?4)) OR
                 (source=?1 AND peer=?2 AND (node_id!=?3 OR public_key!=?4)))",
             params![source.as_str(), peer, pin.node_id, pin.public_key],
             |r| r.get(0),
