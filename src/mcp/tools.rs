@@ -182,9 +182,15 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_msg_list",
             description: "List messages that are still queued (not yet \
                           delivered). Pass `pane` to restrict to one \
-                          recipient (bare-pane target grammar).",
+                          recipient (bare-pane target grammar). Includes wake attempt evidence and failure reasons.",
             input_schema: schema_msg_list,
             build: build_msg_list,
+        },
+        Tool {
+            name: "flock_msg_status",
+            description: "Inspect a sent message by correlation id, including read or relay state and local submission attempts with unconfirmed or abandoned reasons.",
+            input_schema: schema_msg_status,
+            build: build_msg_status,
         },
         Tool {
             name: "flock_msg_read",
@@ -646,6 +652,18 @@ fn schema_msg_reply() -> Value {
         "required": ["correlation_id", "body"],
         "additionalProperties": false,
     })
+}
+
+fn schema_msg_status() -> Value {
+    json!({"type": "object", "properties": {
+        "correlation_id": {"type": "string", "minLength": 1}
+    }, "required": ["correlation_id"], "additionalProperties": false})
+}
+
+fn build_msg_status(args: Value) -> Result<Method, McpError> {
+    Ok(Method::MsgStatus(crate::api::schema::MsgStatusParams {
+        correlation_id: required_string(&args, "correlation_id")?,
+    }))
 }
 
 fn schema_msg_list() -> Value {
@@ -1391,6 +1409,7 @@ mod tests {
                 "flock_msg_send",
                 "flock_msg_reply",
                 "flock_msg_list",
+                "flock_msg_status",
                 "flock_msg_read",
                 "flock_msg_mute",
                 "flock_msg_wait_reply",

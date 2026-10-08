@@ -182,6 +182,23 @@ pub struct Record {
     pub retry_at_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinSource {
+    #[default]
+    Configured,
+    Inbound,
+}
+
+impl PinSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Inbound => "inbound",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPin {
     pub node_id: String,
@@ -571,11 +588,15 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn get_pin(&self, peer: &str) -> Result<Option<IdentityPin>> {
+        self.get_pin_from(PinSource::Configured, peer)
+    }
+
+    pub fn get_pin_from(&self, source: PinSource, peer: &str) -> Result<Option<IdentityPin>> {
         Ok(self
             .connection
             .query_row(
-                "SELECT node_id,public_key FROM identity_pins WHERE peer=?1",
-                [peer],
+                "SELECT node_id,public_key FROM identity_pins WHERE source=?1 AND peer=?2",
+                params![source.as_str(), peer],
                 |r| {
                     Ok(IdentityPin {
                         node_id: r.get(0)?,
@@ -586,42 +607,55 @@ impl<D: DiskSpace> Store<D> {
             .optional()?)
     }
 
-    /// Enrollment is idempotent, but never silently replaces a pin or aliases
-    /// an already pinned node. Replacement requires an explicit operator reset.
+    /// Look up both identity components before issuing a challenge.
+    pub fn conflicting_pin_name(&self, peer: &str, pin: &IdentityPin) -> Result<Option<String>> {
+        Ok(self.connection.query_row(
+            "SELECT peer FROM identity_pins WHERE peer!=?1 AND (node_id=?2 OR public_key=?3) LIMIT 1",
+            params![peer, pin.node_id, pin.public_key], |r| r.get(0),
+        ).optional()?)
+    }
+
     pub fn put_pin(&mut self, peer: &str, pin: &IdentityPin) -> Result<()> {
+        self.put_pin_from(PinSource::Configured, peer, pin)
+    }
+
+    /// Transactionally enforce name binding in both directions, without
+    /// allowing one direction to overwrite the other's pin.
+    pub fn put_pin_from(&mut self, source: PinSource, peer: &str, pin: &IdentityPin) -> Result<()> {
         if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
             return Err(Error::InvalidEnvelope);
         }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<(String, String, Vec<u8>)> = tx
-            .query_row(
-                "SELECT peer,node_id,public_key FROM identity_pins WHERE peer=?1 OR node_id=?2",
-                params![peer, pin.node_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        if let Some((name, node_id, key)) = existing {
-            if name != peer || node_id != pin.node_id || key != pin.public_key {
-                return Err(Error::IdentityPinConflict);
-            }
-        } else {
-            tx.execute(
-                "INSERT INTO identity_pins VALUES(?1,?2,?3)",
-                params![peer, pin.node_id, pin.public_key],
-            )?;
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_pins WHERE
+                (peer!=?2 AND (node_id=?3 OR public_key=?4)) OR
+                (source=?1 AND peer=?2 AND (node_id!=?3 OR public_key!=?4)))",
+            params![source.as_str(), peer, pin.node_id, pin.public_key],
+            |r| r.get(0),
+        )?;
+        if conflict {
+            return Err(Error::IdentityPinConflict);
         }
+        tx.execute(
+            "INSERT OR IGNORE INTO identity_pins VALUES(?1,?2,?3,?4)",
+            params![source.as_str(), peer, pin.node_id, pin.public_key],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     /// Only the operator's explicit re-enrollment path should call this.
     pub fn reset_pin(&mut self, peer: &str) -> Result<bool> {
-        Ok(self
-            .connection
-            .execute("DELETE FROM identity_pins WHERE peer=?1", [peer])?
-            != 0)
+        self.reset_pin_from(PinSource::Configured, peer)
+    }
+
+    pub fn reset_pin_from(&mut self, source: PinSource, peer: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM identity_pins WHERE source=?1 AND peer=?2",
+            params![source.as_str(), peer],
+        )? != 0)
     }
 
     /// Rebuild the unread mailbox projection after restart, including while

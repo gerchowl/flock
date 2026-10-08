@@ -19,8 +19,12 @@ an enrolled attachment, including after a server restart. Relay methods are
 bound to an SSH-descended process and its start time.
 
 `peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
-`state`, and `reason`. `peers.enroll_reset { "peer": "<peer>" }` clears a pin
-and invalidates its enrollment; it is local-operator-only and absent from MCP.
+`source` (`configured` or `inbound`), `state`, and `reason`.
+`peers.enroll_reset { "peer": "<peer>", "source": "configured", "preview": true }`
+shows the affected pin. Repeat with `preview: false` and the returned `node_id`
+as `expected_node_id` to clear it and invalidate its enrollment. Source defaults
+to `configured`. Reset is refused when invoked from an agent pane or over
+MCP/relay; the operator's shell is the trust boundary.
 
 ## Choose an integration layer
 

@@ -104,10 +104,10 @@ pub(crate) enum ServerRuntimeStatus {
 fn print_full_status(json: bool) -> std::io::Result<i32> {
     let server = read_server_runtime_status()?;
     let installed = read_installed_status(&server);
-    let peers = if matches!(server, ServerRuntimeStatus::Running { .. }) {
-        super::peers::read_enrollment()?
+    let (peers, enrollment_warning) = if matches!(server, ServerRuntimeStatus::Running { .. }) {
+        super::peers::read_enrollment()
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     if json {
@@ -117,13 +117,11 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
             update: update_status_json(&server),
             installed,
             peers,
+            enrollment_warning,
         })?;
         return Ok(0);
     }
 
-    for peer in &peers {
-        println!("{}", super::peers::enrollment_line(peer));
-    }
     println!("client:");
     println!("  version: {}", crate::build_info::version());
     println!(
@@ -131,6 +129,14 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
         crate::config::Config::load().config.update.channel.as_str()
     );
     println!("  protocol: {}", crate::protocol::PROTOCOL_VERSION);
+    println!();
+    println!("peers:");
+    if let Some(warning) = enrollment_warning {
+        println!("  {warning}");
+    }
+    for peer in &peers {
+        println!("  {}", super::peers::enrollment_line(peer));
+    }
     println!();
     println!("server:");
     print_server_status_body(&server, "  ");
@@ -308,6 +314,8 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment_warning: Option<&'static str>,
     peers: Vec<crate::mesh::hello::Enrollment>,
     installed: InstalledStatusJson,
     client: ClientStatusJson,

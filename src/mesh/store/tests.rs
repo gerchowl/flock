@@ -528,12 +528,28 @@ fn unversioned_store_migrates_once_and_counters_track_rollback_release_and_gc() 
     {
         let c = Connection::open(&f.path).unwrap();
         c.execute_batch(schema::BASE).unwrap();
+        c.execute(
+            "INSERT INTO identity_pins VALUES(?1,?2,?3)",
+            params!["peer.example", "node.example", vec![7u8; 32]],
+        )
+        .unwrap();
         let mut metadata = e.clone();
         metadata.body.clear();
         c.execute("INSERT INTO envelopes VALUES(?1,?2,?3,?4,X'',?5,'custody',1000,NULL,1000,NULL,0,0,100)",
             params![e.key.origin_node,e.key.message_id,e.correlation_id,serde_json::to_string(&metadata).unwrap(),e.body]).unwrap();
     }
     let mut s = f.open(0);
+    assert_eq!(
+        s.get_pin("peer.example").unwrap(),
+        Some(IdentityPin {
+            node_id: "node.example".into(),
+            public_key: vec![7; 32],
+        })
+    );
+    assert!(s
+        .get_pin_from(PinSource::Inbound, "peer.example")
+        .unwrap()
+        .is_none());
     assert_eq!(
         usage(&s),
         (100 + e.body.len() as i64, e.body.len() as i64, 1)
@@ -715,4 +731,50 @@ fn concurrent_workers_claim_a_message_only_once() {
         .flat_map(|worker| worker.join().unwrap())
         .collect();
     assert_eq!(keys, vec![e.key]);
+}
+
+#[test]
+fn pin_directions_reset_independently_and_identity_cannot_gain_an_alias() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let configured = IdentityPin {
+        node_id: "outbound.example".into(),
+        public_key: vec![1; 32],
+    };
+    let inbound = IdentityPin {
+        node_id: "inbound.example".into(),
+        public_key: vec![2; 32],
+    };
+    s.put_pin("peer.example", &configured).unwrap();
+    s.put_pin_from(PinSource::Inbound, "peer.example", &inbound)
+        .unwrap();
+    assert_eq!(
+        s.conflicting_pin_name("other.example", &inbound).unwrap(),
+        Some("peer.example".into())
+    );
+    assert!(matches!(
+        s.put_pin("other.example", &inbound),
+        Err(Error::IdentityPinConflict)
+    ));
+    let reused_key = IdentityPin {
+        node_id: "forged.example".into(),
+        public_key: inbound.public_key.clone(),
+    };
+    assert!(matches!(
+        s.put_pin_from(PinSource::Inbound, "other.example", &reused_key),
+        Err(Error::IdentityPinConflict)
+    ));
+    s.reset_pin("peer.example").unwrap();
+    assert_eq!(
+        s.get_pin_from(PinSource::Inbound, "peer.example").unwrap(),
+        Some(inbound.clone())
+    );
+    s.put_pin("peer.example", &configured).unwrap();
+    s.reset_pin_from(PinSource::Inbound, "peer.example")
+        .unwrap();
+    assert_eq!(s.get_pin("peer.example").unwrap(), Some(configured));
+    assert_eq!(
+        s.get_pin_from(PinSource::Inbound, "peer.example").unwrap(),
+        None
+    );
 }

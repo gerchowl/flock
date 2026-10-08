@@ -19,6 +19,7 @@ pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
 pub(crate) mod config_io;
 mod creation;
+mod delivery_attempts;
 pub(crate) mod directory;
 pub(crate) mod float;
 pub(crate) mod handoffs;
@@ -139,6 +140,7 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    delivery_attempt_registry: std::cell::RefCell<delivery_attempts::DeliveryAttempts>,
     /// Installed from the API listener during server startup.
     pub(crate) node_id: Option<String>,
     pub(crate) mesh_pending: Option<crate::mesh::hello::Pending>,
@@ -833,6 +835,9 @@ impl App {
         });
 
         let mut this = Self {
+            delivery_attempt_registry: std::cell::RefCell::new(
+                delivery_attempts::DeliveryAttempts::new(event_hub.current_sequence()),
+            ),
             config_diagnostic_deadline: None,
             action_notice_deadline: None,
             toast_deadline: None,
@@ -952,6 +957,7 @@ impl App {
         // ADR-0018 §4: blocking mail restored from the log is still waiting on
         // its recipient, so the attention surface shows it from the first frame.
         this.sync_blocking_mail();
+        this.restore_delivery_attempts();
         // #372 / ADR-0016: rebuild the operator's notification list from the
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.
@@ -1002,6 +1008,7 @@ impl App {
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
     ) -> io::Result<Self> {
+        // Self::new restores attempt evidence once, including interrupted submissions.
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
             snapshot,

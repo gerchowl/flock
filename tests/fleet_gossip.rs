@@ -255,13 +255,10 @@ fn mesh_harness_disabled_and_mismatched_edges_refuse_unauthenticated_ping() {
             NodeSpec::new("nodeb", "beta", &[]).with_mesh(MeshMode::VersionMismatch(999)),
         ],
     );
-    for (node, code) in [
-        ("nodea", "invalid_request"),
-        ("nodeb", "mesh_version_mismatch"),
-    ] {
-        let reply = relay_probe(&fleet, "probe", node, "mesh.hello");
-        assert_eq!(reply["id"], "probe");
-        assert_eq!(reply["error"]["code"], code);
+    let reply = relay_probe(&fleet, "probe", "nodea", "mesh.hello");
+    assert_eq!(reply["error"]["code"], "invalid_request");
+    // The version override is exercised by an actual dialer in mesh_enrollment.
+    for node in ["nodea", "nodeb"] {
         let ping = relay_probe(&fleet, "probe", node, "ping");
         assert_eq!(ping["error"]["code"], "mesh_not_enrolled", "{ping}");
     }

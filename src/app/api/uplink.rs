@@ -341,6 +341,12 @@ impl App {
     /// sshd for a parent too. What this closes is the casual squatter — a
     /// detached shell, a launchd job, a script — and the pane agent.
     pub(super) fn handle_peers_relay_attach(&mut self, id: String) -> String {
+        if self.uplink.is_relay(
+            self.current_api_peer_pid,
+            crate::platform::process_start_time,
+        ) {
+            return encode_success(id, ResponseResult::Ok {});
+        }
         let Some(pid) = self.current_api_peer_pid else {
             return encode_error(
                 id,
@@ -842,11 +848,27 @@ mod tests {
     async fn enrollment_reset_is_refused_from_agent_panes_and_bound_relays() {
         let mut app = test_app();
         attest_caller(&mut app);
-        let response = value(&app.handle_peers_enroll_reset("reset".into(), "peer.test".into()));
+        let response = value(&app.handle_peers_enroll_reset(
+            "reset".into(),
+            crate::api::schema::PeersEnrollResetParams {
+                peer: "peer.test".into(),
+                source: Default::default(),
+                preview: false,
+                expected_node_id: None,
+            },
+        ));
         assert_eq!(response["error"]["code"], "operator_only");
         bind_relay(&mut app);
         app.current_api_peer_pid = Some(relay_pid());
-        let response = value(&app.handle_peers_enroll_reset("reset".into(), "peer.test".into()));
+        let response = value(&app.handle_peers_enroll_reset(
+            "reset".into(),
+            crate::api::schema::PeersEnrollResetParams {
+                peer: "peer.test".into(),
+                source: Default::default(),
+                preview: false,
+                expected_node_id: None,
+            },
+        ));
         assert_eq!(response["error"]["code"], "operator_only");
         assert_eq!(app.uplink.enrolled_hub().as_deref(), Some("hopper"));
     }

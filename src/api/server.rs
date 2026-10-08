@@ -370,7 +370,7 @@ fn handle_connection(
 
 /// PID of the process at the other end of the unix socket. macOS exposes it
 /// via LOCAL_PEERPID; Linux via SO_PEERCRED. None when unavailable.
-fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;

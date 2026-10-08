@@ -34,28 +34,68 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn peers_enroll(args: &[String]) -> std::io::Result<i32> {
-    let [reset, peer] = args else {
-        eprintln!("usage: flk peers enroll --reset <peer>");
-        return Ok(2);
+    use crate::mesh::store::PinSource;
+    let (peer, source) = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["--reset", peer] => ((*peer).to_owned(), PinSource::Configured),
+        ["--reset", peer, "--direction", "configured"] => {
+            ((*peer).to_owned(), PinSource::Configured)
+        }
+        ["--reset", peer, "--direction", "inbound"] => ((*peer).to_owned(), PinSource::Inbound),
+        _ => {
+            eprintln!("usage: flk peers enroll --reset <peer> [--direction configured|inbound]");
+            return Ok(2);
+        }
     };
-    if reset != "--reset" || peer.is_empty() {
-        eprintln!("usage: flk peers enroll --reset <peer>");
-        return Ok(2);
+    let mut params = crate::api::schema::PeersEnrollResetParams {
+        peer,
+        source,
+        preview: true,
+        expected_node_id: None,
+    };
+    let preview = super::send_request(&Request {
+        id: "cli:peers:enroll:preview".into(),
+        method: Method::PeersEnrollReset(params.clone()),
+    })?;
+    if preview.get("error").is_some() {
+        return super::print_response(&preview);
     }
+    let result = preview
+        .get("result")
+        .ok_or_else(|| std::io::Error::other("missing reset preview"))?;
+    params.expected_node_id = result["node_id"].as_str().map(str::to_owned);
+    eprintln!(
+        "clearing {} pin for {}: node {}",
+        source.as_str(),
+        printable(&params.peer),
+        params.expected_node_id.as_deref().unwrap_or("none")
+    );
+    params.preview = false;
     super::print_response(&super::send_request(&Request {
         id: "cli:peers:enroll".into(),
-        method: Method::PeersEnrollReset(crate::api::schema::PeersEnrollResetParams {
-            peer: peer.clone(),
-        }),
+        method: Method::PeersEnrollReset(params),
     })?)
 }
 
-pub(super) fn read_enrollment() -> std::io::Result<Vec<crate::mesh::hello::Enrollment>> {
-    let response = super::send_request(&Request {
+pub(super) const ENROLLMENT_UNKNOWN: &str =
+    "enrollment: unknown (server predates mesh; restart needed)";
+
+pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<&'static str>) {
+    let peers = super::send_request(&Request {
         id: "cli:peers:enrollment".into(),
         method: Method::PeersEnrollment(EmptyParams {}),
-    })?;
-    serde_json::from_value(response["result"]["peers"].clone()).map_err(std::io::Error::other)
+    })
+    .ok()
+    .filter(|response| response.get("error").is_none())
+    .and_then(|response| serde_json::from_value(response["result"]["peers"].clone()).ok());
+    match peers {
+        Some(peers) => (peers, None),
+        None => (Vec::new(), Some(ENROLLMENT_UNKNOWN)),
+    }
 }
 
 pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String {
@@ -67,8 +107,9 @@ pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String
         .take(12)
         .collect::<String>();
     let mut line = format!(
-        "{}  node {}  {}",
+        "{} ({})  node {}  {}",
         printable(&status.peer),
+        status.source.as_str(),
         printable(&node),
         printable(&status.state)
     );
@@ -275,7 +316,7 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
         .cloned()
         .and_then(|rows| serde_json::from_value(rows).ok())
         .unwrap_or_default();
-    let enrollment = read_enrollment()?;
+    let (enrollment, warning) = read_enrollment();
     if json {
         let mut values: Vec<serde_json::Value> = rows
             .iter()
@@ -283,9 +324,10 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
             .collect::<Result<_, _>>()
             .map_err(std::io::Error::other)?;
         for status in &enrollment {
-            let index = values
-                .iter()
-                .position(|v| v["name"].as_str() == Some(&status.peer));
+            let index = values.iter().position(|v| {
+                v["name"].as_str() == Some(&status.peer)
+                    && status.source == crate::mesh::store::PinSource::Configured
+            });
             let row = if let Some(index) = index {
                 &mut values[index]
             } else {
@@ -294,12 +336,23 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
                     .last_mut()
                     .ok_or_else(|| std::io::Error::other("missing peer row"))?
             };
+            row["source"] = serde_json::json!(status.source);
             row["node_id"] = serde_json::json!(status.node_id);
             row["enrollment"] = serde_json::json!(status.state);
             row["enrollment_reason"] = serde_json::json!(status.reason);
         }
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+            for row in &mut values {
+                row["enrollment"] = serde_json::json!("unknown");
+                row["enrollment_reason"] = serde_json::json!(warning);
+            }
+        }
         println!("{}", serde_json::to_string(&values)?);
         return Ok(0);
+    }
+    if let Some(warning) = warning {
+        println!("{warning}");
     }
     if rows.is_empty() && enrollment.is_empty() {
         println!("no peers configured");
@@ -456,6 +509,7 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
+    let mut checked_server = None;
     loop {
         line.clear();
         if stdin.lock().read_line(&mut line)? == 0 {
@@ -465,24 +519,9 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
         if request.is_empty() {
             continue;
         }
-        let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
-        if parsed.as_ref().and_then(|v| v["method"].as_str()) != Some("mesh.hello") {
-            let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});
-            let answer = relay_local_request(&socket, &check)?;
-            let answer: serde_json::Value =
-                serde_json::from_str(&answer).map_err(std::io::Error::other)?;
-            if let Some(error) = answer.get("error") {
-                let id = parsed
-                    .as_ref()
-                    .and_then(|v| v["id"].as_str())
-                    .unwrap_or_default();
-                write_relay_error(id, "mesh_not_enrolled", &error.to_string())?;
-                continue;
-            }
-        }
         // A closed stdout means the hub hung up. That is the ordinary way
         // this process ends, not a failure worth a message nobody can read.
-        match relay_one_request(&socket, request) {
+        match relay_one_request(&socket, request, &mut checked_server) {
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
             other => other?,
         }
@@ -874,7 +913,11 @@ const PUSH_SUBSCRIPTIONS: [&str; 7] = [
 /// this seam.
 const STREAMING_METHODS: [&str; 2] = ["events.subscribe", "pane.wait_for_output"];
 
-fn relay_one_request(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
+fn relay_one_request(
+    socket: &std::path::Path,
+    request: &str,
+    checked_server: &mut Option<(u32, u64)>,
+) -> std::io::Result<()> {
     if let Some((id, code, message)) = relay_refusal(request) {
         return write_relay_error(&id, code, &message);
     }
@@ -900,6 +943,20 @@ fn relay_one_request(socket: &std::path::Path, request: &str) -> std::io::Result
             );
         }
     };
+    let server = crate::api::socket_peer_pid(&stream)
+        .and_then(|pid| crate::platform::process_start_time(pid).map(|started| (pid, started)));
+    let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
+    if parsed.as_ref().and_then(|v| v["method"].as_str()) == Some("mesh.hello") {
+        *checked_server = None;
+    } else if server.is_none() || *checked_server != server {
+        let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});
+        let answer: serde_json::Value = serde_json::from_str(&relay_local_request(socket, &check)?)
+            .map_err(std::io::Error::other)?;
+        if answer.get("result").is_none() || answer.get("error").is_some() {
+            return write_relay_error(&id, "mesh_not_enrolled", &answer.to_string());
+        }
+        *checked_server = server;
+    }
     stream.write_all(request.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -935,7 +992,7 @@ fn write_relay_error(id: &str, code: &str, message: &str) -> std::io::Result<()>
 fn print_peers_help() {
     eprintln!("usage: flk peers [status] [--json]");
     eprintln!("       flk peers summary [--json]");
-    eprintln!("       flk peers enroll --reset <peer>  (local operator only)");
+    eprintln!("       flk peers enroll --reset <peer> [--direction configured|inbound]  (local operator only)");
     eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
     eprintln!("       flk peers logs [--all] [--lines N] [--json]");
     eprintln!(

@@ -21,6 +21,8 @@ pub struct EventHub {
     /// mutex, and `inner` is held across disk writes — a waiter must never
     /// queue behind an fsync just to learn that nothing new arrived.
     arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    #[cfg(test)]
+    cold_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -352,6 +354,11 @@ impl EventHub {
         state.next_sequence
     }
 
+    #[cfg(test)]
+    pub(crate) fn cold_read_count(&self) -> usize {
+        self.cold_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Stream persisted history (rotated files + active) with `seq >
     /// sequence`, oldest first. COLD PATH: re-reads every log file per call
     /// — fine for one-shot queries like lineage, wrong for polling. Reads from disk, not the in-memory ring, so
@@ -359,6 +366,9 @@ impl EventHub {
     /// walker; an unreadable file contributes nothing rather than failing
     /// the whole read.
     pub fn persisted_events_after(&self, sequence: u64) -> Vec<(u64, u64, EventEnvelope)> {
+        #[cfg(test)]
+        self.cold_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Ok(state) = self.inner.lock() else {
             return Vec::new();
         };

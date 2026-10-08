@@ -1298,6 +1298,20 @@ impl App {
             self.active_submissions.remove(&pane);
         }
 
+        if !matches!(
+            &request.method,
+            Method::MeshHello(_) | Method::PeersRelayAttach(_) | Method::PeersEnrollReset(_)
+        ) && self.uplink.is_relay(
+            self.current_api_peer_pid,
+            crate::platform::process_start_time,
+        ) && self.uplink.enrolled_hub().is_none()
+        {
+            return responses::encode_error(
+                request.id,
+                "mesh_not_enrolled",
+                "mesh edge is not enrolled; repeat mesh.hello",
+            );
+        }
         let response = match request.method {
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
@@ -1404,7 +1418,7 @@ impl App {
             }
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
             Method::PeersEnrollReset(params) => {
-                return self.handle_peers_enroll_reset(request.id, params.peer)
+                return self.handle_peers_enroll_reset(request.id, params)
             }
             Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
             Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),

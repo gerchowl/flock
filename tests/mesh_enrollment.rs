@@ -144,7 +144,7 @@ fn version_mismatch_is_refused_with_upgrade_instruction() {
     refused_mode(
         "mesh-version",
         MeshMode::VersionMismatch(99),
-        "upgrade flk on acceptor.test",
+        "upgrade flk on this node",
     );
 }
 
@@ -175,4 +175,298 @@ fn custom_summary_transport_is_refused() {
             .contains("custom summary transport unsupported"),
         "{status}"
     );
+}
+
+#[test]
+fn forged_acceptor_challenge_is_refused() {
+    refused_mode(
+        "mesh-challenge",
+        MeshMode::ForgedChallenge,
+        "invalid mesh signature",
+    );
+}
+
+fn remove_identity(node: &Node) {
+    for app in ["flock", "flock-dev"] {
+        let key = node.home.join("state").join(app).join("mesh/identity.json");
+        if key.exists() {
+            std::fs::remove_file(key).unwrap();
+        }
+    }
+}
+
+#[test]
+fn acceptor_refuses_changed_dialer_key_until_inbound_reset() {
+    let mut fleet = fleet::spawn("mesh-dialer-key", PAIR);
+    let old = enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned");
+    enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
+    remove_identity(fleet.node("dialer.test"));
+    fleet.node_mut("dialer.test").restart();
+    let refused = enrollment(fleet.node("acceptor.test"), "dialer.test", "refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("--direction inbound"),
+        "{refused}"
+    );
+    let reset = cli(
+        fleet.node("acceptor.test"),
+        &["peers", "enroll", "--reset", "dialer.test"],
+    );
+    assert!(reset["result"]["node_id"].is_null(), "{reset}");
+    assert_eq!(
+        enrollment(fleet.node("acceptor.test"), "dialer.test", "refused")["state"],
+        "refused"
+    );
+    let reset = cli(
+        fleet.node("acceptor.test"),
+        &[
+            "peers",
+            "enroll",
+            "--reset",
+            "dialer.test",
+            "--direction",
+            "inbound",
+        ],
+    );
+    assert_eq!(reset["result"]["node_id"], old["node_id"]);
+    // A fresh dial avoids waiting for the deliberately backed-off refused edge.
+    fleet.node_mut("dialer.test").restart();
+    assert_ne!(
+        enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned")["node_id"],
+        old["node_id"]
+    );
+}
+
+#[test]
+fn enrolled_dialer_cannot_reconnect_under_an_unused_name() {
+    let mut fleet = fleet::spawn("mesh-rename", PAIR);
+    let pinned = enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned");
+    enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
+    rename_node(fleet.node("dialer.test"), "impostor.test");
+    fleet.node_mut("dialer.test").restart();
+    let refused = enrollment(fleet.node("acceptor.test"), "impostor.test", "refused");
+    assert_eq!(
+        refused["reason"],
+        format!(
+            "node {} is enrolled as dialer.test",
+            pinned["node_id"].as_str().unwrap()
+        )
+    );
+    assert!(refused["node_id"].is_null());
+    let preview = request(
+        fleet.node("acceptor.test"),
+        "peers.enroll_reset",
+        json!({"peer":"impostor.test", "source":"inbound", "preview":true}),
+    );
+    assert!(preview["result"]["node_id"].is_null(), "{preview}");
+    rename_node(fleet.node("dialer.test"), "dialer.test");
+    fleet.node_mut("dialer.test").restart();
+    assert_eq!(
+        enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned")["node_id"],
+        pinned["node_id"]
+    );
+}
+
+#[test]
+fn authenticated_relay_cannot_reset_enrollment() {
+    let mut specs = PAIR.to_vec();
+    specs[1].mesh = MeshMode::RelayReset;
+    let fleet = fleet::spawn("mesh-reset-relay", &specs);
+    let pinned = enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned");
+    let refused = fleet::wait_until("relay reset refusal", Duration::from_secs(30), || {
+        std::fs::read_to_string(fleet.base.join("reset-refused-acceptor.test")).ok()
+    });
+    let refused: Value = serde_json::from_str(&refused).unwrap();
+    assert_eq!(refused["error"]["code"], "operator_only");
+    let preview = request(
+        fleet.node("acceptor.test"),
+        "peers.enroll_reset",
+        json!({"peer":"dialer.test", "source":"inbound", "preview":true}),
+    );
+    assert_eq!(preview["result"]["node_id"], pinned["node_id"]);
+}
+
+// This subprocess exercises the public MCP stdio boundary.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn mcp_cannot_reset_enrollment() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let fleet = fleet::spawn("mesh-reset-mcp", PAIR);
+    let node = fleet.node("dialer.test");
+    let pinned = enrollment(node, "acceptor.test", "pinned");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flk"))
+        .args(["mcp", "serve"])
+        .env_clear()
+        .env("HOME", &node.home)
+        .env("XDG_CONFIG_HOME", &node.config_home)
+        .env("XDG_RUNTIME_DIR", &node.runtime_dir)
+        .env("XDG_STATE_HOME", node.home.join("state"))
+        .env("FLOCK_SOCKET_PATH", &node.api_socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for message in [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mesh-test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"flock_peers_enroll_reset","arguments":{"peer":"acceptor.test"}}}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let tools = responses.iter().find(|v| v["id"] == 2).unwrap();
+    assert!(!tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"].as_str().unwrap().contains("enroll_reset")));
+    let reset = responses.iter().find(|v| v["id"] == 3).unwrap();
+    assert!(
+        reset.get("error").is_some() || reset["result"]["isError"] == true,
+        "{reset}"
+    );
+    let preview = request(
+        node,
+        "peers.enroll_reset",
+        json!({"peer":"acceptor.test","preview":true}),
+    );
+    assert_eq!(preview["result"]["node_id"], pinned["node_id"]);
+}
+
+// The old-server fixture implements discovery but deliberately rejects enrollment.
+#[allow(clippy::disallowed_methods)]
+#[test]
+fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let dir = std::env::temp_dir().join(format!("ml-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.as_path().join("api.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_server = stop.clone();
+    let worker = std::thread::spawn(move || {
+        while !stop_server.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let mut response = match request["method"].as_str().unwrap() {
+                "ping" => json!({"result":{"type":"pong","version":"0.10.0","protocol":26}}),
+                "peers.summary" => {
+                    json!({"result":{"relayed_fleet":[{"name":"legacy.test","ssh_target":"legacy.test","origin":"local.test","latency_ms":7,"error":null}]}})
+                }
+                "peers.enrollment" => {
+                    json!({"error":{"code":"method_not_found","message":"unknown method"}})
+                }
+                method => panic!("unexpected method {method}"),
+            };
+            response["id"] = request["id"].clone();
+            writeln!(stream, "{response}").unwrap();
+        }
+    });
+    let mut outputs = Vec::new();
+    for args in [
+        vec!["status"],
+        vec!["status", "--json"],
+        vec!["peers", "status"],
+        vec!["peers", "status", "--json"],
+    ] {
+        outputs.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+                .args(args)
+                .env_clear()
+                .env("HOME", dir.as_path())
+                .env("XDG_CONFIG_HOME", dir.as_path().join("config"))
+                .env("XDG_STATE_HOME", dir.as_path().join("state"))
+                .env("XDG_RUNTIME_DIR", dir.as_path().join("runtime"))
+                .env("FLOCK_SOCKET_PATH", &socket)
+                .output()
+                .unwrap(),
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    for output in &outputs {
+        assert!(output.status.success(), "{output:?}");
+    }
+    let warning = "enrollment: unknown (server predates mesh; restart needed)";
+    let full = String::from_utf8_lossy(&outputs[0].stdout);
+    assert!(full.starts_with("client:"), "{full}");
+    assert!(
+        full.contains("peers:\n") && full.contains(warning) && full.contains("server:\n"),
+        "{full}"
+    );
+    let full: Value = serde_json::from_slice(&outputs[1].stdout).unwrap();
+    assert_eq!(full["enrollment_warning"], warning);
+    assert_eq!(full["server"]["version"], "0.10.0");
+    let peers = String::from_utf8_lossy(&outputs[2].stdout);
+    assert!(
+        peers.contains("legacy.test") && peers.contains("7ms") && peers.contains(warning),
+        "{peers}"
+    );
+    let peers: Value = serde_json::from_slice(&outputs[3].stdout).unwrap();
+    assert_eq!(peers[0]["name"], "legacy.test");
+    assert_eq!(peers[0]["enrollment"], "unknown");
+}
+
+fn rename_node(node: &Node, name: &str) {
+    for app in ["flock", "flock-dev"] {
+        let path = node.config_home.join(app).join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        let original = config
+            .lines()
+            .find(|line| line.starts_with("name = "))
+            .unwrap();
+        let config = config.replacen(original, &format!("name = {name:?}"), 1);
+        std::fs::write(path, config).unwrap();
+    }
+}
+
+#[test]
+fn old_dialer_is_visible_as_refused_on_acceptor() {
+    let mut specs = PAIR.to_vec();
+    specs[1].mesh = MeshMode::LegacyDialer;
+    let fleet = fleet::spawn("mesh-old-dialer", &specs);
+    let refused = enrollment(
+        fleet.node("acceptor.test"),
+        "unidentified SSH peer",
+        "refused",
+    );
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade flk on the dialer"),
+        "{refused}"
+    );
+    assert!(refused["node_id"].is_null());
 }

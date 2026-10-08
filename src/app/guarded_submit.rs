@@ -12,6 +12,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub(crate) struct Attempt {
+    pub(crate) evidence: crate::api::schema::DeliveryAttempt,
     pub(crate) text: String,
     cursor: String,
     child_pid: Option<u32>,
@@ -305,10 +306,20 @@ impl App {
         if text.contains(['\n', '\t']) && !bytes.starts_with(b"\x1b[200~") {
             return Err("unsafe_text");
         }
-        runtime
-            .try_send_flock_authored(Bytes::from(bytes))
-            .map_err(|_| "write_failed")?;
+        let mut evidence = self.new_delivery_attempt(pane, wake)?;
+        self.record_delivery_attempt(&evidence);
+        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
+            evidence.state = "abandoned".into();
+            evidence.reason = Some("write_failed".into());
+            evidence.finished_at_ms = Some(super::api::messages::now_ms());
+            self.record_delivery_attempt(&evidence);
+            return Err("write_failed");
+        }
+        evidence.state = "typed".into();
+        evidence.typed_at_ms = Some(super::api::messages::now_ms());
+        self.record_delivery_attempt(&evidence);
         Ok(Attempt {
+            evidence,
             text: text.to_owned(),
             cursor: terminal.turn_cursor(),
             child_pid: runtime.child_pid(),
@@ -324,6 +335,30 @@ impl App {
     }
 
     pub(crate) fn advance_guarded_submit(
+        &self,
+        pane: &str,
+        attempt: &mut Attempt,
+        now: Instant,
+    ) -> Option<Outcome> {
+        let outcome = self.advance_guarded_submit_inner(pane, attempt, now);
+        if let Some(ref outcome) = outcome {
+            self.finish_delivery_attempt(attempt, outcome);
+        } else if attempt.sent
+            && (attempt.evidence.state != "submit_sent"
+                || attempt.evidence.retried != attempt.retried)
+        {
+            attempt.evidence.state = "submit_sent".into();
+            attempt
+                .evidence
+                .submit_sent_at_ms
+                .get_or_insert_with(super::api::messages::now_ms);
+            attempt.evidence.retried = attempt.retried;
+            self.record_delivery_attempt(&attempt.evidence);
+        }
+        outcome
+    }
+
+    fn advance_guarded_submit_inner(
         &self,
         pane: &str,
         attempt: &mut Attempt,
@@ -449,6 +484,7 @@ impl App {
             let _ = respond_to.send(encode_success(
                 id,
                 ResponseResult::GuardedSubmit {
+                    attempt: Some(attempt.evidence),
                     outcome: outcome.to_owned(),
                     reason,
                     retried: attempt.retried,
@@ -460,10 +496,89 @@ impl App {
     }
 }
 
+fn new_evidence(
+    attempt_id: String,
+    pane: &str,
+    wake: bool,
+    correlation_ids: Vec<String>,
+) -> crate::api::schema::DeliveryAttempt {
+    crate::api::schema::DeliveryAttempt {
+        attempt_id,
+        pane: pane.into(),
+        correlation_ids,
+        wake,
+        state: "queued".into(),
+        reason: None,
+        queued_at_ms: super::api::messages::now_ms(),
+        typed_at_ms: None,
+        submit_sent_at_ms: None,
+        finished_at_ms: None,
+        retried: false,
+    }
+}
+
+impl App {
+    fn new_delivery_attempt(
+        &self,
+        pane: &str,
+        wake: bool,
+    ) -> Result<crate::api::schema::DeliveryAttempt, &'static str> {
+        let queued_ids = self.mailboxes.queued_correlation_ids();
+        let id = self
+            .delivery_attempt_registry
+            .borrow_mut()
+            .reserve_id(|id| queued_ids.contains(id))?;
+        let ids = if wake {
+            self.mailboxes
+                .queued_infos(Some(pane))
+                .into_iter()
+                .map(|m| m.correlation_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(new_evidence(id, pane, wake, ids))
+    }
+
+    pub(crate) fn record_delivery_attempt(&self, attempt: &crate::api::schema::DeliveryAttempt) {
+        self.delivery_attempt_registry
+            .borrow_mut()
+            .record(attempt.clone());
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::DeliveryAttemptUpdated,
+            data: crate::api::schema::EventData::DeliveryAttemptUpdated {
+                attempt: attempt.clone(),
+            },
+        });
+    }
+
+    pub(crate) fn finish_delivery_attempt(&self, attempt: &mut Attempt, outcome: &Outcome) {
+        if attempt.evidence.finished_at_ms.is_some() {
+            return;
+        }
+        let (state, reason) = match outcome {
+            Outcome::Accepted => ("accepted", None),
+            Outcome::ObservedAccepted => ("observed_accepted", None),
+            Outcome::Unconfirmed(reason) => ("unconfirmed", Some(*reason)),
+            Outcome::Abandoned(reason) => ("abandoned", Some(*reason)),
+        };
+        attempt.evidence.state = state.into();
+        attempt.evidence.reason = reason.map(str::to_owned);
+        attempt.evidence.retried = attempt.retried;
+        attempt.evidence.finished_at_ms = Some(super::api::messages::now_ms());
+        self.record_delivery_attempt(&attempt.evidence);
+    }
+
+    pub(crate) fn delivery_attempts(&self) -> Vec<crate::api::schema::DeliveryAttempt> {
+        self.delivery_attempt_registry.borrow().snapshot()
+    }
+}
+
 #[cfg(test)]
 impl Attempt {
     pub(crate) fn test_new() -> Self {
         Self {
+            evidence: new_evidence("test-attempt".into(), "test-pane", false, Vec::new()),
             text: String::new(),
             cursor: "1:0:0:0:i".into(),
             child_pid: None,

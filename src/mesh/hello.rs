@@ -1,7 +1,7 @@
 //! Mutual possession proof bound to both endpoints, fresh challenges and direction.
 use super::{
     identity::NodeIdentity,
-    store::{IdentityPin, Store},
+    store::{IdentityPin, PinSource, Store},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,22 @@ use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock};
 
 pub const VERSION: u32 = 1;
+
+pub(crate) fn version() -> u32 {
+    if cfg!(debug_assertions) {
+        if let Ok(value) = std::env::var("FLOCK_TEST_MESH_VERSION") {
+            if let Ok(version) = value.parse() {
+                return version;
+            }
+        }
+    }
+    VERSION
+}
+
+pub(crate) fn version_mismatch(local: u32, remote: u32, peer: &str) -> String {
+    let older = if local < remote { "this node" } else { peer };
+    format!("mesh version mismatch: local {local}, remote {remote}; upgrade flk on {older}")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Offer {
@@ -36,6 +52,8 @@ pub struct Challenge {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Enrollment {
     pub peer: String,
+    #[serde(default)]
+    pub source: PinSource,
     pub node_id: Option<String>,
     pub state: String,
     pub reason: Option<String>,
@@ -54,7 +72,7 @@ impl Offer {
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
         Ok(Self {
-            mesh: VERSION,
+            mesh: version(),
             name,
             node_id: identity.node_id(),
             public_key: identity.public_key(),
@@ -63,11 +81,8 @@ impl Offer {
     }
 
     pub(crate) fn validate(&self, peer: &str) -> Result<(), String> {
-        if self.mesh != VERSION {
-            return Err(format!(
-                "mesh version mismatch: local {VERSION}, remote {}; upgrade flk on {peer}",
-                self.mesh
-            ));
+        if self.mesh != version() {
+            return Err(version_mismatch(version(), self.mesh, peer));
         }
         let id: String = Sha256::digest(self.public_key)
             .iter()
@@ -141,18 +156,34 @@ pub(crate) fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> 
     }
 }
 
-pub(crate) fn check_pin(peer: &str, offer: &Offer, save: bool) -> Result<(), String> {
+pub(crate) fn check_pin(
+    peer: &str,
+    offer: &Offer,
+    source: PinSource,
+    save: bool,
+) -> Result<(), String> {
     with_store(|store| {
+        if let Some(name) = store
+            .conflicting_pin_name(peer, &offer.pin())
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("node {} is enrolled as {name}", offer.node_id));
+        }
+        let direction = if source == PinSource::Inbound {
+            " --direction inbound"
+        } else {
+            ""
+        };
         if store
-            .get_pin(peer)
+            .get_pin_from(source, peer)
             .map_err(|e| e.to_string())?
             .is_some_and(|pin| pin != offer.pin())
         {
-            return Err(format!("identity changed for {peer}: possible impersonation or re-key; run flk peers enroll --reset {peer}"));
+            return Err(format!("identity changed for {peer}: possible impersonation or re-key; run flk peers enroll --reset {peer}{direction}"));
         }
         if save {
             store
-                .put_pin(peer, &offer.pin())
+                .put_pin_from(source, peer, &offer.pin())
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -210,7 +241,11 @@ mod tests {
         remote.mesh = 99;
         assert_eq!(
             remote.validate("configured.test").unwrap_err(),
-            "mesh version mismatch: local 1, remote 99; upgrade flk on configured.test"
+            "mesh version mismatch: local 1, remote 99; upgrade flk on this node"
+        );
+        assert_eq!(
+            version_mismatch(99, 1, "configured.test"),
+            "mesh version mismatch: local 99, remote 1; upgrade flk on configured.test"
         );
         remote.mesh = VERSION;
         remote.node_id = "forged".into();

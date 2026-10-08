@@ -104,6 +104,19 @@ where
         collected.push((seq, ts_ms, envelope.clone()));
         sections.events_considered += 1;
         match &envelope.data {
+            EventData::DeliveryAttemptUpdated { attempt }
+                if matches!(attempt.state.as_str(), "unconfirmed" | "abandoned") => {
+                sections.yellow.push(DigestRow {
+                    seq, ts_ms, kind: "delivery_attempt_updated",
+                    summary: format!("{}: {}", attempt.state, attempt.reason.as_deref().unwrap_or("unknown")),
+                    context: vec![
+                        ("attempt_id".into(), attempt.attempt_id.clone()),
+                        ("pane".into(), attempt.pane.clone()),
+                        ("correlation_ids".into(), attempt.correlation_ids.join(",")),
+                    ],
+                    run_id: None,
+                });
+            }
             EventData::MessageDelivered {
                 correlation_id,
                 delivered,

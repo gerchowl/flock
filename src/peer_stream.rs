@@ -312,6 +312,18 @@ impl PeerStream {
         let raw = self.request("mesh.hello", request)?;
         let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if let Some(error) = response.get("error") {
+            if error["code"] == "mesh_version_mismatch" {
+                if let Some(remote) = error["data"]["mesh"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                {
+                    return Err(hello::version_mismatch(
+                        hello::version(),
+                        remote,
+                        &peer.name,
+                    ));
+                }
+            }
             if matches!(
                 error["code"].as_str(),
                 Some("invalid_request" | "mesh_version_mismatch")
@@ -320,7 +332,7 @@ impl PeerStream {
                     .as_u64()
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "unsupported".into());
-                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::VERSION, peer.name));
+                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::version(), peer.name));
             }
             return Err(format!("mesh handshake refused for {}: {error}", peer.name));
         }
@@ -328,13 +340,18 @@ impl PeerStream {
             .map_err(|e| {
                 format!(
                     "unsupported mesh hello (local {}, remote unknown): {e}; upgrade flk on {}",
-                    hello::VERSION,
+                    hello::version(),
                     peer.name
                 )
             })?;
         challenge.offer.validate(&peer.name)?;
         hello::verify(&dialer, &challenge.offer, "acceptor", &challenge.signature)?;
-        hello::check_pin(&peer.name, &challenge.offer, false)?;
+        hello::check_pin(
+            &peer.name,
+            &challenge.offer,
+            crate::mesh::store::PinSource::Configured,
+            false,
+        )?;
         let signature = hello::sign(&identity, &dialer, &challenge.offer, "dialer")?;
         let finish =
             serde_json::to_value(Hello::Finish { signature }).map_err(|e| e.to_string())?;
@@ -346,7 +363,12 @@ impl PeerStream {
         if !ack.get("result").is_some_and(serde_json::Value::is_object) {
             return Err("invalid mesh enrollment acknowledgement".into());
         }
-        hello::check_pin(&peer.name, &challenge.offer, true)?;
+        hello::check_pin(
+            &peer.name,
+            &challenge.offer,
+            crate::mesh::store::PinSource::Configured,
+            true,
+        )?;
         if let Ok(mut push) = self.latest_push.lock() {
             *push = None;
         }
@@ -565,6 +587,7 @@ fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<Str
             peer.name.clone(),
             crate::mesh::hello::Enrollment {
                 peer: peer.name.clone(),
+                source: crate::mesh::store::PinSource::Configured,
                 node_id: node_id.or(previous),
                 state: if reason.is_some() {
                     "refused"
@@ -585,6 +608,7 @@ pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
         .and_then(|s| s.get(&peer.name).cloned())
         .unwrap_or_else(|| crate::mesh::hello::Enrollment {
             peer: peer.name.clone(),
+            source: crate::mesh::store::PinSource::Configured,
             node_id: None,
             state: "pending".into(),
             reason: None,
