@@ -539,7 +539,7 @@ fn plan_stop(
         // turns that had ended with one, on nearly every turn of every
         // session, so the recap is left alone — mail still wakes.
         return HookOutcome {
-            stdout: mail_nudge(pending_messages, false),
+            stdout: mail_nudge(pending_messages, false, pane_id),
             ..HookOutcome::default()
         };
     };
@@ -579,7 +579,7 @@ fn plan_stop(
                 seq: Some(seq()),
             }));
         // A clean turn still has to be told about mail.
-        outcome.stdout = mail_nudge(pending_messages, false);
+        outcome.stdout = mail_nudge(pending_messages, false, pane_id);
         return outcome;
     }
 
@@ -587,17 +587,17 @@ fn plan_stop(
     // Skip when we saw no assistant text, this is a subagent, or this turn is
     // already the nudge's continuation, so we don't loop on nothing.
     if !last_assistant.is_empty() && !is_subagent && !stop_hook_active {
-        outcome.stdout = mail_nudge(pending_messages, true);
+        outcome.stdout = mail_nudge(pending_messages, true, pane_id);
     } else {
-        outcome.stdout = mail_nudge(pending_messages, false);
+        outcome.stdout = mail_nudge(pending_messages, false, pane_id);
     }
     outcome
 }
 
 /// The `decision:block` payload that wakes an agent at its turn boundary.
 ///
-/// ADR-0008: this names the COUNT and the tool, never a body. Message content
-/// reaches the recipient only through `flock_msg_read`, so nothing another
+/// ADR-0008: this names the count, inbox readers and pane, never a body.
+/// Message content is pulled through MCP or the CLI, so nothing another
 /// agent wrote can arrive dressed as the operator's instruction — the wake
 /// channel carries no attacker-controlled text.
 ///
@@ -608,7 +608,7 @@ fn plan_stop(
 /// acknowledged and dropped (#408). So mail pending means read AND act, with
 /// no word of stopping; the recap is asked for at the next boundary, when the
 /// inbox is empty and the turn really is over.
-fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
+fn mail_nudge(pending_messages: usize, want_recap: bool, pane_id: &str) -> Option<String> {
     let reason = match (pending_messages, want_recap) {
         (0, false) => return None,
         (0, true) => "End your turn with a single sentinel line: `※ recap: \
@@ -616,8 +616,8 @@ fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
             .to_string(),
         (n, _) => format!(
             "You have {n} unread message{} from other agents. Read {} with the \
-             `flock_msg_read` tool and act on any that need a reply before you end \
-             your turn.",
+             `flock_msg_read` tool (or `flk msg read --pane {pane_id}` if the tool is \
+             unavailable) and act on any that need a reply before you end your turn.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "it" } else { "them" }
         ),
@@ -921,7 +921,7 @@ mod tests {
         }
         let answered = wire(wake.clone());
         assert_eq!(
-            mail_nudge(wake_count_from_response(&answered), false),
+            mail_nudge(wake_count_from_response(&answered), false, &pane),
             None,
             "notices alone must not cost the recipient a turn: {answered}"
         );
@@ -930,7 +930,7 @@ mod tests {
             .get("result")
             .is_some());
         let answered = wire(wake);
-        let nudge = mail_nudge(wake_count_from_response(&answered), false)
+        let nudge = mail_nudge(wake_count_from_response(&answered), false, &pane)
             .expect("a question wakes the recipient");
         assert!(
             nudge.contains("3 unread messages"),
@@ -973,7 +973,7 @@ mod tests {
         });
         assert_eq!(wake_count_from_response(&suppressed), 0);
         assert_eq!(
-            mail_nudge(wake_count_from_response(&suppressed), false),
+            mail_nudge(wake_count_from_response(&suppressed), false, "p_1"),
             None
         );
 
@@ -1623,6 +1623,7 @@ mod tests {
         assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
         assert!(nudge.contains("2 unread messages"), "{nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
+        assert!(nudge.contains("`flk msg read --pane p_1`"), "{nudge}");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1641,13 +1642,14 @@ mod tests {
         assert!(nudge.contains("1 unread message"), "{nudge}");
         assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
+        assert!(nudge.contains("`flk msg read --pane p_1`"), "{nudge}");
         assert!(nudge.contains("act on"), "{nudge}");
         assert!(
             !nudge.contains("recap"),
             "the recap waits for an empty inbox: {nudge}"
         );
         for (pending, want_recap) in [(1, false), (1, true), (3, false), (3, true)] {
-            let nudge = mail_nudge(pending, want_recap).expect("mail wakes");
+            let nudge = mail_nudge(pending, want_recap, "p_1").expect("mail wakes");
             assert!(
                 !nudge.to_lowercase().contains("stop"),
                 "a mail wake must never tell the agent to stop: {nudge}"
@@ -1655,6 +1657,31 @@ mod tests {
         }
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn mail_fallback_targets_the_stopping_pane_even_without_a_transcript() {
+        for pane_id in ["p_1", "w2:p3"] {
+            for pending in [1, 3] {
+                let out = plan(
+                    Agent::Claude,
+                    Action::Stop,
+                    &json!({"hook_event_name": "Stop"}),
+                    "Stop",
+                    pane_id,
+                    pending,
+                    None,
+                );
+                let nudge: serde_json::Value =
+                    serde_json::from_str(&out.stdout.expect("mail wakes")).unwrap();
+                let reason = nudge["reason"].as_str().unwrap();
+                assert!(
+                    reason.contains(&format!("`flk msg read --pane {pane_id}`")),
+                    "{reason}"
+                );
+                assert!(reason.contains("if the tool is unavailable"), "{reason}");
+            }
+        }
     }
 
     #[test]
