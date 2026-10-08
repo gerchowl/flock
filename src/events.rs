@@ -81,7 +81,7 @@ pub enum AppEvent {
     AgentSubmit {
         request_id: String,
         pane_id: String,
-        child_pid: Option<u32>,
+        attempt: crate::app::guarded_submit::Attempt,
         respond_to: std::sync::mpsc::Sender<String>,
     },
     /// A pane's child process exited.

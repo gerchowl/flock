@@ -967,6 +967,14 @@ pub(super) fn wait_for_agent_change(
 }
 
 pub(super) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    if response
+        .pointer("/result/outcome")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|outcome| matches!(outcome, "unconfirmed" | "abandoned"))
+    {
+        eprintln!("{response}");
+        return Ok(1);
+    }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());
         return Ok(1);
@@ -982,6 +990,14 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
         method,
     })?;
 
+    if response
+        .pointer("/result/outcome")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|outcome| matches!(outcome, "unconfirmed" | "abandoned"))
+    {
+        eprintln!("{response}");
+        return Ok(1);
+    }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(&response).unwrap());
         return Ok(1);

@@ -125,7 +125,7 @@ fn write_fake_opencode(base: &Path) {
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
          sleep 0.05; done ) &\n\
          first=1; while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{base}/typed.log'; \
-         if [ -n \"$first\" ]; then first=; printf '\\033[2J\\033[H■■■■⬝⬝  esc interrupt  opencode\\n'; sleep 0.4; \
+         if [ ! -e '{base}/manual-submit' ]; then first=; printf '\\033[2J\\033[H■■■■⬝⬝  esc interrupt  opencode\\n'; sleep 0.4; \
          printf '\\033[2J\\033[H%s\\n' \"$(cat '{base}/screen')\"; fi; done\n",
         base = base.display()
     );
@@ -359,7 +359,7 @@ fn screen_for(state: &str) -> &'static str {
     match state {
         "working" => "\u{25a0}\u{25a0}\u{25a0}\u{25a0}\u{2b1d}\u{2b1d}  esc interrupt  opencode",
         "blocked" => "\u{25b3} Permission required",
-        "idle" => "opencode ready >",
+        "idle" => "┃\n┃  Ask anything…\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n",
         other => panic!("no screen for {other}"),
     }
 }
@@ -915,6 +915,7 @@ fn s4_the_earlier_turn_does_not_count() {
     );
     finish(child);
 
+    fs::write(server.base.join("manual-submit"), "").unwrap();
     // The agent is working BEFORE the send runs, so the send sits in the idle
     // gate rather than submitting straight away. (Reported first, then spawned:
     // the reverse order races, and a send that finds the agent already idle has
@@ -951,6 +952,30 @@ fn s4_the_earlier_turn_does_not_count() {
     assert!(
         sender.try_wait().unwrap().is_none(),
         "round one's reply must not be reported as round two's"
+    );
+    let status =
+        exited_within(&mut sender, Duration::from_secs(5)).expect("unconfirmed submit is bounded");
+    let out = finish(sender);
+    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("could not be confirmed"));
+    assert!(
+        stdout(&out).is_empty(),
+        "round one's reply is not round two's"
+    );
+    // Resume observation from the cursor captured after the idle gate. An
+    // unconfirmed submission may still be accepted later, without another paste.
+    let mut sender = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "wait",
+            "d1",
+            "--settle",
+            SETTLE,
+            "--timeout",
+            "60000",
+            "--json",
+        ],
     );
     thread::sleep(RESULT_GRACE_OUTSIDE);
     assert!(

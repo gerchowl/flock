@@ -14,11 +14,10 @@
 //! remembered cursor between each pair. That is a script, and the script was
 //! living in somebody's shell history.
 //!
-//! `flk delegate` is that script, composed client-side out of the socket
-//! methods that already exist. No new socket method, no new dependency, and
-//! exactly ONE additive server change: `worktree.create`'s response now
-//! carries `parent_workspace_id` so the rollback knows which parent workspace
-//! IT opened and must not close somebody else's (#595). Every other claim in
+//! `flk delegate` composes resource and observation methods client-side.
+//! Keyboard submission uses `pane.submit`, which guards and confirms input in
+//! the server. `worktree.create` carries `parent_workspace_id` so rollback
+//! knows which parent workspace it opened (#595). Every other claim in
 //! the docs is checkable against a method `flk agent wait` or `flk worktree
 //! kill` already used. What the composition adds is the part that was never
 //! written down anywhere — which cursor belongs to which round, which errors
@@ -65,12 +64,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
     AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, EventsSubscribeParams, Method,
-    PaneListParams, PaneReadParams, PaneSendInputParams, PaneSendKeysParams, PaneTarget,
-    ReadFormat, ReadSource, Request, Subscription, WorkspaceCreateParams, WorkspaceTarget,
-    WorktreeCreateParams, WorktreeKillParams, WorktreeListParams,
+    PaneListParams, PaneReadParams, PaneSubmitParams, PaneTarget, ReadFormat, ReadSource, Request,
+    Subscription, WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
+    WorktreeListParams,
 };
 
-use super::pane::PANE_RUN_SUBMIT_GAP;
 use super::ready::{classify_ready_event, status_is_ready, ReadySignal};
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
 
@@ -130,9 +128,6 @@ const RESULT_POLL: Duration = Duration::from_millis(250);
 
 /// How often the readiness gate asks whether the agent is at its prompt.
 const READY_POLL: Duration = Duration::from_millis(200);
-
-/// Confirmation budget for each attempt, including one guarded composer retry.
-const SUBMIT_CONFIRM_WINDOW: Duration = Duration::from_secs(15);
 
 /// Cap on any single socket request this module makes.
 ///
@@ -252,7 +247,7 @@ fn cap_for(method: &Method) -> Duration {
         | Method::WorkspaceCreate(_)
         | Method::WorkspaceClose(_)
         | Method::AgentStart(_) => Duration::from_secs(60),
-        Method::PaneSendInput(_) => Duration::from_secs(10),
+        Method::PaneSendInput(_) | Method::PaneSubmit(_) => Duration::from_secs(10),
         _ => REQUEST_TIMEOUT,
     }
 }
@@ -491,7 +486,7 @@ const HARNESSES: [HarnessSpec; 3] = [
         name: "claude",
         argv: claude_argv,
         supports_sandbox: false,
-        confirm_submit: false,
+        confirm_submit: true,
         session_source: SessionSource::Hook,
         // The TUI clears its spinner before Claude has flushed its last
         // transcript entry, so the gap this covers is the same one it covers
@@ -506,7 +501,7 @@ const HARNESSES: [HarnessSpec; 3] = [
         name: "codex",
         argv: codex_argv,
         supports_sandbox: true,
-        confirm_submit: false,
+        confirm_submit: true,
         session_source: SessionSource::Hook,
         result_grace: Duration::from_secs(10),
         startup_dialog: Some(StartupDialog {
@@ -2655,14 +2650,8 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    if let Err(reason) = submit_brief(&pane_id, &sentence, None).and_then(|()| {
-        if harness.confirm_submit {
-            confirm_submit(&entry, &sentence)
-        } else {
-            Ok(())
-        }
-    }) {
-        if harness.confirm_submit {
+    if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
+        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
             return Ok(fail(format!(
                 "delegate {name}: brief submission could not be confirmed: {reason}. \
                  Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
@@ -2711,42 +2700,24 @@ fn rollback(cleanup: &Cleanup) {
     }
 }
 
-/// Type the brief into the agent's pane, then press Enter, each as its own
-/// bounded request (W2).
-///
-/// The `pane` module has a helper that does the same ordered writes, but it
-/// routes through the untimed socket helpers upstairs: a server that goes
-/// quiet mid-type can hang the whole command forever (F2). This helper takes
-/// the same two steps — type, then Enter — through `bounded`, so both halves
-/// inherit the 10 s `PaneSendInput` cap and the caller's deadline (if any).
-/// A failure returns the server's own words; a timeout returns `TimedOut` so
-/// the caller can print "the brief was not submitted: timed out".
-fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), String> {
-    // 1) Type the sentence. No keys ride along: that is the whole point.
+/// Submit through the server's composer guard and bounded confirmation loop.
+/// The 10 s request cap and caller deadline also bound a stalled transport.
+fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     bounded_submit(
-        Method::PaneSendInput(PaneSendInputParams {
-            pane_id: pane_id.to_string(),
-            text: text.to_string(),
-            keys: Vec::new(),
+        Method::PaneSubmit(PaneSubmitParams {
+            self_submit_confirmed: None,
+            pane_id: pane_id.to_owned(),
+            text: text.to_owned(),
+            if_session: None,
+            min_age_secs: 0,
         }),
         deadline,
-    )?;
-    // 2) Let the pane's reader come back round before the Enter — the same
-    //    gap `pane run` uses, so the submit lands at the same cadence.
-    std::thread::sleep(PANE_RUN_SUBMIT_GAP);
-    // 3) Press Enter, on its own, as its own write.
-    bounded_submit(
-        Method::PaneSendKeys(PaneSendKeysParams {
-            pane_id: pane_id.to_string(),
-            keys: vec!["Enter".to_string()],
-        }),
-        deadline,
-    )?;
-    Ok(())
+    )
 }
 
 /// Session lifecycle reports can precede input. Only a new working entry
 /// in this terminal's pre-submit cursor proves that a turn followed the brief.
+#[cfg(test)]
 fn submit_turn_started(record: &serde_json::Value, baseline: &str) -> Result<bool, String> {
     let before = Cursor::parse(baseline).map_err(|err| err.to_string())?;
     let now = Cursor::parse(&cursor_of(record)?).map_err(|err| err.to_string())?;
@@ -2756,25 +2727,7 @@ fn submit_turn_started(record: &serde_json::Value, baseline: &str) -> Result<boo
     Ok(now.entries > before.entries)
 }
 
-fn poll_submit_turn(entry: &Entry, deadline: Instant) -> Result<bool, String> {
-    loop {
-        match agent_record(&entry.terminal_id, Some(deadline)) {
-            AgentFetch::Found(record) => {
-                if submit_turn_started(&record, &entry.cursor)? {
-                    return Ok(true);
-                }
-            }
-            AgentFetch::Failed(reason) => return Err(reason),
-            AgentFetch::Missing => return Err("the agent no longer resolves".into()),
-            AgentFetch::TimedOut => return Ok(false),
-        }
-        if expired(Some(deadline)) {
-            return Ok(false);
-        }
-        sleep_bounded(deadline, READY_POLL);
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum Composer {
     Brief,
@@ -2782,136 +2735,54 @@ enum Composer {
     Ambiguous,
 }
 
-/// Read only the final complete OpenCode composer, bounded by its left border
-/// and bottom cap. Transcript copies of the sentence never authorize a retry.
-/// Unknown layouts, partial text and wrapped empty-prompt hints stay ambiguous.
+#[cfg(test)]
 fn composer_state(screen: &str, sentence: &str) -> Composer {
-    let lines: Vec<_> = screen.lines().map(str::trim_start).collect();
-    let Some(end) = lines.iter().rposition(|line| line.starts_with('╹')) else {
-        return Composer::Ambiguous;
-    };
-    if !lines[end + 1..]
-        .iter()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| line.contains(" commands") && !line.contains("interrupt"))
-    {
-        return Composer::Ambiguous;
-    }
-    let start = (0..end)
-        .rev()
-        .take_while(|&i| lines[i].starts_with('┃'))
-        .last();
-    let Some(start) = start else {
-        return Composer::Ambiguous;
-    };
-    let body: Vec<_> = lines[start..end]
-        .iter()
-        .map(|line| line.trim_start_matches('┃').trim())
-        .skip_while(|line| line.is_empty())
-        .take_while(|line| !line.is_empty())
-        .collect();
-    // A composer can wrap in the middle of the brief path. Match each visible
-    // fragment against the remaining sentence, allowing space at a row break.
-    let mut remaining = sentence;
-    let holds_brief = !body.is_empty()
-        && body.iter().all(|line| {
-            if let Some(rest) = remaining.strip_prefix(line) {
-                remaining = rest.trim_start();
-                true
-            } else {
-                false
-            }
-        })
-        && remaining.is_empty();
-    let input = body.join(" ");
-    if holds_brief {
-        Composer::Brief
-    } else if body.len() == 1
-        && (input == "Ask anything…"
-            || (input.starts_with("Ask anything… \"") && input.ends_with('\"')))
-    {
-        Composer::Empty
-    } else {
-        Composer::Ambiguous
+    match crate::app::guarded_submit::composer(crate::detect::Agent::OpenCode, screen, sentence) {
+        crate::app::guarded_submit::Composer::Owned => Composer::Brief,
+        crate::app::guarded_submit::Composer::Empty => Composer::Empty,
+        _ => Composer::Ambiguous,
     }
 }
 
-fn read_composer(entry: &Entry, sentence: &str, deadline: Instant) -> Result<Composer, String> {
-    let response = bounded(
-        Method::PaneRead(PaneReadParams {
-            pane_id: entry.pane_id.clone(),
-            source: ReadSource::Detection,
-            lines: Some(STARTUP_DIALOG_LINES),
-            format: ReadFormat::Text,
-            strip_ansi: true,
-        }),
-        Some(deadline),
-    )
-    .map_err(|err| err.to_string())?;
-    if let Some(error) = response.get("error") {
-        return Err(server_error(error));
-    }
-    let text = response
-        .pointer("/result/read/text")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "the composer read contained no text".to_string())?;
-    Ok(composer_state(text, sentence))
+/// A refusal precedes typing. Uncertainty retains the round's cursor so a
+/// later genuine turn can still be observed without retyping the brief.
+#[derive(Debug)]
+enum SubmitFailure {
+    Refused(String),
+    Unconfirmed(String),
 }
 
-fn confirm_submit(entry: &Entry, sentence: &str) -> Result<(), String> {
-    if poll_submit_turn(entry, Instant::now() + SUBMIT_CONFIRM_WINDOW)? {
-        return Ok(());
-    }
-    let deadline = Instant::now() + SUBMIT_CONFIRM_WINDOW;
-    let composer = read_composer(entry, sentence, deadline)?;
-    if composer == Composer::Ambiguous {
-        return Err("no new turn observed and the composer is ambiguous".into());
-    }
-    // Require a stable composer, then query the turn again immediately before
-    // retrying. Any work, replacement, blocked status or uncertainty stops it.
-    sleep_bounded(deadline, READY_POLL);
-    if read_composer(entry, sentence, deadline)? != composer {
-        return Err("the composer changed before retry".into());
-    }
-    let record = match agent_record(&entry.terminal_id, Some(deadline)) {
-        AgentFetch::Found(record) => record,
-        _ => return Err("could not guard the submission retry".into()),
-    };
-    if submit_turn_started(&record, &entry.cursor)? {
-        return Ok(());
-    }
-    if !matches!(field(&record, "agent_status"), Some("idle" | "done")) {
-        return Err("the agent is no longer at its prompt".into());
-    }
-    match composer {
-        Composer::Brief => bounded_submit(
-            Method::PaneSendKeys(PaneSendKeysParams {
-                pane_id: entry.pane_id.clone(),
-                keys: vec!["Enter".into()],
-            }),
-            Some(deadline),
-        )?,
-        Composer::Empty => submit_brief(&entry.pane_id, sentence, Some(deadline))?,
-        Composer::Ambiguous => return Err("the composer is ambiguous".into()),
-    }
-    if poll_submit_turn(entry, deadline)? {
-        Ok(())
-    } else {
-        Err("no new turn observed after the single guarded retry".into())
+impl fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(reason) | Self::Unconfirmed(reason) => f.write_str(reason),
+        }
     }
 }
 
-/// Make a `bounded` request, map a timeout to a readable "timed out" string,
-/// a transport error to its own message, and a server refusal to its code and
-/// message. Shared by both halves of `submit_brief`.
-fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), String> {
+fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     let response = match bounded(method, deadline) {
         Ok(response) => response,
-        Err(BoundedError::TimedOut) => return Err("timed out".to_string()),
-        Err(BoundedError::Transport(err)) => return Err(err.to_string()),
+        Err(BoundedError::TimedOut) => {
+            return Err(SubmitFailure::Unconfirmed("timed out".to_string()))
+        }
+        Err(BoundedError::Transport(err)) => {
+            return Err(SubmitFailure::Unconfirmed(err.to_string()))
+        }
     };
     if let Some(error) = response.get("error") {
-        return Err(server_error(error));
+        return Err(SubmitFailure::Refused(server_error(error)));
+    }
+    if !matches!(
+        response
+            .pointer("/result/outcome")
+            .and_then(serde_json::Value::as_str),
+        Some("accepted" | "observed_accepted")
+    ) {
+        return Err(SubmitFailure::Unconfirmed(format!(
+            "submission unconfirmed: {}",
+            response.get("result").unwrap_or(&serde_json::Value::Null)
+        )));
     }
     Ok(())
 }
@@ -3367,7 +3238,10 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     }
 
     if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
-        // This round did not start, so the whole entry goes back, and a
+        if matches!(reason, SubmitFailure::Unconfirmed(_)) {
+            return Ok(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
+        }
+        // The server refused before typing, so the whole entry goes back, and a
         // write-back that itself fails is said rather than swallowed: a
         // registry that now claims a round nobody is running is worse than
         // the failed send that caused it.

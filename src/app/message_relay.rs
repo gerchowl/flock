@@ -7,7 +7,25 @@ use std::sync::mpsc::Sender;
 use crate::api::schema::MsgIntent;
 use crate::events::AppEvent;
 
-pub(crate) type RelayWork = Box<dyn FnOnce() -> AppEvent + Send>;
+pub(crate) struct RelayWork {
+    pub run: Box<dyn FnOnce() -> AppEvent + Send>,
+    pub failure: AppEvent,
+}
+
+/// Own the failure completion before invoking code that can unwind. Both the
+/// normal return and a panic release the slot through the app event channel.
+struct CompletionGuard {
+    event_tx: tokio::sync::mpsc::Sender<AppEvent>,
+    completion: Option<AppEvent>,
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            let _ = self.event_tx.blocking_send(completion);
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct MessageRelays {
@@ -16,7 +34,7 @@ pub(crate) struct MessageRelays {
     running: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RelaySend {
     pub id: String,
     pub peer: crate::config::PeerConfig,
@@ -40,6 +58,19 @@ pub(crate) struct RelayCompletion {
 }
 
 impl RelaySend {
+    pub fn into_work(self) -> RelayWork {
+        let failure = AppEvent::MsgRelayCompleted(Box::new(RelayCompletion {
+            send: self.clone(),
+            result: Err(crate::peers::PeerMessageFailure::Unreachable(
+                "message relay worker panicked".into(),
+            )),
+        }));
+        RelayWork {
+            run: Box::new(move || self.run()),
+            failure,
+        }
+    }
+
     pub fn run(self) -> AppEvent {
         let result = crate::peers::send_peer_message(
             &self.peer,
@@ -56,6 +87,15 @@ impl RelaySend {
 }
 
 impl super::App {
+    /// An in-process caller may have no transport to park. Detach its relay
+    /// before another request can attach its unrelated responder.
+    pub(crate) fn detach_pending_message_relay(&mut self) {
+        if let Some(mut relay) = self.message_relays.pending.take() {
+            relay.respond_to = None;
+            self.enqueue_message_relay(relay.into_work());
+        }
+    }
+
     pub(crate) fn enqueue_message_relay(&mut self, work: RelayWork) {
         self.message_relays.waiting.push_back(work);
         self.pump_message_relays();
@@ -75,7 +115,11 @@ impl super::App {
             self.message_relays.running += 1;
             let event_tx = self.event_tx.clone();
             std::thread::spawn(move || {
-                let _ = event_tx.blocking_send(work());
+                let mut guard = CompletionGuard {
+                    event_tx,
+                    completion: Some(work.failure),
+                };
+                guard.completion = Some((work.run)());
             });
         }
     }
@@ -95,12 +139,17 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         for index in 0..3 {
             let started = started_tx.clone();
-            app.enqueue_message_relay(Box::new(move || {
-                started.send(index).unwrap();
-                AppEvent::ClipboardWrite {
+            app.enqueue_message_relay(RelayWork {
+                run: Box::new(move || {
+                    started.send(index).unwrap();
+                    AppEvent::ClipboardWrite {
+                        content: Vec::new(),
+                    }
+                }),
+                failure: AppEvent::ClipboardWrite {
                     content: Vec::new(),
-                }
-            }));
+                },
+            });
         }
         for index in 0..3 {
             tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
@@ -114,6 +163,63 @@ mod tests {
             );
             assert_eq!(app.message_relays.running, 1);
             app.finish_message_relay();
+        }
+        assert_eq!(app.message_relays.running, 0);
+        assert!(app.message_relays.waiting.is_empty());
+    }
+    #[tokio::test]
+    async fn a_panicking_relay_answers_with_failure_and_frees_its_slot() {
+        let mut config = crate::config::Config::default();
+        config.msg.deferral_relay_concurrency = 1;
+        let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let mut replies = Vec::new();
+        for index in 0..2 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            replies.push(rx);
+            let relay = RelaySend {
+                id: format!("request-{index}"),
+                peer: crate::config::PeerConfig::default(),
+                // An invalid agent id is refused before any SSH is started.
+                to_agent: "invalid recipient".into(),
+                host: "nodeb".into(),
+                direct: true,
+                from_agent: "agent_nodea_sender".into(),
+                from_host: "nodea".into(),
+                body: "test".into(),
+                correlation_id: format!("question-{index}"),
+                in_reply_to: None,
+                intent: MsgIntent::NeedsReply,
+                settle_original: None,
+                respond_to: Some(tx),
+            };
+            app.mailboxes.start_relaying_question(&relay.correlation_id);
+            let mut work = relay.into_work();
+            if index == 0 {
+                work.run = Box::new(|| panic!("test relay panic"));
+            }
+            app.enqueue_message_relay(work);
+        }
+        for (index, reply) in replies.into_iter().enumerate() {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
+                    .await
+                    .unwrap()
+                    .expect("even a panic must complete");
+            app.handle_internal_event(event);
+            let response: serde_json::Value =
+                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
+            assert_eq!(response["id"], format!("request-{index}"));
+            if index == 0 {
+                assert_eq!(response["error"]["code"], "peer_unreachable");
+                assert_eq!(
+                    response["error"]["data"]["detail"],
+                    "message relay worker panicked"
+                );
+            } else {
+                assert_eq!(response["error"]["code"], "peer_refused_message");
+            }
         }
         assert_eq!(app.message_relays.running, 0);
         assert!(app.message_relays.waiting.is_empty());

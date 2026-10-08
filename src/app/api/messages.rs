@@ -1200,26 +1200,34 @@ impl App {
         for hop in self.mailboxes.start_deferral_hops(cap) {
             let crate::app::mailboxes::DeferralHop { peer, body, relay } = hop;
             let from_host = crate::app::short_host_name();
-            self.enqueue_message_relay(Box::new(move || {
-                let result = crate::peers::send_peer_message(
-                    &peer,
-                    &relay.to_agent,
-                    &relay.from_agent,
-                    &from_host,
-                    &body,
-                    &relay.deferral_correlation_id,
-                    Some(&relay.correlation_id),
-                    MsgIntent::Fyi,
-                )
-                .map_err(|failure| {
-                    let reason = crate::peers::SshFailureReason::classify(failure.detail());
-                    failure.hop_message(&from_host, &relay.to_host, reason)
-                });
+            let failure =
                 crate::events::AppEvent::MsgDeferralRelayed(crate::events::MsgDeferralRelay {
-                    result,
-                    ..relay
-                })
-            }));
+                    result: Err("message relay worker panicked".into()),
+                    ..relay.clone()
+                });
+            self.enqueue_message_relay(crate::app::message_relay::RelayWork {
+                failure,
+                run: Box::new(move || {
+                    let result = crate::peers::send_peer_message(
+                        &peer,
+                        &relay.to_agent,
+                        &relay.from_agent,
+                        &from_host,
+                        &body,
+                        &relay.deferral_correlation_id,
+                        Some(&relay.correlation_id),
+                        MsgIntent::Fyi,
+                    )
+                    .map_err(|failure| {
+                        let reason = crate::peers::SshFailureReason::classify(failure.detail());
+                        failure.hop_message(&from_host, &relay.to_host, reason)
+                    });
+                    crate::events::AppEvent::MsgDeferralRelayed(crate::events::MsgDeferralRelay {
+                        result,
+                        ..relay
+                    })
+                }),
+            });
         }
     }
 
@@ -2590,6 +2598,54 @@ mod tests {
             }];
             peer
         }];
+    }
+
+    #[tokio::test]
+    async fn an_unparked_relay_cannot_steal_the_next_requests_responder() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        configure_unreachable_message_peer(&mut app);
+        let response = send(
+            &mut app,
+            MsgSendParams {
+                from_agent: Some("agent_atlas_cafe".into()),
+                from_host: None,
+                to: MessageTarget::Agent {
+                    agent: "agent_kiln-dev_beef".into(),
+                },
+                body: "detached send".into(),
+                correlation_id: Some("detached-question".into()),
+                in_reply_to: None,
+                intent: MsgIntent::NeedsReply,
+                intent_unrecognised: None,
+            },
+        );
+        assert!(response.is_empty());
+        assert!(app.message_relays.pending.is_some());
+        // This in-process caller never called respond_or_park.
+        let response = app.handle_api_request(Request {
+            id: "unrelated".into(),
+            method: Method::MsgList(MsgListParams::default()),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.respond_or_park(tx, response);
+        let response: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], "unrelated");
+        assert!(response.get("result").is_some());
+        assert!(app.message_relays.pending.is_none());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), app.event_rx.recv())
+            .await
+            .unwrap()
+            .expect("detached relay completes");
+        let crate::events::AppEvent::MsgRelayCompleted(completion) = &event else {
+            panic!("expected relay completion");
+        };
+        assert_eq!(completion.send.id, "req");
+        assert!(completion.send.respond_to.is_none());
+        app.handle_internal_event(event);
+        assert!(
+            rx.try_recv().is_err(),
+            "the detached result is never delivered to the new caller"
+        );
     }
 
     #[tokio::test]

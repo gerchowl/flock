@@ -111,22 +111,11 @@ impl App {
     ) {
         if let Some(mut relay) = self.message_relays.pending.take() {
             relay.respond_to = Some(respond_to);
-            self.enqueue_message_relay(Box::new(move || relay.run()));
+            self.enqueue_message_relay(relay.into_work());
             return;
         }
-        if let Some((request_id, pane_id, child_pid)) = self.pending_agent_submit.take() {
-            let event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(crate::cli::pane::PANE_RUN_SUBMIT_GAP).await;
-                let _ = event_tx
-                    .send(crate::events::AppEvent::AgentSubmit {
-                        request_id,
-                        pane_id,
-                        child_pid,
-                        respond_to,
-                    })
-                    .await;
-            });
+        if let Some((request_id, pane_id, attempt)) = self.pending_agent_submit.take() {
+            self.schedule_guarded_request(request_id, pane_id, attempt, respond_to);
             return;
         }
         let Some(park) = self.uplink.take_pending_park() else {
