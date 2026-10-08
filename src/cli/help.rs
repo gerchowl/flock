@@ -131,7 +131,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "tab",
         "create",
-        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]\n  --workspace places the tab in that workspace; --cwd only sets the directory.",
     ),
     ("tab", "get", "flk tab get <tab_id>"),
     ("tab", "focus", "flk tab focus <tab_id>"),
