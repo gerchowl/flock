@@ -79,7 +79,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           · 1 every other error, including a server unreachable for 30 s when no --timeout\n",
     "           was given. A timeout is 1 for the non-settled statuses above.\n",
     "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
-    "  output use `flk agent result` (once #575 lands). Native agents are read from the screen every\n",
+    "  output use `flk agent result`. Native agents are read from the screen every\n",
     "  300-500 ms, so a working phase shorter than one sample is never observed — a cursor taken\n",
     "  before one waits for the next turn instead. A turn cursor never satisfies a wait on another\n",
     "  terminal or another execution.",
@@ -945,9 +945,7 @@ fn print_agent_help() {
         "    (`done` too: an unattended agent goes quiet as `done`, which is an effective idle)."
     );
     eprintln!("    `done` on its own means exactly that effective state, not a UI-only marker:");
-    eprintln!(
-        "    --status settled waits for the agent to go quiet; `flk agent result` (once #575 lands) is"
-    );
+    eprintln!("    --status settled waits for the agent to go quiet; `flk agent result` is");
     eprintln!("    the turn's output, which settled does not promise.");
 }
 
