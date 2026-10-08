@@ -11,7 +11,7 @@ Read `references/pre-release-audit.md` and follow its workflow. Treat it as the 
 
 - choosing the release base ref
 - inspecting first-parent history and merged PRs
-- auditing `docs/next/CHANGELOG.md`
+- auditing `docs/next/CHANGELOG.md` and `docs/next/changes/`
 - auditing `docs/next/README.md` and staged website docs
 - checking issue reference lines
 - deciding when to run `just release-docs-check`
