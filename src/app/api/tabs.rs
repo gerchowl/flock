@@ -84,6 +84,7 @@ impl App {
 
     pub(super) fn handle_tab_create(&mut self, id: String, params: TabCreateParams) -> String {
         let TabCreateParams {
+            dry_run,
             workspace_id,
             cwd,
             focus,
@@ -99,6 +100,35 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
+        if dry_run {
+            let sibling = self.state.tab_mode == crate::config::TabModeConfig::Workspace;
+            let follow_cwd = if sibling {
+                self.seed_cwd_from_workspace(ws_idx)
+            } else {
+                self.state
+                    .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+                    .and_then(|rt| rt.cwd())
+            };
+            let pinned_cwd = sibling
+                .then(|| {
+                    crate::app::creation::sibling_spawn_seed(self.state.workspaces.get(ws_idx)).1
+                })
+                .flatten();
+            let resolved_cwd = cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .or(pinned_cwd)
+                .unwrap_or_else(|| self.resolve_new_terminal_cwd(follow_cwd));
+            return super::responses::encode_allocation_plan(
+                id,
+                "tab.create",
+                serde_json::json!({
+                    "workspace_id": self.public_workspace_id(ws_idx), "cwd": resolved_cwd,
+                    "placement": if sibling { "sibling_workspace" } else { "tab" },
+                    "label": label, "focus": focus,
+                }),
+            );
+        }
         // Workspace-as-unit tab mode (#25): a "tab" IS a sibling workspace.
         // The keyboard path branches here; this one did not, so an agent
         // calling tab.create grew an inner tab that the workspace-mode strip
@@ -320,6 +350,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                dry_run: false,
                 workspace_id: Some(source_id.clone()),
                 cwd: None,
                 focus: false,
@@ -360,6 +391,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::TabCreate(TabCreateParams {
+                dry_run: false,
                 workspace_id: Some(source_id),
                 cwd: None,
                 focus: false,

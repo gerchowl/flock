@@ -3738,6 +3738,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_split_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                dry_run: false,
                 workspace_id: None,
                 target_pane_id,
                 direction: crate::api::schema::SplitDirection::Right,
@@ -3816,6 +3817,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_split_focus_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                dry_run: false,
                 workspace_id: None,
                 target_pane_id,
                 direction: crate::api::schema::SplitDirection::Right,
@@ -3937,6 +3939,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: None,
@@ -4109,6 +4112,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_390_explicit".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
                 workspace_id: Some(workspace_id),
@@ -4133,6 +4137,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390_split".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: None,
@@ -4154,6 +4159,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_active".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -4176,6 +4182,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_here".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -4267,6 +4274,7 @@ sidebar_pane_gap = 99
                 id: format!("req_agent_start_398_{index}"),
                 method: crate::api::schema::Method::AgentStart(
                     crate::api::schema::AgentStartParams {
+                        dry_run: false,
                         name: format!("worker-{index}"),
                         cwd: Some(checkout.display().to_string()),
                         workspace_id: None,
@@ -4733,6 +4741,7 @@ sidebar_pane_gap = 99
         };
 
         let base = || crate::api::schema::AgentStartParams {
+            dry_run: false,
             name: "worker".into(),
             cwd: None,
             workspace_id: None,
@@ -4747,6 +4756,7 @@ sidebar_pane_gap = 99
         // `--active`: names the focused space, so there is something to split.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 active: true,
                 ..base()
             })
@@ -4757,6 +4767,7 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let workspace_id = app.public_workspace_id(0);
             split_start(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 workspace_id: Some(workspace_id),
                 ..base()
             })
@@ -4767,6 +4778,7 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let tab_id = app.public_tab_id(0, 0).expect("a public tab id");
             split_start(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 tab_id: Some(tab_id),
                 ..base()
             })
@@ -4776,6 +4788,7 @@ sidebar_pane_gap = 99
         // `--cwd` naming an OPEN checkout: resolves to a space, so it splits it.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 cwd: Some(open_checkout.display().to_string()),
                 ..base()
             })
@@ -4789,6 +4802,7 @@ sidebar_pane_gap = 99
         // `a_headless_start_naming_an_unopened_checkout_still_gets_a_space_of_its_own`.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 cwd: Some(unopened.display().to_string()),
                 ..base()
             })
@@ -4821,6 +4835,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_398_precedence".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
                 workspace_id: None,
@@ -5057,6 +5072,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -5112,6 +5128,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,

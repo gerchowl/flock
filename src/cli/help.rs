@@ -76,7 +76,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "workspace",
         "create",
-        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]",
     ),
     ("workspace", "get", "flk workspace get <workspace_id>"),
     ("workspace", "focus", "flk workspace focus <workspace_id>"),
@@ -100,7 +100,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "worktree",
         "create",
-        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]",
+        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]",
     ),
     (
         "worktree",
@@ -131,7 +131,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "tab",
         "create",
-        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]",
     ),
     ("tab", "get", "flk tab get <tab_id>"),
     ("tab", "focus", "flk tab focus <tab_id>"),
@@ -200,7 +200,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "split",
-        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]",
+        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
     ),
     (
         "pane",

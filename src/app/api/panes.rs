@@ -33,6 +33,17 @@ impl App {
             });
             Some(self.resolve_new_terminal_cwd(follow_cwd))
         });
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "pane.split",
+                serde_json::json!({
+                    "workspace_id": self.public_workspace_id(ws_idx),
+                    "target_pane_id": self.public_pane_id(ws_idx, target_pane_id),
+                    "direction": params.direction, "cwd": split_cwd, "focus": params.focus,
+                }),
+            );
+        }
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;

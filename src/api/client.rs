@@ -53,6 +53,7 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
+        self.check_allocation_preview_protocol(request, None)?;
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
 
@@ -65,6 +66,7 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
+        self.check_allocation_preview_protocol(request, Some(timeout))?;
         let mut stream = self.connect()?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_read_timeout(Some(timeout))?;
@@ -124,6 +126,32 @@ impl ApiClient {
             }),
             result => Err(ApiClientError::UnexpectedResult(format!("{result:?}"))),
         }
+    }
+
+    fn check_allocation_preview_protocol(
+        &self,
+        request: &Request,
+        timeout: Option<Duration>,
+    ) -> Result<(), ApiClientError> {
+        if !request.method.is_allocation_preview() {
+            return Ok(());
+        }
+        let ping = Request {
+            id: "api-client:preview-protocol".into(),
+            method: Method::Ping(PingParams::default()),
+        };
+        let response =
+            self.request_value_with_timeout(&ping, timeout.unwrap_or(Duration::from_secs(5)))?;
+        let protocol = response
+            .pointer("/result/protocol")
+            .and_then(serde_json::Value::as_u64);
+        if protocol != Some(u64::from(crate::protocol::PROTOCOL_VERSION)) {
+            return Err(ApiClientError::Io(io::Error::other(format!(
+                "allocation preview requires server protocol {}, received {protocol:?}; update the server before retrying --dry-run",
+                crate::protocol::PROTOCOL_VERSION,
+            ))));
+        }
+        Ok(())
     }
 
     fn connect(&self) -> io::Result<UnixStream> {
@@ -248,6 +276,49 @@ pub(crate) fn parse_response_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_dry_run_refuses_old_server_before_sending_allocation() {
+        let path = std::env::temp_dir().join(format!("f459-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: Request = read_json_line(&mut reader).unwrap();
+            assert!(matches!(ping.method, Method::Ping(_)));
+            let response = serde_json::json!({"id": ping.id, "result": {
+                "type": "pong", "version": "old", "protocol": crate::protocol::PROTOCOL_VERSION - 1,
+            }});
+            writeln!(reader.get_mut(), "{response}").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let request = Request {
+            id: "preview".into(),
+            method: Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                dry_run: true,
+                ..Default::default()
+            }),
+        };
+        let error = client.request_value(&request).unwrap_err();
+        assert!(error.to_string().contains("requires server protocol"));
+        let error = client
+            .request_value_with_timeout(&request, Duration::from_millis(100))
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let listener = server.join().unwrap();
+        // The second attempt only queued another protocol ping, never an allocation.
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let ping: Request = read_json_line(&mut reader).unwrap();
+        assert!(matches!(ping.method, Method::Ping(_)));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn local_session_target_resolves_named_session_socket() {

@@ -242,6 +242,20 @@ pub enum Method {
     RevertRun(RevertRunParams),
 }
 
+impl Method {
+    pub(crate) fn is_allocation_preview(&self) -> bool {
+        match self {
+            Self::WorkspaceCreate(p) => p.dry_run,
+            Self::WorktreeCreate(p) => p.dry_run,
+            Self::TabCreate(p) => p.dry_run,
+            Self::PaneSplit(p) => p.dry_run,
+            Self::AgentStart(p) => p.dry_run,
+            Self::AgentFork(p) => p.dry_run,
+            _ => false,
+        }
+    }
+}
+
 /// `revert.run` params.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevertRunParams {
@@ -561,6 +575,9 @@ pub struct TabTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -593,6 +610,9 @@ pub struct WorktreeListParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorktreeCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +702,9 @@ pub struct WorktreeKillParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,6 +835,9 @@ pub struct AgentRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -900,6 +926,9 @@ pub enum SpawnLocation {
 /// optionally seeded with a pivot prompt as its opening turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentForkParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Pane id, terminal id, or agent name — same grammar as `agent.send`.
     pub target: String,
     /// New branch name; a slug is generated when omitted.
@@ -1378,6 +1407,9 @@ pub struct InboxMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSplitParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     pub target_pane_id: String,
@@ -2033,6 +2065,10 @@ pub struct ServerCapabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    AllocationPlan {
+        operation: String,
+        plan: serde_json::Value,
+    },
     Pong {
         version: String,
         protocol: u32,
@@ -3858,6 +3894,7 @@ mod tests {
         let request = Request {
             id: "req_1".into(),
             method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                dry_run: false,
                 cwd: Some("/tmp".into()),
                 focus: true,
                 label: Some("api".into()),

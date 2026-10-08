@@ -126,7 +126,7 @@ Use `default` as the session name when you need to stop the default session expl
 
 ```bash
 flk workspace list
-flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]
 flk workspace get <workspace_id>
 flk workspace focus <workspace_id>
 flk workspace rename <workspace_id> <label>
@@ -143,11 +143,13 @@ flk workspace create --cwd ~/project --label api --no-focus
 
 ```bash
 flk worktree list [--workspace ID | --cwd PATH] [--scan] [--json]
-flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]
+flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]
 flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]
 flk worktree remove --workspace ID [--force] [--json]
 flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]
 ```
+
+Allocation commands (`worktree create`, `agent fork`, `agent start`, `workspace create`, `tab create`, and `pane split`) accept `--dry-run`. The server returns an `allocation_plan` JSON result with resolved paths, placement, and command arguments where applicable. It creates no directories, branches, workspaces, or terminal processes. Fork previews perform the same admission and transcript checks as a real fork. Generated branch names are chosen independently for each request; reuse the preview's branch and path explicitly to execute that plan. `agent start --dry-run --wait-ready` returns the plan immediately.
 
 Worktrees are normal Flock workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Flock creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`.
 
@@ -163,7 +165,7 @@ A kill also sweeps the processes left in the checkout. Removing a worktree unlin
 
 ```bash
 flk tab list [--workspace <workspace_id>]
-flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]
+flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]
 flk tab get <tab_id>
 flk tab focus <tab_id>
 flk tab rename <tab_id> <label>
@@ -176,7 +178,7 @@ flk tab close <tab_id>
 flk pane list [--workspace <workspace_id>]
 flk pane get <pane_id>
 flk pane rename <pane_id> <label>|--clear
-flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]
+flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]
 flk pane close <pane_id>
 ```
 
@@ -271,8 +273,8 @@ flk agent rename <target> <name>|--clear
 flk agent focus <target>
 flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
-flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>
-flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]
+flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>
+flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]
 flk agent hibernate <target>
 flk agent resume <target>
 flk lineage <target> [--json]
