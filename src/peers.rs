@@ -176,6 +176,7 @@ impl PeerPollTracker {
 /// Cached state of one configured peer, updated by the poll loop.
 #[derive(Debug, Clone)]
 pub struct PeerSummaryState {
+    pub node_id: Option<String>,
     /// Peer name from config (sidebar host badge).
     pub peer: String,
     /// SSH destination used for polling and switch-on-select attach.
@@ -319,6 +320,7 @@ impl PeerDialHealth {
 impl PeerSummaryState {
     pub fn new(config: &PeerConfig) -> Self {
         Self {
+            node_id: None,
             peer: config.name.clone(),
             ssh_target: config.ssh_target().to_string(),
             host: None,
@@ -701,6 +703,7 @@ pub fn relayed_entry_from_wire(
     let strip = |text: String| crate::control_bytes::strip(&text);
     Some(RelayedEntry {
         peer: PeerSummaryState {
+            node_id: entry.node_id,
             dial: Default::default(),
             stream_error: None,
             peer: strip(entry.name),
@@ -876,6 +879,7 @@ pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol
 /// receiver's dwell no longer cliffs a snapshot entry at `stale_after`.
 pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
     PeerSummaryState {
+        node_id: None,
         dial: Default::default(),
         stream_error: None,
         peer: peer.name,
@@ -904,6 +908,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
 /// Parsed summary payload from one peer (everything its `peers.summary` carries).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerSummaryPayload {
+    pub node_id: Option<String>,
     pub outbound_pending: bool,
     pub host: String,
     pub version: Option<String>,
@@ -918,6 +923,18 @@ pub struct PeerSummaryPayload {
     /// two-hop fleet visibility. Empty when the peer is v(N-1) — additive
     /// with a serde default keeps mixed-version fleets safe.
     pub relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer>,
+}
+
+pub(crate) fn validated_summary_node(
+    claimed: Option<String>,
+    pinned: Option<&str>,
+) -> Option<String> {
+    if claimed.as_deref().is_some_and(|node| Some(node) != pinned) {
+        tracing::warn!("dropping summary node id that does not match enrolled pin");
+        None
+    } else {
+        claimed
+    }
 }
 
 /// Result of one poll of one peer, sent back as an AppEvent.
@@ -1583,6 +1600,10 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
             .map(crate::api::schema::PeerSystemSummary::sanitized);
     }
     Ok(PeerSummaryPayload {
+        node_id: result
+            .get("node_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         outbound_pending: result
             .get("outbound_pending")
             .and_then(serde_json::Value::as_bool)
@@ -1609,6 +1630,7 @@ mod tests {
         proxy_jump: Option<&str>,
     ) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            node_id: None,
             dial: None,
             name: "spoke2.invalid".into(),
             ssh_target: ssh_target.into(),
@@ -2019,6 +2041,7 @@ mod tests {
     #[test]
     fn to_wire_dedups_origin_and_caps_peer_count() {
         let mk = |name: &str| PeerSummaryState {
+            node_id: None,
             dial: Default::default(),
             stream_error: None,
             peer: name.to_string(),
@@ -2068,6 +2091,7 @@ mod tests {
 
     fn summary_state(name: &str, ssh_target: &str, age_secs: Option<u64>) -> PeerSummaryState {
         PeerSummaryState {
+            node_id: None,
             dial: Default::default(),
             stream_error: None,
             peer: name.to_string(),
@@ -2689,6 +2713,7 @@ Last login: banner noise
 
         // v(N) struct → JSON → v(N) struct: value preserved.
         let full = RelayedFleetPeer {
+            node_id: None,
             dial: None,
             name: "atlas".into(),
             ssh_target: "operator@atlas".into(),

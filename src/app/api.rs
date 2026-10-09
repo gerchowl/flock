@@ -12,6 +12,7 @@ mod lineage;
 mod mesh;
 mod mesh_mail;
 mod mesh_replies;
+pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
 mod panes;
@@ -436,7 +437,16 @@ impl App {
             // independently of this poll's outcome.
             summary.stream_error = fetch.stream_error;
             match fetch.result {
-                Ok(payload) => {
+                Ok(mut payload) => {
+                    let pinned = self
+                        .state
+                        .peers
+                        .iter()
+                        .find(|p| p.name == fetch.peer)
+                        .and_then(|p| crate::peer_stream::enrollment(p).node_id);
+                    payload.node_id =
+                        crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
+                    summary.node_id = payload.node_id.clone();
                     self.mesh_outbound_polls
                         .entry(fetch.peer.clone())
                         .or_default()
@@ -538,6 +548,7 @@ impl App {
             // re-addressed keeps its row for the process lifetime, keeps
             // rendering, and keeps riding outgoing snapshots to other servers.
             // Only meaningful now that carried freshness decays.
+            self.note_mesh_owners();
             self.state.evict_expired_relayed_entries();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
@@ -559,6 +570,10 @@ impl App {
             return;
         }
 
+        if let AppEvent::MeshRoutesCompleted(completion) = ev {
+            self.finish_mesh_routes(*completion);
+            return;
+        }
         if let AppEvent::MeshCollected(completion) = ev {
             self.collection_relays.complete();
             self.collection_peers.remove(&completion.peer.name);
@@ -1416,6 +1431,7 @@ impl App {
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
+            Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
             Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, params),
             Method::MeshCollect(params) => return self.handle_mesh_collect(request.id, params),
@@ -1770,6 +1786,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
@@ -1930,6 +1947,7 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        node_id: None,
                         outbound_pending: false,
                         host: "atlas".into(),
                         version: None,
@@ -1994,6 +2012,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
                     version: None,
@@ -3046,6 +3065,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),

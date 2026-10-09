@@ -244,7 +244,9 @@ impl App {
             return;
         }
         self.mesh_collect_at = Some(now + std::time::Duration::from_secs(1));
-        self.inbound.prune(crate::platform::process_start_time);
+        for node in self.inbound.prune(crate::platform::process_start_time) {
+            self.mesh_routes.table.withdraw_edge(&node);
+        }
         if self.fleet_pause.paused {
             return;
         }

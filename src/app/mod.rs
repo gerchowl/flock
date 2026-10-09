@@ -9,6 +9,7 @@ pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;
@@ -147,6 +148,7 @@ pub struct App {
     pub(crate) mesh_collect_at: Option<Instant>,
     pub(crate) mesh_outbound_cursor: usize,
     pub(crate) mesh_outbound_polls: std::collections::HashMap<String, crate::mesh::collect::Poll>,
+    pub(crate) mesh_routes: api::mesh_routes::Routes,
     pub(crate) collection_relays: message_relay::MessageRelays,
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
@@ -939,6 +941,7 @@ impl App {
             mesh_outbound_cursor: 0,
             mesh_outbound_polls: Default::default(),
             collection_relays: Default::default(),
+            mesh_routes: Default::default(),
             collection_peers: Default::default(),
             collection_generation: 0,
             mesh_retry_at: None,
