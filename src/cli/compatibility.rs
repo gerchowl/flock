@@ -1,8 +1,3 @@
-use std::io;
-use std::time::Duration;
-
-use crate::api::schema::{Method, PingParams, Request};
-
 // Turn cursors and agent.result first shipped together in v0.9.0.
 const MIN_TURN_SERVER: crate::update::Version = crate::update::Version {
     major: 0,
@@ -10,20 +5,9 @@ const MIN_TURN_SERVER: crate::update::Version = crate::update::Version {
     patch: 0,
 };
 
-fn running_version() -> io::Result<Option<String>> {
-    let response = super::ApiClient::local()
-        .request_value_with_timeout(
-            &Request {
-                id: "cli:compatibility".into(),
-                method: Method::Ping(PingParams::default()),
-            },
-            Duration::from_millis(500),
-        )
-        .map_err(super::api_client_error_to_io)?;
-    if let Some(error) = response.get("error") {
-        return Err(io::Error::other(error.to_string()));
-    }
-    Ok(response["result"]["version"].as_str().map(str::to_owned))
+fn running_version() -> Option<String> {
+    crate::api::compatibility::server_version(&super::ApiClient::local())
+        .map(|server| server.version)
 }
 
 fn version_gap(command: &str, version: Option<&str>) -> String {
@@ -38,17 +22,14 @@ fn parse_server_version(raw: &str) -> Option<crate::update::Version> {
 }
 
 fn is_capability_failure(reason: &str) -> bool {
-    reason.contains("unknown variant")
-        || reason.contains("unknown method")
-        || reason.contains("method not found")
-        || reason.contains("no turn cursor")
+    crate::api::compatibility::is_capability_failure(reason) || reason.contains("no turn cursor")
 }
 
 pub(super) fn diagnose_failure(command: &str, reason: &str) -> String {
     if !is_capability_failure(reason) {
         return reason.to_owned();
     }
-    let version = running_version().ok().flatten();
+    let version = running_version();
     diagnosis(command, reason, version.as_deref())
 }
 
@@ -70,7 +51,7 @@ pub(super) fn capability_error_message(
         Some("unknown_method" | "method_not_found")
     ) || is_capability_failure(reason)
     {
-        let version = running_version().ok().flatten();
+        let version = running_version();
         let message = diagnosis(command, reason, version.as_deref());
         (message != reason).then_some(message)
     } else {

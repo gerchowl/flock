@@ -55,12 +55,19 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
+        super::compatibility::before_request(self, request);
         self.check_allocation_preview_protocol(request, None)?;
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
 
         let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+        let mut response = read_json_line(&mut reader)?;
+        if matches!(request.method, Method::Ping(_)) {
+            super::compatibility::observe_ping(self, &response);
+        } else {
+            super::compatibility::normalize(self, &mut response);
+        }
+        Ok(response)
     }
 
     pub fn request_value_with_timeout(
@@ -68,6 +75,7 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
+        super::compatibility::before_request(self, request);
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         let mut stream = self.connect()?;
         stream.set_write_timeout(Some(timeout))?;
@@ -75,7 +83,13 @@ impl ApiClient {
         write_request(&mut stream, request)?;
 
         let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+        let mut response = read_json_line(&mut reader)?;
+        if matches!(request.method, Method::Ping(_)) {
+            super::compatibility::observe_ping(self, &response);
+        } else {
+            super::compatibility::normalize(self, &mut response);
+        }
+        Ok(response)
     }
 
     #[allow(dead_code)] // Kept as the typed subscription API; CLI wait paths use subscribe_value to preserve raw ack errors.
@@ -98,6 +112,7 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        super::compatibility::before_request(self, request);
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
         if let Some(timeout) = read_timeout {
@@ -105,7 +120,8 @@ impl ApiClient {
         }
 
         let mut reader = BufReader::new(stream);
-        let ack = read_json_line(&mut reader)?;
+        let mut ack = read_json_line(&mut reader)?;
+        super::compatibility::normalize(self, &mut ack);
         Ok((ack, EventStream { reader }))
     }
 

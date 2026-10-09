@@ -2491,6 +2491,11 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
 
+    if let Some(message) = crate::api::compatibility::require_submit(&ApiClient::local()) {
+        eprintln!("{message}");
+        return Ok(crate::api::compatibility::EXIT_CODE);
+    }
+
     let _lock = match take_lock(name) {
         Ok(lock) => lock,
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),

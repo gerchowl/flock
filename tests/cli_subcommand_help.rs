@@ -272,6 +272,9 @@ impl StandInServer {
                         continue;
                     }
                 }
+                if support::compatibility::answer_probe(&mut stream, &line) {
+                    continue;
+                }
                 counter.fetch_add(1, Ordering::SeqCst);
                 let response = if line.contains("worktree.create") {
                     allocate_worktree(&repo);

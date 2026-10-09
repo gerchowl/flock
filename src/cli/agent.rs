@@ -788,6 +788,13 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: {AGENT_SEND_USAGE}");
         return Ok(2);
     };
+    if params.submit {
+        if let Some(message) = crate::api::compatibility::require_submit(&super::ApiClient::local())
+        {
+            eprintln!("{message}");
+            return Ok(crate::api::compatibility::EXIT_CODE);
+        }
+    }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send".into(),
         method: Method::AgentSend(params),

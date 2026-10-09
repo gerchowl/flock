@@ -7,6 +7,8 @@ Flock’s CLI talks to the running server over the same local socket API used by
 
 Most commands print JSON responses. Use them from scripts when you want deterministic automation.
 
+When the running server uses a different protocol, the CLI prints one warning to stderr per invocation. Commands the server does not recognize fail with **exit code 78** (`server_version_gap`) and report the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). `delegate start` and `agent send --submit` check submission support before creating a workspace or typing. Supported commands still run against an older server. On its first API request, the CLI probes server status once with a 500 ms timeout (or reuses that request when it is itself a ping) and reuses that identity for failure diagnosis; an unavailable probe leaves the original error intact. MCP tools return the same message with `error.data.refusal: "server_version_gap"`.
+
 ## Launch and status
 
 ```bash

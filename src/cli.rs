@@ -103,6 +103,33 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         return Ok(CommandOutcome::Handled(0));
     }
 
+    // MCP stays alive across server upgrades and diagnoses each failed call.
+    let cli_probe = command != "mcp";
+    if cli_probe {
+        crate::api::compatibility::begin_cli(&ApiClient::local(), |server| {
+            eprintln!(
+                "warning: server is flk {} (protocol {}); client protocol {} is incompatible",
+                server.version,
+                server.protocol,
+                crate::protocol::PROTOCOL_VERSION,
+            );
+        });
+    }
+    let outcome = dispatch(args, command);
+    if cli_probe {
+        if let Some(message) = crate::api::compatibility::end_cli() {
+            // Some commands deliberately consume API errors while probing for
+            // optional state. The invocation must still explain a refusal.
+            eprintln!("{message}");
+            return Ok(CommandOutcome::Handled(
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
+    outcome
+}
+
+fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
     let exit_code = match command {
         "server" => {
             let Some(exit_code) = server::run_server_command(&args[2..])? else {

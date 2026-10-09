@@ -703,6 +703,9 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let line = read_request_line(&stream);
+                    if support::compatibility::answer_probe(&mut stream, &line) {
+                        continue;
+                    }
                     let _ = stream.write_all(br#"{"id":"test","result":{"type":"ok"}}"#);
                     let _ = stream.write_all(b"\n");
                     let _ = stream.flush();
@@ -1000,6 +1003,9 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let line = read_request_line(&stream);
+                    if support::compatibility::answer_probe(&mut stream, &line) {
+                        continue;
+                    }
                     stream
                         .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                         .unwrap();
@@ -1072,17 +1078,18 @@ fn pane_report_metadata_sends_presentation_request() {
         let socket_path = base.join("flock.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
 
-        let server = thread::spawn(move || {
+        let server = thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
+            let line = read_request_line(&stream);
+            if support::compatibility::answer_probe(&mut stream, &line) {
+                continue;
+            }
             stream
                 .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                 .unwrap();
             stream.write_all(b"\n").unwrap();
             stream.flush().unwrap();
-            line
+            return line;
         });
 
         let mut args = vec!["pane", "report-metadata"];
