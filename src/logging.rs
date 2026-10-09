@@ -4655,6 +4655,11 @@ pub(crate) fn mesh_store_suspended(reason: &str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.store.suspended", reason, "mesh store suspended; recovery will retry");
 }
 
+/// Routing diagnostics never contain message bodies, keys, or SSH destinations.
+pub(crate) fn mesh_routing_failed(operation: &'static str, peer: &str, reason: &str) {
+    tracing::warn!(target: "flock::mesh", event = "mesh.routing.failed", operation, peer, reason, "mesh routing operation failed");
+}
+
 /// Custody errors expose a bounded code, never envelope bodies or return tokens.
 pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");

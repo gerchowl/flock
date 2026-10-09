@@ -19,7 +19,30 @@ an enrolled attachment, including after a server restart. Relay methods are
 bound to an SSH-descended process and its start time.
 
 `peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
-`source` (`configured` or `inbound`), `state`, and `reason`.
+`source` (`configured` or `inbound`), `state`, and `reason`. Its `routes` array
+contains `{node, name, next_hop, hops}` for live shortest paths (at most eight
+hops). Names use locally pinned names when available; other names include an
+eight-character node ID suffix and `(advertised)`.
+
+`mesh.routes { "adverts": [...] }` exchanges signed topology over an enrolled
+edge and returns `{ "adverts": [...] }`. Each advert binds its node ID, public
+key, name, mesh version, generation `[boot_ms, seq]`, and live adjacencies to its
+own signature. Invalid adverts are discarded individually. Exchanges contain
+no SSH addresses, and never authorize dialing a discovered node. Routes remain
+live through silence and are withdrawn on edge closure, without a route TTL.
+Exchanges run on enrollment, debounced topology changes, or `mesh.routes_changed` pushes;
+there is no periodic route refresh. Failed exchanges retry with jittered backoff
+through five seconds, one minute, and five minutes. Paused acceptors return
+`fleet_paused`; resuming triggers another exchange. Each batch replaces that
+supplier's full view, withdrawing omitted records when no supplier remains.
+Split horizon excludes records learned solely from the receiving peer. Route
+wakes and new topology generations clear exchange retry backoff.
+Advert boot generations are persisted so clock rollback across restart cannot
+make a new advert older than its predecessor.
+`peers.summary.node_id` is accepted only when it matches the enrolled peer pin;
+relayed directory rows carry the owning node ID. Last-known agent owners are
+retained across restart as offline hints.
+
 `peers.enroll_reset { "peer": "<peer>", "source": "configured", "preview": true }`
 shows the affected pin. Repeat with `preview: false` and the returned `node_id`
 as `expected_node_id` to clear it and invalidate its enrollment. Source defaults

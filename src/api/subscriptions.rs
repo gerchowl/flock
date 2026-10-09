@@ -117,6 +117,10 @@ impl ActiveSubscription {
         event_hub: &EventHub,
     ) -> Result<Self, ErrorResponse> {
         match subscription {
+            Subscription::MeshRoutesChanged {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::MeshRoutesChanged,
+                last_sequence: event_hub.current_sequence(),
+            })),
             Subscription::MeshOutboundPending {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::MeshOutboundPending,
                 last_sequence: 0,

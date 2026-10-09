@@ -288,6 +288,7 @@ impl App {
         encode_success(
             id,
             ResponseResult::PeersEnrollment {
+                routes: self.mesh_route_status(),
                 peers,
                 mesh_suspended_reason,
             },

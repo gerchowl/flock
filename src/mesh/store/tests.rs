@@ -3559,6 +3559,20 @@ fn quarantine_sidecar_rotation_keeps_two_bounded_private_files() {
 }
 
 #[test]
+fn route_boot_epoch_survives_restart_and_clock_rollback() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    store.set_paused(true, 1500).unwrap();
+    let first = store.reserve_route_boot(2000).unwrap();
+    let clock = store.clock().unwrap();
+    drop(store);
+    let mut store = fixture.open(500);
+    let second = store.reserve_route_boot(500).unwrap();
+    assert!(second > first);
+    assert_eq!(store.clock().unwrap(), clock);
+}
+
+#[test]
 fn held_answer_push_ready_honors_due_time_without_reenrollment_or_idle_commits() {
     let f = Fixture::new();
     let mut store = f.open(0);

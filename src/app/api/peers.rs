@@ -197,6 +197,7 @@ impl App {
             None => fleet.extend(hub_self),
         }
         crate::peers::merge_hub_pushed_fleet(&mut self.state.relayed_fleet_cache, fleet, &hub);
+        self.note_mesh_owners();
         self.state.evict_expired_relayed_entries();
         self.render_dirty
             .store(true, std::sync::atomic::Ordering::Release);
@@ -210,6 +211,7 @@ impl App {
     pub(crate) fn hub_self_row(&self) -> RelayedFleetPeer {
         let us = short_host_name();
         RelayedFleetPeer {
+            node_id: self.node_id.clone(),
             name: us.clone(),
             // Never dialled by the spoke (hub-pushed rows are display-only),
             // and a spoke that already has a route to us keeps its own.
@@ -239,6 +241,7 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
+                    node_id: peer.node_id.clone(),
                     // #418: how this server's dials to the peer are failing,
                     // which is what `flk peers` shows.
                     dial: peer.dial_report(std::time::Instant::now()),
@@ -1069,6 +1072,7 @@ mod tests {
 
     fn summary(name: &str, ssh_target: &str) -> crate::peers::PeerSummaryState {
         crate::peers::PeerSummaryState {
+            node_id: None,
             dial: Default::default(),
             stream_error: None,
             peer: name.to_string(),
@@ -1267,6 +1271,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
                 ssh_target: "operator@spoke2.invalid".into(),
@@ -1318,6 +1323,7 @@ mod tests {
     /// A row `kiln` relays about `node-b`, with the target only kiln resolves.
     fn relayed_by_anvil(name: &str, ssh_target: &str) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            node_id: None,
             dial: None,
             name: name.into(),
             ssh_target: ssh_target.into(),
@@ -1504,6 +1510,7 @@ mod tests {
 
     fn hub_row(name: &str, ssh_target: &str, age: u64) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            node_id: None,
             dial: None,
             name: name.into(),
             ssh_target: ssh_target.into(),
@@ -1660,6 +1667,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
                 ssh_target: "operator@spoke2.invalid".into(),
@@ -1711,6 +1719,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
                     outbound_pending: false,
                     host: "kiln".into(),
                     version: None,
@@ -1719,6 +1728,7 @@ mod tests {
                     latency_ms: 5,
                     workspaces: Vec::new(),
                     relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
+                        node_id: None,
                         dial: None,
                         name: "loop-back".into(),
                         ssh_target: "operator@loop".into(),

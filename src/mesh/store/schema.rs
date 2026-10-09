@@ -21,6 +21,9 @@ pub(super) fn migrate(
 ) -> Result<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     check_version(&tx)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mesh_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);",
+    )?;
     let mut version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let existing: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='envelopes')",
