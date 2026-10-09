@@ -82,6 +82,7 @@ child = subprocess.Popen(
 lock = threading.Lock()
 deliveries = set()
 collections = set()
+outbound_collections = set()
 
 
 def emit(line):
@@ -108,7 +109,17 @@ def forward_input():
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"
-                if not outbound:
+                if outbound:
+                    outbound_collections.add(request.get("id"))
+                    with (base / f"outbound-polls-{source}-{target}").open("a") as log:
+                        log.write(str(time.monotonic()) + "\n")
+                    lose_ack = base / f"lose-outbound-ack-{source}-{target}"
+                    if lose_ack.exists() and request.get("params", {}).get("outbound", {}).get("ack"):
+                        lose_ack.rename(base / f"lost-outbound-ack-{source}-{target}")
+                        outbound_collections.discard(request.get("id"))
+                        emit(json.dumps({"id": request["id"], "result": {"answers": []}}) + "\n")
+                        continue
+                else:
                     collections.add(request.get("id"))
                 hold = base / f"hold-{kind}-{source}-{target}"
                 if hold.is_dir():
@@ -207,6 +218,17 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        if response.get("id") in outbound_collections:
+            outbound_collections.discard(response.get("id"))
+            answers = response.get("result", {}).get("answers", [])
+            if answers:
+                with (base / f"outbound-offers-{source}-{target}").open("a") as log:
+                    log.write(json.dumps(answers) + "\n")
+                corrupt = base / f"corrupt-outbound-{source}-{target}"
+                if corrupt.exists():
+                    answers[0]["remaining_ms"] = "undecodable"
+                    corrupt.unlink()
+                    line = json.dumps(response) + "\n"
         if response.get("id") in collections:
             answers = response.get("result", {}).get("answers", [])
             if answers and (base / f"corrupt-collect-answer-{source}-{target}").exists():

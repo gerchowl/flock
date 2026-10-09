@@ -1272,7 +1272,7 @@ pub struct AdvancedConfig {
 /// id changes every time it is recreated, so an agent-granular allowlist would
 /// be unmaintainable. The host is the trust boundary the fleet already has.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct MsgConfig {
     /// Accept agent-to-agent messages at all. Default: true.
     ///
@@ -1854,10 +1854,9 @@ mod tests {
     }
 
     #[test]
-    fn spoke_custody_rejects_removed_uplink_settings() {
+    fn spoke_custody_accepts_removed_uplink_settings() {
         for key in ["uplink_timeout_secs", "uplink_heartbeat_secs"] {
-            let error = toml::from_str::<super::MsgConfig>(&format!("{key}=20")).unwrap_err();
-            assert!(error.to_string().contains(key));
+            assert!(toml::from_str::<super::MsgConfig>(&format!("{key}=20")).is_ok());
         }
     }
 

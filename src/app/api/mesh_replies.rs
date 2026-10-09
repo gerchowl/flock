@@ -5,7 +5,7 @@ use super::{
     responses::{encode_error, encode_success},
 };
 use crate::{
-    api::schema::{EventEnvelope, EventKind, ResponseResult},
+    api::schema::{EventData, EventEnvelope, EventKind, ResponseResult},
     app::{mailboxes::PendingMessage, App},
     mesh::{
         collect::{AnswerCollect, Collect, Completion},
@@ -179,7 +179,22 @@ impl App {
                 .and_then(|edge| edge.node_id.as_deref())
                 .ok_or("mesh edge is not enrolled")?;
             with_store(|store| {
-                match &query {
+                let mut refusals = Vec::new();
+                if let Collect::Outbound { outbound } = &query {
+                    for ack in &outbound.ack {
+                        if let Some(reason) = &ack.refusal {
+                            if let Some(record) = store
+                                .collection_record(&ack.key, now_ms() as i64)
+                                .map_err(|e| e.to_string())?
+                            {
+                                if record.state == "held" && record.remaining_ms > 0 {
+                                    refusals.push((record.envelope.correlation_id, reason.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let answers = match &query {
                     Collect::Answers(query) => {
                         store.collect_answers(origin, query, now_ms() as i64)
                     }
@@ -192,11 +207,26 @@ impl App {
                         now_ms() as i64,
                     ),
                 }
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                Ok((answers, refusals))
             })
         })();
         match result {
-            Ok(answers) => encode_success(id, ResponseResult::MeshCollected { answers }),
+            Ok((answers, refusals)) => {
+                for (correlation_id, reason) in refusals {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::MessageDelivered,
+                        data: EventData::MessageDelivered {
+                            correlation_id,
+                            delivered: false,
+                            outcome: format!("refused: {reason}"),
+                            delivery_attempts: 0,
+                            latency_ms: 0,
+                        },
+                    });
+                }
+                encode_success(id, ResponseResult::MeshCollected { answers })
+            }
             Err(reason) => encode_error(id, "mesh_collection_refused", reason),
         }
     }
@@ -213,7 +243,7 @@ impl App {
         if self.fleet_pause.paused {
             return;
         }
-        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+        let cap = crate::mesh::collect::POLL_CONCURRENCY;
         let slots = self.collection_relays.slots(cap);
         if slots == 0 {
             return;
@@ -277,7 +307,15 @@ impl App {
         }
         for peer in peers {
             if !self.collection_peers.contains_key(&peer.name)
-                && crate::peer_stream::enrollment(&peer).state == "pinned"
+                && self
+                    .mesh_outbound_polls
+                    .entry(peer.name.clone())
+                    .or_default()
+                    .ready(
+                        now,
+                        crate::peer_stream::enrollment(&peer).state == "pinned",
+                        crate::peer_stream::peer_enrollment_generation(&peer),
+                    )
             {
                 self.start_collection(
                     peer,
@@ -303,7 +341,7 @@ impl App {
     }
 
     pub(super) fn start_collection(&mut self, peer: crate::config::PeerConfig, query: Collect) {
-        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+        let cap = crate::mesh::collect::POLL_CONCURRENCY;
         if self.collection_relays.slots(cap) == 0 {
             return;
         }
@@ -316,7 +354,7 @@ impl App {
         self.collection_relays.start_bounded(
             crate::mesh::collect::work(peer, query),
             self.event_tx.clone(),
-            self.state.config.msg.deferral_relay_concurrency.clamp(1, 4),
+            crate::mesh::collect::POLL_CONCURRENCY,
         );
     }
 
@@ -350,7 +388,7 @@ impl App {
         {
             return;
         }
-        for answer in answers {
+        for answer in answers.deliveries {
             if let Err(reason) =
                 self.import_mesh_answer(&query.request, &answer, Some(&completion.peer.name))
             {

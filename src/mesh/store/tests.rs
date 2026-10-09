@@ -294,7 +294,15 @@ fn duplicate_cannot_extend_ttl_or_change_immutable_content() {
         s.accept(&e, 5000, Admission::Custody, 500).unwrap(),
         Accepted::Duplicate
     );
-    assert_eq!(s.get(&e.key).unwrap().unwrap().remaining_ms, 500);
+    // Duplicate admission is read-only. Read TTL at the caller's wall time,
+    // rather than assuming it committed a new persistent clock anchor.
+    assert_eq!(
+        s.collection_record(&e.key, 500)
+            .unwrap()
+            .unwrap()
+            .remaining_ms,
+        500
+    );
     e.body.push(1);
     assert!(matches!(
         s.accept(&e, 1000, Admission::Custody, 500),
@@ -1802,7 +1810,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
     let mut store = fixture.open(2);
     assert_eq!(
         store
-            .collect_outbound("origin.example", "receiver.example", &poll, 2)
+            .collect_outbound("origin.example", "receiver.example", &poll, 5002)
             .unwrap()[0]
             .envelope,
         mail
@@ -1849,4 +1857,81 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         .is_empty());
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "delivered");
     assert_eq!(store.get(&other.key).unwrap().unwrap().state, "held");
+}
+
+#[test]
+fn spoke_custody_duplicates_do_not_write_and_conflicts_still_fail() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mut mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let observer = rusqlite::Connection::open(&fixture.path).unwrap();
+    let version = || {
+        observer
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    let changes = store.connection.total_changes();
+    for now in 1..20 {
+        assert_eq!(
+            store
+                .accept(&mail, CUSTODY_TTL_MS - now, Admission::Inbox, now)
+                .unwrap(),
+            Accepted::Duplicate
+        );
+    }
+    mail.body.push(0);
+    assert!(matches!(
+        store.accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 20),
+        Err(Error::ConflictingKey)
+    ));
+    assert_eq!(changes, store.connection.total_changes());
+    assert_eq!(before, version());
+}
+
+#[test]
+fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
+    use crate::mesh::collect::{OutboundCollect, BATCH_CAP};
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    for _ in 0..(BATCH_CAP + 5) {
+        store
+            .accept(&envelope(), CUSTODY_TTL_MS, Admission::Held, 0)
+            .unwrap();
+    }
+    let first = store
+        .collect_outbound(
+            "origin.example",
+            "receiver.example",
+            &OutboundCollect::default(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(first.len(), BATCH_CAP);
+    drop(store);
+    let mut store = fixture.open(2);
+    let rest = store
+        .collect_outbound(
+            "origin.example",
+            "receiver.example",
+            &OutboundCollect::default(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(rest.len(), 5);
+    assert!(rest
+        .iter()
+        .all(|r| !first.iter().any(|f| f.envelope.key == r.envelope.key)));
+    assert!(!store
+        .has_outbound("origin.example", "receiver.example", 3)
+        .unwrap());
+    assert!(!store
+        .has_outbound("origin.example", "other.example", 5002)
+        .unwrap());
+    assert!(store
+        .has_outbound("origin.example", "receiver.example", 5002)
+        .unwrap());
 }

@@ -25,7 +25,11 @@ impl App {
         if params.from_host.is_some() || !self.state.peers.is_empty() {
             return None;
         }
-        let hub = self.uplink.enrolled_hub()?;
+        let hub = self.uplink.enrolled_hub().or_else(|| {
+            with_store(|store| store.sole_inbound_peer().map_err(|e| e.to_string()))
+                .ok()
+                .flatten()
+        })?;
         let result = (|| {
             if self.fleet_pause.paused {
                 return Err("fleet_paused".to_string());
@@ -101,34 +105,42 @@ impl App {
     }
 
     pub(super) fn finish_outbound_collection(&mut self, completion: Completion) {
-        let Ok(deliveries) = completion.result else {
+        self.mesh_outbound_polls
+            .entry(completion.peer.name.clone())
+            .or_default()
+            .finished(std::time::Instant::now(), completion.result.is_err());
+        let Ok(batch) = completion.result else {
             return;
         };
         let edge = crate::peer_stream::enrollment(&completion.peer);
         if edge.state != "pinned" {
             return;
         }
-        let mut ack = Vec::new();
-        for delivery in deliveries {
+        let mut ack: Vec<_> = batch
+            .quarantined
+            .into_iter()
+            .filter(|ack| edge.node_id.as_deref() == Some(ack.key.origin_node.as_str()))
+            .collect();
+        for delivery in batch.deliveries {
             let mail = &delivery.envelope;
-            if edge.node_id.as_deref() != Some(mail.key.origin_node.as_str())
-                || self.node_id.as_deref() != Some(mail.return_binding.recipient_node.as_str())
-                || mail.request_key.is_some()
-            {
+            if edge.node_id.as_deref() != Some(mail.key.origin_node.as_str()) {
                 continue;
             }
-            let refusal = match self.import_attested_mesh_mail(&delivery) {
-                Ok((_, true)) => None,
-                Ok((_, false)) => continue,
-                Err(reason) if matches!(reason.as_str(), "forward_limit" | "msg_not_allowed") => {
-                    Some(reason)
-                }
+            let result = if self.node_id.as_deref()
+                != Some(mail.return_binding.recipient_node.as_str())
+                || mail.request_key.is_some()
+            {
+                Err("invalid_envelope".into())
+            } else {
+                self.import_attested_mesh_mail(&delivery)
+            };
+            let refusal = match result {
+                Ok(_) => None,
                 Err(reason) => {
-                    crate::logging::mesh_custody_failed(
-                        "collect_outbound",
-                        super::mesh_mail::error_code(&reason),
-                    );
-                    continue;
+                    if transient_import_error(&reason) {
+                        continue;
+                    }
+                    Some(reason.chars().take(512).collect())
                 }
             };
             ack.push(OutboundAck {
@@ -146,4 +158,12 @@ impl App {
             );
         }
     }
+}
+
+fn transient_import_error(reason: &str) -> bool {
+    matches!(
+        reason.split(':').next().unwrap_or(reason),
+        "mailbox_full" | "mail_store_full" | "fleet_paused" | "mail_store_unavailable"
+    ) || crate::mesh::runtime_store::recovery_reason().is_some()
+        || crate::mesh::runtime_store::suspended().unwrap_or(true)
 }

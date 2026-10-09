@@ -106,6 +106,10 @@ fn open_fifo_or_timeout(path: &Path, write: bool, timeout: Duration, what: &str)
 impl PanedMcp {
     /// Start `flk mcp serve` as an agent pane on `node` and connect to it.
     fn start(node: &fleet::Node, base: &Path) -> Self {
+        Self::start_named(node, base, "mcpbridge")
+    }
+
+    fn start_named(node: &fleet::Node, base: &Path, name: &str) -> Self {
         let dir = base.join(format!("mcp-bridge-{}", node.name));
         std::fs::create_dir_all(&dir).unwrap();
         let to_mcp = dir.join("in");
@@ -132,7 +136,8 @@ impl PanedMcp {
             stderr_path.display(),
         );
         let response = node.api(&format!(
-            r#"{{"id":"t:start","method":"agent.start","params":{{"name":"mcpbridge","argv":["/bin/sh","-c",{}],"cwd":"{}"}}}}"#,
+            r#"{{"id":"t:start","method":"agent.start","params":{{"name":{},"argv":["/bin/sh","-c",{}],"cwd":"{}"}}}}"#,
+            serde_json::to_string(name).unwrap(),
             serde_json::to_string(&command).unwrap(),
             node.repo.display(),
         ));
@@ -979,4 +984,166 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
 #[test]
 fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
     slow_message_hop_keeps_api_responsive(PAIR_AB, "nodeb", "nodea");
+}
+
+#[test]
+fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
+    let (fleet, mut alice, bob) = spoke_pair("h2bad", SPOKE_PAIR);
+    let hold = fleet.base.join("hold-outbound-nodeb-nodea");
+    std::fs::create_dir(&hold).unwrap();
+    for i in 0..20 {
+        let sent = alice.call_tool(
+            "flock_msg_send",
+            json!({
+                "to":{"type":"agent","agent":"agent_spoke2_123456789abcdef0"},
+                "body":"no such recipient", "correlation_id":format!("bad-{i}"), "intent":"fyi"
+            }),
+        );
+        assert_eq!(sent["state"], "queued", "{sent}");
+    }
+    spoke_send(&mut alice, &bob.agent_id);
+    std::fs::remove_dir_all(hold).unwrap();
+    let mail = spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id);
+    assert_eq!(mail.as_array().unwrap().len(), 1);
+    for i in 0..20 {
+        wait_for("terminal refusal of unknown target", GOSSIP_TIMEOUT, || {
+            let status = spoke_api(
+                fleet.node("nodea"),
+                "msg.status",
+                json!({"correlation_id":format!("bad-{i}")}),
+            );
+            (status["result"]["state"] == "refused").then_some(())
+        });
+    }
+}
+
+#[test]
+fn spoke_custody_one_undecodable_record_does_not_discard_its_batch() {
+    let (fleet, mut alice, bob) = spoke_pair("h2wire", SPOKE_PAIR);
+    let hold = fleet.base.join("hold-outbound-nodeb-nodea");
+    std::fs::create_dir(&hold).unwrap();
+    std::fs::write(fleet.base.join("corrupt-outbound-nodeb-nodea"), "").unwrap();
+    for i in 0..2 {
+        let sent = alice.call_tool(
+            "flock_msg_send",
+            json!({
+                "to":{"type":"agent","agent":bob.agent_id}, "body":"wire record",
+                "correlation_id":format!("wire-{i}"), "intent":"fyi"
+            }),
+        );
+        assert_eq!(sent["state"], "queued", "{sent}");
+    }
+    std::fs::remove_dir_all(hold).unwrap();
+    assert_eq!(
+        spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id)
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    wait_for("isolated malformed record refusal", GOSSIP_TIMEOUT, || {
+        let count: i64 = spoke_db(fleet.node("nodea")).query_row(
+            "SELECT count(*) FROM envelopes WHERE state='refused' AND collect_error='invalid_envelope'", [], |r| r.get(0)).ok()?;
+        (count == 1).then_some(())
+    });
+}
+
+#[test]
+fn spoke_custody_offline_send_survives_missing_runtime_enrollment() {
+    let (mut fleet, mut alice, bob) = spoke_pair("h2down", SPOKE_PAIR);
+    fleet.refuse_edge("nodeb", "nodea");
+    fleet.kill_edge("nodeb", "nodea", Duration::from_secs(10));
+    drop(alice);
+    fleet.node_mut("nodea").restart();
+    alice = PanedMcp::start_named(
+        fleet.node("nodea"),
+        &fleet.base.join("after-restart"),
+        "mcpbridge2",
+    );
+    spoke_send(&mut alice, &bob.agent_id);
+    fleet.allow_edge("nodeb", "nodea");
+    assert_eq!(
+        spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id)
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers() {
+    let (fleet, mut alice, mut bob) = spoke_pair("h2mute", SPOKE_PAIR);
+    let muted = bob.call_tool("flock_msg_mute", json!({"seconds":900}));
+    assert!(muted["muted_until_ms"].as_u64().is_some(), "{muted}");
+    let lost = fleet.base.join("lose-outbound-ack-nodeb-nodea");
+    std::fs::write(&lost, "").unwrap();
+    let sent = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to":{"type":"agent","agent":bob.agent_id}, "body":"unread while muted",
+            "correlation_id":"muted-ack", "intent":"fyi"
+        }),
+    );
+    assert_eq!(sent["state"], "queued", "{sent}");
+    wait_for("first ack lost", GOSSIP_TIMEOUT, || {
+        fleet
+            .base
+            .join("lost-outbound-ack-nodeb-nodea")
+            .exists()
+            .then_some(())
+    });
+    let db = spoke_db(fleet.node("nodeb"));
+    let version = || {
+        db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    let offers = fleet.base.join("outbound-offers-nodeb-nodea");
+    wait_for(
+        "duplicate offered to muted recipient",
+        GOSSIP_TIMEOUT,
+        || (std::fs::read_to_string(&offers).ok()?.lines().count() >= 2).then_some(()),
+    );
+    assert_eq!(version(), before, "duplicate import must not commit on hub");
+    wait_for("next ack settles custody", GOSSIP_TIMEOUT, || {
+        let state: String = spoke_db(fleet.node("nodea"))
+            .query_row(
+                "SELECT state FROM envelopes WHERE correlation='muted-ack'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (state == "delivered").then_some(())
+    });
+    assert_eq!(version(), before);
+    let count = std::fs::read_to_string(&offers).unwrap().lines().count();
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(
+        std::fs::read_to_string(&offers).unwrap().lines().count(),
+        count
+    );
+    assert_eq!(
+        spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id)
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn spoke_custody_idle_pinned_peer_does_not_poll_every_second() {
+    let (fleet, _alice, _bob) = spoke_pair("h2idle", SPOKE_PAIR);
+    let polls = fleet.base.join("outbound-polls-nodeb-nodea");
+    thread::sleep(Duration::from_secs(8));
+    let times: Vec<f64> = std::fs::read_to_string(polls)
+        .unwrap()
+        .lines()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert!(times.len() <= 2, "idle polls: {times:?}");
+    for pair in times.windows(2) {
+        assert!(pair[1] - pair[0] >= 5.0, "{times:?}");
+    }
 }

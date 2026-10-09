@@ -433,6 +433,10 @@ impl App {
             summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(payload) => {
+                    self.mesh_outbound_polls
+                        .entry(fetch.peer.clone())
+                        .or_default()
+                        .pending = payload.outbound_pending;
                     // Gossip v3 (#101): merge the polled peer's relayed_fleet
                     // into our cache BEFORE we mutate `summary`. Loop
                     // prevention rides on the origin field: we drop entries
@@ -1759,6 +1763,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),
@@ -1918,6 +1923,7 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        outbound_pending: false,
                         host: "atlas".into(),
                         version: None,
                         protocol: None,
@@ -1981,6 +1987,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: None,
                     protocol: None,
@@ -3032,6 +3039,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),

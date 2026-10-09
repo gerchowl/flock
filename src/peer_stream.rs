@@ -471,7 +471,7 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Default::default)
 }
 
-type Enrollments = Mutex<HashMap<String, crate::mesh::hello::Enrollment>>;
+type Enrollments = Mutex<HashMap<String, (crate::mesh::hello::Enrollment, u64)>>;
 
 fn enrollments() -> &'static Enrollments {
     static STATUS: OnceLock<Enrollments> = OnceLock::new();
@@ -487,22 +487,30 @@ pub(crate) fn enrollment_generation() -> u64 {
 fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<String>) {
     let enrolled = reason.is_none();
     if let Ok(mut statuses) = enrollments().lock() {
-        let previous = statuses.get(&peer.name).and_then(|s| s.node_id.clone());
+        let previous = statuses.get(&peer.name).and_then(|s| s.0.node_id.clone());
+        let generation = if enrolled {
+            enrollment_generation().saturating_add(1)
+        } else {
+            statuses.get(&peer.name).map(|s| s.1).unwrap_or(0)
+        };
         statuses.insert(
             peer.name.clone(),
-            crate::mesh::hello::Enrollment {
-                peer: peer.name.clone(),
-                source: crate::mesh::store::PinSource::Configured,
-                pin_origin: Default::default(),
-                node_id: node_id.or(previous),
-                state: if reason.is_some() {
-                    "refused"
-                } else {
-                    "pinned"
-                }
-                .into(),
-                reason,
-            },
+            (
+                crate::mesh::hello::Enrollment {
+                    peer: peer.name.clone(),
+                    source: crate::mesh::store::PinSource::Configured,
+                    pin_origin: Default::default(),
+                    node_id: node_id.or(previous),
+                    state: if reason.is_some() {
+                        "refused"
+                    } else {
+                        "pinned"
+                    }
+                    .into(),
+                    reason,
+                },
+                generation,
+            ),
         );
         // Publish the wake only after the enrolled status is visible.
         if enrolled {
@@ -515,7 +523,7 @@ pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
     enrollments()
         .lock()
         .ok()
-        .and_then(|s| s.get(&peer.name).cloned())
+        .and_then(|s| s.get(&peer.name).map(|s| s.0.clone()))
         .unwrap_or_else(|| crate::mesh::hello::Enrollment {
             peer: peer.name.clone(),
             source: crate::mesh::store::PinSource::Configured,
@@ -524,6 +532,15 @@ pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
             state: "pending".into(),
             reason: None,
         })
+}
+
+/// A successful reattachment remains observable even between app ticks.
+pub(crate) fn peer_enrollment_generation(peer: &PeerConfig) -> u64 {
+    enrollments()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&peer.name).map(|s| s.1))
+        .unwrap_or(0)
 }
 
 pub(crate) fn reset_enrollment(peer: &str) {

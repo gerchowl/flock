@@ -1,5 +1,6 @@
 //! Conversation-scoped collection with durable deadlines and acknowledgement debt.
 use super::*;
+use crate::mesh::collect::BATCH_CAP;
 
 pub(super) fn record_answer(
     tx: &rusqlite::Transaction<'_>,
@@ -122,7 +123,7 @@ impl<D: DiskSpace> Store<D> {
                     params![
                         origin,
                         now,
-                        limit.min(16) as i64,
+                        limit.min(BATCH_CAP) as i64,
                         serde_json::to_string(busy)?
                     ],
                     |r| {
@@ -205,14 +206,17 @@ impl<D: DiskSpace> Store<D> {
 
     pub fn collection_acks(&self, request: &MessageKey) -> Result<Vec<MessageKey>> {
         let mut stmt = self.connection.prepare(
-            "SELECT answer_origin,answer_id FROM collect_acks WHERE request_origin=?1 AND request_id=?2 LIMIT 16")?;
+            "SELECT answer_origin,answer_id FROM collect_acks WHERE request_origin=?1 AND request_id=?2 LIMIT ?3")?;
         let keys = stmt
-            .query_map(params![request.origin_node, request.message_id], |r| {
-                Ok(MessageKey {
-                    origin_node: r.get(0)?,
-                    message_id: r.get(1)?,
-                })
-            })?
+            .query_map(
+                params![request.origin_node, request.message_id, BATCH_CAP as i64],
+                |r| {
+                    Ok(MessageKey {
+                        origin_node: r.get(0)?,
+                        message_id: r.get(1)?,
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(keys)
     }
@@ -268,7 +272,7 @@ impl<D: DiskSpace> Store<D> {
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
-        if origin != query.request.origin_node || query.ack.len() > 16 {
+        if origin != query.request.origin_node || query.ack.len() > BATCH_CAP {
             return Err(Error::InvalidEnvelope);
         }
         let request = self
@@ -279,7 +283,7 @@ impl<D: DiskSpace> Store<D> {
         {
             return Err(Error::InvalidEnvelope);
         }
-        // Indexed membership checks bound validation to the 16 supplied keys.
+        // Indexed membership checks bound validation to the capped supplied keys.
         for ack in &query.ack {
             let valid = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND id=?2 AND request_origin=?3 AND request_id=?4)",
@@ -299,10 +303,14 @@ impl<D: DiskSpace> Store<D> {
         let keys = {
             let mut stmt = self.connection.prepare(
                 "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 AND state IN ('custody','held')
-                 ORDER BY origin,id LIMIT 16")?;
+                 ORDER BY origin,id LIMIT ?3")?;
             let rows = stmt
                 .query_map(
-                    params![query.request.origin_node, query.request.message_id],
+                    params![
+                        query.request.origin_node,
+                        query.request.message_id,
+                        BATCH_CAP as i64
+                    ],
                     |r| {
                         Ok(MessageKey {
                             origin_node: r.get(0)?,
@@ -329,6 +337,16 @@ impl<D: DiskSpace> Store<D> {
 }
 
 impl<D: DiskSpace> Store<D> {
+    /// The existing summary carries only ready work, so a backed-off row cannot cause hot polling.
+    pub fn has_outbound(&self, local: &str, hub: &str, wall_ms: i64) -> Result<bool> {
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Ok(false);
+        }
+        let now = clock.advance(wall_ms);
+        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND request_origin IS NULL AND state='held' AND recipient_node=?3 AND retry_at<=?2 AND custody_deadline>?2)", params![local, now, hub], |r| r.get(0))?)
+    }
+
     /// The enrolled hub can collect only local requests addressed to itself.
     /// A lost ack reoffers the same immutable envelope for idempotent import.
     pub fn collect_outbound(
@@ -341,7 +359,7 @@ impl<D: DiskSpace> Store<D> {
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
-        if query.ack.len() > 16 {
+        if query.ack.len() > BATCH_CAP {
             return Err(Error::InvalidEnvelope);
         }
         for ack in &query.ack {
@@ -355,7 +373,7 @@ impl<D: DiskSpace> Store<D> {
                 || ack
                     .refusal
                     .as_deref()
-                    .is_some_and(|r| !matches!(r, "forward_limit" | "msg_not_allowed"))
+                    .is_some_and(|r| r.is_empty() || r.len() > 2048)
             {
                 return Err(Error::InvalidEnvelope);
             }
@@ -384,10 +402,11 @@ impl<D: DiskSpace> Store<D> {
                 }
             }
         }
+        let now = self.clock()?.advance(wall_ms);
         let keys = {
-            let mut stmt = self.connection.prepare("SELECT id FROM envelopes WHERE origin=?1 AND recipient_node=?2 AND request_origin IS NULL AND state='held' ORDER BY id LIMIT 16")?;
+            let mut stmt = self.connection.prepare("SELECT id FROM envelopes WHERE origin=?1 AND recipient_node=?2 AND request_origin IS NULL AND state='held' AND retry_at<=?3 ORDER BY retry_at,id LIMIT ?4")?;
             let rows = stmt
-                .query_map(params![local, hub], |r| {
+                .query_map(params![local, hub, now, BATCH_CAP as i64], |r| {
                     Ok(MessageKey {
                         origin_node: local.into(),
                         message_id: r.get(0)?,
@@ -400,6 +419,9 @@ impl<D: DiskSpace> Store<D> {
         for key in keys {
             if let Some(record) = self.collection_record(&key, wall_ms)? {
                 if record.remaining_ms > 0 {
+                    // Lease each offer with durable backoff, including lost acks and bad wire records.
+                    self.connection.execute("UPDATE envelopes SET retry_at=?3 + CASE WHEN collect_attempts=0 THEN 5000 WHEN collect_attempts=1 THEN 60000 ELSE 299000 END, collect_attempts=collect_attempts+1 WHERE origin=?1 AND id=?2",
+                        params![key.origin_node, key.message_id, now])?;
                     outbound.push(crate::mesh::delivery::Deliver {
                         envelope: record.envelope,
                         remaining_ms: record.remaining_ms,

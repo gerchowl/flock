@@ -259,7 +259,7 @@ impl App {
         };
         let (ws, pane) = match self
             .resolve_message_target(&target)
-            .map_err(|(_, reason)| reason)?
+            .map_err(|(code, reason)| format!("{code}: {reason}"))?
         {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
             ResolvedTarget::Remote(_) => return Err("forward_limit".into()),

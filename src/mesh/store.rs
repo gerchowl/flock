@@ -426,7 +426,9 @@ impl<D: DiskSpace> Store<D> {
         wall_ms: i64,
         collect_ack: bool,
     ) -> Result<Accepted> {
-        let now = self.writable(wall_ms)?;
+        if self.clock()?.paused {
+            return Err(Error::Paused);
+        }
         if !envelope.key.is_valid()
             || !(1..=CUSTODY_TTL_MS).contains(&ttl_ms)
             || !envelope.return_binding.request.is_valid()
@@ -446,6 +448,25 @@ impl<D: DiskSpace> Store<D> {
             + envelope.key.message_id.len() as u64
             + envelope.correlation_id.len() as u64
             + ROW_RESERVE;
+        // Retransmitting an accepted request must not advance the clock or write WAL.
+        if envelope.request_key.is_none() {
+            let prior: Option<Vec<u8>> = self
+                .connection
+                .query_row(
+                    "SELECT fingerprint FROM envelopes WHERE origin=?1 AND id=?2",
+                    params![envelope.key.origin_node, envelope.key.message_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(prior) = prior {
+                return if prior == fingerprint {
+                    Ok(Accepted::Duplicate)
+                } else {
+                    Err(Error::ConflictingKey)
+                };
+            }
+        }
+        let now = self.writable(wall_ms)?;
         self.guard_disk(charge.saturating_add(envelope.body.len() as u64))?;
         let tx = self
             .connection
@@ -734,6 +755,18 @@ impl<D: DiskSpace> Store<D> {
 
     pub fn get_pin(&self, peer: &str) -> Result<Option<IdentityPin>> {
         self.get_pin_from(PinSource::Configured, peer)
+    }
+
+    /// A disconnected single-hub spoke retains its durable enrollment.
+    /// Ambiguous or explicitly reset pins never choose a destination implicitly.
+    pub fn sole_inbound_peer(&self) -> Result<Option<String>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT peer FROM identity_pins WHERE source='inbound' LIMIT 2")?;
+        let peers = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((peers.len() == 1).then(|| peers[0].clone()))
     }
 
     pub fn get_pin_from(&self, source: PinSource, peer: &str) -> Result<Option<IdentityPin>> {

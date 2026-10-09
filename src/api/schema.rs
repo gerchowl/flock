@@ -2192,6 +2192,8 @@ pub enum ResponseResult {
         mesh_suspended_reason: Option<String>,
     },
     PeersSummary {
+        #[serde(default)]
+        outbound_pending: bool,
         /// This server's persistent per-user node identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<String>,
