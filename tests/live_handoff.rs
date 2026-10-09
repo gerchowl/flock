@@ -108,6 +108,9 @@ fn spawn_server_with_env(
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
+    // Config diagnostics must come from the fixture, not the runner's name aliases.
+    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env_remove("FLOCK_NAME");
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
     }
@@ -1412,6 +1415,8 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
         let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
         command
             .args(args)
+            .env_remove("FLOCK_HOST_NAME")
+            .env_remove("FLOCK_NAME")
             .envs(env.iter().cloned())
             .env("FLOCK_CONFIG_PATH", &config);
         support::environment::assert_command_isolated(&command);
