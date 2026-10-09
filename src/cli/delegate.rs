@@ -64,7 +64,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
     AgentResultParams, AgentStartParams, AgentTarget, EmptyParams, EventsSubscribeParams, Method,
-    PaneListParams, PaneReadParams, PaneSubmitParams, PaneTarget, ReadFormat, ReadSource, Request,
+    PaneListParams, PaneReadParams, PaneSubmitParams, ReadFormat, ReadSource, Request,
     Subscription, WorkspaceCreateParams, WorkspaceTarget, WorktreeCreateParams, WorktreeKillParams,
     WorktreeListParams,
 };
@@ -2556,22 +2556,6 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let terminal_id = field(&agent, "terminal_id").unwrap_or_default().to_string();
     let pane_id = field(&agent, "pane_id").unwrap_or_default().to_string();
     let cleanup = placement.cleanup(name, mode, &pane_id, &terminal_id);
-
-    // The workspace the delegate created came with a shell in it. Leaving that
-    // shell there would mean the operator's "where is my agent" question has two
-    // panes in the answer, and an idle wake or a manual type would land in a pane
-    // nobody is watching.
-    if let Err(err) = request(
-        Method::PaneClose(PaneTarget {
-            pane_id: placement.root_pane.clone(),
-        }),
-        None,
-    ) {
-        rollback(&cleanup);
-        return Ok(fail(format!(
-            "could not close the workspace's root pane: {err}"
-        )));
-    }
 
     let ready_timeout = flags
         .ready_timeout_ms

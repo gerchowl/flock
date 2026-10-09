@@ -40,7 +40,15 @@ Server status includes the API socket listener’s accept-error count, latest er
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node
-ID, and enrollment state: `pending`, `pinned`, or `refused` with the reason.
+ID, and enrollment state: `pending`, `pinned`, `retrying`, or `refused` with the reason.
+The acceptor shows live inbound edges only; handshake refusals remain visible
+on the dialer. Unknown handshake failures retry as transient failures.
+
+During post-handoff recovery, status reports `mesh: recovering store after handoff`
+while the server and panes keep running. Failed recovery reports the suspension
+reason and retries every five seconds. Quarantined records
+are reported as `mesh quarantined: N` when the count is nonzero;
+`peers.enrollment` exposes the count as `mesh_quarantined`.
 
 If a peer server is restarting or temporarily unavailable, held edges retry with
 jittered exponential backoff with a ceiling that grows from 1 second to 30 seconds,
@@ -394,6 +402,8 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 `--wait-ready` is opt-in and off unless passed. Because readiness is a detector verdict rather than a liveness check, **a headless agent never becomes ready**: `opencode run "…"`, a CI step, or anything that paints nothing while it works will sit at `unknown` for the whole window and then time out, however healthy it is. Do not pass `--wait-ready` to those; the start itself already refuses a child that dies in its first moments, and `pane_exited` reports the rest.
 
 `agent start` with no placement is refused (`agent_placement_required`) unless the caller is running inside a pane of that server's session, because "the workspace you are looking at" is only an answer to a caller that has one — an `ssh` dispatch or a resume script is told to pass `--workspace`, `--tab`, `--cwd`, or `--active` instead of being placed wherever a human last focused. `--active` names the workspace being looked at; `--here` names the workspace the caller's own pane is in, read from its process ancestry, and is refused (`agent_here_unavailable`) when the server cannot place the caller in a pane. Naming two placements at once is refused (`agent_placement_conflict`). A `--cwd` naming a real directory that matches no open space still gets a space of its own, except under `--split`, which refuses there because there is no space yet to split.
+
+Without `--split`, `--workspace` replaces the workspace’s only pane when it is an untouched root shell created by Flock. `--tab` does the same for a lone root shell in that tab. The pane must have been created with the default shell rather than a custom command, and must never have received input; shell startup scripts may still be running. Otherwise the agent opens a new tab, or a sibling workspace under `tab_mode = "workspace"`. An explicit `--split right|down` always requests a split. Replacement preserves the tab and public pane address, and a failed start leaves the shell running. A dry-run placement can differ from the real run if the shell receives input between the two requests.
 
 `agent start` registers the name it returns itself, before the child has printed anything and independently of any hook the agent runs. The `name` in the `agent_started` result resolves with `agent get`, `agent read`, `agent send` and `agent wait` straight away, so `agent_not_found` for a just-started name is a real failure rather than a race. An agent name cannot look like a pane ID: targets resolve as a pane ID first, so a name written `1:p1` or `p_1_2` is read as that pane.
 

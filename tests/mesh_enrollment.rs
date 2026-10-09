@@ -69,7 +69,7 @@ fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
             .find(|p| {
                 p["peer"] == "acceptor.test"
                     && p["reason"].as_str().is_some_and(|reason| {
-                        reason.contains("mesh handshake refused")
+                        reason.contains("mesh handshake failed")
                             && reason.contains("no_local_server")
                     })
             })
@@ -833,7 +833,15 @@ fn two_hubs_hold_edges_to_one_spoke_concurrently() {
     two_hubs_ready(&fleet);
     let status = cli(fleet.node("nodec"), &["status", "--json"]);
     let rows = status["peers"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{status}");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["source"] == "inbound"
+                && row["state"] == "pinned"
+                && row["node_id"].is_string())
+            .count(),
+        2,
+        "{status}"
+    );
     for hub in ["nodea", "nodeb"] {
         assert!(
             rows.iter().any(|row| row["peer"] == hub
@@ -924,4 +932,48 @@ fn killing_one_hub_edge_leaves_the_other_working() {
     );
     let sent = hub_send(&fleet, "nodeb", &recipient, "after-disconnect");
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
+}
+
+#[test]
+fn status_shows_quarantine_count() {
+    let mut fleet = fleet::spawn(
+        "mesh-quarantine-status",
+        &[NodeSpec::new("quarantine.test", "quarantine-status", &[])],
+    );
+    let node = fleet.node("quarantine.test");
+    let workspace = request(node, "workspace.create", json!({"cwd":node.repo}));
+    let pane = &workspace["result"]["root_pane"]["pane_id"];
+    let sent = request(
+        node,
+        "msg.send",
+        json!({
+            "to":{"type":"pane", "pane":pane}, "body":"quarantine fixture",
+            "correlation_id":"quarantine-status", "intent":"fyi"
+        }),
+    );
+    assert!(sent.get("error").is_none(), "{sent}");
+    fleet.node_mut("quarantine.test").stop();
+    let database = rusqlite::Connection::open(
+        fleet
+            .node("quarantine.test")
+            .home
+            .join("state/flock-dev/mesh-mail.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(
+        database
+            .execute(
+                "UPDATE envelopes SET body=X'00' WHERE correlation='quarantine-status'",
+                []
+            )
+            .unwrap(),
+        1
+    );
+    drop(database);
+    fleet.node_mut("quarantine.test").restart();
+    let node = fleet.node("quarantine.test");
+    let status = request(node, "peers.enrollment", json!({}));
+    assert_eq!(status["result"]["mesh_quarantined"], 1, "{status}");
+    let text = cli_text(node, &["status"]);
+    assert!(text.contains("mesh quarantined: 1"), "{text}");
 }

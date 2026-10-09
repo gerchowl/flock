@@ -49,7 +49,7 @@ impl<D: DiskSpace> Store<D> {
             )
             .optional()?;
         let Some(key) = key else { return Ok(None) };
-        self.status_key(&key, wall_ms)
+        self.status_key(&key, wall_ms, None)
     }
 
     fn signing_key(&self) -> Result<SigningKey> {
@@ -92,7 +92,7 @@ impl<D: DiskSpace> Store<D> {
             return Err(Error::InvalidEnvelope);
         }
         Ok(self
-            .status_key(&reference.key, wall_ms)?
+            .status_key(&reference.key, wall_ms, Some(reference))?
             .unwrap_or_else(|| Status {
                 state: "outcome_retention_elapsed".into(),
                 reference: reference.clone(),
@@ -101,7 +101,12 @@ impl<D: DiskSpace> Store<D> {
             }))
     }
 
-    fn status_key(&self, key: &MessageKey, wall_ms: i64) -> Result<Option<Status>> {
+    pub(crate) fn status_key(
+        &self,
+        key: &MessageKey,
+        wall_ms: i64,
+        reference: Option<&StatusReference>,
+    ) -> Result<Option<Status>> {
         let Some(record) = self.get(key)? else {
             return Ok(None);
         };
@@ -164,7 +169,10 @@ impl<D: DiskSpace> Store<D> {
         }
         Ok(Some(Status {
             state,
-            reference: self.reference(key, &record.envelope.correlation_id)?,
+            reference: match reference {
+                Some(reference) => reference.clone(),
+                None => self.reference(key, &record.envelope.correlation_id)?,
+            },
             reply,
             detail: error,
         }))
@@ -173,7 +181,7 @@ impl<D: DiskSpace> Store<D> {
     /// Called only after the collection edge and conversation token are authenticated.
     pub fn receipt(&self, key: &MessageKey, wall_ms: i64) -> Result<Option<String>> {
         Ok(self
-            .status_key(key, wall_ms)?
+            .status_key(key, wall_ms, None)?
             .map(|s| s.state)
             .filter(|state| RECEIPT_STATES.contains(&state.as_str())))
     }

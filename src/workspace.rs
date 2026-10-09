@@ -188,8 +188,9 @@ pub struct Workspace {
     /// Explicit Flock-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
     /// Public pane numbers within this workspace. Numbers are assigned
-    /// monotonically on creation and are NEVER reused: closing pane N does
-    /// not retarget N to a different pane later (#25).
+    /// monotonically on creation: closing pane N does not retarget N to a
+    /// different pane later (#25). Replacing an untouched root shell during
+    /// agent start preserves its address as one atomic allocation (#818).
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
     /// Next stable public tab number. Like pane numbers, closed tab numbers
