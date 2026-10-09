@@ -439,7 +439,10 @@ impl<D: DiskSpace> Store<D> {
         // takes the receipt too, rather than the hub marking it sent for
         // nothing.
         for receipt in receipts {
-            self.import_receipt(&receipt.key, &receipt.state)?;
+            if self.import_receipt(&receipt.key, &receipt.state)? == ReceiptImport::OriginalNotReady
+            {
+                return Err(Error::InvalidState);
+            }
         }
         if offer == Offer::All {
             // Materialize only changed inbox receipts. The sent mark follows
@@ -473,8 +476,8 @@ impl<D: DiskSpace> Store<D> {
                 params![local,hub,now,BATCH_CAP as i64],
             )?,
             Offer::All => self.routing_keys(
-                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
-                params![hub,now,BATCH_CAP as i64],
+                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND origin IN (?1,?4) AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
+                params![hub,now,BATCH_CAP as i64,local],
             )?,
         };
         let mut outbound = Vec::new();

@@ -13,7 +13,7 @@ mod tombstones;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use status::{Status, StatusReference};
+pub use status::{ReceiptImport, Status, StatusReference};
 use std::{
     fmt, fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},

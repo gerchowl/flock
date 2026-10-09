@@ -49,7 +49,15 @@ pub(super) fn payload(envelope: &Envelope) -> Result<Payload, String> {
 }
 
 impl App {
-    pub(super) fn emit_mesh_wake(&mut self) {
+    pub(super) fn emit_mesh_wake(&mut self, next_hop: &str) {
+        if self.outbound_reply_peer(next_hop).is_some()
+            || !self
+                .inbound
+                .live(crate::platform::process_start_time)
+                .any(|edge| edge.enrolled() && edge.enrollment.node_id.as_deref() == Some(next_hop))
+        {
+            return;
+        }
         self.emit_event(EventEnvelope {
             event: EventKind::MeshOutboundPending,
             data: EventData::MeshOutboundPending {},
@@ -63,20 +71,28 @@ impl App {
         let receipt: crate::mesh::collect::Receipt =
             serde_json::from_slice(&mail.body).map_err(|_| "invalid_envelope".to_string())?;
         with_store(|store| {
+            if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str()) {
+                return Err("invalid reply binding".into());
+            }
             let original = store
                 .get(&receipt.key)
                 .map_err(|e| e.to_string())?
-                .ok_or("invalid_envelope")?;
-            if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str())
-                || original.envelope.return_binding.recipient_node != mail.key.origin_node
+                .ok_or("receipt_original_not_ready")?;
+            if original.envelope.return_binding.recipient_node != mail.key.origin_node
                 || original.envelope.return_binding.collection_token != receipt.token
             {
                 return Err("invalid reply binding".into());
             }
-            store
+            match store
                 .import_receipt(&receipt.key, &receipt.state)
-                .map_err(|e| e.to_string())?;
-            Ok((Accepted::New, true))
+                .map_err(|e| e.to_string())?
+            {
+                crate::mesh::store::ReceiptImport::Applied => Ok((Accepted::New, true)),
+                crate::mesh::store::ReceiptImport::Duplicate => Ok((Accepted::Duplicate, true)),
+                crate::mesh::store::ReceiptImport::OriginalNotReady => {
+                    Err("receipt_original_not_ready".into())
+                }
+            }
         })
     }
 
@@ -326,7 +342,7 @@ impl App {
                 .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
-            self.emit_mesh_wake();
+            self.emit_mesh_wake(&envelope.key.origin_node);
             self.queue_message_tiered(String::new(), data.message, Vec::new(), "unattested");
         }
         if unbound_muted {
@@ -440,7 +456,7 @@ impl App {
                     .outbound_reply_peer(&delivery.envelope.return_binding.recipient_node)
                     .is_none()
                 {
-                    self.emit_mesh_wake();
+                    self.emit_mesh_wake(&delivery.envelope.return_binding.recipient_node);
                 }
             }
         }
@@ -499,20 +515,23 @@ impl App {
             .filter_map(|message| message.message_key)
             .collect();
         let (expired, changed) = with_store(|store| {
-            let mut changed = false;
+            let mut changed = Vec::new();
             for key in &keys {
-                changed |= store
+                if store
                     .get(key)
                     .map_err(|e| e.to_string())?
-                    .is_some_and(|record| record.state == "inbox");
+                    .is_some_and(|record| record.state == "inbox")
+                {
+                    changed.push(key.origin_node.clone());
+                }
             }
             let expired = store
                 .read_inbox(&keys, now_ms() as i64)
                 .map_err(|e| e.to_string())?;
             Ok((expired, changed))
         })?;
-        if changed {
-            self.emit_mesh_wake();
+        for node in changed {
+            self.emit_mesh_wake(&node);
         }
         Ok(expired)
     }

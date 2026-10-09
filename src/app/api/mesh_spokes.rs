@@ -84,7 +84,7 @@ impl App {
                     .accept(&mail, CUSTODY_TTL_MS, Admission::Held, now_ms() as i64)
                     .map_err(|e| e.to_string())
             })?;
-            self.emit_mesh_wake();
+            self.emit_mesh_wake(&mail.return_binding.recipient_node);
             Ok((mail.key, correlation))
         })();
         Some(match result {
@@ -217,6 +217,7 @@ mod tests {
     #[test]
     fn unknown_import_errors_remain_retryable() {
         for error in [
+            "receipt_original_not_ready",
             "database is locked",
             "disk I/O error",
             "mailbox_full",

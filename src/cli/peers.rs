@@ -684,13 +684,62 @@ fn start_summary_push(socket: std::path::PathBuf) {
 /// Wake failures are confined to this worker, never the request relay.
 fn start_mesh_wake_push(socket: std::path::PathBuf) {
     std::thread::spawn(move || {
-        if let Err(error) = mesh_wake_push(&socket) {
-            crate::logging::peer_mesh_wake_failed("push", &error.to_string());
-        }
+        retry_mesh_wake_push(&socket, || {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            writeln!(out, "{{\"push\":\"mesh.wake\"}}")?;
+            out.flush()
+        });
     });
 }
 
-fn mesh_wake_push(socket: &std::path::Path) -> std::io::Result<()> {
+#[derive(Default)]
+struct WakeRetry {
+    outage: bool,
+    seconds: u64,
+}
+
+impl WakeRetry {
+    fn connected(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failed(&mut self) -> (bool, std::time::Duration) {
+        let log = !self.outage;
+        self.outage = true;
+        self.seconds = self.seconds.saturating_mul(2).clamp(1, 30);
+        (log, std::time::Duration::from_secs(self.seconds))
+    }
+}
+
+fn retry_mesh_wake_push(socket: &std::path::Path, mut emit: impl FnMut() -> std::io::Result<()>) {
+    let mut retry = WakeRetry::default();
+    loop {
+        let mut output_failed = false;
+        let error = match mesh_wake_push(socket, || retry.connected(), &mut || {
+            let result = emit();
+            output_failed = result.is_err();
+            result
+        }) {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        let (log, delay) = retry.failed();
+        if log {
+            crate::logging::peer_mesh_wake_failed("subscription", &error.to_string());
+        }
+        if output_failed {
+            return;
+        }
+        std::thread::sleep(delay);
+    }
+}
+
+fn mesh_wake_push(
+    socket: &std::path::Path,
+    connected: impl FnOnce(),
+    emit: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     writeln!(
         stream,
@@ -707,16 +756,14 @@ fn mesh_wake_push(socket: &std::path::Path) -> std::io::Result<()> {
             "mesh wake subscription refused: {ack}"
         )));
     }
+    connected();
     let debounce = PushDebounce::default();
     let events = debounce.clone();
     std::thread::spawn(move || {
         for line in reader.lines() {
             match line {
                 Ok(_) => events.note_event(),
-                Err(error) => {
-                    crate::logging::peer_mesh_wake_failed("subscription", &error.to_string());
-                    break;
-                }
+                Err(_) => break,
             }
         }
         events.note_closed();
@@ -724,12 +771,12 @@ fn mesh_wake_push(socket: &std::path::Path) -> std::io::Result<()> {
     loop {
         std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
         if debounce.take_due().is_some() {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            writeln!(out, "{{\"push\":\"mesh.wake\"}}")?;
-            out.flush()?;
+            emit()?;
         } else if debounce.is_finished() {
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mesh wake subscription closed",
+            ));
         }
     }
 }
@@ -934,6 +981,52 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    #[test]
+    fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {
+        let mut retry = super::WakeRetry::default();
+        for (index, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let (log, delay) = retry.failed();
+            assert_eq!(log, index == 0);
+            assert_eq!(delay.as_secs(), seconds);
+        }
+        retry.connected();
+        assert_eq!(retry.failed(), (true, std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn wake_worker_resubscribes_after_local_subscription_drops() {
+        use std::io::{BufRead, Write};
+        let socket = std::env::temp_dir().join(format!("wake-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert!(line.contains("mesh.outbound_pending"));
+                writeln!(stream, "{{\"result\":{{}}}}").unwrap();
+                writeln!(stream, "{{\"event\":\"mesh_outbound_pending\"}}").unwrap();
+            }
+        });
+        let mut wakes = 0;
+        super::retry_mesh_wake_push(&socket, || {
+            wakes += 1;
+            if wakes == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test consumer closed",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+        assert_eq!(wakes, 2);
+    }
 
     #[test]
     fn wake_debounce_coalesces_a_burst_and_ships_the_last() {

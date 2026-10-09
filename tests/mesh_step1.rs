@@ -1214,3 +1214,244 @@ fn outbound_answer_import_failure_skips_only_its_own_ack() {
             .then_some(())
     });
 }
+
+fn receipt_waits_for_original_custody(receipt_state: &str) {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    std::fs::write(
+        conversation.fleet.base.join("lose-receipt-nodea-nodeb"),
+        b"",
+    )
+    .unwrap();
+    let sent = conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "question",
+            "question body",
+        ],
+    );
+    assert_eq!(sent["state"], "queued");
+    let sender_store = db(origin);
+    let receiver_store = db(spoke);
+    if receipt_state == "expired" {
+        receiver_store
+            .execute(
+                "UPDATE envelopes SET inbox_deadline=0 WHERE correlation='question'",
+                [],
+            )
+            .unwrap();
+    }
+    read(spoke, &conversation.receiver.pane);
+    let offered = || {
+        receiver_store.query_row(
+        "SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held' AND collect_attempts>0
+         AND json_extract(CAST(body AS TEXT), '$.state')=?1", [receipt_state], |row| row.get::<_, i64>(0)).unwrap()
+    };
+    fleet::wait_until("unready receipt offered", DEADLINE, || {
+        (offered() > 0).then_some(())
+    });
+    // Allow any erroneous ack to arrive before checking retained custody.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        offered() > 0,
+        "unready {receipt_state} receipt was acknowledged"
+    );
+    assert_eq!(status(origin, "question")["state"], "queued");
+    // Hold the next receipt offer while the original's retry receives its ack.
+    receiver_store
+        .execute(
+            "UPDATE envelopes SET retry_at=9223372036854775807 WHERE kind='receipt'",
+            [],
+        )
+        .unwrap();
+    sender_store
+        .execute(
+            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE correlation='question'",
+            [],
+        )
+        .unwrap();
+    state(origin, "question", "delivered");
+    receiver_store
+        .execute("UPDATE envelopes SET retry_at=0 WHERE kind='receipt'", [])
+        .unwrap();
+    // A fresh delivery emits a real wake without shortening production polls.
+    conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "wake-probe",
+            "wake probe",
+        ],
+    );
+    state(origin, "question", receipt_state);
+    fleet::wait_until("receipt acknowledged after application", DEADLINE, || {
+        (offered() == 0).then_some(())
+    });
+}
+
+#[test]
+fn read_receipt_is_not_acked_until_lost_push_response_is_recovered() {
+    receipt_waits_for_original_custody("read");
+}
+
+#[test]
+fn expired_receipt_is_not_acked_until_lost_push_response_is_recovered() {
+    receipt_waits_for_original_custody("expired");
+}
+
+#[test]
+fn duplicate_read_receipt_is_acked_without_rewriting_the_original() {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    conversation.send();
+    let receiver_store = db(spoke);
+    fleet::wait_until("initial receipt drained", DEADLINE, || {
+        let sent: bool = receiver_store
+            .query_row(
+                "SELECT receipt_sent='delivered' FROM envelopes WHERE correlation='question'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let held: i64 = receiver_store
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (sent && held == 0).then_some(())
+    });
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    std::fs::write(
+        conversation
+            .fleet
+            .base
+            .join("lose-outbound-ack-nodea-nodeb"),
+        b"",
+    )
+    .unwrap();
+    conversation.read_question();
+    state(origin, "question", "read");
+    fleet::wait_until("read receipt ack lost", DEADLINE, || {
+        conversation
+            .fleet
+            .base
+            .join("lost-outbound-ack-nodea-nodeb")
+            .exists()
+            .then_some(())
+    });
+    let store = db(origin);
+    store
+        .execute_batch(
+            "CREATE TRIGGER forbid_receipt_rewrite BEFORE UPDATE OF remote_state ON envelopes
+        WHEN OLD.correlation='question'
+        BEGIN SELECT RAISE(FAIL, 'duplicate receipt attempted a write'); END;",
+        )
+        .unwrap();
+    due(spoke);
+    conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "duplicate-wake",
+            "wake probe",
+        ],
+    );
+    fleet::wait_until("duplicate receipt acknowledged", DEADLINE, || {
+        let held: i64 = receiver_store.query_row("SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held' AND json_extract(CAST(body AS TEXT),'$.state')='read'", [], |r| r.get(0)).ok()?;
+        (held == 0).then_some(())
+    });
+    assert_eq!(status(origin, "question")["state"], "read");
+    store
+        .execute_batch("DROP TRIGGER forbid_receipt_rewrite")
+        .unwrap();
+}
+
+#[test]
+fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
+    use std::io::{BufRead, BufReader, Write};
+    let conversation = Conversation::new(SPOKE);
+    let hub = conversation.fleet.node("nodeb");
+    let mut stream = std::os::unix::net::UnixStream::connect(&hub.api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id":"quiet", "method":"events.subscribe", "params":{
+            "subscriptions":[{"type":"mesh.outbound_pending"}]
+        }})
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.contains("error"));
+    conversation.send();
+    conversation.read_question();
+    line.clear();
+    assert!(
+        reader.read_line(&mut line).is_err(),
+        "unexpected wake: {line}"
+    );
+}
+
+#[test]
+fn answer_with_wrong_collection_token_is_rejected() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let capture = conversation.fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, b"").unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let mut answer: Value = fleet::wait_until("answer captured", DEADLINE, || {
+        serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()
+    });
+    let first = answer["envelope"]["return_binding"]["collection_token"][0]
+        .as_u64()
+        .unwrap();
+    answer["envelope"]["return_binding"]["collection_token"][0] = json!(first ^ 1);
+    let replay = conversation.fleet.base.join("replay-delivery-nodeb-nodea");
+    std::fs::write(&replay, serde_json::to_vec(&answer).unwrap()).unwrap();
+    std::fs::remove_file(capture).unwrap();
+    let hub = conversation.fleet.node("nodeb");
+    state(hub, correlation, "held");
+    due(hub);
+    fleet::wait_until("forged answer attempted", DEADLINE, || {
+        (delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        read(conversation.fleet.node("nodea"), &conversation.sender.pane),
+        json!([])
+    );
+    std::fs::remove_file(replay).unwrap();
+    due(hub);
+    conversation.answer_once();
+}

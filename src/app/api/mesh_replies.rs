@@ -97,6 +97,8 @@ impl App {
         };
         let mut answer = envelope(&origin, original.envelope.sender.clone(), &data)?;
         answer.request_key = Some(request.clone());
+        answer.return_binding.collection_token =
+            original.envelope.return_binding.collection_token.clone();
         answer.return_binding.recipient_node = request.origin_node.clone();
         answer.return_binding.collection_peers = vec![request.origin_node.clone()];
         with_store(|store| {
@@ -117,7 +119,7 @@ impl App {
             Ok(())
         })?;
         if !local && push_peer.is_none() {
-            self.emit_mesh_wake();
+            self.emit_mesh_wake(&request.origin_node);
         }
         message.message_key = Some(answer.key.clone());
         let state = if local && !message.to_pane.is_empty() {
@@ -536,6 +538,8 @@ impl App {
                 || answer.in_reply_to.as_deref() != Some(original.envelope.correlation_id.as_str())
                 || answer.return_binding.request != answer.key
                 || answer.return_binding.recipient_node != origin
+                || answer.return_binding.collection_token
+                    != original.envelope.return_binding.collection_token
             {
                 return Err("invalid reply binding".into());
             }
@@ -578,7 +582,7 @@ impl App {
             .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
-            self.emit_mesh_wake();
+            self.emit_mesh_wake(&answer.key.origin_node);
             self.project_mesh_answer(data.message);
         }
         Ok(())
