@@ -698,3 +698,44 @@ fn delegate_reap_removes_persisted_verdict() {
     assert!(!verdict.exists());
     assert!(!pane.registry.join("fixture.json").exists());
 }
+
+#[test]
+fn delegate_idle_without_new_turn_reports_not_started_and_informs_s1() {
+    let pane = Pane::new("idle", "› Ask Codex to do anything\n? for shortcuts");
+    let s1 = S1::new(200);
+    let started = Instant::now();
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--after",
+                "term_fixture:0:1:0:i",
+                "--timeout",
+                "30000",
+                "--json",
+            ],
+            Some(&s1.url),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(8),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let value = Pane::json(&out);
+    assert_eq!(value["outcome"], "not_started");
+    assert_eq!(value["reason"], "idle_without_new_turn");
+    assert_eq!(value["turn_cursor"], "term_fixture:0:1:0:i");
+    assert_eq!(s1.calls.load(Ordering::SeqCst), 1);
+    let bodies = s1.bodies.lock().unwrap();
+    let context = bodies[0]["state"].as_str().unwrap();
+    assert!(
+        context.contains("not_started") && context.contains("idle_without_new_turn"),
+        "{context}"
+    );
+}

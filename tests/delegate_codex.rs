@@ -861,7 +861,21 @@ fn guarded_submit_first_enter_works_with_late_composer_repaint() {
     guarded_socket("codex", false, true);
 }
 
+#[test]
+fn guarded_submit_codex_waits_for_footer_after_partial_repaint() {
+    guarded_socket_repaint("codex", false, true, 600);
+}
+
+#[test]
+fn guarded_submit_codex_missing_footer_expires_without_enter() {
+    guarded_socket_repaint("codex", false, true, 3000);
+}
+
 fn guarded_socket(kind: &str, slow: bool, first_works: bool) {
+    guarded_socket_repaint(kind, slow, first_works, 0);
+}
+
+fn guarded_socket_repaint(kind: &str, slow: bool, first_works: bool, footer_delay_ms: u64) {
     let server = start_server();
     let script = r#"import os, sys, tty, time
 from pathlib import Path
@@ -887,7 +901,15 @@ while True:
     if byte == b'\x1b' or pending:
         pending += byte
         if pending == b'\x1b[200~': paste = True; pending = b''
-        elif pending == b'\x1b[201~': paste = False; pending = b''; draw()
+        elif pending == b'\x1b[201~':
+            paste = False
+            pending = b''
+            delay_file = log.parent / 'footer-delay'
+            if delay_file.exists():
+                sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› ' + text.decode() + '\r\n')
+                sys.stdout.flush()
+                time.sleep(float(delay_file.read_text()) / 1000)
+            draw()
         continue
     if byte == b'\r' and not paste:
         enters += 1
@@ -918,6 +940,13 @@ while True:
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    if footer_delay_ms > 0 {
+        fs::write(
+            server.base.join("footer-delay"),
+            footer_delay_ms.to_string(),
+        )
+        .unwrap();
+    }
     if slow {
         fs::write(server.base.join("slow-reader"), "").unwrap();
     }
@@ -969,6 +998,18 @@ while True:
     let response = request(&server, &serde_json::json!({
         "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
     }).to_string());
+    if footer_delay_ms > 2000 {
+        assert_eq!(response["result"]["outcome"], "unconfirmed", "{response}");
+        assert_eq!(
+            response["result"]["reason"], "owned_composer_not_visible",
+            "{response}"
+        );
+        assert_eq!(
+            fs::read(server.base.join("guarded-bytes")).unwrap(),
+            b"\x1b[200~hello\x1b[201~"
+        );
+        return;
+    }
     assert_eq!(
         response["result"]["outcome"], "observed_accepted",
         "{response}"
