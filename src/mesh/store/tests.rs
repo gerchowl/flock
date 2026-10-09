@@ -2474,3 +2474,108 @@ fn a_delivery_attempt_write_stays_keyed_with_a_full_registry() {
         "one attempt write took {elapsed:?}"
     );
 }
+
+#[test]
+fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
+    use crate::mesh::collect::OutboundCollect;
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let first = envelope();
+    let second = envelope();
+    for mail in [&first, &second] {
+        store
+            .accept(mail, CUSTODY_TTL_MS, Admission::Held, 0)
+            .unwrap();
+    }
+    store
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER fail_second_lease BEFORE UPDATE OF collect_attempts ON envelopes
+         WHEN (SELECT SUM(collect_attempts) FROM envelopes)>0
+         BEGIN SELECT RAISE(ABORT,'second lease fails'); END;",
+        )
+        .unwrap();
+    let poll = OutboundCollect::default();
+    assert!(store
+        .collect_outbound("origin.example", "receiver.example", &poll, 1)
+        .is_err());
+    let attempts: i64 = store
+        .connection
+        .query_row("SELECT SUM(collect_attempts) FROM envelopes", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(attempts, 0, "the first lease must roll back too");
+    store
+        .connection
+        .execute_batch("DROP TRIGGER fail_second_lease")
+        .unwrap();
+    assert_eq!(
+        store
+            .collect_outbound("origin.example", "receiver.example", &poll, 1)
+            .unwrap()
+            .len(),
+        2
+    );
+    let observer = Connection::open(&fixture.path).unwrap();
+    let version = || {
+        observer
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    assert!(store
+        .collect_outbound("origin.example", "receiver.example", &poll, 2)
+        .unwrap()
+        .is_empty());
+    assert_eq!(version(), before);
+}
+
+#[test]
+fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect};
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let expired = envelope();
+    let live = envelope();
+    for mail in [&expired, &live] {
+        store
+            .accept(mail, CUSTODY_TTL_MS, Admission::Held, 0)
+            .unwrap();
+    }
+    store
+        .collect_outbound(
+            "origin.example",
+            "receiver.example",
+            &OutboundCollect::default(),
+            1,
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "DELETE FROM envelopes WHERE id=?1",
+            [&expired.key.message_id],
+        )
+        .unwrap();
+    let query = OutboundCollect {
+        ack: [&expired, &live]
+            .into_iter()
+            .map(|mail| OutboundAck {
+                key: mail.key.clone(),
+                token: mail.return_binding.collection_token.clone(),
+                refusal: None,
+            })
+            .collect(),
+        receipts: Vec::new(),
+    };
+    assert!(store
+        .collect_outbound("origin.example", "receiver.example", &query, 2)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.get(&live.key).unwrap().unwrap().state, "delivered");
+    assert!(store
+        .collect_outbound("origin.example", "receiver.example", &query, 3)
+        .unwrap()
+        .is_empty());
+}
