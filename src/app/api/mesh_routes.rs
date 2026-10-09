@@ -26,14 +26,19 @@ pub(crate) struct Routes {
 
 struct Retry {
     enrollment: u64,
+    generation: u64,
     attempts: u32,
     at: Instant,
 }
 
 impl Retry {
-    fn failed(previous: Option<&Self>, enrollment: u64, now: Instant) -> Self {
+    fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
+        awakened || self.enrollment != enrollment || self.generation != generation
+    }
+
+    fn failed(previous: Option<&Self>, enrollment: u64, generation: u64, now: Instant) -> Self {
         let attempts = previous
-            .filter(|r| r.enrollment == enrollment)
+            .filter(|r| r.enrollment == enrollment && r.generation == generation)
             .map_or(0, |r| r.attempts.saturating_add(1));
         let base = match attempts {
             0 => 5,
@@ -50,6 +55,7 @@ impl Retry {
         let delay = Duration::from_millis(base * 800 + jitter);
         Self {
             enrollment,
+            generation,
             attempts,
             at: now + delay,
         }
@@ -194,7 +200,7 @@ impl App {
         encode_success(
             id,
             ResponseResult::MeshRoutes {
-                adverts: self.mesh_routes.table.adverts(),
+                adverts: self.mesh_routes.table.adverts_for_peer(&supplier),
             },
         )
     }
@@ -238,11 +244,15 @@ impl App {
                 continue;
             };
             let enrollment = crate::peer_stream::peer_enrollment_generation(&peer);
+            if self.mesh_routes.busy.contains(&peer.name) {
+                continue;
+            }
+            let awakened = crate::peer_stream::take_route_wake(&peer);
             if self
                 .mesh_routes
                 .retries
                 .get(&peer.name)
-                .is_some_and(|r| r.enrollment != enrollment)
+                .is_some_and(|r| r.superseded(enrollment, generation, awakened))
             {
                 self.mesh_routes.retries.remove(&peer.name);
             }
@@ -257,15 +267,11 @@ impl App {
             let previous = self.mesh_routes.sent.get(&peer.name).copied();
             let reconnected = previous.is_none_or(|(old, _)| old != enrollment);
             let changed = previous.is_none_or(|(_, old)| old != generation);
-            if self.mesh_routes.busy.contains(&peer.name) {
-                continue;
-            }
-            let awakened = crate::peer_stream::take_route_wake(&peer);
             if !(reconnected || (changed && debounced) || awakened) {
                 continue;
             }
             self.mesh_routes.busy.insert(peer.name.clone());
-            let adverts = self.mesh_routes.table.adverts();
+            let adverts = self.mesh_routes.table.adverts_for_peer(&node);
             let failure = AppEvent::MeshRoutesCompleted(Box::new(Completion {
                 peer: peer.clone(),
                 node: node.clone(),
@@ -339,6 +345,7 @@ impl App {
                 let retry = Retry::failed(
                     self.mesh_routes.retries.get(&completion.peer.name),
                     completion.enrollment,
+                    completion.generation,
                     Instant::now(),
                 );
                 self.mesh_routes
@@ -377,18 +384,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wake_or_new_generation_supersedes_even_the_longest_backoff() {
+        let now = Instant::now();
+        let mut retry = Retry::failed(None, 1, 7, now);
+        for _ in 0..2 {
+            retry = Retry::failed(Some(&retry), 1, 7, now);
+        }
+        assert!(retry.at > now + Duration::from_secs(60));
+        assert!(!retry.superseded(1, 7, false));
+        assert!(retry.superseded(1, 7, true));
+        assert!(retry.superseded(1, 8, false));
+        assert!(retry.superseded(2, 7, false));
+        assert_eq!(Retry::failed(Some(&retry), 1, 8, now).attempts, 0);
+    }
+
+    #[test]
     fn retries_back_off_and_reset_on_new_enrollment() {
         let now = Instant::now();
-        let mut retry = Retry::failed(None, 1, now);
+        let mut retry = Retry::failed(None, 1, 7, now);
         for (attempt, seconds) in [5, 60, 300, 300].into_iter().enumerate() {
             if attempt != 0 {
-                retry = Retry::failed(Some(&retry), 1, now);
+                retry = Retry::failed(Some(&retry), 1, 7, now);
             }
             let delay = retry.at.duration_since(now);
             assert!(delay >= Duration::from_millis(seconds * 800));
             assert!(delay <= Duration::from_secs(seconds));
         }
-        let reset = Retry::failed(Some(&retry), 2, now);
+        let reset = Retry::failed(Some(&retry), 2, 7, now);
         assert_eq!(reset.attempts, 0);
         assert!(reset.at.duration_since(now) <= Duration::from_secs(5));
     }

@@ -253,11 +253,17 @@ impl RouteTable {
         }
     }
 
-    pub fn adverts(&self) -> Vec<Advert> {
+    /// Split horizon prevents a neighbor from becoming its own indirect supplier.
+    pub fn adverts_for_peer(&self, peer: &str) -> Vec<Advert> {
         self.own
             .iter()
             .cloned()
-            .chain(self.records.values().map(|r| r.advert.clone()))
+            .chain(
+                self.records
+                    .values()
+                    .filter(|r| r.suppliers.len() != 1 || !r.suppliers.contains(peer))
+                    .map(|r| r.advert.clone()),
+            )
             .take(MAX_RECORDS)
             .collect()
     }
@@ -351,6 +357,51 @@ mod tests {
         table.set_own(own);
         table.learn("edge", others);
         table
+    }
+
+    #[test]
+    fn bidirectional_exchange_does_not_retain_a_closed_edge_record() {
+        let x = advert(3, &[2]);
+        let b_advert = advert(2, &[1, 3]);
+        let a_advert = advert(1, &[2]);
+        for reverse_order in [false, true] {
+            let mut a = RouteTable::default();
+            let mut b = RouteTable::default();
+            a.set_own(a_advert.clone());
+            b.set_own(b_advert.clone());
+            b.learn(&x.node_id, vec![x.clone()]);
+            // Exchange in both directions repeatedly, allowing the old echo loop
+            // to form if either side forgets split horizon.
+            for _ in 0..3 {
+                a.learn(&b_advert.node_id, b.adverts_for_peer(&a_advert.node_id));
+                b.learn(&a_advert.node_id, a.adverts_for_peer(&b_advert.node_id));
+            }
+            assert!(a.records.contains_key(&x.node_id));
+            assert!(b.records.contains_key(&x.node_id));
+            b.withdraw_edge(&x.node_id);
+            // One round must remove X regardless of which direction runs first.
+            if reverse_order {
+                b.learn(&a_advert.node_id, a.adverts_for_peer(&b_advert.node_id));
+                a.learn(&b_advert.node_id, b.adverts_for_peer(&a_advert.node_id));
+            } else {
+                a.learn(&b_advert.node_id, b.adverts_for_peer(&a_advert.node_id));
+                b.learn(&a_advert.node_id, a.adverts_for_peer(&b_advert.node_id));
+            }
+            assert!(!a.records.contains_key(&x.node_id));
+            assert!(!b.records.contains_key(&x.node_id));
+        }
+    }
+
+    #[test]
+    fn split_horizon_preserves_own_and_independently_supplied_records() {
+        let own = advert(1, &[2]);
+        let remote = advert(3, &[2]);
+        let mut t = RouteTable::default();
+        t.set_own(own.clone());
+        t.learn("peer", vec![remote.clone()]);
+        assert_eq!(t.adverts_for_peer("peer"), vec![own.clone()]);
+        t.learn("independent", vec![remote.clone()]);
+        assert_eq!(t.adverts_for_peer("peer"), vec![own, remote]);
     }
 
     #[test]
@@ -468,7 +519,7 @@ mod tests {
         assert!(t.next_hop(&advert(8, &[]).node_id).is_some());
         assert!(t.next_hop(&advert(9, &[]).node_id).is_none());
         t.learn("edge", (10..300).map(|i| advert(i, &[])));
-        assert_eq!(t.adverts().len(), MAX_RECORDS);
+        assert_eq!(t.adverts_for_peer("other").len(), MAX_RECORDS);
         assert!(advert(1, &(0..65).collect::<Vec<_>>()).verify().is_err());
         let mut bad = advert(1, &[]);
         bad.name = "a".repeat(256);

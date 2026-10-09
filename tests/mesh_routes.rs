@@ -280,7 +280,9 @@ fn paused_hub_learns_spoke_change_after_resume() {
             let text = std::fs::read_to_string(&shim).unwrap();
             let marker = "        response = json.loads(line)\n";
             let source = r#"        if response.get("error", {}).get("code") == "fleet_paused":
-            (base / "route-paused").write_text("yes")
+            counter = base / "route-paused"
+            count = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(count + 1))
 "#;
             assert!(text.contains(marker));
             std::fs::write(shim, text.replace(marker, &format!("{marker}{source}"))).unwrap();
@@ -296,15 +298,30 @@ fn paused_hub_learns_spoke_change_after_resume() {
     api(b, "fleet.pause", json!({}));
     fleet.allow_edge("nodec", "nodea");
     route(a, &id(c));
-    fleet::wait_until("paused route refusal", Duration::from_secs(15), || {
-        a.home
-            .parent()
-            .unwrap()
-            .join("route-paused")
-            .exists()
-            .then_some(())
-    });
-    assert!(routes(b).iter().all(|r| r["node"] != id(c)));
+    let mut observed = (0, std::time::Instant::now());
+    fleet::wait_until(
+        "two refusals and long retry backoff",
+        Duration::from_secs(30),
+        || {
+            let count = std::fs::read_to_string(a.home.parent().unwrap().join("route-paused"))
+                .ok()?
+                .parse::<usize>()
+                .ok()?;
+            if count != observed.0 {
+                observed = (count, std::time::Instant::now());
+            }
+            // A quiet seven seconds exceeds the first retry window plus its tick.
+            // Resume must interrupt the longer backoff rather than race that window.
+            (count >= 2 && observed.1.elapsed() >= Duration::from_secs(7)).then_some(())
+        },
+    );
+    let target = id(c);
+    assert!(routes(b).iter().all(|r| r["node"] != target));
     api(b, "fleet.resume", json!({}));
-    assert_eq!(route(b, &id(c))["next_hop"], id(a));
+    let found = fleet::wait_until(
+        "prompt route recovery on resume",
+        Duration::from_secs(10),
+        || routes(b).into_iter().find(|r| r["node"] == target),
+    );
+    assert_eq!(found["next_hop"], id(a));
 }
