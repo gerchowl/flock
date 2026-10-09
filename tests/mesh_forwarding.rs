@@ -249,6 +249,19 @@ fn one_undecodable_record_does_not_stall_the_retry_pass() {
     send(&fleet, &sender, &recipient, "broken");
     send(&fleet, &sender, &recipient, "healthy");
     row_state(fleet.node("nodeb"), "healthy", "custody");
+    // Custody precedes the first downstream result. Wait for both blocked
+    // attempts to finish so a late result cannot overwrite the forced retry.
+    fleet::wait_until("both initial attempts backed off", WAIT, || {
+        let completed: i64 = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE correlation IN ('broken','healthy')
+             AND retry_at > (SELECT elapsed FROM clock WHERE singleton=1)",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (completed == 2).then_some(())
+    });
     db(fleet.node("nodeb"))
         .execute(
             "UPDATE envelopes SET metadata='invalid JSON' WHERE correlation='broken'",
