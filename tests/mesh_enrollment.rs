@@ -168,7 +168,7 @@ fn refused_mode(tag: &str, mode: MeshMode, expected: &str) {
             status["reason"]
                 .as_str()
                 .unwrap()
-                .contains(&format!("local 3, remote {version}")),
+                .contains(&format!("local 4, remote {version}")),
             "{status}"
         );
     }

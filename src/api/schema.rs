@@ -140,10 +140,6 @@ pub enum Method {
     /// event hub rather than a poll — see [`MsgWaitReplyParams`].
     #[serde(rename = "msg.wait_reply")]
     MsgWaitReply(MsgWaitReplyParams),
-    /// #410: a spoke's held relay collecting the messages this server hands up
-    /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
-    #[serde(rename = "msg.uplink_take")]
-    MsgUplinkTake(MsgUplinkTakeParams),
     /// #410: the hub's relay binds itself to this server's uplink. Every other
     /// relay method is accepted only from the process that did.
     #[serde(rename = "peers.relay_attach")]
@@ -158,10 +154,6 @@ pub enum Method {
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
     PeersEnrollment(EmptyParams),
-    /// #410: the hub's answer to a message a spoke handed up, sent back down
-    /// the same relay.
-    #[serde(rename = "msg.uplink_result")]
-    MsgUplinkResult(MsgUplinkResultParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
     #[serde(rename = "msg.mute")]
@@ -1195,45 +1187,6 @@ pub struct MsgSendParams {
     pub intent_unrecognised: Option<String>,
 }
 
-/// One message a spoke hands up to its hub (#410).
-///
-/// A spoke has no `[[peers]]` — deliberately, the fleet refuses N×N trust —
-/// so the only channel it has to the rest of the fleet is the relay the hub
-/// holds INTO it. The frame rides that relay upward as a push, the hub runs
-/// its ordinary `msg.send` on `message`, and the answer comes back down keyed
-/// by `uplink_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UplinkFrame {
-    /// Correlates the hub's answer with the send waiting for it. The message's
-    /// own `correlation_id` is the idempotency key end to end; this one only
-    /// pairs a result with its caller.
-    pub uplink_id: String,
-    /// The send as the spoke attested it: `from_agent` and `from_host` are the
-    /// ORIGINATING sender, never the hub.
-    pub message: MsgSendParams,
-}
-
-/// `msg.uplink_take` — the relay collecting frames to push up (#410).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MsgUplinkTakeParams {
-    /// Frames the relay has already written up the pipe. Until a frame is
-    /// acknowledged it is re-offered, so a relay that died between taking a
-    /// frame and writing it does not lose the message; the recipient's mailbox
-    /// dedupes on `correlation_id`, so a re-offer cannot double-deliver.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ack: Vec<String>,
-}
-
-/// `msg.uplink_result` — the hub's answer to one handed-up frame (#410).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MsgUplinkResultParams {
-    pub uplink_id: String,
-    /// The hub's own name for itself: what the spoke reports as `via <hub>`.
-    pub hub: String,
-    /// The hub's `msg.send` response, verbatim: a success or an error body.
-    pub response: serde_json::Value,
-}
-
 /// Reply to a delivered message: routed back to the original sender's pane,
 /// no addressing needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2239,6 +2192,8 @@ pub enum ResponseResult {
         mesh_suspended_reason: Option<String>,
     },
     PeersSummary {
+        #[serde(default)]
+        outbound_pending: bool,
         /// This server's persistent per-user node identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<String>,
@@ -2453,14 +2408,6 @@ pub enum ResponseResult {
         /// Absent for a message queued here.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
-    },
-    /// #410: the frames a spoke's relay should push up to its hub.
-    MsgUplinkFrames {
-        frames: Vec<UplinkFrame>,
-    },
-    /// #410: whether an uplink result matched a send still waiting for it.
-    MsgUplinkResultAck {
-        matched: bool,
     },
     MsgList {
         messages: Vec<QueuedMessageInfo>,

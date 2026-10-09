@@ -316,6 +316,14 @@ fn load_live_config_from_table(
 ) -> Result<LoadedConfig, Vec<String>> {
     let mut config = Config::default();
     let mut diagnostics = unknown_top_level_section_diagnostics(&table);
+    if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
+        let known = toml::Value::try_from(super::model::MsgConfig::default())
+            .map_err(|err| vec![err.to_string()])?;
+        for key in msg.keys().filter(|key| known.get(key.as_str()).is_none()) {
+            diagnostics.push(format!("unknown or obsolete msg.{key} setting ignored"));
+        }
+    }
+
     let mut invalid_sections = Vec::new();
 
     if let Some(value) = table.get("onboarding") {
@@ -1492,5 +1500,21 @@ stale_after_secs = 30
             "a known section must not warn: {:?}",
             loaded.diagnostics
         );
+    }
+}
+
+#[cfg(test)]
+mod spoke_config_tests {
+    #[test]
+    fn spoke_custody_obsolete_and_unknown_keys_warn_without_discarding_config() {
+        let loaded = super::load_live_config_from_str("[msg]\nuplink_timeout_secs=20\nuplink_heartbeat_secs=3\nfuture_setting=true\nenabled=false").unwrap();
+        assert!(!loaded.config.msg.enabled);
+        for key in [
+            "uplink_timeout_secs",
+            "uplink_heartbeat_secs",
+            "future_setting",
+        ] {
+            assert!(loaded.diagnostics.iter().any(|d| d.contains(key)), "{key}");
+        }
     }
 }

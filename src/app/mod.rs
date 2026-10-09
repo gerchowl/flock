@@ -144,6 +144,8 @@ pub struct App {
     /// Installed from the API listener during server startup.
     pub(crate) node_id: Option<String>,
     pub(crate) mesh_collect_at: Option<Instant>,
+    pub(crate) mesh_outbound_cursor: usize,
+    pub(crate) mesh_outbound_polls: std::collections::HashMap<String, crate::mesh::collect::Poll>,
     pub(crate) collection_relays: message_relay::MessageRelays,
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
@@ -934,6 +936,8 @@ impl App {
             event_hub,
             node_id: None,
             mesh_collect_at: None,
+            mesh_outbound_cursor: 0,
+            mesh_outbound_polls: Default::default(),
             collection_relays: Default::default(),
             collection_peers: Default::default(),
             collection_generation: 0,

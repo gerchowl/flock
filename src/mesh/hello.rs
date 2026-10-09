@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 pub(crate) fn version() -> u32 {
     if cfg!(debug_assertions) {
@@ -253,7 +253,7 @@ mod tests {
         remote.mesh = 99;
         assert_eq!(
             remote.validate("configured.test").unwrap_err(),
-            "mesh version mismatch: local 3, remote 99; upgrade flk on this node"
+            "mesh version mismatch: local 4, remote 99; upgrade flk on this node"
         );
         assert_eq!(
             version_mismatch(99, 1, "configured.test"),

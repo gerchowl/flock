@@ -1093,7 +1093,6 @@ impl App {
                 from_host: None,
                 intent_unrecognised: None,
             },
-            None,
         );
         self.current_api_peer_pid = peer;
         self.detach_pending_message_relay();
