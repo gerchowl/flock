@@ -54,6 +54,8 @@ pub struct Enrollment {
     pub peer: String,
     #[serde(default)]
     pub source: PinSource,
+    #[serde(default)]
+    pub pin_origin: super::store::PinOrigin,
     pub node_id: Option<String>,
     pub state: String,
     pub reason: Option<String>,
