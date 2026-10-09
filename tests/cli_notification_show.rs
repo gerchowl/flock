@@ -31,7 +31,7 @@ fn show_response(response: serde_json::Value, expected_exit: i32) {
     let socket = TempSocket::new();
     let listener = UnixListener::bind(&socket.0).expect("bind isolated socket");
     let reply = response.clone();
-    let server = thread::spawn(move || loop {
+    let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("CLI connects");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -40,14 +40,10 @@ fn show_response(response: serde_json::Value, expected_exit: i32) {
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
-        if support::compatibility::answer_probe(&mut stream, &line) {
-            continue;
-        }
         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["method"], "notification.show");
         assert_eq!(request["params"]["title"], "owner needed");
         writeln!(stream, "{reply}").unwrap();
-        break;
     });
     let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["notification", "show", "owner needed"])

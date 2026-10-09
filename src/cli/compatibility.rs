@@ -48,11 +48,14 @@ pub(super) fn capability_error_message(
     let reason = error["message"].as_str()?;
     if matches!(
         error["code"].as_str(),
-        Some("unknown_method" | "method_not_found")
+        Some("unknown_method" | "method_not_found" | "server_version_gap")
     ) || is_capability_failure(reason)
     {
-        let version = running_version();
-        let message = diagnosis(command, reason, version.as_deref());
+        let server = crate::api::compatibility::server_version(&super::ApiClient::local())?;
+        if server.protocol >= crate::protocol::PROTOCOL_VERSION {
+            return None;
+        }
+        let message = diagnosis(command, reason, Some(&server.version));
         (message != reason).then_some(message)
     } else {
         None

@@ -9,7 +9,6 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub mod compatibility;
 pub mod fleet;
 pub mod process_table;
 

@@ -103,7 +103,7 @@ fn run(
                 continue;
             }
             let response = if method == "ping" {
-                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":if version.as_deref() == Some("current") { 27 } else { 25 }}})
+                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":if version.as_deref() == Some("current") { support::PROTOCOL_VERSION } else if version.as_deref() == Some("future") { support::PROTOCOL_VERSION + 1 } else { 25 }}})
             } else if let Some(error) = &error {
                 serde_json::json!({"id":request["id"],"error":error})
             } else if method == "agent.get" {
@@ -156,7 +156,7 @@ fn unknown_variant() -> serde_json::Value {
 }
 
 #[test]
-fn successful_commands_probe_once_and_keep_their_result() {
+fn agent_result_success_has_no_diagnostic_ping() {
     let (output, methods) = run(
         &["agent", "result", "fixture"],
         Some("current"),
@@ -164,7 +164,7 @@ fn successful_commands_probe_once_and_keep_their_result() {
         false,
     );
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(methods, ["ping", "agent.result"]);
+    assert_eq!(methods, ["agent.result"]);
     assert!(output.stderr.is_empty());
     assert!(String::from_utf8(output.stdout)
         .unwrap()
@@ -223,7 +223,7 @@ fn msg_send_unknown_method_has_uniform_error() {
         false,
     );
     assert_gap(output, "0.10.0");
-    assert_eq!(methods, ["ping", "msg.send"]);
+    assert_eq!(methods, ["msg.send", "ping"]);
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn capability_failures_are_uniform_across_versions_and_error_codes() {
                 false,
             );
             assert_gap(output, version);
-            assert_eq!(methods, ["ping", "agent.result"]);
+            assert_eq!(methods, ["agent.result", "ping"]);
         }
     }
 }
@@ -259,7 +259,7 @@ fn unavailable_identity_preserves_original_error() {
         assert!(String::from_utf8(output.stderr)
             .unwrap()
             .contains("unknown variant"));
-        assert_eq!(methods, ["ping", "agent.result"]);
+        assert_eq!(methods, ["agent.result", "ping"]);
     }
 }
 
@@ -275,26 +275,15 @@ fn unrelated_errors_are_preserved() {
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("fixture pane missing"));
-    assert_eq!(methods, ["ping", "agent.result"]);
+    assert_eq!(methods, ["agent.result"]);
 }
 
 #[test]
-fn older_server_can_still_run_supported_commands_with_one_warning() {
-    let (output, methods) = run(
-        &["delegate", "status", "fixture"],
-        Some("0.10.0"),
-        None,
-        false,
-    );
+fn delegate_success_has_no_diagnostic_ping() {
+    let (output, methods) = run(&["delegate", "status", "fixture"], None, None, false);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(methods, ["ping", "agent.get", "agent.get"]);
-    assert_eq!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .matches("warning:")
-            .count(),
-        1
-    );
+    assert_eq!(methods, ["agent.get", "agent.get"]);
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -309,7 +298,7 @@ fn missing_turn_cursor_retains_pre_09_diagnosis() {
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("needs a server ≥ 0.9.0"));
-    assert_eq!(methods, ["ping", "agent.get", "agent.get"]);
+    assert_eq!(methods, ["agent.get", "agent.get", "ping"]);
 }
 
 #[test]
@@ -353,7 +342,7 @@ fn mcp_success_needs_no_diagnostic_ping() {
 }
 
 #[test]
-fn consumed_lookup_errors_still_report_the_protocol_gap() {
+fn surfaced_lookup_errors_report_the_protocol_gap() {
     let (output, methods) = run(
         &["delegate", "status", "fixture"],
         Some("0.10.0"),
@@ -361,5 +350,54 @@ fn consumed_lookup_errors_still_report_the_protocol_gap() {
         false,
     );
     assert_gap(output, "0.10.0");
-    assert_eq!(methods, ["ping", "agent.get"]);
+    assert_eq!(methods, ["agent.get", "ping"]);
+}
+
+#[test]
+fn equal_or_newer_protocol_keeps_original_invalid_request() {
+    for version in ["current", "future"] {
+        let (output, methods) = run(
+            &["agent", "result", "fixture"],
+            Some(version),
+            Some(unknown_variant()),
+            false,
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("invalid_request"), "{stderr}");
+        assert!(stderr.contains("unknown variant"), "{stderr}");
+        assert!(!stderr.contains("this command needs protocol"), "{stderr}");
+        assert_eq!(methods, ["agent.result", "ping"]);
+    }
+}
+
+#[test]
+fn agent_result_old_server_names_version_gap() {
+    let (output, methods) = run(
+        &["agent", "result", "fixture"],
+        Some("0.6.8-fork.9ebb536"),
+        Some(unknown_variant()),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(78));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("flk agent result needs a server ≥ 0.9.0 (running: 0.6.8-fork.9ebb536)"),
+        "{stderr}"
+    );
+    assert_eq!(methods, ["agent.result", "ping"]);
+}
+
+#[test]
+fn an_existing_ping_warns_once_for_an_older_server() {
+    let (output, methods) = run(&["status", "server", "--json"], Some("0.10.0"), None, false);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(methods, ["ping"]);
+    assert_eq!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .matches("warning:")
+            .count(),
+        1
+    );
 }

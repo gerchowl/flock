@@ -111,7 +111,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 8 not started, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 8 not started, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";

@@ -53,17 +53,6 @@ pub fn begin_cli(client: &ApiClient, warn: fn(&ServerVersion)) {
     });
 }
 
-pub fn before_request(client: &ApiClient, request: &Request) {
-    if matches!(request.method, Method::Ping(_)) {
-        return;
-    }
-    let needs_probe = INVOCATION
-        .with_borrow(|state| state.target.as_ref() == Some(&client.socket_path()) && !state.probed);
-    if needs_probe {
-        let _ = server_version(client);
-    }
-}
-
 pub fn observe_ping(client: &ApiClient, response: &Value) {
     let server = parse_ping(response);
     let warning = INVOCATION.with_borrow_mut(|state| {
@@ -131,8 +120,11 @@ pub fn normalize(client: &ApiClient, response: &mut Value) {
         return;
     }
     let path = client.socket_path();
-    let server = cached(&path).unwrap_or_else(|| probe(client));
+    let server = server_version(client);
     let Some(server) = server else { return };
+    if server.protocol >= crate::protocol::PROTOCOL_VERSION {
+        return;
+    }
     response["error"] = serde_json::json!({
         "code": ERROR_CODE,
         "message": server.message(crate::protocol::PROTOCOL_VERSION),

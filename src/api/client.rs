@@ -55,7 +55,6 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        super::compatibility::before_request(self, request);
         self.check_allocation_preview_protocol(request, None)?;
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
@@ -75,7 +74,6 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
-        super::compatibility::before_request(self, request);
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         let mut stream = self.connect()?;
         stream.set_write_timeout(Some(timeout))?;
@@ -112,7 +110,6 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
-        super::compatibility::before_request(self, request);
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
         if let Some(timeout) = read_timeout {

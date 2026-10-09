@@ -91,9 +91,6 @@ impl Pane {
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                if support::compatibility::answer_probe(&mut stream, &line) {
-                    continue;
-                }
                 counted.fetch_add(1, Ordering::SeqCst);
                 let result = match request["method"].as_str().unwrap() {
                     "agent.get" => {

@@ -56,25 +56,21 @@ impl Drop for TempSocket {
     }
 }
 
-/// Answer the version probe, then one request with a canned response and the request
+/// One connection, one request line, one canned response — and the request
 /// line back to the test, so the assertions are about the wire.
 fn serve_once(socket: &Path, response: &'static str) -> mpsc::Receiver<String> {
     let listener = UnixListener::bind(socket).expect("bind stand-in socket");
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("a client should connect");
         let mut line = String::new();
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .expect("read one request line");
-        if support::compatibility::answer_probe(&mut stream, &line) {
-            continue;
-        }
         stream.write_all(response.as_bytes()).unwrap();
         stream.write_all(b"\n").unwrap();
         stream.flush().unwrap();
         let _ = tx.send(line);
-        break;
     });
     rx
 }

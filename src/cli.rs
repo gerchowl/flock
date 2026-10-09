@@ -118,8 +118,17 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let outcome = dispatch(args, command);
     if cli_probe {
         if let Some(message) = crate::api::compatibility::end_cli() {
-            // Some commands deliberately consume API errors while probing for
-            // optional state. The invocation must still explain a refusal.
+            // Optional lookups may consume a capability error and still succeed.
+            // Preserve that command's outcome instead of turning it into a refusal.
+            if matches!(
+                outcome,
+                Ok(CommandOutcome::Handled(0) | CommandOutcome::NotCli)
+            ) {
+                return outcome;
+            }
+            if let Err(error) = &outcome {
+                eprintln!("{error}");
+            }
             eprintln!("{message}");
             return Ok(CommandOutcome::Handled(
                 crate::api::compatibility::EXIT_CODE,

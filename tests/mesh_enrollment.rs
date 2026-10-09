@@ -448,9 +448,7 @@ fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
     worker.join().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     for output in &outputs {
-        assert_eq!(output.status.code(), Some(78), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("server is flk 0.10.0 (protocol 26); this command needs protocol 27"));
+        assert!(output.status.success(), "{output:?}");
     }
     let warning = "enrollment: unknown (server predates mesh; restart needed)";
     let full = String::from_utf8_lossy(&outputs[0].stdout);
