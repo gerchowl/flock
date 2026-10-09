@@ -138,8 +138,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
     if version == 10 {
         tx.execute_batch("ALTER TABLE envelopes ADD COLUMN remote_state TEXT;
             ALTER TABLE envelopes ADD COLUMN receipt_sent TEXT;
-            CREATE INDEX status_correlation ON envelopes(correlation,id);
-            CREATE TABLE delivery_attempts (id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+            CREATE INDEX status_correlation ON envelopes(correlation,origin,id);
+            CREATE TABLE delivery_attempts (id TEXT PRIMARY KEY, evidence TEXT NOT NULL,
+              queued_at INTEGER NOT NULL, finished INTEGER NOT NULL, state TEXT NOT NULL,
+              correlations TEXT NOT NULL);
+            CREATE INDEX delivery_attempt_age ON delivery_attempts(queued_at,id);
             CREATE TABLE status_signer (singleton INTEGER PRIMARY KEY CHECK(singleton=1), secret BLOB NOT NULL);")?;
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|_| Error::InvalidState)?;

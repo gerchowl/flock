@@ -392,9 +392,6 @@ impl<D: DiskSpace> Store<D> {
                 return Err(Error::InvalidEnvelope);
             }
         }
-        for receipt in receipts {
-            self.import_receipt(&receipt.key, &receipt.state)?;
-        }
         for ack in &query.ack {
             if self
                 .collection_record(&ack.key, wall_ms)?
@@ -418,6 +415,13 @@ impl<D: DiskSpace> Store<D> {
                     self.finish(&ack.key, Outcome::Delivered, wall_ms)?;
                 }
             }
+        }
+        // After the acks, so a receipt riding with its own message's ack
+        // lands on the delivered row. A row still held (its ack was lost)
+        // takes the receipt too, rather than the hub marking it sent for
+        // nothing.
+        for receipt in receipts {
+            self.import_receipt(&receipt.key, &receipt.state)?;
         }
         let now = self.clock()?.advance(wall_ms);
         let keys = {

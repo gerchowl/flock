@@ -792,6 +792,28 @@ fn sender_identity(message: &PendingMessage) -> String {
         .unwrap_or_else(|| "unknown sender".to_string())
 }
 
+/// Whether a reply to a message can be routed, and on which contract. The
+/// one rule `msg.read` and the MCP channel push share, so a push never
+/// promises a reply `flock_msg_reply` would refuse (#213). `replyable` means
+/// routable: a same-host pane, a directory-resolvable agent, or a durable
+/// mesh return binding. Only the contract says whether that return survives
+/// the sender being offline (#623).
+pub(crate) fn reply_route(
+    from_pane: Option<&str>,
+    from_agent: Option<&str>,
+    durable: bool,
+) -> (bool, &'static str) {
+    let contract = if durable {
+        "durable_return_binding"
+    } else {
+        "best_effort_local_or_directory"
+    };
+    (
+        durable || from_pane.is_some() || from_agent.is_some(),
+        contract,
+    )
+}
+
 /// Suffix that marks a mute's automatic deferral reply (ADR-0018 §3): the
 /// deferral's correlation id is the deferred message's id plus this, so it is
 /// stable across a relay and a restart and [`is_deferral`] can recognise one

@@ -39,6 +39,8 @@ pub(crate) enum Answer {
     Expired,
     RetentionElapsed,
     RecipientGone,
+    /// The receiver refused custody; the reason, when it gave one.
+    Refused(Option<String>),
 }
 
 impl Answer {
@@ -49,6 +51,7 @@ impl Answer {
             Self::Expired => "expired",
             Self::RetentionElapsed => "outcome_retention_elapsed",
             Self::RecipientGone => "recipient_gone",
+            Self::Refused(_) => "refused",
         }
     }
 
@@ -61,14 +64,21 @@ impl Answer {
         match self {
             Self::Replied(_) => 3,
             Self::Deferred(_) => 2,
-            Self::Expired | Self::RetentionElapsed | Self::RecipientGone => 1,
+            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => 1,
+        }
+    }
+
+    fn detail(&self) -> Option<String> {
+        match self {
+            Self::Refused(reason) => reason.clone(),
+            _ => None,
         }
     }
 
     pub(crate) fn into_reply(self) -> Option<MsgReplyInfo> {
         match self {
             Self::Replied(reply) | Self::Deferred(reply) => Some(reply),
-            Self::Expired | Self::RetentionElapsed | Self::RecipientGone => None,
+            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => None,
         }
     }
 }
@@ -185,10 +195,11 @@ struct Watch {
 impl Watch {
     fn refresh_mesh(
         &mut self,
+        origin: Option<&str>,
         correlation: &str,
         reference: Option<&crate::mesh::store::StatusReference>,
     ) -> Result<(), String> {
-        if let Some(status) = crate::mesh::runtime_store::status(correlation, reference)? {
+        if let Some(status) = crate::mesh::runtime_store::status(origin, correlation, reference)? {
             let durable = status
                 .reply
                 .map(|reply| {
@@ -201,7 +212,8 @@ impl Watch {
                 .or(match status.state.as_str() {
                     "expired" => Some(Answer::Expired),
                     "outcome_retention_elapsed" => Some(Answer::RetentionElapsed),
-                    "recipient_gone" | "refused" => Some(Answer::RecipientGone),
+                    "recipient_gone" => Some(Answer::RecipientGone),
+                    "refused" => Some(Answer::Refused(status.detail.clone())),
                     _ => None,
                 });
             // Merge by rank, as `observe` does: a local answer the mesh
@@ -247,6 +259,7 @@ fn awaited(
     correlation_id: String,
     outcome: &str,
     reply: Option<MsgReplyInfo>,
+    detail: Option<String>,
     state: Option<&str>,
 ) -> String {
     encode(&SuccessResponse {
@@ -255,6 +268,7 @@ fn awaited(
             correlation_id,
             outcome: outcome.into(),
             reply,
+            detail,
             state: state.map(str::to_string),
         },
     })
@@ -269,6 +283,7 @@ fn awaited(
 pub(super) fn wait_for_reply(
     request_id: String,
     params: MsgWaitReplyParams,
+    origin: Option<&str>,
     stream: &mut UnixStream,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -290,7 +305,7 @@ pub(super) fn wait_for_reply(
     for (_, event) in event_hub.events_after(0) {
         watch.observe(&event, &correlation_id);
     }
-    if let Err(reason) = watch.refresh_mesh(&correlation_id, params.reference.as_ref()) {
+    if let Err(reason) = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref()) {
         if params.reference.is_some() {
             return Ok(Some(encode(&ErrorResponse {
                 id: request_id,
@@ -321,15 +336,17 @@ pub(super) fn wait_for_reply(
         // transient outage (a handoff suspends the writer) keeps the wait
         // alive on the event ring rather than ending it. It is not logged:
         // at this cadence one outage would flood the log.
-        let _ = watch.refresh_mesh(&correlation_id, params.reference.as_ref());
+        let _ = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref());
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();
             crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, outcome);
+            let detail = answer.detail();
             return Ok(Some(awaited(
                 request_id,
                 correlation_id,
                 outcome,
                 answer.into_reply(),
+                detail,
                 watch.state.as_deref(),
             )));
         }
@@ -339,6 +356,7 @@ pub(super) fn wait_for_reply(
                 request_id,
                 correlation_id,
                 "timeout",
+                None,
                 None,
                 watch.state.as_deref(),
             )));

@@ -2454,10 +2454,15 @@ pub enum ResponseResult {
     MsgReplyAwaited {
         correlation_id: String,
         /// `replied`, `deferred` (a muted recipient's automatic answer),
-        /// `expired` (dropped unread), or `timeout`.
+        /// `expired` (dropped unread), `refused` (the receiver declined
+        /// custody, reason in `detail`), `recipient_gone`,
+        /// `outcome_retention_elapsed`, or `timeout`.
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
+        /// On `refused`: the receiver's reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         /// On `timeout`: the message's last known delivery state (`queued`,
         /// `read`, `relayed`), so "read but unanswered" is visible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4715,6 +4720,7 @@ mod tests {
             correlation_id: "c-1".into(),
             outcome: "timeout".into(),
             reply: None,
+            detail: None,
             state: Some("read".into()),
         };
         let value = serde_json::to_value(&result).unwrap();

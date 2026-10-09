@@ -22,12 +22,16 @@ pub struct Status {
 }
 
 impl<D: DiskSpace> Store<D> {
-    pub fn status(&self, correlation: &str, wall_ms: i64) -> Result<Option<Status>> {
+    /// The newest message `origin` minted under `correlation`. Scoped to the
+    /// asking node, so a correlation id another node reused for mail it sent
+    /// here never answers for this node's own message.
+    pub fn status(&self, origin: &str, correlation: &str, wall_ms: i64) -> Result<Option<Status>> {
         let key = self
             .connection
             .query_row(
-                "SELECT origin,id FROM envelopes WHERE correlation=?1 ORDER BY id DESC LIMIT 1",
-                [correlation],
+                "SELECT origin,id FROM envelopes WHERE origin=?1 AND correlation=?2
+                 ORDER BY id DESC LIMIT 1",
+                params![origin, correlation],
                 |r| {
                     Ok(MessageKey {
                         origin_node: r.get(0)?,
@@ -173,7 +177,7 @@ impl<D: DiskSpace> Store<D> {
         self.connection.execute(
             "UPDATE envelopes SET remote_state=?3 WHERE origin=?1 AND id=?2
             AND (remote_state IS NULL OR remote_state='delivered') AND remote_state IS NOT ?3
-            AND state='delivered'",
+            AND state IN ('delivered','held')",
             params![key.origin_node, key.message_id, state],
         )?;
         Ok(())
@@ -181,6 +185,8 @@ impl<D: DiskSpace> Store<D> {
 }
 
 impl<D: DiskSpace> Store<D> {
+    /// Every retained mesh attempt, read once at boot to seed the in-memory
+    /// registry. Live queries read that registry, never this table.
     pub fn delivery_attempts(&self) -> Result<Vec<crate::api::schema::DeliveryAttempt>> {
         let mut statement = self
             .connection
@@ -193,78 +199,108 @@ impl<D: DiskSpace> Store<D> {
             .collect()
     }
 
-    /// Store mesh submission transitions at their producer, never during status reads.
+    /// Store one mesh submission transition at its producer, never during a
+    /// status read. Each write is keyed: one upsert, and for a new attempt
+    /// over the cap one indexed eviction of the oldest evictable row. The
+    /// bound and protection rule are [`delivery_attempts::DeliveryAttempts`]'s
+    /// own: a pending attempt is never evicted, nor an unconfirmed one while
+    /// a correlated message is still in a local inbox.
     pub fn record_attempt(
         &mut self,
         attempt: &crate::api::schema::DeliveryAttempt,
     ) -> Result<bool> {
         let ids = serde_json::to_string(&attempt.correlation_ids)?;
-        let relevant: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE correlation IN (SELECT value FROM json_each(?1)))
-             OR EXISTS(SELECT 1 FROM delivery_attempts WHERE id=?2)",
-            params![ids,attempt.attempt_id], |r| r.get(0))?;
-        if !relevant {
+        let (relevant, known): (bool, bool) = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM json_each(?1) j JOIN envelopes e ON e.correlation=j.value),
+                    EXISTS(SELECT 1 FROM delivery_attempts WHERE id=?2)",
+            params![ids, attempt.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if !relevant && !known {
             return Ok(false);
         }
-        let mut registry = delivery_attempts::DeliveryAttempts::new(0);
-        let previous = self.delivery_attempts()?;
-        if previous.iter().any(|a| a == attempt) {
-            return Ok(true);
-        }
-        for old in &previous {
-            registry.record(old.clone());
-        }
-        if !previous.iter().any(|a| a.attempt_id == attempt.attempt_id) {
-            let mut statement = self
-                .connection
-                .prepare("SELECT correlation FROM envelopes WHERE state='inbox'")?;
-            let queued = statement
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
-            registry
-                .reserve_id(|id| queued.contains(id))
-                .map_err(|_| Error::MailStoreFull)?;
-        }
-        registry.record(attempt.clone());
-        let retained = registry
-            .snapshot()
-            .into_iter()
-            .map(|a| a.attempt_id)
-            .collect::<Vec<_>>();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !known {
+            let retained: i64 =
+                tx.query_row("SELECT count(*) FROM delivery_attempts", [], |r| r.get(0))?;
+            if retained >= crate::app::mailboxes::MAX_SEEN as i64 {
+                let evicted = tx.execute(
+                    "DELETE FROM delivery_attempts WHERE id=(
+                       SELECT a.id FROM delivery_attempts a WHERE a.finished=1
+                         AND (a.state!='unconfirmed' OR NOT EXISTS(
+                           SELECT 1 FROM json_each(a.correlations) j JOIN envelopes e
+                             ON e.correlation=j.value WHERE e.state='inbox'))
+                       ORDER BY a.queued_at,a.id LIMIT 1)",
+                    [],
+                )?;
+                if evicted == 0 {
+                    return Err(Error::MailStoreFull);
+                }
+            }
+        }
         tx.execute(
-            "DELETE FROM delivery_attempts WHERE id NOT IN (SELECT value FROM json_each(?1))",
-            [serde_json::to_string(&retained)?],
+            "INSERT INTO delivery_attempts(id,evidence,queued_at,finished,state,correlations)
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence,
+             finished=excluded.finished,state=excluded.state,correlations=excluded.correlations",
+            params![
+                attempt.attempt_id,
+                serde_json::to_string(attempt)?,
+                attempt.queued_at_ms as i64,
+                attempt.finished_at_ms.is_some(),
+                attempt.state,
+                ids
+            ],
         )?;
-        tx.execute("INSERT INTO delivery_attempts VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence",
-            params![attempt.attempt_id,serde_json::to_string(attempt)?])?;
         tx.commit()?;
         Ok(true)
     }
 }
 
+/// The receipt a receiver owes for one inbox row, in the same precedence as
+/// [`Store::status_key`]. Evaluated in SQL so selection and the sent mark
+/// can never disagree and a row cannot sit unsendable at the window's head.
+const RECEIPT_STATE_SQL: &str = "CASE
+    WHEN outcome_until IS NOT NULL AND outcome_until<=?2 THEN 'outcome_retention_elapsed'
+    WHEN state='inbox' AND inbox_deadline IS NOT NULL AND inbox_deadline<=?2 THEN 'expired'
+    WHEN state='inbox' THEN 'delivered'
+    WHEN state='read' THEN 'read'
+    ELSE 'expired' END";
+
 impl<D: DiskSpace> Store<D> {
+    /// Receipts owed to `origin`: rows whose receipt state changed since the
+    /// last one it accepted. Every state is markable, so a row leaves this
+    /// window after one successful exchange and id order cannot starve the
+    /// newer ones behind it.
     pub fn pending_receipts(
         &self,
         origin: &str,
         wall_ms: i64,
     ) -> Result<Vec<crate::mesh::collect::Receipt>> {
-        let mut stmt = self.connection.prepare("SELECT id FROM envelopes WHERE origin=?1
-            AND state IN ('inbox','read','inbox_expired') AND (receipt_sent IS NULL OR receipt_sent!=state)
-            ORDER BY id LIMIT 16")?;
-        let keys = stmt
-            .query_map([origin], |r| {
-                Ok(MessageKey {
-                    origin_node: origin.into(),
-                    message_id: r.get(0)?,
-                })
-            })?
+        let now = self.clock()?.advance(wall_ms);
+        let mut stmt = self.connection.prepare(&format!(
+            "SELECT id,state_now FROM (SELECT id,receipt_sent,{RECEIPT_STATE_SQL} AS state_now
+               FROM envelopes WHERE origin=?1 AND state IN ('inbox','read','inbox_expired'))
+             WHERE receipt_sent IS NOT state_now ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![origin, now, crate::mesh::collect::BATCH_CAP as i64],
+                |r| {
+                    Ok((
+                        MessageKey {
+                            origin_node: origin.into(),
+                            message_id: r.get(0)?,
+                        },
+                        r.get::<_, String>(1)?,
+                    ))
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut receipts = Vec::new();
-        for key in keys {
-            if let (Some(record), Some(state)) = (self.get(&key)?, self.receipt(&key, wall_ms)?) {
+        for (key, state) in rows {
+            if let Some(record) = self.get(&key)? {
                 receipts.push(crate::mesh::collect::Receipt {
                     key,
                     token: record.envelope.return_binding.collection_token,
@@ -275,16 +311,27 @@ impl<D: DiskSpace> Store<D> {
         Ok(receipts)
     }
 
+    /// Mark receipts the origin accepted. The mark is the receipt state
+    /// itself, so a later change (read, expiry) selects the row again.
     pub fn receipts_sent(&mut self, receipts: &[crate::mesh::collect::Receipt]) -> Result<()> {
-        for receipt in receipts {
-            let state = match receipt.state.as_str() {
-                "delivered" => "inbox",
-                "expired" => "inbox_expired",
-                state => state,
-            };
-            self.connection.execute("UPDATE envelopes SET receipt_sent=?3 WHERE origin=?1 AND id=?2 AND state=?3 AND (receipt_sent IS NULL OR receipt_sent!=?3)",
-                params![receipt.key.origin_node,receipt.key.message_id,state])?;
+        if receipts.is_empty() {
+            return Ok(());
         }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for receipt in receipts {
+            tx.execute(
+                "UPDATE envelopes SET receipt_sent=?3 WHERE origin=?1 AND id=?2
+                 AND receipt_sent IS NOT ?3",
+                params![
+                    receipt.key.origin_node,
+                    receipt.key.message_id,
+                    receipt.state
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }

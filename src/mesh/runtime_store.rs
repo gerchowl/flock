@@ -73,6 +73,7 @@ pub(crate) fn read<T>(f: impl FnOnce(&Store) -> Result<T, String>) -> Result<Opt
 }
 
 pub(crate) fn status(
+    origin: Option<&str>,
     correlation: &str,
     reference: Option<&super::store::StatusReference>,
 ) -> Result<Option<super::store::Status>, String> {
@@ -85,7 +86,10 @@ pub(crate) fn status(
             Some(reference) => store
                 .referenced_status(correlation, reference, wall)
                 .map(Some),
-            None => store.status(correlation, wall),
+            None => match origin {
+                Some(origin) => store.status(origin, correlation, wall),
+                None => Ok(None),
+            },
         }
         .map_err(|e| e.to_string())
     })?

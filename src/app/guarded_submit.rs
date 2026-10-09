@@ -580,28 +580,10 @@ impl App {
         self.record_delivery_attempt(&attempt.evidence);
     }
 
+    /// The registry is write-through to the custody store and restored from
+    /// it at boot, so a query never re-reads the durable table.
     pub(crate) fn delivery_attempts(&self) -> Vec<crate::api::schema::DeliveryAttempt> {
-        let mut attempts = self
-            .delivery_attempt_registry
-            .borrow()
-            .snapshot()
-            .into_iter()
-            .map(|a| (a.attempt_id.clone(), a))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if self.node_id.is_some() {
-            match crate::mesh::runtime_store::read(|store| {
-                store.delivery_attempts().map_err(|e| e.to_string())
-            }) {
-                Ok(Some(stored)) => {
-                    attempts.extend(stored.into_iter().map(|a| (a.attempt_id.clone(), a)))
-                }
-                Err(_) => {
-                    crate::logging::mesh_custody_failed("read_attempts", "mail_store_unavailable")
-                }
-                Ok(None) => {}
-            }
-        }
-        attempts.into_values().collect()
+        self.delivery_attempt_registry.borrow().snapshot()
     }
 }
 

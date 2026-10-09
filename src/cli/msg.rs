@@ -320,6 +320,8 @@ const EXIT_REPLIED: i32 = 0;
 /// No answer is coming: the recipient is muted (its deferral is printed), or
 /// the message was dropped unread.
 const EXIT_NO_ANSWER: i32 = 3;
+/// The receiver refused custody of the message; the reason is printed.
+const EXIT_REFUSED: i32 = 4;
 /// The wait ran out first. The coreutils `timeout` convention.
 const EXIT_TIMEOUT: i32 = 124;
 
@@ -327,6 +329,7 @@ fn exit_for(outcome: &str) -> i32 {
     match outcome {
         "replied" => EXIT_REPLIED,
         "deferred" | "expired" | "recipient_gone" | "outcome_retention_elapsed" => EXIT_NO_ANSWER,
+        "refused" => EXIT_REFUSED,
         "timeout" => EXIT_TIMEOUT,
         _ => 1,
     }
@@ -441,6 +444,10 @@ fn await_reply_for(
             println!("{}", reply["body"].as_str().unwrap_or_default());
         }
         "recipient_gone" | "outcome_retention_elapsed" => eprintln!("{correlation_id}: {outcome}"),
+        "refused" => eprintln!(
+            "{correlation_id} was refused by the receiver: {}",
+            result["detail"].as_str().unwrap_or("no reason given")
+        ),
         "expired" => eprintln!("{correlation_id} was dropped unread; no answer is coming"),
         "timeout" => eprintln!(
             "no answer to {correlation_id} yet (last state: {})",
@@ -654,13 +661,10 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
 /// no-answer wait, everything still live or settled-good exits 0.
 fn status_exit(state: Option<&str>) -> i32 {
     match state {
-        Some(
-            "expired"
-            | "recipient_gone"
-            | "outcome_retention_elapsed"
-            | "refused"
-            | "collect_failed",
-        ) => EXIT_NO_ANSWER,
+        Some("refused") => EXIT_REFUSED,
+        Some("expired" | "recipient_gone" | "outcome_retention_elapsed" | "collect_failed") => {
+            EXIT_NO_ANSWER
+        }
         _ => 0,
     }
 }
@@ -863,6 +867,7 @@ mod tests {
         assert_eq!(super::exit_for("anything else"), 1);
         assert_eq!(super::exit_for("recipient_gone"), 3);
         assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
+        assert_eq!(super::exit_for("refused"), 4);
     }
 
     #[test]
@@ -882,11 +887,11 @@ mod tests {
             "expired",
             "outcome_retention_elapsed",
             "recipient_gone",
-            "refused",
             "collect_failed",
         ] {
             assert_eq!(super::status_exit(Some(state)), 3, "{state}");
         }
+        assert_eq!(super::status_exit(Some("refused")), 4);
     }
 
     #[test]
