@@ -190,13 +190,12 @@ fn spawn_server(
     cmd.arg("server");
     cmd.cwd(cwd);
     // Each simulated node owns its identity and pins, like the shared fleet fixture.
-    cmd.env("HOME", config_home.join("home"));
-    cmd.env("XDG_STATE_HOME", config_home.join("state"));
     cmd.env("XDG_DATA_HOME", config_home.join("data"));
     cmd.env("XDG_CACHE_HOME", config_home.join("cache"));
     cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -207,6 +206,7 @@ fn spawn_server(
         cmd.env("PATH", format!("{}:{}", extra.display(), path));
     }
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);

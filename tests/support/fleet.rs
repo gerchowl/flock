@@ -176,9 +176,10 @@ impl Node {
                 cmd.env(key, value);
             }
         }
+        for (key, value) in super::environment::isolated_env(&self.config_home, &self.runtime_dir) {
+            cmd.env(key, value);
+        }
         cmd.env("HOME", &self.home);
-        cmd.env("XDG_CONFIG_HOME", &self.config_home);
-        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         cmd.env("XDG_DATA_HOME", self.home.join("data"));
         cmd.env("XDG_STATE_HOME", self.home.join("state"));
         cmd.env("XDG_CACHE_HOME", self.home.join("cache"));
@@ -193,6 +194,7 @@ impl Node {
         }
         let outer_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{outer_path}", self.shim_dir.display()));
+        super::environment::assert_pty_isolated(&cmd);
         let child = pair.slave.spawn_command(cmd).unwrap();
         register_spawned_flock_pid(child.process_id());
         drop(pair.slave);

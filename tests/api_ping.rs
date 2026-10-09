@@ -167,8 +167,9 @@ fn spawn_flock_with_options(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
@@ -177,6 +178,7 @@ fn spawn_flock_with_options(
         cmd.env("PATH", path);
     }
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
 
@@ -351,6 +353,34 @@ fn event_wait_preserves_interleaved_creation_events() {
         wait_for_event(&mut reader, "tab_created", timeout)["event"],
         "tab_created"
     );
+}
+
+#[test]
+fn server_state_is_isolated_between_fixtures() {
+    let _lock = test_lock();
+    let first = unique_test_dir();
+    let second = unique_test_dir();
+    let mut servers = Vec::new();
+    for base in [&first, &second] {
+        let config = base.join("config");
+        let runtime = base.join("runtime");
+        let socket = runtime.join("flock.sock");
+        servers.push(spawn_flock(&config, &runtime, &socket));
+        wait_for_socket(&socket, Duration::from_secs(5));
+        let app = if cfg!(debug_assertions) {
+            "flock-dev"
+        } else {
+            "flock"
+        };
+        wait_for_path(
+            &config.join("state").join(app).join("mesh-mail.sqlite"),
+            Duration::from_secs(5),
+        );
+        assert!(config.join("home").is_dir());
+    }
+    drop(servers);
+    cleanup_test_base(&first);
+    cleanup_test_base(&second);
 }
 
 #[test]
@@ -2532,7 +2562,6 @@ fn agent_send_and_pane_send_text_use_bracketed_paste() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
-    std::env::set_var("HOME", &config_home);
     for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
         std::env::remove_var(key);
     }
@@ -2688,7 +2717,6 @@ fn guarded_submit_enter_follows_socket_paste_by_at_least_100ms() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
-    std::env::set_var("HOME", &config_home);
     for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
         std::env::remove_var(key);
     }
@@ -2845,10 +2873,6 @@ fn guarded_submit_cli_reports_exit_8_and_9_with_evidence() {
         let base = unique_test_dir();
         fs::create_dir_all(&base).unwrap();
         let config_home = base.join("config");
-        std::env::set_var("HOME", &config_home);
-        for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
-            std::env::remove_var(key);
-        }
         let runtime_dir = base.join("runtime");
         let socket_path = runtime_dir.join("flock.sock");
         let script = base.join("codex");
