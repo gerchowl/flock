@@ -141,6 +141,11 @@ fn collection_migration_preserves_existing_writer_generation_and_custody() {
         DROP INDEX collect_ready;
         ALTER TABLE envelopes DROP COLUMN collect_at;
         ALTER TABLE envelopes DROP COLUMN collect_attempts;
+        ALTER TABLE envelopes DROP COLUMN remote_state;
+        ALTER TABLE envelopes DROP COLUMN receipt_sent;
+        DROP TABLE delivery_attempts;
+        DROP TABLE status_signer;
+        DROP INDEX status_correlation;
         PRAGMA user_version=7;",
         )
         .unwrap();
@@ -1028,6 +1033,11 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
         DROP INDEX collect_ready;
          ALTER TABLE envelopes DROP COLUMN collect_at;
          ALTER TABLE envelopes DROP COLUMN collect_attempts;
+         ALTER TABLE envelopes DROP COLUMN remote_state;
+         ALTER TABLE envelopes DROP COLUMN receipt_sent;
+         DROP TABLE delivery_attempts;
+         DROP TABLE status_signer;
+         DROP INDEX status_correlation;
          PRAGMA user_version=3;",
         )
         .unwrap();
@@ -1198,6 +1208,11 @@ fn version_four_pin_origin_is_unknown_after_migration() {
         DROP INDEX collect_ready;
          ALTER TABLE envelopes DROP COLUMN collect_at;
          ALTER TABLE envelopes DROP COLUMN collect_attempts;
+         ALTER TABLE envelopes DROP COLUMN remote_state;
+         ALTER TABLE envelopes DROP COLUMN receipt_sent;
+         DROP TABLE delivery_attempts;
+         DROP TABLE status_signer;
+         DROP INDEX status_correlation;
          PRAGMA user_version=4;",
         )
         .unwrap();
@@ -1327,6 +1342,9 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
         .collect_ready(&request.key.origin_node, 4_999, 16, &[])
         .unwrap()
         .is_empty());
+    // A notice is polled only for its read receipt, and a terminal one ends
+    // that. The question's own polling is what the rest of this test pins.
+    store.import_receipt(&notice.key, "read").unwrap();
     let claimed = store
         .collect_ready(&request.key.origin_node, 5_000, 16, &[])
         .unwrap();
@@ -1384,11 +1402,19 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
         "a later bad answer cannot override a final answer"
     );
     assert!(
+        !store
+            .collect_ready(&request.key.origin_node, 400_000, 16, &[])
+            .unwrap()
+            .is_empty(),
+        "a final answer still needs a terminal read receipt"
+    );
+    store.import_receipt(&request.key, "read").unwrap();
+    assert!(
         store
             .collect_ready(&request.key.origin_node, 500_000, 16, &[])
             .unwrap()
             .is_empty(),
-        "the first final answer stops polling"
+        "the final answer and read receipt stop polling"
     );
 }
 
@@ -1725,7 +1751,7 @@ fn schema_nine_held_answers_migrate_out_of_the_retry_queue() {
         .unwrap();
     store
         .connection
-        .execute_batch("DROP INDEX held_recipient; PRAGMA user_version=9;")
+        .execute_batch("DROP INDEX held_recipient; ALTER TABLE envelopes DROP COLUMN remote_state; ALTER TABLE envelopes DROP COLUMN receipt_sent; DROP TABLE delivery_attempts; DROP TABLE status_signer; DROP INDEX status_correlation; PRAGMA user_version=9;")
         .unwrap();
     drop(store);
     let mut store = f.open(1);
@@ -1830,6 +1856,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
             "origin.example",
             "receiver.example",
             &OutboundCollect {
+                receipts: Vec::new(),
                 ack: vec![good.clone(), bad]
             },
             3
@@ -1842,11 +1869,17 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         .collect_outbound(
             "origin.example",
             "receiver.example",
-            &OutboundCollect { ack: vec![forged] },
+            &OutboundCollect {
+                ack: vec![forged],
+                receipts: Vec::new()
+            },
             3
         )
         .is_err());
-    let ack = OutboundCollect { ack: vec![good] };
+    let ack = OutboundCollect {
+        ack: vec![good],
+        receipts: Vec::new(),
+    };
     assert!(store
         .collect_outbound("origin.example", "receiver.example", &ack, 4)
         .unwrap()
@@ -1934,4 +1967,480 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
     assert!(store
         .has_outbound("origin.example", "receiver.example", 5002)
         .unwrap());
+}
+
+#[test]
+fn status_reads_are_pure_and_survive_restart_handoff_and_retention() {
+    let fixture = Fixture::new();
+    let request = envelope();
+    let mut store = fixture.open(0);
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let changes = store.connection.total_changes();
+    let queued = store
+        .status("origin.example", "thread", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.state, "queued");
+    assert_eq!(store.connection.total_changes(), changes);
+    store.finish(&request.key, Outcome::Delivered, 2).unwrap();
+    store.import_receipt(&request.key, "read").unwrap();
+    let generation = store.handoff_generation().unwrap();
+    drop(store);
+    Store::check_generation(&fixture.path, generation).unwrap();
+    let mut store = fixture.open(3);
+    assert_eq!(
+        store
+            .referenced_status("thread", &queued.reference, 3)
+            .unwrap()
+            .state,
+        "read"
+    );
+    let changes = store.connection.total_changes();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", CUSTODY_TTL_MS + 3)
+            .unwrap()
+            .unwrap()
+            .state,
+        "outcome_retention_elapsed"
+    );
+    assert_eq!(store.connection.total_changes(), changes);
+    store.maintain(CUSTODY_TTL_MS + 2 * DAY_MS).unwrap();
+    assert!(store
+        .status("origin.example", "thread", CUSTODY_TTL_MS + 2 * DAY_MS)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store
+            .referenced_status("thread", &queued.reference, CUSTODY_TTL_MS + 2 * DAY_MS)
+            .unwrap()
+            .state,
+        "outcome_retention_elapsed"
+    );
+    let mut forged = queued.reference;
+    forged.key.message_id = MessageKey::mint("origin.example".into(), 0)
+        .unwrap()
+        .message_id;
+    assert!(store.referenced_status("thread", &forged, 0).is_err());
+}
+
+#[test]
+fn status_reports_held_collected_custody_and_expiry_without_commits() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&request.key, Outcome::Transferred, 1).unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        "custody"
+    );
+    let mut answer = envelope();
+    answer.correlation_id = "answer".into();
+    answer.request_key = Some(request.key.clone());
+    answer.in_reply_to = Some("thread".into());
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Held, 2)
+        .unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "answer", 2)
+            .unwrap()
+            .unwrap()
+            .state,
+        "held"
+    );
+    store.finish(&answer.key, Outcome::Delivered, 3).unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "answer", 3)
+            .unwrap()
+            .unwrap()
+            .state,
+        "collected"
+    );
+    let mut expired = envelope();
+    expired.correlation_id = "expired".into();
+    store.accept(&expired, 10, Admission::Custody, 3).unwrap();
+    let changes = store.connection.total_changes();
+    assert_eq!(
+        store
+            .status("origin.example", "expired", 14)
+            .unwrap()
+            .unwrap()
+            .state,
+        "expired"
+    );
+    assert_eq!(store.connection.total_changes(), changes);
+}
+
+#[test]
+fn status_selects_real_imported_reply_after_deferral_without_audit_events() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    for correlation in ["thread:deferred", "real-answer"] {
+        let mut answer = envelope();
+        answer.correlation_id = correlation.into();
+        answer.request_key = Some(request.key.clone());
+        answer.in_reply_to = Some("thread".into());
+        answer.body =
+            serde_json::to_vec(&serde_json::json!({"message":{"body":correlation}})).unwrap();
+        store
+            .accept(&answer, CUSTODY_TTL_MS, Admission::Inbox, 1)
+            .unwrap();
+    }
+    let changes = store.connection.total_changes();
+    let status = store
+        .status("origin.example", "thread", 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.reply.unwrap().body, "real-answer");
+    assert_eq!(store.connection.total_changes(), changes);
+}
+
+#[test]
+fn receipt_collection_is_repeatable_until_ack_and_read_advances_it() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let receipts = store.pending_receipts(&request.key.origin_node, 1).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, "delivered");
+    assert_eq!(
+        store.pending_receipts(&request.key.origin_node, 1).unwrap(),
+        receipts
+    );
+    store.receipts_sent(&receipts).unwrap();
+    assert!(store
+        .pending_receipts(&request.key.origin_node, 1)
+        .unwrap()
+        .is_empty());
+    store
+        .read_inbox(std::slice::from_ref(&request.key), 2)
+        .unwrap();
+    let receipts = store.pending_receipts(&request.key.origin_node, 2).unwrap();
+    assert_eq!(receipts[0].state, "read");
+    drop(store);
+    assert_eq!(
+        fixture
+            .open(3)
+            .pending_receipts(&request.key.origin_node, 3)
+            .unwrap(),
+        receipts
+    );
+}
+
+#[test]
+fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mut notice = envelope();
+    notice.intent = "\"fyi\"".into();
+    store
+        .accept(&notice, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&notice.key, Outcome::Delivered, 0).unwrap();
+    let claimed = store
+        .collect_ready(&notice.key.origin_node, 5_000, 16, &[])
+        .unwrap();
+    assert_eq!(claimed.len(), 1, "an unconfirmed notice awaits its receipt");
+    store.import_receipt(&notice.key, "delivered").unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 5_001)
+            .unwrap()
+            .unwrap()
+            .state,
+        "delivered"
+    );
+    assert_eq!(
+        store
+            .collect_ready(&notice.key.origin_node, 400_000, 16, &[])
+            .unwrap()
+            .len(),
+        1,
+        "a delivered receipt is not terminal"
+    );
+    store.import_receipt(&notice.key, "read").unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 400_001)
+            .unwrap()
+            .unwrap()
+            .state,
+        "read"
+    );
+    assert!(store
+        .collect_ready(&notice.key.origin_node, 900_000, 16, &[])
+        .unwrap()
+        .is_empty());
+    store.import_receipt(&notice.key, "delivered").unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 900_001)
+            .unwrap()
+            .unwrap()
+            .state,
+        "read",
+        "a late receipt never moves a message backwards"
+    );
+}
+
+#[test]
+fn outbound_receipts_are_judged_per_record_and_never_fail_the_batch() {
+    use crate::mesh::collect::{OutboundCollect, Receipt};
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&mail.key, Outcome::Delivered, 1).unwrap();
+    let good = Receipt {
+        key: mail.key.clone(),
+        token: mail.return_binding.collection_token.clone(),
+        state: "read".into(),
+    };
+    let mut pruned = good.clone();
+    pruned.key = MessageKey::mint("origin.example".into(), 2).unwrap();
+    let mut forged = good.clone();
+    forged.token[0] ^= 1;
+    forged.state = "expired".into();
+    let query = OutboundCollect {
+        receipts: vec![pruned, forged, good],
+        ack: Vec::new(),
+    };
+    store
+        .collect_outbound("origin.example", "receiver.example", &query, 3)
+        .expect("a pruned or forged receipt drops only itself");
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 4)
+            .unwrap()
+            .unwrap()
+            .state,
+        "read"
+    );
+}
+
+#[test]
+fn every_receipt_state_is_markable_so_none_hogs_the_window() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let stale = envelope();
+    store
+        .accept(&stale, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    // Past its inbox deadline but not yet swept: status says expired while
+    // the row is still `inbox`. That receipt must be markable too.
+    let late = DAY_MS + 1;
+    let receipts = store
+        .pending_receipts(&stale.key.origin_node, late)
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].state, "expired");
+    store.receipts_sent(&receipts).unwrap();
+    assert!(store
+        .pending_receipts(&stale.key.origin_node, late)
+        .unwrap()
+        .is_empty());
+    // A full window of fresh rows behind it is not starved.
+    let mut fresh = Vec::new();
+    for _ in 0..crate::mesh::collect::BATCH_CAP + 1 {
+        let mut mail = envelope();
+        mail.key = MessageKey::mint("origin.example".into(), late as u64).unwrap();
+        mail.return_binding.request = mail.key.clone();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, late)
+            .unwrap();
+        fresh.push(mail.key);
+    }
+    let window = store
+        .pending_receipts(&stale.key.origin_node, late)
+        .unwrap();
+    assert_eq!(window.len(), crate::mesh::collect::BATCH_CAP);
+    assert!(window.iter().all(|r| r.key != stale.key));
+    store.receipts_sent(&window).unwrap();
+    assert_eq!(
+        store
+            .pending_receipts(&stale.key.origin_node, late)
+            .unwrap()
+            .len(),
+        1,
+        "the row past the first window is offered next"
+    );
+}
+
+#[test]
+fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect, Receipt};
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Held, 0)
+        .unwrap();
+    let token = mail.return_binding.collection_token.clone();
+    let receipt = Receipt {
+        key: mail.key.clone(),
+        token: token.clone(),
+        state: "read".into(),
+    };
+    store
+        .collect_outbound(
+            "origin.example",
+            "receiver.example",
+            &OutboundCollect {
+                receipts: vec![receipt],
+                ack: Vec::new(),
+            },
+            1,
+        )
+        .unwrap();
+    let ack = OutboundAck {
+        key: mail.key.clone(),
+        token,
+        refusal: None,
+    };
+    store
+        .collect_outbound(
+            "origin.example",
+            "receiver.example",
+            &OutboundCollect {
+                receipts: Vec::new(),
+                ack: vec![ack],
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 3)
+            .unwrap()
+            .unwrap()
+            .state,
+        "read",
+        "the receipt that outran its ack is kept"
+    );
+}
+
+#[test]
+fn status_by_correlation_is_scoped_to_the_asking_origin() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let own = envelope();
+    store
+        .accept(&own, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let mut foreign = envelope();
+    foreign.key = MessageKey::mint("foreign.example".into(), 1).unwrap();
+    foreign.return_binding.request = foreign.key.clone();
+    store
+        .accept(&foreign, CUSTODY_TTL_MS, Admission::Inbox, 1)
+        .unwrap();
+    let status = store
+        .status("origin.example", "thread", 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.reference.key, own.key);
+    assert_eq!(status.state, "queued");
+    assert!(store
+        .status("elsewhere.example", "thread", 2)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_delivery_attempt_write_stays_keyed_with_a_full_registry() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let cap = crate::app::mailboxes::MAX_SEEN;
+    let attempt = |id: usize, state: &str, finished: bool| crate::api::schema::DeliveryAttempt {
+        attempt_id: format!("attempt:{id:020}"),
+        pane: "fixture-pane".into(),
+        correlation_ids: vec!["thread".into()],
+        wake: true,
+        state: state.into(),
+        reason: None,
+        queued_at_ms: id as u64,
+        typed_at_ms: None,
+        submit_sent_at_ms: None,
+        finished_at_ms: finished.then_some(id as u64),
+        retried: false,
+    };
+    // Seed a full registry directly: the oldest is pending, the next is
+    // unconfirmed while its message still sits in the inbox, the rest done.
+    let tx = store.connection.transaction().unwrap();
+    for id in 0..cap {
+        let row = match id {
+            0 => attempt(id, "typed", false),
+            1 => attempt(id, "unconfirmed", true),
+            _ => attempt(id, "accepted", true),
+        };
+        tx.execute(
+            "INSERT INTO delivery_attempts VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                row.attempt_id,
+                serde_json::to_string(&row).unwrap(),
+                row.queued_at_ms as i64,
+                row.finished_at_ms.is_some(),
+                row.state,
+                serde_json::to_string(&row.correlation_ids).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let started = std::time::Instant::now();
+    assert!(store
+        .record_attempt(&attempt(cap, "queued", false))
+        .unwrap());
+    let elapsed = started.elapsed();
+    let ids: Vec<String> = store
+        .connection
+        .prepare("SELECT id FROM delivery_attempts ORDER BY id LIMIT 3")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [0, 1, 3].map(|id| format!("attempt:{id:020}")),
+        "only the oldest evictable row goes; pending and protected stay"
+    );
+    let retained: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM delivery_attempts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(retained as usize, cap);
+    // An update to an existing attempt is one keyed upsert, no eviction.
+    let before = store.connection.total_changes();
+    assert!(store.record_attempt(&attempt(cap, "typed", false)).unwrap());
+    assert_eq!(store.connection.total_changes() - before, 1);
+    // Generous for a debug build on a loaded runner, far below what parsing
+    // and rewriting 4096 rows per write cost before this was keyed.
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "one attempt write took {elapsed:?}"
+    );
 }

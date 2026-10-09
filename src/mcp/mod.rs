@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 mod bridge;
-mod channel;
+pub(crate) mod channel;
 mod framing;
 mod resources;
 mod tools;

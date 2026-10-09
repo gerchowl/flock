@@ -524,10 +524,34 @@ impl App {
         } else {
             Vec::new()
         };
-        Ok(new_evidence(id, pane, wake, ids))
+        let evidence = new_evidence(id, pane, wake, ids);
+        if self.node_id.is_some() {
+            match crate::mesh::hello::with_store(|store| {
+                store.record_attempt(&evidence).map_err(|e| e.to_string())
+            }) {
+                Ok(_) => {}
+                // Only a full durable registry refuses admission. Any other
+                // store failure leaves local typing to the in-memory registry.
+                Err(reason) if reason.starts_with("mail_store_full") => {
+                    return Err("delivery_attempt_capacity")
+                }
+                Err(_) => {
+                    crate::logging::mesh_custody_failed("record_attempt", "mail_store_unavailable")
+                }
+            }
+        }
+        Ok(evidence)
     }
 
     pub(crate) fn record_delivery_attempt(&self, attempt: &crate::api::schema::DeliveryAttempt) {
+        if self.node_id.is_some()
+            && crate::mesh::hello::with_store(|store| {
+                store.record_attempt(attempt).map_err(|e| e.to_string())
+            })
+            .is_err()
+        {
+            crate::logging::mesh_custody_failed("record_attempt", "mail_store_unavailable");
+        }
         self.delivery_attempt_registry
             .borrow_mut()
             .record(attempt.clone());
@@ -556,6 +580,8 @@ impl App {
         self.record_delivery_attempt(&attempt.evidence);
     }
 
+    /// The registry is write-through to the custody store and restored from
+    /// it at boot, so a query never re-reads the durable table.
     pub(crate) fn delivery_attempts(&self) -> Vec<crate::api::schema::DeliveryAttempt> {
         self.delivery_attempt_registry.borrow().snapshot()
     }

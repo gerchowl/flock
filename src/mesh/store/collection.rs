@@ -114,7 +114,7 @@ impl<D: DiskSpace> Store<D> {
                   AND recipient_node NOT IN ('',?1)
                   AND recipient_node NOT IN (SELECT value FROM json_each(?4))
                   AND collect_error IS NULL AND (
-                    (reply_expected=1 AND collect_done=0) OR EXISTS (
+                    (reply_expected=1 AND collect_done=0) OR remote_state IS NULL OR remote_state='delivered' OR EXISTS (
                       SELECT 1 FROM collect_acks a WHERE a.request_origin=e.origin AND a.request_id=e.id)))
                  WHERE rank=1 ORDER BY collect_at,id LIMIT ?3",
             )?;
@@ -359,8 +359,22 @@ impl<D: DiskSpace> Store<D> {
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
-        if query.ack.len() > BATCH_CAP {
+        if query.ack.len() > BATCH_CAP || query.receipts.len() > BATCH_CAP {
             return Err(Error::InvalidEnvelope);
+        }
+        // Receipts are judged one record at a time: a pruned or foreign
+        // request drops only its own receipt, never the ack batch beside it.
+        let mut receipts = Vec::new();
+        for receipt in &query.receipts {
+            let valid = receipt.key.origin_node == local
+                && super::status::RECEIPT_STATES.contains(&receipt.state.as_str())
+                && self.get(&receipt.key)?.is_some_and(|record| {
+                    record.envelope.return_binding.recipient_node == hub
+                        && record.envelope.return_binding.collection_token == receipt.token
+                });
+            if valid {
+                receipts.push(receipt);
+            }
         }
         for ack in &query.ack {
             let record = self
@@ -401,6 +415,13 @@ impl<D: DiskSpace> Store<D> {
                     self.finish(&ack.key, Outcome::Delivered, wall_ms)?;
                 }
             }
+        }
+        // After the acks, so a receipt riding with its own message's ack
+        // lands on the delivered row. A row still held (its ack was lost)
+        // takes the receipt too, rather than the hub marking it sent for
+        // nothing.
+        for receipt in receipts {
+            self.import_receipt(&receipt.key, &receipt.state)?;
         }
         let now = self.clock()?.advance(wall_ms);
         let keys = {

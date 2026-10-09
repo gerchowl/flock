@@ -1,15 +1,15 @@
-//! Bounded local submission evidence. The accessor isolates future custody-store migration.
+//! Bounded submission evidence shared by local and durable mesh attempts.
 use std::collections::BTreeMap;
 
 use crate::api::schema::DeliveryAttempt;
 
-pub(super) struct DeliveryAttempts {
+pub(crate) struct DeliveryAttempts {
     by_id: BTreeMap<String, DeliveryAttempt>,
     next_id: u64,
 }
 
 impl DeliveryAttempts {
-    pub(super) fn new(next_id: u64) -> Self {
+    pub(crate) fn new(next_id: u64) -> Self {
         Self {
             by_id: BTreeMap::new(),
             next_id,
@@ -30,11 +30,11 @@ impl DeliveryAttempts {
         oldest.is_some_and(|id| self.by_id.remove(&id).is_some())
     }
 
-    pub(super) fn reserve_id(
+    pub(crate) fn reserve_id(
         &mut self,
         is_queued: impl Fn(&str) -> bool,
     ) -> Result<String, &'static str> {
-        while self.by_id.len() >= super::mailboxes::MAX_SEEN {
+        while self.by_id.len() >= crate::app::mailboxes::MAX_SEEN {
             if !self.evict_oldest_terminal(&is_queued) {
                 return Err("delivery_attempt_capacity");
             }
@@ -43,7 +43,7 @@ impl DeliveryAttempts {
         Ok(format!("attempt:{:020}", self.next_id))
     }
 
-    pub(super) fn record(&mut self, attempt: DeliveryAttempt) {
+    pub(crate) fn record(&mut self, attempt: DeliveryAttempt) {
         if let Some(id) = attempt
             .attempt_id
             .strip_prefix("attempt:")
@@ -52,7 +52,7 @@ impl DeliveryAttempts {
             self.next_id = self.next_id.max(id);
         }
         self.by_id.insert(attempt.attempt_id.clone(), attempt);
-        while self.by_id.len() > super::mailboxes::MAX_SEEN {
+        while self.by_id.len() > crate::app::mailboxes::MAX_SEEN {
             // Admission checks the live mailbox snapshot. Updates conservatively
             // retain correlated unconfirmed evidence until that check.
             if !self.evict_oldest_terminal(&|_| true) {
@@ -61,11 +61,11 @@ impl DeliveryAttempts {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.by_id.clear();
     }
 
-    pub(super) fn snapshot(&self) -> Vec<DeliveryAttempt> {
+    pub(crate) fn snapshot(&self) -> Vec<DeliveryAttempt> {
         self.by_id.values().cloned().collect()
     }
 }
@@ -95,7 +95,7 @@ mod tests {
         let mut registry = DeliveryAttempts::new(0);
         registry.record(attempt(0, "typed"));
         registry.record(attempt(1, "unconfirmed"));
-        for id in 2..super::super::mailboxes::MAX_SEEN as u64 {
+        for id in 2..crate::app::mailboxes::MAX_SEEN as u64 {
             registry.record(attempt(id, "accepted"));
         }
         let id = registry.reserve_id(|_| true).unwrap();
@@ -103,7 +103,7 @@ mod tests {
         new.attempt_id = id;
         registry.record(new);
         let remaining = registry.snapshot();
-        assert_eq!(remaining.len(), super::super::mailboxes::MAX_SEEN);
+        assert_eq!(remaining.len(), crate::app::mailboxes::MAX_SEEN);
         assert!(remaining.iter().any(|a| a.queued_at_ms == 0));
         assert!(remaining.iter().any(|a| a.queued_at_ms == 1));
         assert!(!remaining.iter().any(|a| a.queued_at_ms == 2));
@@ -112,20 +112,20 @@ mod tests {
     #[test]
     fn protected_capacity_refuses_new_attempts_instead_of_losing_evidence() {
         let mut registry = DeliveryAttempts::new(0);
-        for id in 0..super::super::mailboxes::MAX_SEEN as u64 {
+        for id in 0..crate::app::mailboxes::MAX_SEEN as u64 {
             registry.record(attempt(id, "unconfirmed"));
         }
         assert_eq!(
             registry.reserve_id(|_| true),
             Err("delivery_attempt_capacity")
         );
-        assert_eq!(registry.snapshot().len(), super::super::mailboxes::MAX_SEEN);
+        assert_eq!(registry.snapshot().len(), crate::app::mailboxes::MAX_SEEN);
     }
 
     #[test]
     fn any_queued_correlation_protects_unconfirmed_but_missing_mail_releases_it() {
         let mut registry = DeliveryAttempts::new(0);
-        for id in 0..super::super::mailboxes::MAX_SEEN as u64 {
+        for id in 0..crate::app::mailboxes::MAX_SEEN as u64 {
             let mut evidence = attempt(id, "unconfirmed");
             evidence.correlation_ids = vec!["gone-mail".into(), "queued-mail".into()];
             registry.record(evidence);

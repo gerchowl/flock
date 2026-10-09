@@ -312,7 +312,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
         return Ok(1);
     };
-    await_reply_for(sent_id, timeout_ms, json)
+    await_reply_for(sent_id, timeout_ms, json, None)
 }
 
 /// `flk wait reply` exit status (#576): an answer arrived.
@@ -320,13 +320,16 @@ const EXIT_REPLIED: i32 = 0;
 /// No answer is coming: the recipient is muted (its deferral is printed), or
 /// the message was dropped unread.
 const EXIT_NO_ANSWER: i32 = 3;
+/// The receiver refused custody of the message; the reason is printed.
+const EXIT_REFUSED: i32 = 4;
 /// The wait ran out first. The coreutils `timeout` convention.
 const EXIT_TIMEOUT: i32 = 124;
 
 fn exit_for(outcome: &str) -> i32 {
     match outcome {
         "replied" => EXIT_REPLIED,
-        "deferred" | "expired" => EXIT_NO_ANSWER,
+        "deferred" | "expired" | "recipient_gone" | "outcome_retention_elapsed" => EXIT_NO_ANSWER,
+        "refused" => EXIT_REFUSED,
         "timeout" => EXIT_TIMEOUT,
         _ => 1,
     }
@@ -337,10 +340,25 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk wait reply <correlation_id> [--timeout MS] [--json]";
     let mut correlation_id = None;
     let mut timeout_ms = None;
+    let mut reference = None;
     let mut json = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--reference" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing --reference JSON");
+                    return Ok(2);
+                };
+                reference = match serde_json::from_str(value) {
+                    Ok(reference) => Some(reference),
+                    Err(error) => {
+                        eprintln!("invalid status reference: {error}");
+                        return Ok(2);
+                    }
+                };
+                index += 2;
+            }
             "--timeout" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --timeout");
@@ -356,7 +374,11 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
             other if looks_like_option(other) => {
                 eprintln!(
                     "{}",
-                    unknown_option("flk wait reply", other, &["--timeout", "--json"])
+                    unknown_option(
+                        "flk wait reply",
+                        other,
+                        &["--timeout", "--json", "--reference"]
+                    )
                 );
                 return Ok(2);
             }
@@ -374,7 +396,7 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{USAGE}");
         return Ok(2);
     };
-    await_reply_for(&correlation_id, timeout_ms, json)
+    await_reply_for(&correlation_id, timeout_ms, json, reference)
 }
 
 /// Hold `msg.wait_reply` and report how it ended: the answer's body on
@@ -383,10 +405,12 @@ fn await_reply_for(
     correlation_id: &str,
     timeout_ms: Option<u64>,
     json: bool,
+    reference: Option<crate::mesh::store::StatusReference>,
 ) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:wait:reply".into(),
         method: Method::MsgWaitReply(crate::api::schema::MsgWaitReplyParams {
+            reference,
             correlation_id: correlation_id.to_string(),
             timeout_ms,
         }),
@@ -419,6 +443,11 @@ fn await_reply_for(
             );
             println!("{}", reply["body"].as_str().unwrap_or_default());
         }
+        "recipient_gone" | "outcome_retention_elapsed" => eprintln!("{correlation_id}: {outcome}"),
+        "refused" => eprintln!(
+            "{correlation_id} was refused by the receiver: {}",
+            result["detail"].as_str().unwrap_or("no reason given")
+        ),
         "expired" => eprintln!("{correlation_id} was dropped unread; no answer is coming"),
         "timeout" => eprintln!(
             "no answer to {correlation_id} yet (last state: {})",
@@ -600,12 +629,44 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: flk msg status <correlation_id>");
         return Ok(2);
     };
-    super::print_response(&super::send_request(&Request {
+    let reference = match args.get(1).map(String::as_str) {
+        None => None,
+        Some("--reference") if args.len() == 3 => match serde_json::from_str(&args[2]) {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                eprintln!("invalid status reference: {error}");
+                return Ok(2);
+            }
+        },
+        _ => {
+            eprintln!("usage: flk msg status <correlation_id> [--reference JSON]");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
         id: "cli:msg:status".into(),
         method: Method::MsgStatus(crate::api::schema::MsgStatusParams {
+            reference,
             correlation_id: correlation_id.clone(),
         }),
-    })?)
+    })?;
+    let code = super::print_response(&response)?;
+    if code != 0 {
+        return Ok(code);
+    }
+    Ok(status_exit(response["result"]["state"].as_str()))
+}
+
+/// `flk msg status` exit code: states no answer can follow exit like a
+/// no-answer wait, everything still live or settled-good exits 0.
+fn status_exit(state: Option<&str>) -> i32 {
+    match state {
+        Some("refused") => EXIT_REFUSED,
+        Some("expired" | "recipient_gone" | "outcome_retention_elapsed" | "collect_failed") => {
+            EXIT_NO_ANSWER
+        }
+        _ => 0,
+    }
 }
 
 /// `flk msg mute` — the receiver-side half of the wake rule (#316).
@@ -804,6 +865,33 @@ mod tests {
         assert_eq!(super::exit_for("expired"), 3);
         assert_eq!(super::exit_for("timeout"), 124);
         assert_eq!(super::exit_for("anything else"), 1);
+        assert_eq!(super::exit_for("recipient_gone"), 3);
+        assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
+        assert_eq!(super::exit_for("refused"), 4);
+    }
+
+    #[test]
+    fn msg_status_exits_3_only_for_states_no_answer_can_follow() {
+        for state in [
+            "queued",
+            "custody",
+            "delivered",
+            "read",
+            "held",
+            "collected",
+            "relayed",
+        ] {
+            assert_eq!(super::status_exit(Some(state)), 0, "{state}");
+        }
+        for state in [
+            "expired",
+            "outcome_retention_elapsed",
+            "recipient_gone",
+            "collect_failed",
+        ] {
+            assert_eq!(super::status_exit(Some(state)), 3, "{state}");
+        }
+        assert_eq!(super::status_exit(Some("refused")), 4);
     }
 
     #[test]
