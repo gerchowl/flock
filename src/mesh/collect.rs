@@ -23,6 +23,10 @@ pub(crate) struct Poll {
     failed: bool,
 }
 impl Poll {
+    pub fn note_wake(&mut self) {
+        self.pending = true;
+    }
+
     pub fn note_receipts(&mut self, pending: bool) {
         self.pending |= pending;
     }
@@ -180,6 +184,22 @@ fn decode(raw: &str) -> Result<Batch, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wake_does_not_bypass_failed_backoff() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, false);
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, true);
+        for second in 0..60 {
+            poll.note_wake();
+            assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
+        }
+        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+    }
+
     #[test]
     fn receipts_wake_idle_poll_but_failed_receipt_commit_keeps_backoff() {
         let now = std::time::Instant::now();

@@ -172,6 +172,23 @@ pub(crate) fn take_route_wake(peer: &PeerConfig) -> bool {
         .unwrap_or(false)
 }
 
+fn wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
+    static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    WAKES.get_or_init(Default::default)
+}
+
+pub(crate) fn take_wake(peer: &PeerConfig) -> bool {
+    wake_registry()
+        .lock()
+        .ok()
+        .and_then(|wakes| {
+            wakes
+                .get(&peer.name)
+                .map(|wake| wake.swap(false, std::sync::atomic::Ordering::AcqRel))
+        })
+        .unwrap_or(false)
+}
+
 /// Split the relay's inbound lines: pushes to the single-slot buffer, every
 /// other line to whoever is waiting on a response.
 ///
@@ -195,6 +212,15 @@ fn route_relay_lines<R: BufRead>(
         // JSON at all, which surfaces to the caller as a parse error rather
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
+            if push_kind(&line).as_deref() == Some("mesh.wake") {
+                if let Ok(mut wakes) = wake_registry().lock() {
+                    wakes
+                        .entry(peer.into())
+                        .or_default()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
             if push_kind(&line).as_deref() == Some("mesh.routes_changed") {
                 if let Ok(mut wakes) = route_wake_registry().lock() {
                     wakes
@@ -953,8 +979,10 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
 /// its peer is gone from config, or when its ssh destination changed — the two
 /// cases where the held connection no longer points where the config says.
 pub fn retain_configured(peers: &[PeerConfig]) {
-    if let Ok(mut wakes) = route_wake_registry().lock() {
-        wakes.retain(|name, _| peers.iter().any(|p| p.name == *name));
+    for registry in [route_wake_registry(), wake_registry()] {
+        if let Ok(mut wakes) = registry.lock() {
+            wakes.retain(|name, _| peers.iter().any(|peer| &peer.name == name));
+        }
     }
     let Ok(mut registry) = registry().lock() else {
         return;
@@ -998,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn a_route_wake_push_interleaved_with_a_response_disturbs_neither() {
+    fn both_wake_kinds_interleaved_with_responses_remain_independent() {
         let peer = crate::config::PeerConfig {
             name: "wake.example".into(),
             ..Default::default()
@@ -1008,6 +1036,7 @@ mod tests {
         let wire = concat!(
             "{\"id\":\"one\"}\n",
             "{\"push\":\"mesh.routes_changed\"}\n",
+            "{\"push\":\"mesh.wake\"}\n",
             "{\"push\":\"unknown\"}\n",
             "{\"id\":\"two\"}\n"
         );
@@ -1018,7 +1047,30 @@ mod tests {
         );
         assert!(take_route_wake(&peer));
         assert!(!take_route_wake(&peer));
+        assert!(take_wake(&peer));
+        assert!(!take_wake(&peer));
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn config_reload_retains_and_removes_both_wake_registries() {
+        let kept = peer("kept.example");
+        let removed = peer("removed.example");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let slot = Arc::new(Mutex::new(None));
+        let wire = "{\"push\":\"mesh.wake\"}\n{\"push\":\"mesh.routes_changed\"}\n";
+        for peer in [&kept, &removed] {
+            route_relay_lines(&peer.name, std::io::Cursor::new(wire), &tx, &slot);
+        }
+        retain_configured(std::slice::from_ref(&kept));
+        assert!(take_wake(&kept));
+        assert!(take_route_wake(&kept));
+        assert!(!take_wake(&removed));
+        assert!(!take_route_wake(&removed));
+        for registry in [wake_registry(), route_wake_registry()] {
+            assert!(registry.lock().unwrap().contains_key(&kept.name));
+            assert!(!registry.lock().unwrap().contains_key(&removed.name));
+        }
     }
 
     #[test]

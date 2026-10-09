@@ -1377,7 +1377,7 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
         .is_empty());
     // A notice is polled only for its read receipt, and a terminal one ends
     // that. The question's own polling is what the rest of this test pins.
-    store.import_receipt(&notice.key, "read").unwrap();
+    let _ = store.import_receipt(&notice.key, "read").unwrap();
     let claimed = store
         .collect_ready(&request.key.origin_node, 5_000, 16, &[])
         .unwrap();
@@ -1441,7 +1441,7 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
             .is_empty(),
         "a final answer still needs a terminal read receipt"
     );
-    store.import_receipt(&request.key, "read").unwrap();
+    let _ = store.import_receipt(&request.key, "read").unwrap();
     assert!(
         store
             .collect_ready(&request.key.origin_node, 500_000, 16, &[])
@@ -2046,7 +2046,7 @@ fn status_reads_are_pure_and_survive_restart_handoff_and_retention() {
     assert_eq!(queued.state, "queued");
     assert_eq!(store.connection.total_changes(), changes);
     store.finish(&request.key, Outcome::Delivered, 2).unwrap();
-    store.import_receipt(&request.key, "read").unwrap();
+    let _ = store.import_receipt(&request.key, "read").unwrap();
     let generation = store.handoff_generation().unwrap();
     drop(store);
     Store::check_generation(&fixture.path, generation).unwrap();
@@ -2220,7 +2220,7 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
         .collect_ready(&notice.key.origin_node, 5_000, 16, &[])
         .unwrap();
     assert_eq!(claimed.len(), 1, "an unconfirmed notice awaits its receipt");
-    store.import_receipt(&notice.key, "delivered").unwrap();
+    let _ = store.import_receipt(&notice.key, "delivered").unwrap();
     assert_eq!(
         store
             .status("origin.example", "thread", 5_001)
@@ -2237,7 +2237,7 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
         1,
         "a delivered receipt is not terminal"
     );
-    store.import_receipt(&notice.key, "read").unwrap();
+    let _ = store.import_receipt(&notice.key, "read").unwrap();
     assert_eq!(
         store
             .status("origin.example", "thread", 400_001)
@@ -2250,7 +2250,7 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
         .collect_ready(&notice.key.origin_node, 900_000, 16, &[])
         .unwrap()
         .is_empty());
-    store.import_receipt(&notice.key, "delivered").unwrap();
+    let _ = store.import_receipt(&notice.key, "delivered").unwrap();
     assert_eq!(
         store
             .status("origin.example", "thread", 900_001)
@@ -2785,7 +2785,7 @@ fn unrouted_rows_are_never_leased() {
 }
 
 #[test]
-fn collect_outbound_offers_forwarded_answers_and_receipts_to_next_hop_only() {
+fn collect_outbound_filters_unverifiable_origins_before_leasing() {
     use crate::mesh::collect::OutboundCollect;
     let f = Fixture::new();
     let mut s = f.open(0);
@@ -2797,15 +2797,21 @@ fn collect_outbound_offers_forwarded_answers_and_receipts_to_next_hop_only() {
         s.accept(e, 1000, Admission::Held, 0).unwrap();
         s.set_next_hop(&e.key, "neighbor.example").unwrap();
     }
+    let mut foreign = envelope();
+    foreign.key.origin_node = "foreign.example".into();
+    foreign.return_binding.request = foreign.key.clone();
+    s.accept(&foreign, 1000, Admission::Held, 0).unwrap();
+    s.set_next_hop(&foreign.key, "neighbor.example").unwrap();
     let query = OutboundCollect::default();
     assert!(s
         .collect_outbound(Offer::All, "local.example", "receiver.example", &query, 0)
         .unwrap()
         .is_empty());
     let offered = s
-        .collect_outbound(Offer::All, "local.example", "neighbor.example", &query, 0)
+        .collect_outbound(Offer::All, "origin.example", "neighbor.example", &query, 0)
         .unwrap();
     assert_eq!(offered.len(), 2);
+    assert_eq!(s.get(&foreign.key).unwrap().unwrap().retry_at_ms, 0);
     assert!(offered.iter().any(|d| d.envelope == answer));
     assert!(offered.iter().any(|d| d.envelope == receipt));
 }
@@ -3180,7 +3186,7 @@ fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased(
     let mut forwarded = envelope();
     forwarded.key.origin_node = "forwarded.example".into();
     let mut receipt = envelope();
-    receipt.key.origin_node = "receipt.example".into();
+    receipt.key.origin_node = "receiver.example".into();
     receipt.kind = Kind::Receipt;
     for e in [&local, &answer, &forwarded, &receipt] {
         s.accept(e, 1000, Admission::Held, 0).unwrap();
@@ -3205,8 +3211,9 @@ fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased(
     let offers = s
         .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
         .unwrap();
-    assert_eq!(offers.len(), 3);
-    for e in [&answer, &forwarded, &receipt] {
+    assert_eq!(offers.len(), 2);
+    assert_eq!(s.get(&forwarded.key).unwrap().unwrap().retry_at_ms, 0);
+    for e in [&answer, &receipt] {
         assert!(offers.iter().any(|delivery| delivery.envelope == *e));
     }
 }
@@ -3563,4 +3570,184 @@ fn route_boot_epoch_survives_restart_and_clock_rollback() {
     let second = store.reserve_route_boot(500).unwrap();
     assert!(second > first);
     assert_eq!(store.clock().unwrap(), clock);
+}
+
+#[test]
+fn held_answer_push_ready_honors_due_time_without_reenrollment_or_idle_commits() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mut answer = envelope();
+    answer.request_key = Some(envelope().key);
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.schedule_retry(&answer.key, 60_000, 0).unwrap();
+    store.hold_answer(&answer.key).unwrap();
+    let peers = vec![answer.return_binding.recipient_node.clone()];
+    let before = store.connection.total_changes();
+    for now in 1..100 {
+        assert!(store.push_ready(now, 16, &peers).unwrap().is_empty());
+    }
+    assert_eq!(store.connection.total_changes(), before);
+    assert_eq!(
+        store.push_ready(60_000, 16, &peers).unwrap(),
+        vec![answer.key.clone()]
+    );
+    assert_eq!(store.get(&answer.key).unwrap().unwrap().state, "custody");
+}
+
+#[test]
+fn outbound_receipts_are_durable_and_acknowledged_individually() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect, Receipt};
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    store
+        .read_inbox(std::slice::from_ref(&request.key), 1)
+        .unwrap();
+    let offered = store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect::default(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].envelope.kind, Kind::Receipt);
+    let receipt: Receipt = serde_json::from_slice(&offered[0].envelope.body).unwrap();
+    assert_eq!(receipt.key, request.key);
+    assert_eq!(receipt.state, "read");
+    assert!(store
+        .pending_receipts("origin.example", 2)
+        .unwrap()
+        .is_empty());
+    let ack = OutboundAck {
+        key: offered[0].envelope.key.clone(),
+        token: offered[0].envelope.return_binding.collection_token.clone(),
+        refusal: None,
+    };
+    assert!(store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect {
+                ack: vec![ack],
+                receipts: vec![]
+            },
+            3
+        )
+        .unwrap()
+        .is_empty());
+    let before = store.connection.total_changes();
+    assert!(store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect::default(),
+            4
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.connection.total_changes(), before);
+}
+
+#[test]
+fn receipt_import_reports_unready_applied_and_true_duplicate_without_writing() {
+    for state in ["read", "expired"] {
+        let f = Fixture::new();
+        let mut store = f.open(0);
+        let original = envelope();
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store.import_receipt(&original.key, state).unwrap(),
+            ReceiptImport::OriginalNotReady
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .accept(&original, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store.import_receipt(&original.key, state).unwrap(),
+            ReceiptImport::OriginalNotReady
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store.finish(&original.key, Outcome::Delivered, 1).unwrap();
+        assert_eq!(
+            store.import_receipt(&original.key, state).unwrap(),
+            ReceiptImport::Applied
+        );
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store.import_receipt(&original.key, state).unwrap(),
+            ReceiptImport::Duplicate
+        );
+        assert_eq!(
+            store.import_receipt(&original.key, "delivered").unwrap(),
+            ReceiptImport::Duplicate
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store
+                .status(&original.key.origin_node, &original.correlation_id, 2)
+                .unwrap()
+                .unwrap()
+                .state,
+            state
+        );
+    }
+}
+
+#[test]
+fn unacknowledged_receipt_for_unknown_original_stops_being_offered_at_its_own_ttl() {
+    use crate::mesh::collect::OutboundCollect;
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mut receipt = envelope();
+    receipt.kind = Kind::Receipt;
+    store.accept(&receipt, 60_000, Admission::Held, 0).unwrap();
+    let query = OutboundCollect::default();
+    assert_eq!(
+        store
+            .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .collect_outbound(
+                Offer::All,
+                "origin.example",
+                "receiver.example",
+                &query,
+                5_000
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    let before = store.connection.total_changes();
+    assert!(store
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            60_000
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.connection.total_changes(), before);
 }

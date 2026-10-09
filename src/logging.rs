@@ -3996,6 +3996,19 @@ pub(crate) fn peer_push_subscribe_failed(err: &str) {
     );
 }
 
+/// A failed wake worker leaves the request relay and bounded polling alive.
+pub(crate) fn peer_mesh_wake_failed(operation: &'static str, err: &str) {
+    tracing::warn!(
+        target: "flock::peers",
+        event = "peer.mesh.wake_failed",
+        subsystem = "peers",
+        outcome = "error",
+        operation,
+        err,
+        "mesh wake worker stopped"
+    );
+}
+
 /// A relay line carried a push kind this hub does not know (#410). Dropped
 /// rather than fed to the summary parser, where it would fail a poll.
 pub(crate) fn peer_push_unknown_kind(peer: &str, kind: &str) {
