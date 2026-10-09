@@ -80,6 +80,7 @@ impl MessageRelays {
         self.running = self.running.saturating_sub(1);
     }
 
+    #[cfg(test)]
     pub fn is_idle(&self) -> bool {
         self.running == 0 && self.waiting.is_empty()
     }

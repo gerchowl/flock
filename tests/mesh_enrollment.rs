@@ -789,6 +789,7 @@ fn two_hubs_ready(fleet: &fleet::Fleet) {
     for hub in ["nodea", "nodeb"] {
         enrollment(fleet.node(hub), "nodec", "pinned");
         enrollment(fleet.node("nodec"), hub, "pinned");
+        fleet.wait_route(hub, "nodec", true);
     }
 }
 

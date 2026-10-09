@@ -58,18 +58,15 @@ impl<D: DiskSpace> Store<D> {
         if envelope.key.origin_node == self.local_node {
             return Err(Error::OriginMismatch);
         }
-        if hops_left > 8 || visited.len() > 8 {
+        if hops_left > 8 || visited.len() > 9 || visited.last() != Some(&self.local_node) {
             return Err(Error::InvalidEnvelope);
         }
         if visited
             .iter()
             .enumerate()
-            .any(|(i, node)| node == &self.local_node || visited[..i].contains(node))
+            .any(|(i, node)| visited[..i].contains(node))
         {
             return Err(Error::LoopDetected);
-        }
-        if hops_left == 0 && admission != Admission::Inbox {
-            return Err(Error::HopBudgetExhausted);
         }
         self.accept_inner(
             envelope,
@@ -82,6 +79,61 @@ impl<D: DiskSpace> Store<D> {
         )
     }
 
+    /// Persist the origin's route and hop budget in the acceptance transaction.
+    pub fn accept_origin(
+        &mut self,
+        envelope: &Envelope,
+        next_hop: &str,
+        admission: Admission,
+        hops_left: u8,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        self.accept_inner(
+            envelope,
+            CUSTODY_TTL_MS,
+            admission,
+            wall_ms,
+            false,
+            Some((
+                hops_left,
+                std::slice::from_ref(&envelope.key.origin_node),
+                next_hop,
+            )),
+            None,
+        )
+    }
+
+    /// Upgrade unsigned local custody just before sending it. Foreign mail can
+    /// never acquire this node's signature, and terminal metadata is untouched.
+    pub(crate) fn seal_local_record(&mut self, record: &mut Record) -> Result<()> {
+        if !record.envelope.signature.is_empty()
+            || record.envelope.key.origin_node != self.local_node
+        {
+            return Ok(());
+        }
+        let identity = super::super::identity::NodeIdentity::load()?;
+        if identity.node_id() != record.envelope.key.origin_node {
+            return Err(Error::OriginMismatch);
+        }
+        super::super::sign::seal(&mut record.envelope, &identity);
+        if record.visited.is_empty() {
+            record.visited.push(record.envelope.key.origin_node.clone());
+        }
+        let mut metadata = record.envelope.clone();
+        metadata.body.clear();
+        self.connection.execute(
+            "UPDATE envelopes SET metadata=?3,fingerprint=?4,visited=?5 WHERE origin=?1 AND id=?2",
+            params![
+                record.envelope.key.origin_node,
+                record.envelope.key.message_id,
+                serde_json::to_string(&metadata)?,
+                fingerprint(&record.envelope)?,
+                serde_json::to_string(&record.visited)?
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_next_hop(&mut self, key: &MessageKey, next_hop: &str) -> Result<()> {
         if self.clock()?.paused {
             return Err(Error::Paused);
@@ -90,6 +142,20 @@ impl<D: DiskSpace> Store<D> {
             "UPDATE envelopes SET next_hop=?3 WHERE origin=?1 AND id=?2 AND next_hop!=?3 AND state IN ('custody','held')",
             params![key.origin_node,key.message_id,next_hop],
         )?;
+        Ok(())
+    }
+
+    pub fn route_custody(
+        &mut self,
+        key: &MessageKey,
+        next_hop: &str,
+        admission: Admission,
+    ) -> Result<()> {
+        if self.clock()?.paused {
+            return Err(Error::Paused);
+        }
+        self.connection.execute("UPDATE envelopes SET next_hop=?3,state=?4,retry_at=0,lease_until=0 WHERE origin=?1 AND id=?2 AND next_hop!=?3 AND state IN ('custody','held')",
+            params![key.origin_node, key.message_id, next_hop, if admission == Admission::Held { "held" } else { "custody" }])?;
         Ok(())
     }
 
@@ -108,7 +174,7 @@ impl<D: DiskSpace> Store<D> {
         }
         let now = clock.advance(wall_ms);
         let peers = serde_json::to_string(pushable_nodes)?;
-        let condition = "(state='custody' OR (state='held' AND request_origin IS NOT NULL)) AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?1)) AND retry_at<=?2 AND custody_deadline>?2 AND lease_until<=?2";
+        let condition = "state IN ('custody','held') AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?1)) AND retry_at<=?2 AND custody_deadline>?2 AND lease_until<=?2";
         let ready: bool = self.connection.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
             params![peers, now],
@@ -152,7 +218,7 @@ impl<D: DiskSpace> Store<D> {
         let mut leased = Vec::new();
         for key in valid {
             if tx.execute(
-                "UPDATE envelopes SET state='custody',lease_until=?3 WHERE origin=?1 AND id=?2 AND (state='custody' OR (state='held' AND request_origin IS NOT NULL)) AND lease_until<=?4 AND retry_at<=?4 AND custody_deadline>?4 AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?5))",
+                "UPDATE envelopes SET state='custody',lease_until=?3 WHERE origin=?1 AND id=?2 AND state IN ('custody','held') AND lease_until<=?4 AND retry_at<=?4 AND custody_deadline>?4 AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?5))",
                 params![key.origin_node, key.message_id, now.saturating_add(60_000),now,peers],
             )? == 1 { leased.push(key); }
         }
@@ -160,8 +226,61 @@ impl<D: DiskSpace> Store<D> {
         Ok(leased)
     }
 
+    /// A withdrawn adjacent edge cannot retain a request's routing lease.
+    /// Called only after topology changes, and writes only affected custody.
+    pub fn withdraw_request_hops(&mut self, live: &[String]) -> Result<()> {
+        if self.clock()?.paused {
+            return Err(Error::Paused);
+        }
+        let live = serde_json::to_string(live)?;
+        let condition = "state IN ('custody','held') AND request_origin IS NULL AND kind='message' AND next_hop!='' AND next_hop NOT IN (SELECT value FROM json_each(?1))";
+        let any: bool = self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
+            [&live],
+            |r| r.get(0),
+        )?;
+        if any {
+            self.connection.execute(
+                &format!("UPDATE envelopes SET next_hop='',lease_until=0 WHERE {condition}"),
+                [&live],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Offline owners, answers and receipts cannot occupy the request window.
+    pub fn routable_requests(
+        &mut self,
+        targets: &[String],
+        after: Option<&MessageKey>,
+        limit: usize,
+    ) -> Result<(Vec<MessageKey>, bool)> {
+        let targets = serde_json::to_string(targets)?;
+        let (origin, id) = after
+            .map(|key| (key.origin_node.as_str(), key.message_id.as_str()))
+            .unwrap_or(("", ""));
+        let condition = "next_hop='' AND state IN ('custody','held') AND kind='message'
+            AND request_origin IS NULL AND recipient_node IN (SELECT value FROM json_each(?1))
+            AND (origin,id) > (?2,?3)";
+        let keys = self.routing_keys(
+            &format!("SELECT origin,id,rowid FROM envelopes WHERE {condition} ORDER BY origin,id LIMIT ?4"),
+            params![targets, origin, id, limit.min(256) as i64],
+        )?;
+        let (origin, id) = keys
+            .last()
+            .map(|key| (key.origin_node.as_str(), key.message_id.as_str()))
+            .unwrap_or((origin, id));
+        let more = self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
+            params![targets, origin, id],
+            |r| r.get(0),
+        )?;
+        Ok((keys, more))
+    }
+
     /// Inspect unrouted custody without leasing or advancing its clock.
     /// Malformed rows alone are quarantined so they cannot stall this window.
+    #[cfg(test)]
     pub fn unrouted(&mut self, limit: usize) -> Result<Vec<MessageKey>> {
         let keys = self.routing_keys("SELECT origin,id,rowid FROM envelopes WHERE next_hop='' AND state IN ('custody','held') ORDER BY origin,id LIMIT ?1", [limit.min(500) as i64])?;
         let wall = self.clock()?.wall_ms;

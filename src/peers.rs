@@ -1127,6 +1127,8 @@ pub enum PeerMessageFailure {
     /// The peer rejected the envelope, or this host refused to build it.
     /// Terminal: the identical relay is refused again.
     Refused(String),
+    /// Keep custody, but wait for a route change before trying another hop.
+    Reroute(String),
 }
 
 impl PeerMessageFailure {
@@ -1138,7 +1140,7 @@ impl PeerMessageFailure {
     /// The far side's own words, unedited.
     pub fn detail(&self) -> &str {
         match self {
-            Self::Unreachable(detail) | Self::Refused(detail) => detail,
+            Self::Unreachable(detail) | Self::Refused(detail) | Self::Reroute(detail) => detail,
         }
     }
 }

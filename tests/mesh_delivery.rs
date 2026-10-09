@@ -33,6 +33,7 @@ fn agent(node: &Node) -> Value {
 }
 
 fn discover(fleet: &fleet::Fleet, recipient: &Value) {
+    fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
         request(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
             .as_array()?
@@ -65,8 +66,15 @@ fn cross_host_send_and_boot_projection_preserve_exactly_one_inbox_import() {
     let mut fleet = fleet::spawn("mesh-deliver", PAIR);
     let recipient = agent(fleet.node("nodeb"));
     discover(&fleet, &recipient);
-    std::fs::write(fleet.base.join("spoof-host-nodea-nodeb"), "spoof").unwrap();
-    let sent = send(&fleet, &recipient, "delivered-once");
+    let sent = request(
+        fleet.node("nodea"),
+        "msg.send",
+        json!({
+            "to":{"type":"agent", "agent":recipient["agent_id"]},
+            "from_agent":agent(fleet.node("nodea"))["agent_id"], "from_host":"spoofed.example",
+            "body":"durable fleet mail", "correlation_id":"delivered-once", "intent":"fyi"
+        }),
+    );
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     assert_eq!(
         sent["result"]["message_key"]["message_id"]
@@ -122,7 +130,7 @@ fn lost_receipt_then_receiver_restart_deduplicates_the_retry() {
 }
 
 #[test]
-fn refused_old_peer_retains_mail_and_names_the_upgrade() {
+fn refused_old_peer_rejects_new_acceptance_and_names_the_upgrade() {
     let fleet = fleet::spawn("mesh-old", PAIR);
     let recipient = agent(fleet.node("nodeb"));
     discover(&fleet, &recipient);
@@ -141,15 +149,12 @@ fn refused_old_peer_retains_mail_and_names_the_upgrade() {
             })
             .cloned()
     });
-    let sent = send(&fleet, &recipient, "upgrade-queued");
-    assert_eq!(sent["result"]["state"], "queued", "{sent}");
-    assert!(
-        sent["result"]["warnings"]
-            .to_string()
-            .contains("upgrade flk on nodeb"),
-        "{sent}"
-    );
-    assert!(sent["result"]["message_key"].is_object());
+    let sent = send(&fleet, &recipient, "upgrade-refused");
+    assert_eq!(sent["error"]["code"], "peer_incompatible", "{sent}");
+    assert!(sent["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("upgrade flk on nodeb"));
     assert_eq!(read(fleet.node("nodeb"), &recipient["pane_id"]), json!([]));
 }
 
@@ -263,7 +268,7 @@ fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
     assert!(
         sent["result"]["warnings"]
             .to_string()
-            .contains("origin_mismatch"),
+            .contains("invalid_signature"),
         "{sent}"
     );
     assert_eq!(
@@ -279,7 +284,7 @@ fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
         json!({"correlation_id":"forged-origin"}),
     );
     assert_eq!(refused["result"]["state"], "refused");
-    assert_eq!(refused["result"]["detail"], "origin_mismatch");
+    assert_eq!(refused["result"]["detail"], "invalid_signature");
     // Correcting the transport requires a new send, not revival of refused mail.
     let sent = send(&fleet, &recipient, "authentic-origin");
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
@@ -463,6 +468,7 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
                 .cloned()
         },
     );
+    fleet.wait_route("nodec", "nodeb", true);
     std::fs::write(fleet.base.join("replay-delivery-nodec-nodeb"), params).unwrap();
     let forged = request(
         fleet.node("nodec"),

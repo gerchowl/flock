@@ -46,7 +46,7 @@ impl<D: DiskSpace> Store<D> {
         let peers = serde_json::to_string(peers)?;
         let ready: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM envelopes WHERE state='held' AND origin=?1
-             AND recipient_node IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3)",
+             AND next_hop IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3)",
             params![origin, peers, now],
             |r| r.get(0),
         )?;
@@ -55,7 +55,7 @@ impl<D: DiskSpace> Store<D> {
         }
         Ok(self.connection.execute(
             "UPDATE envelopes SET state='custody',retry_at=?3,lease_until=0 WHERE state='held'
-             AND origin=?1 AND recipient_node IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3",
+             AND origin=?1 AND next_hop IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3",
             params![origin,peers,now])?)
     }
 
@@ -331,11 +331,14 @@ impl<D: DiskSpace> Store<D> {
         };
         let mut answers = Vec::new();
         for key in keys {
-            if let Some(record) = self.collection_record(&key, wall_ms)? {
+            if let Some(mut record) = self.collection_record(&key, wall_ms)? {
                 if record.remaining_ms > 0 {
+                    self.seal_local_record(&mut record)?;
                     answers.push(crate::mesh::delivery::Deliver {
                         envelope: record.envelope,
                         remaining_ms: record.remaining_ms,
+                        hops_left: record.hops_left,
+                        visited: record.visited,
                     });
                 }
             }
@@ -416,6 +419,16 @@ impl<D: DiskSpace> Store<D> {
                 .is_some_and(|r| r.state == "held" && r.remaining_ms > 0)
             {
                 if let Some(reason) = &ack.refusal {
+                    if matches!(
+                        reason.split(':').next(),
+                        Some("loop_detected" | "hop_budget_exhausted")
+                    ) {
+                        self.set_next_hop(&ack.key, "")?;
+                        continue;
+                    }
+                    if !crate::mesh::delivery::permanent_refusal(reason) {
+                        continue;
+                    }
                     let now = self.writable(wall_ms)?;
                     self.connection.execute(
                         "UPDATE envelopes SET state=?3,body=X'',collect_error=?4,outcome_until=?5
@@ -430,7 +443,15 @@ impl<D: DiskSpace> Store<D> {
                         ],
                     )?;
                 } else {
-                    self.finish(&ack.key, Outcome::Delivered, wall_ms)?;
+                    self.finish(
+                        &ack.key,
+                        if ack.delivered {
+                            Outcome::Delivered
+                        } else {
+                            Outcome::Transferred
+                        },
+                        wall_ms,
+                    )?;
                 }
             }
         }
@@ -476,17 +497,20 @@ impl<D: DiskSpace> Store<D> {
                 params![local,hub,now,BATCH_CAP as i64],
             )?,
             Offer::All => self.routing_keys(
-                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND origin IN (?1,?4) AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
-                params![hub,now,BATCH_CAP as i64,local],
+                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
+                params![hub,now,BATCH_CAP as i64],
             )?,
         };
         let mut outbound = Vec::new();
         for key in keys {
-            if let Some(record) = self.collection_record(&key, wall_ms)? {
+            if let Some(mut record) = self.collection_record(&key, wall_ms)? {
                 if record.remaining_ms > 0 {
+                    self.seal_local_record(&mut record)?;
                     outbound.push(crate::mesh::delivery::Deliver {
                         envelope: record.envelope,
                         remaining_ms: record.remaining_ms,
+                        hops_left: record.hops_left,
+                        visited: record.visited,
                     });
                 }
             }

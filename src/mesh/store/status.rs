@@ -121,7 +121,7 @@ impl<D: DiskSpace> Store<D> {
             params![key.origin_node,key.message_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let mut state = match record.state.as_str() {
             _ if until.is_some_and(|until| until <= now) => "outcome_retention_elapsed",
-            "custody" | "held" if custody <= now => "expired",
+            "custody" | "held" | "transferred" if custody <= now => "expired",
             "inbox" if inbox.is_some_and(|until| until <= now) => "expired",
             "custody" if record.envelope.request_key.is_none() => "queued",
             "held" if record.envelope.request_key.is_none() => "queued",
@@ -220,11 +220,14 @@ impl<D: DiskSpace> Store<D> {
         if current.is_some_and(|current| current >= incoming) {
             return Ok(ReceiptImport::Duplicate);
         }
-        if !matches!(original_state.as_str(), "delivered" | "held") {
+        if !matches!(
+            original_state.as_str(),
+            "delivered" | "held" | "transferred"
+        ) {
             return Ok(ReceiptImport::OriginalNotReady);
         }
         let changed = self.connection.execute(
-            "UPDATE envelopes SET remote_state=?3 WHERE origin=?1 AND id=?2",
+            "UPDATE envelopes SET remote_state=?3,body=CASE WHEN state='transferred' THEN X'' ELSE body END,state=CASE WHEN state='transferred' THEN 'delivered' ELSE state END WHERE origin=?1 AND id=?2",
             params![key.origin_node, key.message_id, state],
         )?;
         Ok(if changed == 1 {

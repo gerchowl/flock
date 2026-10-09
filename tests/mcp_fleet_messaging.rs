@@ -730,7 +730,7 @@ fn spoke_custody_round_trip_uses_authenticated_origin_and_push_down() {
         fleet.node("nodea"),
         "msg.send",
         json!({
-            "to":{"type":"agent","agent":bob.agent_id}, "from_agent":alice.agent_id,
+            "to":{"type":"agent","agent":bob.agent_id},
             "body":"unattested spoke sender", "intent":"fyi"
         }),
     );
@@ -857,22 +857,22 @@ fn spoke_custody_allow_from_refuses_authenticated_spoke() {
 }
 
 #[test]
-fn spoke_custody_remote_target_beyond_hub_is_forward_limit() {
+fn spoke_custody_remote_target_beyond_hub_is_delivered_once() {
     let (fleet, mut alice, _) = spoke_pair("h2limit", HUB_SPOKES);
     let carol = PanedMcp::start(fleet.node("nodec"), &fleet.base);
     wait_for("hub knows remote recipient", GOSSIP_TIMEOUT, || {
         let listing = spoke_api(fleet.node("nodeb"), "agent.list", json!({}));
         fleet_row(&listing["result"], &carol.agent_id).map(|_| ())
     });
-    spoke_send(&mut alice, &carol.agent_id);
-    wait_for("forward limit returned durably", GOSSIP_TIMEOUT, || {
-        let status = spoke_api(
-            fleet.node("nodea"),
-            "msg.status",
-            json!({"correlation_id":"spoke-question"}),
-        );
-        (status["result"]["detail"] == "forward_limit").then_some(())
+    wait_for("spoke knows remote owner", GOSSIP_TIMEOUT, || {
+        let listing = spoke_api(fleet.node("nodea"), "agent.list", json!({}));
+        fleet_row(&listing["result"], &carol.agent_id).map(|_| ())
     });
+    fleet.wait_route("nodea", "nodec", true);
+    spoke_send(&mut alice, &carol.agent_id);
+    let mail = spoke_wait_mail(fleet.node("nodec"), &carol.pane_id);
+    assert_eq!(mail.as_array().unwrap().len(), 1);
+    assert_eq!(mail[0]["correlation_id"], "spoke-question");
     assert_eq!(
         spoke_api(
             fleet.node("nodec"),
@@ -1003,29 +1003,27 @@ fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
     let hold = fleet.base.join("hold-outbound-nodeb-nodea");
     std::fs::create_dir(&hold).unwrap();
     for i in 0..20 {
-        let sent = alice.call_tool(
+        let sent = alice.call_tool_error(
             "flock_msg_send",
             json!({
                 "to":{"type":"agent","agent":"agent_spoke2_123456789abcdef0"},
                 "body":"no such recipient", "correlation_id":format!("bad-{i}"), "intent":"fyi"
             }),
         );
-        assert_eq!(sent["state"], "queued", "{sent}");
+        assert_eq!(sent["data"]["refusal"], "msg_target_not_found", "{sent}");
     }
     spoke_send(&mut alice, &bob.agent_id);
     std::fs::remove_dir_all(hold).unwrap();
     let mail = spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id);
     assert_eq!(mail.as_array().unwrap().len(), 1);
-    for i in 0..20 {
-        wait_for("terminal refusal of unknown target", GOSSIP_TIMEOUT, || {
-            let status = spoke_api(
-                fleet.node("nodea"),
-                "msg.status",
-                json!({"correlation_id":format!("bad-{i}")}),
-            );
-            (status["result"]["state"] == "refused").then_some(())
-        });
-    }
+    let count: i64 = spoke_db(fleet.node("nodea"))
+        .query_row(
+            "SELECT count(*) FROM envelopes WHERE correlation LIKE 'bad-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "unknown owners were never admitted into custody");
 }
 
 #[test]
