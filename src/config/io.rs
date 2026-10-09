@@ -67,18 +67,6 @@ impl Config {
         Self::finish_load(load_live_config())
     }
 
-    /// Server startup must not replace a removed security setting with defaults.
-    /// Other parse/read errors retain the existing diagnostic-and-default policy.
-    pub fn load_for_server() -> std::io::Result<LoadedConfig> {
-        match load_config() {
-            Err(LoadError::Removed(diagnostics)) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                diagnostics.join("\n"),
-            )),
-            result => Ok(Self::finish_load(result.map_err(LoadError::diagnostics))),
-        }
-    }
-
     fn finish_load(result: Result<LoadedConfig, Vec<String>>) -> LoadedConfig {
         match result {
             Ok(mut loaded) => {
@@ -157,32 +145,12 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-#[derive(Debug)]
-enum LoadError {
-    Invalid(Vec<String>),
-    Removed(Vec<String>),
-}
-
-impl LoadError {
-    fn diagnostics(self) -> Vec<String> {
-        match self {
-            Self::Invalid(messages) | Self::Removed(messages) => messages,
-        }
-    }
-}
-
-impl From<Vec<String>> for LoadError {
-    fn from(messages: Vec<String>) -> Self {
-        Self::Invalid(messages)
-    }
-}
-
 /// Inspect source keys before merging, retaining file/line information even
 /// when an overlay would replace the removed setting. Malformed TOML still
 /// follows the existing parse-error policy in the normal loader.
-fn reject_removed_keys(content: &str, path: &Path) -> Result<(), LoadError> {
+pub(super) fn removed_key_diagnostics(content: &str, path: &Path) -> Vec<String> {
     let Ok(document) = toml_edit::Document::parse(content) else {
-        return Ok(());
+        return Vec::new();
     };
     let mut diagnostics = Vec::new();
     let mut check = |table: &dyn toml_edit::TableLike, section: &str, key: &str| {
@@ -220,11 +188,7 @@ fn reject_removed_keys(content: &str, path: &Path) -> Result<(), LoadError> {
             }
         }
     }
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
-        Err(LoadError::Removed(diagnostics))
-    }
+    diagnostics
 }
 
 const REMOVED_MSG_KEYS: [&str; 3] = [
@@ -234,7 +198,7 @@ const REMOVED_MSG_KEYS: [&str; 3] = [
 ];
 
 fn removed_key_message(section: &str, key: &str) -> String {
-    let mut message = format!("{section}.{key} was removed in flk 1.0.0 (mesh); delete this line");
+    let mut message = format!("{section}.{key} was removed (mesh); delete this line");
     if section == "peers" {
         message.push_str("; peers now always hold a mesh edge");
     }
@@ -242,10 +206,10 @@ fn removed_key_message(section: &str, key: &str) -> String {
 }
 
 pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
-    load_config().map_err(LoadError::diagnostics)
+    load_config()
 }
 
-fn load_config() -> Result<LoadedConfig, LoadError> {
+fn load_config() -> Result<LoadedConfig, Vec<String>> {
     let path = config_path();
     let base = if path.exists() {
         Some(
@@ -256,9 +220,10 @@ fn load_config() -> Result<LoadedConfig, LoadError> {
         None
     };
 
-    if let Some(content) = &base {
-        reject_removed_keys(content, &path)?;
-    }
+    let mut source_diagnostics = base
+        .as_deref()
+        .map(|content| removed_key_diagnostics(content, &path))
+        .unwrap_or_default();
     let overlay_path = config_overlay_path();
     let overlay = if overlay_path.exists() {
         match std::fs::read_to_string(&overlay_path) {
@@ -272,8 +237,9 @@ fn load_config() -> Result<LoadedConfig, LoadError> {
                     "overlay read error at {}: {err}; keeping base config",
                     overlay_path.display()
                 );
-                return load_with_overlay_diagnostic(base.as_deref(), Some(diagnostic))
-                    .map_err(Into::into);
+                let mut loaded = load_with_overlay_diagnostic(base.as_deref(), Some(diagnostic))?;
+                attach_source_diagnostics(&mut loaded, source_diagnostics);
+                return Ok(loaded);
             }
         }
     } else {
@@ -281,9 +247,21 @@ fn load_config() -> Result<LoadedConfig, LoadError> {
     };
 
     if let Some(content) = &overlay {
-        reject_removed_keys(content, &overlay_path)?;
+        source_diagnostics.extend(removed_key_diagnostics(content, &overlay_path));
     }
-    load_with_overlay(base.as_deref(), overlay.as_deref(), &overlay_path).map_err(Into::into)
+    let mut loaded = load_with_overlay(base.as_deref(), overlay.as_deref(), &overlay_path)?;
+    attach_source_diagnostics(&mut loaded, source_diagnostics);
+    Ok(loaded)
+}
+
+fn attach_source_diagnostics(loaded: &mut LoadedConfig, diagnostics: Vec<String>) {
+    loaded
+        .diagnostics
+        .retain(|message| !message.contains("was removed (mesh)"));
+    for diagnostic in &diagnostics {
+        crate::logging::config_removed_key(diagnostic);
+    }
+    loaded.diagnostics.extend(diagnostics);
 }
 
 /// Load the base config with the user overlay (`config.local.toml`)
@@ -423,28 +401,27 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
 }
 
 fn load_live_config_from_table(
-    table: toml::map::Map<String, toml::Value>,
+    mut table: toml::map::Map<String, toml::Value>,
 ) -> Result<LoadedConfig, Vec<String>> {
     let mut removed = Vec::new();
-    if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
+    if let Some(msg) = table.get_mut("msg").and_then(toml::Value::as_table_mut) {
         for key in REMOVED_MSG_KEYS {
-            if msg.contains_key(key) {
+            if msg.remove(key).is_some() {
                 removed.push(removed_key_message("msg", key));
             }
         }
     }
-    if let Some(peers) = table.get("peers").and_then(toml::Value::as_array) {
-        for peer in peers {
-            if peer.get("summary_command").is_some() {
+    if let Some(peers) = table.get_mut("peers").and_then(toml::Value::as_array_mut) {
+        for peer in peers.iter_mut().filter_map(toml::Value::as_table_mut) {
+            if peer.remove("summary_command").is_some() {
                 removed.push(removed_key_message("peers", "summary_command"));
             }
         }
     }
-    if !removed.is_empty() {
-        return Err(removed);
-    }
+
     let mut config = Config::default();
     let mut diagnostics = unknown_top_level_section_diagnostics(&table);
+    diagnostics.extend(removed);
     if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
         let known = toml::Value::try_from(super::model::MsgConfig::default())
             .map_err(|err| vec![err.to_string()])?;
@@ -1635,7 +1612,7 @@ stale_after_secs = 30
 #[cfg(test)]
 mod spoke_config_tests {
     #[test]
-    fn removed_msg_keys_fail_startup_with_migration_message() {
+    fn removed_msg_keys_warn_on_startup_and_reload_preserving_settings() {
         let _guard = crate::config::test_config_env_guard();
         let path =
             std::env::temp_dir().join(format!("flock-removed-config-{}.toml", std::process::id()));
@@ -1646,15 +1623,22 @@ mod spoke_config_tests {
             "uplink_heartbeat_secs",
             "deferral_relay_concurrency",
         ] {
-            std::fs::write(&path, format!("[msg]\n{key}=20\nenabled=false")).unwrap();
+            std::fs::write(
+                &path,
+                format!("[msg]\n{key}=20\nenabled=false\nallow_from=[]\n[[peers]]\nname='nodea'"),
+            )
+            .unwrap();
             let expected = vec![format!(
-                "{}:2: msg.{key} was removed in flk 1.0.0 (mesh); delete this line",
+                "{}:2: msg.{key} was removed (mesh); delete this line",
                 path.display()
             )];
-            assert_eq!(super::load_live_config().unwrap_err(), expected);
-            let refusal = super::Config::load_for_server().unwrap_err();
-            assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(refusal.to_string(), expected[0]);
+            for loaded in [super::load_live_config().unwrap(), super::Config::load()] {
+                assert_eq!(loaded.diagnostics, expected);
+                assert!(!loaded.config.msg.enabled);
+                assert!(loaded.config.msg.allow_from.is_empty());
+                assert_eq!(loaded.config.peers[0].name, "nodea");
+                assert!(loaded.invalid_sections.is_empty());
+            }
         }
         match previous {
             Some(value) => std::env::set_var(super::CONFIG_PATH_ENV_VAR, value),
@@ -1664,14 +1648,49 @@ mod spoke_config_tests {
     }
 
     #[test]
+    fn removed_keys_in_base_and_overlay_preserve_all_other_settings() {
+        let _guard = crate::config::test_config_env_guard();
+        let dir = std::env::temp_dir().join(format!("removed-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("config.toml");
+        let overlay = dir.join("config.local.toml");
+        let previous = std::env::var_os(super::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(super::CONFIG_PATH_ENV_VAR, &base);
+        std::fs::write(&base, "name='base'\n[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n[[peers]]\nname='nodea'\nsummary_command='false'\n").unwrap();
+        std::fs::write(&overlay, "name='overlay'\n[msg]\nuplink_timeout_secs=2\n[[peers]]\nname='nodeb'\nsummary_command='false'\nrelay_command='custom-relay'\n").unwrap();
+        for loaded in [super::Config::load(), super::load_live_config().unwrap()] {
+            assert_eq!(loaded.config.name, "overlay");
+            assert!(!loaded.config.msg.enabled);
+            assert!(loaded.config.msg.allow_from.is_empty());
+            assert_eq!(loaded.config.peers.len(), 2);
+            assert_eq!(loaded.config.peers[0].name, "nodea");
+            assert_eq!(loaded.config.peers[1].name, "nodeb");
+            assert_eq!(loaded.config.peers[1].relay_command, "custom-relay");
+            assert_eq!(loaded.diagnostics.len(), 4, "{:?}", loaded.diagnostics);
+            assert!(loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.starts_with(&format!("{}:5:", base.display()))));
+            assert!(loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.starts_with(&format!("{}:3:", overlay.display()))));
+            assert!(loaded.invalid_sections.is_empty());
+        }
+        match previous {
+            Some(value) => std::env::set_var(super::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(super::CONFIG_PATH_ENV_VAR),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn removed_key_locations_follow_toml_keys_not_comments_or_values() {
         let source = "# summary_command is only a comment\npeers = [{ name='nodea', 'summary_command' = 'false' }]\nmsg = { enabled=false, uplink_timeout_secs=1 }\n";
-        let errors = super::reject_removed_keys(source, std::path::Path::new("fixture.toml"))
-            .unwrap_err()
-            .diagnostics();
+        let errors = super::removed_key_diagnostics(source, std::path::Path::new("fixture.toml"));
         assert_eq!(errors, vec![
-            "fixture.toml:3: msg.uplink_timeout_secs was removed in flk 1.0.0 (mesh); delete this line",
-            "fixture.toml:2: peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge",
+            "fixture.toml:3: msg.uplink_timeout_secs was removed (mesh); delete this line",
+            "fixture.toml:2: peers.summary_command was removed (mesh); delete this line; peers now always hold a mesh edge",
         ]);
     }
 
@@ -1683,7 +1702,7 @@ mod spoke_config_tests {
         let previous = std::env::var_os(super::CONFIG_PATH_ENV_VAR);
         std::env::set_var(super::CONFIG_PATH_ENV_VAR, &path);
         std::fs::write(&path, "[msg\n").unwrap();
-        let loaded = super::Config::load_for_server().unwrap();
+        let loaded = super::Config::load();
         assert!(loaded
             .diagnostics
             .iter()
@@ -1697,13 +1716,14 @@ mod spoke_config_tests {
     }
 
     #[test]
-    fn summary_command_key_is_rejected() {
+    fn summary_command_key_warns_and_preserves_peers() {
         for command in ["false", "sh -lc 'flk peers summary --json'"] {
-            let diagnostics = super::load_live_config_from_str(&format!(
+            let loaded = super::load_live_config_from_str(&format!(
                 "[[peers]]\nname=\"nodea\"\nsummary_command=\"{command}\"\n"
             ))
-            .unwrap_err();
-            assert_eq!(diagnostics, vec!["peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge"]);
+            .unwrap();
+            assert_eq!(loaded.config.peers[0].name, "nodea");
+            assert_eq!(loaded.diagnostics, vec!["peers.summary_command was removed (mesh); delete this line; peers now always hold a mesh edge"]);
         }
     }
 
