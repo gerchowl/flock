@@ -883,6 +883,7 @@ async fn restart_live_retry_does_not_override_deliberate_hibernation() {
 
 #[tokio::test]
 async fn restart_messages_detach_leftover_relays_before_the_next_request() {
+    let store = crate::mesh::runtime_store::TestStore::new();
     let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
         &crate::config::Config::default(),
@@ -892,7 +893,7 @@ async fn restart_messages_detach_leftover_relays_before_the_next_request() {
         crate::api::EventHub::default(),
     );
     app.message_relays.pending = Some(crate::app::message_relay::RelaySend {
-        mesh: None,
+        mesh: store.delivery(),
         id: "detached".into(),
         peer: crate::config::PeerConfig::default(),
         // Refused locally, without dialing a peer.
@@ -900,12 +901,8 @@ async fn restart_messages_detach_leftover_relays_before_the_next_request() {
         host: "nodeb".into(),
         direct: true,
         from_agent: "agent_nodea_sender".into(),
-        from_host: "nodea".into(),
-        body: "test".into(),
         correlation_id: "detached".into(),
-        in_reply_to: None,
         intent: MsgIntent::Fyi,
-        settle_original: None,
         respond_to: None,
     });
     app.restart_message_with_intent(

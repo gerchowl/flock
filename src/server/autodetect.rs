@@ -218,6 +218,7 @@ pub fn auto_detect_launch() -> io::Result<()> {
         info!("server already running, attaching as client");
     } else {
         info!("no server running, spawning server daemon");
+        crate::config::Config::load_for_server()?;
         spawn_server_daemon()?;
         wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT)?;
         info!("server ready, attaching as client");
