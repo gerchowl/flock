@@ -155,6 +155,12 @@ impl Node {
         self.wait_ready();
     }
 
+    /// Restart a sandbox as a different mesh protocol version.
+    pub fn restart_with_mesh(&mut self, mesh: MeshMode) {
+        self.mesh = mesh;
+        self.restart();
+    }
+
     fn start(&mut self) {
         let pair = native_pty_system()
             .openpty(PtySize {

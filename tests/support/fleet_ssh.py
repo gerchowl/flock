@@ -68,6 +68,8 @@ env.update(
     PATH=manifest["bin"] + os.pathsep + os.environ["PATH"],
 )
 if "peers relay" not in command:
+    if "msg send" in command:
+        (base / f"legacy-message-{source}-{target}").touch()
     os.execve("/bin/sh", ["sh", "-c", command], env)
 
 # Killing this group closes both halves of the held edge, without touching
@@ -239,6 +241,14 @@ try:
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
             deliveries.discard(response.get("id"))
+            gate = base / f"gate-delivery-ack-{source}-{target}"
+            if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:
+                (gate / "entered").touch()
+                deadline = time.monotonic() + 30
+                while gate.is_dir() and not (gate / "release").exists():
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
             gate = base / f"lose-receipt-{source}-{target}"
             if gate.exists() and response.get("result", {}).get("state") == "delivered":
                 gate.rename(base / f"lost-receipt-{source}-{target}")

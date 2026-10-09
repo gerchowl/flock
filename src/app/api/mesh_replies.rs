@@ -312,6 +312,22 @@ impl App {
             self.mesh_outbound_cursor = (self.mesh_outbound_cursor + slots) % count;
         }
         for peer in peers {
+            let edge = crate::peer_stream::enrollment(&peer);
+            if let Some(node) = edge.node_id.as_deref().filter(|_| edge.state == "pinned") {
+                // The hub's own read receipts are work even after the spoke
+                // has drained its outbox and stopped advertising pending mail.
+                let receipts_pending = with_store(|store| {
+                    store
+                        .pending_receipts(node, now_ms() as i64)
+                        .map(|receipts| !receipts.is_empty())
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap_or(false);
+                self.mesh_outbound_polls
+                    .entry(peer.name.clone())
+                    .or_default()
+                    .pending |= receipts_pending;
+            }
             if !self.collection_peers.contains_key(&peer.name)
                 && self
                     .mesh_outbound_polls
@@ -319,7 +335,7 @@ impl App {
                     .or_default()
                     .ready(
                         now,
-                        crate::peer_stream::enrollment(&peer).state == "pinned",
+                        edge.state == "pinned",
                         crate::peer_stream::peer_enrollment_generation(&peer),
                     )
             {
