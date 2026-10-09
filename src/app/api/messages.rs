@@ -1140,7 +1140,9 @@ impl App {
                     state: "queued".into(),
                     warnings: Vec::new(),
                     to_host: Some(host.into()),
-                    path: Some(if next.node == owner || next.node.is_empty() {
+                    path: Some(if next.node.is_empty() {
+                        "queued".into()
+                    } else if next.node == owner {
                         "direct".into()
                     } else {
                         format!("via {}", next.name)

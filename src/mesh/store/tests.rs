@@ -4025,3 +4025,44 @@ fn unsigned_local_custody_is_sealed_once_without_resetting_its_budget() {
         Accepted::Duplicate
     );
 }
+
+#[test]
+fn request_route_pages_skip_offline_answers_and_receipts_without_idle_writes() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let owner = "reachable.example".to_string();
+    let request = envelope();
+    for index in 0..402 {
+        let mut mail = envelope();
+        mail.key = MessageKey::mint(mail.key.origin_node.clone(), index).unwrap();
+        mail.return_binding.request = mail.key.clone();
+        mail.return_binding.recipient_node = if index < 100 {
+            "offline.example".into()
+        } else {
+            owner.clone()
+        };
+        if index == 100 {
+            mail.request_key = Some(request.key.clone());
+        }
+        if index == 101 {
+            mail.kind = Kind::Receipt;
+        }
+        store
+            .accept_origin(&mail, "", Admission::Custody, 8, 0)
+            .unwrap();
+    }
+    let before = store.connection.total_changes();
+    let targets = [owner];
+    let (first, more) = store.routable_requests(&targets, None, 256).unwrap();
+    assert_eq!(first.len(), 256);
+    assert!(more);
+    // Rows deliberately stay unrouted: even a downstream reroute refusal must
+    // not select an already visited key in the same generation pass.
+    let (last, more) = store
+        .routable_requests(&targets, first.last(), 256)
+        .unwrap();
+    assert_eq!(last.len(), 44);
+    assert!(!more);
+    assert!(last.iter().all(|key| !first.contains(key)));
+    assert_eq!(store.connection.total_changes(), before);
+}

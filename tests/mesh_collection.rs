@@ -504,7 +504,7 @@ fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
 }
 
 #[test]
-fn invalid_collected_binding_is_terminal_and_visible_in_message_status() {
+fn collected_answer_signature_covers_the_binding_and_failure_is_visible() {
     let fleet = fleet::spawn("mesh-collect-failed", PAIR);
     question(&fleet, "invalid-answer");
     std::fs::write(fleet.base.join("corrupt-collect-answer-nodea-nodeb"), "").unwrap();

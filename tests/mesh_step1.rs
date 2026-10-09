@@ -687,8 +687,17 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
         .base
         .join("legacy-message-nodea-nodeb")
         .exists());
+    let attempts = conversation
+        .fleet
+        .base
+        .join("enrollment-attempts-nodea-nodeb");
+    let before = std::fs::read_to_string(&attempts).unwrap().lines().count();
     due(conversation.fleet.node("nodea"));
-    std::thread::sleep(Duration::from_secs(2));
+    fleet::wait_until(
+        "incompatible peer enrollment retried",
+        Duration::from_secs(90),
+        || (std::fs::read_to_string(&attempts).ok()?.lines().count() > before).then_some(()),
+    );
     state(conversation.fleet.node("nodea"), "question", "queued");
     assert_eq!(
         read(
@@ -1387,7 +1396,7 @@ fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
 }
 
 #[test]
-fn answer_with_wrong_collection_token_is_rejected() {
+fn answer_signature_covers_the_collection_token() {
     let conversation = Conversation::new(SPOKE);
     conversation.send();
     conversation.read_question();

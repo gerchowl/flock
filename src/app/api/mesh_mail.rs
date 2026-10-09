@@ -709,13 +709,32 @@ impl App {
                 .filter(|route| route.hops == 1)
                 .map(|route| route.node)
                 .collect();
+            let targets: Vec<_> = self
+                .mesh_routes
+                .table
+                .routes()
+                .into_iter()
+                .map(|route| route.node)
+                .collect();
+            let after = self
+                .mesh_forward_cursor
+                .as_ref()
+                .filter(|(generation, _)| *generation == route_generation)
+                .map(|(_, key)| key);
             let keys = with_store(|store| {
                 store
                     .withdraw_request_hops(&adjacent)
                     .map_err(|e| e.to_string())?;
-                store.unrouted(64).map_err(|e| e.to_string())
+                store
+                    .routable_requests(&targets, after, 256)
+                    .map_err(|e| e.to_string())
             });
-            if let Ok(keys) = keys {
+            if let Ok((keys, more)) = keys {
+                // Advance even if a downstream refusal clears a just-assigned
+                // hop. That row must wait for another generation, not this pass.
+                if let Some(last) = keys.last() {
+                    self.mesh_forward_cursor = Some((route_generation, last.clone()));
+                }
                 for key in keys {
                     let record = with_store(|store| {
                         store
@@ -741,7 +760,10 @@ impl App {
                         self.emit_mesh_wake(&next.node);
                     }
                 }
-                self.mesh_forward_generation = Some(route_generation);
+                if !more {
+                    self.mesh_forward_cursor = None;
+                    self.mesh_forward_generation = Some(route_generation);
+                }
             }
         }
         // Leave a worker available for new user sends when a retry edge stalls.

@@ -66,7 +66,15 @@ fn cross_host_send_and_boot_projection_preserve_exactly_one_inbox_import() {
     let mut fleet = fleet::spawn("mesh-deliver", PAIR);
     let recipient = agent(fleet.node("nodeb"));
     discover(&fleet, &recipient);
-    let sent = send(&fleet, &recipient, "delivered-once");
+    let sent = request(
+        fleet.node("nodea"),
+        "msg.send",
+        json!({
+            "to":{"type":"agent", "agent":recipient["agent_id"]},
+            "from_agent":agent(fleet.node("nodea"))["agent_id"], "from_host":"spoofed.example",
+            "body":"durable fleet mail", "correlation_id":"delivered-once", "intent":"fyi"
+        }),
+    );
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     assert_eq!(
         sent["result"]["message_key"]["message_id"]

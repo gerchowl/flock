@@ -329,7 +329,7 @@ fn incompatible_next_hop_refuses_new_acceptance_existing_custody_kept() {
 }
 
 fn reroute_after_refusal(tag: &str, looped: bool) {
-    let (mut fleet, sender, recipient) = setup(tag, CHAIN);
+    let (fleet, sender, recipient) = setup(tag, CHAIN);
     let capture = fleet.base.join("capture-delivery-nodea-nodeb");
     std::fs::write(&capture, "").unwrap();
     send(&fleet, &sender, &recipient, "reroute");
@@ -367,9 +367,11 @@ fn reroute_after_refusal(tag: &str, looped: bool) {
         "same route retried without a generation change"
     );
     std::fs::remove_file(replay).unwrap();
-    // A new authenticated topology after restart triggers route reevaluation.
-    fleet.node_mut("nodeb").restart();
-    fleet.node_mut("nodea").restart();
+    // Withdraw and restore a live edge without resetting app generation state.
+    fleet.refuse_edge("nodeb", "nodec");
+    fleet.kill_edge("nodeb", "nodec", WAIT);
+    fleet.wait_route("nodea", "nodec", false);
+    fleet.allow_edge("nodeb", "nodec");
     fleet.wait_route("nodea", "nodec", true);
     read_once(&fleet, &recipient, "reroute");
 }
@@ -445,4 +447,92 @@ fn forwarded_request_is_collected_over_inbound_only_next_hop() {
     assert_eq!(response["result"]["state"], "queued", "{response}");
     read_once(&fleet, &recipient, "forwarded-held");
     row_state(fleet.node("nodeb"), "forwarded-held", "delivered");
+}
+
+#[test]
+fn offline_requests_do_not_starve_a_live_route_generation() {
+    let (fleet, sender, offline) = setup(
+        "forward-window",
+        &[
+            NodeSpec::new("nodea", "window-a", &["nodeb", "nodec"]),
+            NodeSpec::new("nodeb", "window-b", &[]),
+            NodeSpec::new("nodec", "window-c", &[]),
+        ],
+    );
+    let recipient = api(
+        fleet.node("nodeb"),
+        "agent.start",
+        json!({
+            "name":"window", "argv":["/bin/sh"], "cwd":fleet.node("nodeb").repo
+        }),
+    )["result"]["agent"]
+        .clone();
+    fleet.wait_route("nodea", "nodeb", true);
+    fleet::wait_until("second owner discovery", WAIT, || {
+        api(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
+            .as_array()?
+            .iter()
+            .any(|row| row["agent_id"] == recipient["agent_id"])
+            .then_some(())
+    });
+    for target in ["nodeb", "nodec"] {
+        fleet.refuse_edge("nodea", target);
+        fleet.kill_edge("nodea", target, WAIT);
+        fleet.wait_route("nodea", target, false);
+    }
+    for index in 0..100 {
+        let response = send(&fleet, &sender, &offline, &format!("offline-{index}"));
+        assert_eq!(response["result"]["state"], "queued", "{response}");
+        assert_eq!(response["result"]["path"], "queued");
+    }
+    assert_eq!(
+        send(&fleet, &sender, &recipient, "later")["result"]["state"],
+        "queued"
+    );
+    fleet.allow_edge("nodea", "nodeb");
+    fleet.wait_route("nodea", "nodeb", true);
+    fleet::wait_until("later request routed live", WAIT, || {
+        let response = api(
+            fleet.node("nodeb"),
+            "msg.read",
+            json!({"pane":recipient["pane_id"]}),
+        );
+        response["result"]["messages"]
+            .as_array()?
+            .iter()
+            .any(|message| message["correlation_id"] == "later")
+            .then_some(())
+    });
+    let queued: i64 = db(fleet.node("nodea")).query_row(
+        "SELECT count(*) FROM envelopes WHERE correlation LIKE 'offline-%' AND state='custody' AND next_hop=''",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(queued, 100);
+}
+
+#[test]
+fn configured_origin_name_is_accepted_by_forwarded_policy() {
+    let (fleet, sender, recipient) = setup(
+        "forward-allowed",
+        &[
+            CHAIN[0].clone(),
+            CHAIN[1].clone(),
+            NodeSpec::new("nodec", "allowed-c", &["nodea"])
+                .with_config("[msg]\nallow_from = [\"nodea\"]\n"),
+        ],
+    );
+    // C knows the origin by its configured pin, but A still sends via B.
+    fleet.wait_route("nodec", "nodea", true);
+    fleet.refuse_edge("nodec", "nodea");
+    fleet.kill_edge("nodec", "nodea", WAIT);
+    fleet::wait_until("forwarded route after direct withdrawal", WAIT, || {
+        let enrollment = api(fleet.node("nodea"), "peers.enrollment", json!({}));
+        enrollment["result"]["routes"]
+            .as_array()?
+            .iter()
+            .any(|route| route["node"] == fleet.node_id("nodec") && route["hops"] == 2)
+            .then_some(())
+    });
+    let response = send(&fleet, &sender, &recipient, "allowed");
+    assert_eq!(response["result"]["path"], "via nodeb", "{response}");
+    read_once(&fleet, &recipient, "allowed");
 }

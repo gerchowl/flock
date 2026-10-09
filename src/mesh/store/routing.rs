@@ -248,8 +248,39 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
+    /// Offline owners, answers and receipts cannot occupy the request window.
+    pub fn routable_requests(
+        &mut self,
+        targets: &[String],
+        after: Option<&MessageKey>,
+        limit: usize,
+    ) -> Result<(Vec<MessageKey>, bool)> {
+        let targets = serde_json::to_string(targets)?;
+        let (origin, id) = after
+            .map(|key| (key.origin_node.as_str(), key.message_id.as_str()))
+            .unwrap_or(("", ""));
+        let condition = "next_hop='' AND state IN ('custody','held') AND kind='message'
+            AND request_origin IS NULL AND recipient_node IN (SELECT value FROM json_each(?1))
+            AND (origin,id) > (?2,?3)";
+        let keys = self.routing_keys(
+            &format!("SELECT origin,id,rowid FROM envelopes WHERE {condition} ORDER BY origin,id LIMIT ?4"),
+            params![targets, origin, id, limit.min(256) as i64],
+        )?;
+        let (origin, id) = keys
+            .last()
+            .map(|key| (key.origin_node.as_str(), key.message_id.as_str()))
+            .unwrap_or((origin, id));
+        let more = self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
+            params![targets, origin, id],
+            |r| r.get(0),
+        )?;
+        Ok((keys, more))
+    }
+
     /// Inspect unrouted custody without leasing or advancing its clock.
     /// Malformed rows alone are quarantined so they cannot stall this window.
+    #[cfg(test)]
     pub fn unrouted(&mut self, limit: usize) -> Result<Vec<MessageKey>> {
         let keys = self.routing_keys("SELECT origin,id,rowid FROM envelopes WHERE next_hop='' AND state IN ('custody','held') ORDER BY origin,id LIMIT ?1", [limit.min(500) as i64])?;
         let wall = self.clock()?.wall_ms;

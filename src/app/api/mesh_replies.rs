@@ -137,7 +137,7 @@ impl App {
         } else if let Some(peer) = push_peer {
             let send = crate::app::message_relay::RelaySend {
                 mesh: Deliver {
-                    hops_left: 8,
+                    hops_left: crate::mesh::delivery::hop_limit(),
                     visited: vec![origin.clone()],
                     envelope: answer.clone(),
                     remaining_ms: CUSTODY_TTL_MS,
@@ -599,5 +599,68 @@ impl App {
             self.project_mesh_answer(data.message);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn correctly_signed_answer_with_wrong_token_reaches_reply_binding_check() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let signer = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = signer.node_id();
+        app.node_id = Some(original.key.origin_node.clone());
+        with_store(|store| {
+            store
+                .accept(
+                    &original,
+                    CUSTODY_TTL_MS,
+                    crate::mesh::store::Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let mut answer = original.clone();
+        answer.key = crate::mesh::key::MessageKey::mint(signer.node_id(), now_ms()).unwrap();
+        answer.request_key = Some(original.key.clone());
+        answer.target_agent = original.sender.clone();
+        answer.in_reply_to = Some(original.correlation_id.clone());
+        answer.return_binding.request = answer.key.clone();
+        answer.return_binding.recipient_node = original.key.origin_node.clone();
+        answer.return_binding.collection_token[0] ^= 1;
+        crate::mesh::sign::seal(&mut answer, &signer);
+        assert_eq!(crate::mesh::sign::verify(&answer), Ok(()));
+        let mut delivery = Deliver {
+            visited: vec![signer.node_id()],
+            hops_left: 8,
+            envelope: answer,
+            remaining_ms: CUSTODY_TTL_MS,
+        };
+        assert_eq!(
+            app.import_mesh_answer(&original.key, &delivery, None),
+            Err("invalid reply binding".into())
+        );
+        // With only the token corrected, binding validation succeeds and the
+        // intentionally non-payload fixture body reaches the payload decoder.
+        delivery.envelope.return_binding.collection_token =
+            original.return_binding.collection_token;
+        crate::mesh::sign::seal(&mut delivery.envelope, &signer);
+        let error = app
+            .import_mesh_answer(&original.key, &delivery, None)
+            .unwrap_err();
+        assert_ne!(error, "invalid reply binding");
+        assert_ne!(error, "invalid_signature");
     }
 }
