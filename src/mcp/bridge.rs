@@ -167,6 +167,13 @@ fn extract_flock_result(mut raw: Value) -> Result<Value, McpError> {
         .get_mut("result")
         .map(Value::take)
         .unwrap_or(Value::Null);
+    if let Some(code) = crate::api::effect_exit_code(&result) {
+        return Err(McpError {
+            code,
+            message: result["outcome"].as_str().unwrap_or_default().to_owned(),
+            data: Some(result),
+        });
+    }
     Ok(result)
 }
 
@@ -196,6 +203,41 @@ mod tests {
         fn call(&self, method: Method) -> Result<Value, ApiClientError> {
             self.calls.borrow_mut().push(method);
             Ok(self.response.clone())
+        }
+    }
+
+    #[test]
+    fn send_outcomes_match_cli_and_mcp_with_evidence() {
+        for (outcome, code) in [
+            ("delivered", 0),
+            ("accepted", 0),
+            ("observed_accepted", 0),
+            ("unconfirmed", 8),
+            ("abandoned", 9),
+        ] {
+            let result = json!({"type":"guarded_submit", "outcome":outcome,
+                "reason":"test_evidence", "attempt":{"state":outcome}});
+            let raw = json!({"result":result});
+            assert_eq!(crate::cli::print_response(&raw).unwrap(), code);
+            let flock = MockApi::ok(raw);
+            let response = route(
+                "tools/call",
+                json!({"name":"flock_pane_submit",
+                "arguments":{"pane_id":"1-1","text":"hello"}}),
+                &flock,
+                &ChannelOptions::off(),
+            );
+            if code == 0 {
+                let response = response.unwrap();
+                let content: Value =
+                    serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(content, result);
+            } else {
+                let error = response.unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.message, outcome);
+                assert_eq!(error.data, Some(result));
+            }
         }
     }
 

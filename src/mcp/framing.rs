@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 /// request), `-32601` (method not found), `-32602` (invalid params), and
 /// `-32000` (implementation-defined server error — the bucket the design
 /// dedicates to flock refusals, tagged with `data.refusal = <flock code>`).
+/// Effect failures use CLI codes `8` and `9`, with the complete result in `data`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct McpError {
     pub code: i32,
