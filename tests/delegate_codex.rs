@@ -863,24 +863,31 @@ fn guarded_submit_first_enter_works_with_late_composer_repaint() {
 
 #[test]
 fn guarded_submit_codex_waits_for_footer_after_partial_repaint() {
-    guarded_socket_repaint("codex", false, true, 600);
+    guarded_socket_repaint("codex", false, true, 600, false);
 }
 
 #[test]
-fn guarded_submit_codex_missing_footer_expires_without_enter() {
-    guarded_socket_repaint("codex", false, true, 3000);
+fn guarded_submit_codex_missing_footer_refuses_before_typing() {
+    guarded_socket_repaint("codex", false, true, 0, true);
 }
 
 fn guarded_socket(kind: &str, slow: bool, first_works: bool) {
-    guarded_socket_repaint(kind, slow, first_works, 0);
+    guarded_socket_repaint(kind, slow, first_works, 0, false);
 }
 
-fn guarded_socket_repaint(kind: &str, slow: bool, first_works: bool, footer_delay_ms: u64) {
+fn guarded_socket_repaint(
+    kind: &str,
+    slow: bool,
+    first_works: bool,
+    footer_delay_ms: u64,
+    missing_footer: bool,
+) {
     let server = start_server();
     let script = r#"import os, sys, tty, time
 from pathlib import Path
 tty.setraw(0)
 log = Path(__file__).parent.parent / 'guarded-bytes'
+log.write_bytes(b'')
 text = b''
 enters = 0
 paste = False
@@ -891,7 +898,11 @@ def draw(working=False):
     sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n' + chrome + '› ' + body + '\r\n  ? for shortcuts\r\n')
     sys.stdout.flush()
 sys.stdout.write('\x1b[?2004h')
-draw()
+if (log.parent / 'missing-footer').exists():
+    sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› hello\r\n')
+    sys.stdout.flush()
+else:
+    draw()
 if (log.parent / 'slow-reader').exists():
     while not (log.parent / 'idle-detected').exists(): time.sleep(0.01)
     time.sleep(0.35)
@@ -908,12 +919,7 @@ while True:
             if delay_file.exists():
                 sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› ' + text.decode() + '\r\n')
                 sys.stdout.flush()
-                delay = float(delay_file.read_text())
-                if delay > 2000:
-                    while not (log.parent / 'footer-observed').exists(): time.sleep(0.01)
-                    while not (log.parent / 'release-footer').exists(): time.sleep(0.01)
-                else:
-                    time.sleep(delay / 1000)
+                time.sleep(float(delay_file.read_text()) / 1000)
             draw()
         continue
     if byte == b'\r' and not paste:
@@ -945,6 +951,9 @@ while True:
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    if missing_footer {
+        fs::write(server.base.join("missing-footer"), "").unwrap();
+    }
     if footer_delay_ms > 0 {
         fs::write(
             server.base.join("footer-delay"),
@@ -987,7 +996,9 @@ while True:
         ],
     );
     assert!(capture.status.success(), "{}", stderr(&capture));
-    assert!(stdout(&capture).contains(if kind == "opencode" {
+    assert!(stdout(&capture).contains(if missing_footer {
+        "› hello"
+    } else if kind == "opencode" {
         "commands"
     } else {
         "? for shortcuts"
@@ -1003,9 +1014,9 @@ while True:
     let submit = serde_json::json!({
         "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
     });
-    let response = if footer_delay_ms > 2000 {
-        let mut stream = UnixStream::connect(&server.socket).unwrap();
-        writeln!(stream, "{submit}").unwrap();
+    if missing_footer {
+        // Observe the partial FIRST frame before issuing submit. There is no
+        // earlier empty editor that could authorize Enter if PTY reads lag.
         let deadline = Instant::now() + WITHIN;
         loop {
             let screen = request(
@@ -1027,30 +1038,14 @@ while True:
             );
             thread::sleep(Duration::from_millis(10));
         }
-        fs::write(server.base.join("footer-observed"), "").unwrap();
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).unwrap();
-        serde_json::from_str::<serde_json::Value>(&line).unwrap()
-    } else {
-        request(&server, &submit.to_string())
-    };
-    if footer_delay_ms > 2000 {
-        assert_eq!(response["result"]["outcome"], "unconfirmed", "{response}");
-        assert!(
-            response["result"]["attempt"]["submit_sent_at_ms"].is_null(),
-            "{response}"
-        );
-        assert_eq!(
-            response["result"]["reason"], "owned_composer_not_visible",
-            "{response}"
-        );
-        assert_eq!(
-            fs::read(server.base.join("guarded-bytes")).unwrap(),
-            b"\x1b[200~hello\x1b[201~"
-        );
-        fs::write(server.base.join("release-footer"), "").unwrap();
+        let response = request(&server, &submit.to_string());
+        assert_eq!(response["error"]["code"], "unknown_composer", "{response}");
+        assert!(fs::read(server.base.join("guarded-bytes"))
+            .unwrap()
+            .is_empty());
         return;
     }
+    let response = request(&server, &submit.to_string());
     assert_eq!(
         response["result"]["outcome"], "observed_accepted",
         "{response}"
