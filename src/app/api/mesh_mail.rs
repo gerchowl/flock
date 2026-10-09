@@ -189,16 +189,13 @@ impl App {
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
-        if !self.uplink.is_relay(
-            self.current_api_peer_pid,
-            crate::platform::process_start_time,
-        ) || self.uplink.enrolled_hub().is_none()
-        {
-            return Err("mesh delivery requires an authenticated held edge".into());
-        }
         let edge = self
-            .mesh_inbound
-            .as_ref()
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .map(|edge| &edge.enrollment)
             .filter(|edge| edge.state == "pinned")
             .ok_or("mesh edge is not enrolled")?;
         let envelope = &delivery.envelope;

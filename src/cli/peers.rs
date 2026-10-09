@@ -680,45 +680,6 @@ fn start_summary_push(socket: std::path::PathBuf) {
     });
 }
 
-/// Bind this relay to the local server's uplink (`peers.relay_attach`), so the
-/// relay methods it and the hub use are accepted from this process and no
-/// other. Retried while an older relay that is still alive holds the binding
-/// — the hub's previous connection winding down. Missing servers return an
-/// error immediately so the hello caller can reconnect with transient backoff.
-fn attach_relay(socket: &std::path::Path) -> std::io::Result<bool> {
-    let request = serde_json::json!({
-        "id": "relay-attach",
-        "method": "peers.relay_attach",
-        "params": {},
-    });
-    let mut blocked_attempts: u64 = 0;
-    loop {
-        let line = relay_local_request(socket, &request)?;
-        let value: serde_json::Value =
-            serde_json::from_str(line.trim()).map_err(std::io::Error::other)?;
-        let Some(error) = value.get("error") else {
-            return Ok(true);
-        };
-        if error.get("code").and_then(|code| code.as_str()) == Some("relay_already_attached") {
-            // Never silently: another process holding the binding for long is
-            // either the hub's previous connection failing to die or a
-            // squatter, and either wants an operator's eyes. Logged on
-            // attempts 1, 2, 4, 8, … so a long hold stays a few lines.
-            blocked_attempts += 1;
-            if blocked_attempts.is_power_of_two() {
-                crate::logging::relay_attach_blocked(&error.to_string(), blocked_attempts);
-            }
-            std::thread::sleep(RELAY_ATTACH_RETRY);
-            continue;
-        }
-        crate::logging::relay_attach_refused(&error.to_string());
-        return Ok(false);
-    }
-}
-
-/// Pace attachment retries while an older relay still owns the binding.
-const RELAY_ATTACH_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// One request to this node's own socket, answered by one line.
 fn relay_local_request(
     socket: &std::path::Path,
@@ -863,13 +824,6 @@ fn relay_one_request(
         .and_then(|pid| crate::platform::process_start_time(pid).map(|started| (pid, started)));
     let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
     if parsed.as_ref().and_then(|v| v["method"].as_str()) == Some("mesh.hello") {
-        match attach_relay(socket) {
-            Ok(true) => {}
-            Ok(false) => {
-                return write_relay_error(&id, "relay_unavailable", "relay attachment refused")
-            }
-            Err(error) => return write_relay_error(&id, "no_local_server", &error.to_string()),
-        }
         *checked_server = None;
     } else if server.is_none() || *checked_server != server {
         let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});

@@ -140,10 +140,7 @@ pub enum Method {
     /// event hub rather than a poll — see [`MsgWaitReplyParams`].
     #[serde(rename = "msg.wait_reply")]
     MsgWaitReply(MsgWaitReplyParams),
-    /// #410: the hub's relay binds itself to this server's uplink. Every other
-    /// relay method is accepted only from the process that did.
-    #[serde(rename = "peers.relay_attach")]
-    PeersRelayAttach(EmptyParams),
+
     #[serde(rename = "mesh.hello")]
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.deliver")]
