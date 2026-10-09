@@ -1,3 +1,5 @@
+#[path = "mesh_collection/diagnostics.rs"]
+mod diagnostics;
 mod support;
 
 use serde_json::{json, Value};
@@ -815,14 +817,21 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
     database(fleet.node("nodea"))
         .execute("UPDATE envelopes SET collect_at=999999999", [])
         .unwrap();
+    let db = database(fleet.node("nodeb"));
+    let mut timeline = diagnostics::WriteTimeline::install(&db);
+    timeline.sample(&db, "before reply");
     std::fs::write(fleet.base.join("capture-delivery-nodeb-nodea"), "capture").unwrap();
     let response = reply(fleet.node("nodeb"), "push-fails", "held after refusal");
-    assert!(response.get("error").is_none(), "{response}");
-    let db = database(fleet.node("nodeb"));
+    timeline.sample(&db, "reply returned");
+    assert!(
+        response.get("error").is_none(),
+        "reply RPC failed: {response}"
+    );
     fleet::wait_until(
         "failed push returns to held",
         Duration::from_secs(5),
         || {
+            timeline.sample(&db, "waiting for held");
             (db.query_row(
                 "SELECT state FROM envelopes WHERE request_id IS NOT NULL",
                 [],
@@ -840,6 +849,7 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
         "question receipt marked sent",
         Duration::from_secs(10),
         || {
+            timeline.sample(&db, "waiting for receipt sent");
             db.query_row(
                 "SELECT receipt_sent IS NOT NULL FROM envelopes WHERE request_id IS NULL",
                 [],
@@ -849,18 +859,16 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
             .then_some(())
         },
     );
-    let version: i64 = db
-        .pragma_query_value(None, "data_version", |r| r.get(0))
-        .unwrap();
+    let version = timeline.sample(&db, "idle baseline");
     let idle = std::time::Instant::now();
     fleet::wait_until(
         "failed answer remains collect-only",
         Duration::from_secs(5),
         || {
             assert_eq!(
-                db.pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
-                    .unwrap(),
-                version
+                timeline.sample(&db, "idle observation"),
+                version,
+                "idle database committed after failed reply returned to held (see write timeline)"
             );
             assert_eq!(
                 db.query_row(
@@ -869,7 +877,8 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
                     |r| r.get::<_, i64>(0)
                 )
                 .unwrap(),
-                0
+                0,
+                "held reply acquired an idle retry lease (see write timeline)"
             );
             (idle.elapsed() >= Duration::from_secs(3)).then_some(())
         },
