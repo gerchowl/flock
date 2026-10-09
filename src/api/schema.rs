@@ -143,6 +143,8 @@ pub enum Method {
 
     #[serde(rename = "mesh.hello")]
     MeshHello(crate::mesh::hello::Hello),
+    #[serde(rename = "mesh.routes")]
+    MeshRoutes { adverts: Vec<serde_json::Value> },
     #[serde(rename = "mesh.deliver")]
     MeshDeliver(crate::mesh::delivery::Deliver),
     #[serde(rename = "mesh.collect")]
@@ -1738,6 +1740,8 @@ pub struct EventsSubscribeParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Subscription {
+    #[serde(rename = "mesh.routes_changed")]
+    MeshRoutesChanged {},
     #[serde(rename = "mesh.outbound_pending")]
     MeshOutboundPending {},
     #[serde(rename = "workspace.created")]
@@ -1923,6 +1927,7 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    MeshRoutesChanged,
     MeshOutboundPending,
     WorkspaceCreated,
     WorkspaceUpdated,
@@ -2042,7 +2047,7 @@ impl EventKind {
             | Self::NotificationFiled
             | Self::NotificationSeen
             | Self::FileHandedOver => true,
-            Self::PaneOutputChanged | Self::MeshOutboundPending => false,
+            Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
 }
@@ -2174,7 +2179,11 @@ pub enum ResponseResult {
         source: crate::mesh::store::PinSource,
         node_id: Option<String>,
     },
+    MeshRoutes {
+        adverts: Vec<crate::mesh::routes::Advert>,
+    },
     PeersEnrollment {
+        routes: Vec<crate::mesh::routes::Route>,
         peers: Vec<crate::mesh::hello::Enrollment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mesh_suspended_reason: Option<String>,
@@ -3047,6 +3056,7 @@ pub struct PaneAgentStatusChangedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    MeshRoutesChanged {},
     MeshOutboundPending {},
     WorkspaceCreated {
         workspace: WorkspaceInfo,
@@ -3730,6 +3740,8 @@ pub struct PeersHubFleetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedFleetPeer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     /// Peer name (config-owned label on the origin's `[[peers]]`).
     pub name: String,
     /// SSH destination the ORIGIN uses to reach this peer.

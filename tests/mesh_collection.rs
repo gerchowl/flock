@@ -692,14 +692,22 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
         .unwrap(),
         "held"
     );
-    let version: i64 = db
-        .pragma_query_value(None, "data_version", |r| r.get(0))
-        .unwrap();
+    // Initial route and directory discovery legitimately persist metadata.
+    // Finish both before measuring an otherwise idle custody database.
+    fleet::wait_until("route and owner discovery", Duration::from_secs(10), || {
+        let ready: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mesh_meta WHERE name='route_boot_ms') AND EXISTS(SELECT 1 FROM agent_owners WHERE agent_id=?1)",
+            [sender["agent_id"].as_str().unwrap()],
+            |r| r.get(0),
+        ).unwrap();
+        ready.then_some(())
+    });
+    let mut timeline = diagnostics::WriteTimeline::install(&db);
+    let version = timeline.sample(&db, "idle baseline");
     let idle = std::time::Instant::now();
     fleet::wait_until("three idle retry ticks", Duration::from_secs(5), || {
         assert_eq!(
-            db.pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
-                .unwrap(),
+            timeline.sample(&db, "idle"),
             version,
             "held mail must not commit retry leases on an idle target"
         );

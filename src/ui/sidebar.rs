@@ -4068,6 +4068,7 @@ mod tests {
         let relayed = |name: &str, host: Option<&str>, target: &str| {
             let mut entry =
                 crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                    node_id: None,
                     name: name.to_string(),
                     ssh_target: target.to_string(),
                     host: host.map(str::to_string),

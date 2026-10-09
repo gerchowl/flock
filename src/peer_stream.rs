@@ -155,6 +155,23 @@ fn push_kind(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn route_wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
+    static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    WAKES.get_or_init(Default::default)
+}
+
+pub(crate) fn take_route_wake(peer: &PeerConfig) -> bool {
+    route_wake_registry()
+        .lock()
+        .ok()
+        .and_then(|wakes| {
+            wakes
+                .get(&peer.name)
+                .map(|wake| wake.swap(false, std::sync::atomic::Ordering::AcqRel))
+        })
+        .unwrap_or(false)
+}
+
 fn wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
     static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
     WAKES.get_or_init(Default::default)
@@ -197,6 +214,15 @@ fn route_relay_lines<R: BufRead>(
         if line_is_push(&line) {
             if push_kind(&line).as_deref() == Some("mesh.wake") {
                 if let Ok(mut wakes) = wake_registry().lock() {
+                    wakes
+                        .entry(peer.into())
+                        .or_default()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
+            if push_kind(&line).as_deref() == Some("mesh.routes_changed") {
+                if let Ok(mut wakes) = route_wake_registry().lock() {
                     wakes
                         .entry(peer.into())
                         .or_default()
@@ -272,8 +298,9 @@ impl PeerStream {
         let latest_push = Arc::new(Mutex::new(None));
         let push_slot = Arc::clone(&latest_push);
         let reader_peer = peer.name.clone();
+        let epoch = register_reader(&reader_peer);
         std::thread::spawn(move || {
-            route_relay_lines(&reader_peer, BufReader::new(stdout), &tx, &push_slot);
+            route_registered_lines(&reader_peer, epoch, BufReader::new(stdout), &tx, &push_slot);
         });
         Ok(Self {
             child,
@@ -512,6 +539,62 @@ fn enrollments() -> &'static Enrollments {
     STATUS.get_or_init(Default::default)
 }
 
+fn reader_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    static EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    EPOCHS.get_or_init(Default::default)
+}
+
+fn register_reader(peer: &str) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let epoch = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut readers) = reader_epochs().lock() {
+        readers.insert(peer.into(), epoch);
+    }
+    epoch
+}
+
+fn route_registered_lines<R: BufRead>(
+    peer: &str,
+    epoch: u64,
+    reader: R,
+    responses: &std::sync::mpsc::Sender<String>,
+    push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
+) {
+    route_relay_lines(peer, reader, responses, push_slot);
+    // An old reader may finish after its replacement has already enrolled.
+    if let Ok(mut readers) = reader_epochs().lock() {
+        if readers.get(peer) == Some(&epoch) {
+            readers.remove(peer);
+            note_closed_edge(peer);
+        }
+    }
+}
+
+fn closed_edges() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static CLOSED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    CLOSED.get_or_init(Default::default)
+}
+
+fn note_closed_edge(peer: &str) {
+    if let Ok(mut closed) = closed_edges().lock() {
+        closed.insert(peer.into());
+    }
+    if let Ok(mut statuses) = enrollments().lock() {
+        if let Some((status, _)) = statuses.get_mut(peer) {
+            if status.state == "pinned" {
+                status.state = "retrying".into();
+            }
+        }
+    }
+}
+
+pub(crate) fn take_closed_edges() -> Vec<String> {
+    closed_edges()
+        .lock()
+        .map(|mut closed| std::mem::take(&mut *closed).into_iter().collect())
+        .unwrap_or_default()
+}
+
 static ENROLLMENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn enrollment_generation() -> u64 {
@@ -532,6 +615,9 @@ fn set_enrollment(peer: &PeerConfig, result: Result<String, EnrollmentError>) {
         ),
     };
     let enrolled = node_id.is_some();
+    if !enrolled {
+        note_closed_edge(&peer.name);
+    }
     if let Ok(mut statuses) = enrollments().lock() {
         let previous = statuses.get(&peer.name).and_then(|s| s.0.node_id.clone());
         let generation = if enrolled {
@@ -585,6 +671,7 @@ pub(crate) fn peer_enrollment_generation(peer: &PeerConfig) -> u64 {
 }
 
 pub(crate) fn reset_enrollment(peer: &str) {
+    note_closed_edge(peer);
     // Removing the registry entry avoids waiting on a worker that is itself
     // waiting for an API response from this loop.
     if let Ok(mut registry) = registry().lock() {
@@ -656,6 +743,7 @@ fn request_over(
         Ok(slot) => slot,
         Err(poisoned) => {
             let mut slot = poisoned.into_inner();
+            note_closed_edge(&peer.name);
             slot.stream = None;
             slot
         }
@@ -677,6 +765,7 @@ fn request_over(
     // held: without this, a still-reachable OLD target would keep answering
     // indefinitely because nothing forces the stream to be re-spawned.
     if slot.stream.is_some() && slot.target != peer.ssh_target() {
+        note_closed_edge(&peer.name);
         slot.stream = None;
     }
 
@@ -752,6 +841,7 @@ fn request_over(
             set_enrollment(peer, Err(EnrollmentError::transport(detail.clone())));
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
+            note_closed_edge(&peer.name);
             slot.stream = None;
             // A best-effort extra (#410 down-gossip, `spawn: false`) must not
             // cost the poll its connection for a whole backoff: the next poll
@@ -889,14 +979,17 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
 /// its peer is gone from config, or when its ssh destination changed — the two
 /// cases where the held connection no longer points where the config says.
 pub fn retain_configured(peers: &[PeerConfig]) {
-    if let Ok(mut wakes) = wake_registry().lock() {
-        wakes.retain(|name, _| peers.iter().any(|peer| &peer.name == name));
+    for registry in [route_wake_registry(), wake_registry()] {
+        if let Ok(mut wakes) = registry.lock() {
+            wakes.retain(|name, _| peers.iter().any(|peer| &peer.name == name));
+        }
     }
     let Ok(mut registry) = registry().lock() else {
         return;
     };
     registry.retain(|name, slot| {
         let Some(peer) = peers.iter().find(|peer| &peer.name == name) else {
+            note_closed_edge(name);
             return false;
         };
         // A slot that never connected has an empty target and no stream to
@@ -909,11 +1002,15 @@ pub fn retain_configured(peers: &[PeerConfig]) {
         // re-checks `target` against config under the lock it already holds,
         // so a moved peer reconnects there rather than waiting for the old
         // stream to happen to die.
-        match slot.try_lock() {
+        let retain = match slot.try_lock() {
             Ok(slot) => slot.stream.is_none() || slot.target == peer.ssh_target(),
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
+        };
+        if !retain {
+            note_closed_edge(name);
         }
+        retain
     });
 }
 
@@ -929,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_push_interleaved_with_a_response_disturbs_neither() {
+    fn both_wake_kinds_interleaved_with_responses_remain_independent() {
         let peer = crate::config::PeerConfig {
             name: "wake.example".into(),
             ..Default::default()
@@ -938,6 +1035,7 @@ mod tests {
         let slot = Arc::new(Mutex::new(None));
         let wire = concat!(
             "{\"id\":\"one\"}\n",
+            "{\"push\":\"mesh.routes_changed\"}\n",
             "{\"push\":\"mesh.wake\"}\n",
             "{\"push\":\"unknown\"}\n",
             "{\"id\":\"two\"}\n"
@@ -947,9 +1045,77 @@ mod tests {
             rx.try_iter().collect::<Vec<_>>(),
             vec![r#"{"id":"one"}"#, r#"{"id":"two"}"#]
         );
+        assert!(take_route_wake(&peer));
+        assert!(!take_route_wake(&peer));
         assert!(take_wake(&peer));
         assert!(!take_wake(&peer));
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn config_reload_retains_and_removes_both_wake_registries() {
+        let kept = peer("kept.example");
+        let removed = peer("removed.example");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let slot = Arc::new(Mutex::new(None));
+        let wire = "{\"push\":\"mesh.wake\"}\n{\"push\":\"mesh.routes_changed\"}\n";
+        for peer in [&kept, &removed] {
+            route_relay_lines(&peer.name, std::io::Cursor::new(wire), &tx, &slot);
+        }
+        retain_configured(std::slice::from_ref(&kept));
+        assert!(take_wake(&kept));
+        assert!(take_route_wake(&kept));
+        assert!(!take_wake(&removed));
+        assert!(!take_route_wake(&removed));
+        for registry in [wake_registry(), route_wake_registry()] {
+            assert!(registry.lock().unwrap().contains_key(&kept.name));
+            assert!(!registry.lock().unwrap().contains_key(&removed.name));
+        }
+    }
+
+    #[test]
+    fn eof_withdraws_a_quiet_enrolled_edge() {
+        let peer = peer("route-close.test");
+        set_enrollment(&peer, Ok("node".into()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        route_registered_lines(
+            &peer.name,
+            register_reader(&peer.name),
+            std::io::Cursor::new(""),
+            &tx,
+            &Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(enrollment(&peer).state, "retrying");
+        assert!(take_closed_edges().contains(&peer.name));
+        assert!(take_closed_edges().is_empty());
+    }
+
+    #[test]
+    fn old_reader_eof_does_not_withdraw_replacement_edge() {
+        let peer = peer("route-replaced.test");
+        let old = register_reader(&peer.name);
+        register_reader(&peer.name);
+        set_enrollment(&peer, Ok("node".into()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        route_registered_lines(
+            &peer.name,
+            old,
+            std::io::Cursor::new(""),
+            &tx,
+            &Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(enrollment(&peer).state, "pinned");
+        assert!(!take_closed_edges().contains(&peer.name));
+    }
+
+    #[test]
+    fn reset_and_refusal_queue_route_withdrawal() {
+        let peer = peer("route-reset.test");
+        set_enrollment(&peer, Ok("node".into()));
+        reset_enrollment(&peer.name);
+        assert!(take_closed_edges().contains(&peer.name));
+        set_enrollment(&peer, Err("refused".to_string().into()));
+        assert!(take_closed_edges().contains(&peer.name));
     }
 
     #[test]

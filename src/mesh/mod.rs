@@ -13,4 +13,5 @@ pub(crate) mod runtime_store;
 
 pub mod collect;
 
+pub mod routes;
 pub mod sign;

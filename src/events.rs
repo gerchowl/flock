@@ -281,6 +281,7 @@ pub enum AppEvent {
     WorktreeRemoveFinished(WorktreeRemoveResult),
     WorktreeKillGateFinished(WorktreeKillGateResult),
     /// A bounded collection job finished outside the app loop.
+    MeshRoutesCompleted(Box<crate::app::MeshRoutesCompletion>),
     MeshCollected(Box<crate::mesh::collect::Completion>),
     MsgRelayCompleted(Box<crate::app::message_relay::RelayCompletion>),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),

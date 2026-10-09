@@ -20,6 +20,8 @@ use crate::app::App;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentLocation {
     pub(crate) agent_id: String,
+    pub(crate) node: Option<String>,
+    pub(crate) live: bool,
     /// Short host name of the server the agent lives on.
     pub(crate) host: String,
     /// Public pane id **on that host**. Meaningless anywhere else.
@@ -69,6 +71,88 @@ impl App {
     pub(crate) fn locate_agent(&self, agent_id: &str) -> Option<AgentLocation> {
         self.locate_agent_locally(agent_id)
             .or_else(|| self.locate_agent_in_fleet(agent_id))
+            .or_else(|| self.locate_agent_owner_hint(agent_id))
+    }
+
+    fn locate_agent_owner_hint(&self, agent_id: &str) -> Option<AgentLocation> {
+        let owner = match crate::mesh::runtime_store::read(|store| {
+            store.owner(agent_id).map_err(|e| e.to_string())
+        }) {
+            Ok(owner) => owner.flatten()?,
+            Err(reason) => {
+                crate::logging::mesh_routing_failed("lookup_owner", "", &reason);
+                return None;
+            }
+        };
+        let route = crate::mesh::runtime_store::read(|store| {
+            for peer in &self.state.peers {
+                if store
+                    .get_pin(&peer.name)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|pin| pin.node_id == owner.node_id)
+                {
+                    return Ok(Some(peer.name.clone()));
+                }
+            }
+            Ok(None)
+        });
+        let route = match route {
+            Ok(route) => route.flatten(),
+            Err(reason) => {
+                crate::logging::mesh_routing_failed("lookup_owner_pin", "", &reason);
+                None
+            }
+        };
+        Some(AgentLocation {
+            agent_id: agent_id.into(),
+            node: Some(owner.node_id),
+            live: false,
+            host: route.clone().unwrap_or(owner.name),
+            pane_id: String::new(),
+            local: false,
+            direct: route.is_some(),
+            route,
+        })
+    }
+
+    /// Persist ownership changes, never on pause. Direct IDs match the peer pin.
+    /// Relayed IDs are claims made by the enrolled relayer.
+    pub(crate) fn note_mesh_owners(&self) {
+        if self.fleet_pause.paused {
+            return;
+        }
+        let entries = self.remote_agent_entries();
+        if !entries.iter().any(|e| e.location.node.is_some()) {
+            return;
+        }
+        let result = crate::mesh::hello::with_store(|store| {
+            let mut seen = std::collections::BTreeSet::new();
+            for entry in &entries {
+                let location = &entry.location;
+                if !seen.insert(&location.agent_id)
+                    || self.locate_agent_locally(&location.agent_id).is_some()
+                {
+                    continue;
+                }
+                if let Some(node) = &location.node {
+                    store
+                        .note_owner(
+                            &location.agent_id,
+                            node,
+                            &location.host,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64,
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(reason) = result {
+            crate::logging::mesh_routing_failed("note_owner", "", &reason);
+        }
     }
 
     fn locate_agent_locally(&self, agent_id: &str) -> Option<AgentLocation> {
@@ -82,6 +166,8 @@ impl App {
                         continue;
                     }
                     return Some(AgentLocation {
+                        node: self.node_id.clone(),
+                        live: true,
                         agent_id: agent_id.to_string(),
                         host: crate::app::short_host_name(),
                         pane_id: self.state.public_pane_id(ws_idx, *pane_id)?,
@@ -121,12 +207,18 @@ impl App {
         // borrow shape stays obvious.
         let mut entries = Vec::new();
         for peer in &self.state.peer_summaries {
+            let live = peer
+                .node_id
+                .as_deref()
+                .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             let route = Some(peer.peer.clone());
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
                         location: AgentLocation {
+                            node: peer.node_id.clone(),
+                            live,
                             agent_id: agent.agent_id.clone(),
                             host: host.clone(),
                             pane_id: agent.pane_id.clone(),
@@ -142,11 +234,17 @@ impl App {
         }
         for entry in self.state.relayed_fleet_cache.values() {
             let peer = &entry.peer;
+            let live = peer
+                .node_id
+                .as_deref()
+                .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
                         location: AgentLocation {
+                            node: peer.node_id.clone(),
+                            live,
                             agent_id: agent.agent_id.clone(),
                             host: host.clone(),
                             pane_id: agent.pane_id.clone(),

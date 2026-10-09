@@ -65,6 +65,11 @@ enrollment reports `unknown (server predates mesh; restart needed)`.
 `enrollment_reason`; `flk status --json` includes a `peers` array with the same
 `pin_origin` values: `dialed`, `inbound_first_contact`, or `unknown`.
 
+Each JSON peer row also includes `routes: [{node, name, next_hop, hops}]`
+for destinations reached through that peer. Routes use enrolled live edges in
+either direction and disappear when their path closes. Unpinned names are
+marked `(advertised)` with an eight-character node ID suffix.
+
 A node can accept up to 32 inbound relay edges. `peers status` lists each live
 inbound edge separately. Each edge authenticates its own identity; a second hub
 can connect without displacing the first. A newer handshake for the same node ID

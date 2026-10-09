@@ -3780,6 +3780,7 @@ mod tests {
     ) -> crate::peers::RelayedEntry {
         let mut entry =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                node_id: None,
                 dial: None,
                 name: host.into(),
                 ssh_target: format!("operator@{host}"),

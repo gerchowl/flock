@@ -331,6 +331,14 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
         .unwrap_or_default();
     let (enrollment, warning) = read_enrollment();
     if json {
+        let route_response = super::send_request(&Request {
+            id: "cli:peers:routes".into(),
+            method: Method::PeersEnrollment(EmptyParams {}),
+        })?;
+        let routes = route_response["result"]["routes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let mut values: Vec<serde_json::Value> = rows
             .iter()
             .map(serde_json::to_value)
@@ -349,6 +357,10 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
                     .last_mut()
                     .ok_or_else(|| std::io::Error::other("missing peer row"))?
             };
+            row["routes"] = serde_json::json!(routes
+                .iter()
+                .filter(|route| route["next_hop"].as_str() == status.node_id.as_deref())
+                .collect::<Vec<_>>());
             row["source"] = serde_json::json!(status.source);
             row["pin_origin"] = serde_json::json!(status.pin_origin);
             row["node_id"] = serde_json::json!(status.node_id);
@@ -630,15 +642,35 @@ fn start_summary_push(socket: std::path::PathBuf) {
         // has expired with an event still owed.
         let debounce = PushDebounce::default();
         let reader_debounce = debounce.clone();
+        let route_wake = PushDebounce::default();
+        let reader_route_wake = route_wake.clone();
         std::thread::spawn(move || {
-            for _ in reader.lines().map_while(Result::ok) {
-                reader_debounce.note_event();
+            for line in reader.lines().map_while(Result::ok) {
+                if serde_json::from_str::<serde_json::Value>(&line)
+                    .is_ok_and(|event| event["event"] == "mesh_routes_changed")
+                {
+                    reader_route_wake.note_event();
+                } else {
+                    reader_debounce.note_event();
+                }
             }
             reader_debounce.note_closed();
+            reader_route_wake.note_closed();
         });
 
         loop {
             std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+            if route_wake.take_due().is_some() {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                if out
+                    .write_all(b"{\"push\":\"mesh.routes_changed\"}\n")
+                    .is_err()
+                    || out.flush().is_err()
+                {
+                    return;
+                }
+            }
             let Some(coalesced) = debounce.take_due() else {
                 if debounce.is_finished() {
                     return;
@@ -672,7 +704,8 @@ fn start_summary_push(socket: std::path::PathBuf) {
             let push = serde_json::json!({ "push": "peers.summary", "result": result });
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            if writeln!(out, "{push}").is_err() || out.flush().is_err() {
+            let line = format!("{push}\n");
+            if out.write_all(line.as_bytes()).is_err() || out.flush().is_err() {
                 return;
             }
             drop(out);
@@ -687,7 +720,7 @@ fn start_mesh_wake_push(socket: std::path::PathBuf) {
         retry_mesh_wake_push(&socket, || {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            writeln!(out, "{{\"push\":\"mesh.wake\"}}")?;
+            out.write_all(b"{\"push\":\"mesh.wake\"}\n")?;
             out.flush()
         });
     });
@@ -872,7 +905,8 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// `events.subscribe` invalid — the server rejects it, this thread exits, and
 /// pushes silently never arrive, indistinguishable from a quiet node. That is
 /// only caught at runtime, against a live server.
-const PUSH_SUBSCRIPTIONS: [&str; 7] = [
+const PUSH_SUBSCRIPTIONS: [&str; 8] = [
+    "mesh.routes_changed",
     "workspace.created",
     "workspace.updated",
     "workspace.closed",
@@ -1068,6 +1102,7 @@ mod tests {
     #[test]
     fn peer_status_strips_control_sequences_from_remote_text() {
         let row = crate::api::schema::RelayedFleetPeer {
+            node_id: None,
             dial: Some(crate::api::schema::PeerDialReport {
                 reason: Some("auth_refused".into()),
                 consecutive_failures: 3,
@@ -1098,6 +1133,7 @@ mod tests {
 
     fn status_row(name: &str, error: Option<&str>) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            node_id: None,
             dial: None,
             name: name.into(),
             ssh_target: "atlas".into(),
