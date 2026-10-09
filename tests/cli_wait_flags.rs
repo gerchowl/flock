@@ -24,7 +24,10 @@
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
 #![allow(clippy::disallowed_methods)]
 
-use std::process::{Command, Output};
+mod support;
+
+use std::process::Output;
+use support::environment::Command;
 
 /// The usage-error code both wait verbs reserve for a flag they cannot accept.
 const USAGE_EXIT: i32 = 2;

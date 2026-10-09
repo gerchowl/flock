@@ -137,8 +137,29 @@ impl Node {
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let pid = child.process_id();
-            let _ = child.kill();
+            let group = pid.expect("fleet node pid") as i32;
+            // Edges deliberately own separate groups, so stop them while the
+            // server can still reap its ssh children, then stop the server.
+            kill_edges(
+                self.shim_dir.parent().unwrap(),
+                Some(&format!("{}-", self.name)),
+            );
+            unsafe {
+                libc::kill(-group, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            // The leader may already be gone while another group member lives.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
             let _ = child.wait();
+            kill_edges(
+                self.shim_dir.parent().unwrap(),
+                Some(&format!("{}-", self.name)),
+            );
             super::unregister_spawned_flock_pid(pid);
         }
         self._master = None;
@@ -212,7 +233,13 @@ impl Node {
         let outer_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{outer_path}", self.shim_dir.display()));
         super::environment::assert_pty_isolated(&cmd);
-        let child = pair.slave.spawn_command(cmd).unwrap();
+        let child = super::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
+        let pid = child.process_id().expect("fleet node pid") as i32;
+        assert_eq!(
+            unsafe { libc::getpgid(pid) },
+            pid,
+            "node owns its process group"
+        );
         register_spawned_flock_pid(child.process_id());
         drop(pair.slave);
         // Drain output so a full PTY cannot block a headless fixture server.
@@ -391,46 +418,63 @@ impl Fleet {
         })
     }
 
-    fn edge_pids(&self, prefix: Option<&str>) -> Vec<(PathBuf, i32)> {
-        let mut live = Vec::new();
-        for entry in fs::read_dir(self.base.join("edges"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".pending") || prefix.is_some_and(|p| !name.starts_with(p)) {
-                continue;
-            }
-            let pid = fs::read_to_string(entry.path())
-                .ok()
-                .and_then(|p| p.parse::<i32>().ok());
-            if let Some(pid) = pid.filter(|pid| *pid > 1) {
-                // A stale pid file must never authorize killing a reused pid.
-                // The unique script path identifies this fleet's ssh proxy.
-                let script = self.base.join("bin/ssh");
-                let ours = super::process_table::process_info(pid as u32)
-                    .is_ok_and(|info| info.argv.iter().any(|arg| Path::new(arg) == script));
-                if ours {
-                    live.push((entry.path(), pid));
-                    continue;
-                }
-            }
-            let _ = fs::remove_file(entry.path());
-        }
-        live
+    pub fn edge_pids(&self, prefix: Option<&str>) -> Vec<(PathBuf, i32)> {
+        edge_pids(&self.base, prefix)
     }
 
     fn kill_edges(&self, prefix: Option<&str>) -> usize {
-        let mut count = 0;
-        for (path, pid) in self.edge_pids(prefix) {
-            if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
-                count += 1;
-            }
-            let _ = fs::remove_file(path);
+        kill_edges(&self.base, prefix)
+    }
+
+    pub fn node_id(&self, name: &str) -> String {
+        node_id(self.node(name))
+    }
+
+    pub fn wait_route(&self, node: &str, target: &str, present: bool) {
+        let target_id = self.node_id(target);
+        wait_until("mesh route status", Duration::from_secs(30), || {
+            let response: serde_json::Value = serde_json::from_str(
+                &self
+                    .node(node)
+                    .api(r#"{"id":"route","method":"peers.enrollment","params":{}}"#),
+            )
+            .unwrap();
+            let routes = response["result"]["routes"]
+                .as_array()
+                .expect("wait_route requires slice 2e's peers.enrollment routes status");
+            (routes.iter().any(|route| route["node"] == target_id) == present).then_some(())
+        });
+    }
+
+    pub fn set_allow_from(&self, node: &str, list: &[&str]) {
+        let node = self.node(node);
+        for app in ["flock", "flock-dev"] {
+            let path = node.config_home.join(app).join("config.toml");
+            let mut config: toml::Value =
+                toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let table = config
+                .as_table_mut()
+                .unwrap()
+                .entry("msg")
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+            table.as_table_mut().unwrap().insert(
+                "allow_from".into(),
+                toml::Value::Array(
+                    list.iter()
+                        .map(|s| toml::Value::String((*s).into()))
+                        .collect(),
+                ),
+            );
+            fs::write(path, toml::to_string(&config).unwrap()).unwrap();
         }
-        count
+        let response: serde_json::Value = serde_json::from_str(
+            &node.api(r#"{"id":"reload","method":"server.reload_config","params":{}}"#),
+        )
+        .unwrap();
+        assert!(
+            response.get("result").is_some(),
+            "reload failed: {response}"
+        );
     }
 
     /// Make every new ssh dial to `name` fail with "Connection refused", as a
@@ -657,12 +701,28 @@ pub const HUB_SPOKES: &[NodeSpec] = &[
 /// Laptop dials a hub that dials an edge-less spoke.
 pub const LAPTOP_HUB_SPOKE: &[NodeSpec] = CHAIN_ABC;
 
-/// Two independent hubs can dial the same spoke (multi-edge enrollment is a
-/// later mesh slice, so this describes topology rather than promising success).
+/// Two independent hubs dial the same spoke using multi-edge enrollment.
 pub const TWO_HUBS: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &["nodec"]),
     NodeSpec::new("nodeb", "beta", &["nodec"]),
     NodeSpec::new("nodec", "gamma", &[]),
+];
+
+/// A dials B and C, both of which dial D: equal-length paths and a cycle.
+pub const MESH_DIAMOND: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "alpha", &["nodeb", "nodec"]),
+    NodeSpec::new("nodeb", "beta", &["noded.example"]),
+    NodeSpec::new("nodec", "gamma", &["noded.example"]),
+    NodeSpec::new("noded.example", "delta", &[]),
+];
+
+/// Laptop A dials hubs B and C, which both dial the edge-less spoke D.
+pub const LAPTOP_TWO_HUBS: &[NodeSpec] = MESH_DIAMOND;
+
+/// Only A can dial B. Traffic in either direction uses that held edge.
+pub const ONE_WAY_PAIR: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "alpha", &["nodeb"]),
+    NodeSpec::new("nodeb", "beta", &[]),
 ];
 
 /// Poll an observable condition up to a deadline. Each probe must itself be
@@ -1001,4 +1061,116 @@ pub fn click_row(stream: &mut UnixStream, row: usize, col: u16) {
         .expect("mouse press should send");
     super::send_input(stream, format!("\x1b[<0;{sgr_col};{sgr_row}m").as_bytes())
         .expect("mouse release should send");
+}
+
+#[derive(serde::Deserialize)]
+struct EdgeProcesses {
+    shim: i32,
+    relay: i32,
+}
+
+fn edge_records(base: &Path, prefix: Option<&str>) -> Vec<(PathBuf, EdgeProcesses)> {
+    let mut live = Vec::new();
+    for entry in fs::read_dir(base.join("edges"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".pending") || prefix.is_some_and(|p| !name.starts_with(p)) {
+            continue;
+        }
+        let record = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<EdgeProcesses>(&bytes).ok());
+        if let Some(record) = record.filter(|r| r.shim > 1 && r.relay > 1) {
+            // PeerStream can SIGKILL the shim before its finally block runs.
+            // The relay's unique environment marker still proves ownership.
+            if shim_is_ours(base, record.shim) || relay_is_ours(&entry.path(), record.relay) {
+                live.push((entry.path(), record));
+                continue;
+            }
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+    live
+}
+
+fn edge_pids(base: &Path, prefix: Option<&str>) -> Vec<(PathBuf, i32)> {
+    edge_records(base, prefix)
+        .into_iter()
+        .map(|(path, record)| (path, record.shim))
+        .collect()
+}
+
+pub fn group_members(group: i32) -> Vec<u32> {
+    super::process_table::list_process_ids()
+        .unwrap()
+        .into_iter()
+        .filter(|pid| unsafe { libc::getpgid(*pid as i32) } == group)
+        .collect()
+}
+
+fn shim_is_ours(base: &Path, pid: i32) -> bool {
+    let script = base.join("bin/ssh");
+    super::process_table::process_info(pid as u32)
+        .is_ok_and(|info| info.argv.iter().any(|arg| Path::new(arg) == script))
+}
+
+fn relay_is_ours(path: &Path, group: i32) -> bool {
+    let marker = format!("FLOCK_FLEET_EDGE={}", path.display());
+    group_members(group).iter().any(|pid| {
+        super::process_table::process_environment(*pid)
+            .is_ok_and(|vars| vars.iter().any(|v| v == &marker))
+    })
+}
+
+fn kill_edges(base: &Path, prefix: Option<&str>) -> usize {
+    let edges = edge_records(base, prefix);
+    for (path, edge) in &edges {
+        // An orphan's record does not authorize signaling a reused shim pid.
+        // When alive, the shim handles TERM and reaps the relay itself.
+        if shim_is_ours(base, edge.shim) {
+            unsafe {
+                libc::kill(edge.shim, libc::SIGTERM);
+            }
+        } else if relay_is_ours(path, edge.relay) {
+            unsafe {
+                libc::kill(-edge.relay, libc::SIGTERM);
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while edges
+        .iter()
+        .any(|(path, edge)| shim_is_ours(base, edge.shim) || relay_is_ours(path, edge.relay))
+        && Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    for (path, edge) in &edges {
+        if relay_is_ours(path, edge.relay) {
+            unsafe {
+                libc::kill(-edge.relay, libc::SIGKILL);
+            }
+        }
+        if shim_is_ours(base, edge.shim) {
+            unsafe {
+                libc::kill(-edge.shim, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_file(path);
+    }
+    edges.len()
+}
+
+pub fn node_id(node: &Node) -> String {
+    let response: serde_json::Value =
+        serde_json::from_str(&node.api(r#"{"id":"identity","method":"ping","params":{}}"#))
+            .unwrap();
+    response["result"]["capabilities"]["node_id"]
+        .as_str()
+        .expect("node identity")
+        .to_owned()
 }

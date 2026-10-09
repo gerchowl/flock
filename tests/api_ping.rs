@@ -179,7 +179,7 @@ fn spawn_flock_with_options(
     }
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
 
     SpawnedFlock {
@@ -251,7 +251,7 @@ impl JsonLineReader {
 // the harness spawning flock, which is the funnel's own subject.
 #[allow(clippy::disallowed_methods)]
 fn run_flk(socket_path: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
         .env("FLOCK_SOCKET_PATH", socket_path)
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")

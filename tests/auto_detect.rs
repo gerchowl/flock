@@ -16,10 +16,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde_json::Value;
@@ -153,7 +153,7 @@ fn spawn_server(
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -199,7 +199,7 @@ fn spawn_flock_auto(
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -251,7 +251,7 @@ fn spawn_flock_no_session(
     cmd.env_remove("FLOCK_AGENT_ID");
     cmd.env_remove("FLOCK_SESSION");
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -802,7 +802,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
     let server = SpawnedFlock {

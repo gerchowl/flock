@@ -123,7 +123,7 @@ fn spawn_server_with_env(
     }
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
         _master: pair.master,
@@ -164,7 +164,7 @@ fn spawn_named_session_server(
     cmd.env("SHELL", "/bin/sh");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
         _master: pair.master,
@@ -201,7 +201,7 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env("SHELL", "/bin/sh");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
         _master: pair.master,
@@ -1418,7 +1418,7 @@ fn assert_removed_config_refusal(args: &[&str]) {
                 fs::write(&overlay, settings).unwrap();
             }
             let source = if in_overlay { &overlay } else { &config };
-            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+            let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
             command.args(args);
             if args.contains(&"--handoff-import") {
                 command
@@ -1810,7 +1810,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             status["result"]["mesh_suspended_reason"],
             "injected mesh store open failure"
         );
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+        let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
             .args(["status", "--json"])
             .env("FLOCK_SOCKET_PATH", &api_socket)
             .envs(support::environment::isolated_env(
@@ -1892,7 +1892,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 "recovering store after handoff"
             );
             assert!(started.elapsed() < Duration::from_secs(1), "{status}");
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+            let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
                 .arg("status")
                 .env("FLOCK_SOCKET_PATH", &api_socket)
                 .envs(support::environment::isolated_env(
@@ -2029,7 +2029,7 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
     let socket = base.join("import.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+    let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("FLOCK_") {
             command.env_remove(key);
@@ -2087,7 +2087,7 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
     let api_socket = base.join("api.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+    let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("FLOCK_") {
             command.env_remove(key);
