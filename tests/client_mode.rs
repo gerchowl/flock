@@ -111,8 +111,8 @@ fn test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_client_process(
-    config_home: &PathBuf,
-    runtime_dir: &PathBuf,
+    config_home: &Path,
+    runtime_dir: &Path,
     api_socket_path: &PathBuf,
 ) -> SpawnedFlock {
     register_runtime_dir(runtime_dir);
@@ -128,13 +128,15 @@ fn spawn_client_process(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
@@ -146,8 +148,8 @@ fn spawn_client_process(
 }
 
 fn spawn_server(
-    config_home: &PathBuf,
-    runtime_dir: &PathBuf,
+    config_home: &Path,
+    runtime_dir: &Path,
     api_socket_path: &PathBuf,
     _client_socket_path: &PathBuf,
 ) -> SpawnedFlock {
@@ -171,13 +173,15 @@ fn spawn_server(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
@@ -503,13 +507,15 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", &config_home);
-    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", &api_socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
@@ -1186,7 +1192,9 @@ fn client_receives_notify_on_agent_state_change() {
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", &config_home);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     // app_dir_name() is "flock-dev" in debug builds, so the flock/config.toml
     // written above is NOT read; point FLOCK_CONFIG_PATH straight at it so the
     // [ui.toast]/[ui.sound] enables actually load. (This test needs sound ON; it
@@ -1198,6 +1206,7 @@ fn client_receives_notify_on_agent_state_change() {
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
@@ -1454,8 +1463,9 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
-    cmd.env("XDG_CONFIG_HOME", &config_home);
-    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", &api_socket);
     cmd.env("FLOCK_CLIENT_SOCKET_PATH", &client_socket);
     // Pretend a previous leg handed us a held terminal (the switch-handoff case).
@@ -1465,6 +1475,7 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
     cmd.env_remove("TMUX");
 
     let reader = pair.master.try_clone_reader().unwrap();
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     let pid = child.process_id();
     register_spawned_flock_pid(pid);

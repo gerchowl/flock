@@ -108,9 +108,10 @@ fn spawn_server_with_env(
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("FLOCK_SOCKET_PATH", api_socket);
     cmd.env(
         "FLOCK_CLIENT_SOCKET_PATH",
@@ -121,6 +122,7 @@ fn spawn_server_with_env(
         cmd.env(key, value);
     }
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
@@ -152,14 +154,16 @@ fn spawn_named_session_server(
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("FLOCK_SESSION", session_name);
     cmd.env_remove("FLOCK_SOCKET_PATH");
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
@@ -187,14 +191,16 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env_remove("FLOCK_SESSION");
     cmd.env_remove("FLOCK_SOCKET_PATH");
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
@@ -1574,8 +1580,10 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
             .args(["status", "--json"])
             .env("FLOCK_SOCKET_PATH", &api_socket)
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .envs(support::environment::isolated_env(
+                &config_home,
+                &runtime_dir,
+            ))
             .env("XDG_STATE_HOME", runtime_dir.join("state"))
             .output()
             .unwrap();
@@ -1700,20 +1708,21 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
             command.env_remove(key);
         }
     }
-    let mut child = command
+    command
         .args(["server", "--handoff-import"])
         .arg(&socket)
         .arg("stalled-peer-token")
-        .env("HOME", &base)
-        .env("XDG_CONFIG_HOME", base.join("config"))
+        .envs(support::environment::isolated_env(
+            &base.join("config"),
+            &base.join("runtime"),
+        ))
         .env("XDG_STATE_HOME", base.join("state"))
-        .env("XDG_RUNTIME_DIR", base.join("runtime"))
         .env("SHELL", "/bin/sh")
         .env("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS", "5000")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    support::environment::assert_command_isolated(&command);
+    let mut child = command.spawn().unwrap();
     register_spawned_flock_pid(Some(child.id()));
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut peer = None;
@@ -1757,22 +1766,23 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
             command.env_remove(key);
         }
     }
-    let mut child = command
+    command
         .args(["server", "--handoff-import"])
         .arg(&socket)
         .arg("late-commit-token")
-        .env("HOME", &base)
-        .env("SHELL", "/bin/sh")
-        .env("XDG_CONFIG_HOME", base.join("config"))
+        .envs(support::environment::isolated_env(
+            &base.join("config"),
+            &base.join("runtime"),
+        ))
         .env("XDG_STATE_HOME", base.join("state"))
-        .env("XDG_RUNTIME_DIR", base.join("runtime"))
+        .env("SHELL", "/bin/sh")
         .env("FLOCK_SOCKET_PATH", &api_socket)
         .env("FLOCK_CLIENT_SOCKET_PATH", base.join("client.sock"))
         .env("FLOCK_TEST_HANDOFF_IMPORT_TIMEOUT_MS", "5000")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::null());
+    support::environment::assert_command_isolated(&command);
+    let mut child = command.spawn().unwrap();
     register_spawned_flock_pid(Some(child.id()));
     let started = Instant::now();
     let peer = loop {

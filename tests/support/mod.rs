@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 pub mod fleet;
 pub mod process_table;
 
+pub mod environment;
+
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static INIT: Once = Once::new();
