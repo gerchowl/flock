@@ -1158,3 +1158,47 @@ fn spoke_custody_idle_pinned_peer_does_not_poll_every_second() {
         assert!(pair[1] - pair[0] >= 5.0, "{times:?}");
     }
 }
+
+#[test]
+fn spoke_custody_hub_busy_import_retries_without_refusal() {
+    let (fleet, mut alice, bob) = spoke_pair("h2busy", SPOKE_PAIR);
+    let hub_db = spoke_db(fleet.node("nodeb"));
+    hub_db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    spoke_send(&mut alice, &bob.agent_id);
+    let source_db = spoke_db(fleet.node("nodea"));
+    wait_for("second offer after hub busy import", GOSSIP_TIMEOUT, || {
+        let (state, attempts): (String, i64) = source_db
+            .query_row(
+                "SELECT state,collect_attempts FROM envelopes WHERE correlation='spoke-question'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "held", "a busy hub must not refuse custody");
+        (attempts >= 2).then_some(())
+    });
+    hub_db.execute_batch("ROLLBACK").unwrap();
+    // Bring the retry forward so this probe need not wait for the next backoff.
+    source_db
+        .execute(
+            "UPDATE envelopes SET retry_at=0 WHERE correlation='spoke-question'",
+            [],
+        )
+        .unwrap();
+    let messages = spoke_wait_mail(fleet.node("nodeb"), &bob.pane_id);
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    wait_for(
+        "successful ack after hub storage recovery",
+        GOSSIP_TIMEOUT,
+        || {
+            let state: String = source_db
+                .query_row(
+                    "SELECT state FROM envelopes WHERE correlation='spoke-question'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (state == "delivered" || state == "read").then_some(())
+        },
+    );
+}

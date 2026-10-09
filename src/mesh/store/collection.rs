@@ -377,9 +377,9 @@ impl<D: DiskSpace> Store<D> {
             }
         }
         for ack in &query.ack {
-            let record = self
-                .collection_record(&ack.key, wall_ms)?
-                .ok_or(Error::NotFound)?;
+            let Some(record) = self.collection_record(&ack.key, wall_ms)? else {
+                continue;
+            };
             if ack.key.origin_node != local
                 || record.envelope.request_key.is_some()
                 || record.envelope.return_binding.recipient_node != hub
@@ -440,15 +440,24 @@ impl<D: DiskSpace> Store<D> {
         for key in keys {
             if let Some(record) = self.collection_record(&key, wall_ms)? {
                 if record.remaining_ms > 0 {
-                    // Lease each offer with durable backoff, including lost acks and bad wire records.
-                    self.connection.execute("UPDATE envelopes SET retry_at=?3 + CASE WHEN collect_attempts=0 THEN 5000 WHEN collect_attempts=1 THEN 60000 ELSE 299000 END, collect_attempts=collect_attempts+1 WHERE origin=?1 AND id=?2",
-                        params![key.origin_node, key.message_id, now])?;
                     outbound.push(crate::mesh::delivery::Deliver {
                         envelope: record.envelope,
                         remaining_ms: record.remaining_ms,
                     });
                 }
             }
+        }
+        if !outbound.is_empty() {
+            // Lease the whole offer atomically, without writing on idle polls.
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for delivery in &outbound {
+                let key = &delivery.envelope.key;
+                tx.execute("UPDATE envelopes SET retry_at=?3 + CASE WHEN collect_attempts=0 THEN 5000 WHEN collect_attempts=1 THEN 60000 ELSE 299000 END, collect_attempts=collect_attempts+1 WHERE origin=?1 AND id=?2",
+                    params![key.origin_node, key.message_id, now])?;
+            }
+            tx.commit()?;
         }
         Ok(outbound)
     }
