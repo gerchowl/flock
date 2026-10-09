@@ -78,6 +78,7 @@ impl<D: DiskSpace> Store<D> {
             wall_ms,
             false,
             Some((hops_left, visited, next_hop)),
+            None,
         )
     }
 

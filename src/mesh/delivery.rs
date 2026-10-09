@@ -79,6 +79,7 @@ fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
     let permanent = matches!(
         reason.split(':').next().unwrap_or(reason),
         "forward_limit"
+            | "recipient_gone"
             | "msg_not_allowed"
             | "origin_mismatch"
             | "invalid_envelope"
@@ -131,6 +132,7 @@ mod tests {
             .starts_with("reply_unavailable:"));
         for reason in [
             "forward_limit",
+            "recipient_gone",
             "msg_not_allowed",
             "origin_mismatch",
             "message_not_found",

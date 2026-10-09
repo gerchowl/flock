@@ -314,7 +314,7 @@ async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing(
         .unwrap()
         .argv
         .contains(&"restart-session".into()));
-    assert_eq!(reported_status(&mut rig), "hibernated");
+    assert_eq!(reported_status(&mut rig), "offline");
     let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
     assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
 }
@@ -818,7 +818,7 @@ async fn restart_failed_live_verification_can_retry_after_process_exits() {
         .unwrap()
         .restart_retry
         .is_none());
-    assert_eq!(reported_status(&mut rig), "hibernated");
+    assert_eq!(reported_status(&mut rig), "offline");
     let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
     assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
 }

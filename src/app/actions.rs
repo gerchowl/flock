@@ -2753,6 +2753,17 @@ impl AppState {
                 .floats
                 .values()
                 .any(|float| float.terminal_id == terminal_id);
+            if !still_attached {
+                if let Some(removal) = self.terminals.get(&terminal_id).and_then(|terminal| {
+                    super::agent_removal::capture(
+                        terminal,
+                        super::agent_removal::RemovalEvent::Close,
+                    )
+                }) {
+                    self.pending_ui_events
+                        .push(super::state::PendingUiEvent::AgentRemoved(removal));
+                }
+            }
             if !still_attached
                 && self.terminals.remove(&terminal_id).is_some()
                 && !self.terminal_runtime_shutdowns.contains(&terminal_id)

@@ -141,6 +141,7 @@ impl ReapFold {
                     AgentStatus::Working
                         | AgentStatus::Blocked
                         | AgentStatus::Hibernated
+                        | AgentStatus::Offline
                         | AgentStatus::Unknown
                 ) {
                     return false;

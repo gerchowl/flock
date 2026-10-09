@@ -93,6 +93,9 @@ pub(super) fn pane_agent_status_from_terminal(
     terminal: &crate::terminal::TerminalState,
     seen: bool,
 ) -> crate::api::schema::AgentStatus {
+    if terminal.resume_failed {
+        return crate::api::schema::AgentStatus::Offline;
+    }
     if terminal.hibernated_resume_plan.is_some() {
         return crate::api::schema::AgentStatus::Hibernated;
     }

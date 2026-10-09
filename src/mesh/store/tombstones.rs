@@ -7,6 +7,36 @@ impl<D: DiskSpace> Store<D> {
         Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_tombstones WHERE agent_id=?1 AND session=?2 AND until>?3)", params![agent, session, now], |r| r.get(0))?)
     }
 
+    /// Used for new sends whose discovery data has no native session binding.
+    pub fn agent_removed(&self, agent: &str, wall_ms: i64) -> Result<bool> {
+        let now = self.clock()?.advance(wall_ms);
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_tombstones WHERE agent_id=?1 AND until>?2)",
+            params![agent, now],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Backfill an old inbox against the terminal restored from the same snapshot.
+    pub fn bind_local_recipient(
+        &mut self,
+        key: &MessageKey,
+        agent: &str,
+        session: &str,
+    ) -> Result<()> {
+        let bound: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_recipients WHERE origin=?1 AND id=?2)",
+            params![key.origin_node, key.message_id],
+            |r| r.get(0),
+        )?;
+        if !bound {
+            self.connection.execute(
+                "INSERT INTO local_recipients SELECT origin,id,?3,?4 FROM envelopes WHERE origin=?1 AND id=?2 AND state='inbox' AND request_origin IS NULL",
+                params![key.origin_node,key.message_id,agent,session])?;
+        }
+        Ok(())
+    }
+
     pub fn tombstone(
         &mut self,
         agent: &str,
@@ -35,7 +65,7 @@ impl<D: DiskSpace> Store<D> {
         let mut affected = Vec::new();
         let mut bad_rows = Vec::new();
         {
-            let mut statement = tx.prepare("SELECT rowid,origin,id,metadata FROM envelopes WHERE state IN ('inbox','custody','held') AND (next_hop='' OR next_hop=?1)")?;
+            let mut statement = tx.prepare("SELECT e.rowid,e.origin,e.id,e.metadata,r.agent,r.session,e.body,e.state FROM envelopes e LEFT JOIN local_recipients r USING(origin,id) WHERE e.state IN ('inbox','custody','held') AND (e.next_hop='' OR e.next_hop=?1)")?;
             let mut rows = statement.query([&self.local_node])?;
             while let Some(row) = rows.next()? {
                 let decoded = (|| -> Result<(MessageKey, Envelope)> {
@@ -50,12 +80,28 @@ impl<D: DiskSpace> Store<D> {
                     Ok((key, envelope))
                 })();
                 match decoded {
-                    Ok((key, envelope))
-                        if envelope.target_agent == agent && envelope.target_session == session =>
-                    {
-                        affected.push(key)
+                    Ok((key, envelope)) => {
+                        let binding: Option<String> = row.get(4)?;
+                        let bound_session: Option<String> = row.get(5)?;
+                        let matches = binding.as_deref().map_or(
+                            envelope.target_agent == agent && envelope.target_session == session,
+                            |bound| bound == agent && bound_session.as_deref() == Some(session),
+                        );
+                        // Old outbound rows can have neither recipient_node nor next_hop.
+                        // A local origin does not make their remote target a local recipient.
+                        let outbound = key.origin_node == self.local_node
+                            && row.get::<_, String>(7)? != "inbox"
+                            && binding.is_none()
+                            && (envelope.return_binding.recipient_node != self.local_node
+                                || serde_json::from_slice::<serde_json::Value>(
+                                    &row.get::<_, Vec<u8>>(6)?,
+                                )
+                                .ok()
+                                .is_some_and(|body| body["peer"].is_string()));
+                        if matches && !outbound && envelope.request_key.is_none() {
+                            affected.push(key);
+                        }
                     }
-                    Ok(_) => (),
                     Err(_) => bad_rows.push(row.get::<_, i64>(0)?),
                 }
             }

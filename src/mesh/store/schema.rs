@@ -21,6 +21,7 @@ pub(super) fn migrate(
 ) -> Result<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     check_version(&tx)?;
+    tx.execute_batch(LOCAL_RECIPIENTS)?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS mesh_meta (name TEXT PRIMARY KEY, value INTEGER NOT NULL);",
     )?;
@@ -235,6 +236,7 @@ pub(super) fn is_schema_failure(error: &Error) -> bool {
 fn repair_columns(connection: &Connection, allow_missing_tables: bool) -> Result<()> {
     let baseline = Connection::open_in_memory()?;
     baseline.execute_batch(BASELINE)?;
+    baseline.execute_batch(LOCAL_RECIPIENTS)?;
     let mut tables =
         baseline.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
     let tables = tables.query_map([], |row| row.get::<_, String>(0))?;
@@ -401,6 +403,11 @@ CREATE INDEX IF NOT EXISTS unrouted ON envelopes(state,next_hop) WHERE next_hop=
 CREATE TABLE IF NOT EXISTS agent_tombstones (agent_id TEXT NOT NULL, session TEXT NOT NULL, reason TEXT NOT NULL, at INTEGER NOT NULL, until INTEGER NOT NULL, PRIMARY KEY(agent_id,session));
 CREATE TABLE IF NOT EXISTS agent_owners (agent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, name TEXT NOT NULL, seen INTEGER NOT NULL);
 "#;
+
+const LOCAL_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS local_recipients (
+    origin TEXT NOT NULL, id TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL,
+    PRIMARY KEY(origin,id),
+    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);";
 
 const BASELINE: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_owners (agent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, name TEXT NOT NULL, seen INTEGER NOT NULL);

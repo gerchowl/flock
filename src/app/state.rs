@@ -838,6 +838,7 @@ pub(crate) struct PeerCheckoutState {
 /// rather than indices, because indices shift when a workspace is removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingUiEvent {
+    AgentRemoved(super::agent_removal::Removal),
     /// A pane was split into existence. Resolved at drain (the pane still
     /// exists, and its `PaneInfo` needs App-level terminal runtimes).
     PaneCreated {

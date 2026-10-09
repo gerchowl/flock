@@ -244,7 +244,10 @@ impl App {
                     &err.to_string(),
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_runtime_identity_after_respawn();
+                    terminal.resume_failed = true;
+                    if let Some(plan) = terminal.pending_agent_resume_plan.take() {
+                        terminal.set_hibernated_resume_plan(Some(plan));
+                    }
                 }
                 return false;
             }
@@ -282,11 +285,18 @@ impl App {
                 &err.to_string(),
             );
             runtime.shutdown();
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_failed = true;
+                if let Some(plan) = terminal.pending_agent_resume_plan.take() {
+                    terminal.set_hibernated_resume_plan(Some(plan));
+                }
+            }
             return false;
         }
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.resume_failed = false;
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
         }
@@ -533,12 +543,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resume_whose_shell_will_not_spawn_clears_the_agent_name_in_place() {
-        // #456: this is the second production call site of
-        // `clear_agent_runtime_identity_after_respawn`, and the reason "a name
-        // stops resolving only when the pane goes away" is not a true thing to
-        // tell a reader. The pane is still here; the name is gone, so
-        // `agent get <name>` answers `agent_not_found` on a live pane.
+    async fn a_resume_whose_shell_will_not_spawn_keeps_identity_offline() {
+        // #661: failed resume must retain the identity and retry plan for pending mail.
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
         let pane_id = workspace.tabs[0].root_pane;
@@ -599,15 +605,14 @@ mod tests {
             .terminals
             .get(&terminal_id)
             .expect("terminal should survive a failed resume");
-        assert!(
-            terminal.agent_name.is_none(),
-            "a resume that cannot spawn its shell drops the agent name in place"
-        );
-        assert!(
-            !terminal.is_agent_terminal(),
-            "with no name and nothing else naming it, the pane stops being an \
-             agent target and `agent get <name>` answers agent_not_found"
-        );
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(terminal.resume_failed);
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.hibernated_resume_plan.is_some());
+        assert!(terminal.is_agent_terminal());
+        let info = app.agent_info_for_target("reviewer").unwrap();
+        assert_eq!(info.agent_status, crate::api::schema::AgentStatus::Offline);
+        assert_eq!(info.blocked_reason.as_deref(), Some("resume_failed"));
     }
 
     #[tokio::test]

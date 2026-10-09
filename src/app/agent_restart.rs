@@ -923,6 +923,7 @@ impl App {
         .map_err(|err| format!("resume spawn failed: {err}"))?;
         self.terminal_runtimes.insert(id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(id) {
+            terminal.resume_failed = false;
             terminal.set_hibernated_resume_plan(None);
         }
         self.state.mark_session_dirty();
@@ -952,6 +953,7 @@ impl App {
             terminal.prepare_restart_resume();
             terminal.set_persisted_agent_session(retry.session);
             terminal.set_hibernated_resume_plan(Some(retry.plan));
+            terminal.resume_failed = true;
             terminal.respawn_shell_on_exit = false;
         }
         self.state.mark_session_dirty();

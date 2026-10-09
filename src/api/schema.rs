@@ -1946,6 +1946,7 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     AgentForked,
+    AgentRemoved,
     DeliveryAttemptUpdated,
     MessageQueued,
     MessageDelivered,
@@ -2021,6 +2022,7 @@ impl EventKind {
             | Self::PaneExited
             | Self::PaneAgentDetected
             | Self::PaneAgentStatusChanged
+            | Self::AgentRemoved
             | Self::AgentForked
             | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
@@ -2821,7 +2823,7 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
-    /// Live provider-limit wait, absent after the provider resumes.
+    /// Provider-limit wait or `resume_failed` while a retained identity is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3339,6 +3341,11 @@ pub enum EventData {
         rss_after: Option<u64>,
         detail: String,
     },
+    AgentRemoved {
+        agent_id: String,
+        session: String,
+        reason: String,
+    },
     AgentHibernated {
         pane_id: String,
         workspace_id: String,
@@ -3842,6 +3849,8 @@ pub enum AgentStatus {
     /// pane; the next focus (or explicit `agent.resume`) respawns it.
     /// Ranked at the Idle attention tier — hibernated is a settled state.
     Hibernated,
+    /// The identity and mail survive a failed attempt to resume its process.
+    Offline,
 }
 
 fn default_true() -> bool {

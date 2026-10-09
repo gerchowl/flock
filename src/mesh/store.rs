@@ -541,7 +541,7 @@ impl<D: DiskSpace> Store<D> {
         admission: Admission,
         wall_ms: i64,
     ) -> Result<Accepted> {
-        self.accept_inner(envelope, ttl_ms, admission, wall_ms, false, None)
+        self.accept_inner(envelope, ttl_ms, admission, wall_ms, false, None, None)
     }
 
     pub fn accept_collected(
@@ -550,7 +550,35 @@ impl<D: DiskSpace> Store<D> {
         ttl_ms: i64,
         wall_ms: i64,
     ) -> Result<Accepted> {
-        self.accept_inner(envelope, ttl_ms, Admission::Inbox, wall_ms, true, None)
+        self.accept_inner(
+            envelope,
+            ttl_ms,
+            Admission::Inbox,
+            wall_ms,
+            true,
+            None,
+            None,
+        )
+    }
+
+    /// Bind the receiving terminal's native identity without rewriting signed mail.
+    pub fn accept_local(
+        &mut self,
+        envelope: &Envelope,
+        ttl_ms: i64,
+        agent: &str,
+        session: &str,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        self.accept_inner(
+            envelope,
+            ttl_ms,
+            Admission::Inbox,
+            wall_ms,
+            false,
+            None,
+            Some((agent, session)),
+        )
     }
 
     // Admission atomically binds immutable mail, transport state, and collection debt.
@@ -563,6 +591,7 @@ impl<D: DiskSpace> Store<D> {
         wall_ms: i64,
         collect_ack: bool,
         route: Option<(u8, &[String], &str)>,
+        local_recipient: Option<(&str, &str)>,
     ) -> Result<Accepted> {
         if self.clock()?.paused {
             return Err(Error::Paused);
@@ -574,8 +603,11 @@ impl<D: DiskSpace> Store<D> {
         {
             return Err(Error::InvalidEnvelope);
         }
+        let (target_agent, target_session) =
+            local_recipient.unwrap_or((&envelope.target_agent, &envelope.target_session));
         if admission == Admission::Inbox
-            && self.is_tombstoned(&envelope.target_agent, &envelope.target_session, wall_ms)?
+            && envelope.request_key.is_none()
+            && self.is_tombstoned(target_agent, target_session, wall_ms)?
         {
             return Err(Error::RecipientGone);
         }
@@ -611,9 +643,9 @@ impl<D: DiskSpace> Store<D> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if admission == Admission::Inbox && tx.query_row(
+        if admission == Admission::Inbox && envelope.request_key.is_none() && tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_tombstones WHERE agent_id=?1 AND session=?2 AND until>?3)",
-            params![envelope.target_agent,envelope.target_session,now], |r| r.get::<_, bool>(0),
+            params![target_agent,target_session,now], |r| r.get::<_, bool>(0),
         )? { return Err(Error::RecipientGone); }
         let prior: Option<Vec<u8>> = tx
             .query_row(
@@ -671,6 +703,17 @@ impl<D: DiskSpace> Store<D> {
         ));
         tx.execute("UPDATE envelopes SET next_hop=?3,hops_left=?4,visited=?5,kind=?6,mailbox_ttl_ms=?7 WHERE origin=?1 AND id=?2",
             params![envelope.key.origin_node,envelope.key.message_id,next_hop,hops,serde_json::to_string(visited)?,envelope.kind.as_str(),DAY_MS])?;
+        if let Some((agent, session)) = local_recipient {
+            tx.execute(
+                "INSERT INTO local_recipients VALUES(?1,?2,?3,?4)",
+                params![
+                    envelope.key.origin_node,
+                    envelope.key.message_id,
+                    agent,
+                    session
+                ],
+            )?;
+        }
         collection::record_answer(&tx, envelope, admission, collect_ack)?;
         if inbox {
             tx.execute(
@@ -731,7 +774,16 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn refuse(&mut self, key: &MessageKey, reason: &str, wall_ms: i64) -> Result<()> {
-        self.finish_with_detail(key, Outcome::Refused, Some(reason), wall_ms)
+        self.finish_with_detail(
+            key,
+            if reason.split(':').next() == Some("recipient_gone") {
+                Outcome::RecipientGone
+            } else {
+                Outcome::Refused
+            },
+            Some(reason),
+            wall_ms,
+        )
     }
 
     fn finish_with_detail(
@@ -782,7 +834,8 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Read a mailbox atomically, expiring overdue rows without rejecting live ones.
+    /// Read live inbox rows atomically; return keys that must not be delivered.
+    /// Stale projections of removed, expired, already-read or collected rows are rejected.
     pub fn read_inbox(&mut self, keys: &[MessageKey], wall_ms: i64) -> Result<Vec<MessageKey>> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -799,25 +852,21 @@ impl<D: DiskSpace> Store<D> {
             "UPDATE clock SET wall=?1,elapsed=?2 WHERE singleton=1",
             params![clock.wall_ms, now],
         )?;
-        let mut expired = Vec::new();
+        let mut rejected = Vec::new();
         for key in keys {
-            tx.execute("UPDATE envelopes SET state=CASE WHEN inbox_deadline>?3 THEN 'read' ELSE 'inbox_expired' END,
+            let state: Option<String> = tx.query_row(
+                "UPDATE envelopes SET state=CASE WHEN inbox_deadline>?3 THEN 'read' ELSE 'inbox_expired' END,
                 body=CASE WHEN inbox_deadline>?3 THEN body ELSE X'' END,outcome_until=?4
-                WHERE origin=?1 AND id=?2 AND state='inbox'",
-                params![key.origin_node,key.message_id,now,now.saturating_add(CUSTODY_TTL_MS)])?;
-            let state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM envelopes WHERE origin=?1 AND id=?2",
-                    params![key.origin_node, key.message_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if state.as_deref() == Some("inbox_expired") {
-                expired.push(key.clone());
+                WHERE origin=?1 AND id=?2 AND state='inbox' RETURNING state",
+                params![key.origin_node,key.message_id,now,now.saturating_add(CUSTODY_TTL_MS)],
+                |r| r.get(0),
+            ).optional()?;
+            if state.as_deref() != Some("read") {
+                rejected.push(key.clone());
             }
         }
         tx.commit()?;
-        Ok(expired)
+        Ok(rejected)
     }
 
     /// Scheduler deadlines use the same unpaused clock as expiry. The caller
