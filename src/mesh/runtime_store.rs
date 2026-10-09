@@ -63,6 +63,39 @@ pub(crate) fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> 
     writer.access(&crate::config::state_dir().join("mesh-mail.sqlite"), f)
 }
 
+/// Queries never bootstrap a writer, migrate a database, or advance its clock.
+pub(crate) fn read<T>(f: impl FnOnce(&Store) -> Result<T, String>) -> Result<Option<T>, String> {
+    let writer = writer().lock().map_err(|_| "mesh store poisoned")?;
+    if writer.suspended {
+        return Err("mesh store suspended for handoff".into());
+    }
+    writer.store.as_ref().map(f).transpose()
+}
+
+pub(crate) fn status(
+    origin: Option<&str>,
+    correlation: &str,
+    reference: Option<&super::store::StatusReference>,
+) -> Result<Option<super::store::Status>, String> {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as i64;
+    Ok(read(|store| {
+        match reference {
+            Some(reference) => store
+                .referenced_status(correlation, reference, wall)
+                .map(Some),
+            None => match origin {
+                Some(origin) => store.status(origin, correlation, wall),
+                None => Ok(None),
+            },
+        }
+        .map_err(|e| e.to_string())
+    })?
+    .flatten())
+}
+
 pub(crate) fn suspend() -> Result<u64, String> {
     writer()
         .lock()

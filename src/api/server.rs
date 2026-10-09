@@ -297,8 +297,16 @@ fn handle_connection(
             result
         }
         Method::MsgWaitReply(params) => {
-            let Some(response) =
-                wait_for_reply(request_id.clone(), params, &mut stream, event_hub, running)?
+            let Some(response) = wait_for_reply(
+                request_id.clone(),
+                params,
+                capabilities
+                    .as_ref()
+                    .and_then(|caps| caps.node_id.as_deref()),
+                &mut stream,
+                event_hub,
+                running,
+            )?
             else {
                 crate::logging::api_request_completed(
                     &request_id,

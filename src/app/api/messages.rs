@@ -603,37 +603,55 @@ impl App {
     /// #175 O1 makes that monotonic across restarts, so "last" is a real
     /// ordering rather than whatever the file happened to yield.
     pub(super) fn handle_msg_status(&mut self, id: String, params: MsgStatusParams) -> String {
-        if let Some(origin) = self.node_id.as_deref() {
-            if let Ok(Some(reason)) = crate::mesh::hello::with_store(|store| {
-                store
-                    .collection_error(origin, &params.correlation_id)
-                    .map_err(|e| e.to_string())
-            }) {
-                return encode_success(
-                    id,
-                    ResponseResult::MsgStatus {
-                        attempts: Vec::new(),
-                        correlation_id: params.correlation_id.clone(),
-                        state: if crate::mesh::hello::with_store(|store| {
-                            store
-                                .outbound_refused(origin, &params.correlation_id)
-                                .map_err(|e| e.to_string())
-                        })
-                        .unwrap_or(false)
-                        {
-                            "refused"
-                        } else {
-                            "collect_failed"
-                        }
-                        .into(),
-                        outcome_known: true,
-                        to_host: None,
-                        route: None,
-                        path: None,
-                        detail: Some(reason),
-                        reply: None,
-                    },
-                );
+        if self.node_id.is_some() {
+            match crate::mesh::runtime_store::status(
+                self.node_id.as_deref(),
+                &params.correlation_id,
+                params.reference.as_ref(),
+            ) {
+                Ok(Some(status)) => {
+                    // A local answer the mesh writer could not record (#623)
+                    // is still in the event ring.
+                    let reply = status.reply.or_else(|| {
+                        crate::api::best_answer(
+                            self.event_hub
+                                .events_after(0)
+                                .iter()
+                                .map(|(_, event)| event),
+                            &params.correlation_id,
+                        )
+                        .and_then(crate::api::Answer::into_reply)
+                    });
+                    return encode_success(
+                        id,
+                        ResponseResult::MsgStatus {
+                            reference: Some(status.reference),
+                            attempts: self
+                                .delivery_attempts()
+                                .into_iter()
+                                .filter(|a| a.correlation_ids.contains(&params.correlation_id))
+                                .collect(),
+                            correlation_id: params.correlation_id,
+                            outcome_known: !matches!(
+                                status.state.as_str(),
+                                "queued" | "custody" | "held" | "outcome_retention_elapsed"
+                            ),
+                            state: status.state,
+                            to_host: None,
+                            route: None,
+                            path: None,
+                            detail: status.detail,
+                            reply,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(reason) if params.reference.is_some() => {
+                    return encode_error(id, "mail_store_unavailable", reason)
+                }
+                // Pre-mesh and local messages still answer from the event
+                // ring while the store is unavailable.
+                Err(_) => crate::logging::mesh_custody_failed("status", "mail_store_unavailable"),
             }
         }
         let mut found: Option<ResponseResult> = None;
@@ -643,6 +661,7 @@ impl App {
                     if *correlation_id == params.correlation_id =>
                 {
                     found = Some(ResponseResult::MsgStatus {
+                        reference: None,
                         attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "queued".into(),
@@ -673,6 +692,7 @@ impl App {
                         ),
                     };
                     found = Some(ResponseResult::MsgStatus {
+                        reference: None,
                         attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: "relayed".into(),
@@ -695,6 +715,7 @@ impl App {
                     ..
                 } if *correlation_id == params.correlation_id => {
                     found = Some(ResponseResult::MsgStatus {
+                        reference: None,
                         attempts: Vec::new(),
                         correlation_id: params.correlation_id.clone(),
                         state: if *delivered { "read" } else { "dropped" }.into(),
@@ -716,6 +737,7 @@ impl App {
                 .is_some()
         {
             found = Some(ResponseResult::MsgStatus {
+                reference: None,
                 attempts: Vec::new(),
                 correlation_id: params.correlation_id.clone(),
                 state: "queued".into(),
@@ -1071,16 +1093,17 @@ impl App {
                     latency_ms: now.saturating_sub(message.enqueued_at_ms),
                 },
             });
+            let route = crate::app::mailboxes::reply_route(
+                message.from_pane.as_deref(),
+                message.from_agent.as_deref(),
+                message.message_key.is_some(),
+            );
             messages.push(crate::api::schema::InboxMessage {
                 correlation_id: message.correlation_id.clone(),
                 from_agent: message.from_agent.clone(),
                 from_host: message.from_host.clone(),
-                // `replyable` is computed from the same field `msg.reply`
-                // routes on, so the recipient is never told it can reply when
-                // it cannot — the failure #213 was filed for.
-                // Replyable when there is ANY routable sender: a local pane, or
-                // a fleet-global identity the directory can still resolve.
-                replyable: message.from_pane.is_some() || message.from_agent.is_some(),
+                replyable: route.0,
+                reply_contract: route.1.into(),
                 from_pane: message.from_pane.clone(),
                 from_repo: message.from_repo.clone(),
                 to_pane: message.to_pane.clone(),
@@ -2016,6 +2039,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::MsgStatus(MsgStatusParams {
+                reference: None,
                 correlation_id: correlation.into(),
             }),
         });
@@ -2194,6 +2218,7 @@ mod tests {
             let response = app.handle_api_request(Request {
                 id: "req".into(),
                 method: Method::MsgStatus(MsgStatusParams {
+                    reference: None,
                     correlation_id: correlation.into(),
                 }),
             });
@@ -2248,6 +2273,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::MsgStatus(MsgStatusParams {
+                reference: None,
                 correlation_id: "c-gone".into(),
             }),
         });
@@ -2411,7 +2437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relayed_message_keeps_its_senders_identity_and_stays_replyable() {
+    async fn an_old_relay_stays_replyable_but_discloses_best_effort_replies() {
         // The failure that started all of this: a message from another host
         // arrived with no sender and a reply command that could not work.
         // A relay asserts `from_agent`, so the recipient reads a named sender
@@ -2460,8 +2486,80 @@ mod tests {
         assert_eq!(messages[0].from_host.as_deref(), Some("hopper"));
         assert!(
             messages[0].replyable,
-            "a named sender must be replyable even with no local pane"
+            "a named sender is routable through the directory"
         );
+        assert_eq!(
+            messages[0].reply_contract, "best_effort_local_or_directory",
+            "a named sender alone does not provide durable return custody"
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_read_and_the_channel_push_agree_on_replyable() {
+        // #213: a push must never promise a reply msg.read denies, or the
+        // reverse. One same-host sender, one mesh sender with a return key.
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let to_pane = pane_target(&app, 1);
+        let message = |correlation: &str| crate::app::mailboxes::PendingMessage {
+            message_key: None,
+            correlation_id: correlation.into(),
+            body: "question".into(),
+            from_pane: None,
+            from_agent: Some("agent_sender_example".into()),
+            from_host: Some("sender.example".into()),
+            from_repo: None,
+            to_pane: to_pane.clone(),
+            to_repo: None,
+            in_reply_to: None,
+            enqueued_at_ms: super::now_ms(),
+            delivery_attempts: 0,
+            intent: MsgIntent::NeedsReply,
+        };
+        let mut local = message("same-host");
+        local.from_pane = Some("w1:p9".into());
+        let mut mesh = message("mesh-sender");
+        mesh.message_key = Some(
+            crate::mesh::key::MessageKey::mint("origin.example".into(), super::now_ms()).unwrap(),
+        );
+        let mut pushed = std::collections::HashMap::new();
+        for sent in [&local, &mesh] {
+            let event = EventEnvelope {
+                event: EventKind::MessageQueued,
+                data: super::queued_event(sent),
+            };
+            pushed.insert(
+                sent.correlation_id.clone(),
+                crate::mcp::channel::meta_for_event(&event),
+            );
+            app.mailboxes.enqueue(sent.clone());
+        }
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(to_pane.clone()),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MsgRead { messages } = success.result else {
+            panic!("expected msg_read: {response}");
+        };
+        assert_eq!(messages.len(), 2, "{response}");
+        for read in &messages {
+            let meta = &pushed[&read.correlation_id];
+            assert!(read.replyable, "{}", read.correlation_id);
+            assert_eq!(meta["replyable"], read.replyable.to_string());
+            assert_eq!(meta["reply_contract"], read.reply_contract);
+        }
+        let contract = |id: &str| {
+            messages
+                .iter()
+                .find(|m| m.correlation_id == id)
+                .unwrap()
+                .reply_contract
+                .clone()
+        };
+        assert_eq!(contract("same-host"), "best_effort_local_or_directory");
+        assert_eq!(contract("mesh-sender"), "durable_return_binding");
     }
 
     #[tokio::test]

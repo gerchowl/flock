@@ -93,11 +93,22 @@ pub(super) struct Arrival {
     pub from_host: Option<String>,
     pub intent: MsgIntent,
     pub body: String,
+    /// A mesh message key, so the reply rides a durable return binding.
+    pub durable: bool,
 }
 
 impl Arrival {
     /// Decode one feed line. Anything but a `message_queued` event is `None`.
     pub(super) fn from_event(value: &Value) -> Option<Self> {
+        Self::decode(value, crate::mesh::delivery::body)
+    }
+
+    /// [`Self::from_event`] with the body source injected, so a test can
+    /// drive a keyed message without a custody store on disk.
+    fn decode(
+        value: &Value,
+        resolve: impl Fn(Option<&crate::mesh::key::MessageKey>, &str) -> Option<String>,
+    ) -> Option<Self> {
         let envelope: EventEnvelope = serde_json::from_value(value.clone()).ok()?;
         let EventData::MessageQueued {
             message_key,
@@ -112,8 +123,10 @@ impl Arrival {
         else {
             return None;
         };
-        let body = crate::mesh::delivery::body(message_key.as_ref(), &body)?;
+        let durable = message_key.is_some();
+        let body = resolve(message_key.as_ref(), &body)?;
         Some(Self {
+            durable,
             correlation_id,
             from_pane,
             from_agent,
@@ -129,8 +142,12 @@ impl Arrival {
 
     /// Same rule `msg.read` reports, so a push never promises a reply that
     /// `flock_msg_reply` would then refuse.
-    fn replyable(&self) -> bool {
-        self.from_pane.is_some() || self.from_agent.is_some()
+    fn reply_route(&self) -> (bool, &'static str) {
+        crate::app::mailboxes::reply_route(
+            self.from_pane.as_deref(),
+            self.from_agent.as_deref(),
+            self.durable,
+        )
     }
 }
 
@@ -189,7 +206,9 @@ pub(super) fn notification(arrival: &Arrival, count: usize, opts: &ChannelOption
     put(&mut meta, "from_host", arrival.from_host.as_deref());
     put(&mut meta, "intent", Some(arrival.intent.as_wire()));
     put(&mut meta, "correlation_id", Some(&arrival.correlation_id));
-    meta.insert("replyable".into(), json!(arrival.replyable().to_string()));
+    let (replyable, contract) = arrival.reply_route();
+    meta.insert("replyable".into(), json!(replyable.to_string()));
+    meta.insert("reply_contract".into(), json!(contract));
     meta.insert("unread".into(), json!(count.to_string()));
     let content = if push_body {
         arrival.body.clone()
@@ -299,6 +318,20 @@ fn call(client: &ApiClient, method: Method) -> Result<Value, String> {
         .unwrap_or(Value::Null))
 }
 
+/// The channel push meta for one `message_queued` event, keyed bodies taken
+/// verbatim. Lets `msg.read` tests assert both surfaces agree.
+#[cfg(test)]
+pub(crate) fn meta_for_event(event: &crate::api::schema::EventEnvelope) -> Value {
+    let value = serde_json::to_value(event).expect("event encodes");
+    let arrival = Arrival::decode(&value, |_, body| Some(body.into())).expect("message_queued");
+    let options = ChannelOptions {
+        push: true,
+        body_max_bytes: 4096,
+        reconnect: std::time::Duration::from_secs(1),
+    };
+    notification(&arrival, 1, &options)["params"]["meta"].clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +352,7 @@ mod tests {
             from_host: Some("host".into()),
             intent: MsgIntent::NeedsReply,
             body: body.into(),
+            durable: false,
         }
     }
 

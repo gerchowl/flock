@@ -208,11 +208,17 @@ impl App {
                     ),
                 }
                 .map_err(|e| e.to_string())?;
-                Ok((answers, refusals))
+                let receipt = match &query {
+                    Collect::Answers(query) => store
+                        .receipt(&query.request, now_ms() as i64)
+                        .map_err(|e| e.to_string())?,
+                    Collect::Outbound { .. } => None,
+                };
+                Ok((answers, refusals, receipt))
             })
         })();
         match result {
-            Ok((answers, refusals)) => {
+            Ok((answers, refusals, receipt)) => {
                 for (correlation_id, reason) in refusals {
                     self.emit_event(EventEnvelope {
                         event: EventKind::MessageDelivered,
@@ -225,7 +231,7 @@ impl App {
                         },
                     });
                 }
-                encode_success(id, ResponseResult::MeshCollected { answers })
+                encode_success(id, ResponseResult::MeshCollected { answers, receipt })
             }
             Err(reason) => encode_error(id, "mesh_collection_refused", reason),
         }
@@ -340,7 +346,7 @@ impl App {
             .cloned()
     }
 
-    pub(super) fn start_collection(&mut self, peer: crate::config::PeerConfig, query: Collect) {
+    pub(super) fn start_collection(&mut self, peer: crate::config::PeerConfig, mut query: Collect) {
         let cap = crate::mesh::collect::POLL_CONCURRENCY;
         if self.collection_relays.slots(cap) == 0 {
             return;
@@ -350,6 +356,14 @@ impl App {
             .flatten()
             .map(|pin| pin.node_id)
             .unwrap_or_default();
+        if let Collect::Outbound { outbound } = &mut query {
+            outbound.receipts = with_store(|store| {
+                store
+                    .pending_receipts(&node, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap_or_default();
+        }
         self.collection_peers.insert(peer.name.clone(), node);
         self.collection_relays.start_bounded(
             crate::mesh::collect::work(peer, query),
@@ -387,6 +401,34 @@ impl App {
         .is_err()
         {
             return;
+        }
+        if let Some(receipt) = &answers.receipt {
+            let imported = with_store(|store| {
+                let original = store
+                    .get(&query.request)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("message_not_found")?;
+                let peer = store
+                    .get_pin(&completion.peer.name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("origin_mismatch")?;
+                if original.envelope.return_binding.collection_token != query.token
+                    || original.envelope.return_binding.recipient_node != peer.node_id
+                {
+                    return Err("invalid reply binding".into());
+                }
+                store
+                    .import_receipt(&query.request, receipt)
+                    .map_err(|e| e.to_string())
+            });
+            // A receipt is advisory: refusing it must not stall the answers
+            // that arrived in the same batch.
+            if let Err(reason) = imported {
+                crate::logging::mesh_custody_failed(
+                    "import_receipt",
+                    super::mesh_mail::error_code(&reason),
+                );
+            }
         }
         for answer in answers.deliveries {
             if let Err(reason) =

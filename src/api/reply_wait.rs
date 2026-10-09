@@ -37,6 +37,10 @@ pub(crate) enum Answer {
     Replied(MsgReplyInfo),
     Deferred(MsgReplyInfo),
     Expired,
+    RetentionElapsed,
+    RecipientGone,
+    /// The receiver refused custody; the reason, when it gave one.
+    Refused(Option<String>),
 }
 
 impl Answer {
@@ -45,6 +49,9 @@ impl Answer {
             Self::Replied(_) => "replied",
             Self::Deferred(_) => "deferred",
             Self::Expired => "expired",
+            Self::RetentionElapsed => "outcome_retention_elapsed",
+            Self::RecipientGone => "recipient_gone",
+            Self::Refused(_) => "refused",
         }
     }
 
@@ -57,14 +64,21 @@ impl Answer {
         match self {
             Self::Replied(_) => 3,
             Self::Deferred(_) => 2,
-            Self::Expired => 1,
+            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => 1,
+        }
+    }
+
+    fn detail(&self) -> Option<String> {
+        match self {
+            Self::Refused(reason) => reason.clone(),
+            _ => None,
         }
     }
 
     pub(crate) fn into_reply(self) -> Option<MsgReplyInfo> {
         match self {
             Self::Replied(reply) | Self::Deferred(reply) => Some(reply),
-            Self::Expired => None,
+            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => None,
         }
     }
 }
@@ -174,14 +188,53 @@ fn delivery_state(event: &EventEnvelope, correlation_id: &str) -> Option<&'stati
 /// What a scan of the log knows about one message so far.
 #[derive(Debug, Default)]
 struct Watch {
-    state: Option<&'static str>,
+    state: Option<String>,
     answer: Option<Answer>,
 }
 
 impl Watch {
+    fn refresh_mesh(
+        &mut self,
+        origin: Option<&str>,
+        correlation: &str,
+        reference: Option<&crate::mesh::store::StatusReference>,
+    ) -> Result<(), String> {
+        if let Some(status) = crate::mesh::runtime_store::status(origin, correlation, reference)? {
+            let durable = status
+                .reply
+                .map(|reply| {
+                    if reply.kind == "deferral" {
+                        Answer::Deferred(reply)
+                    } else {
+                        Answer::Replied(reply)
+                    }
+                })
+                .or(match status.state.as_str() {
+                    "expired" => Some(Answer::Expired),
+                    "outcome_retention_elapsed" => Some(Answer::RetentionElapsed),
+                    "recipient_gone" => Some(Answer::RecipientGone),
+                    "refused" => Some(Answer::Refused(status.detail.clone())),
+                    _ => None,
+                });
+            // Merge by rank, as `observe` does: a local answer the mesh
+            // writer could not record still beats a durable expiry.
+            if let Some(found) = durable {
+                if self
+                    .answer
+                    .as_ref()
+                    .is_none_or(|held| found.rank() > held.rank())
+                {
+                    self.answer = Some(found);
+                }
+            }
+            self.state = Some(status.state);
+        }
+        Ok(())
+    }
+
     fn observe(&mut self, event: &EventEnvelope, correlation_id: &str) {
         if let Some(state) = delivery_state(event, correlation_id) {
-            self.state = Some(state);
+            self.state = Some(state.into());
         }
         if let Some(found) = answer_in(event, correlation_id) {
             if self
@@ -206,7 +259,8 @@ fn awaited(
     correlation_id: String,
     outcome: &str,
     reply: Option<MsgReplyInfo>,
-    state: Option<&'static str>,
+    detail: Option<String>,
+    state: Option<&str>,
 ) -> String {
     encode(&SuccessResponse {
         id: request_id,
@@ -214,6 +268,7 @@ fn awaited(
             correlation_id,
             outcome: outcome.into(),
             reply,
+            detail,
             state: state.map(str::to_string),
         },
     })
@@ -228,6 +283,7 @@ fn awaited(
 pub(super) fn wait_for_reply(
     request_id: String,
     params: MsgWaitReplyParams,
+    origin: Option<&str>,
     stream: &mut UnixStream,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -249,6 +305,20 @@ pub(super) fn wait_for_reply(
     for (_, event) in event_hub.events_after(0) {
         watch.observe(&event, &correlation_id);
     }
+    if let Err(reason) = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref()) {
+        if params.reference.is_some() {
+            return Ok(Some(encode(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "mail_store_unavailable".into(),
+                    message: reason,
+                },
+            })));
+        }
+        // Without a durable reference the event ring still answers for
+        // pre-mesh and local messages, so a store outage degrades, not fails.
+        crate::logging::mesh_custody_failed("wait_reply", "mail_store_unavailable");
+    }
     if watch.state.is_none() && watch.answer.is_none() {
         crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, "not_found");
         return Ok(Some(encode(&ErrorResponse {
@@ -262,15 +332,22 @@ pub(super) fn wait_for_reply(
 
     let _waiting = event_hub.track_reply_wait(&correlation_id);
     loop {
+        // One indexed read per wake, bounded by CONNECTION_POLL_INTERVAL. A
+        // transient outage (a handoff suspends the writer) keeps the wait
+        // alive on the event ring rather than ending it. It is not logged:
+        // at this cadence one outage would flood the log.
+        let _ = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref());
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();
             crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, outcome);
+            let detail = answer.detail();
             return Ok(Some(awaited(
                 request_id,
                 correlation_id,
                 outcome,
                 answer.into_reply(),
-                watch.state,
+                detail,
+                watch.state.as_deref(),
             )));
         }
         if Instant::now() >= deadline {
@@ -280,7 +357,8 @@ pub(super) fn wait_for_reply(
                 correlation_id,
                 "timeout",
                 None,
-                watch.state,
+                None,
+                watch.state.as_deref(),
             )));
         }
         if should_stop_connection(stream, running)? {
@@ -467,7 +545,7 @@ mod tests {
         for event in [queued("q", None, "x"), delivered("q", true, "read")] {
             watch.observe(&event, "q");
         }
-        assert_eq!(watch.state, Some("read"));
+        assert_eq!(watch.state.as_deref(), Some("read"));
         assert!(watch.answer.is_none());
     }
 }

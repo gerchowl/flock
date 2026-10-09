@@ -458,6 +458,17 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
          optional on reply and defaults quiet: {answer}"
     );
 
+    let status = alice.call_tool("flock_msg_status", json!({"correlation_id":correlation_id}));
+    assert!(status["reference"].is_object(), "{status}");
+    assert_eq!(status["reply"]["body"], "pong from nodeb", "{status}");
+    let waited = alice.call_tool(
+        "flock_msg_wait_reply",
+        json!({
+            "correlation_id":correlation_id, "timeout_ms":0, "reference":status["reference"]
+        }),
+    );
+    assert_eq!(waited["outcome"], "replied", "{waited}");
+
     // 4b. ADR-0018 §1: the top tier crosses the hop too, so the recipient's
     //     own server — the one that knows whether it is muted — can escalate.
     alice.call_tool(

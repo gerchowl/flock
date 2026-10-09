@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 10;
+pub(super) const VERSION: i64 = 11;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -132,6 +132,24 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
             DROP TABLE usage;",
         )?;
         tx.execute_batch(HELD_ACCOUNTING)?;
+        version = 10;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    if version == 10 {
+        tx.execute_batch("ALTER TABLE envelopes ADD COLUMN remote_state TEXT;
+            ALTER TABLE envelopes ADD COLUMN receipt_sent TEXT;
+            CREATE INDEX status_correlation ON envelopes(correlation,origin,id);
+            CREATE TABLE delivery_attempts (id TEXT PRIMARY KEY, evidence TEXT NOT NULL,
+              queued_at INTEGER NOT NULL, finished INTEGER NOT NULL, state TEXT NOT NULL,
+              correlations TEXT NOT NULL);
+            CREATE INDEX delivery_attempt_age ON delivery_attempts(queued_at,id);
+            CREATE TABLE status_signer (singleton INTEGER PRIMARY KEY CHECK(singleton=1), secret BLOB NOT NULL);")?;
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|_| Error::InvalidState)?;
+        tx.execute(
+            "INSERT INTO status_signer VALUES(1,?1)",
+            [secret.as_slice()],
+        )?;
         tx.pragma_update(None, "user_version", VERSION)?;
     }
     tx.commit()?;
