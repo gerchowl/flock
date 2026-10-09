@@ -57,6 +57,7 @@ struct PendingAgentRelease {
 
 #[derive(Clone, Copy, Default)]
 struct SpawnInitialState<'a> {
+    spawned_with_default_shell: bool,
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
 }
@@ -724,6 +725,7 @@ pub struct PaneRuntime {
     operator_input: OperatorInputClock,
     /// Sticky input history for safe root-shell replacement.
     has_been_typed_into: Cell<bool>,
+    spawned_with_default_shell: bool,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
 }
@@ -1338,6 +1340,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn shell",
             SpawnInitialState {
+                spawned_with_default_shell: true,
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
             },
@@ -1540,6 +1543,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle,
         })
     }
@@ -1971,6 +1975,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(false),
+            spawned_with_default_shell: initial_state.spawned_with_default_shell,
             detect_handle,
         })
     }
@@ -2134,22 +2139,14 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    /// Unknown process state must never authorize replacing a shell.
-    pub(crate) fn is_untouched_shell(&self) -> bool {
-        if self.has_been_typed_into.get() {
-            return false;
-        }
-        let Some(pid) = self.child_pid() else {
-            return false;
-        };
-        crate::detect::foreground_job(pid).is_some_and(|job| {
-            job.processes.len() == 1
-                && job.processes[0].pid == pid
-                && matches!(
-                    job.processes[0].name.trim_start_matches('-'),
-                    "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "nu" | "tcsh" | "csh"
-                )
-        })
+    pub(crate) fn was_spawned_with_default_shell(&self) -> bool {
+        self.spawned_with_default_shell
+    }
+
+    /// Sticky across all input writes, including flock-authored input.
+    /// Imported runtimes start touched because their input history is unknown.
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.has_been_typed_into.get()
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -2383,6 +2380,7 @@ impl PaneRuntime {
                 preserve_processes_on_drop: true,
                 operator_input: OperatorInputClock::default(),
                 has_been_typed_into: Cell::new(false),
+                spawned_with_default_shell: false,
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2393,6 +2391,24 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_input_write_marks_root_shell_touched() {
+        for path in 0..3 {
+            let (runtime, mut receiver) =
+                PaneRuntime::test_with_channel_and_scrollback_bytes(80, 24, 1024, b"", 4);
+            assert!(!runtime.has_received_input());
+            let bytes = Bytes::from_static(b"x");
+            match path {
+                0 => runtime.send_bytes(bytes).await.unwrap(),
+                1 => runtime.try_send_bytes(bytes).unwrap(),
+                _ => runtime.try_send_flock_authored(bytes).unwrap(),
+            }
+            assert!(runtime.has_received_input());
+            assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"x"));
+            assert!(runtime.has_received_input());
+        }
+    }
 
     #[test]
     fn shutdown_liveness_treats_reaped_direct_child_as_gone() {
@@ -2715,6 +2731,7 @@ mod tests {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2745,6 +2762,7 @@ mod tests {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 

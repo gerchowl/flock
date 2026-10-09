@@ -27,9 +27,13 @@ impl TerminalRuntime {
         self.0.shutdown_for_restart(pids, grace)
     }
 
-    /// Whether input and foreground process state permit root replacement.
-    pub(crate) fn is_untouched_shell(&self) -> bool {
-        self.0.is_untouched_shell()
+    pub(crate) fn was_spawned_with_default_shell(&self) -> bool {
+        self.0.was_spawned_with_default_shell()
+    }
+
+    /// Whether any input has reached this terminal, or its history is unknown.
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.0.has_received_input()
     }
 
     /// PID of the pane's direct child process, when alive.

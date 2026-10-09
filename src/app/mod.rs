@@ -4196,7 +4196,7 @@ sidebar_pane_gap = 99
     }
 
     #[tokio::test]
-    async fn an_explicit_workspace_target_still_splits_rather_than_defaulting() {
+    async fn an_explicit_workspace_target_gets_a_tab_rather_than_defaulting() {
         // #365's direction, and the override. `--workspace` is somebody
         // saying, so the cwd default must not reinterpret it.
         let checkout = cwd_fixture_dir("explicit");
@@ -4228,8 +4228,13 @@ sidebar_pane_gap = 99
         assert_eq!(response["result"]["type"], "agent_started");
         let ws = &app.state.workspaces[0];
         assert_eq!(app.state.workspaces.len(), 1);
-        assert_eq!(ws.tabs.len(), 1, "--workspace splits its target, as before");
-        assert_eq!(ws.tabs[0].panes.len(), 2);
+        assert_eq!(
+            ws.tabs.len(),
+            2,
+            "unknown shell provenance requires a new tab"
+        );
+        assert_eq!(ws.tabs[0].panes.len(), 1);
+        assert_eq!(ws.tabs[1].panes.len(), 1);
         drain_test_runtimes(&mut app);
     }
 

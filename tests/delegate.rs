@@ -186,6 +186,10 @@ fn create_db(base: &Path) {
 }
 
 fn start_server() -> Server {
+    start_server_with_shell_startup(false)
+}
+
+fn start_server_with_shell_startup(slow_startup: bool) -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -201,10 +205,22 @@ fn start_server() -> Server {
     fs::create_dir_all(base.join("state")).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::create_dir_all(base.join("home")).unwrap();
+    let terminal_config = if slow_startup {
+        let shell = base.join("slow-shell");
+        fs::write(&shell, "#!/bin/sh\n. \"$0.rc\"\nexec /bin/sh\n").unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(base.join("slow-shell.rc"), "sleep 30\n").unwrap();
+        format!(
+            "[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
+            shell
+        )
+    } else {
+        String::new()
+    };
     fs::write(
         config_home.join(app_dir_name()).join("config.toml"),
         format!(
-            "onboarding = false\n\n[worktrees]\ndirectory = \"{}\"\n",
+            "onboarding = false\n\n{terminal_config}\n[worktrees]\ndirectory = \"{}\"\n",
             base.join("wt").display()
         ),
     )
@@ -1823,7 +1839,7 @@ fn opencode_ambiguous_submission_keeps_workspace_and_does_not_retry() {
 #[test]
 fn delegate_start_uses_single_root_pane() {
     for worktree in [false, true] {
-        let server = start_server();
+        let server = start_server_with_shell_startup(true);
         operator_workspace(&server);
         let b = brief(&server, "task.md", "x\n");
         let mut child = if worktree {
@@ -1854,6 +1870,52 @@ fn delegate_start_uses_single_root_pane() {
         let result = stdout_json(&out);
         let workspace = result["workspace_id"].as_str().unwrap();
         assert_eq!(pane, format!("{workspace}:p1"));
+        let listed = request(
+            &server,
+            &serde_json::json!({
+                "id": "panes", "method": "pane.list", "params": {"workspace_id": workspace}
+            })
+            .to_string(),
+        );
+        assert_eq!(listed["result"]["panes"].as_array().unwrap().len(), 1);
+    }
+}
+
+/// Start through the socket immediately after allocation, while shell rc runs.
+#[test]
+fn agent_start_replaces_slow_startup_shell_after_workspace_or_worktree_create() {
+    for worktree in [false, true] {
+        let server = start_server_with_shell_startup(true);
+        let allocation = if worktree {
+            let repo = committed_repo(&server);
+            serde_json::json!({
+                "id": "create", "method": "worktree.create",
+                "params": {"cwd": repo, "branch": "test/818-api", "path": server.base.join("checkout")}
+            })
+        } else {
+            serde_json::json!({
+                "id": "create", "method": "workspace.create",
+                "params": {"cwd": server.base.join("work")}
+            })
+        };
+        let created = request(&server, &allocation.to_string());
+        let workspace = created["result"]["workspace"]["workspace_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("allocation failed: {created}"));
+        let started = request(
+            &server,
+            &serde_json::json!({
+                "id": "start", "method": "agent.start",
+                "params": {"name": "slow-rc-agent", "workspace_id": workspace,
+                    "argv": ["/bin/sh", "-c", "sleep 30"]}
+            })
+            .to_string(),
+        );
+        assert_eq!(started["result"]["type"], "agent_started", "{started}");
+        assert_eq!(
+            started["result"]["agent"]["pane_id"],
+            format!("{workspace}:p1")
+        );
         let listed = request(
             &server,
             &serde_json::json!({

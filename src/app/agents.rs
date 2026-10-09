@@ -419,7 +419,10 @@ impl App {
                     && self
                         .terminal_runtimes
                         .get(&pane.attached_terminal_id)
-                        .is_some_and(TerminalRuntime::is_untouched_shell)
+                        .is_some_and(|runtime| {
+                            runtime.was_spawned_with_default_shell()
+                                && !runtime.has_received_input()
+                        })
             });
         if untouched {
             StartPlacement::Replace(ws_idx, tab_idx)
@@ -442,7 +445,7 @@ impl App {
         let (rows, cols) = self.state.estimate_pane_size();
         // Stage the replacement before changing the visible tab. A fresh raw
         // pane id keeps the old shell's queued events away from the agent.
-        let (mut tab, terminal, runtime) = crate::workspace::Tab::new_argv_command(
+        let (tab, terminal, runtime) = crate::workspace::Tab::new_argv_command(
             old_tab.number,
             cwd,
             rows,
@@ -455,7 +458,6 @@ impl App {
             self.render_dirty.clone(),
         )
         .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
-        tab.custom_name = old_tab.custom_name.clone();
         let pane_id = tab.root_pane;
         let terminal_id = terminal.id.clone();
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
@@ -469,7 +471,12 @@ impl App {
         if let Some(number) = ws.public_pane_numbers.remove(&old_pane) {
             ws.public_pane_numbers.insert(pane_id, number);
         }
-        ws.tabs[tab_idx] = tab;
+        // Keep the existing tab and replace only its pane tree, preserving
+        // its metadata and any fields added to Tab in the future.
+        let existing = &mut ws.tabs[tab_idx];
+        existing.root_pane = tab.root_pane;
+        existing.layout = tab.layout;
+        existing.panes = tab.panes;
         self.state.terminals.insert(terminal_id, terminal);
         self.state.terminals.remove(&old_terminal);
         if let Some(runtime) = self.terminal_runtimes.remove(&old_terminal) {
@@ -1603,23 +1610,6 @@ mod tests {
         );
         let ws = app.state.workspaces.len() - 1;
         let pane = app.state.workspaces[ws].tabs[0].root_pane;
-        let terminal = app.state.workspaces[ws]
-            .terminal_id(pane)
-            .expect("terminal")
-            .clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !app
-            .terminal_runtimes
-            .get(&terminal)
-            .expect("runtime")
-            .is_untouched_shell()
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shell never became foreground"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         let workspace = app.public_workspace_id(ws);
         (app, workspace, pane)
     }
@@ -1633,6 +1623,8 @@ mod tests {
                 .unwrap()
                 .clone();
             let old_tab = app.public_tab_id(0, 0).unwrap();
+            app.state.workspaces[0].tabs[0].custom_name = Some("keep this tab".into());
+            app.state.workspaces[0].tabs[0].zoomed = true;
             let mut request = targeted_start_request(&workspace, None);
             if let Method::AgentStart(params) = &mut request.method {
                 if target_tab {
@@ -1648,6 +1640,11 @@ mod tests {
                 format!("{workspace}:p1")
             );
             assert_eq!(response["result"]["agent"]["tab_id"], old_tab);
+            assert_eq!(
+                app.state.workspaces[0].tabs[0].custom_name.as_deref(),
+                Some("keep this tab")
+            );
+            assert!(app.state.workspaces[0].tabs[0].zoomed);
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
             assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
             assert!(!app.state.terminals.contains_key(&old_terminal));
@@ -1686,6 +1683,55 @@ mod tests {
             assert_eq!(app.state.workspaces[0].tabs[1].panes.len(), 1);
             shutdown(app);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_start_never_replaces_custom_argv_root() {
+        let (mut app, workspace, _) = created_root_shell().await;
+        let first = app.handle_api_request(targeted_start_request(&workspace, None));
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["result"]["type"], "agent_started", "{first}");
+        let first_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.name = "second".into();
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, first_pane);
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_keeps_custom_runtime_in_original_shell_root() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        // Restart paths can retain the pane while replacing its runtime.
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane,
+            24,
+            80,
+            std::env::temp_dir(),
+            &[crate::test_support::live_program()],
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .unwrap();
+        assert!(!runtime.has_received_input());
+        assert!(!runtime.was_spawned_with_default_shell());
+        let old_runtime = app.terminal_runtimes.insert(terminal, runtime).unwrap();
+        let raw = app.handle_api_request(targeted_start_request(&workspace, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        old_runtime.shutdown();
+        shutdown(app);
     }
 
     #[tokio::test]
@@ -1760,11 +1806,11 @@ mod tests {
             assert!(response.get("error").is_some(), "{response}");
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
             assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
-            assert!(app
+            assert!(!app
                 .terminal_runtimes
                 .get(&terminal)
                 .unwrap()
-                .is_untouched_shell());
+                .has_received_input());
             assert_eq!(app.terminal_runtimes.len(), 1);
         }
         shutdown(app);
