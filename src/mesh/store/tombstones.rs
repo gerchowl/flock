@@ -61,9 +61,12 @@ impl<D: DiskSpace> Store<D> {
             }
         }
         for rowid in bad_rows {
-            tx.execute(
-                "UPDATE envelopes SET state='quarantined',body=X'' WHERE rowid=?1",
-                [rowid],
+            quarantine::row(
+                &tx,
+                rowid,
+                &self.path,
+                "invalid tombstone candidate",
+                wall_ms,
             )?;
         }
         tx.execute(

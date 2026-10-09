@@ -308,12 +308,13 @@ impl<D: DiskSpace> Store<D> {
         }
         drop(rows);
         drop(stmt);
-        for rowid in bad_rows {
-            self.connection.execute(
-                "UPDATE envelopes SET state='quarantined',body=X'' WHERE rowid=?1",
-                [rowid],
-            )?;
-        }
+        quarantine::rows(
+            &self.connection,
+            &bad_rows,
+            &self.path,
+            "invalid receipt row",
+            wall_ms,
+        )?;
         let mut receipts = Vec::new();
         for (key, state) in selected {
             if let Some(record) = self.collection_record(&key, wall_ms)? {

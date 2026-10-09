@@ -14,7 +14,11 @@ pub(super) fn check_version(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
+pub(super) fn migrate(
+    connection: &mut Connection,
+    directory: &std::path::Path,
+    wall_ms: i64,
+) -> Result<()> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     check_version(&tx)?;
     let mut version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -184,10 +188,21 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
         tx.execute("UPDATE envelopes SET next_hop=recipient_node WHERE next_hop='' AND state IN ('held','custody')", [])?;
     }
     repair_columns(&tx, false)?;
-    tx.execute(
-        "UPDATE envelopes SET body=X'' WHERE state='quarantined' AND length(body)>0",
-        [],
-    )?;
+    let rowids = {
+        let mut statement =
+            tx.prepare("SELECT rowid FROM envelopes WHERE state='quarantined' AND length(body)>0")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for rowid in rowids {
+        super::quarantine::row(
+            &tx,
+            rowid,
+            directory,
+            "existing quarantine during migration",
+            wall_ms,
+        )?;
+    }
     if version != VERSION {
         tx.pragma_update(None, "user_version", VERSION)?;
     }

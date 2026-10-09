@@ -5,6 +5,7 @@
 use super::{clock::Clock, key::MessageKey};
 mod collection;
 pub(crate) mod delivery_attempts;
+mod quarantine;
 mod routing;
 mod schema;
 mod status;
@@ -402,7 +403,7 @@ impl<D: DiskSpace> Store<D> {
             PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;",
         )?;
         let version = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        schema::migrate(&mut connection).map_err(|error| {
+        schema::migrate(&mut connection, parent, wall_ms).map_err(|error| {
             if schema::is_schema_failure(&error) {
                 Error::Migration {
                     path: path.into(),
@@ -1107,12 +1108,23 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Retain undecodable metadata for diagnosis and discard the body to release quota.
+    /// Archive the raw row durably before discarding its quarantined body.
     pub fn quarantine(&mut self, key: &MessageKey) -> Result<()> {
-        self.connection.execute(
-            "UPDATE envelopes SET state='quarantined',body=X'' WHERE origin=?1 AND id=?2",
-            params![key.origin_node, key.message_id],
-        )?;
+        let wall = self.clock()?.wall_ms;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rowid: Option<i64> = tx
+            .query_row(
+                "SELECT rowid FROM envelopes WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = rowid {
+            quarantine::row(&tx, rowid, &self.path, "invalid envelope", wall)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

@@ -3308,7 +3308,7 @@ fn genuine_v11_backfills_live_mail_and_second_migration_is_read_only() {
     }
     let changes = s.connection.total_changes();
     let wal = fs::read(f.path.with_extension("sqlite-wal")).unwrap();
-    schema::migrate(&mut s.connection).unwrap();
+    schema::migrate(&mut s.connection, f.path.parent().unwrap(), 0).unwrap();
     assert_eq!(s.connection.total_changes(), changes);
     assert_eq!(fs::read(f.path.with_extension("sqlite-wal")).unwrap(), wal);
 }
@@ -3422,4 +3422,131 @@ fn quarantine_discards_bodies_and_releases_quota_including_older_quarantines() {
         s.accept(&next, 1000, Admission::Custody, 0).unwrap();
         assert_eq!(s.quarantined_count().unwrap(), 1);
     }
+}
+
+#[test]
+fn migration_archives_full_raw_quarantined_rows_before_clearing() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mail = envelope();
+    s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+    let body = [0xff, 0, 0x80];
+    let metadata = [0xfe, 0, b'{'];
+    s.connection
+        .execute(
+            "UPDATE envelopes SET state='quarantined',body=?1,metadata=?2",
+            params![body.as_slice(), metadata.as_slice()],
+        )
+        .unwrap();
+    strip_step2_schema(&s.connection);
+    drop(s);
+    let s = f.open(10);
+    let archived = f.path.parent().unwrap().join("mesh-quarantine.jsonl");
+    let line = fs::read_to_string(&archived).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        record["key"]["message_id"]["base64"],
+        STANDARD.encode(mail.key.message_id.as_bytes())
+    );
+    assert_eq!(record["state"]["base64"], STANDARD.encode(b"quarantined"));
+    assert_eq!(record["reason"], "existing quarantine during migration");
+    assert_eq!(record["quarantined_at"], 10);
+    assert_eq!(record["body"]["base64"], STANDARD.encode(body));
+    assert_eq!(record["envelope"]["base64"], STANDARD.encode(metadata));
+    assert_eq!(record["envelope"]["sqlite_type"], "blob");
+    let columns: i64 = s
+        .connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('envelopes')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        record["raw_row"].as_object().unwrap().len(),
+        columns as usize + 1
+    );
+    assert_eq!(record["raw_row"]["custody_deadline"]["value"], 1000);
+    let kept: Vec<u8> = s
+        .connection
+        .query_row("SELECT body FROM envelopes", [], |r| r.get(0))
+        .unwrap();
+    assert!(kept.is_empty());
+    assert_eq!(
+        fs::metadata(&archived).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(s);
+    f.open(11);
+    assert_eq!(fs::read_to_string(archived).unwrap(), line);
+}
+
+#[test]
+fn failed_quarantine_backup_preserves_body_and_state_until_retry() {
+    for migration in [false, true] {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let mail = envelope();
+        s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+        let blocked = f.path.parent().unwrap().join("mesh-quarantine.jsonl");
+        fs::create_dir(&blocked).unwrap();
+        if migration {
+            s.connection
+                .execute("UPDATE envelopes SET state='quarantined'", [])
+                .unwrap();
+            strip_step2_schema(&s.connection);
+            drop(s);
+            s = f.open(0);
+        } else {
+            s.quarantine(&mail.key).unwrap();
+        }
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.envelope, mail);
+        assert_eq!(row.state, if migration { "quarantined" } else { "held" });
+        fs::remove_dir(&blocked).unwrap();
+        s.quarantine(&mail.key).unwrap();
+        assert!(s.get(&mail.key).unwrap().unwrap().envelope.body.is_empty());
+        assert_eq!(fs::read_to_string(blocked).unwrap().lines().count(), 1);
+    }
+}
+
+#[test]
+fn failed_database_quarantine_update_leaves_recoverable_archive() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mail = envelope();
+    s.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+    s.connection.execute_batch("CREATE TRIGGER reject_clear BEFORE UPDATE OF body ON envelopes BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(s.quarantine(&mail.key).is_err());
+    assert_eq!(s.get(&mail.key).unwrap().unwrap().envelope, mail);
+    let archive =
+        fs::read_to_string(f.path.parent().unwrap().join("mesh-quarantine.jsonl")).unwrap();
+    assert_eq!(archive.lines().count(), 1);
+}
+
+#[test]
+fn quarantine_sidecar_rotation_keeps_two_bounded_private_files() {
+    let f = Fixture::new();
+    let directory = f.path.parent().unwrap();
+    let active = directory.join("mesh-quarantine.jsonl");
+    let previous = directory.join("mesh-quarantine.jsonl.1");
+    let lines = [b"{\"n\":1}\n", b"{\"n\":2}\n", b"{\"n\":3}\n"];
+    for line in lines {
+        quarantine::append(directory, line, line.len() as u64).unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    // Opening the active file tightens it before it can become a rotated file.
+    quarantine::append(directory, b"{\"n\":4}\n", lines[0].len() as u64).unwrap();
+    assert_eq!(fs::read_to_string(&active).unwrap(), "{\"n\":4}\n");
+    assert_eq!(fs::read_to_string(&previous).unwrap(), "{\"n\":3}\n");
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    for path in [&active, &previous] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(quarantine::append(directory, b"oversized record\n", 8).is_err());
+    assert_eq!(fs::read_to_string(active).unwrap(), "{\"n\":4}\n");
 }
