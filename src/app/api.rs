@@ -12,6 +12,7 @@ mod lineage;
 mod mesh;
 mod mesh_forward;
 pub(super) mod mesh_mail;
+mod mesh_receipts;
 mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
