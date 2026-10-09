@@ -547,6 +547,10 @@ fn workspace_list_and_create_round_trip() {
             .to_string(),
         );
         assert_eq!(pasted["result"]["outcome"], "delivered", "{pasted}");
+        assert_eq!(
+            pasted["result"]["evidence"]["level"], "text_matched",
+            "{pasted}"
+        );
     }
     let cleared = send_request(&socket_path, &serde_json::json!({
         "id":"clear_draft", "method":"pane.send_keys", "params":{"pane_id":pane_id,"keys":["C-c"]}

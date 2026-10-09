@@ -620,7 +620,10 @@ impl App {
             resolved.ws_idx,
             resolved.pane_id,
             params.text,
-            "agent_not_found",
+            (
+                "agent_not_found",
+                format!("agent target {} not found", params.target),
+            ),
             "agent_send_failed",
         )
     }

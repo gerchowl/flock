@@ -1009,12 +1009,15 @@ impl App {
             Ok(target) => target,
             Err(error) => return encode_error(id, &error.code, error.message),
         };
+        let public = self
+            .public_pane_id(ws_idx, pane_id)
+            .unwrap_or_else(|| pane_id.raw().to_string());
         self.begin_paste(
             id,
             ws_idx,
             pane_id,
             params.text,
-            "pane_not_found",
+            ("pane_not_found", format!("pane {public} not found")),
             "pane_send_failed",
         )
     }

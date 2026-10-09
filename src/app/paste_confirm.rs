@@ -22,7 +22,7 @@ pub(crate) struct Paste {
     agent: Option<Agent>,
     child_pid: Option<u32>,
     operator_input: Option<Instant>,
-    deadline: Instant,
+    pub(super) deadline: Instant,
 }
 
 fn digest(screen: &str) -> String {
@@ -37,9 +37,9 @@ fn normalize(text: &str) -> String {
 }
 
 /// Isolate the inserted/changed span instead of searching old transcript text.
-fn gained_text(before: &str, after: &str, text: &str) -> bool {
-    let before = normalize(before);
-    let after = normalize(after);
+fn inserted_text(before: &str, after: &str, text: &str) -> bool {
+    let before = before.lines().map(normalize).collect::<Vec<_>>().join("\n");
+    let after = after.lines().map(normalize).collect::<Vec<_>>().join("\n");
     let text = normalize(text);
     if text.is_empty() || before == after {
         return false;
@@ -58,7 +58,73 @@ fn gained_text(before: &str, after: &str, text: &str) -> bool {
         .take_while(|(a, b)| a == b)
         .count();
     let changed: String = after_tail[..after_tail.len() - suffix].iter().collect();
-    changed.contains(&text)
+    contains_wrapped(&changed, &text)
+}
+
+/// Terminal row boundaries may split a word or replace whitespace.
+fn contains_wrapped(changed: &str, text: &str) -> bool {
+    let wanted: Vec<_> = text.chars().collect();
+    let changed: Vec<_> = changed.chars().collect();
+    (0..changed.len()).any(|start| {
+        let mut matched = 0;
+        for &ch in &changed[start..] {
+            if ch == '\n' {
+                if wanted.get(matched) == Some(&' ') {
+                    matched += 1;
+                }
+            } else if wanted.get(matched) == Some(&ch) {
+                matched += 1;
+            } else {
+                return false;
+            }
+            if matched == wanted.len() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Align retained rows before looking for inserted text. A scroll shifts old
+/// rows without making their contents new input, including repeated rows.
+fn gained_text(before: &str, after: &str, text: &str) -> bool {
+    let before: Vec<_> = before.lines().map(normalize).collect();
+    let after: Vec<_> = after.lines().map(normalize).collect();
+    let mut common = vec![vec![0; after.len() + 1]; before.len() + 1];
+    for i in (0..before.len()).rev() {
+        for j in (0..after.len()).rev() {
+            common[i][j] = if before[i] == after[j] {
+                1 + common[i + 1][j + 1]
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut old_start, mut new_start) = (0, 0, 0, 0);
+    while i < before.len() && j < after.len() {
+        if before[i] == after[j] {
+            if inserted_text(
+                &before[old_start..i].join("\n"),
+                &after[new_start..j].join("\n"),
+                text,
+            ) {
+                return true;
+            }
+            i += 1;
+            j += 1;
+            old_start = i;
+            new_start = j;
+        } else if common[i + 1][j] >= common[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    inserted_text(
+        &before[old_start..].join("\n"),
+        &after[new_start..].join("\n"),
+        text,
+    )
 }
 
 fn observed(agent: Option<Agent>, before: &str, after: &str, text: &str) -> Option<&'static str> {
@@ -71,13 +137,14 @@ fn observed(agent: Option<Agent>, before: &str, after: &str, text: &str) -> Opti
             composer_contents(agent, after)?,
         ))
     }) {
-        if before != after {
-            return Some(if gained_text(&before, &after, text) {
-                "text_matched"
-            } else {
-                "composer_changed"
-            });
+        if before == after {
+            return None;
         }
+        return Some(if gained_text(&before, &after, text) {
+            "text_matched"
+        } else {
+            "composer_changed"
+        });
     }
 
     // Unsupported harnesses and ordinary terminals share an observational
@@ -96,14 +163,14 @@ impl App {
         ws: usize,
         pane_id: PaneId,
         text: String,
-        not_found: &str,
+        not_found: (&str, String),
         write_failed: &str,
     ) -> String {
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
-            return encode_error(id, not_found, "pane runtime not found");
+            return encode_error(id, not_found.0, not_found.1);
         };
         let Some(runtime) = self.lookup_runtime_sender(ws, pane_id) else {
-            return encode_error(id, not_found, "pane runtime not found");
+            return encode_error(id, not_found.0, not_found.1);
         };
         let mut paste = Paste {
             id: id.clone(),
@@ -146,6 +213,7 @@ impl App {
         let level = after
             .as_deref()
             .and_then(|after| observed(paste.agent, &paste.before, after, &paste.text));
+        let expired = Instant::now() >= paste.deadline;
         let reason = match current {
             None => "pane_gone",
             Some((runtime, terminal))
@@ -156,8 +224,10 @@ impl App {
             Some((runtime, _)) if runtime.last_operator_input_at() != paste.operator_input => {
                 "operator_active"
             }
-            Some(_) if level.is_some() => "change_observed",
-            Some(_) if Instant::now() >= paste.deadline => "confirm_timeout",
+            Some(_) if level.is_some() && (level != Some("screen_changed") || expired) => {
+                "change_observed"
+            }
+            Some(_) if expired => "confirm_timeout",
             Some(_) => {
                 self.schedule_paste(paste, respond_to);
                 return;
@@ -187,6 +257,26 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_paste_scrolling_old_rows_is_not_a_text_match() {
+        for (before, after) in [
+            ("old\nhello\nretained", "hello\nretained\nnew output"),
+            ("hello\nretained", "older output\nhello\nretained"),
+            (
+                "old\nhello\nhello\nretained",
+                "hello\nhello\nretained\nnew output",
+            ),
+            ("hello\nclock 1\n$", "hello\nclock 2\n$"),
+        ] {
+            assert_eq!(
+                observed(None, before, after, "hello"),
+                Some("screen_changed")
+            );
+        }
+        assert!(gained_text("$ hello\n$", "$ hello\n$ hello", "hello"));
+        assert!(gained_text("$", "$ hel\nlo world", "hello world"));
+    }
 
     #[test]
     fn plain_paste_confirms_short_repeated_and_wrapped_input() {

@@ -1586,6 +1586,11 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
     for (agent_send, code) in [(true, "agent_not_found"), (false, "pane_not_found")] {
         let Rig { mut app, pane, .. } = rig();
         app.state.workspaces[1].tabs[0].runtimes.clear();
+        let expected_message = if agent_send {
+            format!("agent target {pane} not found")
+        } else {
+            format!("pane {pane} not found")
+        };
         let method = if agent_send {
             Method::AgentSend(crate::api::schema::AgentSendParams {
                 target: pane,
@@ -1604,6 +1609,7 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
         }))
         .unwrap();
         assert_eq!(result["error"]["code"], code);
+        assert_eq!(result["error"]["message"], expected_message);
     }
 }
 
@@ -1663,6 +1669,116 @@ async fn plain_paste_observes_folded_and_busy_composers_after_dispatch() {
         assert_eq!(result["result"]["outcome"], "delivered", "{result}");
         assert_eq!(result["result"]["reason"], "change_observed");
         assert_eq!(result["result"]["evidence"]["level"], level);
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn plain_paste_streaming_output_does_not_confirm_an_unchanged_composer() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    let response = app.handle_api_request(Request {
+        id: "streaming".into(),
+        method: Method::PaneSendText(PaneSendTextParams {
+            pane_id: pane,
+            text: "hello".into(),
+        }),
+    });
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+    app.event_tx = event_tx;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Claude),
+        AgentState::Working,
+        false,
+        false,
+        false,
+        false,
+        Instant::now(),
+    );
+    runtime(&app).test_process_pty_bytes(b"\x1b[2J\x1b[HStreaming hello from old output\r\n");
+    runtime(&app).test_process_pty_bytes("────\r\n❯ \r\n────".as_bytes());
+    let crate::events::AppEvent::PasteConfirm {
+        mut paste,
+        respond_to,
+    } = event_rx.recv().await.unwrap()
+    else {
+        panic!("expected observation")
+    };
+    paste.deadline = Instant::now();
+    app.advance_paste(paste, respond_to);
+    let result: serde_json::Value =
+        serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+    assert_eq!(result["result"]["outcome"], "unconfirmed", "{result}");
+    assert_eq!(result["result"]["reason"], "confirm_timeout");
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn plain_paste_waits_for_late_chip_before_using_screen_only_evidence() {
+    for late_chip in [true, false] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let response = app.handle_api_request(Request {
+            id: "late-paint".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane,
+                text: "long brief".into(),
+            }),
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        app.event_tx = event_tx;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.respond_or_park(sender, response);
+        assert_eq!(drain(&mut pty), vec![b"long brief".to_vec()]);
+        runtime(&app).test_process_pty_bytes(b"\x1b[2J\x1b[HRepainting...");
+        let crate::events::AppEvent::PasteConfirm {
+            mut paste,
+            respond_to,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected observation")
+        };
+        paste.deadline = Instant::now() + crate::app::guarded_submit::CONFIRM_WINDOW;
+        app.advance_paste(paste, respond_to);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let crate::events::AppEvent::PasteConfirm {
+            mut paste,
+            respond_to,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected another observation")
+        };
+        if late_chip {
+            runtime(&app).test_process_pty_bytes(&claude_screen("[Pasted text #1 +20 lines]"));
+        } else {
+            paste.deadline = Instant::now();
+        }
+        app.advance_paste(paste, respond_to);
+        let result: serde_json::Value =
+            serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(result["result"]["outcome"], "delivered", "{result}");
+        assert_eq!(
+            result["result"]["evidence"]["level"],
+            if late_chip {
+                "composer_changed"
+            } else {
+                "screen_changed"
+            }
+        );
         assert!(drain(&mut pty).is_empty());
     }
 }
