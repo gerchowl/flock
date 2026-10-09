@@ -105,6 +105,118 @@ fn native_agent(node: &Node) -> Value {
     agent
 }
 
+fn native_harness(node: &Node, harness: &str, screen: &str) -> Value {
+    let executable = node.home.join(harness);
+    let report = format!(
+        "{} pane report-agent --source flock:{harness} --agent {harness} --state idle --agent-session-id retained-session",
+        quote(env!("CARGO_BIN_EXE_flk"))
+    );
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\n{report}\nprintf '\\033[2J\\033[H%s\\n' {}\nwhile IFS= read -r line; do :; done\n", quote(screen)),
+    ).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let agent = start_at(node, &node.repo, &executable);
+    fleet::wait_until("native harness session", DEADLINE, || {
+        let current = api(node, "agent.get", json!({"target":agent["pane_id"]}))["agent"].clone();
+        (current["agent_session"]["value"] == "retained-session").then_some(())
+    });
+    agent
+}
+
+fn assert_harness_restart(harness: &str, screen: &str) {
+    let fleet = fleet::spawn("ts-harness", SINGLE);
+    let node = fleet.node("nodea");
+    let target = native_harness(node, harness, screen);
+    let sender = start(node);
+    send(node, &sender, &target, "harness-restart-mail");
+    api(
+        node,
+        "agent.restart",
+        json!({"target":target["pane_id"], "reason":"fixture harness restart"}),
+    );
+    fleet::wait_until("harness restart verified", DEADLINE, || {
+        let log = fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl")).ok()?;
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| {
+                event["envelope"]["event"] == "agent_restart"
+                    && event["envelope"]["data"]["phase"] == "restarted"
+            })
+            .then_some(())
+    });
+    let current = api(node, "agent.get", json!({"target":target["pane_id"]}))["agent"].clone();
+    assert_eq!(current["agent_id"], target["agent_id"]);
+    assert_eq!(current["agent_session"]["value"], "retained-session");
+    assert_eq!(removals(node), 0);
+    state(node, "harness-restart-mail", "delivered");
+    let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
+    let messages = messages["messages"].as_array().unwrap();
+    assert!(messages
+        .iter()
+        .any(|m| m["correlation_id"] == "harness-restart-mail"));
+    assert!(messages.iter().any(|m| m["body"]
+        .as_str()
+        .is_some_and(|body| body.contains("Restart verified:"))));
+}
+
+#[test]
+fn codex_restart_confirms_startup_composer() {
+    assert_harness_restart(
+        "codex",
+        include_str!("fixtures/codex/startup-passive-banners.txt"),
+    );
+}
+
+#[test]
+fn codex_restart_confirms_model_footer_without_shortcuts() {
+    assert_harness_restart(
+        "codex",
+        "› Ask Codex to do anything\n\n  GPT-6.1-Sol default · /fixture/work\n",
+    );
+}
+
+#[test]
+fn opencode_restart_confirms_composer() {
+    assert_harness_restart(
+        "opencode",
+        "┃\n┃  Ask anything…\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n",
+    );
+}
+
+#[test]
+fn codex_resume_failed_keeps_mail_without_tombstone() {
+    let fleet = fleet::spawn("ts-codex-fail", SINGLE);
+    let node = fleet.node("nodea");
+    let target = native_harness(
+        node,
+        "codex",
+        "› Ask Codex to do anything\n\n  GPT-6.1-Sol default · /fixture/work\n",
+    );
+    let sender = start(node);
+    send(node, &sender, &target, "codex-failed-resume-mail");
+    fs::remove_file(node.home.join("codex")).unwrap();
+    api(
+        node,
+        "agent.restart",
+        json!({"target":target["pane_id"],"reason":"fixture failed Codex resume"}),
+    );
+    fleet::wait_until("Codex offline resume failure", DEADLINE, || {
+        let current = api(node, "agent.get", json!({"target":target["pane_id"]}))["agent"].clone();
+        assert_eq!(current["agent_id"], target["agent_id"]);
+        (current["agent_status"] == "offline" && current["blocked_reason"] == "resume_failed")
+            .then_some(())
+    });
+    assert_eq!(removals(node), 0);
+    state(node, "codex-failed-resume-mail", "delivered");
+    let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
+    assert!(messages["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["correlation_id"] == "codex-failed-resume-mail"));
+}
+
 fn stop_hook(node: &Node, agent: &Value) -> String {
     let ready = node.home.join("stop-ready");
     let _ = fs::remove_file(&ready);

@@ -434,7 +434,7 @@ async fn restart_api_unknown_startup_dialog_times_out_without_continuing() {
     rig.app.tick_agent_restarts(Instant::now() + TICK);
     assert!(has_phase(&rig, "restart_stuck"));
     assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("Unknown startup question"))));
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("Unknown startup question") && detail.contains("unknown_composer"))));
 }
 
 #[tokio::test]
@@ -921,4 +921,111 @@ async fn restart_messages_detach_leftover_relays_before_the_next_request() {
     assert_eq!(completion.send.id, "detached");
     assert!(completion.send.respond_to.is_none());
     app.handle_internal_event(event);
+}
+
+#[tokio::test]
+async fn restart_composer_rejects_unknown_harness_drafts_and_dialogs() {
+    let mut rig = rig();
+    for (agent, screen, reason) in [
+        ("pi", "─────────────\n❯ \n─────────────\n", "unknown_composer"),
+        ("codex", "› operator draft\n  ? for shortcuts\n", "composer_not_empty"),
+        ("opencode", "┃\n┃ operator draft\n┃\n╹\ntab agents ctrl+p commands\n", "composer_not_empty"),
+        ("codex", include_str!("../../tests/fixtures/codex/startup-update-dialog.txt"), "unknown_composer"),
+        ("opencode", "┃\n┃ Ask anything…\n┃\n╹\ntab agents ctrl+p commands\n↑↓ select enter confirm esc dismiss\n", "unknown_composer"),
+    ] {
+        rig.app.state.terminals.get_mut(&rig.id).unwrap().persisted_agent_session.as_mut().unwrap().agent = agent.into();
+        let screen = format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n"));
+        rig.app.terminal_runtimes.get(&rig.id).unwrap().test_process_pty_bytes(screen.as_bytes());
+        assert_eq!(rig.app.restart_composer_ready(&rig.id), Err(reason), "{agent}: {screen}");
+    }
+}
+
+#[tokio::test]
+async fn restart_opencode_requires_fresh_observation_and_empty_composer_without_idle_hook() {
+    let mut rig = rig();
+    let now = Instant::now();
+    let terminal = rig.app.state.terminals.get_mut(&rig.id).unwrap();
+    terminal.prepare_restart_resume();
+    terminal.persisted_agent_session.as_mut().unwrap().agent = "opencode".into();
+    terminal.set_detected_state_with_screen_signals_at(
+        Some(Agent::OpenCode),
+        AgentState::Idle,
+        false,
+        false,
+        false,
+        false,
+        now,
+    );
+    rig.app
+        .terminal_runtimes
+        .get(&rig.id)
+        .unwrap()
+        .test_process_pty_bytes(
+            "\x1b[2J\x1b[H┃\r\n┃ Ask anything…\r\n┃\r\n╹\r\ntab agents ctrl+p commands\r\n"
+                .as_bytes(),
+        );
+    let policy = rig.app.restart_policy(&rig.id);
+    assert!(rig.app.restart_ready(&rig.id, now, &policy, now));
+    assert!(!rig.app.restart_ready(&rig.id, now, &policy, now + TICK));
+    assert!(!rig
+        .app
+        .restart_ready(&rig.id, now + Duration::from_secs(10), &policy, now));
+}
+
+async fn claude_verifying_rig() -> Rig {
+    let mut rig = rig();
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    report_session(&mut rig, "restart-session", 1);
+    rig
+}
+
+#[tokio::test]
+async fn restart_claude_empty_composer_verifies_and_delivers_continuation() {
+    let mut rig = claude_verifying_rig().await;
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "");
+    assert_eq!(rig.app.restart_composer_ready(&rig.id), Ok(()));
+    rig.app.tick_agent_restarts(now);
+    assert!(has_phase(&rig, "restarted"));
+    assert!(!has_phase(&rig, "restart_stuck"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 1);
+}
+
+#[tokio::test]
+async fn restart_claude_draft_reports_composer_not_empty_without_continuing() {
+    let mut rig = claude_verifying_rig().await;
+    rig.app.state.config.session.restart.verify_timeout_secs = 0;
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "operator draft");
+    assert_eq!(
+        rig.app.restart_composer_ready(&rig.id),
+        Err("composer_not_empty")
+    );
+    rig.app.tick_agent_restarts(now);
+    assert!(!has_phase(&rig, "restarted"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+        &event.data, EventData::AgentRestart { phase, detail, .. }
+        if phase == "restart_stuck" && detail.contains("verification timed out (composer_not_empty)")
+    )));
+}
+
+#[tokio::test]
+async fn restart_claude_empty_composer_timeout_reports_missing_idle_observation() {
+    let mut rig = claude_verifying_rig().await;
+    rig.app.state.config.session.restart.verify_timeout_secs = 0;
+    let Phase::Verifying(started) = rig.app.state.agent_restarts.pending[&rig.id].phase else {
+        panic!("expected verifying phase");
+    };
+    idle(&mut rig, started - TICK, "");
+    assert_eq!(rig.app.restart_composer_ready(&rig.id), Ok(()));
+    rig.app.tick_agent_restarts(Instant::now() + TICK);
+    assert!(!has_phase(&rig, "restarted"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+        &event.data, EventData::AgentRestart { phase, detail, .. }
+        if phase == "restart_stuck" && detail.contains("verification timed out (idle_observation_missing)")
+    )));
 }

@@ -1300,9 +1300,12 @@ impl TerminalState {
         self.state_changed_at = None;
     }
 
+    // OpenCode proves its composer in restart_ready, as in guarded submit.
+    // Its detector observation supplies freshness without a visible-idle flag.
     pub(crate) fn restart_idle_observed_since(&self, since: Instant) -> bool {
         self.state == AgentState::Idle
-            && (self.fallback_visible_idle
+            && ((self.fallback_visible_idle
+                || self.effective_known_agent() == Some(crate::detect::Agent::OpenCode))
                 && self.fallback_observed_at.is_some_and(|at| at >= since)
                 || self.hook_authority.as_ref().is_some_and(|hook| {
                     hook.state == AgentState::Idle && hook.reported_at >= since
