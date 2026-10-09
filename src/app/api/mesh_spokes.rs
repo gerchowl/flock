@@ -25,11 +25,17 @@ impl App {
         if params.from_host.is_some() || !self.state.peers.is_empty() {
             return None;
         }
-        let hub = self.uplink.enrolled_hub().or_else(|| {
-            with_store(|store| store.sole_inbound_peer().map_err(|e| e.to_string()))
-                .ok()
-                .flatten()
-        })?;
+        let hub = self
+            .inbound
+            .live(crate::platform::process_start_time)
+            .filter(|edge| edge.enrolled())
+            .min_by_key(|edge| &edge.enrollment.node_id)
+            .map(|edge| edge.enrollment.peer.clone())
+            .or_else(|| {
+                with_store(|store| store.sole_inbound_peer().map_err(|e| e.to_string()))
+                    .ok()
+                    .flatten()
+            })?;
         let result = (|| {
             if self.fleet_pause.paused {
                 return Err("fleet_paused".to_string());
