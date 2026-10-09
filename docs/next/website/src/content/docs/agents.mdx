@@ -170,6 +170,8 @@ the agent in that target's checkout:
 flk agent start docs --workspace 1 --tab 1-1 -- claude
 ```
 
+Without `--split`, `--workspace` replaces the workspace’s only pane when it is an untouched root shell created by Flock. `--tab` does the same for a lone root shell in that tab. The shell must never have received input and must still be the foreground process. Otherwise the agent opens a new tab, or a sibling workspace under `tab_mode = "workspace"`. An explicit `--split right|down` always requests a split. Replacement preserves the tab and public pane address, and a failed start leaves the shell running.
+
 ## Where a start lands when you named nothing
 
 "The workspace you are looking at" is an answer for a person in front of the

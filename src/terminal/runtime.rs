@@ -27,6 +27,11 @@ impl TerminalRuntime {
         self.0.shutdown_for_restart(pids, grace)
     }
 
+    /// Whether input and foreground process state permit root replacement.
+    pub(crate) fn is_untouched_shell(&self) -> bool {
+        self.0.is_untouched_shell()
+    }
+
     /// PID of the pane's direct child process, when alive.
     pub fn child_pid(&self) -> Option<u32> {
         self.0.child_pid()

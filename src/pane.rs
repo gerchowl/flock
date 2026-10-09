@@ -722,6 +722,8 @@ pub struct PaneRuntime {
     /// When input last reached this pane from anyone but flock itself
     /// (ADR-0018 §2) — the idle wake's "flock does not type over a human".
     operator_input: OperatorInputClock,
+    /// Sticky input history for safe root-shell replacement.
+    has_been_typed_into: Cell<bool>,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
 }
@@ -1537,6 +1539,7 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
             detect_handle,
         })
     }
@@ -1967,6 +1970,7 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: false,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(false),
             detect_handle,
         })
     }
@@ -2130,12 +2134,32 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
+    /// Unknown process state must never authorize replacing a shell.
+    pub(crate) fn is_untouched_shell(&self) -> bool {
+        if self.has_been_typed_into.get() {
+            return false;
+        }
+        let Some(pid) = self.child_pid() else {
+            return false;
+        };
+        crate::detect::foreground_job(pid).is_some_and(|job| {
+            job.processes.len() == 1
+                && job.processes[0].pid == pid
+                && matches!(
+                    job.processes[0].name.trim_start_matches('-'),
+                    "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "nu" | "tcsh" | "csh"
+                )
+        })
+    }
+
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.operator_input.stamp();
         self.io.send_bytes(bytes).await
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.operator_input.stamp();
         self.io.try_send_bytes(bytes)
     }
@@ -2147,6 +2171,7 @@ impl PaneRuntime {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.io.try_send_bytes(bytes)
     }
 
@@ -2357,6 +2382,7 @@ impl PaneRuntime {
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 operator_input: OperatorInputClock::default(),
+                has_been_typed_into: Cell::new(false),
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2688,6 +2714,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2717,6 +2744,7 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 

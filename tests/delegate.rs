@@ -1818,3 +1818,49 @@ fn opencode_ambiguous_submission_keeps_workspace_and_does_not_retry() {
         vec![expected_line(&b)]
     );
 }
+
+/// #818: both placement paths must return one agent at the root address.
+#[test]
+fn delegate_start_uses_single_root_pane() {
+    for worktree in [false, true] {
+        let server = start_server();
+        operator_workspace(&server);
+        let b = brief(&server, "task.md", "x\n");
+        let mut child = if worktree {
+            let repo = committed_repo(&server);
+            cli_spawn(
+                &server,
+                &[
+                    "delegate",
+                    "start",
+                    "d1",
+                    "--brief",
+                    &b,
+                    "--worktree",
+                    "--repo",
+                    repo.to_str().unwrap(),
+                    "--branch",
+                    "test/818",
+                    "--json",
+                ],
+            )
+        } else {
+            start_cwd(&server, "d1", &b, &["--json"])
+        };
+        let pane = make_ready(&server, "d1");
+        let status = exited_within(&mut child, WITHIN).expect("delegate started");
+        let out = finish(child);
+        assert_eq!(status.code(), Some(0), "{}", stderr(&out));
+        let result = stdout_json(&out);
+        let workspace = result["workspace_id"].as_str().unwrap();
+        assert_eq!(pane, format!("{workspace}:p1"));
+        let listed = request(
+            &server,
+            &serde_json::json!({
+                "id": "panes", "method": "pane.list", "params": {"workspace_id": workspace}
+            })
+            .to_string(),
+        );
+        assert_eq!(listed["result"]["panes"].as_array().unwrap().len(), 1);
+    }
+}

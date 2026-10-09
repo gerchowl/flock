@@ -400,6 +400,90 @@ impl App {
         Ok((ws_idx, tab_idx, pane_id))
     }
 
+    fn targeted_agent_placement(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        split: Option<SplitDirection>,
+        whole_workspace: bool,
+    ) -> StartPlacement {
+        let ws = &self.state.workspaces[ws_idx];
+        let tab = &ws.tabs[tab_idx];
+        if let Some(direction) = split {
+            return StartPlacement::Split(ws_idx, tab.layout.focused(), direction);
+        }
+        let untouched = (!whole_workspace || ws.tabs.len() == 1)
+            && tab.panes.len() == 1
+            && tab.panes.get(&tab.root_pane).is_some_and(|pane| {
+                pane.created_as_root_shell
+                    && self
+                        .terminal_runtimes
+                        .get(&pane.attached_terminal_id)
+                        .is_some_and(TerminalRuntime::is_untouched_shell)
+            });
+        if untouched {
+            StartPlacement::Replace(ws_idx, tab_idx)
+        } else {
+            StartPlacement::Workspace(self.public_workspace_id(ws_idx))
+        }
+    }
+
+    fn replace_agent_root_shell(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        cwd: PathBuf,
+        argv: &[String],
+        focus: bool,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        let old_tab = &self.state.workspaces[ws_idx].tabs[tab_idx];
+        let old_pane = old_tab.root_pane;
+        let old_terminal = old_tab.panes[&old_pane].attached_terminal_id.clone();
+        let (rows, cols) = self.state.estimate_pane_size();
+        // Stage the replacement before changing the visible tab. A fresh raw
+        // pane id keeps the old shell's queued events away from the agent.
+        let (mut tab, terminal, runtime) = crate::workspace::Tab::new_argv_command(
+            old_tab.number,
+            cwd,
+            rows,
+            cols,
+            argv,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        )
+        .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
+        tab.custom_name = old_tab.custom_name.clone();
+        let pane_id = tab.root_pane;
+        let terminal_id = terminal.id.clone();
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
+            if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+                runtime.shutdown();
+            }
+            return Err(AgentStartError::ExitedAtStart(exit));
+        }
+        let ws = &mut self.state.workspaces[ws_idx];
+        if let Some(number) = ws.public_pane_numbers.remove(&old_pane) {
+            ws.public_pane_numbers.insert(pane_id, number);
+        }
+        ws.tabs[tab_idx] = tab;
+        self.state.terminals.insert(terminal_id, terminal);
+        self.state.terminals.remove(&old_terminal);
+        if let Some(runtime) = self.terminal_runtimes.remove(&old_terminal) {
+            runtime.shutdown();
+        }
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        if focus {
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.state.mode = Mode::Terminal;
+        }
+        self.schedule_session_save();
+        Ok((ws_idx, tab_idx, pane_id))
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -512,11 +596,7 @@ impl App {
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             (
                 cwd,
-                StartPlacement::Split(
-                    ws_idx,
-                    target_pane,
-                    params.split.unwrap_or(SplitDirection::Right),
-                ),
+                self.targeted_agent_placement(ws_idx, tab_idx, params.split, false),
             )
         } else if let Some(workspace_id) = params.workspace_id {
             let ws_idx = self.parse_workspace_id(&workspace_id).ok_or_else(|| {
@@ -529,11 +609,7 @@ impl App {
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             (
                 cwd,
-                StartPlacement::Split(
-                    ws_idx,
-                    target_pane,
-                    params.split.unwrap_or(SplitDirection::Right),
-                ),
+                self.targeted_agent_placement(ws_idx, tab_idx, params.split, true),
             )
         } else if let Some(ws_idx) = named_workspace {
             // #398: the placement was asked for by name, so it is reached from
@@ -633,8 +709,7 @@ impl App {
             // to listen. Only a matched cwd changes anything — an unmatched one
             // takes the #364 path unchanged.
             //
-            // Splitting is still reachable, but only by asking: name a
-            // `workspace_id`/`tab_id`, pass `split`, or pass `--active`.
+            // Splitting is reachable only by explicitly passing `--split`.
             let requested_cwd = explicit_cwd.clone();
             let cwd = self.agent_start_cwd(explicit_cwd, None);
             match self.agent_cwd_workspace_id(requested_cwd.as_deref()) {
@@ -679,6 +754,12 @@ impl App {
                     None,
                     None,
                 ),
+                StartPlacement::Replace(ws, tab) => (
+                    "replace",
+                    Some(self.public_workspace_id(*ws)),
+                    self.public_pane_id(*ws, self.state.workspaces[*ws].tabs[*tab].root_pane),
+                    None,
+                ),
                 StartPlacement::NewWorkspace => ("workspace", None, None, None),
             };
             return Ok(crate::api::schema::ResponseResult::AllocationPlan {
@@ -688,6 +769,9 @@ impl App {
             });
         }
         let (ws_idx, tab_idx, pane_id) = match placement {
+            StartPlacement::Replace(ws, tab) => {
+                self.replace_agent_root_shell(ws, tab, cwd, &argv, focus)?
+            }
             StartPlacement::Split(ws, pane, direction) => {
                 self.spawn_agent_split(ws, pane, direction, cwd, &argv, focus)?
             }
@@ -1222,6 +1306,7 @@ pub(super) enum AgentRenameError {
 }
 
 enum StartPlacement {
+    Replace(usize, usize),
     Split(usize, crate::layout::PaneId, SplitDirection),
     Workspace(String),
     NewWorkspace,
@@ -1498,6 +1583,191 @@ mod tests {
         .message();
         assert!(message.contains("exit code 0"), "{message}");
         assert!(message.contains("No conversation found"), "{message}");
+    }
+
+    async fn created_root_shell() -> (crate::app::App, String, crate::layout::PaneId) {
+        let mut app = test_app();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        app.state.tab_mode = crate::config::TabModeConfig::Tabs;
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": std::env::temp_dir(), "focus": true}
+        }))
+        .expect("workspace request");
+        let response = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&response).expect("response");
+        assert_eq!(
+            response["result"]["type"], "workspace_created",
+            "{response}"
+        );
+        let ws = app.state.workspaces.len() - 1;
+        let pane = app.state.workspaces[ws].tabs[0].root_pane;
+        let terminal = app.state.workspaces[ws]
+            .terminal_id(pane)
+            .expect("terminal")
+            .clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app
+            .terminal_runtimes
+            .get(&terminal)
+            .expect("runtime")
+            .is_untouched_shell()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never became foreground"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let workspace = app.public_workspace_id(ws);
+        (app, workspace, pane)
+    }
+
+    #[tokio::test]
+    async fn agent_start_replaces_created_root_shell_at_p1() {
+        for target_tab in [false, true] {
+            let (mut app, workspace, old_pane) = created_root_shell().await;
+            let old_terminal = app.state.workspaces[0]
+                .terminal_id(old_pane)
+                .unwrap()
+                .clone();
+            let old_tab = app.public_tab_id(0, 0).unwrap();
+            let mut request = targeted_start_request(&workspace, None);
+            if let Method::AgentStart(params) = &mut request.method {
+                if target_tab {
+                    params.tab_id = Some(old_tab.clone());
+                    params.workspace_id = None;
+                }
+            }
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["result"]["type"], "agent_started", "{response}");
+            assert_eq!(
+                response["result"]["agent"]["pane_id"],
+                format!("{workspace}:p1")
+            );
+            assert_eq!(response["result"]["agent"]["tab_id"], old_tab);
+            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+            assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+            assert!(!app.state.terminals.contains_key(&old_terminal));
+            assert!(app.terminal_runtimes.get(&old_terminal).is_none());
+            // A queued death from the retired shell cannot remove the new agent.
+            app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id: old_pane });
+            assert_eq!(app.collect_agent_infos().len(), 1);
+            shutdown(app);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_typed_root_shell_gets_new_tab() {
+        for target_tab in [false, true] {
+            let (mut app, workspace, pane) = created_root_shell().await;
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "type", "method": "pane.send_text",
+                "params": {"pane_id": format!("{workspace}:p1"), "text": " "}
+            }))
+            .expect("input request");
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            let mut request = targeted_start_request(&workspace, None);
+            if let Method::AgentStart(params) = &mut request.method {
+                if target_tab {
+                    params.tab_id = app.public_tab_id(0, 0);
+                    params.workspace_id = None;
+                }
+            }
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["result"]["type"], "agent_started", "{response}");
+            assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+            assert_eq!(app.state.workspaces[0].tabs[1].panes.len(), 1);
+            shutdown(app);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_explicit_split_preserves_root_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.split = Some(crate::api::schema::SplitDirection::Right);
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 2);
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&pane));
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_unknown_root_provenance_gets_sibling_in_workspace_mode() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .created_as_root_shell = false;
+        let raw = app.handle_api_request(targeted_start_request(&workspace, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_replacement_dry_run_preserves_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.dry_run = true;
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["result"]["plan"]["placement"], "replace",
+            "{response}"
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert_eq!(app.terminal_runtimes.len(), 1);
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_failed_replacement_keeps_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        for argv in [
+            vec![std::env::temp_dir()
+                .join("flock-818-missing-program")
+                .to_string_lossy()
+                .into_owned()],
+            vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+        ] {
+            let mut request = targeted_start_request(&workspace, None);
+            if let Method::AgentStart(params) = &mut request.method {
+                params.argv = argv;
+            }
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(response.get("error").is_some(), "{response}");
+            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+            assert!(app
+                .terminal_runtimes
+                .get(&terminal)
+                .unwrap()
+                .is_untouched_shell());
+            assert_eq!(app.terminal_runtimes.len(), 1);
+        }
+        shutdown(app);
     }
 
     /// #365: `--workspace <id>` named where the PANE goes and nothing about
