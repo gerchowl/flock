@@ -1,1 +1,1 @@
-- Add isolated mesh acceptance coverage for multi-hop delivery, replies, custody recovery, routing, and refusal diagnostics. (#661)
+- Add isolated mesh acceptance coverage for multi-hop delivery, replies, custody recovery, routing, and refusal diagnostics, with route-generation diagnostics in `peers.enrollment`. (#661)

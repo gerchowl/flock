@@ -164,6 +164,27 @@ def forward_input():
                     }}) + "\n")
                     continue
                 deliveries.add(request.get("id"))
+                tamper = base / f"tamper-delivery-{source}-{target}"
+                if tamper.exists():
+                    field = tamper.read_text().strip()
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    if field == "origin":
+                        envelope["key"]["origin_node"] = "0" * 64
+                    elif field == "visited":
+                        params["visited"][-1] = envelope["key"]["origin_node"]
+                    elif field == "body":
+                        payload = json.loads(bytes(envelope["body"]))
+                        payload["message"]["body"] = "wire forgery"
+                        envelope["body"] = list(json.dumps(payload).encode())
+                    elif field == "signature":
+                        envelope["signature"] = [0] * 64
+                    elif field == "token":
+                        envelope["return_binding"]["collection_token"][0] ^= 1
+                    else:
+                        raise ValueError(f"unknown delivery tamper: {field}")
+                    line = json.dumps(request) + "\n"
+                    (base / f"tampered-delivery-{source}-{target}").write_text(line)
                 if (base / f"spoof-host-{source}-{target}").exists():
                     envelope = request["params"]["envelope"]
                     payload = json.loads(bytes(envelope["body"]))
@@ -259,6 +280,8 @@ try:
             if response.get("error"):
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
+            if (base / f"tamper-delivery-{source}-{target}").exists():
+                (base / f"tampered-result-{source}-{target}").write_text(line)
             deliveries.discard(response.get("id"))
             gate = base / f"gate-delivery-ack-{source}-{target}"
             if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:

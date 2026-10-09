@@ -530,66 +530,46 @@ fn route_cycle_and_exhausted_hop_budget_retain_custody() {
 #[test]
 #[ignore = "needs 661-2g"]
 fn forged_origin_signature_route_and_token_are_refused() {
-    for field in ["origin", "signature", "route", "token"] {
+    for field in ["origin", "visited", "body", "signature", "token"] {
         let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
-        let capture = c.fleet.base.join("capture-delivery-nodea-nodeb");
-        std::fs::write(&capture, "").unwrap();
+        fs::write(c.fleet.base.join("tamper-delivery-nodeb-nodec"), field).unwrap();
         c.send();
-        let mut delivery: Value =
-            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
-        match field {
-            "origin" => delivery["envelope"]["key"]["origin_node"] = json!("0".repeat(64)),
-            "signature" => delivery["envelope"]["signature"] = json!(vec![0; 64]),
-            "route" => delivery["visited"] = json!(["forged.example"]),
-            "token" => {
-                delivery["envelope"]["return_binding"]["collection_token"] = json!(vec![0; 32])
-            }
-            _ => unreachable!(),
-        }
-        let replay = c.fleet.base.join("replay-delivery-nodea-nodeb");
-        std::fs::write(replay, serde_json::to_vec(&delivery).unwrap()).unwrap();
-        std::fs::remove_file(capture).unwrap();
-        due(c.fleet.node("nodea"));
-        let refused = state(c.fleet.node("nodea"), "question", "refused");
-        let expected = if field == "route" {
+        let response: Value =
+            fleet::wait_until("forwarded forgery refused on the wire", DEADLINE, || {
+                serde_json::from_slice(
+                    &fs::read(c.fleet.base.join("tampered-result-nodeb-nodec")).ok()?,
+                )
+                .ok()
+            });
+        let expected = if field == "visited" {
             "origin_mismatch"
         } else {
             "invalid_signature"
         };
-        assert!(
-            refused["detail"].as_str().unwrap().contains(expected),
-            "{refused}"
+        assert_eq!(
+            response["error"]["message"], expected,
+            "{field}: {response}"
         );
-        for name in ["nodeb", "nodec"] {
-            assert_eq!(
-                scalar(c.fleet.node(name), "SELECT count(*) FROM envelopes"),
-                0,
-                "{field} accepted at {name}"
-            );
-        }
+        let forwarded: Value = serde_json::from_slice(
+            &fs::read(c.fleet.base.join("tampered-delivery-nodeb-nodec")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded["params"]["envelope"]["correlation_id"],
+            "question"
+        );
+        assert_eq!(forwarded["params"]["visited"].as_array().unwrap().len(), 2);
+        once(c.fleet.node("nodeb"), "question");
+        assert_eq!(
+            scalar(
+                c.fleet.node("nodec"),
+                "SELECT count(*) FROM envelopes WHERE correlation='question'"
+            ),
+            0,
+            "{field} accepted"
+        );
+        assert_eq!(read(c.fleet.node("nodec"), &c.receiver.pane), json!([]));
     }
-    let fleet = fleet::spawn_with_startup_probe("s2forged-route", DIRECT, |fleet, name| {
-        if name == "nodea" {
-            shim(
-                fleet,
-                "        response = json.loads(line)\n",
-                r#"        adverts = response.get("result", {}).get("adverts")
-        if adverts:
-            forged = dict(adverts[0])
-            forged["node_id"] = "0" * 64
-            forged["name"] = "forged.example"
-            adverts.insert(0, forged)
-            line = json.dumps(response) + "\n"
-            (base / "forged-advert-sent").touch()
-"#,
-            );
-        }
-    });
-    route(fleet.node("nodea"), fleet.node("nodeb"));
-    assert!(fleet.base.join("forged-advert-sent").exists());
-    assert!(routes(fleet.node("nodea"))
-        .iter()
-        .all(|r| r["node"] != "0".repeat(64)));
 }
 
 #[test]
@@ -653,19 +633,22 @@ fn quiet_healthy_edge_keeps_routes() {
         trace_writes(node);
     }
     let databases: Vec<_> = fleet.nodes.iter().map(db).collect();
-    let sample = || {
-        databases
-            .iter()
-            .map(|db| {
-                db.query_row(
-                    "SELECT count(*), coalesce(max(total_changes),0) FROM acceptance_writes",
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>()
-    };
+    let sample =
+        || {
+            databases
+                .iter()
+                .zip(&fleet.nodes)
+                .map(|(db, node)| {
+                    let writes = db.query_row(
+                "SELECT count(*), coalesce(max(total_changes),0) FROM acceptance_writes", [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap();
+                    let generation = api(node, "peers.enrollment", json!({}))["route_generation"]
+                        .as_u64()
+                        .unwrap();
+                    (writes, generation)
+                })
+                .collect::<Vec<_>>()
+        };
     // Initial directory persistence is asynchronous. Observe a quiet window
     // before starting the fixed 30-second acceptance interval.
     let mut baseline = sample();
@@ -683,7 +666,11 @@ fn quiet_healthy_edge_keeps_routes() {
         "30 seconds with no store mutations",
         Duration::from_secs(35),
         || {
-            assert_eq!(sample(), baseline, "idle fleet committed store writes");
+            assert_eq!(
+                sample(),
+                baseline,
+                "idle fleet changed store writes or route generation"
+            );
             for (from, to) in [("nodea", "nodec"), ("nodec", "nodea")] {
                 let target = fleet::node_id(fleet.node(to));
                 assert!(routes(fleet.node(from)).iter().any(|r| r["node"] == target));

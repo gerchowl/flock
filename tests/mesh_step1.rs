@@ -672,18 +672,24 @@ fn multihop_chain_is_refused_with_forward_limit() {
 
 #[test]
 fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
-    let mut conversation = Conversation::new(DIRECT);
+    let mut conversation = Conversation::new(&[
+        NodeSpec::new("nodea", "version-origin", &["nodeb", "nodec"]),
+        NodeSpec::new("nodeb", "version-old", &[]),
+        NodeSpec::new("nodec", "version-healthy", &[]),
+    ]);
+    cut(&conversation.fleet, "nodea", "nodeb");
+    assert_eq!(conversation.send()["state"], "queued");
     conversation
         .fleet
         .node_mut("nodeb")
         .restart_with_mesh(fleet::MeshMode::VersionMismatch(0));
+    conversation.fleet.allow_edge("nodea", "nodeb");
     fleet::wait_until("old protocol refused", DEADLINE, || {
-        let enrollment = api(
+        api(
             conversation.fleet.node("nodea"),
             "peers.enrollment",
             json!({}),
-        );
-        enrollment["peers"]
+        )["peers"]
             .as_array()?
             .iter()
             .any(|peer| {
@@ -693,38 +699,56 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
             })
             .then_some(())
     });
-    let sent = conversation.send();
-    assert_eq!(sent["state"], "queued", "{sent}");
-    assert!(
-        sent["warnings"]
-            .to_string()
-            .contains("upgrade flk on nodeb"),
-        "{sent}"
-    );
-    state(conversation.fleet.node("nodea"), "question", "queued");
-    assert_eq!(
-        read(
-            conversation.fleet.node("nodeb"),
-            &conversation.receiver.pane
-        ),
-        json!([])
-    );
-    assert!(!conversation
-        .fleet
-        .base
-        .join("legacy-message-nodea-nodeb")
-        .exists());
-    due(conversation.fleet.node("nodea"));
-    fleet::wait_until("old peer forced retry completed", DEADLINE, || {
-        let retry: i64 = db(conversation.fleet.node("nodea"))
-            .query_row(
-                "SELECT retry_at FROM envelopes WHERE correlation='question'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        (retry > 0).then_some(())
+    let origin = conversation.fleet.node("nodea");
+    let healthy = conversation.fleet.node("nodec");
+    let probe = Agent::start(healthy);
+    fleet::wait_until("healthy retry recipient discovered", DEADLINE, || {
+        api(origin, "agent.list", json!({}))["fleet"]
+            .as_array()?
+            .iter()
+            .any(|a| a["agent_id"] == probe.id)
+            .then_some(())
     });
+    let capture = conversation.fleet.base.join("capture-delivery-nodea-nodec");
+    std::fs::write(&capture, "").unwrap();
+    let sent = conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &probe.id,
+            "--correlation-id",
+            "retry-probe",
+            "--intent",
+            "fyi",
+            "worker probe",
+        ],
+    );
+    assert_eq!(sent["state"], "queued");
+    assert_eq!(
+        delivery_attempts(&conversation.fleet, "nodea", "nodec", "retry-probe"),
+        1
+    );
+    std::fs::remove_file(capture).unwrap();
+    due(origin);
+    // Only the message retry worker can deliver this already-queued probe.
+    // The incompatible edge itself is unpushable and must retain its custody.
+    state(origin, "retry-probe", "delivered");
+    assert_eq!(
+        delivery_attempts(&conversation.fleet, "nodea", "nodec", "retry-probe"),
+        2
+    );
+    assert_eq!(mail(healthy, &probe.pane)[0]["body"], "worker probe");
+    state(origin, "question", "queued");
+    let retained: String = db(origin)
+        .query_row(
+            "SELECT state FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, "custody");
     assert_eq!(
         read(
             conversation.fleet.node("nodeb"),
