@@ -733,7 +733,11 @@ mod tests {
         std::fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let previous_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", &shim);
+        let mut paths = vec![shim.clone()];
+        if let Some(path) = &previous_path {
+            paths.extend(std::env::split_paths(path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         let _store = crate::mesh::runtime_store::TestStore::new();
         let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(

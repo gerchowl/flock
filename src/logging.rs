@@ -1787,6 +1787,16 @@ pub(crate) fn handoff_refusal_report_failed(err: &str) {
 
 // --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
 
+pub(crate) fn server_config_refused(err: &str) {
+    tracing::error!(
+        event = "server.config.refused",
+        subsystem = "server",
+        outcome = "error",
+        err,
+        "server startup refused configuration"
+    );
+}
+
 pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
     tracing::info!(
         event = "server.start",

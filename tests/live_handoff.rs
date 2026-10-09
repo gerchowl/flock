@@ -1349,6 +1349,25 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
 
 #[test]
 fn removed_config_key_refuses_startup_without_creating_sockets() {
+    assert_removed_config_refusal(&["server"]);
+}
+
+#[test]
+fn removed_config_key_refuses_plain_auto_launch_without_creating_sockets() {
+    assert_removed_config_refusal(&[]);
+}
+
+#[test]
+fn removed_config_key_refuses_remote_bridge_launch_without_creating_sockets() {
+    assert_removed_config_refusal(&["remote-client-bridge"]);
+}
+
+#[test]
+fn removed_config_key_survives_handoff_refusal_reporting_failure() {
+    assert_removed_config_refusal(&["server", "--handoff-import"]);
+}
+
+fn assert_removed_config_refusal(args: &[&str]) {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1363,6 +1382,11 @@ fn removed_config_key_refuses_startup_without_creating_sockets() {
             "[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
             "msg.uplink_timeout_secs",
             4,
+        ),
+        (
+            "[msg]\nuplink_timeout_secs=1\nuplink_heartbeat_secs=1\n",
+            "msg.uplink_heartbeat_secs",
+            3,
         ),
         (
             "[msg]\nuplink_heartbeat_secs=1\n",
@@ -1395,7 +1419,12 @@ fn removed_config_key_refuses_startup_without_creating_sockets() {
             }
             let source = if in_overlay { &overlay } else { &config };
             let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
-            command.arg("server");
+            command.args(args);
+            if args.contains(&"--handoff-import") {
+                command
+                    .arg(base.join("missing-handoff.sock"))
+                    .arg("test-token");
+            }
             for (key, _) in
                 std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
             {
@@ -1425,6 +1454,39 @@ fn removed_config_key_refuses_startup_without_creating_sockets() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(exited, "server started on defaults: {stderr}");
             assert!(!output.status.success(), "{stderr}");
+            assert!(!stderr.contains("Custom {"), "{stderr}");
+            if settings.contains("uplink_timeout_secs")
+                && settings.contains("uplink_heartbeat_secs")
+            {
+                assert!(
+                    stderr.contains(&format!(
+                        "\n{}:3: msg.uplink_heartbeat_secs",
+                        source.display()
+                    )),
+                    "{stderr}"
+                );
+            }
+            if args.first() == Some(&"server") {
+                let log =
+                    fs::read_to_string(config_home.join("flock-dev/flock-server.log")).unwrap();
+                let records: Vec<serde_json::Value> = log
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| record["event"] == "server.config.refused"
+                            && record["level"] == "ERROR"
+                            && record["err"].as_str().is_some_and(|error| error.contains(
+                                &format!("{}:{line}: {key} was removed", source.display())
+                            ))),
+                    "{log}"
+                );
+                if args.contains(&"--handoff-import") {
+                    assert!(records.iter().any(|record| record["event"] == "handoff.import.refusal_report_failed"), "{log}");
+                }
+            }
             assert!(
                 stderr.contains(&format!(
                     "{}:{line}: {key} was removed in flk 1.0.0 (mesh); delete this line",

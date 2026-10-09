@@ -414,7 +414,14 @@ fn switch_failure_reason(err: &io::Error) -> String {
     peers::failure_text(&err.to_string())
 }
 
-fn main() -> io::Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,

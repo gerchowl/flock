@@ -103,10 +103,10 @@ pub(super) fn mint_correlation_id() -> String {
 /// outside a pane — shares one bucket, because `from_agent` is a claim.
 /// Keying on it let a caller mint fresh budget per invented name, or name a
 /// real agent and spend its budget for it. One shared bucket is safe because
-/// a spent budget downgrades rather than
-/// refuses ([`App::apply_blocking_budget`]), so nobody can be silenced by
-/// someone else exhausting it. The key space is therefore bounded by the
-/// panes on this server, plus one.
+/// a spent budget downgrades rather than refuses
+/// ([`App::apply_blocking_budget`]), so nobody can be silenced by someone
+/// else exhausting it. The key space is therefore bounded by the panes on
+/// this server, plus one.
 fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
     match (attested_agent, from_pane) {
         (Some(agent), _) => agent.to_string(),
