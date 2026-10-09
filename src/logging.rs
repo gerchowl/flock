@@ -4716,6 +4716,11 @@ pub(crate) fn node_clone_detection_unavailable(warning: &str) {
     );
 }
 
+/// Recovery failures must never abort terminal ownership transfer.
+pub(crate) fn mesh_store_suspended(reason: &str) {
+    tracing::warn!(target: "flock::mesh", event = "mesh.store.suspended", reason, "mesh store suspended; recovery will retry");
+}
+
 /// Custody errors expose a bounded code, never envelope bodies or return tokens.
 pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");

@@ -851,6 +851,15 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
+    /// Retain undecodable bytes for diagnosis, excluding them from delivery and projection.
+    pub fn quarantine(&mut self, key: &MessageKey) -> Result<()> {
+        self.connection.execute(
+            "UPDATE envelopes SET state='quarantined' WHERE origin=?1 AND id=?2",
+            params![key.origin_node, key.message_id],
+        )?;
+        Ok(())
+    }
+
     pub fn mailbox_keys(&self) -> Result<Vec<MessageKey>> {
         self.projection_keys(true)
     }

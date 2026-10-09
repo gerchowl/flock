@@ -315,7 +315,7 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 #[derive(Serialize)]
 struct FullStatusJson {
     #[serde(skip_serializing_if = "Option::is_none")]
-    enrollment_warning: Option<&'static str>,
+    enrollment_warning: Option<String>,
     peers: Vec<crate::mesh::hello::Enrollment>,
     installed: InstalledStatusJson,
     client: ClientStatusJson,

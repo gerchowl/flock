@@ -8,6 +8,7 @@ struct Writer {
     store: Option<Store>,
     suspended: bool,
     generation: u64,
+    reason: Option<String>,
 }
 
 impl Writer {
@@ -30,7 +31,10 @@ impl Writer {
         f: impl FnOnce(&mut Store) -> Result<T, String>,
     ) -> Result<T, String> {
         if self.suspended {
-            return Err("mesh store writer suspended for handoff".into());
+            return Err(self
+                .reason
+                .clone()
+                .unwrap_or_else(|| "mesh store writer suspended for handoff".into()));
         }
         self.open(path, 0)?;
         match self.store.as_mut() {
@@ -76,13 +80,42 @@ pub(crate) fn suspended() -> Result<bool, String> {
 pub(crate) fn resume(minimum: u64) -> Result<(), String> {
     let mut writer = writer().lock().map_err(|_| "mesh store poisoned")?;
     if writer.suspended {
-        let minimum = minimum.max(writer.generation);
+        writer.generation = minimum.max(writer.generation);
+        let minimum = writer.generation;
+        if cfg!(debug_assertions)
+            && std::env::var_os("FLOCK_TEST_MESH_OPEN_FAIL_FILE")
+                .is_some_and(|path| Path::new(&path).exists())
+        {
+            return Err("injected mesh store open failure".into());
+        }
         writer.open(
             &crate::config::state_dir().join("mesh-mail.sqlite"),
             minimum,
         )?;
     }
     Ok(())
+}
+
+/// Keep the last known generation and refuse workers until recovery completes.
+pub(crate) fn failed(reason: String) {
+    if let Ok(mut writer) = writer().lock() {
+        writer.store = None;
+        writer.suspended = true;
+        writer.reason = Some(reason);
+    }
+}
+
+pub(crate) fn recovery_reason() -> Option<String> {
+    writer()
+        .lock()
+        .ok()
+        .and_then(|writer| writer.reason.clone())
+}
+
+pub(crate) fn recovered() {
+    if let Ok(mut writer) = writer().lock() {
+        writer.reason = None;
+    }
 }
 
 #[cfg(test)]

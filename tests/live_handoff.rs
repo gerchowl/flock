@@ -1449,12 +1449,30 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
 
-    let spawned = spawn_server_with_env(
-        &config_home,
-        &runtime_dir,
-        &api_socket,
-        &[("FLOCK_TEST_HANDOFF_IMPORT_FAIL", failure_point)],
-    );
+    let store_failure = matches!(failure_point, "rollback_store" | "committed_store");
+    let committed = failure_point == "committed_store";
+    let fail_file = base.join("fail-store-open");
+    let hook = match failure_point {
+        "rollback_store" => "before_fds",
+        "committed_store" => "",
+        other => other,
+    };
+    let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
+    let mut extra_env = vec![
+        ("FLOCK_TEST_HANDOFF_IMPORT_FAIL", hook),
+        (
+            "FLOCK_TEST_MESH_OPEN_FAIL_FILE",
+            fail_file.to_str().unwrap(),
+        ),
+    ];
+    let late_corruption = matches!(hook, "before_ready" | "before_commit" | "stale_generation");
+    if late_corruption {
+        extra_env.push((
+            "FLOCK_TEST_HANDOFF_CORRUPT_IDENTITY_PATH",
+            identity_path.to_str().unwrap(),
+        ));
+    }
+    let spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, &extra_env);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
@@ -1491,19 +1509,34 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         &api_socket,
         serde_json::json!({"id":"identity-before","method":"ping","params":{}}),
     );
-    let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
-    if failure_point == "after_restored" {
+    if matches!(hook, "after_restored" | "before_fds") {
         fs::write(&identity_path, b"corrupt during handoff").unwrap();
     }
     let identity_before = fs::read(&identity_path).unwrap();
+    if store_failure {
+        fs::write(&fail_file, b"fail").unwrap();
+    }
     let failed = request(
         &api_socket,
         serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
     );
-    assert!(
-        failed.get("error").is_some(),
-        "{failure_point} handoff should fail: {failed}"
-    );
+    assert_eq!(failed.get("error").is_some(), !committed, "{failed}");
+    if committed {
+        wait_for_replacement_server_pid(
+            &runtime_dir,
+            spawned.child.process_id().unwrap(),
+            Duration::from_secs(10),
+        );
+    }
+    if failure_point == "rollback_store" {
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("test handoff failure before fd transfer"),
+            "{failed}"
+        );
+    }
     if failure_point == "stale_generation" {
         assert!(
             failed["error"]["message"]
@@ -1523,14 +1556,44 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         before["result"]["capabilities"],
         after["result"]["capabilities"]
     );
-    assert_eq!(fs::read(identity_path).unwrap(), identity_before);
-    // This API uses the shared writer, unlike ping or pane input.
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"writer-after-rollback", "method":"msg.send", "params":{
-            "to":{"type":"pane", "pane":pane_id}, "body":"writer recovered", "intent":"fyi"
-        }}),
-    ));
+    let expected_identity = if late_corruption {
+        b"corrupt during handoff".to_vec()
+    } else {
+        identity_before
+    };
+    assert_eq!(fs::read(identity_path).unwrap(), expected_identity);
+    if store_failure {
+        let status = request(
+            &api_socket,
+            serde_json::json!({"id":"mesh-status", "method":"peers.enrollment", "params":{}}),
+        );
+        assert_eq!(
+            status["result"]["mesh_suspended_reason"],
+            "injected mesh store open failure"
+        );
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["status", "--json"])
+            .env("FLOCK_SOCKET_PATH", &api_socket)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_STATE_HOME", runtime_dir.join("state"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(status["enrollment_warning"]
+            .as_str()
+            .unwrap()
+            .contains("mesh: suspended: injected mesh store open failure"));
+    } else {
+        // This API uses the shared writer, unlike ping or pane input.
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"writer-after-rollback", "method":"msg.send", "params":{
+                "to":{"type":"pane", "pane":pane_id}, "body":"writer recovered", "intent":"fyi"
+            }}),
+        ));
+    }
     let database = rusqlite::Connection::open_with_flags(
         runtime_dir.join("state/flock-dev/mesh-mail.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1559,12 +1622,44 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         Duration::from_secs(5),
     );
 
+    wait_for_output(&api_socket, &pane_id, &format!("got:{failure_point}"));
+    if store_failure {
+        fs::remove_file(&fail_file).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = request(
+                &api_socket,
+                serde_json::json!({"id":"mesh-recovered", "method":"peers.enrollment", "params":{}}),
+            );
+            if status["result"]["mesh_suspended_reason"].is_null() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{status}");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"recovered-send", "method":"msg.send", "params":{
+                "to":{"type":"pane", "pane":pane_id}, "body":"recovered", "intent":"fyi"
+            }}),
+        ));
+    }
     let _ = request(
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     drop(spawned);
     cleanup_test_base(&base);
+}
+
+#[test]
+fn rollback_store_open_failure_preserves_panes_and_original_error() {
+    live_handoff_import_failure_rolls_back_old_server_at("rollback_store");
+}
+
+#[test]
+fn committed_store_open_failure_preserves_panes_and_retries() {
+    live_handoff_import_failure_rolls_back_old_server_at("committed_store");
 }
 
 #[test]

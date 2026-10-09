@@ -1,1 +1,0 @@
-- Transfer the mesh custody writer only after live handoff commits, reopen it on rollback, reject stale store generations, and resume queued delivery from durable state (#623)
