@@ -40,6 +40,9 @@ impl Drop for Fixture {
 fn envelope() -> Envelope {
     let key = MessageKey::mint("origin.example".into(), 1000).unwrap();
     Envelope {
+        kind: Kind::Message,
+        origin_key: Vec::new(),
+        signature: Vec::new(),
         return_binding: ReturnBinding {
             request: key.clone(),
             recipient_node: "receiver.example".into(),
@@ -1858,7 +1861,13 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         .unwrap();
     let poll = OutboundCollect::default();
     let batch = store
-        .collect_outbound("origin.example", "receiver.example", &poll, 1)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &poll,
+            1,
+        )
         .unwrap();
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].envelope, mail);
@@ -1866,7 +1875,13 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
     let mut store = fixture.open(2);
     assert_eq!(
         store
-            .collect_outbound("origin.example", "receiver.example", &poll, 5002)
+            .collect_outbound(
+                Offer::Step1RequestsOnly,
+                "origin.example",
+                "receiver.example",
+                &poll,
+                5002
+            )
             .unwrap()[0]
             .envelope,
         mail
@@ -1883,6 +1898,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
     };
     assert!(store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect {
@@ -1897,6 +1913,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
     forged.token[0] ^= 1;
     assert!(store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect {
@@ -1911,11 +1928,23 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         receipts: Vec::new(),
     };
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &ack, 4)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &ack,
+            4
+        )
         .unwrap()
         .is_empty());
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &ack, 5)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &ack,
+            5
+        )
         .unwrap()
         .is_empty());
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "delivered");
@@ -1967,6 +1996,7 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
     }
     let first = store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
@@ -1978,6 +2008,7 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
     let mut store = fixture.open(2);
     let rest = store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
@@ -2256,7 +2287,13 @@ fn outbound_receipts_are_judged_per_record_and_never_fail_the_batch() {
         ack: Vec::new(),
     };
     store
-        .collect_outbound("origin.example", "receiver.example", &query, 3)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &query,
+            3,
+        )
         .expect("a pruned or forged receipt drops only itself");
     assert_eq!(
         store
@@ -2333,6 +2370,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
     };
     store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect {
@@ -2349,6 +2387,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
     };
     store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect {
@@ -2497,7 +2536,13 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
         .unwrap();
     let poll = OutboundCollect::default();
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &poll, 1)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &poll,
+            1
+        )
         .is_err());
     let attempts: i64 = store
         .connection
@@ -2512,7 +2557,13 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
         .unwrap();
     assert_eq!(
         store
-            .collect_outbound("origin.example", "receiver.example", &poll, 1)
+            .collect_outbound(
+                Offer::Step1RequestsOnly,
+                "origin.example",
+                "receiver.example",
+                &poll,
+                1
+            )
             .unwrap()
             .len(),
         2
@@ -2525,7 +2576,13 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
     };
     let before = version();
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &poll, 2)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &poll,
+            2
+        )
         .unwrap()
         .is_empty());
     assert_eq!(version(), before);
@@ -2545,6 +2602,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
     }
     store
         .collect_outbound(
+            Offer::Step1RequestsOnly,
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
@@ -2570,12 +2628,925 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
         receipts: Vec::new(),
     };
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &query, 2)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &query,
+            2
+        )
         .unwrap()
         .is_empty());
     assert_eq!(store.get(&live.key).unwrap().unwrap().state, "delivered");
     assert!(store
-        .collect_outbound("origin.example", "receiver.example", &query, 3)
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &query,
+            3
+        )
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn v11_db_with_in_place_edited_columns_migrates_idempotently() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Held, 0).unwrap();
+    s.connection
+        .execute_batch("PRAGMA user_version=11")
+        .unwrap();
+    drop(s);
+    let mut s = f.open(1);
+    assert_eq!(
+        s.get(&e.key).unwrap().unwrap().next_hop,
+        e.return_binding.recipient_node
+    );
+    assert_eq!(
+        s.accept(&e, 999, Admission::Held, 1).unwrap(),
+        Accepted::Duplicate
+    );
+    drop(s);
+    assert_eq!(f.open(2).get(&e.key).unwrap().unwrap().remaining_ms, 998);
+}
+
+#[test]
+fn fresh_and_upgraded_schemas_are_identical() {
+    fn schema(s: &Store<Disk>) -> Vec<(String, String)> {
+        s.connection
+            .prepare("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                        .split_whitespace()
+                        .collect::<String>()
+                        .replace('"', ""),
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+    let fresh = Fixture::new();
+    let old = Fixture::new();
+    Connection::open(&old.path)
+        .unwrap()
+        .execute_batch(schema::BASE)
+        .unwrap();
+    assert_eq!(schema(&fresh.open(0)), schema(&old.open(0)));
+}
+
+#[test]
+fn failed_migration_reports_path_and_hint() {
+    let f = Fixture::new();
+    Connection::open(&f.path)
+        .unwrap()
+        .execute_batch("CREATE TABLE envelopes(origin TEXT); PRAGMA user_version=11")
+        .unwrap();
+    let error = Store::open_with(&f.path, 0, Limits::default(), f.disk.clone())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "mail_store_unavailable: migrating {} (schema v11 -> v12) failed:",
+            f.path.display()
+        )),
+        "{error}"
+    );
+    assert!(error.contains("missing column envelopes.id"), "{error}");
+    assert!(
+        error.ends_with("move the file aside to start an empty store (custody in it will be lost)")
+    );
+    assert_eq!(
+        Connection::open(&f.path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        11
+    );
+}
+
+#[test]
+fn fingerprint_ignores_signature() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mut e = envelope();
+    s.accept(&e, 1000, Admission::Custody, 0).unwrap();
+    e.signature = vec![7; 64];
+    assert_eq!(
+        s.accept(&e, 1000, Admission::Custody, 1).unwrap(),
+        Accepted::Duplicate
+    );
+    e.kind = Kind::Receipt;
+    assert!(matches!(
+        s.accept(&e, 1000, Admission::Custody, 1),
+        Err(Error::ConflictingKey)
+    ));
+}
+
+#[test]
+fn push_ready_selects_only_pushable_next_hops_and_leases() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let a = envelope();
+    let b = envelope();
+    for e in [&a, &b] {
+        s.accept(e, CUSTODY_TTL_MS, Admission::Custody, 0).unwrap();
+    }
+    s.set_next_hop(&a.key, "push.example").unwrap();
+    s.set_next_hop(&b.key, "pull.example").unwrap();
+    let nodes = vec!["push.example".into()];
+    assert_eq!(s.push_ready(0, 10, &nodes).unwrap(), vec![a.key.clone()]);
+    assert!(s.push_ready(1, 10, &nodes).unwrap().is_empty());
+    drop(s);
+    assert_eq!(
+        f.open(60_000).push_ready(60_000, 10, &nodes).unwrap(),
+        vec![a.key]
+    );
+}
+
+#[test]
+fn unrouted_rows_are_never_leased() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Custody, 0).unwrap();
+    s.set_next_hop(&e.key, "").unwrap();
+    let before = s.connection.total_changes();
+    assert_eq!(s.unrouted(10).unwrap(), vec![e.key]);
+    assert!(s.push_ready(1, 10, &[String::new()]).unwrap().is_empty());
+    assert_eq!(s.connection.total_changes(), before);
+}
+
+#[test]
+fn collect_outbound_offers_forwarded_answers_and_receipts_to_next_hop_only() {
+    use crate::mesh::collect::OutboundCollect;
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mut answer = envelope();
+    answer.request_key = Some(envelope().key);
+    let mut receipt = envelope();
+    receipt.kind = Kind::Receipt;
+    for e in [&answer, &receipt] {
+        s.accept(e, 1000, Admission::Held, 0).unwrap();
+        s.set_next_hop(&e.key, "neighbor.example").unwrap();
+    }
+    let query = OutboundCollect::default();
+    assert!(s
+        .collect_outbound(Offer::All, "local.example", "receiver.example", &query, 0)
+        .unwrap()
+        .is_empty());
+    let offered = s
+        .collect_outbound(Offer::All, "local.example", "neighbor.example", &query, 0)
+        .unwrap();
+    assert_eq!(offered.len(), 2);
+    assert!(offered.iter().any(|d| d.envelope == answer));
+    assert!(offered.iter().any(|d| d.envelope == receipt));
+}
+
+#[test]
+fn ack_from_wrong_neighbor_is_invalid() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect};
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Held, 0).unwrap();
+    s.set_next_hop(&e.key, "neighbor.example").unwrap();
+    let query = OutboundCollect {
+        ack: vec![OutboundAck {
+            key: e.key.clone(),
+            token: e.return_binding.collection_token.clone(),
+            refusal: None,
+        }],
+        receipts: Vec::new(),
+    };
+    assert!(matches!(
+        s.collect_outbound(Offer::All, "local.example", "receiver.example", &query, 0),
+        Err(Error::InvalidEnvelope)
+    ));
+    s.collect_outbound(Offer::All, "local.example", "neighbor.example", &query, 0)
+        .unwrap();
+    assert_eq!(s.get(&e.key).unwrap().unwrap().state, "delivered");
+}
+
+#[test]
+fn tombstone_finishes_pending_rows_and_refuses_new_inbox_import() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    s.set_local_node("receiver.example");
+    let mut keys = Vec::new();
+    for admission in [Admission::Inbox, Admission::Custody, Admission::Held] {
+        let e = envelope();
+        s.accept(&e, 1000, admission, 0).unwrap();
+        keys.push(e.key);
+    }
+    let mut remote = envelope();
+    remote.return_binding.recipient_node = "other.example".into();
+    s.accept(&remote, 1000, Admission::Custody, 0).unwrap();
+    let mut other_session = envelope();
+    other_session.target_session = "new-session".into();
+    s.accept(&other_session, 1000, Admission::Inbox, 0).unwrap();
+    let affected = s.tombstone("recipient", "session", "killed", 1).unwrap();
+    assert_eq!(affected.len(), 3);
+    for key in keys {
+        assert!(affected.contains(&key));
+        let record = s.get(&key).unwrap().unwrap();
+        assert_eq!(record.state, "recipient_gone");
+        assert!(record.envelope.body.is_empty());
+    }
+    assert_eq!(s.get(&remote.key).unwrap().unwrap().state, "custody");
+    assert_eq!(s.get(&other_session.key).unwrap().unwrap().state, "inbox");
+    assert!(matches!(
+        s.accept(&envelope(), 1000, Admission::Inbox, 2),
+        Err(Error::RecipientGone)
+    ));
+}
+
+#[test]
+fn tombstone_and_owner_hints_survive_reopen() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    s.tombstone("recipient", "session", "closed", 0).unwrap();
+    s.note_owner("recipient", "receiver.example", "peer.example", 0)
+        .unwrap();
+    s.set_paused(true, 1).unwrap();
+    drop(s);
+    let mut s = f.open(20 * DAY_MS);
+    assert!(s
+        .is_tombstoned("recipient", "session", 20 * DAY_MS)
+        .unwrap());
+    assert_eq!(
+        s.owner("recipient").unwrap().unwrap().node_id,
+        "receiver.example"
+    );
+    s.set_paused(false, 20 * DAY_MS).unwrap();
+    assert!(!s
+        .is_tombstoned("recipient", "session", 27 * DAY_MS)
+        .unwrap());
+}
+
+#[test]
+fn note_owner_writes_only_on_change() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    assert!(s
+        .note_owner("recipient", "receiver.example", "peer.example", 0)
+        .unwrap());
+    let before = s.connection.total_changes();
+    for wall in 1..100 {
+        assert!(!s
+            .note_owner("recipient", "receiver.example", "peer.example", wall)
+            .unwrap());
+    }
+    assert_eq!(s.connection.total_changes(), before);
+    assert!(s
+        .note_owner("recipient", "other.example", "peer.example", 100)
+        .unwrap());
+    assert!(s
+        .note_owner("recipient", "other.example", "renamed.example", 101)
+        .unwrap());
+}
+
+#[test]
+fn gc_keeps_quarantined_rows() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Custody, 0).unwrap();
+    s.finish(&e.key, Outcome::Delivered, 1).unwrap();
+    s.quarantine(&e.key).unwrap();
+    assert_eq!(s.maintain(20 * DAY_MS).unwrap(), 0);
+    assert_eq!(s.quarantined_count().unwrap(), 1);
+    let before = s.connection.total_changes();
+    s.maintain_if_due(21 * DAY_MS).unwrap();
+    assert_eq!(s.connection.total_changes(), before);
+}
+
+#[test]
+fn pending_receipts_limit_applies_after_sql_filter() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    for _ in 0..40 {
+        s.accept(&envelope(), 1000, Admission::Inbox, 0).unwrap();
+    }
+    let first = s.pending_receipts("origin.example", 0).unwrap();
+    assert_eq!(first.len(), 16);
+    s.receipts_sent(&first).unwrap();
+    let second = s.pending_receipts("origin.example", 0).unwrap();
+    assert_eq!(second.len(), 16);
+    assert!(second
+        .iter()
+        .all(|r| !first.iter().any(|old| old.key == r.key)));
+    s.receipts_sent(&second).unwrap();
+    assert_eq!(s.pending_receipts("origin.example", 0).unwrap().len(), 8);
+}
+
+#[test]
+fn open_tightens_loose_modes() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    let parent = f.path.parent().unwrap();
+    let wal = f.path.with_extension("sqlite-wal");
+    let shm = f.path.with_extension("sqlite-shm");
+    for path in [&f.path, &wal, &shm] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let _second = f.open(0);
+    for path in [&f.path, &wal, &shm] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    drop(s);
+}
+
+#[test]
+fn unknown_error_is_transient() {
+    for error in [
+        Error::InvalidEnvelope,
+        Error::ConflictingKey,
+        Error::InvalidSignature,
+        Error::OriginMismatch,
+        Error::RecipientGone,
+        Error::LoopDetected,
+        Error::HopBudgetExhausted,
+    ] {
+        assert!(error.is_permanent());
+    }
+    for error in [
+        Error::InvalidState,
+        Error::NotFound,
+        Error::Paused,
+        Error::MailStoreFull,
+        Error::Io(std::io::Error::other("unknown future failure")),
+    ] {
+        assert!(!error.is_permanent());
+    }
+}
+
+#[test]
+fn idle_step2_queries_make_no_commits() {
+    use crate::mesh::collect::OutboundCollect;
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    s.checkpoint().unwrap();
+    let before = s.connection.total_changes();
+    let wal = f.path.with_extension("sqlite-wal");
+    let size = fs::metadata(&wal).unwrap().len();
+    for now in 0..100 {
+        assert!(s
+            .push_ready(now, 16, &["receiver.example".into()])
+            .unwrap()
+            .is_empty());
+        assert!(s.unrouted(16).unwrap().is_empty());
+        assert!(s
+            .collect_outbound(
+                Offer::All,
+                "origin.example",
+                "receiver.example",
+                &OutboundCollect::default(),
+                now
+            )
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(s.connection.total_changes(), before);
+    assert_eq!(fs::metadata(wal).unwrap().len(), size);
+}
+
+#[test]
+fn forwarding_verifies_origin_and_duplicate_preserves_transport_state() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    s.set_local_node("local.example");
+    let e = crate::mesh::sign::tests::signed();
+    let visited = vec![e.key.origin_node.clone()];
+    assert_eq!(
+        s.accept_forward(
+            &e,
+            1000,
+            7,
+            &visited,
+            "neighbor.example",
+            Admission::Custody,
+            0
+        )
+        .unwrap(),
+        Accepted::New
+    );
+    assert_eq!(
+        s.accept_forward(&e, 2000, 6, &[], "other.example", Admission::Custody, 10)
+            .unwrap(),
+        Accepted::Duplicate
+    );
+    let record = s.get(&e.key).unwrap().unwrap();
+    assert_eq!(record.remaining_ms, 1000);
+    assert_eq!(record.hops_left, 7);
+    assert_eq!(record.visited, visited);
+    assert_eq!(record.next_hop, "neighbor.example");
+    let mut forged = e.clone();
+    forged.body.push(1);
+    assert!(matches!(
+        s.accept_forward(&forged, 1000, 7, &[], "", Admission::Custody, 0),
+        Err(Error::InvalidSignature)
+    ));
+    assert!(matches!(
+        s.accept_forward(&e, 1000, 0, &[], "", Admission::Custody, 0),
+        Err(Error::HopBudgetExhausted)
+    ));
+    assert!(matches!(
+        s.accept_forward(
+            &e,
+            1000,
+            7,
+            &["local.example".into()],
+            "",
+            Admission::Custody,
+            0
+        ),
+        Err(Error::LoopDetected)
+    ));
+}
+
+#[test]
+fn routing_quarantines_bad_rows_individually() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let broken = envelope();
+    let good = envelope();
+    for e in [&broken, &good] {
+        s.accept(e, 1000, Admission::Custody, 0).unwrap();
+    }
+    s.connection
+        .execute(
+            "UPDATE envelopes SET visited='bad' WHERE id=?1",
+            [&broken.key.message_id],
+        )
+        .unwrap();
+    assert_eq!(
+        s.push_ready(0, 16, &["receiver.example".into()]).unwrap(),
+        vec![good.key]
+    );
+    assert_eq!(s.quarantined_count().unwrap(), 1);
+    let broken = envelope();
+    s.accept(&broken, 1000, Admission::Custody, 0).unwrap();
+    s.set_next_hop(&broken.key, "").unwrap();
+    s.connection
+        .execute(
+            "UPDATE envelopes SET metadata='bad' WHERE id=?1",
+            [&broken.key.message_id],
+        )
+        .unwrap();
+    assert!(s.unrouted(16).unwrap().is_empty());
+    assert_eq!(s.quarantined_count().unwrap(), 2);
+}
+
+#[test]
+fn inbox_record_reads_the_persisted_ttl() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Inbox, 0).unwrap();
+    s.connection
+        .execute(
+            "UPDATE envelopes SET mailbox_ttl_ms=1234 WHERE id=?1",
+            [&e.key.message_id],
+        )
+        .unwrap();
+    drop(s);
+    assert_eq!(f.open(0).get(&e.key).unwrap().unwrap().mailbox_ttl_ms, 1234);
+}
+
+#[test]
+fn all_dev_versions_tolerate_columns_already_added_in_place() {
+    for version in 1..=11 {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let e = envelope();
+        s.accept(&e, 1000, Admission::Custody, 0).unwrap();
+        s.handoff_generation().unwrap();
+        s.connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(s);
+        let mut s = f.open(1);
+        assert_eq!(s.handoff_generation().unwrap(), 2, "version {version}");
+        assert_eq!(
+            s.accept(&e, 999, Admission::Custody, 1).unwrap(),
+            Accepted::Duplicate,
+            "version {version}"
+        );
+        assert_eq!(
+            s.get(&e.key).unwrap().unwrap().remaining_ms,
+            999,
+            "version {version}"
+        );
+    }
+}
+
+#[test]
+fn tombstone_and_pending_outcomes_roll_back_together() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = envelope();
+    s.accept(&e, 1000, Admission::Inbox, 0).unwrap();
+    s.connection.execute_batch("CREATE TRIGGER fail_removal BEFORE UPDATE OF state ON envelopes BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(s.tombstone("recipient", "session", "killed", 1).is_err());
+    assert!(!s.is_tombstoned("recipient", "session", 1).unwrap());
+    assert_eq!(s.get(&e.key).unwrap().unwrap().state, "inbox");
+    assert_eq!(s.clock().unwrap().elapsed_ms, 0);
+}
+
+#[test]
+fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased() {
+    use crate::mesh::collect::OutboundCollect;
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let local = envelope();
+    let mut answer = envelope();
+    answer.request_key = Some(local.key.clone());
+    let mut forwarded = envelope();
+    forwarded.key.origin_node = "forwarded.example".into();
+    let mut receipt = envelope();
+    receipt.key.origin_node = "receipt.example".into();
+    receipt.kind = Kind::Receipt;
+    for e in [&local, &answer, &forwarded, &receipt] {
+        s.accept(e, 1000, Admission::Held, 0).unwrap();
+    }
+    // Step 1 uses the original recipient binding, independently of new routing state.
+    s.set_next_hop(&local.key, "other.example").unwrap();
+    let query = OutboundCollect::default();
+    let offers = s
+        .collect_outbound(
+            Offer::Step1RequestsOnly,
+            "origin.example",
+            "receiver.example",
+            &query,
+            0,
+        )
+        .unwrap();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].envelope, local);
+    for e in [&answer, &forwarded, &receipt] {
+        assert_eq!(s.get(&e.key).unwrap().unwrap().retry_at_ms, 0);
+    }
+    let offers = s
+        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
+        .unwrap();
+    assert_eq!(offers.len(), 3);
+    for e in [&answer, &forwarded, &receipt] {
+        assert!(offers.iter().any(|delivery| delivery.envelope == *e));
+    }
+}
+
+#[test]
+fn step1_ack_cannot_finish_answers_or_forwarded_requests() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect};
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mut answer = envelope();
+    answer.request_key = Some(envelope().key);
+    let mut forwarded = envelope();
+    forwarded.key.origin_node = "forwarded.example".into();
+    for e in [&answer, &forwarded] {
+        s.accept(e, 1000, Admission::Held, 0).unwrap();
+        let query = OutboundCollect {
+            ack: vec![OutboundAck {
+                key: e.key.clone(),
+                token: e.return_binding.collection_token.clone(),
+                refusal: None,
+            }],
+            receipts: Vec::new(),
+        };
+        assert!(matches!(
+            s.collect_outbound(
+                Offer::Step1RequestsOnly,
+                "origin.example",
+                "receiver.example",
+                &query,
+                0
+            ),
+            Err(Error::InvalidEnvelope)
+        ));
+        assert_eq!(s.get(&e.key).unwrap().unwrap().state, "held");
+        s.collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
+            .unwrap();
+        assert_eq!(s.get(&e.key).unwrap().unwrap().state, "delivered");
+    }
+}
+
+fn strip_step2_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX push_ready; DROP INDEX unrouted;
+         ALTER TABLE envelopes DROP COLUMN next_hop;
+         ALTER TABLE envelopes DROP COLUMN hops_left;
+         ALTER TABLE envelopes DROP COLUMN visited;
+         ALTER TABLE envelopes DROP COLUMN kind;
+         ALTER TABLE envelopes DROP COLUMN mailbox_ttl_ms;
+         DROP TABLE agent_owners; DROP TABLE agent_tombstones;
+         PRAGMA user_version=11;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn genuine_v11_backfills_live_mail_and_second_migration_is_read_only() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let rows: Vec<_> = [Admission::Held, Admission::Custody, Admission::Inbox]
+        .into_iter()
+        .map(|admission| {
+            let mail = envelope();
+            s.accept(&mail, 1000, admission, 0).unwrap();
+            (mail, admission)
+        })
+        .collect();
+    strip_step2_schema(&s.connection);
+    drop(s);
+    let mut s = f.open(0);
+    for (mail, admission) in rows {
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.envelope, mail);
+        assert_eq!(row.mailbox_ttl_ms, DAY_MS);
+        assert_eq!(
+            row.remaining_ms,
+            if admission == Admission::Inbox {
+                DAY_MS
+            } else {
+                1000
+            }
+        );
+        assert_eq!(
+            row.next_hop,
+            if admission == Admission::Inbox {
+                ""
+            } else {
+                &mail.return_binding.recipient_node
+            }
+        );
+        assert_eq!(
+            row.state,
+            match admission {
+                Admission::Held => "held",
+                Admission::Custody => "custody",
+                Admission::Inbox => "inbox",
+            }
+        );
+    }
+    let changes = s.connection.total_changes();
+    let wal = fs::read(f.path.with_extension("sqlite-wal")).unwrap();
+    schema::migrate(&mut s.connection, f.path.parent().unwrap(), 0).unwrap();
+    assert_eq!(s.connection.total_changes(), changes);
+    assert_eq!(fs::read(f.path.with_extension("sqlite-wal")).unwrap(), wal);
+}
+
+#[test]
+fn stamped_stores_repair_missing_columns_in_each_table() {
+    for version in [11, 12] {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let mail = envelope();
+        s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+        if version == 11 {
+            strip_step2_schema(&s.connection);
+        }
+        s.connection
+            .execute_batch(
+                "ALTER TABLE envelopes DROP COLUMN receipt_sent;
+             ALTER TABLE identity_pins DROP COLUMN origin;
+             INSERT INTO identity_pins VALUES('configured','peer.example','node.example',X'42');",
+            )
+            .unwrap();
+        drop(s);
+        let s = f.open(0);
+        assert_eq!(s.get(&mail.key).unwrap().unwrap().envelope, mail);
+        let receipt: Option<String> = s
+            .connection
+            .query_row("SELECT receipt_sent FROM envelopes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipt, None);
+        let origin: String = s
+            .connection
+            .query_row("SELECT origin FROM identity_pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(origin, "unknown");
+    }
+}
+
+#[test]
+fn busy_migration_and_transient_open_errors_never_advise_discarding_mail() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    strip_step2_schema(&s.connection);
+    s.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = Store::open_with(&f.path, 0, Limits::default(), f.disk.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, Error::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.code == rusqlite::ErrorCode::DatabaseBusy)
+    );
+    assert_eq!(error.code(), "mail_store_unavailable");
+    assert!(!error.is_permanent());
+    assert!(!error.to_string().contains("move the file aside"));
+    s.connection.execute_batch("ROLLBACK").unwrap();
+    let missing_parent = f.path.join("not-a-directory.sqlite");
+    let error = Store::open_with(&missing_parent, 0, Limits::default(), f.disk.clone())
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), "mail_store_unavailable");
+    assert!(!error.is_permanent());
+    assert!(!error.to_string().contains("move the file aside"));
+}
+
+#[test]
+fn permission_tightening_is_best_effort_and_skips_current_directory() {
+    let f = Fixture::new();
+    tighten_mode(&f.path, 0o600);
+    assert_eq!(mode_directory(Path::new("mail.sqlite")), None);
+    assert_eq!(mode_directory(Path::new("./mail.sqlite")), None);
+    assert_eq!(mode_directory(&f.path), f.path.parent());
+    f.open(0);
+}
+
+#[test]
+fn conflicting_key_keeps_its_public_error_code() {
+    assert_eq!(Error::ConflictingKey.code(), "message_key_conflict");
+    assert!(Error::ConflictingKey.is_permanent());
+}
+
+#[test]
+fn quarantine_discards_bodies_and_releases_quota_including_older_quarantines() {
+    for older in [false, true] {
+        let f = Fixture::new();
+        let limits = Limits {
+            logical_bytes: 10_000,
+            metadata_reserve: 4000,
+            ..Limits::default()
+        };
+        let mut s = f.limited(0, limits);
+        let mut mail = envelope();
+        mail.body = vec![42; 6000];
+        s.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+        let mut next = envelope();
+        next.body = mail.body.clone();
+        assert!(matches!(
+            s.accept(&next, 1000, Admission::Custody, 0),
+            Err(Error::MailStoreFull)
+        ));
+        if older {
+            s.connection
+                .execute("UPDATE envelopes SET state='quarantined'", [])
+                .unwrap();
+            drop(s);
+            s = f.limited(0, limits);
+        } else {
+            s.quarantine(&mail.key).unwrap();
+        }
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.state, "quarantined");
+        assert!(row.envelope.body.is_empty());
+        assert_eq!(row.envelope.target_agent, mail.target_agent);
+        s.accept(&next, 1000, Admission::Custody, 0).unwrap();
+        assert_eq!(s.quarantined_count().unwrap(), 1);
+    }
+}
+
+#[test]
+fn migration_archives_full_raw_quarantined_rows_before_clearing() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mail = envelope();
+    s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+    let body = [0xff, 0, 0x80];
+    let metadata = *b"\xfe\0{";
+    s.connection
+        .execute(
+            "UPDATE envelopes SET state='quarantined',body=?1,metadata=?2",
+            params![body.as_slice(), metadata.as_slice()],
+        )
+        .unwrap();
+    strip_step2_schema(&s.connection);
+    drop(s);
+    let s = f.open(10);
+    let archived = f.path.parent().unwrap().join("mesh-quarantine.jsonl");
+    let line = fs::read_to_string(&archived).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        record["key"]["message_id"]["base64"],
+        STANDARD.encode(mail.key.message_id.as_bytes())
+    );
+    assert_eq!(record["state"]["base64"], STANDARD.encode(b"quarantined"));
+    assert_eq!(record["reason"], "existing quarantine during migration");
+    assert_eq!(record["quarantined_at"], 10);
+    assert_eq!(record["body"]["base64"], STANDARD.encode(body));
+    assert_eq!(record["envelope"]["base64"], STANDARD.encode(metadata));
+    assert_eq!(record["envelope"]["sqlite_type"], "blob");
+    let columns: i64 = s
+        .connection
+        .query_row(
+            "SELECT count(*) FROM pragma_table_info('envelopes')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        record["raw_row"].as_object().unwrap().len(),
+        columns as usize + 1
+    );
+    assert_eq!(record["raw_row"]["custody_deadline"]["value"], 1000);
+    let kept: Vec<u8> = s
+        .connection
+        .query_row("SELECT body FROM envelopes", [], |r| r.get(0))
+        .unwrap();
+    assert!(kept.is_empty());
+    assert_eq!(
+        fs::metadata(&archived).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(s);
+    f.open(11);
+    assert_eq!(fs::read_to_string(archived).unwrap(), line);
+}
+
+#[test]
+fn failed_quarantine_backup_preserves_body_and_state_until_retry() {
+    for migration in [false, true] {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let mail = envelope();
+        s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+        let blocked = f.path.parent().unwrap().join("mesh-quarantine.jsonl");
+        fs::create_dir(&blocked).unwrap();
+        if migration {
+            s.connection
+                .execute("UPDATE envelopes SET state='quarantined'", [])
+                .unwrap();
+            strip_step2_schema(&s.connection);
+            drop(s);
+            s = f.open(0);
+        } else {
+            s.quarantine(&mail.key).unwrap();
+        }
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.envelope, mail);
+        assert_eq!(row.state, if migration { "quarantined" } else { "held" });
+        fs::remove_dir(&blocked).unwrap();
+        s.quarantine(&mail.key).unwrap();
+        assert!(s.get(&mail.key).unwrap().unwrap().envelope.body.is_empty());
+        assert_eq!(fs::read_to_string(blocked).unwrap().lines().count(), 1);
+    }
+}
+
+#[test]
+fn failed_database_quarantine_update_leaves_recoverable_archive() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let mail = envelope();
+    s.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+    s.connection.execute_batch("CREATE TRIGGER reject_clear BEFORE UPDATE OF body ON envelopes BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(s.quarantine(&mail.key).is_err());
+    assert_eq!(s.get(&mail.key).unwrap().unwrap().envelope, mail);
+    let archive =
+        fs::read_to_string(f.path.parent().unwrap().join("mesh-quarantine.jsonl")).unwrap();
+    assert_eq!(archive.lines().count(), 1);
+}
+
+#[test]
+fn quarantine_sidecar_rotation_keeps_two_bounded_private_files() {
+    let f = Fixture::new();
+    let directory = f.path.parent().unwrap();
+    let active = directory.join("mesh-quarantine.jsonl");
+    let previous = directory.join("mesh-quarantine.jsonl.1");
+    let lines = [b"{\"n\":1}\n", b"{\"n\":2}\n", b"{\"n\":3}\n"];
+    for line in lines {
+        quarantine::append(directory, line, line.len() as u64).unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    // Opening the active file tightens it before it can become a rotated file.
+    quarantine::append(directory, b"{\"n\":4}\n", lines[0].len() as u64).unwrap();
+    assert_eq!(fs::read_to_string(&active).unwrap(), "{\"n\":4}\n");
+    assert_eq!(fs::read_to_string(&previous).unwrap(), "{\"n\":3}\n");
+    assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    for path in [&active, &previous] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert!(quarantine::append(directory, b"oversized record\n", 8).is_err());
+    assert_eq!(fs::read_to_string(active).unwrap(), "{\"n\":4}\n");
 }

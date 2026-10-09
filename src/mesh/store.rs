@@ -5,8 +5,11 @@
 use super::{clock::Clock, key::MessageKey};
 mod collection;
 pub(crate) mod delivery_attempts;
+mod quarantine;
+mod routing;
 mod schema;
 mod status;
+mod tombstones;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,12 +65,44 @@ pub enum Error {
     ConflictingKey,
     NotFound,
     InvalidState,
-    NewerSchema { found: i64, supported: i64 },
+    NewerSchema {
+        found: i64,
+        supported: i64,
+    },
     IdentityPinConflict,
+    RecipientGone,
+    InvalidSignature,
+    OriginMismatch,
+    LoopDetected,
+    HopBudgetExhausted,
+    SchemaRepair(String),
+    Migration {
+        path: PathBuf,
+        version: i64,
+        detail: String,
+    },
 }
 impl Error {
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidEnvelope
+                | Self::ConflictingKey
+                | Self::InvalidSignature
+                | Self::OriginMismatch
+                | Self::RecipientGone
+                | Self::LoopDetected
+                | Self::HopBudgetExhausted
+        )
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RecipientGone => "recipient_gone",
+            Self::InvalidSignature => "invalid_signature",
+            Self::OriginMismatch => "origin_mismatch",
+            Self::LoopDetected => "loop_detected",
+            Self::HopBudgetExhausted => "hop_budget_exhausted",
             Self::MailStoreFull => "mail_store_full",
             Self::Paused => "fleet_paused",
             Self::InvalidEnvelope => "invalid_envelope",
@@ -82,6 +117,14 @@ impl Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Migration {
+            path,
+            version,
+            detail,
+        } = self
+        {
+            return write!(f, "mail_store_unavailable: migrating {} (schema v{version} -> v{}) failed: {detail}; move the file aside to start an empty store (custody in it will be lost)", path.display(), schema::VERSION);
+        }
         if let Self::NewerSchema { found, supported } = self {
             return write!(
                 f,
@@ -134,8 +177,33 @@ impl ReturnBinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Message,
+    Receipt,
+}
+impl Kind {
+    fn is_message(&self) -> bool {
+        *self == Self::Message
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Receipt => "receipt",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
+    #[serde(default, skip_serializing_if = "Kind::is_message")]
+    pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature: Vec<u8>,
     pub key: MessageKey,
     pub sender: String,
     pub target_agent: String,
@@ -147,6 +215,13 @@ pub struct Envelope {
     pub intent: String,
     pub body: Vec<u8>,
 }
+/// The caller enables all custody kinds only once its importer supports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offer {
+    Step1RequestsOnly,
+    All,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     Custody,
@@ -190,6 +265,9 @@ pub struct Record {
     pub mailbox_ttl_ms: i64,
     pub delivered: bool,
     pub retry_at_ms: i64,
+    pub next_hop: String,
+    pub hops_left: u8,
+    pub visited: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -235,6 +313,13 @@ pub struct IdentityPin {
     pub public_key: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub node_id: String,
+    pub name: String,
+    pub seen: i64,
+}
+
 /// `Store` with the default disk provider is `Send` but not `Sync`. Share it
 /// between workers through a `Mutex`, never concurrent unsynchronized access.
 /// Message order within the same millisecond is arbitrary, with no FIFO promise.
@@ -243,6 +328,7 @@ pub struct Store<D = SystemDisk> {
     path: PathBuf,
     limits: Limits,
     disk: D,
+    local_node: String,
 }
 impl Store<SystemDisk> {
     /// `path` is normally `config::state_dir()/mesh-mail.sqlite`. Its parent
@@ -288,9 +374,25 @@ impl<D: DiskSpace> Store<D> {
             .mode(0o600)
             .open(path)
         {
-            Ok(file) => file.set_permissions(fs::Permissions::from_mode(0o600))?,
+            Ok(file) => {
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    warn_mode_failure(path, &error);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(error) => return Err(error.into()),
+        }
+        if let Some(directory) = mode_directory(path) {
+            tighten_mode(directory, 0o700);
+        }
+        tighten_mode(path, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = Path::new(&sidecar);
+            if sidecar.exists() {
+                tighten_mode(sidecar, 0o600);
+            }
         }
         let mut connection = Connection::open(path)?;
         schema::check_version(&connection)?;
@@ -300,7 +402,18 @@ impl<D: DiskSpace> Store<D> {
             PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;",
         )?;
-        schema::migrate(&mut connection)?;
+        let version = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        schema::migrate(&mut connection, parent, wall_ms).map_err(|error| {
+            if schema::is_schema_failure(&error) {
+                Error::Migration {
+                    path: path.into(),
+                    version,
+                    detail: error.to_string(),
+                }
+            } else {
+                error
+            }
+        })?;
         connection.execute("INSERT OR IGNORE INTO clock VALUES(1,?1,0,0)", [wall_ms])?;
         fs::File::open(path)?.sync_all()?;
         fs::File::open(parent)?.sync_all()?;
@@ -309,6 +422,7 @@ impl<D: DiskSpace> Store<D> {
             path: parent.canonicalize()?,
             limits,
             disk,
+            local_node: String::new(),
         };
         store.advance(wall_ms, None)?;
         Ok(store)
@@ -409,7 +523,7 @@ impl<D: DiskSpace> Store<D> {
         admission: Admission,
         wall_ms: i64,
     ) -> Result<Accepted> {
-        self.accept_inner(envelope, ttl_ms, admission, wall_ms, false)
+        self.accept_inner(envelope, ttl_ms, admission, wall_ms, false, None)
     }
 
     pub fn accept_collected(
@@ -418,9 +532,11 @@ impl<D: DiskSpace> Store<D> {
         ttl_ms: i64,
         wall_ms: i64,
     ) -> Result<Accepted> {
-        self.accept_inner(envelope, ttl_ms, Admission::Inbox, wall_ms, true)
+        self.accept_inner(envelope, ttl_ms, Admission::Inbox, wall_ms, true, None)
     }
 
+    // Admission atomically binds immutable mail, transport state, and collection debt.
+    #[allow(clippy::too_many_arguments)]
     fn accept_inner(
         &mut self,
         envelope: &Envelope,
@@ -428,6 +544,7 @@ impl<D: DiskSpace> Store<D> {
         admission: Admission,
         wall_ms: i64,
         collect_ack: bool,
+        route: Option<(u8, &[String], &str)>,
     ) -> Result<Accepted> {
         if self.clock()?.paused {
             return Err(Error::Paused);
@@ -439,13 +556,15 @@ impl<D: DiskSpace> Store<D> {
         {
             return Err(Error::InvalidEnvelope);
         }
+        if admission == Admission::Inbox
+            && self.is_tombstoned(&envelope.target_agent, &envelope.target_session, wall_ms)?
+        {
+            return Err(Error::RecipientGone);
+        }
         let mut metadata = envelope.clone();
         metadata.body.clear();
         let metadata = serde_json::to_string(&metadata)?;
-        let mut hash = Sha256::new();
-        hash.update(metadata.as_bytes());
-        hash.update(&envelope.body);
-        let fingerprint = hash.finalize().to_vec();
+        let fingerprint = fingerprint(envelope)?;
         let charge = metadata.len() as u64
             + envelope.key.origin_node.len() as u64
             + envelope.key.message_id.len() as u64
@@ -474,6 +593,10 @@ impl<D: DiskSpace> Store<D> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if admission == Admission::Inbox && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_tombstones WHERE agent_id=?1 AND session=?2 AND until>?3)",
+            params![envelope.target_agent,envelope.target_session,now], |r| r.get::<_, bool>(0),
+        )? { return Err(Error::RecipientGone); }
         let prior: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT fingerprint FROM envelopes WHERE origin=?1 AND id=?2",
@@ -519,6 +642,17 @@ impl<D: DiskSpace> Store<D> {
                 envelope.request_key.as_ref().map(|k| &k.origin_node),envelope.request_key.as_ref().map(|k| &k.message_id),
                 envelope.return_binding.recipient_node,
                 matches!(envelope.intent.as_str(), "\"needs_reply\"" | "\"blocking\""),serde_json::to_string(&envelope.return_binding.collection_token)?])?;
+        let (hops, visited, next_hop) = route.unwrap_or((
+            8,
+            &[],
+            if inbox {
+                ""
+            } else {
+                &envelope.return_binding.recipient_node
+            },
+        ));
+        tx.execute("UPDATE envelopes SET next_hop=?3,hops_left=?4,visited=?5,kind=?6,mailbox_ttl_ms=?7 WHERE origin=?1 AND id=?2",
+            params![envelope.key.origin_node,envelope.key.message_id,next_hop,hops,serde_json::to_string(visited)?,envelope.kind.as_str(),DAY_MS])?;
         collection::record_answer(&tx, envelope, admission, collect_ack)?;
         if inbox {
             tx.execute(
@@ -534,6 +668,15 @@ impl<D: DiskSpace> Store<D> {
     /// custody untouched and retry later, before calling this method. This only
     /// references the existing body, so it does not require disk-reserve admission.
     pub fn import(&mut self, key: &MessageKey, wall_ms: i64) -> Result<Accepted> {
+        if let Some(record) = self.get(key)? {
+            if self.is_tombstoned(
+                &record.envelope.target_agent,
+                &record.envelope.target_session,
+                wall_ms,
+            )? {
+                return Err(Error::RecipientGone);
+            }
+        }
         let now = self.writable(wall_ms)?;
         let tx = self
             .connection
@@ -556,8 +699,8 @@ impl<D: DiskSpace> Store<D> {
             "INSERT INTO inbox_imports VALUES(?1,?2)",
             params![key.origin_node, key.message_id],
         )?;
-        tx.execute("UPDATE envelopes SET state='inbox',delivered=1,inbox_deadline=?3 WHERE origin=?1 AND id=?2",
-            params![key.origin_node,key.message_id,now.saturating_add(DAY_MS)])?;
+        tx.execute("UPDATE envelopes SET state='inbox',delivered=1,inbox_deadline=?3,mailbox_ttl_ms=?4 WHERE origin=?1 AND id=?2",
+            params![key.origin_node,key.message_id,now.saturating_add(DAY_MS),DAY_MS])?;
         tx.commit()?;
         Ok(Accepted::New)
     }
@@ -682,7 +825,7 @@ impl<D: DiskSpace> Store<D> {
         let row = self
             .connection
             .query_row(
-                "SELECT metadata,body,state,custody_deadline,inbox_deadline,delivered,retry_at
+                "SELECT metadata,body,state,custody_deadline,inbox_deadline,delivered,retry_at,mailbox_ttl_ms,next_hop,hops_left,visited
             FROM envelopes WHERE origin=?1 AND id=?2",
                 params![key.origin_node, key.message_id],
                 |r| {
@@ -694,14 +837,37 @@ impl<D: DiskSpace> Store<D> {
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, bool>(5)?,
                         r.get::<_, i64>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, u8>(9)?,
+                        r.get::<_, String>(10)?,
                     ))
                 },
             )
             .optional()?;
         row.map(
-            |(metadata, body, state, custody, inbox, delivered, retry_at_ms)| {
+            |(
+                metadata,
+                body,
+                state,
+                custody,
+                inbox,
+                delivered,
+                retry_at_ms,
+                mailbox_ttl_ms,
+                next_hop,
+                hops_left,
+                visited,
+            )| {
                 let mut envelope: Envelope = serde_json::from_str(&metadata)?;
+                if envelope.key != *key || !envelope.key.is_valid() {
+                    return Err(Error::InvalidEnvelope);
+                }
                 envelope.body = body;
+                let visited: Vec<String> = serde_json::from_str(&visited)?;
+                if visited.len() > 8 || hops_left > 8 {
+                    return Err(Error::InvalidEnvelope);
+                }
                 let remaining_ms = if matches!(state.as_str(), "inbox" | "read") {
                     inbox.unwrap_or(custody)
                 } else {
@@ -713,7 +879,10 @@ impl<D: DiskSpace> Store<D> {
                     envelope,
                     state,
                     remaining_ms,
-                    mailbox_ttl_ms: DAY_MS,
+                    mailbox_ttl_ms,
+                    next_hop,
+                    hops_left,
+                    visited,
                     delivered,
                     retry_at_ms,
                 })
@@ -939,12 +1108,23 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Retain undecodable bytes for diagnosis, excluding them from delivery and projection.
+    /// Archive the raw row durably before discarding its quarantined body.
     pub fn quarantine(&mut self, key: &MessageKey) -> Result<()> {
-        self.connection.execute(
-            "UPDATE envelopes SET state='quarantined' WHERE origin=?1 AND id=?2",
-            params![key.origin_node, key.message_id],
-        )?;
+        let wall = self.clock()?.wall_ms;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rowid: Option<i64> = tx
+            .query_row(
+                "SELECT rowid FROM envelopes WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(rowid) = rowid {
+            quarantine::row(&tx, rowid, &self.path, "invalid envelope", wall)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1032,7 +1212,7 @@ impl<D: DiskSpace> Store<D> {
             "SELECT EXISTS(SELECT 1 FROM envelopes WHERE
              (state IN ('custody','held') AND custody_deadline<=?1)
              OR (state='inbox' AND inbox_deadline<=?1)
-             OR (outcome_until<=?1 AND dedupe_until<=?1))",
+             OR (state!='quarantined' AND outcome_until<=?1 AND dedupe_until<=?1)) OR EXISTS(SELECT 1 FROM agent_tombstones WHERE until<=?1)",
             [now],
             |r| r.get(0),
         )?;
@@ -1067,13 +1247,15 @@ impl<D: DiskSpace> Store<D> {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let batch = tx.execute("DELETE FROM envelopes WHERE rowid IN
-                (SELECT rowid FROM envelopes WHERE outcome_until<=?1 AND dedupe_until<=?1 LIMIT 500)", [now])?;
+                (SELECT rowid FROM envelopes WHERE state!='quarantined' AND outcome_until<=?1 AND dedupe_until<=?1 LIMIT 500)", [now])?;
             tx.commit()?;
             deleted += batch;
             if batch < 500 {
                 break;
             }
         }
+        self.connection
+            .execute("DELETE FROM agent_tombstones WHERE until<=?1", [now])?;
         self.checkpoint()?;
         Ok(deleted)
     }
@@ -1092,3 +1274,38 @@ impl<D: DiskSpace> Store<D> {
 
 #[cfg(test)]
 mod tests;
+
+fn mode_directory(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != Path::new("."))
+}
+
+fn warn_mode_failure(path: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        path = path.display().to_string(),
+        error = error.to_string(),
+        "could not tighten mesh store permissions"
+    );
+}
+
+fn tighten_mode(path: &Path, mode: u32) {
+    let result = (|| -> std::io::Result<()> {
+        if fs::metadata(path)?.permissions().mode() & 0o777 & !mode != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        warn_mode_failure(path, &error);
+    }
+}
+
+fn fingerprint(envelope: &Envelope) -> Result<Vec<u8>> {
+    let mut metadata = envelope.clone();
+    metadata.body.clear();
+    metadata.signature.clear();
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&metadata)?);
+    hash.update(&envelope.body);
+    Ok(hash.finalize().to_vec())
+}

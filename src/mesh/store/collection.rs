@@ -81,7 +81,15 @@ impl<D: DiskSpace> Store<D> {
                 }
                 Ok(Some(record))
             }
-            Err(Error::Json(_)) => {
+            Err(
+                Error::Json(_)
+                | Error::InvalidEnvelope
+                | Error::Sql(
+                    rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::IntegralValueOutOfRange(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..),
+                ),
+            ) => {
                 self.quarantine(key)?;
                 Ok(None)
             }
@@ -347,10 +355,12 @@ impl<D: DiskSpace> Store<D> {
         Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND request_origin IS NULL AND state='held' AND recipient_node=?3 AND retry_at<=?2 AND custody_deadline>?2)", params![local, now, hub], |r| r.get(0))?)
     }
 
-    /// The enrolled hub can collect only local requests addressed to itself.
+    /// Step-1 importers accept only local requests addressed to their neighbor.
+    /// All-custody importers opt into offers and acks bound to the next hop.
     /// A lost ack reoffers the same immutable envelope for idempotent import.
     pub fn collect_outbound(
         &mut self,
+        offer: Offer,
         local: &str,
         hub: &str,
         query: &crate::mesh::collect::OutboundCollect,
@@ -368,10 +378,12 @@ impl<D: DiskSpace> Store<D> {
         for receipt in &query.receipts {
             let valid = receipt.key.origin_node == local
                 && super::status::RECEIPT_STATES.contains(&receipt.state.as_str())
-                && self.get(&receipt.key)?.is_some_and(|record| {
-                    record.envelope.return_binding.recipient_node == hub
-                        && record.envelope.return_binding.collection_token == receipt.token
-                });
+                && self
+                    .collection_record(&receipt.key, wall_ms)?
+                    .is_some_and(|record| {
+                        record.envelope.return_binding.recipient_node == hub
+                            && record.envelope.return_binding.collection_token == receipt.token
+                    });
             if valid {
                 receipts.push(receipt);
             }
@@ -380,9 +392,15 @@ impl<D: DiskSpace> Store<D> {
             let Some(record) = self.collection_record(&ack.key, wall_ms)? else {
                 continue;
             };
-            if ack.key.origin_node != local
-                || record.envelope.request_key.is_some()
-                || record.envelope.return_binding.recipient_node != hub
+            let wrong_neighbor = match offer {
+                Offer::Step1RequestsOnly => {
+                    ack.key.origin_node != local
+                        || record.envelope.request_key.is_some()
+                        || record.envelope.return_binding.recipient_node != hub
+                }
+                Offer::All => record.next_hop != hub,
+            };
+            if wrong_neighbor
                 || record.envelope.return_binding.collection_token != ack.token
                 || ack
                     .refusal
@@ -424,17 +442,15 @@ impl<D: DiskSpace> Store<D> {
             self.import_receipt(&receipt.key, &receipt.state)?;
         }
         let now = self.clock()?.advance(wall_ms);
-        let keys = {
-            let mut stmt = self.connection.prepare("SELECT id FROM envelopes WHERE origin=?1 AND recipient_node=?2 AND request_origin IS NULL AND state='held' AND retry_at<=?3 ORDER BY retry_at,id LIMIT ?4")?;
-            let rows = stmt
-                .query_map(params![local, hub, now, BATCH_CAP as i64], |r| {
-                    Ok(MessageKey {
-                        origin_node: local.into(),
-                        message_id: r.get(0)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows
+        let keys = match offer {
+            Offer::Step1RequestsOnly => self.routing_keys(
+                "SELECT origin,id,rowid FROM envelopes WHERE origin=?1 AND recipient_node=?2 AND request_origin IS NULL AND state='held' AND retry_at<=?3 ORDER BY retry_at,id LIMIT ?4",
+                params![local,hub,now,BATCH_CAP as i64],
+            )?,
+            Offer::All => self.routing_keys(
+                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
+                params![hub,now,BATCH_CAP as i64],
+            )?,
         };
         let mut outbound = Vec::new();
         for key in keys {

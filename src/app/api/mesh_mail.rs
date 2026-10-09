@@ -28,6 +28,9 @@ pub(super) fn envelope(
     let return_binding =
         ReturnBinding::mint(key.clone(), String::new(), Vec::new()).map_err(|e| e.to_string())?;
     Ok(Envelope {
+        kind: Default::default(),
+        origin_key: Vec::new(),
+        signature: Vec::new(),
         key,
         sender: payload.message.from_agent.clone().unwrap_or_default(),
         target_agent: target,
