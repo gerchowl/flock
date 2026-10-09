@@ -86,12 +86,8 @@ impl App {
         {
             return Err("mailbox_full".into());
         }
-        let push_peer = if local {
-            None
-        } else {
-            self.outbound_reply_peer(&request.origin_node)
-                .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
-        };
+        let next = self.request_next_hop(&request.origin_node);
+        let push_peer = if local { None } else { next.peer.clone() };
         let data = Payload {
             message: message.clone(),
             peer: push_peer.as_ref().map(|peer| peer.name.clone()),
@@ -108,9 +104,9 @@ impl App {
         crate::mesh::sign::seal(&mut answer, &identity);
         with_store(|store| {
             store
-                .accept(
+                .accept_origin(
                     &answer,
-                    CUSTODY_TTL_MS,
+                    &next.node,
                     if local {
                         Admission::Inbox
                     } else if push_peer.is_some() {
@@ -118,13 +114,14 @@ impl App {
                     } else {
                         Admission::Held
                     },
+                    crate::mesh::delivery::hop_limit(),
                     now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())?;
             Ok(())
         })?;
         if !local && push_peer.is_none() {
-            self.emit_mesh_wake(&request.origin_node);
+            self.emit_mesh_wake(&next.node);
         }
         message.message_key = Some(answer.key.clone());
         let state = if local && !message.to_pane.is_empty() {
@@ -223,11 +220,34 @@ impl App {
                         .map_err(|e| e.to_string())?,
                     Collect::Outbound { .. } => None,
                 };
-                Ok((answers, refusals, receipt))
+                let mut receipts_acked = Vec::new();
+                if let Collect::Outbound { outbound } = &query {
+                    for receipt in &outbound.receipts {
+                        let valid = store
+                            .collection_record(&receipt.key, now_ms() as i64)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| {
+                                Some(receipt.key.origin_node.as_str()) == self.node_id.as_deref()
+                                    && r.envelope.return_binding.recipient_node == origin
+                                    && r.envelope.return_binding.collection_token == receipt.token
+                            });
+                        if valid
+                            && matches!(
+                                store.import_receipt(&receipt.key, &receipt.state),
+                                Ok(crate::mesh::store::ReceiptImport::Applied
+                                    | crate::mesh::store::ReceiptImport::Duplicate)
+                            )
+                        {
+                            receipts_acked.push(receipt.clone());
+                        }
+                    }
+                }
+                Ok((answers, refusals, receipt, receipts_acked))
             })
         })();
         match result {
-            Ok((answers, refusals, receipt)) => {
+            Ok((answers, refusals, receipt, receipts_acked)) => {
                 for (correlation_id, reason) in refusals {
                     self.emit_event(EventEnvelope {
                         event: EventKind::MessageDelivered,
@@ -240,13 +260,33 @@ impl App {
                         },
                     });
                 }
-                encode_success(id, ResponseResult::MeshCollected { answers, receipt })
+                encode_success(
+                    id,
+                    ResponseResult::MeshCollected {
+                        answers,
+                        receipt,
+                        receipts_acked,
+                    },
+                )
             }
             Err(reason) => encode_error(id, "mesh_collection_refused", reason),
         }
     }
 
     pub(crate) fn tick_mesh_collections(&mut self) {
+        // A custody wake is actionable work, not an idle scan. Consume it only
+        // once the prior collection finishes, and before the idle tick gate.
+        for peer in &self.state.peers {
+            if !self.collection_peers.contains_key(&peer.name)
+                && crate::peer_stream::take_wake(peer)
+            {
+                self.mesh_outbound_polls
+                    .entry(peer.name.clone())
+                    .or_default()
+                    .note_wake();
+                self.mesh_collect_at = None;
+            }
+        }
         let now = std::time::Instant::now();
         if self.mesh_collect_at.is_some_and(|deadline| deadline > now) {
             return;
@@ -262,6 +302,7 @@ impl App {
             return;
         }
         self.retry_agent_removals();
+        self.route_mesh_receipts();
         let cap = crate::mesh::collect::POLL_CONCURRENCY;
         let slots = self.collection_relays.slots(cap);
         if slots == 0 {
@@ -283,6 +324,15 @@ impl App {
             Vec::new()
         };
         self.collection_generation = generation;
+        let pinned: Vec<String> = self
+            .state
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                let edge = crate::peer_stream::enrollment(peer);
+                (edge.state == "pinned").then_some(edge.node_id).flatten()
+            })
+            .collect();
         let busy: Vec<String> = self.collection_peers.values().cloned().collect();
         let records = with_store(|store| {
             store
@@ -294,7 +344,7 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
             store
-                .collect_ready(&origin, now_ms() as i64, slots, &busy)
+                .collect_ready(&origin, now_ms() as i64, slots, &busy, &pinned)
                 .map_err(|e| e.to_string())
         });
         let Ok(records) = records else { return };
@@ -327,14 +377,6 @@ impl App {
         for peer in peers {
             let edge = crate::peer_stream::enrollment(&peer);
             if let Some(node) = edge.node_id.as_deref().filter(|_| edge.state == "pinned") {
-                if !self.collection_peers.contains_key(&peer.name)
-                    && crate::peer_stream::take_wake(&peer)
-                {
-                    self.mesh_outbound_polls
-                        .entry(peer.name.clone())
-                        .or_default()
-                        .note_wake();
-                }
                 // The hub's own read receipts are work even after the spoke
                 // has drained its outbox and stopped advertising pending mail.
                 let receipts_pending = with_store(|store| {
@@ -528,15 +570,6 @@ impl App {
             return Err("msg_not_allowed".into());
         }
         let original = with_store(|store| {
-            if let Some(peer) = collecting_peer {
-                if store
-                    .get_pin(peer)
-                    .map_err(|e| e.to_string())?
-                    .is_none_or(|pin| pin.node_id != answer.key.origin_node)
-                {
-                    return Err("invalid reply binding".into());
-                }
-            }
             let original = store
                 .get(request)
                 .map_err(|e| e.to_string())?
@@ -607,7 +640,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn correctly_signed_answer_with_wrong_token_reaches_reply_binding_check() {
+    async fn forged_answer_signature_or_token_is_refused() {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -652,13 +685,19 @@ mod tests {
             app.import_mesh_answer(&original.key, &delivery, None),
             Err("invalid reply binding".into())
         );
+        delivery.envelope.body.push(0);
+        assert_eq!(
+            app.import_mesh_answer(&original.key, &delivery, Some("hub.example")),
+            Err("invalid_signature".into())
+        );
+        delivery.envelope.body.pop();
         // With only the token corrected, binding validation succeeds and the
         // intentionally non-payload fixture body reaches the payload decoder.
         delivery.envelope.return_binding.collection_token =
             original.return_binding.collection_token;
         crate::mesh::sign::seal(&mut delivery.envelope, &signer);
         let error = app
-            .import_mesh_answer(&original.key, &delivery, None)
+            .import_mesh_answer(&original.key, &delivery, Some("hub.example"))
             .unwrap_err();
         assert_ne!(error, "invalid reply binding");
         assert_ne!(error, "invalid_signature");

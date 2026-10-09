@@ -102,6 +102,7 @@ pub(crate) fn permanent_refusal(reason: &str) -> bool {
             | "msg_not_allowed"
             | "origin_mismatch"
             | "invalid_signature"
+            | "invalid reply binding"
             | "invalid_envelope"
             | "message_key_conflict"
     )
@@ -166,6 +167,7 @@ mod tests {
             "msg_not_allowed",
             "origin_mismatch",
             "invalid_signature",
+            "invalid reply binding",
             "invalid_envelope",
         ] {
             let failure = super::delivery_failure(

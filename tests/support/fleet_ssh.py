@@ -262,6 +262,8 @@ try:
             if response.get("error"):
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
+            if (base / f"observe-delivery-{source}-{target}").exists():
+                (base / f"observed-result-{source}-{target}").write_text(line)
             deliveries.discard(response.get("id"))
             gate = base / f"gate-delivery-ack-{source}-{target}"
             if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:

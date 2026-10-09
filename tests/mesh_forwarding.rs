@@ -121,7 +121,7 @@ fn chain_request_is_forwarded_and_imported_once() {
     assert_eq!(response["result"]["state"], "queued", "{response}");
     assert_eq!(response["result"]["path"], "via nodeb");
     read_once(&fleet, &recipient, "chain");
-    row_state(fleet.node("nodea"), "chain", "transferred");
+    remote_state(&fleet, "chain", "read");
     let body: Vec<u8> = db(fleet.node("nodea"))
         .query_row(
             "SELECT body FROM envelopes WHERE correlation='chain'",
@@ -130,8 +130,8 @@ fn chain_request_is_forwarded_and_imported_once() {
         )
         .unwrap();
     assert!(
-        !body.is_empty(),
-        "origin retains its body after custody transfer"
+        body.is_empty(),
+        "origin releases its body after final delivery receipt"
     );
     row_state(fleet.node("nodeb"), "chain", "delivered");
     let body: Vec<u8> = db(fleet.node("nodeb"))
@@ -548,4 +548,346 @@ fn configured_origin_name_is_accepted_by_forwarded_policy() {
     let response = send(&fleet, &sender, &recipient, "allowed");
     assert_eq!(response["result"]["path"], "via nodeb", "{response}");
     read_once(&fleet, &recipient, "allowed");
+}
+
+fn reply(fleet: &Fleet, correlation: &str, body: &str) {
+    let response = api(
+        fleet.node("nodec"),
+        "msg.reply",
+        json!({"correlation_id":correlation,"body":body}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+}
+fn read_answer(fleet: &Fleet, sender: &Value, body: &str) {
+    let messages = fleet::wait_until("routed answer", WAIT, || {
+        let response = api(
+            fleet.node("nodea"),
+            "msg.read",
+            json!({"pane":sender["pane_id"]}),
+        );
+        let messages = response["result"]["messages"].as_array()?;
+        (!messages.is_empty()).then_some(messages.clone())
+    });
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0]["body"], body);
+    assert_eq!(
+        api(
+            fleet.node("nodea"),
+            "msg.read",
+            json!({"pane":sender["pane_id"]})
+        )["result"]["messages"],
+        json!([])
+    );
+}
+fn remote_state(fleet: &Fleet, correlation: &str, expected: &str) {
+    fleet::wait_until("routed receipt", WAIT, || {
+        let response = api(
+            fleet.node("nodea"),
+            "msg.status",
+            json!({"correlation_id":correlation}),
+        );
+        (response["result"]["state"] == expected).then_some(())
+    });
+}
+
+#[test]
+fn answer_routes_back_across_two_hops_and_imports_once() {
+    let (fleet, sender, recipient) = setup("routed-answer", CHAIN);
+    send(&fleet, &sender, &recipient, "routed");
+    read_once(&fleet, &recipient, "routed");
+    reply(&fleet, "routed", "answer across two hops");
+    read_answer(&fleet, &sender, "answer across two hops");
+}
+
+#[test]
+fn delivered_and_read_receipts_reach_origin_across_hops() {
+    let (fleet, sender, recipient) = setup("routed-receipts", CHAIN);
+    send(&fleet, &sender, &recipient, "receipts");
+    remote_state(&fleet, "receipts", "delivered");
+    read_once(&fleet, &recipient, "receipts");
+    remote_state(&fleet, "receipts", "read");
+}
+
+#[test]
+fn answer_held_while_origin_unroutable_moves_when_route_appears() {
+    let (fleet, sender, recipient) = setup("routed-offline", CHAIN);
+    send(&fleet, &sender, &recipient, "offline-answer");
+    read_once(&fleet, &recipient, "offline-answer");
+    fleet.refuse_edge("nodea", "nodeb");
+    fleet.kill_edge("nodea", "nodeb", WAIT);
+    fleet.wait_route("nodec", "nodea", false);
+    reply(&fleet, "offline-answer", "held answer");
+    let count: i64 = db(fleet.node("nodec")).query_row(
+        "SELECT count(*) FROM envelopes WHERE request_origin IS NOT NULL AND kind='message' AND state='held' AND next_hop=''", [], |r|r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    fleet.allow_edge("nodea", "nodeb");
+    fleet.wait_route("nodec", "nodea", true);
+    read_answer(&fleet, &sender, "held answer");
+}
+
+#[test]
+fn follow_up_after_final_answer_on_one_way_edge_is_collected() {
+    let (fleet, sender, recipient) = setup("routed-followup", CHAIN);
+    send(&fleet, &sender, &recipient, "followup");
+    read_once(&fleet, &recipient, "followup");
+    reply(&fleet, "followup", "first answer");
+    read_answer(&fleet, &sender, "first answer");
+    reply(&fleet, "followup", "second answer");
+    read_answer(&fleet, &sender, "second answer");
+}
+
+#[test]
+fn recipient_gone_receipt_reaches_multihop_origin() {
+    let (fleet, sender, recipient) = setup("routed-gone", CHAIN);
+    send(&fleet, &sender, &recipient, "gone");
+    remote_state(&fleet, "gone", "delivered");
+    let response = api(
+        fleet.node("nodec"),
+        "pane.close",
+        json!({"pane_id":recipient["pane_id"]}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    remote_state(&fleet, "gone", "recipient_gone");
+}
+
+#[test]
+fn channel_original_settles_on_reply_custody_multihop() {
+    let (fleet, sender, recipient) = setup(
+        "routed-channel",
+        &[
+            CHAIN[0].clone(),
+            CHAIN[1].clone(),
+            NodeSpec::new("nodec", "channel-c", &[]).with_config("[msg]\nchannel_push = true\n"),
+        ],
+    );
+    send(&fleet, &sender, &recipient, "channel");
+    remote_state(&fleet, "channel", "delivered");
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let output = fleet.node("nodec").home.join("channel-reply.json");
+    let response = api(
+        fleet.node("nodec"),
+        "pane.send_text",
+        json!({
+            "pane_id":recipient["pane_id"],
+            "text":format!("{} msg reply channel 'channel answer' >{}\n",
+                quote(env!("CARGO_BIN_EXE_flk")), quote(output.to_str().unwrap()))
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let response: Value = fleet::wait_until("reply from recipient ancestry", WAIT, || {
+        serde_json::from_slice(&std::fs::read(&output).ok()?).ok()
+    });
+    assert!(response.get("error").is_none(), "{response}");
+    read_answer(&fleet, &sender, "channel answer");
+    assert_eq!(
+        api(
+            fleet.node("nodec"),
+            "msg.read",
+            json!({"pane":recipient["pane_id"]})
+        )["result"]["messages"],
+        json!([])
+    );
+}
+
+#[test]
+fn laptop_collects_answer_through_a_different_hub() {
+    let fleet = fleet::spawn("routed-two-hubs", fleet::LAPTOP_TWO_HUBS);
+    let start = |name: &str| {
+        let node = fleet.node(name);
+        api(
+            node,
+            "agent.start",
+            json!({"name":"roaming", "argv":["/bin/sh"], "cwd":node.repo}),
+        )["result"]["agent"]
+            .clone()
+    };
+    let sender = start("nodea");
+    let recipient = start("noded.example");
+    fleet.wait_route("nodea", "noded.example", true);
+    fleet::wait_until("roaming recipient discovery", WAIT, || {
+        api(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
+            .as_array()?
+            .iter()
+            .any(|row| row["agent_id"] == recipient["agent_id"])
+            .then_some(())
+    });
+    fleet.refuse_edge("nodea", "nodec");
+    fleet.kill_edge("nodea", "nodec", WAIT);
+    send(&fleet, &sender, &recipient, "roaming");
+    remote_state(&fleet, "roaming", "delivered");
+    let response = api(
+        fleet.node("noded.example"),
+        "msg.read",
+        json!({"pane":recipient["pane_id"]}),
+    );
+    assert_eq!(response["result"]["messages"].as_array().unwrap().len(), 1);
+    fleet.refuse_edge("nodea", "nodeb");
+    fleet.kill_edge("nodea", "nodeb", WAIT);
+    fleet.wait_route("noded.example", "nodea", false);
+    let response = api(
+        fleet.node("noded.example"),
+        "msg.reply",
+        json!({"correlation_id":"roaming", "body":"via second hub"}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    fleet.allow_edge("nodea", "nodec");
+    fleet.wait_route("noded.example", "nodea", true);
+    read_answer(&fleet, &sender, "via second hub");
+}
+
+#[test]
+fn forged_answer_signature_or_token_is_refused() {
+    for wrong_token in [false, true] {
+        let (fleet, sender, recipient) = setup(
+            if wrong_token {
+                "routed-token"
+            } else {
+                "routed-signature"
+            },
+            CHAIN,
+        );
+        send(&fleet, &sender, &recipient, "forged");
+        read_once(&fleet, &recipient, "forged");
+        fleet.refuse_edge("nodea", "nodeb");
+        fleet.kill_edge("nodea", "nodeb", WAIT);
+        fleet.wait_route("nodec", "nodea", false);
+        if wrong_token {
+            // The receiver signs an answer with a token the original sender never granted.
+            db(fleet.node("nodec")).execute(
+                "UPDATE envelopes SET metadata=json_set(metadata,'$.return_binding.collection_token',json(?1)) WHERE correlation='forged'",
+                [serde_json::to_string(&vec![0u8;32]).unwrap()],
+            ).unwrap();
+        }
+        reply(&fleet, "forged", "refuse this answer");
+        if !wrong_token {
+            db(fleet.node("nodec")).execute(
+                "UPDATE envelopes SET metadata=json_set(metadata,'$.signature',json(?1)) WHERE request_origin IS NOT NULL AND kind='message'",
+                [serde_json::to_string(&vec![0u8;64]).unwrap()],
+            ).unwrap();
+        }
+        fleet.allow_edge("nodea", "nodeb");
+        fleet.wait_route("nodec", "nodea", true);
+        let custodian = if wrong_token { "nodeb" } else { "nodec" };
+        fleet::wait_until("forged answer refused", WAIT, || {
+            let count: i64 = db(fleet.node(custodian)).query_row(
+                "SELECT count(*) FROM envelopes WHERE request_origin IS NOT NULL AND kind='message' AND state='refused'", [], |r| r.get(0)).ok()?;
+            (count == 1).then_some(())
+        });
+        assert_eq!(
+            api(
+                fleet.node("nodea"),
+                "msg.read",
+                json!({"pane":sender["pane_id"]})
+            )["result"]["messages"],
+            json!([])
+        );
+    }
+}
+
+// Ported from #852's mesh_step2 regression at 65709cd6, using this suite's helpers.
+#[test]
+fn route_cycle_and_exhausted_hop_budget_retain_custody() {
+    for (field, value) in [("visited", json!(["receiver"])), ("hops_left", json!(0))] {
+        let (fleet, sender, recipient) = setup("reroute-lease", CHAIN);
+        let origin = fleet.node("nodea");
+        let capture = fleet.base.join("capture-delivery-nodea-nodeb");
+        std::fs::write(&capture, "").unwrap();
+        assert_eq!(
+            send(&fleet, &sender, &recipient, "lease-refusal")["result"]["state"],
+            "queued"
+        );
+        let mut delivery: Value = fleet::wait_until("initial delivery captured", WAIT, || {
+            serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()
+        });
+        fleet::wait_until("captured delivery retry scheduled", WAIT, || {
+            let ready: bool = db(origin).query_row(
+                "SELECT retry_at>0 AND lease_until<=retry_at FROM envelopes WHERE correlation='lease-refusal'",
+                [], |r| r.get(0)).ok()?;
+            ready.then_some(())
+        });
+        delivery[field] = if field == "visited" {
+            json!([
+                fleet.node_id("nodea"),
+                fleet.node_id("nodeb"),
+                fleet.node_id("nodea")
+            ])
+        } else {
+            value
+        };
+        let replay = fleet.base.join("replay-delivery-nodea-nodeb");
+        std::fs::write(&replay, serde_json::to_vec(&delivery).unwrap()).unwrap();
+        std::fs::remove_file(capture).unwrap();
+        std::fs::write(fleet.base.join("observe-delivery-nodea-nodeb"), "").unwrap();
+        due(origin);
+        let refused: Value = fleet::wait_until("route refused on wire", WAIT, || {
+            serde_json::from_slice(
+                &std::fs::read(fleet.base.join("observed-result-nodea-nodeb")).ok()?,
+            )
+            .ok()
+        });
+        assert_eq!(
+            refused["error"]["message"],
+            if field == "visited" {
+                "loop_detected"
+            } else {
+                "hop_budget_exhausted"
+            },
+            "{refused}"
+        );
+        remote_state(&fleet, "lease-refusal", "queued");
+        fleet::wait_until("rejected route releases custody lease", WAIT, || {
+            let row: (String, String, i64) = db(origin).query_row(
+                "SELECT state,next_hop,lease_until FROM envelopes WHERE correlation='lease-refusal'",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            (row == ("custody".into(), String::new(), 0)).then_some(())
+        });
+        let attempts = || {
+            std::fs::read_to_string(fleet.base.join("delivery-attempts-nodea-nodeb"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "lease-refusal")
+                .count()
+        };
+        let before = attempts();
+        let observed = std::time::Instant::now();
+        fleet::wait_until(
+            "unpushable custody stays unleased across worker ticks",
+            WAIT,
+            || {
+                let leased: i64 = db(origin).query_row(
+                "SELECT count(*) FROM envelopes WHERE next_hop='' AND lease_until>0 AND state IN ('custody','held')", [], |r|r.get(0)).unwrap();
+                assert_eq!(leased, 0);
+                assert_eq!(
+                    attempts(),
+                    before,
+                    "same refused route retried without a generation change"
+                );
+                (observed.elapsed() >= Duration::from_secs(2)).then_some(())
+            },
+        );
+        assert_eq!(
+            api(
+                fleet.node("nodec"),
+                "msg.read",
+                json!({"pane":recipient["pane_id"]})
+            )["result"]["messages"],
+            json!([])
+        );
+        std::fs::remove_file(replay).unwrap();
+        fleet.refuse_edge("nodeb", "nodec");
+        fleet.kill_edge("nodeb", "nodec", WAIT);
+        fleet.wait_route("nodea", "nodec", false);
+        fleet.allow_edge("nodeb", "nodec");
+        fleet.wait_route("nodea", "nodec", true);
+        due(origin);
+        read_once(&fleet, &recipient, "lease-refusal");
+        let count: i64 = db(fleet.node("nodec"))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE correlation='lease-refusal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }
