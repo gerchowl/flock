@@ -1402,6 +1402,8 @@ fn a14_unsafe_names_are_usage_errors() {
     let before = workspaces(&server).len();
     let work = work_dir(&server);
     let b = brief(&server, "task.md", "x\n");
+    let state = server.base.join("state");
+    let startup_files: std::collections::BTreeSet<_> = walk(&state).into_iter().collect();
     let long = "n".repeat(65);
     for name in ["../x", "a/b", ".hidden", "-dash", "sp ace", long.as_str()] {
         let out = cli(
@@ -1411,13 +1413,10 @@ fn a14_unsafe_names_are_usage_errors() {
         assert_eq!(out.status.code(), Some(2), "{name:?}: {}", stderr(&out));
     }
     assert_eq!(workspaces(&server).len(), before);
-    // Server startup owns these two files; rejected names must write no other state.
-    let state = server.base.join("state");
-    let mesh = state.join(app_dir_name()).join("mesh");
-    let allowed = [mesh.join("identity.json"), mesh.join("identity.lock")];
+    // Rejected names must add no files beyond the server's startup state.
     let unexpected: Vec<_> = walk(&state)
         .into_iter()
-        .filter(|path| !allowed.contains(path))
+        .filter(|path| !startup_files.contains(path))
         .collect();
     assert!(
         unexpected.is_empty(),

@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 5;
+pub(super) const VERSION: i64 = 6;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -62,6 +62,11 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
         tx.execute_batch(
             "ALTER TABLE identity_pins ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown';",
         )?;
+        version = 5;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    if version == 5 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);")?;
         tx.pragma_update(None, "user_version", VERSION)?;
     }
     tx.commit()?;

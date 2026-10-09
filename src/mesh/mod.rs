@@ -1,8 +1,10 @@
 //! Durable mesh identity and transport foundations (ADR-0026).
-//! Opening the custody store is owned by the future handoff integration.
+//! Custody is projected into app mailboxes and transferred over enrolled edges.
 
 pub mod clock;
 pub mod hello;
 pub(crate) mod identity;
 pub mod key;
 pub mod store;
+
+pub mod delivery;

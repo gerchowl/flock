@@ -633,7 +633,16 @@ fn enrollments() -> &'static Enrollments {
     STATUS.get_or_init(Default::default)
 }
 
+static ENROLLMENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn enrollment_generation() -> u64 {
+    ENROLLMENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<String>) {
+    if reason.is_none() {
+        ENROLLMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Ok(mut statuses) = enrollments().lock() {
         let previous = statuses.get(&peer.name).and_then(|s| s.node_id.clone());
         statuses.insert(

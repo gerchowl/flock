@@ -742,15 +742,15 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "the forged row never reached the directory: {listing}"
     );
 
-    assert_eq!(queued["state"], "relayed", "send: {queued}");
+    assert_eq!(queued["state"], "delivered", "send: {queued}");
     assert_eq!(
         queued["path"], "via nodeb",
         "the send result says which hub carried it: {queued}"
     );
     assert_eq!(queued["to_host"], "nodec", "and where it went: {queued}");
 
-    // It arrives on nodec as ALICE's, from nodea — the hub vouched for its
-    // edge and did not become the sender.
+    // The agent identity survives forwarding, while the host is the authenticated
+    // custody origin (nodeb), never the payload's claimed host.
     let delivered = wait_for("the message to land on nodec", RPC_TIMEOUT, || {
         let inbox = carol.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
@@ -762,8 +762,8 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "the originating sender survives both hops: {delivered}"
     );
     assert_eq!(
-        delivered["from_host"], "nodea",
-        "and names the spoke it came from, never the hub: {delivered}"
+        delivered["from_host"], "nodeb",
+        "and names the authenticated custody origin: {delivered}"
     );
     assert_eq!(delivered["replyable"], true, "{delivered}");
     assert_eq!(delivered["intent"], "needs_reply", "{delivered}");
@@ -782,7 +782,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     });
     assert_eq!(answer["body"], "pong from spoke c");
     assert_eq!(answer["from_agent"], carol.agent_id.as_str(), "{answer}");
-    assert_eq!(answer["from_host"], "nodec", "{answer}");
+    assert_eq!(answer["from_host"], "nodeb", "{answer}");
     assert_eq!(answer["in_reply_to"], "c-410-hub", "{answer}");
 
     // The sender's own log says how it went, too.
@@ -869,7 +869,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         inbox["messages"].as_array()?.first().cloned()
     });
     assert_eq!(arrived["intent"], "blocking", "{arrived}");
-    assert_eq!(arrived["from_host"], "nodea", "{arrived}");
+    assert_eq!(arrived["from_host"], "nodeb", "{arrived}");
 
     // ADR-0018 §3 rides the route too: carol mutes, so a question from alice
     // is answered by carol's OWN server with a deferral — and nodec cannot
@@ -919,7 +919,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         deferral["correlation_id"], "c-410-muted:deferred",
         "{deferral}"
     );
-    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
+    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
     assert_eq!(
         deferral["from_agent"],
         carol.agent_id.as_str(),
@@ -937,32 +937,21 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     );
     carol.call_tool("flock_msg_mute", json!({"seconds": 0}));
 
-    // Break the hub's edge to nodec. The failure is nodeb's hop, and the
-    // sender on nodea is told so — which machine could not reach which, and
-    // why — not a generic "not in [[peers]]".
+    // A partition retains custody at the hub and names the queued destination.
     fleet.refuse_ssh_to("nodec");
-    let error = alice.call_tool_error(
+    fleet.kill_edge("nodeb", "nodec", Duration::from_secs(10));
+    let queued = alice.call_tool(
         "flock_msg_send",
         json!({
             "to": {"type": "agent", "agent": carol.agent_id},
-            "body": "this one cannot land",
+            "body": "this one cannot land yet",
             "correlation_id": "c-410-broken",
             "intent": "fyi",
         }),
     );
-    let text = error.to_string();
-    assert!(
-        text.contains("nodeb cannot reach nodec"),
-        "the failure names the hop that broke: {text}"
-    );
-    assert!(
-        text.contains("connection refused"),
-        "and why it broke: {text}"
-    );
-    assert!(
-        !text.contains("[[peers]]"),
-        "never the generic peers refusal: {text}"
-    );
+    assert_eq!(queued["state"], "queued", "{queued}");
+    assert!(queued["warnings"].to_string().contains("nodec"), "{queued}");
+    assert!(queued["message_key"].is_object(), "{queued}");
 }
 
 /// Hold the actual legacy SSH command until another app-loop API responds.
@@ -1025,7 +1014,7 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
         "responsive"
     );
     let sent = send.join().unwrap();
-    assert_eq!(sent["state"], "relayed", "{sent}");
+    assert_eq!(sent["state"], "delivered", "{sent}");
     assert_eq!(sent["correlation_id"], "slow-hop-question");
     let read = bob.call_tool("flock_msg_read", json!({}));
     assert!(read["messages"]

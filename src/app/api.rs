@@ -9,6 +9,7 @@ mod handoffs;
 mod integrations;
 mod lineage;
 mod mesh;
+mod mesh_mail;
 pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
@@ -1417,6 +1418,7 @@ impl App {
                 return self.handle_msg_uplink_take(request.id, params)
             }
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
+            Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, params),
             Method::PeersEnrollReset(params) => {
                 return self.handle_peers_enroll_reset(request.id, params)
             }

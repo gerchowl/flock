@@ -748,6 +748,8 @@ fn assert_sandbox_refusal_creates_nothing(harness: &str) {
     let before = workspaces(&server);
     let repo = committed_repo(&server);
     let b = brief(&server, "task.md", "do it\n");
+    let state = server.base.join("state");
+    let startup_files: std::collections::BTreeSet<_> = walk(&state).into_iter().collect();
     let out = cli(
         &server,
         &[
@@ -775,13 +777,10 @@ fn assert_sandbox_refusal_creates_nothing(harness: &str) {
         walk(&server.base.join("wt")).is_empty(),
         "no checkout created"
     );
-    // Server startup owns these two files; refusal must write no other state.
-    let state = server.base.join("state");
-    let mesh = state.join(app_dir_name()).join("mesh");
-    let allowed = [mesh.join("identity.json"), mesh.join("identity.lock")];
+    // Refusal must add no files beyond the server's startup state.
     let unexpected: Vec<_> = walk(&state)
         .into_iter()
-        .filter(|path| !allowed.contains(path))
+        .filter(|path| !startup_files.contains(path))
         .collect();
     assert!(
         unexpected.is_empty(),
