@@ -105,10 +105,10 @@ impl App {
                 .schedule_retry(&envelope.key, 60_000, now_ms() as i64)
                 .map_err(|e| e.to_string())
         })?;
+        self.mesh_retry_at = None;
         send.mesh = Some(Deliver {
             envelope,
             remaining_ms: CUSTODY_TTL_MS,
-            forwarded_by: None,
         });
         Ok(())
     }
@@ -166,7 +166,15 @@ impl App {
                     path: None,
                 },
             ),
-            Err(reason) => encode_error(id, "mesh_delivery_refused", reason),
+            Err(reason) => encode_error(
+                id,
+                if reason == "origin_mismatch" {
+                    "origin_mismatch"
+                } else {
+                    "mesh_delivery_refused"
+                },
+                reason,
+            ),
         }
     }
 
@@ -187,15 +195,19 @@ impl App {
             .filter(|edge| edge.state == "pinned")
             .ok_or("mesh edge is not enrolled")?;
         let envelope = &delivery.envelope;
-        if edge.node_id.as_deref() != Some(envelope.key.origin_node.as_str())
-            && delivery.forwarded_by.as_deref() != edge.node_id.as_deref()
-        {
-            return Err("message origin is not the authenticated neighbor".into());
+        if edge.node_id.as_deref() != Some(envelope.key.origin_node.as_str()) {
+            crate::logging::mesh_custody_failed("import", "origin_mismatch");
+            return Err("origin_mismatch".into());
         }
-        if !self.state.config.msg.accepts_from(Some(&edge.peer)) {
+        let sender_host = with_store(|store| {
+            store
+                .origin_name(&envelope.key.origin_node)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "origin_mismatch".into())
+        })?;
+        if !self.state.config.msg.accepts_from(Some(&sender_host)) {
             return Err("msg_not_allowed".into());
         }
-        let sender_host = edge.peer.clone();
         let mut data = payload(envelope)?;
         if data.message.correlation_id != envelope.correlation_id
             || data.message.from_agent.as_deref().unwrap_or_default() != envelope.sender
@@ -231,35 +243,13 @@ impl App {
             .map_err(|(_, reason)| reason)?
         {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
-            ResolvedTarget::Remote(location) => {
-                if !location.direct
-                    || delivery.forwarded_by.is_some()
-                    || self.peer_for_location(&location).is_none()
-                {
-                    return Err("forward_limit".into());
-                }
-                return with_store(|store| {
-                    let accepted = store
-                        .accept(
-                            envelope,
-                            delivery.remaining_ms,
-                            Admission::Custody,
-                            now_ms() as i64,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let delivered = store
-                        .get(&envelope.key)
-                        .map_err(|e| e.to_string())?
-                        .is_some_and(|record| record.state == "delivered");
-                    Ok((accepted, delivered))
-                });
-            }
+            ResolvedTarget::Remote(_) => return Err("forward_limit".into()),
         };
         data.message.to_pane = self
             .public_pane_id(ws, pane)
             .ok_or("missing recipient pane")?;
         data.message.from_pane = None;
-        data.message.from_host = data.message.from_host.or(Some(sender_host));
+        data.message.from_host = Some(sender_host);
         data.message.message_key = Some(envelope.key.clone());
         data.message.enqueued_at_ms = now_ms();
         let accepted = with_store(|store| {
@@ -331,7 +321,11 @@ impl App {
                 % 1000;
             if let Err(reason) = with_store(|store| {
                 store
-                    .schedule_retry(&delivery.envelope.key, delay + jitter, now_ms() as i64)
+                    .schedule_retry(
+                        &delivery.envelope.key,
+                        (delay + jitter).min(300_000),
+                        now_ms() as i64,
+                    )
                     .map_err(|e| e.to_string())
             }) {
                 warnings.push(reason);
@@ -380,9 +374,9 @@ impl App {
         }
     }
 
-    pub(super) fn mark_mesh_inbox_read(&mut self, pane: &str) -> Result<(), String> {
+    pub(super) fn mark_mesh_inbox_read(&mut self, pane: &str) -> Result<Vec<MessageKey>, String> {
         if self.node_id.is_none() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let keys: Vec<_> = self
             .mailboxes
@@ -392,13 +386,20 @@ impl App {
             .filter_map(|message| message.message_key)
             .collect();
         with_store(|store| {
-            for key in keys {
-                store
-                    .finish(&key, Outcome::Read, now_ms() as i64)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            store
+                .read_inbox(&keys, now_ms() as i64)
+                .map_err(|e| e.to_string())
         })
+    }
+
+    pub(crate) fn initialize_mesh_mail(
+        &mut self,
+        server: Option<&crate::api::ServerHandle>,
+    ) -> Result<(), String> {
+        self.node_id = server.and_then(|server| server.node_id.clone());
+        self.clone_detection_warning =
+            server.and_then(|server| server.clone_detection_warning.clone());
+        self.restore_mesh_mail()
     }
 
     pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {
@@ -466,9 +467,16 @@ impl App {
         })?;
         for record in records.into_iter().flatten() {
             let mut data = payload(&record.envelope)?;
+            if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
+                data.message.from_host = with_store(|store| {
+                    store
+                        .origin_name(&record.envelope.key.origin_node)
+                        .map_err(|e| e.to_string())
+                })?;
+            }
             data.message.message_key = Some(record.envelope.key);
             data.message.enqueued_at_ms = now_ms()
-                .saturating_sub((crate::mesh::store::DAY_MS - record.remaining_ms).max(0) as u64);
+                .saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
             if !record.envelope.target_agent.is_empty() {
                 if let Some(location) = self
                     .locate_agent(&record.envelope.target_agent)
@@ -491,6 +499,18 @@ impl App {
         if self.node_id.is_none() {
             return;
         }
+        let generation = crate::peer_stream::enrollment_generation();
+        let now = std::time::Instant::now();
+        let paused = self.fleet_pause.paused;
+        if self.mesh_retry_at.is_some_and(|deadline| now < deadline)
+            && self.mesh_enrollment_generation == generation
+            && self.mesh_pause_seen == Some(paused)
+        {
+            return;
+        }
+        self.mesh_retry_at = Some(now + std::time::Duration::from_secs(1));
+        self.mesh_enrollment_generation = generation;
+        self.mesh_pause_seen = Some(paused);
         if let Err(reason) = with_store(|store| {
             store
                 .set_paused(self.fleet_pause.paused, now_ms() as i64)
@@ -533,19 +553,15 @@ impl App {
             let Ok(data) = payload(&record.envelope) else {
                 continue;
             };
-            let forwarded =
-                Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref();
-            let peer = if forwarded {
-                self.locate_agent(&record.envelope.target_agent)
-                    .filter(|location| location.direct)
-                    .and_then(|location| self.peer_for_location(&location))
-            } else {
-                self.state
-                    .peers
-                    .iter()
-                    .find(|peer| Some(&peer.name) == data.peer.as_ref())
-                    .cloned()
-            };
+            if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
+                continue;
+            }
+            let peer = self
+                .state
+                .peers
+                .iter()
+                .find(|peer| Some(&peer.name) == data.peer.as_ref())
+                .cloned();
             let Some(peer) = peer else {
                 continue;
             };
@@ -554,7 +570,6 @@ impl App {
                 mesh: Some(Deliver {
                     envelope: record.envelope.clone(),
                     remaining_ms: record.remaining_ms,
-                    forwarded_by: forwarded.then(|| self.node_id.clone()).flatten(),
                 }),
                 id: String::new(),
                 peer,

@@ -106,6 +106,33 @@ def forward_input():
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
             if method == "mesh.deliver":
                 deliveries.add(request.get("id"))
+                if (base / f"spoof-host-{source}-{target}").exists():
+                    envelope = request["params"]["envelope"]
+                    payload = json.loads(bytes(envelope["body"]))
+                    payload["message"]["from_host"] = "spoofed.example"
+                    envelope["body"] = list(json.dumps(payload).encode())
+                    line = json.dumps(request) + "\n"
+                capture = base / f"capture-delivery-{source}-{target}"
+                if capture.exists():
+                    capture.write_text(json.dumps(request["params"]))
+                    emit(json.dumps({"id": request.get("id"), "error": {
+                        "code": "held_by_test", "message": "captured before receiver import",
+                    }}) + "\n")
+                    continue
+                replay = base / f"replay-delivery-{source}-{target}"
+                if replay.exists():
+                    params = json.loads(replay.read_text())
+                    params["forwarded_by"] = request["params"]["envelope"]["key"]["origin_node"]
+                    request["params"] = params
+                    line = json.dumps(request) + "\n"
+                attack = base / f"forge-origin-{source}-{target}"
+                if attack.exists():
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    params["forwarded_by"] = envelope["key"]["origin_node"]
+                    envelope["key"]["origin_node"] = "disallowed.example"
+                    envelope["return_binding"]["request"] = dict(envelope["key"])
+                    line = json.dumps(request) + "\n"
                 gate = base / f"gate-message-{source}-{target}"
                 if gate.is_dir():
                     (gate / "entered").touch()

@@ -1361,11 +1361,19 @@ impl App {
         };
 
         let now = now_ms();
-        if let Err(reason) = self.mark_mesh_inbox_read(&pane) {
-            return encode_error(id, super::mesh_mail::error_code(&reason), reason);
-        }
+        let expired = match self.mark_mesh_inbox_read(&pane) {
+            Ok(expired) => expired,
+            Err(reason) => return encode_error(id, super::mesh_mail::error_code(&reason), reason),
+        };
         let mut messages = Vec::new();
         while let Some(message) = self.mailboxes.pop_next(&pane) {
+            if message
+                .message_key
+                .as_ref()
+                .is_some_and(|key| expired.contains(key))
+            {
+                continue;
+            }
             self.mailboxes.record_delivered(&message);
             self.emit_event(EventEnvelope {
                 event: EventKind::MessageDelivered,
@@ -2751,7 +2759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relay_that_never_left_the_machine_writes_no_audit_record() {
+    async fn a_relay_without_custody_is_refused_without_an_audit_record() {
         // `MessageRelayed` has to mean "this message left, and went there".
         // Emitting it on the attempt rather than the success would make the
         // audit trail claim delivery for messages that never crossed the
@@ -2778,7 +2786,10 @@ mod tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         app.respond_or_park(tx, response);
-        assert!(rx.try_recv().is_err(), "the request is parked during SSH");
+        assert!(
+            rx.try_recv().is_err(),
+            "the request is parked for the worker"
+        );
         let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let event = app.event_rx.recv().await.expect("relay completion");
@@ -2789,25 +2800,19 @@ mod tests {
             }
         })
         .await
-        .expect("SSH failure must answer the caller");
+        .expect("custody refusal must answer the caller");
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
-            error.error.code, "peer_unreachable",
-            "the parked caller receives the original failure code"
+            error.error.code, "peer_refused_message",
+            "the worker refuses a send without custody"
         );
-        // #380 split this from a refusal, so the code alone is now a claim
-        // about which of the two happened — and it comes with the advice that
-        // follows from it. A peer that was never reached is worth retrying.
         let data: serde_json::Value = serde_json::from_str(&response).unwrap();
         let data = &data["error"]["data"];
         assert_eq!(
-            data["retryable"], true,
-            "an unreachable peer is a transient failure: {data}"
+            data["retryable"], false,
+            "missing custody is a refusal: {data}"
         );
-        assert!(
-            data["detail"].as_str().is_some_and(|d| !d.is_empty()),
-            "the far side's own words reach the caller unedited: {data}"
-        );
+        assert_eq!(data["detail"], "mesh custody required");
         let relayed = hub
             .events_after(0)
             .iter()

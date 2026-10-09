@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fmt, fs,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -178,6 +179,8 @@ pub struct Record {
     pub envelope: Envelope,
     pub state: String,
     pub remaining_ms: i64,
+    /// The inbox admission budget, independent of the transferred custody budget.
+    pub mailbox_ttl_ms: i64,
     pub delivered: bool,
     pub retry_at_ms: i64,
 }
@@ -251,6 +254,18 @@ impl<D: DiskSpace> Store<D> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        // SQLite sidecars inherit this mode. A strict umask must not remove
+        // owner write and leave the durable store impossible to reopen.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(file) => file.set_permissions(fs::Permissions::from_mode(0o600))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error.into()),
+        }
         let mut connection = Connection::open(path)?;
         schema::check_version(&connection)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -331,7 +346,9 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn set_paused(&mut self, paused: bool, wall_ms: i64) -> Result<()> {
-        self.advance(wall_ms, Some(paused))?;
+        if self.clock()?.paused != paused {
+            self.advance(wall_ms, Some(paused))?;
+        }
         Ok(())
     }
 
@@ -494,6 +511,44 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
+    /// Read a mailbox atomically, expiring overdue rows without rejecting live ones.
+    pub fn read_inbox(&mut self, keys: &[MessageKey], wall_ms: i64) -> Result<Vec<MessageKey>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        let now = clock.advance(wall_ms);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE clock SET wall=?1,elapsed=?2 WHERE singleton=1",
+            params![clock.wall_ms, now],
+        )?;
+        let mut expired = Vec::new();
+        for key in keys {
+            tx.execute("UPDATE envelopes SET state=CASE WHEN inbox_deadline>?3 THEN 'read' ELSE 'inbox_expired' END,
+                body=CASE WHEN inbox_deadline>?3 THEN body ELSE X'' END,outcome_until=?4
+                WHERE origin=?1 AND id=?2 AND state='inbox'",
+                params![key.origin_node,key.message_id,now,now.saturating_add(CUSTODY_TTL_MS)])?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM envelopes WHERE origin=?1 AND id=?2",
+                    params![key.origin_node, key.message_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if state.as_deref() == Some("inbox_expired") {
+                expired.push(key.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(expired)
+    }
+
     /// Scheduler deadlines use the same unpaused clock as expiry. The caller
     /// supplies its jittered backoff; the durable deadline survives restart.
     pub fn schedule_retry(&mut self, key: &MessageKey, delay_ms: i64, wall_ms: i64) -> Result<()> {
@@ -537,7 +592,7 @@ impl<D: DiskSpace> Store<D> {
             |(metadata, body, state, custody, inbox, delivered, retry_at_ms)| {
                 let mut envelope: Envelope = serde_json::from_str(&metadata)?;
                 envelope.body = body;
-                let remaining_ms = if state == "inbox" {
+                let remaining_ms = if matches!(state.as_str(), "inbox" | "read") {
                     inbox.unwrap_or(custody)
                 } else {
                     custody
@@ -548,6 +603,7 @@ impl<D: DiskSpace> Store<D> {
                     envelope,
                     state,
                     remaining_ms,
+                    mailbox_ttl_ms: DAY_MS,
                     delivered,
                     retry_at_ms,
                 })
@@ -643,6 +699,14 @@ impl<D: DiskSpace> Store<D> {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Prefer the operator's configured alias over the authenticated inbound name.
+    pub fn origin_name(&self, node_id: &str) -> Result<Option<String>> {
+        Ok(self.connection.query_row(
+            "SELECT peer FROM identity_pins WHERE node_id=?1 ORDER BY CASE source WHEN 'configured' THEN 0 ELSE 1 END,peer LIMIT 1",
+            [node_id], |row| row.get(0),
+        ).optional()?)
     }
 
     /// Configured labels are local aliases, not remote identity claims.
@@ -786,6 +850,18 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn retry_ready_limit(&mut self, wall_ms: i64, limit: usize) -> Result<Vec<MessageKey>> {
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        let now = clock.advance(wall_ms);
+        let ready: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE state='custody' AND retry_at<=?1 AND custody_deadline>?1 AND lease_until<=?1)",
+            [now], |row| row.get(0),
+        )?;
+        if !ready || limit == 0 {
+            return Ok(Vec::new());
+        }
         let now = self.writable(wall_ms)?;
         let tx = self
             .connection

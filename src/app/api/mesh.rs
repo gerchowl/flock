@@ -144,6 +144,7 @@ impl App {
                 status.state = "pinned".into();
                 status.reason = None;
                 self.uplink.enroll_hub(status.peer.clone());
+                self.mesh_retry_at = None;
                 Ok(None)
             }
         }

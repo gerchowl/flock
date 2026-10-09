@@ -749,8 +749,8 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     );
     assert_eq!(queued["to_host"], "nodec", "and where it went: {queued}");
 
-    // It arrives on nodec as ALICE's, from nodea — the hub vouched for its
-    // edge and did not become the sender.
+    // The agent identity survives forwarding, while the host is the authenticated
+    // custody origin (nodeb), never the payload's claimed host.
     let delivered = wait_for("the message to land on nodec", RPC_TIMEOUT, || {
         let inbox = carol.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
@@ -762,8 +762,8 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "the originating sender survives both hops: {delivered}"
     );
     assert_eq!(
-        delivered["from_host"], "nodea",
-        "and names the spoke it came from, never the hub: {delivered}"
+        delivered["from_host"], "nodeb",
+        "and names the authenticated custody origin: {delivered}"
     );
     assert_eq!(delivered["replyable"], true, "{delivered}");
     assert_eq!(delivered["intent"], "needs_reply", "{delivered}");
@@ -782,7 +782,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     });
     assert_eq!(answer["body"], "pong from spoke c");
     assert_eq!(answer["from_agent"], carol.agent_id.as_str(), "{answer}");
-    assert_eq!(answer["from_host"], "nodec", "{answer}");
+    assert_eq!(answer["from_host"], "nodeb", "{answer}");
     assert_eq!(answer["in_reply_to"], "c-410-hub", "{answer}");
 
     // The sender's own log says how it went, too.
@@ -869,7 +869,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         inbox["messages"].as_array()?.first().cloned()
     });
     assert_eq!(arrived["intent"], "blocking", "{arrived}");
-    assert_eq!(arrived["from_host"], "nodea", "{arrived}");
+    assert_eq!(arrived["from_host"], "nodeb", "{arrived}");
 
     // ADR-0018 §3 rides the route too: carol mutes, so a question from alice
     // is answered by carol's OWN server with a deferral — and nodec cannot
@@ -919,7 +919,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         deferral["correlation_id"], "c-410-muted:deferred",
         "{deferral}"
     );
-    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
+    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
     assert_eq!(
         deferral["from_agent"],
         carol.agent_id.as_str(),

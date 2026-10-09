@@ -58,8 +58,10 @@ fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
     let pinned = enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
     fleet.node_mut("acceptor.test").stop();
     // Wait for a fresh hello to reach the stopped server, not just for the
-    // previously enrolled stream to notice that its server disappeared.
-    fleet::wait_until("hello to stopped peer", Duration::from_secs(10), || {
+    // previously enrolled stream to notice that its server disappeared. An
+    // in-flight held request can consume its 15-second transport timeout first.
+    // This is setup; the six-second recovery assertion below stays strict.
+    fleet::wait_until("hello to stopped peer", Duration::from_secs(30), || {
         let status = request(fleet.node("dialer.test"), "peers.enrollment", json!({}));
         status["result"]["peers"]
             .as_array()?

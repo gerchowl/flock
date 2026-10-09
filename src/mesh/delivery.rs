@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 pub struct Deliver {
     pub envelope: Envelope,
     pub remaining_ms: i64,
-    pub forwarded_by: Option<String>,
 }
 
 pub(crate) fn send(peer: &crate::config::PeerConfig, delivery: &Deliver) -> Result<bool, String> {

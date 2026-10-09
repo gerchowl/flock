@@ -365,13 +365,8 @@ impl HeadlessServer {
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
-        app.node_id = api_server
-            .as_ref()
-            .and_then(|server| server.node_id.clone());
-        app.restore_mesh_mail().map_err(io::Error::other)?;
-        app.clone_detection_warning = api_server
-            .as_ref()
-            .and_then(|server| server.clone_detection_warning.clone());
+        app.initialize_mesh_mail(api_server.as_ref())
+            .map_err(io::Error::other)?;
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 

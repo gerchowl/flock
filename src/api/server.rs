@@ -61,6 +61,14 @@ pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
 ) -> std::io::Result<ServerHandle> {
+    start_server_for_mode(api_tx, event_hub, true)
+}
+
+pub(crate) fn start_server_for_mode(
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    live_handoff: bool,
+) -> std::io::Result<ServerHandle> {
     let identity = crate::mesh::identity::NodeIdentity::load()?;
     if let Some(warning) = &identity.clone_detection_warning {
         crate::logging::node_clone_detection_unavailable(warning);
@@ -69,7 +77,7 @@ pub fn start_server(
         api_tx,
         event_hub,
         Some(ServerCapabilities {
-            live_handoff: true,
+            live_handoff,
             node_id: Some(identity.node_id()),
             clone_detection_warning: identity.clone_detection_warning.clone(),
         }),

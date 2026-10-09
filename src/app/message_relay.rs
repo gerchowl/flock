@@ -1,4 +1,4 @@
-//! Legacy SSH message delivery runs outside the app loop. Completion returns
+//! Mesh delivery and legacy mute deferrals run outside the app loop. Completion returns
 //! through the event channel so mailbox evidence and replies stay serialized.
 
 use std::collections::VecDeque;
@@ -83,17 +83,9 @@ impl RelaySend {
             crate::mesh::delivery::send(&self.peer, delivery)
                 .map_err(crate::peers::PeerMessageFailure::Unreachable)
         } else {
-            crate::peers::send_peer_message(
-                &self.peer,
-                &self.to_agent,
-                &self.from_agent,
-                &self.from_host,
-                &self.body,
-                &self.correlation_id,
-                self.in_reply_to.as_deref(),
-                self.intent,
-            )
-            .map(|()| true)
+            Err(crate::peers::PeerMessageFailure::Refused(
+                "mesh custody required".into(),
+            ))
         };
         AppEvent::MsgRelayCompleted(Box::new(RelayCompletion { send: self, result }))
     }
