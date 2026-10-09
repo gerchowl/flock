@@ -57,6 +57,7 @@ struct PendingAgentRelease {
 
 #[derive(Clone, Copy, Default)]
 struct SpawnInitialState<'a> {
+    spawned_with_default_shell: bool,
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
 }
@@ -722,6 +723,9 @@ pub struct PaneRuntime {
     /// When input last reached this pane from anyone but flock itself
     /// (ADR-0018 §2) — the idle wake's "flock does not type over a human".
     operator_input: OperatorInputClock,
+    /// Sticky input history for safe root-shell replacement.
+    has_been_typed_into: Cell<bool>,
+    spawned_with_default_shell: bool,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
 }
@@ -1336,6 +1340,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn shell",
             SpawnInitialState {
+                spawned_with_default_shell: true,
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
             },
@@ -1537,6 +1542,8 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle,
         })
     }
@@ -1967,6 +1974,8 @@ impl PaneRuntime {
             pending_release,
             preserve_processes_on_drop: false,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(false),
+            spawned_with_default_shell: initial_state.spawned_with_default_shell,
             detect_handle,
         })
     }
@@ -2130,12 +2139,24 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
+    pub(crate) fn was_spawned_with_default_shell(&self) -> bool {
+        self.spawned_with_default_shell
+    }
+
+    /// Sticky across all input writes, including flock-authored input.
+    /// Imported runtimes start touched because their input history is unknown.
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.has_been_typed_into.get()
+    }
+
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.operator_input.stamp();
         self.io.send_bytes(bytes).await
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.operator_input.stamp();
         self.io.try_send_bytes(bytes)
     }
@@ -2147,6 +2168,7 @@ impl PaneRuntime {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.io.try_send_bytes(bytes)
     }
 
@@ -2357,6 +2379,8 @@ impl PaneRuntime {
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 operator_input: OperatorInputClock::default(),
+                has_been_typed_into: Cell::new(false),
+                spawned_with_default_shell: false,
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2367,6 +2391,24 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_input_write_marks_root_shell_touched() {
+        for path in 0..3 {
+            let (runtime, mut receiver) =
+                PaneRuntime::test_with_channel_and_scrollback_bytes(80, 24, 1024, b"", 4);
+            assert!(!runtime.has_received_input());
+            let bytes = Bytes::from_static(b"x");
+            match path {
+                0 => runtime.send_bytes(bytes).await.unwrap(),
+                1 => runtime.try_send_bytes(bytes).unwrap(),
+                _ => runtime.try_send_flock_authored(bytes).unwrap(),
+            }
+            assert!(runtime.has_received_input());
+            assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"x"));
+            assert!(runtime.has_received_input());
+        }
+    }
 
     #[test]
     fn shutdown_liveness_treats_reaped_direct_child_as_gone() {
@@ -2688,6 +2730,8 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2717,6 +2761,8 @@ mod tests {
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 

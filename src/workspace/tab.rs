@@ -161,7 +161,9 @@ impl Tab {
             None => TerminalState::new(terminal_id.clone(), initial_cwd),
         };
         let mut panes = HashMap::new();
-        panes.insert(root_id, PaneState::new(terminal_id));
+        let mut pane = PaneState::new(terminal_id);
+        pane.created_as_root_shell = argv.is_none();
+        panes.insert(root_id, pane);
 
         Ok((
             Self {
