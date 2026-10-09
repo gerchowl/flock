@@ -511,7 +511,7 @@ impl App {
             .filter(|message| message.to_pane == pane)
             .filter_map(|message| message.message_key)
             .collect();
-        let (expired, changed) = with_store(|store| {
+        let (rejected, changed) = with_store(|store| {
             let mut changed = Vec::new();
             for key in &keys {
                 if store
@@ -522,15 +522,15 @@ impl App {
                     changed.push(key.origin_node.clone());
                 }
             }
-            let expired = store
+            let rejected = store
                 .read_inbox(&keys, now_ms() as i64)
                 .map_err(|e| e.to_string())?;
-            Ok((expired, changed))
+            Ok((rejected, changed))
         })?;
         for node in changed {
             self.emit_mesh_wake(&node);
         }
-        Ok(expired)
+        Ok(rejected)
     }
 
     pub(crate) fn initialize_mesh_mail(

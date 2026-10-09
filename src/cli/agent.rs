@@ -991,6 +991,8 @@ fn print_agent_help() {
     eprintln!("  flk agent hibernate <target>");
     eprintln!("  flk agent resume <target>");
     eprintln!("  {AGENT_RESTART_USAGE}");
+    eprintln!("  --workspace/--tab replace an untouched lone root shell, otherwise open a new tab");
+    eprintln!("    (a sibling space in workspace tab mode). Only --split splits a pane.");
     eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
     eprintln!(
         "  --cwd also picks the SPACE: a cwd naming an already-open checkout joins that space"

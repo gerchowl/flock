@@ -1004,8 +1004,8 @@ impl App {
         };
 
         let now = now_ms();
-        let expired = match self.mark_mesh_inbox_read(&pane) {
-            Ok(expired) => expired,
+        let rejected = match self.mark_mesh_inbox_read(&pane) {
+            Ok(rejected) => rejected,
             Err(reason) => return encode_error(id, super::mesh_mail::error_code(&reason), reason),
         };
         let mut messages = Vec::new();
@@ -1013,7 +1013,7 @@ impl App {
             if message
                 .message_key
                 .as_ref()
-                .is_some_and(|key| expired.contains(key))
+                .is_some_and(|key| rejected.contains(key))
             {
                 continue;
             }

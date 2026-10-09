@@ -115,15 +115,15 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let changed = crate::mesh::hello::with_store(|store| {
+        let affected = crate::mesh::hello::with_store(|store| {
             store.set_local_node(self.node_id.as_deref().unwrap_or_default());
             if store
                 .is_tombstoned(&removal.agent, &removal.session, now)
                 .map_err(|e| e.to_string())?
             {
-                return Ok(false);
+                return Ok(None);
             }
-            store
+            let keys = store
                 .tombstone(
                     &removal.agent,
                     &removal.session,
@@ -131,9 +131,11 @@ impl App {
                     now,
                 )
                 .map_err(|e| e.to_string())?;
-            Ok(true)
+            Ok(Some(keys))
         })?;
-        if changed {
+        if let Some(keys) = affected {
+            self.mailboxes.discard_mesh_messages(&keys);
+            self.sync_blocking_mail();
             self.emit_event(EventEnvelope {
                 event: EventKind::AgentRemoved,
                 data: EventData::AgentRemoved {

@@ -89,7 +89,8 @@ fn quote(s: &str) -> String {
 fn native_executable(node: &Node) -> std::path::PathBuf {
     let executable = node.home.join("claude");
     let report = format!("printf '%s\\n' '{{\"session_id\":\"retained-session\"}}' | {0} hook claude session\n{0} pane report-agent --source flock:claude --agent claude --state idle --agent-session-id retained-session", quote(env!("CARGO_BIN_EXE_flk")));
-    fs::write(&executable, format!("#!/bin/sh\n{report}\nprintf 'Claude Code\\nTask complete.\\n─────────────\\n❯ \\n─────────────\\n'\nwhile IFS= read -r line\ndo\n{report}\ndone\n")).unwrap();
+    let stop = format!("if [ \"$line\" = fixture-stop ]; then printf '%s\\n' '{{\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"※ recap: Done. Next: wait.\"}}' | {} hook claude stop > {}; touch {}; fi", quote(env!("CARGO_BIN_EXE_flk")), quote(node.home.join("stop-output").to_str().unwrap()), quote(node.home.join("stop-ready").to_str().unwrap()));
+    fs::write(&executable, format!("#!/bin/sh\n{report}\nprintf 'Claude Code\\nTask complete.\\n─────────────\\n❯ \\n─────────────\\n'\nwhile IFS= read -r line\ndo\n{report}\n{stop}\ndone\n")).unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     executable
 }
@@ -101,6 +102,20 @@ fn native_agent(node: &Node) -> Value {
         (current["agent_session"]["value"] == "retained-session").then_some(())
     });
     agent
+}
+
+fn stop_hook(node: &Node, agent: &Value) -> String {
+    let ready = node.home.join("stop-ready");
+    let _ = fs::remove_file(&ready);
+    api(
+        node,
+        "pane.send_text",
+        json!({"pane_id":agent["pane_id"],"text":"fixture-stop\n"}),
+    );
+    fleet::wait_until("Stop hook output", DEADLINE, || {
+        ready.exists().then_some(())
+    });
+    fs::read_to_string(node.home.join("stop-output")).unwrap()
 }
 
 // The respawn-shell path belongs to imported agent runtimes. Keep the
@@ -129,7 +144,12 @@ fn exit_to_shell(node: &Node, agent: &Value) {
     );
     fleet::wait_until("agent exited to shell", DEADLINE, || {
         // A successful pane lookup plus absent agent proves shell respawn, not close.
-        api(node, "pane.get", json!({"pane_id":agent["pane_id"]}));
+        if raw(node, "pane.get", json!({"pane_id":agent["pane_id"]}))
+            .get("error")
+            .is_some()
+        {
+            return None;
+        }
         raw(node, "agent.get", json!({"target":agent["pane_id"]}))
             .get("error")
             .map(|_| ())
@@ -164,16 +184,31 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     let old = start(node);
     let sender = start(node);
     let _restored = restore_server(node);
+    send(node, &sender, &old, "removed-unread-mail");
+    state(node, "removed-unread-mail", "delivered");
     let replacement = replacement_in_same_pane(node, &old);
     assert_eq!(removals(node), 1);
+    state(node, "removed-unread-mail", "recipient_gone");
+    assert_eq!(
+        api(node, "msg.wake", json!({"pane":replacement["pane_id"]}))["count"],
+        0
+    );
+    assert!(!stop_hook(node, &replacement).contains("unread message"));
     send(node, &sender, &replacement, "replacement-mail");
     state(node, "replacement-mail", "delivered");
+    assert!(stop_hook(node, &replacement).contains("1 unread message"));
     let messages = api(node, "msg.read", json!({"pane":replacement["pane_id"]}));
     assert!(messages["messages"]
         .as_array()
         .unwrap()
         .iter()
         .any(|m| m["correlation_id"] == "replacement-mail"));
+    assert!(messages["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["correlation_id"] != "removed-unread-mail"));
+    state(node, "removed-unread-mail", "recipient_gone");
     let refused = raw(
         node,
         "msg.send",

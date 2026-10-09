@@ -1306,6 +1306,47 @@ fn batch_read_expires_overdue_rows_and_reads_live_rows() {
 }
 
 #[test]
+fn batch_read_rejects_non_inbox_and_missing_rows_without_rewriting_evidence() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    for state in [
+        "recipient_gone",
+        "expired",
+        "inbox_expired",
+        "read",
+        "custody",
+        "held",
+        "delivered",
+    ] {
+        let stale = envelope();
+        let live = envelope();
+        let missing = envelope();
+        store
+            .accept(&stale, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store
+            .accept(&live, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE envelopes SET state=?3 WHERE origin=?1 AND id=?2",
+                params![stale.key.origin_node, stale.key.message_id, state],
+            )
+            .unwrap();
+        let rejected = store
+            .read_inbox(
+                &[stale.key.clone(), live.key.clone(), missing.key.clone()],
+                1,
+            )
+            .unwrap();
+        assert_eq!(rejected, vec![stale.key.clone(), missing.key], "{state}");
+        assert_eq!(store.get(&stale.key).unwrap().unwrap().state, state);
+        assert_eq!(store.get(&live.key).unwrap().unwrap().state, "read");
+    }
+}
+
+#[test]
 fn dedupe_is_scoped_to_authenticated_origin() {
     let fixture = Fixture::new();
     let mut store = fixture.open(1000);

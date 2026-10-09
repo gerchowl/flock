@@ -816,7 +816,8 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Read a mailbox atomically, expiring overdue rows without rejecting live ones.
+    /// Read live inbox rows atomically; return keys that must not be delivered.
+    /// Stale projections of removed, expired, already-read or collected rows are rejected.
     pub fn read_inbox(&mut self, keys: &[MessageKey], wall_ms: i64) -> Result<Vec<MessageKey>> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -833,25 +834,21 @@ impl<D: DiskSpace> Store<D> {
             "UPDATE clock SET wall=?1,elapsed=?2 WHERE singleton=1",
             params![clock.wall_ms, now],
         )?;
-        let mut expired = Vec::new();
+        let mut rejected = Vec::new();
         for key in keys {
-            tx.execute("UPDATE envelopes SET state=CASE WHEN inbox_deadline>?3 THEN 'read' ELSE 'inbox_expired' END,
+            let state: Option<String> = tx.query_row(
+                "UPDATE envelopes SET state=CASE WHEN inbox_deadline>?3 THEN 'read' ELSE 'inbox_expired' END,
                 body=CASE WHEN inbox_deadline>?3 THEN body ELSE X'' END,outcome_until=?4
-                WHERE origin=?1 AND id=?2 AND state='inbox'",
-                params![key.origin_node,key.message_id,now,now.saturating_add(CUSTODY_TTL_MS)])?;
-            let state: Option<String> = tx
-                .query_row(
-                    "SELECT state FROM envelopes WHERE origin=?1 AND id=?2",
-                    params![key.origin_node, key.message_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if state.as_deref() == Some("inbox_expired") {
-                expired.push(key.clone());
+                WHERE origin=?1 AND id=?2 AND state='inbox' RETURNING state",
+                params![key.origin_node,key.message_id,now,now.saturating_add(CUSTODY_TTL_MS)],
+                |r| r.get(0),
+            ).optional()?;
+            if state.as_deref() != Some("read") {
+                rejected.push(key.clone());
             }
         }
         tx.commit()?;
-        Ok(expired)
+        Ok(rejected)
     }
 
     /// Scheduler deadlines use the same unpaused clock as expiry. The caller
