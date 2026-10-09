@@ -29,6 +29,22 @@ impl Pane {
     }
 
     fn frames(frames: Vec<(String, String)>) -> Self {
+        Self::samples(
+            frames
+                .into_iter()
+                .map(|(status, screen)| {
+                    let cursor = if status == "idle" {
+                        "term_fixture:0:1:2:i"
+                    } else {
+                        "term_fixture:0:1:1:w"
+                    };
+                    (status, screen, cursor.to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn samples(frames: Vec<(String, String, String)>) -> Self {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -78,11 +94,7 @@ impl Pane {
                         frame = sampled.min(frames.len() - 1);
                         sampled += 1;
                         let status = &frames[frame].0;
-                        let cursor = if status == "idle" {
-                            "term_fixture:0:1:2:i"
-                        } else {
-                            "term_fixture:0:1:1:w"
-                        };
+                        let cursor = &frames[frame].2;
                         let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
                         "agent_status": status, "turn_cursor": cursor, "revision": 0}});
                         if status == "blocked" && frames[frame].1.contains("retrying in ") {
@@ -697,4 +709,98 @@ fn delegate_reap_removes_persisted_verdict() {
     );
     assert!(!verdict.exists());
     assert!(!pane.registry.join("fixture.json").exists());
+}
+
+#[test]
+fn delegate_idle_without_new_turn_reports_not_started_and_informs_s1() {
+    let pane = Pane::new(
+        "idle",
+        "┃\n┃  Ask anything…\n┃\n╹\ntab agents ctrl+p commands",
+    );
+    let s1 = S1::new(200);
+    let started = Instant::now();
+    let out = pane
+        .command(
+            &[
+                "delegate",
+                "wait",
+                "fixture",
+                "--after",
+                "term_fixture:0:1:0:i",
+                "--timeout",
+                "40000",
+                "--settle",
+                "0",
+                "--json",
+            ],
+            Some(&s1.url),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(8),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(40));
+    let value = Pane::json(&out);
+    assert_eq!(value["outcome"], "not_started");
+    assert_eq!(value["reason"], "idle_without_new_turn");
+    assert_eq!(value["turn_cursor"], "term_fixture:0:1:0:i");
+    assert_eq!(s1.calls.load(Ordering::SeqCst), 1);
+    let bodies = s1.bodies.lock().unwrap();
+    let context = bodies[0]["state"].as_str().unwrap();
+    assert!(
+        context.contains("not_started") && context.contains("idle_without_new_turn"),
+        "{context}"
+    );
+}
+
+#[test]
+fn delegate_await_allows_idle_and_queued_samples_before_a_turn() {
+    for screen in [
+        "┃\n┃  Ask anything…\n┃\n╹\ntab agents ctrl+p commands",
+        "Waiting for startup · esc cancel\n› build it\n? for shortcuts",
+    ] {
+        let mut samples = vec![("idle".into(), screen.into(), "term_fixture:0:0:0:i".into()); 8];
+        samples.extend(vec![
+            (
+                "working".into(),
+                "working".into(),
+                "term_fixture:0:1:1:w".into()
+            );
+            3
+        ]);
+        samples.push((
+            "idle".into(),
+            "DONE: recovered".into(),
+            "term_fixture:0:1:2:i".into(),
+        ));
+        let pane = Pane::samples(samples);
+        let out = pane
+            .command(
+                &[
+                    "delegate",
+                    "wait",
+                    "fixture",
+                    "--settle",
+                    "0",
+                    "--timeout",
+                    "10000",
+                    "--json",
+                ],
+                None,
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(Pane::json(&out)["outcome"], "done");
+    }
 }

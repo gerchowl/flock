@@ -1782,3 +1782,63 @@ async fn plain_paste_waits_for_late_chip_before_using_screen_only_evidence() {
         assert!(drain(&mut pty).is_empty());
     }
 }
+
+#[tokio::test]
+async fn guarded_submit_waits_for_unknown_or_other_until_original_deadline() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    for screen in [b"\x1b[2J\x1b[H".to_vec(), claude_screen("hel")] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&screen);
+        for at in [now + GAP, now + CONFIRM_WINDOW - Duration::from_millis(1)] {
+            assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, at), None);
+            assert!(attempt.due > at && attempt.due <= now + CONFIRM_WINDOW);
+            assert!(drain(&mut pty).is_empty());
+        }
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + CONFIRM_WINDOW),
+            Some(Outcome::Unconfirmed("owned_composer_not_visible"))
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn idle_wake_reports_fired_only_when_enter_is_sent() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    let text = super::idle_wake_text(1);
+    assert_eq!(drain(&mut pty), vec![text.clone().into_bytes()]);
+    let now = Instant::now() + GAP;
+    runtime(&app).test_process_pty_bytes(b"\x1b[2J\x1b[H");
+    assert_eq!(
+        app.submit_idle_wake(&pane, now),
+        super::Decision::Suppressed("confirm_pending")
+    );
+    assert!(drain(&mut pty).is_empty());
+    runtime(&app).test_process_pty_bytes(&claude_screen(&text));
+    assert_eq!(
+        app.submit_idle_wake(&pane, now + Duration::from_millis(50)),
+        super::Decision::Submitted
+    );
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    assert_eq!(
+        app.submit_idle_wake(&pane, now + Duration::from_millis(100)),
+        super::Decision::Suppressed("confirm_pending")
+    );
+    assert!(drain(&mut pty).is_empty());
+}

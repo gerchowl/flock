@@ -19,8 +19,9 @@ pub(crate) struct Attempt {
     operator_input: Option<Instant>,
     prompt_generation: u64,
     pub(crate) due: Instant,
-    sent: bool,
-    retried: bool,
+    deadline: Instant,
+    pub(crate) sent: bool,
+    pub(crate) retried: bool,
     wake: bool,
     session: Option<String>,
     settle: Duration,
@@ -309,6 +310,7 @@ impl App {
             operator_input: runtime.last_operator_input_at(),
             prompt_generation: terminal.prompt_report_generation,
             due: now + crate::cli::pane::PANE_RUN_SUBMIT_GAP,
+            deadline: now + CONFIRM_WINDOW,
             sent: false,
             retried: false,
             wake,
@@ -409,6 +411,12 @@ impl App {
         // The first Enter may precede the child's paste repaint. An unchanged
         // empty editor remains safe, but only exact owned text permits a retry.
         if editor != Composer::Owned && (attempt.sent || editor != Composer::Empty) {
+            // A partial paste repaint may omit the footer or still show only
+            // part of our text. Wait for ownership before the first Enter.
+            if !attempt.sent && now < attempt.deadline {
+                attempt.due = (now + POLL).min(attempt.deadline);
+                return None;
+            }
             return Some(Outcome::Unconfirmed("owned_composer_not_visible"));
         }
         let enter = runtime.encode_terminal_key(
@@ -594,6 +602,7 @@ impl Attempt {
             operator_input: None,
             prompt_generation: 0,
             due: Instant::now(),
+            deadline: Instant::now() + CONFIRM_WINDOW,
             sent: false,
             retried: false,
             wake: false,
