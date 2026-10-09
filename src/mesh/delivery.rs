@@ -60,12 +60,16 @@ fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
         // The receiver accepted the question but cannot bind its return path.
         return PeerMessageFailure::Refused(format!("reply_unavailable: {reason}"));
     }
-    let transient = matches!(
+    let permanent = matches!(
         reason.split(':').next().unwrap_or(reason),
-        "mailbox_full" | "mail_store_full" | "fleet_paused" | "mail_store_unavailable"
-    ) || reason.starts_with("mesh store")
-        || reason == "mesh edge is not enrolled";
-    if !transient
+        "forward_limit"
+            | "msg_not_allowed"
+            | "origin_mismatch"
+            | "invalid_envelope"
+            | "message_not_found"
+            | "msg_target_not_found"
+    );
+    if permanent
         && matches!(
             error["code"].as_str(),
             Some("mesh_delivery_refused" | "origin_mismatch")
@@ -112,7 +116,9 @@ mod tests {
         for reason in [
             "forward_limit",
             "msg_not_allowed",
+            "origin_mismatch",
             "message_not_found",
+            "msg_target_not_found: unknown agent",
             "invalid_envelope",
         ] {
             let failure = super::delivery_failure(
@@ -136,5 +142,15 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    #[test]
+    fn unknown_delivery_refusal_remains_retryable() {
+        let reason = "mesh delivery requires an authenticated held edge";
+        let failure = super::delivery_failure(&serde_json::json!({
+            "code":"mesh_delivery_refused", "message":reason
+        }));
+        assert!(failure.retryable());
+        assert_eq!(failure.detail(), reason);
     }
 }

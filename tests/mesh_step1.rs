@@ -894,6 +894,12 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     conversation.reply();
     api(conversation.fleet.node("nodeb"), "fleet.pause", json!({}));
     let held_db = db(conversation.fleet.node("nodeb"));
+    fleet::wait_until("receiver durable pause", DEADLINE, || {
+        held_db
+            .query_row("SELECT paused FROM clock", [], |row| row.get::<_, bool>(0))
+            .unwrap()
+            .then_some(())
+    });
     let held_snapshot = || {
         held_db
             .query_row(
