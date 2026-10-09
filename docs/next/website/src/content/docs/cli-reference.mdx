@@ -40,7 +40,15 @@ Server status includes the API socket listener’s accept-error count, latest er
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node
-ID, and enrollment state: `pending`, `pinned`, or `refused` with the reason.
+ID, and enrollment state: `pending`, `pinned`, `retrying`, or `refused` with the reason.
+The acceptor shows live inbound edges only; handshake refusals remain visible
+on the dialer. Unknown handshake failures retry as transient failures.
+
+During post-handoff recovery, status reports `mesh: recovering store after handoff`
+while the server and panes keep running. Failed recovery reports the suspension
+reason and retries every five seconds. Quarantined records
+are reported as `mesh quarantined: N` when the count is nonzero;
+`peers.enrollment` exposes the count as `mesh_quarantined`.
 
 If a peer server is restarting or temporarily unavailable, held edges retry with
 jittered exponential backoff with a ceiling that grows from 1 second to 30 seconds,

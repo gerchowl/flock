@@ -10,7 +10,7 @@ mod handoffs;
 mod integrations;
 mod lineage;
 mod mesh;
-mod mesh_mail;
+pub(super) mod mesh_mail;
 mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
@@ -572,6 +572,10 @@ impl App {
 
         if let AppEvent::MeshRoutesCompleted(completion) = ev {
             self.finish_mesh_routes(*completion);
+            return;
+        }
+        if let AppEvent::MeshStoreRecovered(result) = ev {
+            self.finish_mesh_recovery(result);
             return;
         }
         if let AppEvent::MeshCollected(completion) = ev {

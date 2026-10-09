@@ -237,9 +237,6 @@ impl App {
     }
 
     pub(crate) fn tick_mesh_collections(&mut self) {
-        let Some(origin) = self.node_id.clone() else {
-            return;
-        };
         let now = std::time::Instant::now();
         if self.mesh_collect_at.is_some_and(|deadline| deadline > now) {
             return;
@@ -248,6 +245,9 @@ impl App {
         for node in self.inbound.prune(crate::platform::process_start_time) {
             self.mesh_routes.table.withdraw_edge(&node);
         }
+        let Some(origin) = self.node_id.clone() else {
+            return;
+        };
         if self.fleet_pause.paused {
             return;
         }

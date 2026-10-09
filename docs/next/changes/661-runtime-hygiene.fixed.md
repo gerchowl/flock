@@ -1,0 +1,1 @@
+- Keep mesh recovery off the app loop, isolate reply waiters from the custody writer, preserve finished delivery attempts, report read-time expiry and quarantined mail, and retry unknown handshake failures (#661)
