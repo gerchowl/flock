@@ -185,6 +185,26 @@ fn status(node: &Node, correlation: &str) -> Value {
     api(node, "msg.status", json!({"correlation_id":correlation}))
 }
 
+fn audit_event(node: &Node, event: &str, field: &str, correlation: &str) -> Value {
+    fleet::wait_until("server audit event", DEADLINE, || {
+        std::fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl"))
+            .ok()?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|row| {
+                row["envelope"]["event"] == event && row["envelope"]["data"][field] == correlation
+            })
+    })
+}
+
+fn delivery_attempts(fleet: &Fleet, from: &str, to: &str, correlation: &str) -> usize {
+    std::fs::read_to_string(fleet.base.join(format!("delivery-attempts-{from}-{to}")))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == correlation)
+        .count()
+}
+
 fn state(node: &Node, correlation: &str, expected: &str) -> Value {
     fleet::wait_until(
         &format!("{} {correlation} becomes {expected}", node.name),
@@ -232,14 +252,22 @@ fn cut(fleet: &Fleet, from: &str, to: &str) {
     fleet.kill_edge(from, to, Duration::from_secs(10));
 }
 
+fn reconnect(fleet: &Fleet, from: &str, to: &str) {
+    fleet.allow_edge(from, to);
+    fleet::wait_until("replacement edge enrolled", DEADLINE, || {
+        api(fleet.node(from), "peers.enrollment", json!({}))["peers"]
+            .as_array()?
+            .iter()
+            .any(|peer| peer["peer"] == to && peer["state"] == "pinned")
+            .then_some(())
+    });
+}
+
 // Advance fixture deadlines only after a deliberate partition. Production
 // backoff remains unchanged, and every delivery still crosses the real edge.
 fn due(node: &Node) {
     db(node)
-        .execute(
-            "UPDATE envelopes SET collect_at=0,retry_at=0,lease_until=0",
-            [],
-        )
+        .execute("UPDATE envelopes SET collect_at=0,retry_at=0", [])
         .unwrap();
 }
 
@@ -249,7 +277,6 @@ fn incident_direct_held_collected_read_without_an_active_waiter() {
     assert_eq!(conversation.send()["state"], "delivered");
     state(conversation.fleet.node("nodea"), "question", "delivered");
     conversation.read_question();
-    cut(&conversation.fleet, "nodea", "nodeb");
     let reply = conversation.reply();
     assert_eq!(reply["state"], "held", "{reply}");
     state(
@@ -257,9 +284,12 @@ fn incident_direct_held_collected_read_without_an_active_waiter() {
         reply["correlation_id"].as_str().unwrap(),
         "held",
     );
-    conversation.fleet.allow_edge("nodea", "nodeb");
-    due(conversation.fleet.node("nodea"));
     conversation.answer_once();
+    state(
+        conversation.fleet.node("nodeb"),
+        reply["correlation_id"].as_str().unwrap(),
+        "collected",
+    );
     state(conversation.fleet.node("nodea"), "question", "read");
 }
 
@@ -286,10 +316,28 @@ fn incident_reverse_edge_pushes_within_two_seconds() {
     db(conversation.fleet.node("nodea"))
         .execute("UPDATE envelopes SET collect_at=999999999", [])
         .unwrap();
-    let started = Instant::now();
-    conversation.reply();
+    let reply = conversation.reply();
     conversation.answer_once();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let accepted = audit_event(
+        conversation.fleet.node("nodeb"),
+        "message_replied",
+        "reply_correlation_id",
+        correlation,
+    );
+    let imported = audit_event(
+        conversation.fleet.node("nodea"),
+        "message_queued",
+        "correlation_id",
+        correlation,
+    );
+    assert!(
+        imported["ts_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(accepted["ts_ms"].as_u64().unwrap())
+            < 2_000
+    );
 }
 
 #[test]
@@ -302,23 +350,107 @@ fn incident_spoke_outbox_is_collected_and_answer_is_pushed_down() {
     state(conversation.fleet.node("nodea"), "question", "delivered");
     conversation.read_question();
     state(conversation.fleet.node("nodea"), "question", "read");
+    let reply = conversation.reply();
+    assert_eq!(reply["state"], "held");
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    state(conversation.fleet.node("nodeb"), correlation, "collected");
+    fleet::wait_until("push-down inbox before read", DEADLINE, || {
+        api(
+            conversation.fleet.node("nodea"),
+            "msg.list",
+            json!({"pane":conversation.sender.pane}),
+        )["messages"]
+            .as_array()?
+            .iter()
+            .any(|m| m["correlation_id"] == correlation)
+            .then_some(())
+    });
+    conversation.answer_once();
+}
+
+#[test]
+fn failed_receipt_commit_backs_off_on_a_healthy_edge() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    state(conversation.fleet.node("nodea"), "question", "delivered");
+    let hub = db(conversation.fleet.node("nodeb"));
+    fleet::wait_until("initial delivery receipt committed", DEADLINE, || {
+        hub.query_row(
+            "SELECT receipt_sent='delivered' FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .ok()?
+        .then_some(())
+    });
+    hub.execute_batch(
+        "CREATE TRIGGER fail_receipt BEFORE UPDATE OF receipt_sent ON envelopes
+        BEGIN SELECT RAISE(FAIL, 'receipt write fault'); END;",
+    )
+    .unwrap();
+    let polls = conversation.fleet.base.join("receipt-polls-nodeb-nodea");
+    let count = || {
+        std::fs::read_to_string(&polls)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = count();
+    conversation.read_question();
+    state(conversation.fleet.node("nodea"), "question", "read");
+    fleet::wait_until(
+        "receipt send despite local commit failure",
+        DEADLINE,
+        || (count() > before).then_some(()),
+    );
+    let after = count();
+    let started = Instant::now();
+    fleet::wait_until(
+        "failed receipt backoff across two worker ticks",
+        DEADLINE,
+        || {
+            assert_eq!(count(), after);
+            assert_eq!(
+                status(conversation.fleet.node("nodea"), "question")["state"],
+                "read"
+            );
+            (started.elapsed() >= Duration::from_secs(2)).then_some(())
+        },
+    );
+    assert_eq!(
+        hub.query_row(
+            "SELECT receipt_sent FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "delivered"
+    );
+    hub.execute_batch("DROP TRIGGER fail_receipt").unwrap();
     conversation.reply();
     conversation.answer_once();
 }
 
 #[test]
 fn queued_request_and_held_answer_survive_offline_reconnect() {
-    let conversation = Conversation::new(DIRECT);
+    let mut conversation = Conversation::new(DIRECT);
     cut(&conversation.fleet, "nodea", "nodeb");
     assert_eq!(conversation.send()["state"], "queued");
     state(conversation.fleet.node("nodea"), "question", "queued");
+    reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
-    conversation.fleet.allow_edge("nodea", "nodeb");
     conversation.read_question();
     cut(&conversation.fleet, "nodea", "nodeb");
-    assert_eq!(conversation.reply()["state"], "held");
+    let reply = conversation.reply();
+    assert_eq!(reply["state"], "held");
+    conversation.fleet.node_mut("nodeb").restart();
+    state(
+        conversation.fleet.node("nodeb"),
+        reply["correlation_id"].as_str().unwrap(),
+        "held",
+    );
+    reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
-    conversation.fleet.allow_edge("nodea", "nodeb");
     conversation.answer_once();
 }
 
@@ -370,8 +502,8 @@ fn lost_collect_ack_reimports_once_after_edge_is_killed() {
     cut(&conversation.fleet, "nodea", "nodeb");
     conversation.answer_once();
     std::fs::remove_dir_all(&gate).unwrap();
+    reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
-    conversation.fleet.allow_edge("nodea", "nodeb");
     conversation.fleet.node_mut("nodea").restart();
     let reply = status(conversation.fleet.node("nodea"), "question")["reply"]["correlation_id"]
         .as_str()
@@ -440,7 +572,7 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
     assert_eq!(cli_result(&output)["state"], "queued");
     std::fs::remove_dir_all(gate).unwrap();
     // The origin retries the committed key after the acknowledgement was lost.
-    conversation.fleet.allow_edge("nodea", "nodeb");
+    reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
     state(conversation.fleet.node("nodea"), "question", "delivered");
     assert!(conversation
@@ -493,11 +625,48 @@ fn multihop_chain_is_refused_with_forward_limit() {
             "not forwarded",
         ],
     );
-    assert_eq!(sent["state"], "queued", "{sent}");
+    assert_eq!(sent["state"], "refused", "{sent}");
     assert!(
         sent["warnings"].to_string().contains("forward_limit"),
         "{sent}"
     );
+    assert_eq!(
+        state(fleet.node("nodea"), "too-far", "refused")["detail"],
+        "forward_limit"
+    );
+    let refused = audit_event(
+        fleet.node("nodea"),
+        "message_delivered",
+        "correlation_id",
+        "too-far",
+    );
+    assert_eq!(refused["envelope"]["data"]["delivered"], false);
+    assert_eq!(
+        refused["envelope"]["data"]["outcome"],
+        "refused: forward_limit"
+    );
+    let attempts = delivery_attempts(&fleet, "nodea", "nodeb", "too-far");
+    assert_eq!(attempts, 1);
+    // A retryable probe proves the retry worker actually ran after due().
+    std::fs::write(fleet.base.join("transient-delivery-nodea-nodeb"), "").unwrap();
+    let probe = api(
+        fleet.node("nodea"),
+        "msg.send",
+        json!({
+            "to":{"type":"agent","agent":recipient.id}, "from_agent":sender.id,
+            "body":"retry probe", "correlation_id":"retry-probe", "intent":"fyi"
+        }),
+    );
+    assert_eq!(probe["state"], "queued");
+    due(fleet.node("nodea"));
+    fleet::wait_until("forced retry worker attempt", DEADLINE, || {
+        (delivery_attempts(&fleet, "nodea", "nodeb", "retry-probe") >= 2).then_some(())
+    });
+    assert_eq!(
+        delivery_attempts(&fleet, "nodea", "nodeb", "too-far"),
+        attempts
+    );
+    assert_eq!(status(fleet.node("nodea"), "too-far")["state"], "refused");
     assert_eq!(read(fleet.node("nodec"), &recipient.pane), json!([]));
 }
 
@@ -533,6 +702,29 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
         "{sent}"
     );
     state(conversation.fleet.node("nodea"), "question", "queued");
+    assert_eq!(
+        read(
+            conversation.fleet.node("nodeb"),
+            &conversation.receiver.pane
+        ),
+        json!([])
+    );
+    assert!(!conversation
+        .fleet
+        .base
+        .join("legacy-message-nodea-nodeb")
+        .exists());
+    due(conversation.fleet.node("nodea"));
+    fleet::wait_until("old peer forced retry completed", DEADLINE, || {
+        let retry: i64 = db(conversation.fleet.node("nodea"))
+            .query_row(
+                "SELECT retry_at FROM envelopes WHERE correlation='question'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (retry > 0).then_some(())
+    });
     assert_eq!(
         read(
             conversation.fleet.node("nodeb"),
@@ -672,7 +864,7 @@ fn audit_rotation_during_held_conversation_loses_nothing() {
             .exists()
             .then_some(())
     });
-    conversation.fleet.allow_edge("nodea", "nodeb");
+    reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
     conversation.answer_once();
 }
@@ -700,6 +892,18 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     assert_eq!(queued["state"], "queued");
     api(conversation.fleet.node("nodea"), "fleet.pause", json!({}));
     conversation.reply();
+    api(conversation.fleet.node("nodeb"), "fleet.pause", json!({}));
+    let held_db = db(conversation.fleet.node("nodeb"));
+    let held_snapshot = || {
+        held_db
+            .query_row(
+                "SELECT elapsed,custody_deadline FROM clock,envelopes WHERE state='held'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let held_frozen = held_snapshot();
     due(conversation.fleet.node("nodea"));
     let database = db(conversation.fleet.node("nodea"));
     fleet::wait_until("durable pause", DEADLINE, || {
@@ -720,6 +924,7 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     let started = Instant::now();
     fleet::wait_until("paused clock across two ticks", DEADLINE, || {
         assert_eq!(snapshot(), frozen);
+        assert_eq!(held_snapshot(), held_frozen);
         assert_eq!(
             read(conversation.fleet.node("nodea"), &conversation.sender.pane),
             json!([])
@@ -733,6 +938,7 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
         );
         (started.elapsed() >= Duration::from_secs(2)).then_some(())
     });
+    api(conversation.fleet.node("nodeb"), "fleet.resume", json!({}));
     api(conversation.fleet.node("nodea"), "fleet.resume", json!({}));
     let retried = mail(
         conversation.fleet.node("nodeb"),

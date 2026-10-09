@@ -23,6 +23,10 @@ pub(crate) struct Poll {
     failed: bool,
 }
 impl Poll {
+    pub fn note_receipts(&mut self, pending: bool) {
+        self.pending |= pending;
+    }
+
     pub fn ready(&mut self, now: std::time::Instant, pinned: bool, generation: u64) -> bool {
         if pinned && (!self.pinned || self.generation != generation) {
             self.deadline = None;
@@ -176,6 +180,26 @@ fn decode(raw: &str) -> Result<Batch, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receipts_wake_idle_poll_but_failed_receipt_commit_keeps_backoff() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, false);
+        assert!(!poll.ready(now, true, 1));
+        poll.note_receipts(true);
+        assert!(poll.ready(now, true, 1));
+        // Transport succeeded but persisting receipts_sent failed.
+        poll.finished(now, true);
+        for second in 0..60 {
+            poll.note_receipts(true);
+            assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
+        }
+        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+        poll.finished(now + std::time::Duration::from_secs(61), false);
+        assert!(!poll.ready(now + std::time::Duration::from_secs(62), true, 1));
+    }
+
     #[test]
     fn spoke_custody_idle_and_failed_polls_back_off_without_busy_waiting() {
         let now = std::time::Instant::now();

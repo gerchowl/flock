@@ -326,7 +326,7 @@ impl App {
                 self.mesh_outbound_polls
                     .entry(peer.name.clone())
                     .or_default()
-                    .pending |= receipts_pending;
+                    .note_receipts(receipts_pending);
             }
             if !self.collection_peers.contains_key(&peer.name)
                 && self

@@ -105,20 +105,15 @@ impl App {
     }
 
     pub(super) fn finish_outbound_collection(&mut self, completion: Completion) {
-        self.mesh_outbound_polls
-            .entry(completion.peer.name.clone())
-            .or_default()
-            .finished(std::time::Instant::now(), completion.result.is_err());
-        let Ok(batch) = completion.result else {
-            return;
-        };
+        let mut failed = completion.result.is_err();
         if let Collect::Outbound { outbound } = &completion.query {
-            if !outbound.receipts.is_empty() {
+            if completion.result.is_ok() && !outbound.receipts.is_empty() {
                 if let Err(reason) = with_store(|store| {
                     store
                         .receipts_sent(&outbound.receipts)
                         .map_err(|e| e.to_string())
                 }) {
+                    failed = true;
                     crate::logging::mesh_custody_failed(
                         "receipts_sent",
                         super::mesh_mail::error_code(&reason),
@@ -126,6 +121,13 @@ impl App {
                 }
             }
         }
+        self.mesh_outbound_polls
+            .entry(completion.peer.name.clone())
+            .or_default()
+            .finished(std::time::Instant::now(), failed);
+        let Ok(batch) = completion.result else {
+            return;
+        };
         let edge = crate::peer_stream::enrollment(&completion.peer);
         if edge.state != "pinned" {
             return;

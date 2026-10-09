@@ -1,5 +1,6 @@
 //! Held-edge delivery carries an immutable envelope and a decreasing TTL budget.
 use super::store::Envelope;
+use crate::peers::PeerMessageFailure;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -8,7 +9,10 @@ pub struct Deliver {
     pub remaining_ms: i64,
 }
 
-pub(crate) fn send(peer: &crate::config::PeerConfig, delivery: &Deliver) -> Result<bool, String> {
+pub(crate) fn send(
+    peer: &crate::config::PeerConfig,
+    delivery: &Deliver,
+) -> Result<bool, PeerMessageFailure> {
     let mut delivery = delivery.clone();
     super::hello::with_store(|store| {
         if store.clock().map_err(|e| e.to_string())?.paused {
@@ -23,24 +27,54 @@ pub(crate) fn send(peer: &crate::config::PeerConfig, delivery: &Deliver) -> Resu
         }
         delivery.remaining_ms = record.remaining_ms;
         Ok(())
-    })?;
-    let params = serde_json::to_value(&delivery).map_err(|e| e.to_string())?;
-    let raw = crate::peer_stream::request(peer, "mesh.deliver", params)?;
-    let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    })
+    .map_err(PeerMessageFailure::Unreachable)?;
+    let params =
+        serde_json::to_value(&delivery).map_err(|e| PeerMessageFailure::Refused(e.to_string()))?;
+    let raw = crate::peer_stream::request(peer, "mesh.deliver", params)
+        .map_err(PeerMessageFailure::Unreachable)?;
+    let response: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| PeerMessageFailure::Unreachable(e.to_string()))?;
     if let Some(error) = response.get("error") {
-        return Err(error.to_string());
+        return Err(delivery_failure(error));
     }
     let result = &response["result"];
     if result["message_key"]
-        != serde_json::to_value(&delivery.envelope.key).map_err(|e| e.to_string())?
+        != serde_json::to_value(&delivery.envelope.key)
+            .map_err(|e| PeerMessageFailure::Refused(e.to_string()))?
         || !matches!(
             result["state"].as_str(),
             Some("delivered" | "duplicate" | "custody")
         )
     {
-        return Err("mesh peer did not acknowledge durable inbox import".into());
+        return Err(PeerMessageFailure::Unreachable(
+            "mesh peer did not acknowledge durable inbox import".into(),
+        ));
     }
     Ok(result["state"] != "custody")
+}
+
+fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
+    let reason = error["message"].as_str().unwrap_or("unknown refusal");
+    if error["code"] == "reply_unavailable" {
+        // The receiver accepted the question but cannot bind its return path.
+        return PeerMessageFailure::Refused(format!("reply_unavailable: {reason}"));
+    }
+    let transient = matches!(
+        reason.split(':').next().unwrap_or(reason),
+        "mailbox_full" | "mail_store_full" | "fleet_paused" | "mail_store_unavailable"
+    ) || reason.starts_with("mesh store")
+        || reason == "mesh edge is not enrolled";
+    if !transient
+        && matches!(
+            error["code"].as_str(),
+            Some("mesh_delivery_refused" | "origin_mismatch")
+        )
+    {
+        PeerMessageFailure::Refused(reason.into())
+    } else {
+        PeerMessageFailure::Unreachable(reason.into())
+    }
 }
 
 /// Hydrate a metadata notification without opening another custody writer.
@@ -63,4 +97,44 @@ pub(crate) fn body(key: Option<&super::key::MessageKey>, legacy: &str) -> Option
         .ok()?;
     let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     payload["message"]["body"].as_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn delivery_classifies_permanent_refusals_and_transient_backpressure() {
+        let accepted_without_reply = super::delivery_failure(&serde_json::json!({
+            "code":"reply_unavailable", "message":"message has no valid mesh return binding"
+        }));
+        assert!(accepted_without_reply
+            .detail()
+            .starts_with("reply_unavailable:"));
+        for reason in [
+            "forward_limit",
+            "msg_not_allowed",
+            "message_not_found",
+            "invalid_envelope",
+        ] {
+            let failure = super::delivery_failure(
+                &serde_json::json!({"code":"mesh_delivery_refused","message":reason}),
+            );
+            assert!(!failure.retryable(), "{reason}");
+            assert_eq!(failure.detail(), reason);
+        }
+        for reason in [
+            "mailbox_full",
+            "mail_store_full: quota",
+            "fleet_paused",
+            "mail_store_unavailable: disk",
+            "mesh store suspended for handoff",
+        ] {
+            assert!(
+                super::delivery_failure(
+                    &serde_json::json!({"code":"mesh_delivery_refused","message":reason})
+                )
+                .retryable(),
+                "{reason}"
+            );
+        }
+    }
 }

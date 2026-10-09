@@ -21,6 +21,12 @@
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# Acceptance must expose flakes even without a command-line retry override.
+filter = 'binary(mesh_step1)'
+test-group = 'serial-pty'
+retries = 0
+
+[[profile.default.overrides]]
 # The federation hub/spoke and detach/reattach suites stand up multiple servers
 # + clients per test and race hardest under contention — serialize them.
 # live_handoff belongs here too: its live-handoff cases spawn a REPLACEMENT

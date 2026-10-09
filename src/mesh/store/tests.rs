@@ -59,6 +59,36 @@ fn envelope() -> Envelope {
 }
 
 #[test]
+fn refused_custody_is_terminal_and_never_selected_for_retry() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.refuse(&mail.key, "forward_limit", 1).unwrap();
+    for now in [2, 60_000, 300_000] {
+        assert!(matches!(
+            store.schedule_retry(&mail.key, 60_000, now),
+            Err(Error::InvalidState)
+        ));
+        assert!(store.retry_ready_limit(now, 10).unwrap().is_empty());
+        let status = store
+            .status(&mail.key.origin_node, &mail.correlation_id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "refused");
+        assert_eq!(status.detail.as_deref(), Some("forward_limit"));
+    }
+    drop(store);
+    assert!(fixture
+        .open(300_001)
+        .retry_ready_limit(300_001, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn collection_is_origin_token_and_request_scoped_and_ack_is_idempotent() {
     let f = Fixture::new();
     let mut store = f.open(0);

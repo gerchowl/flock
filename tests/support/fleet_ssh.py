@@ -113,6 +113,9 @@ def forward_input():
                 kind = "outbound" if outbound else "collect"
                 if outbound:
                     outbound_collections.add(request.get("id"))
+                    if request.get("params", {}).get("outbound", {}).get("receipts"):
+                        with (base / f"receipt-polls-{source}-{target}").open("a") as log:
+                            log.write(str(time.monotonic()) + "\n")
                     with (base / f"outbound-polls-{source}-{target}").open("a") as log:
                         log.write(str(time.monotonic()) + "\n")
                     lose_ack = base / f"lose-outbound-ack-{source}-{target}"
@@ -144,6 +147,13 @@ def forward_input():
                             break
                         time.sleep(0.01)
             if method == "mesh.deliver":
+                with (base / f"delivery-attempts-{source}-{target}").open("a") as log:
+                    log.write(request["params"]["envelope"]["correlation_id"] + "\n")
+                if (base / f"transient-delivery-{source}-{target}").exists():
+                    emit(json.dumps({"id": request["id"], "error": {
+                        "code": "mesh_delivery_refused", "message": "fleet_paused",
+                    }}) + "\n")
+                    continue
                 deliveries.add(request.get("id"))
                 if (base / f"spoof-host-{source}-{target}").exists():
                     envelope = request["params"]["envelope"]
