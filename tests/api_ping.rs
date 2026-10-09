@@ -793,8 +793,12 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         ),
     );
     assert_eq!(send_enter["result"]["type"], "ok");
-    wait_for_path(&marker, Duration::from_secs(5));
-    wait_for_path(&cwd_marker, Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_path(&marker, deadline.saturating_duration_since(Instant::now()));
+    wait_for_path(
+        &cwd_marker,
+        deadline.saturating_duration_since(Instant::now()),
+    );
 
     // The foreground process is in `foreground`, by its own account. Compared
     // with `assert_same_dir` because the shell reports the path as typed while
@@ -805,13 +809,30 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         &foreground,
     );
 
-    let pane = send_request(
-        &socket_path,
-        &format!(
+    // File markers precede the server observing the foreground process change.
+    let expected = foreground.canonicalize().unwrap();
+    let pane = loop {
+        let mut reader = JsonLineReader::connect(&socket_path);
+        reader.send_line(&format!(
             r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
             pane_id
-        ),
-    );
+        ));
+        let pane = reader.read_json_line(deadline.saturating_duration_since(Instant::now()));
+        if pane["result"]["pane"]["foreground_cwd"]
+            .as_str()
+            .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+            .as_ref()
+            == Some(&expected)
+        {
+            break pane;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "foreground cwd did not settle: {pane}"
+        );
+        thread::park_timeout(remaining.min(Duration::from_millis(25)));
+    };
     assert_same_dir(&pane["result"]["pane"]["cwd"], &base);
     assert_same_dir(&pane["result"]["pane"]["foreground_cwd"], &foreground);
 
