@@ -699,11 +699,6 @@ fn request_over(
     params: serde_json::Value,
     spawn: bool,
 ) -> Result<String, String> {
-    if peer.summary_command != crate::config::model::default_peer_summary_command() {
-        let reason = "custom summary transport unsupported: restore the default summary_command to hold a mesh edge".to_string();
-        set_enrollment(peer, Err(reason.clone().into()));
-        return Err(reason);
-    }
     // Outer lock is held only long enough to find the slot; the request itself
     // runs under the per-peer lock so one slow peer cannot stall the others.
     let slot = {
@@ -932,9 +927,6 @@ const MAX_PUSH_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 /// of the slot either way, because leaving it would have the next poll re-judge
 /// the same expired snapshot instead of getting on with a live request.
 pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
-    if peer.summary_command != crate::config::model::default_peer_summary_command() {
-        return None;
-    }
     let slot = {
         let registry = registry().lock().ok()?;
         Arc::clone(registry.get(&peer.name)?)

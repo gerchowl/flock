@@ -97,7 +97,7 @@ The default reset clears the configured-peer pin. Use
 `flk peers enroll --reset <peer> --direction inbound` for an inbound pin.
 The command shows the direction, name, and node ID before clearing that pin.
 Reset is refused when invoked from an agent pane or over MCP/relay; the
-operator's shell is the trust boundary. Peers using a custom `summary_command`, incompatible versions, or a
+operator's shell is the trust boundary. Peers using incompatible versions or a
 failing relay are refused with a concrete reason. Version refusals include
 `upgrade flk on <peer>` (or `this node` when the local version is older); discovery does not fall back to one-shot SSH.
 
@@ -606,7 +606,7 @@ The two-step is the whole story:
 
 Replies need no addressing: `flock_msg_reply` carries the incoming `correlation_id` and uses its durable return binding. For a direct mesh request, the target pushes the reply over an enrolled outbound edge when available, or holds it (`state: "held"`) for origin collection. Collection starts about five seconds after confirmed delivery, works without an active waiter, and stops at the first final answer. The target needs no outbound peer entry. Held answers do not consume outbound retry slots, and a newly enrolled outbound edge pushes them. Automatic collection closes at the first final answer; send a new request for a follow-up that needs automatic collection on a one-way edge. Collection survives restart, deduplicates imports, and pauses with the fleet. An active reply waiter or a reconnect restores fast polling; `msg.status` reports terminal import failures as `collect_failed`. Replies to messages without a valid return binding return `reply_unavailable`.
 
-**Spokes can message their hub without outbound peers.** A spoke with a pinned hub and no `[[peers]]` persists its send even while the edge is disconnected and returns `state: "queued"` with a minted `message_key` and `path: "via <hub>"`. The hub collects the spoke's durable outbox over its held edge, checks `allow_from` against the authenticated spoke origin, imports once, and acknowledges. Lost acknowledgements, restart and live handoff preserve custody and deduplication. Replies are pushed down with `mesh.deliver`; an offline edge leaves the answer held until re-enrollment. Step 1 allows a local recipient on the hub; a target beyond the hub is refused with `forward_limit`, visible in the spoke's `msg.status`. Multi-hop forwarding is separate mesh work.
+**Spokes can message their hub without outbound peers.** A spoke with a pinned hub and no `[[peers]]` persists its send even while the edge is disconnected and returns `state: "queued"` with a minted `message_key` and `path: "via <hub>"`. The hub collects the spoke's durable outbox over its held edge, imports once, and acknowledges. `allow_from` matches the authenticated origin node by its configured peer name; forwarding hubs are never checked. Lost acknowledgements, restart and live handoff preserve custody and deduplication. Replies are pushed down with `mesh.deliver`; an offline edge leaves the answer held until re-enrollment. Step 1 allows a local recipient on the hub; a target beyond the hub is refused with `forward_limit`, visible in the spoke's `msg.status`. Multi-hop forwarding is separate mesh work.
 
 A fresh send can be refused with `msg_target_not_found` (unknown target and no pinned hub), `peer_not_configured` (no usable configured route), or `sender_unresolved` (a spoke send must come from inside an agent pane). Once accepted into custody, `queued` means awaiting delivery, not recipient inbox import. A hub's permanent refusal, including `msg_target_not_found`, `msg_not_allowed` or `forward_limit`, is retained in the originating spoke's `msg.status` as `state: "refused"` with the reason in `detail`.
 
@@ -711,3 +711,14 @@ Flock never files the report itself (ADR-0010 decision 6). The one write path it
 | `FLOCK_LOG` | Set log filter, for example `FLOCK_LOG=flock=debug`. |
 | `FLOCK_<UPPER_SNAKE_PATH>` | Generic override for any scalar config field (ADR-0002); sits BELOW the config file. |
 | `FLOCK_DISABLE_SOUND` | Deprecated alias for `FLOCK_UI_SOUND_ENABLED=false`. Sits below the file (removal after one release). |
+
+## Removed in 1.0.0
+
+Upgrade the fleet together for mesh transport. Remove these settings and callers:
+
+- `[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`, and `deferral_relay_concurrency`: delete these lines. Custody pushes use a fixed concurrency of four.
+- `[[peers]] summary_command`: delete this line; peers now always hold a mesh edge. Use `relay_command` if the remote executable needs a custom path.
+- `flk msg send --from-host` and the `msg.send` fields `from_host` and `intent_unrecognised`: remote origins come from authenticated mesh envelopes. `--from-agent` remains available for operator tooling.
+- The old `msg.uplink_*` methods: use enrolled mesh edges for delivery and collection.
+
+Removed config keys are errors with migration instructions. The server refuses to start and names the file, line, and key to delete. A replacement server reports the refusal to the old server so live handoff rolls back safely. A live reload fails, surfaces the diagnostic, and keeps the previous configuration and running panes. Unknown future keys still only warn.

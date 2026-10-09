@@ -126,22 +126,18 @@ impl App {
             self.project_mesh_answer(message);
         } else if let Some(peer) = push_peer {
             let send = crate::app::message_relay::RelaySend {
-                mesh: Some(Deliver {
+                mesh: Deliver {
                     envelope: answer.clone(),
                     remaining_ms: CUSTODY_TTL_MS,
-                }),
+                },
                 id: answer.key.message_id.clone(),
                 host: peer.name.clone(),
                 peer,
                 to_agent: answer.target_agent.clone(),
                 direct: true,
                 from_agent: answer.sender.clone(),
-                from_host: crate::app::short_host_name(),
-                body: message.body,
                 correlation_id: answer.correlation_id.clone(),
-                in_reply_to: answer.in_reply_to.clone(),
                 intent: message.intent,
-                settle_original: None,
                 respond_to: None,
             };
             self.enqueue_message_relay(send.into_work());

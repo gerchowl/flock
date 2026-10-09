@@ -3239,6 +3239,37 @@ sidebar_pane_gap = 99
     }
 
     #[test]
+    fn removed_key_on_live_reload_keeps_previous_config() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-removed-mesh-key");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        let previous = toml::to_string(&app.state.config).unwrap();
+        let workspace_count = app.state.workspaces.len();
+        for removed in [
+            "[msg]\nuplink_timeout_secs=20",
+            "[msg]\nuplink_heartbeat_secs=3",
+            "[msg]\ndeferral_relay_concurrency=1",
+            "[[peers]]\nname='nodea'\nsummary_command='false'",
+        ] {
+            std::fs::write(&path, format!("name='changed'\n{removed}\n")).unwrap();
+            let report = app.reload_config();
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
+            assert_eq!(toml::to_string(&app.state.config).unwrap(), previous);
+            assert_eq!(app.state.workspaces.len(), workspace_count);
+            assert!(app
+                .state
+                .config_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("was removed in flk 1.0.0 (mesh); delete this line"));
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-toml");

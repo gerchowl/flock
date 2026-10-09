@@ -51,13 +51,17 @@ pub(super) fn payload(envelope: &Envelope) -> Result<Payload, String> {
 impl App {
     pub(super) fn persist_mesh_send(
         &mut self,
-        send: &mut RelaySend,
-        pane: &str,
-    ) -> Result<(), String> {
+        peer: &crate::config::PeerConfig,
+        to_agent: &str,
+        data: &Payload,
+    ) -> Result<Deliver, String> {
         // Pure App fixtures have no server identity or filesystem store.
         #[cfg(test)]
         if self.node_id.is_none() {
-            return Ok(());
+            return Ok(Deliver {
+                envelope: envelope("nodea", to_agent.to_string(), data)?,
+                remaining_ms: CUSTODY_TTL_MS,
+            });
         }
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
@@ -66,29 +70,9 @@ impl App {
             .node_id
             .as_deref()
             .ok_or("mesh node identity unavailable")?;
-        let data = Payload {
-            message: PendingMessage {
-                message_key: None,
-                correlation_id: send.correlation_id.clone(),
-                body: send.body.clone(),
-                from_pane: None,
-                from_agent: Some(send.from_agent.clone()),
-                from_host: Some(send.from_host.clone()),
-                from_repo: None,
-                to_pane: pane.into(),
-                to_repo: None,
-                in_reply_to: send.in_reply_to.clone(),
-                enqueued_at_ms: now_ms(),
-                delivery_attempts: 0,
-                intent: send.intent,
-            },
-            peer: Some(send.peer.name.clone()),
-            host: Some(send.host.clone()),
-            direct: send.direct,
-        };
-        let mut envelope = envelope(origin, send.to_agent.clone(), &data)?;
+        let mut envelope = envelope(origin, to_agent.to_string(), data)?;
         with_store(|store| {
-            if let Some(pin) = store.get_pin(&send.peer.name).map_err(|e| e.to_string())? {
+            if let Some(pin) = store.get_pin(&peer.name).map_err(|e| e.to_string())? {
                 envelope
                     .return_binding
                     .collection_peers
@@ -111,11 +95,10 @@ impl App {
                 .map_err(|e| e.to_string())
         })?;
         self.mesh_retry_at = None;
-        send.mesh = Some(Deliver {
+        Ok(Deliver {
             envelope,
             remaining_ms: CUSTODY_TTL_MS,
-        });
-        Ok(())
+        })
     }
 
     pub(super) fn persist_local_mail(
@@ -308,9 +291,7 @@ impl App {
         send: RelaySend,
         mut result: Result<bool, crate::peers::PeerMessageFailure>,
     ) {
-        let Some(delivery) = &send.mesh else {
-            return;
-        };
+        let delivery = &send.mesh;
         let mut warnings = Vec::new();
         if result
             .as_ref()
@@ -420,9 +401,6 @@ impl App {
                     via: (!send.direct).then(|| send.peer.name.clone()),
                 },
             });
-        }
-        if let Some(original) = &send.settle_original {
-            self.settle_original_in(&original.pane, &original.correlation_id);
         }
         self.mailboxes
             .finish_relaying_question(&send.correlation_id);
@@ -672,10 +650,7 @@ impl App {
         }
         let records = with_store(|store| {
             store
-                .retry_ready_limit(
-                    now_ms() as i64,
-                    self.state.config.msg.deferral_relay_concurrency.max(1),
-                )
+                .retry_ready_limit(now_ms() as i64, crate::mesh::delivery::push_concurrency())
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|key| store.get(&key).map_err(|e| e.to_string()))
@@ -714,22 +689,18 @@ impl App {
             let host = data.host.unwrap_or_else(|| peer.name.clone());
             let message = data.message;
             let send = RelaySend {
-                mesh: Some(Deliver {
+                mesh: Deliver {
                     envelope: record.envelope.clone(),
                     remaining_ms: record.remaining_ms,
-                }),
+                },
                 id: String::new(),
                 peer,
                 to_agent: record.envelope.target_agent,
                 host,
                 direct: data.direct,
                 from_agent: message.from_agent.unwrap_or_default(),
-                from_host: message.from_host.unwrap_or_default(),
-                body: message.body,
                 correlation_id: message.correlation_id,
-                in_reply_to: message.in_reply_to,
                 intent: message.intent,
-                settle_original: None,
                 respond_to: None,
             };
             self.enqueue_message_relay(send.into_work());
@@ -746,5 +717,103 @@ pub(super) fn error_code(reason: &str) -> &'static str {
         Some("message_not_found") => "message_not_found",
         Some("message has no valid mesh return binding") => "reply_unavailable",
         _ => "mail_store_unavailable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_batch_uses_fixed_push_concurrency() {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = std::env::temp_dir().join(format!("flock-retry-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&shim).unwrap();
+        let ssh = shim.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous_path = std::env::var_os("PATH");
+        let mut paths = vec![shim.clone()];
+        if let Some(path) = &previous_path {
+            paths.extend(std::env::split_paths(path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.node_id = Some("nodea".into());
+        let peer = crate::config::PeerConfig {
+            name: "nodeb".into(),
+            ssh: "retry-batch.invalid".into(),
+            ..Default::default()
+        };
+        app.state.peers.push(peer.clone());
+        for index in 0..5 {
+            let data = Payload {
+                message: PendingMessage {
+                    message_key: None,
+                    correlation_id: format!("batch-{index}"),
+                    body: "retry me".into(),
+                    from_pane: None,
+                    from_agent: Some("agent_nodea_sender".into()),
+                    from_host: Some("nodea".into()),
+                    from_repo: None,
+                    to_pane: "p1".into(),
+                    to_repo: None,
+                    in_reply_to: None,
+                    enqueued_at_ms: now_ms(),
+                    delivery_attempts: 0,
+                    intent: crate::api::schema::MsgIntent::Fyi,
+                },
+                peer: Some(peer.name.clone()),
+                host: Some(peer.name.clone()),
+                direct: true,
+            };
+            let envelope = envelope("nodea", "agent_nodeb_recipient".into(), &data).unwrap();
+            with_store(|store| {
+                store
+                    .accept(
+                        &envelope,
+                        CUSTODY_TTL_MS,
+                        Admission::Custody,
+                        now_ms() as i64,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        }
+        app.retry_mesh_mail();
+        assert_eq!(app.message_relays.slots(5), 1, "four records dispatched");
+        let remaining = with_store(|store| {
+            store
+                .retry_ready_limit(now_ms() as i64, 10)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the fifth record is not leased by this batch"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !app.message_relays.is_idle() {
+                let event = app.event_rx.recv().await.unwrap();
+                app.handle_internal_event(event);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.message_relays.is_idle());
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(shim);
     }
 }

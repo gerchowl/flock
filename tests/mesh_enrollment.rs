@@ -209,21 +209,6 @@ fn forged_signature_is_refused() {
 }
 
 #[test]
-fn custom_summary_transport_is_refused() {
-    let mut specs = PAIR.to_vec();
-    specs[0].extra_config = "summary_command = 'false'\n";
-    let fleet = fleet::spawn("mesh-custom", &specs);
-    let status = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
-    assert!(
-        status["reason"]
-            .as_str()
-            .unwrap()
-            .contains("custom summary transport unsupported"),
-        "{status}"
-    );
-}
-
-#[test]
 fn forged_acceptor_challenge_is_refused() {
     refused_mode(
         "mesh-challenge",

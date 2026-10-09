@@ -429,19 +429,6 @@ pub(crate) fn transcript_writer_newer_than_tested(writer_version: &str) {
     );
 }
 
-/// A relayed agent message carried an intent tier this build does not know
-/// (ADR-0018 §1). It was read as `needs_reply`; this records the skew.
-pub(crate) fn msg_intent_unrecognised(intent: &str, from_host: &str) {
-    tracing::warn!(
-        event = "msg.intent.unrecognised",
-        subsystem = "msg",
-        outcome = "degraded",
-        intent,
-        from_host,
-        "relayed message carried an intent this build does not know; read as needs_reply"
-    );
-}
-
 /// A transcript could not be read or no longer matches the schema kernel.
 ///
 /// Logs the session id and the error shape only — never transcript content,
@@ -1799,6 +1786,16 @@ pub(crate) fn handoff_refusal_report_failed(err: &str) {
 }
 
 // --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
+
+pub(crate) fn server_config_refused(err: &str) {
+    tracing::error!(
+        event = "server.config.refused",
+        subsystem = "server",
+        outcome = "error",
+        err,
+        "server startup refused configuration"
+    );
+}
 
 pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
     tracing::info!(
