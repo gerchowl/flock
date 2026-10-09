@@ -243,6 +243,25 @@ impl Store<SystemDisk> {
     pub fn open(path: &Path, wall_ms: i64) -> Result<Self> {
         Self::open_with(path, wall_ms, Limits::default(), SystemDisk)
     }
+    /// Validate without opening a writer, migrating, or advancing the clock.
+    pub fn check_generation(path: &Path, minimum: u64) -> Result<()> {
+        if minimum == 0 {
+            return Ok(());
+        }
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let found: i64 = connection.query_row(
+            "SELECT generation FROM writer_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if found < 0 || (found as u64) < minimum {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "mesh store generation {found} is older than handoff generation {minimum}"
+            ))));
+        }
+        Ok(())
+    }
 }
 impl<D: DiskSpace> Store<D> {
     pub fn open_with(path: &Path, wall_ms: i64, limits: Limits, disk: D) -> Result<Self> {
@@ -286,6 +305,20 @@ impl<D: DiskSpace> Store<D> {
         };
         store.advance(wall_ms, None)?;
         Ok(store)
+    }
+
+    /// Advance the durable handoff fence before releasing the writer.
+    pub fn handoff_generation(&mut self) -> Result<u64> {
+        self.connection.execute(
+            "UPDATE writer_generation SET generation=generation+1 WHERE singleton=1",
+            [],
+        )?;
+        let generation: i64 = self.connection.query_row(
+            "SELECT generation FROM writer_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(generation).map_err(|_| Error::InvalidState)
     }
 
     fn guard_disk(&self, extra: u64) -> Result<()> {
@@ -815,6 +848,15 @@ impl<D: DiskSpace> Store<D> {
     pub fn finish_migration(&mut self, name: &str) -> Result<()> {
         self.connection
             .execute("INSERT OR IGNORE INTO migrations VALUES(?1)", [name])?;
+        Ok(())
+    }
+
+    /// Retain undecodable bytes for diagnosis, excluding them from delivery and projection.
+    pub fn quarantine(&mut self, key: &MessageKey) -> Result<()> {
+        self.connection.execute(
+            "UPDATE envelopes SET state='quarantined' WHERE origin=?1 AND id=?2",
+            params![key.origin_node, key.message_id],
+        )?;
         Ok(())
     }
 

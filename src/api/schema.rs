@@ -2230,6 +2230,8 @@ pub enum ResponseResult {
     },
     PeersEnrollment {
         peers: Vec<crate::mesh::hello::Enrollment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh_suspended_reason: Option<String>,
     },
     PeersSummary {
         /// This server's persistent per-user node identity.

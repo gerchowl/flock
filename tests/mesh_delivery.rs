@@ -513,3 +513,120 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
         1
     );
 }
+
+#[test]
+fn live_handoff_resumes_pending_outbox_once() {
+    let mut fleet = fleet::spawn("mesh-handoff", PAIR);
+    let recipient = agent(fleet.node("nodeb"));
+    discover(&fleet, &recipient);
+    fleet.refuse_edge("nodea", "nodeb");
+    fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
+    let sent = send(&fleet, &recipient, "handoff-custody");
+    assert_eq!(sent["result"]["state"], "queued", "{sent}");
+    let origin = fleet.node("nodea");
+    let old_pid = origin.process_id();
+    let result = request(origin, "server.live_handoff", json!({}));
+    assert!(result.get("error").is_none(), "{result}");
+    let replacement = fleet::wait_until("handoff replacement", Duration::from_secs(15), || {
+        support::flock_server_pids_for_runtime_dir(&origin.runtime_dir)
+            .ok()?
+            .into_iter()
+            .find(|pid| *pid != old_pid)
+    });
+    support::register_spawned_flock_pid(Some(replacement));
+    // Keep teardown responsible for the replacement even if an assertion fails.
+    struct Replacement(u32);
+    impl Drop for Replacement {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGTERM);
+            }
+            support::unregister_spawned_flock_pid(Some(self.0));
+        }
+    }
+    let _replacement = Replacement(replacement);
+    fleet.allow_edge("nodea", "nodeb");
+    let messages = fleet::wait_until("handoff outbox replay", Duration::from_secs(150), || {
+        let messages = read(fleet.node("nodeb"), &recipient["pane_id"]);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    });
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["correlation_id"], "handoff-custody");
+    let path = fleet
+        .node("nodea")
+        .home
+        .join("state/flock-dev/mesh-mail.sqlite");
+    fleet::wait_until(
+        "durable handoff delivery receipt",
+        Duration::from_secs(30),
+        || {
+            let db = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .ok()?;
+            let delivered: bool = db
+                .query_row(
+                    "SELECT delivered FROM envelopes WHERE correlation='handoff-custody'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            delivered.then_some(())
+        },
+    );
+    fleet.node_mut("nodeb").restart();
+    assert_eq!(read(fleet.node("nodeb"), &recipient["pane_id"]), json!([]));
+}
+
+#[test]
+fn cold_restart_quarantines_undecodable_mail_and_restores_valid_records() {
+    let mut fleet = fleet::spawn(
+        "mesh-quarantine",
+        &[NodeSpec::new("nodea", "quarantine", &[])],
+    );
+    let recipient = agent(fleet.node("nodea"));
+    for correlation in ["bad-metadata", "bad-payload", "valid-record"] {
+        let sent = request(
+            fleet.node("nodea"),
+            "msg.send",
+            json!({
+                "to":{"type":"pane", "pane":recipient["pane_id"]},
+                "body":"retained", "correlation_id":correlation, "intent":"fyi"
+            }),
+        );
+        assert!(sent.get("error").is_none(), "{sent}");
+    }
+    let path = fleet
+        .node("nodea")
+        .home
+        .join("state/flock-dev/mesh-mail.sqlite");
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE envelopes SET metadata='{}' WHERE correlation='bad-metadata'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE envelopes SET body=X'FF' WHERE correlation='bad-payload'",
+            [],
+        )
+        .unwrap();
+    }
+    fleet.node_mut("nodea").restart();
+    let messages = read(fleet.node("nodea"), &recipient["pane_id"]);
+    assert_eq!(messages.as_array().unwrap().len(), 1, "{messages}");
+    assert_eq!(messages[0]["correlation_id"], "valid-record");
+    let db =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM envelopes WHERE state='quarantined' AND length(body)>0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}

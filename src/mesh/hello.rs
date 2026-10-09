@@ -1,12 +1,11 @@
 //! Mutual possession proof bound to both endpoints, fresh challenges and direction.
 use super::{
     identity::NodeIdentity,
-    store::{IdentityPin, PinSource, Store},
+    store::{IdentityPin, PinSource},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::{Mutex, OnceLock};
 
 pub const VERSION: u32 = 2;
 
@@ -134,29 +133,7 @@ pub(crate) fn verify(
         .map_err(|_| "invalid mesh signature".into())
 }
 
-// The store is opened only by real enrollment, never by pure App construction.
-// Transactions serialize pin changes across inbound and outbound handshakes.
-pub(crate) fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
-    static STORE: OnceLock<Mutex<Option<Store>>> = OnceLock::new();
-    let mut guard = STORE
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| "mesh store poisoned")?;
-    if guard.is_none() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_millis() as i64;
-        *guard = Some(
-            Store::open(&crate::config::state_dir().join("mesh-mail.sqlite"), now)
-                .map_err(|e| e.to_string())?,
-        );
-    }
-    match guard.as_mut() {
-        Some(store) => f(store),
-        None => Err("mesh store unavailable".into()),
-    }
-}
+pub(crate) use super::runtime_store::with_store;
 
 pub(crate) fn check_pin(
     peer: &str,
