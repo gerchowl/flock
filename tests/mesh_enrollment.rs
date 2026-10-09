@@ -29,7 +29,7 @@ fn enrollment(node: &Node, peer: &str, state: &str) -> Value {
 
 // Integration scaffolding launches the public CLI outside the product logging funnel.
 #[allow(clippy::disallowed_methods)]
-fn cli(node: &Node, args: &[&str]) -> Value {
+fn cli_text(node: &Node, args: &[&str]) -> String {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
         .env_clear()
@@ -45,7 +45,11 @@ fn cli(node: &Node, args: &[&str]) -> Value {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn cli(node: &Node, args: &[&str]) -> Value {
+    serde_json::from_str(&cli_text(node, args)).unwrap()
 }
 
 #[test]
@@ -53,6 +57,8 @@ fn mutual_enrollment_and_restart_keep_pins() {
     let mut fleet = fleet::spawn("mesh-enroll", PAIR);
     let remote = enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
     let local = enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned");
+    assert_eq!(remote["pin_origin"], "dialed");
+    assert_eq!(local["pin_origin"], "inbound_first_contact");
     assert_ne!(remote["node_id"], local["node_id"]);
     assert_eq!(remote["node_id"].as_str().unwrap().len(), 64);
     let peers = cli(fleet.node("dialer.test"), &["peers", "status", "--json"]);
@@ -617,6 +623,23 @@ fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
             enrollment(fleet.node("e.test"), "a.test", "pinned");
             let inbound = enrollment(fleet.node("a.test"), "b-ts.test", "pinned");
             assert_eq!(inbound["node_id"], attacker_id);
+            assert_eq!(inbound["pin_origin"], "inbound_first_contact");
+            for args in [vec!["status"], vec!["peers", "status"]] {
+                let text = cli_text(fleet.node("a.test"), &args);
+                assert!(text.contains("pinned (first contact inbound)"), "{text}");
+                let mut json_args = args;
+                json_args.push("--json");
+                let value = cli(fleet.node("a.test"), &json_args);
+                let rows = value
+                    .as_array()
+                    .or_else(|| value["peers"].as_array())
+                    .unwrap();
+                assert!(
+                    rows.iter()
+                        .all(|p| p["pin_origin"] == "inbound_first_contact"),
+                    "{value}"
+                );
+            }
             for source in ["configured", "inbound"] {
                 let preview = request(
                     fleet.node("a.test"),
@@ -628,6 +651,7 @@ fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
             fleet.allow_edge("a.test", "b.test");
             fleet.node_mut("a.test").restart();
             let refused = enrollment(fleet.node("a.test"), "b-ts.test", "refused");
+            assert_eq!(refused["pin_origin"], "inbound_first_contact");
             assert!(
                 refused["reason"]
                     .as_str()

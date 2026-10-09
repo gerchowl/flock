@@ -46,11 +46,17 @@ supply local display names and may differ from those remote names. An inbound
 peer claiming a configured peer's name must match that peer's configured pin.
 If no pin exists, the first authenticated inbound contact pins both the
 configured and inbound identity in one transaction. Fresh mutually configured
-peers can enroll simultaneously.
+peers can enroll simultaneously. Status marks pins created by inbound contact
+as `(first contact inbound)` and pins created by dialing as `(dialed)`.
+This origin survives reconnects and restarts, including later outbound dials.
+Pins created before origin tracking show `(pin origin unknown)`.
+Verify inbound first-contact node IDs through a trusted channel, or use the
+reset command below to enroll again.
 With an older running server, the rest of status remains available and
 enrollment reports `unknown (server predates mesh; restart needed)`.
-`flk peers status --json` includes `source`, `node_id`, `enrollment`, and
-`enrollment_reason`; `flk status --json` includes a `peers` array.
+`flk peers status --json` includes `source`, `node_id`, `pin_origin`, `enrollment`, and
+`enrollment_reason`; `flk status --json` includes a `peers` array with the same
+`pin_origin` values: `dialed`, `inbound_first_contact`, or `unknown`.
 
 Held SSH edges authenticate both node keys using fresh challenges and require
 matching mesh protocol versions (`mesh: 1`). First contact pins the identity.

@@ -199,6 +199,26 @@ impl PinSource {
     }
 }
 
+/// How trust was first established, independent of the pin's direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinOrigin {
+    #[default]
+    Unknown,
+    Dialed,
+    InboundFirstContact,
+}
+
+impl PinOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Dialed => "dialed",
+            Self::InboundFirstContact => "inbound_first_contact",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPin {
     pub node_id: String,
@@ -607,6 +627,24 @@ impl<D: DiskSpace> Store<D> {
             .optional()?)
     }
 
+    /// Reconnects retain the original trust decision stored with the pin.
+    pub fn pin_origin(&self, source: PinSource, peer: &str) -> Result<Option<PinOrigin>> {
+        self.connection
+            .query_row(
+                "SELECT origin FROM identity_pins WHERE source=?1 AND peer=?2",
+                params![source.as_str(), peer],
+                |row| {
+                    Ok(match row.get::<_, String>(0)?.as_str() {
+                        "dialed" => PinOrigin::Dialed,
+                        "inbound_first_contact" => PinOrigin::InboundFirstContact,
+                        _ => PinOrigin::Unknown,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Configured labels are local aliases, not remote identity claims.
     pub fn pin_name_from(&self, source: PinSource, pin: &IdentityPin) -> Result<Option<String>> {
         Ok(self.connection.query_row(
@@ -638,15 +676,30 @@ impl<D: DiskSpace> Store<D> {
     /// Transactionally bind inbound claims and refuse key replacement in
     /// either direction. A configured alias cannot rename an inbound claim.
     pub fn put_pin_from(&mut self, source: PinSource, peer: &str, pin: &IdentityPin) -> Result<()> {
-        self.put_pins(&[source], peer, pin)
+        let origin = match source {
+            PinSource::Configured => PinOrigin::Dialed,
+            PinSource::Inbound => PinOrigin::InboundFirstContact,
+        };
+        self.put_pins(&[source], peer, pin, origin)
     }
 
     /// First authenticated inbound contact to a configured name pins both directions atomically.
     pub fn put_inbound_configured_pin(&mut self, peer: &str, pin: &IdentityPin) -> Result<()> {
-        self.put_pins(&[PinSource::Configured, PinSource::Inbound], peer, pin)
+        self.put_pins(
+            &[PinSource::Configured, PinSource::Inbound],
+            peer,
+            pin,
+            PinOrigin::InboundFirstContact,
+        )
     }
 
-    fn put_pins(&mut self, sources: &[PinSource], peer: &str, pin: &IdentityPin) -> Result<()> {
+    fn put_pins(
+        &mut self,
+        sources: &[PinSource],
+        peer: &str,
+        pin: &IdentityPin,
+        origin: PinOrigin,
+    ) -> Result<()> {
         if peer.is_empty() || pin.node_id.is_empty() || pin.public_key.len() != 32 {
             return Err(Error::InvalidEnvelope);
         }
@@ -665,8 +718,8 @@ impl<D: DiskSpace> Store<D> {
                 return Err(Error::IdentityPinConflict);
             }
             tx.execute(
-                "INSERT OR IGNORE INTO identity_pins VALUES(?1,?2,?3,?4)",
-                params![source.as_str(), peer, pin.node_id, pin.public_key],
+                "INSERT OR IGNORE INTO identity_pins (source,peer,node_id,public_key,origin) VALUES(?1,?2,?3,?4,?5)",
+                params![source.as_str(), peer, pin.node_id, pin.public_key, origin.as_str()],
             )?;
         }
         tx.commit()?;

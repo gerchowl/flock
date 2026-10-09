@@ -588,6 +588,7 @@ fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<Str
             crate::mesh::hello::Enrollment {
                 peer: peer.name.clone(),
                 source: crate::mesh::store::PinSource::Configured,
+                pin_origin: Default::default(),
                 node_id: node_id.or(previous),
                 state: if reason.is_some() {
                     "refused"
@@ -609,6 +610,7 @@ pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
         .unwrap_or_else(|| crate::mesh::hello::Enrollment {
             peer: peer.name.clone(),
             source: crate::mesh::store::PinSource::Configured,
+            pin_origin: Default::default(),
             node_id: None,
             state: "pending".into(),
             reason: None,
