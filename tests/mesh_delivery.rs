@@ -422,8 +422,8 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
             NodeSpec::new("nodec", "forging-origin", &["nodeb"]),
         ],
         |fleet, name| {
-            // Nodes start in reverse order. Partition nodec before it can claim
-            // nodeb's single inbound relay slot; blocking later keeps that edge alive.
+            // Nodes start in reverse order. Partition nodec before its first
+            // enrollment so the later reconnect exercises a fresh handshake.
             if name == "nodec" {
                 fleet.refuse_edge("nodec", "nodeb");
             }
@@ -435,7 +435,7 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
                     status["result"]["peers"]
                         .as_array()?
                         .iter()
-                        .find(|peer| peer["peer"] == "nodeb" && peer["state"] == "refused")
+                        .find(|peer| peer["peer"] == "nodeb" && peer["state"] == "retrying")
                         .cloned()
                 });
             }
