@@ -815,8 +815,12 @@ fn lost_ack_at_each_hop_imports_once() {
 #[ignore = "needs 661-2g"]
 fn pause_at_forwarder_freezes_ttl_across_restart_then_resumes() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
-    cut(&c.fleet, "nodeb", "nodec");
+    let capture = c.fleet.base.join("capture-delivery-nodeb-nodec");
+    fs::write(&capture, "").unwrap();
     c.send();
+    fleet::wait_until("forwarder attempted delivery", DEADLINE, || {
+        (delivery_attempts(&c.fleet, "nodeb", "nodec", "question") >= 1).then_some(())
+    });
     fleet::wait_until("forwarder custody", DEADLINE, || {
         (scalar(
             c.fleet.node("nodeb"),
@@ -835,7 +839,7 @@ fn pause_at_forwarder_freezes_ttl_across_restart_then_resumes() {
     };
     let before = snapshot();
     c.fleet.node_mut("nodeb").restart();
-    reconnect(&c.fleet, "nodeb", "nodec");
+    fs::remove_file(capture).unwrap();
     let start = Instant::now();
     fleet::wait_until("paused across restart and worker ticks", DEADLINE, || {
         let after = db(c.fleet.node("nodeb")).query_row(
