@@ -673,9 +673,9 @@ fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
 fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
     let fleet = fleet::spawn("mesh-held-enroll", PAIR);
     let (sender, _) = question(&fleet, "held-enroll");
-    database(fleet.node("nodea"))
-        .execute("UPDATE envelopes SET collect_at=999999999", [])
-        .unwrap();
+    // Both collection lanes must be unavailable to exercise an idle holder.
+    fleet.refuse_edge("nodea", "nodeb");
+    fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
     let sent = reply(
         fleet.node("nodeb"),
         "held-enroll",

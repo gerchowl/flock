@@ -519,6 +519,7 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     crate::logging::peer_relay_started(pushing);
     if pushing {
         start_summary_push(socket.clone());
+        start_mesh_wake_push(socket.clone());
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -678,6 +679,106 @@ fn start_summary_push(socket: std::path::PathBuf) {
             crate::logging::peer_push_emitted(coalesced);
         }
     });
+}
+
+/// Wake failures are confined to this worker, never the request relay.
+fn start_mesh_wake_push(socket: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        retry_mesh_wake_push(&socket, || {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            writeln!(out, "{{\"push\":\"mesh.wake\"}}")?;
+            out.flush()
+        });
+    });
+}
+
+#[derive(Default)]
+struct WakeRetry {
+    outage: bool,
+    seconds: u64,
+}
+
+impl WakeRetry {
+    fn connected(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failed(&mut self) -> (bool, std::time::Duration) {
+        let log = !self.outage;
+        self.outage = true;
+        self.seconds = self.seconds.saturating_mul(2).clamp(1, 30);
+        (log, std::time::Duration::from_secs(self.seconds))
+    }
+}
+
+fn retry_mesh_wake_push(socket: &std::path::Path, mut emit: impl FnMut() -> std::io::Result<()>) {
+    let mut retry = WakeRetry::default();
+    loop {
+        let mut output_failed = false;
+        let error = match mesh_wake_push(socket, || retry.connected(), &mut || {
+            let result = emit();
+            output_failed = result.is_err();
+            result
+        }) {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        let (log, delay) = retry.failed();
+        if log {
+            crate::logging::peer_mesh_wake_failed("subscription", &error.to_string());
+        }
+        if output_failed {
+            return;
+        }
+        std::thread::sleep(delay);
+    }
+}
+
+fn mesh_wake_push(
+    socket: &std::path::Path,
+    connected: impl FnOnce(),
+    emit: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id":"relay-wake", "method":"events.subscribe",
+            "params":{"subscriptions":[{"type":"mesh.outbound_pending"}]}
+        })
+    )?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut ack = String::new();
+    if reader.read_line(&mut ack)? == 0 || ack.contains("\"error\"") {
+        return Err(std::io::Error::other(format!(
+            "mesh wake subscription refused: {ack}"
+        )));
+    }
+    connected();
+    let debounce = PushDebounce::default();
+    let events = debounce.clone();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(_) => events.note_event(),
+                Err(_) => break,
+            }
+        }
+        events.note_closed();
+    });
+    loop {
+        std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+        if debounce.take_due().is_some() {
+            emit()?;
+        } else if debounce.is_finished() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mesh wake subscription closed",
+            ));
+        }
+    }
 }
 
 /// One request to this node's own socket, answered by one line.
@@ -880,6 +981,69 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    #[test]
+    fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {
+        let mut retry = super::WakeRetry::default();
+        for (index, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let (log, delay) = retry.failed();
+            assert_eq!(log, index == 0);
+            assert_eq!(delay.as_secs(), seconds);
+        }
+        retry.connected();
+        assert_eq!(retry.failed(), (true, std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn wake_worker_resubscribes_after_local_subscription_drops() {
+        use std::io::{BufRead, Write};
+        let socket = std::env::temp_dir().join(format!("wake-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert!(line.contains("mesh.outbound_pending"));
+                writeln!(stream, "{{\"result\":{{}}}}").unwrap();
+                writeln!(stream, "{{\"event\":\"mesh_outbound_pending\"}}").unwrap();
+            }
+        });
+        let mut wakes = 0;
+        super::retry_mesh_wake_push(&socket, || {
+            wakes += 1;
+            if wakes == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test consumer closed",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+        assert_eq!(wakes, 2);
+    }
+
+    #[test]
+    fn wake_debounce_coalesces_a_burst_and_ships_the_last() {
+        let wake = PushDebounce::default();
+        let summary = PushDebounce::default();
+        for _ in 0..100 {
+            wake.note_event();
+        }
+        assert_eq!(wake.take_due(), Some(99));
+        assert_eq!(summary.take_due(), None);
+        assert_eq!(wake.take_due(), None);
+        wake.note_event();
+        wake.note_closed();
+        assert_eq!(wake.take_due(), Some(0));
+        assert_eq!(wake.take_due(), None);
+        assert!(wake.is_finished());
+    }
 
     #[test]
     fn enrollment_origin_labels_and_older_server_default() {
