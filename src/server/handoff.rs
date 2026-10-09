@@ -408,19 +408,6 @@ fn connect_import(socket_path: &Path, token: &str) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-/// Refuse before transferring any PTYs, using the authenticated refusal path
-/// so the old server rolls back with the startup error instead of a timeout.
-#[cfg(unix)]
-pub(crate) fn report_startup_refusal(
-    socket_path: &Path,
-    token: &str,
-    reason: &str,
-) -> io::Result<()> {
-    let mut stream = connect_import(socket_path, token)?;
-    let _manifest = read_line_unbuffered(&mut stream)?;
-    report_import_refusal(&mut stream, reason)
-}
-
 /// Everything after the token write that may fail without the exporter
 /// learning why. Split out so the error-reporting path in [`receive`] has
 /// one place to intercept.

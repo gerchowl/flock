@@ -352,15 +352,17 @@ const CONFIG_CHECK_ADVISORY: i32 = 1;
 const CONFIG_CHECK_PARSE_FAILURE: i32 = 2;
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
+    let mut json = false;
     let mut explicit_path: Option<String> = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--path" => match rest.next() {
                 Some(path) => explicit_path = Some(path.clone()),
                 None => {
                     eprintln!("flk config check: --path needs a file path");
-                    eprintln!("usage: flk config check [--path PATH]");
+                    eprintln!("usage: flk config check [--path PATH] [--json]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
             },
@@ -369,7 +371,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
                     explicit_path = Some(path.to_string());
                 } else {
                     eprintln!("flk config check: unknown argument {other}");
-                    eprintln!("usage: flk config check [--path PATH]");
+                    eprintln!("usage: flk config check [--path PATH] [--json]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
             }
@@ -385,7 +387,34 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
     }
 
     let checked = crate::config::config_path();
-    match config_check_outcome() {
+    let outcome = config_check_outcome();
+    if json {
+        let (code, diagnostics) = match &outcome {
+            ConfigCheckOutcome::Clean => (0, &[][..]),
+            ConfigCheckOutcome::Warnings(diagnostics) => {
+                (CONFIG_CHECK_ADVISORY, diagnostics.as_slice())
+            }
+            ConfigCheckOutcome::DidNotLoad(diagnostics) => {
+                (CONFIG_CHECK_PARSE_FAILURE, diagnostics.as_slice())
+            }
+        };
+        for diagnostic in diagnostics
+            .iter()
+            .filter(|message| message.contains("was removed (mesh)"))
+        {
+            eprintln!("warning: {diagnostic}");
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": checked,
+                "exit_code": code,
+                "diagnostics": diagnostics,
+            })
+        );
+        return Ok(code);
+    }
+    match outcome {
         ConfigCheckOutcome::Clean => {
             println!("{}: ok", checked.display());
             Ok(0)
@@ -427,7 +456,13 @@ fn config_check_outcome() -> ConfigCheckOutcome {
             // keybind conflicts and deprecation renames only surface once the
             // bindings are actually resolved — and those are the warnings this
             // command mostly exists to catch.
-            let mut diagnostics = loaded.diagnostics;
+            let mut diagnostics = crate::config::file_key_diagnostics();
+            diagnostics.extend(
+                loaded
+                    .diagnostics
+                    .into_iter()
+                    .filter(|message| !diagnostics_duplicate_source_key(message)),
+            );
             diagnostics.extend(loaded.config.collect_diagnostics());
 
             if diagnostics.is_empty() {
@@ -437,6 +472,11 @@ fn config_check_outcome() -> ConfigCheckOutcome {
             }
         }
     }
+}
+
+fn diagnostics_duplicate_source_key(message: &str) -> bool {
+    message.contains("was removed (mesh)")
+        || (message.starts_with("unknown ") && message.ends_with(" setting ignored"))
 }
 
 fn config_edit(args: &[String]) -> std::io::Result<i32> {
@@ -1194,7 +1234,7 @@ fn print_config_help() {
     eprintln!("flk config commands:");
     eprintln!("  flk config edit        open the live config (or overlay) in $EDITOR");
     eprintln!("  flk config reset-keys  back up config.toml and remove custom keybindings");
-    eprintln!("  flk config check [--path PATH]");
+    eprintln!("  flk config check [--path PATH] [--json]");
     eprintln!("                         validate a config without starting or touching a server");
     eprintln!("                         exit 0 clean · 1 warnings · 2 did not load");
     eprintln!("                         (unrelated to `flk checks`, which runs health checks)");

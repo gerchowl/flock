@@ -1787,16 +1787,6 @@ pub(crate) fn handoff_refusal_report_failed(err: &str) {
 
 // --- server (headless) family: bind + shutdown (logging redesign PR-4) -----
 
-pub(crate) fn server_config_refused(err: &str) {
-    tracing::error!(
-        event = "server.config.refused",
-        subsystem = "server",
-        outcome = "error",
-        err,
-        "server startup refused configuration"
-    );
-}
-
 pub(crate) fn server_started(api_socket: &Path, client_socket: &Path) {
     tracing::info!(
         event = "server.start",
@@ -3491,6 +3481,16 @@ pub(crate) fn unknown_server_icon(icon: &str, hint: &str) {
         icon,
         hint,
         "config `icon` is not a known name or a valid single glyph; no icon shown"
+    );
+}
+
+pub(crate) fn config_removed_key(diagnostic: &str) {
+    tracing::warn!(
+        event = "config.removed_key",
+        subsystem = "config",
+        outcome = "warning",
+        diagnostic,
+        "removed config setting ignored"
     );
 }
 
