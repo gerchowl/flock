@@ -43,10 +43,9 @@ impl Fixture {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(support::environment::isolated_env(&config, &runtime))
             .env("HOME", &self.0)
-            .env("XDG_CONFIG_HOME", config)
             .env("XDG_STATE_HOME", state)
-            .env("XDG_RUNTIME_DIR", runtime)
             .env("FLOCK_SOCKET_PATH", self.0.join(format!("{session}.sock")))
             .env(
                 "FLOCK_CLIENT_SOCKET_PATH",
@@ -57,6 +56,7 @@ impl Fixture {
             .env("FLOCK_SESSION", session)
             .stdin(Stdio::null())
             .stdout(Stdio::null());
+        support::environment::assert_command_isolated(&cmd);
         cmd
     }
 
@@ -65,6 +65,7 @@ impl Fixture {
     }
 
     fn start_command(&self, session: &str, mut cmd: Command) -> Server {
+        support::environment::assert_command_isolated(&cmd);
         let child = cmd.arg("server").stderr(Stdio::null()).spawn().unwrap();
         support::register_spawned_flock_pid(Some(child.id()));
         let mut server = Server {

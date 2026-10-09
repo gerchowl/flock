@@ -128,8 +128,9 @@ fn start_server_with_rows(rows: u16) -> Server {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.cwd(&base);
-    cmd.env("XDG_CONFIG_HOME", &config_home);
-    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("XDG_DATA_HOME", base.join("data"));
     cmd.env("XDG_STATE_HOME", base.join("state"));
     cmd.env("HOME", base.join("home"));
@@ -143,6 +144,7 @@ fn start_server_with_rows(rows: u16) -> Server {
     cmd.env_remove("FLOCK_ENV");
     cmd.env_remove("FLOCK_HOST_NAME");
     cmd.env_remove("FLOCK_DISABLE_SOUND");
+    support::environment::assert_pty_isolated(&cmd);
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     wait_for_socket(&socket, Duration::from_secs(5));
