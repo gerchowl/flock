@@ -416,8 +416,22 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
             NodeSpec::new("nodec", "forging-origin", &["nodeb"]),
         ],
         |fleet, name| {
-            if name == "nodea" {
+            // Nodes start in reverse order. Partition nodec before it can claim
+            // nodeb's single inbound relay slot; blocking later keeps that edge alive.
+            if name == "nodec" {
                 fleet.refuse_edge("nodec", "nodeb");
+            }
+            if name == "nodea" {
+                // Exercise the early dial before starting the real origin, so this
+                // test does not rely on winning a startup race against nodec.
+                fleet::wait_until("initial nodec partition", Duration::from_secs(30), || {
+                    let status = request(fleet.node("nodec"), "peers.enrollment", json!({}));
+                    status["result"]["peers"]
+                        .as_array()?
+                        .iter()
+                        .find(|peer| peer["peer"] == "nodeb" && peer["state"] == "refused")
+                        .cloned()
+                });
             }
         },
     );
