@@ -34,8 +34,9 @@ mod support;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use support::{cleanup_test_base, register_runtime_dir, wait_for_socket};
 

@@ -137,7 +137,7 @@ fn spawn_client_process(
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -182,7 +182,7 @@ fn spawn_server(
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -516,7 +516,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -757,7 +757,7 @@ fn server_unreachable_shows_clear_error() {
     )
     .unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("client")
         .env("FLOCK_DISABLE_SOUND", "1")
         .env("XDG_CONFIG_HOME", &config_home)
@@ -1207,7 +1207,7 @@ fn client_receives_notify_on_agent_state_change() {
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -1476,7 +1476,7 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
 
     let reader = pair.master.try_clone_reader().unwrap();
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     let pid = child.process_id();
     register_spawned_flock_pid(pid);
     drop(pair.slave);

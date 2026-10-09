@@ -2,17 +2,20 @@
 // The test owns subprocesses, rather than shipped process-execution paths.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 struct Pane {
     base: PathBuf,

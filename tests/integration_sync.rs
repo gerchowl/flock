@@ -1,12 +1,11 @@
 //! Drive sync through the CLI against explicitly selected sandbox profiles.
 // Raw subprocesses are the integration harness, outside the production funnel.
 #![allow(clippy::disallowed_methods)]
-use std::{
-    fs,
-    os::unix::process::CommandExt,
-    path::PathBuf,
-    process::{Command, Output},
-};
+mod support;
+
+use std::{fs, path::PathBuf, process::Output};
+
+use support::environment::Command;
 
 struct Sandbox(PathBuf);
 impl Sandbox {
