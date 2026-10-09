@@ -10,6 +10,7 @@ mod handoffs;
 mod integrations;
 mod lineage;
 mod mesh;
+mod mesh_forward;
 pub(super) mod mesh_mail;
 mod mesh_replies;
 pub(crate) mod mesh_routes;
@@ -1447,7 +1448,7 @@ impl App {
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
-            Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, params),
+            Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, *params),
             Method::MeshCollect(params) => return self.handle_mesh_collect(request.id, params),
             Method::PeersEnrollReset(params) => {
                 return self.handle_peers_enroll_reset(request.id, params)

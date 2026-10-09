@@ -117,6 +117,9 @@ def forward_input():
                 continue
             method = request.get("method", "")
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.hello":
+                with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
+                    log.write(str(time.monotonic()) + "\n")
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"

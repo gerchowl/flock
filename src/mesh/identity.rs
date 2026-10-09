@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+#[derive(Clone)]
 pub(crate) struct NodeIdentity {
     key: SigningKey,
     pub(crate) clone_detection_warning: Option<String>,
@@ -27,12 +28,27 @@ struct StoredIdentity {
 
 impl NodeIdentity {
     pub(crate) fn load() -> io::Result<Self> {
+        // A process keeps its validated key in memory. The path distinguishes
+        // isolated test homes without repeatedly reading the private key.
+        static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, NodeIdentity)>> =
+            std::sync::Mutex::new(None);
+        let path = crate::config::state_dir();
+        let mut cache = CACHE
+            .lock()
+            .map_err(|_| io::Error::other("node identity cache poisoned"))?;
+        if let Some((cached_path, identity)) = cache.as_ref() {
+            if cached_path == &path {
+                return Ok(identity.clone());
+            }
+        }
         // Bind to the OS user too, without persisting its raw machine id.
         // SAFETY: geteuid has no arguments or memory preconditions.
         let uid = unsafe { libc::geteuid() };
         let binding = crate::platform::machine_identity()
             .map(|machine| format!("flock-node-machine-v1:{uid}:{machine}"));
-        Self::load_at(&crate::config::state_dir(), binding)
+        let identity = Self::load_at(&path, binding)?;
+        *cache = Some((path, identity.clone()));
+        Ok(identity)
     }
 
     pub(crate) fn node_id(&self) -> String {
@@ -45,6 +61,14 @@ impl NodeIdentity {
 
     pub(crate) fn sign(&self, bytes: &[u8]) -> Vec<u8> {
         self.key.sign(bytes).to_bytes().to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(secret: [u8; 32]) -> Self {
+        Self {
+            key: SigningKey::from_bytes(&secret),
+            clone_detection_warning: None,
+        }
     }
 
     fn load_at(state_dir: &Path, machine: io::Result<String>) -> io::Result<Self> {
@@ -408,5 +432,16 @@ mod tests {
                 .unwrap()
                 .starts_with("clone detection unavailable: "));
         }
+    }
+    #[test]
+    fn repeated_load_uses_the_validated_process_key() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let fixture = Fixture::new();
+        std::env::set_var("XDG_STATE_HOME", &fixture.0);
+        let first = NodeIdentity::load().unwrap();
+        fs::remove_file(crate::config::state_dir().join("mesh/identity.json")).unwrap();
+        let second = NodeIdentity::load().unwrap();
+        assert_eq!(first.node_id(), second.node_id());
+        assert_eq!(first.sign(b"cached"), second.sign(b"cached"));
     }
 }

@@ -67,6 +67,7 @@ fn close(node: &Node, agent: &Value) {
     api(node, "pane.close", json!({"pane_id":agent["pane_id"]}));
 }
 fn discover(fleet: &Fleet, target: &Value) {
+    fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("remote recipient", DEADLINE, || {
         api(fleet.node("nodea"), "agent.list", json!({}))["fleet"]
             .as_array()?

@@ -45,9 +45,8 @@ pub(crate) struct AgentLocation {
     /// entry, whose route is the hub that relayed it (#410): the message goes
     /// to that hub, which then makes the last hop itself.
     ///
-    /// The distinction is the loop guard. A message that arrived from another
-    /// host is only ever handed on over a DIRECT route, so it crosses at most
-    /// one hub and can never bounce spoke → hub → spoke → hub.
+    /// This is display provenance. Mesh delivery selects its next hop from
+    /// the authenticated owner node and route table, independently of gossip.
     pub(crate) direct: bool,
 }
 

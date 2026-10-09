@@ -145,7 +145,7 @@ pub enum Method {
     #[serde(rename = "mesh.routes")]
     MeshRoutes { adverts: Vec<serde_json::Value> },
     #[serde(rename = "mesh.deliver")]
-    MeshDeliver(crate::mesh::delivery::Deliver),
+    MeshDeliver(Box<crate::mesh::delivery::Deliver>),
     #[serde(rename = "mesh.collect")]
     MeshCollect(crate::mesh::collect::Collect),
     #[serde(rename = "peers.enroll_reset")]
