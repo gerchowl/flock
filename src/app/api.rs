@@ -11,6 +11,7 @@ mod lineage;
 mod mesh;
 mod mesh_mail;
 mod mesh_replies;
+mod mesh_spokes;
 pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
@@ -173,16 +174,6 @@ impl App {
         } = ev
         {
             self.advance_guarded_request(request_id, pane_id, attempt, respond_to);
-            return;
-        }
-        if let AppEvent::UplinkForwarded {
-            spoke,
-            message,
-            respond_to,
-        } = ev
-        {
-            let response = self.forward_uplinked_message(&spoke, message);
-            self.respond_or_park(respond_to, response);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -364,7 +355,6 @@ impl App {
                 let event_tx = self.event_tx.clone();
                 // #410: where a held relay hands the frames its spoke pushes
                 // up. Refreshed every round, so it always points at this loop.
-                crate::peer_stream::set_uplink_sink(event_tx.clone());
                 // #410: what this hub knows about the REST of the fleet, for
                 // the spoke it is about to poll. Gossip used to flow only up,
                 // so a spoke — which polls nobody — never learned anything.
@@ -1291,8 +1281,6 @@ impl App {
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
         self.detach_pending_message_relay();
-        // #410: a park is only ever for the request that set it.
-        let _ = self.uplink.take_pending_park();
         debug_assert!(
             self.pending_agent_submit.is_none(),
             "deferred agent submit must be consumed by respond_or_park before the next request"
@@ -1416,9 +1404,6 @@ impl App {
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
-            Method::MsgUplinkTake(params) => {
-                return self.handle_msg_uplink_take(request.id, params)
-            }
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
             Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, params),
             Method::MeshCollect(params) => return self.handle_mesh_collect(request.id, params),
@@ -1427,9 +1412,6 @@ impl App {
             }
             Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
             Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),
-            Method::MsgUplinkResult(params) => {
-                return self.handle_msg_uplink_result(request.id, params)
-            }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentResult(params) => return self.handle_agent_result(request.id, params),

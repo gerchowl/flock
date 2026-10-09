@@ -2,7 +2,7 @@
 """Local ssh transport for fleet.rs, including directed partitions and faults.
 
 Fault modes alter handshake traffic or attempt an enrollment reset. Requests,
-summary pushes and uplink frames traverse the real relay and enrollment gate.
+summary pushes and custody collections traverse the real relay and enrollment gate.
 """
 import json
 import os
@@ -106,8 +106,11 @@ def forward_input():
             method = request.get("method", "")
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
             if method == "mesh.collect":
-                collections.add(request.get("id"))
-                hold = base / f"hold-collect-{source}-{target}"
+                outbound = "outbound" in request.get("params", {})
+                kind = "outbound" if outbound else "collect"
+                if not outbound:
+                    collections.add(request.get("id"))
+                hold = base / f"hold-{kind}-{source}-{target}"
                 if hold.is_dir():
                     (hold / "entered").touch()
                     deadline = time.monotonic() + 30
@@ -115,12 +118,12 @@ def forward_input():
                         if time.monotonic() >= deadline:
                             break
                         time.sleep(0.01)
-                replay = base / f"replay-collect-{source}-{target}"
+                replay = base / f"replay-{kind}-{source}-{target}"
                 if replay.exists():
                     request["params"] = json.loads(replay.read_text())
                     line = json.dumps(request) + "\n"
-                gate = base / f"gate-collect-ack-{source}-{target}"
-                if gate.is_dir() and request.get("params", {}).get("ack"):
+                gate = base / f"gate-{kind}-ack-{source}-{target}"
+                if gate.is_dir() and request.get("params", {}).get("outbound", request.get("params", {})).get("ack"):
                     (gate / "entered").touch()
                     deadline = time.monotonic() + 30
                     while not (gate / "release").exists() and gate.is_dir():

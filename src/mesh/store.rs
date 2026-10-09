@@ -163,6 +163,7 @@ pub enum Outcome {
     Expired,
     InboxExpired,
     RecipientGone,
+    Refused,
 }
 impl Outcome {
     fn name(self) -> &'static str {
@@ -173,6 +174,7 @@ impl Outcome {
             Self::Expired => "expired",
             Self::InboxExpired => "inbox_expired",
             Self::RecipientGone => "recipient_gone",
+            Self::Refused => "refused",
         }
     }
 }

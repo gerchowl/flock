@@ -90,12 +90,7 @@ impl App {
                     .return_binding
                     .collection_peers
                     .push(pin.node_id.clone());
-                // In-memory uplink mail has no durable spoke-origin binding until 1-H2.
-                // A direct recipient can first appear through down-gossip. The pinned
-                // accepting edge, not the directory snapshot, establishes the binding.
-                if send.from_host == crate::app::short_host_name() {
-                    envelope.return_binding.recipient_node = pin.node_id;
-                }
+                envelope.return_binding.recipient_node = pin.node_id;
             }
             Ok(())
         })?;
@@ -124,14 +119,6 @@ impl App {
         &mut self,
         message: &mut PendingMessage,
     ) -> Result<(), String> {
-        // Uplink sends are not origin-attested mesh requests until 1-H2.
-        if message
-            .from_host
-            .as_deref()
-            .is_some_and(|host| host != crate::app::short_host_name())
-        {
-            return Ok(());
-        }
         if self.mailboxes.queued_len(&message.to_pane) >= crate::app::mailboxes::MAX_QUEUED_PER_PANE
         {
             return Err("mailbox_full".into());
@@ -216,6 +203,17 @@ impl App {
             crate::logging::mesh_custody_failed("import", "origin_mismatch");
             return Err("origin_mismatch".into());
         }
+        self.import_attested_mesh_mail(delivery)
+    }
+
+    pub(super) fn import_attested_mesh_mail(
+        &mut self,
+        delivery: &Deliver,
+    ) -> Result<(Accepted, bool), String> {
+        if self.fleet_pause.paused {
+            return Err("fleet_paused".into());
+        }
+        let envelope = &delivery.envelope;
         let sender_host = with_store(|store| {
             store
                 .origin_name(&envelope.key.origin_node)
@@ -720,7 +718,7 @@ pub(super) fn error_code(reason: &str) -> &'static str {
         Some("fleet_paused") => "fleet_paused",
         Some("message_expired") => "message_expired",
         Some("message_not_found") => "message_not_found",
-        Some("origin not mesh-reachable (needs 1-H2)") => "reply_unavailable",
+        Some("message has no valid mesh return binding") => "reply_unavailable",
         _ => "mail_store_unavailable",
     }
 }

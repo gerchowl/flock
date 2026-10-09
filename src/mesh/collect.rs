@@ -3,8 +3,30 @@ use super::{delivery::Deliver, key::MessageKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Collect {
+    Answers(AnswerCollect),
+    Outbound { outbound: OutboundCollect },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Collect {
+pub struct OutboundCollect {
+    #[serde(default)]
+    pub ack: Vec<OutboundAck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundAck {
+    pub key: MessageKey,
+    pub token: Vec<u8>,
+    pub refusal: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerCollect {
     pub request: MessageKey,
     pub token: Vec<u8>,
     #[serde(default)]

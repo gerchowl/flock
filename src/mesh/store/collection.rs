@@ -251,12 +251,18 @@ impl<D: DiskSpace> Store<D> {
             params![origin,correlation], |r| r.get(0)).optional()?)
     }
 
+    pub fn outbound_refused(&self, origin: &str, correlation: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND correlation=?2 AND state='refused')",
+            params![origin,correlation], |r| r.get(0))?)
+    }
+
     /// Authorize the complete acknowledgement batch before changing custody.
     /// Empty polls do not write the clock or any other state.
     pub fn collect_answers(
         &mut self,
         origin: &str,
-        query: &crate::mesh::collect::Collect,
+        query: &crate::mesh::collect::AnswerCollect,
         wall_ms: i64,
     ) -> Result<Vec<crate::mesh::delivery::Deliver>> {
         if self.clock()?.paused {
@@ -319,5 +325,88 @@ impl<D: DiskSpace> Store<D> {
             }
         }
         Ok(answers)
+    }
+}
+
+impl<D: DiskSpace> Store<D> {
+    /// The enrolled hub can collect only local requests addressed to itself.
+    /// A lost ack reoffers the same immutable envelope for idempotent import.
+    pub fn collect_outbound(
+        &mut self,
+        local: &str,
+        hub: &str,
+        query: &crate::mesh::collect::OutboundCollect,
+        wall_ms: i64,
+    ) -> Result<Vec<crate::mesh::delivery::Deliver>> {
+        if self.clock()?.paused {
+            return Err(Error::Paused);
+        }
+        if query.ack.len() > 16 {
+            return Err(Error::InvalidEnvelope);
+        }
+        for ack in &query.ack {
+            let record = self
+                .collection_record(&ack.key, wall_ms)?
+                .ok_or(Error::NotFound)?;
+            if ack.key.origin_node != local
+                || record.envelope.request_key.is_some()
+                || record.envelope.return_binding.recipient_node != hub
+                || record.envelope.return_binding.collection_token != ack.token
+                || ack
+                    .refusal
+                    .as_deref()
+                    .is_some_and(|r| !matches!(r, "forward_limit" | "msg_not_allowed"))
+            {
+                return Err(Error::InvalidEnvelope);
+            }
+        }
+        for ack in &query.ack {
+            if self
+                .collection_record(&ack.key, wall_ms)?
+                .is_some_and(|r| r.state == "held" && r.remaining_ms > 0)
+            {
+                if let Some(reason) = &ack.refusal {
+                    let now = self.writable(wall_ms)?;
+                    self.connection.execute(
+                        "UPDATE envelopes SET state=?3,body=X'',collect_error=?4,outcome_until=?5
+                         WHERE origin=?1 AND id=?2 AND state='held' AND custody_deadline>?6",
+                        params![
+                            ack.key.origin_node,
+                            ack.key.message_id,
+                            Outcome::Refused.name(),
+                            reason,
+                            now.saturating_add(CUSTODY_TTL_MS),
+                            now
+                        ],
+                    )?;
+                } else {
+                    self.finish(&ack.key, Outcome::Delivered, wall_ms)?;
+                }
+            }
+        }
+        let keys = {
+            let mut stmt = self.connection.prepare("SELECT id FROM envelopes WHERE origin=?1 AND recipient_node=?2 AND request_origin IS NULL AND state='held' ORDER BY id LIMIT 16")?;
+            let rows = stmt
+                .query_map(params![local, hub], |r| {
+                    Ok(MessageKey {
+                        origin_node: local.into(),
+                        message_id: r.get(0)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut outbound = Vec::new();
+        for key in keys {
+            if let Some(record) = self.collection_record(&key, wall_ms)? {
+                if record.remaining_ms > 0 {
+                    outbound.push(crate::mesh::delivery::Deliver {
+                        envelope: record.envelope,
+                        remaining_ms: record.remaining_ms,
+                    });
+                }
+            }
+        }
+        Ok(outbound)
     }
 }
