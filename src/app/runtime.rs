@@ -284,7 +284,7 @@ impl App {
         // mirrored in the headless loop (the #25 dual-loop lesson).
         self.expire_undeliverable_messages();
         self.tick_mesh_collections();
-        self.expire_uplink();
+        self.expire_relayed_entries();
         // ADR-0018 §2: mail that became wakeable since it was queued.
         self.tick_idle_wakes(now);
         // #540: an armed self-compaction's turn boundary, its Enter, or its
