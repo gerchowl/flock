@@ -1,4 +1,4 @@
-//! Mesh delivery and legacy mute deferrals run outside the app loop. Completion returns
+//! Mesh delivery and reply collection run outside the app loop. Completion returns
 //! through the event channel so mailbox evidence and replies stay serialized.
 
 use std::collections::VecDeque;

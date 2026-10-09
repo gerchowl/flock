@@ -1,0 +1,1 @@
+- Hold direct-edge replies and mute deferrals durably for authenticated origin collection, so a recipient can answer an offline sender without its own peer entry; resume collection after restart and fleet pause without duplicate inbox imports (#623)

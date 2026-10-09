@@ -535,6 +535,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgUplinkTake(_) => "msg.uplink_take",
         Method::MeshHello(_) => "mesh.hello",
         Method::MeshDeliver(_) => "mesh.deliver",
+        Method::MeshCollect(_) => "mesh.collect",
         Method::PeersEnrollReset(_) => "peers.enroll_reset",
         Method::PeersEnrollment(_) => "peers.enrollment",
         Method::PeersRelayAttach(_) => "peers.relay_attach",

@@ -152,6 +152,8 @@ pub enum Method {
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.deliver")]
     MeshDeliver(crate::mesh::delivery::Deliver),
+    #[serde(rename = "mesh.collect")]
+    MeshCollect(crate::mesh::collect::Collect),
     #[serde(rename = "peers.enroll_reset")]
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
@@ -2219,6 +2221,9 @@ pub enum ResponseResult {
         path: String,
         encoding: HandoffEncoding,
         content: String,
+    },
+    MeshCollected {
+        answers: Vec<crate::mesh::delivery::Deliver>,
     },
     MeshHello {
         challenge: crate::mesh::hello::Challenge,

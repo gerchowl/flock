@@ -81,6 +81,7 @@ child = subprocess.Popen(
 )
 lock = threading.Lock()
 deliveries = set()
+collections = set()
 
 
 def emit(line):
@@ -104,6 +105,20 @@ def forward_input():
                 continue
             method = request.get("method", "")
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.collect":
+                collections.add(request.get("id"))
+                replay = base / f"replay-collect-{source}-{target}"
+                if replay.exists():
+                    request["params"] = json.loads(replay.read_text())
+                    line = json.dumps(request) + "\n"
+                gate = base / f"gate-collect-ack-{source}-{target}"
+                if gate.is_dir() and request.get("params", {}).get("ack"):
+                    (gate / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while not (gate / "release").exists() and gate.is_dir():
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
             if method == "mesh.deliver":
                 deliveries.add(request.get("id"))
                 if (base / f"spoof-host-{source}-{target}").exists():
@@ -181,6 +196,10 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        if response.get("id") in collections:
+            collections.discard(response.get("id"))
+            if response.get("error"):
+                (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
             deliveries.discard(response.get("id"))
             gate = base / f"lose-receipt-{source}-{target}"

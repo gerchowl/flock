@@ -59,6 +59,156 @@ fn envelope() -> Envelope {
 }
 
 #[test]
+fn collection_is_origin_token_and_request_scoped_and_ack_is_idempotent() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut reply = envelope();
+    reply.request_key = Some(request.key.clone());
+    store
+        .accept(&reply, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let unrelated = envelope();
+    store
+        .accept(&unrelated, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let mut query = crate::mesh::collect::Collect {
+        request: request.key.clone(),
+        token: request.return_binding.collection_token.clone(),
+        ack: vec![],
+    };
+    assert!(store.collect_answers("other.example", &query, 1).is_err());
+    query.token[0] ^= 1;
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 1)
+        .is_err());
+    query.token[0] ^= 1;
+    assert_eq!(
+        store
+            .collect_answers(&request.key.origin_node, &query, 1)
+            .unwrap()[0]
+            .envelope,
+        reply
+    );
+    query.ack = vec![reply.key.clone(), unrelated.key.clone()];
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .is_err());
+    assert_eq!(
+        store.get(&reply.key).unwrap().unwrap().state,
+        "custody",
+        "invalid batch ack is atomic"
+    );
+    query.ack = vec![reply.key.clone()];
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 3)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.get(&unrelated.key).unwrap().unwrap().state, "custody");
+}
+
+#[test]
+fn collection_migration_preserves_existing_writer_generation_and_custody() {
+    let f = Fixture::new();
+    let request = envelope();
+    let mut store = f.open(0);
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    assert_eq!(store.handoff_generation().unwrap(), 1);
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX collect_ready;
+        ALTER TABLE envelopes DROP COLUMN collect_at;
+        ALTER TABLE envelopes DROP COLUMN collect_attempts;
+        PRAGMA user_version=7;",
+        )
+        .unwrap();
+    drop(store);
+    let mut store = f.open(0);
+    assert_eq!(store.handoff_generation().unwrap(), 2);
+    assert_eq!(store.get(&request.key).unwrap().unwrap().envelope, request);
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 0, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&request.key, Outcome::Delivered, 0).unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 0, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    let due = |s: &Store<Disk>| {
+        s.connection
+            .query_row("SELECT collect_at FROM envelopes", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let first = due(&store);
+    assert!((60_000..=61_000).contains(&first));
+    let before = store.connection.total_changes();
+    assert!(store
+        .collect_ready(&request.key.origin_node, first - 1, 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "idle scans must not commit"
+    );
+    store.set_paused(true, 10).unwrap();
+    drop(store);
+    let mut store = f.open(100_000);
+    assert!(store
+        .collect_ready(&request.key.origin_node, 100_000, 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(due(&store), first);
+    store.set_paused(false, 100_000).unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 100_000 + first, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    let second = due(&store);
+    assert!((120_000..=121_000).contains(&(second - first - 10)));
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 100_000 + second, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!((299_000..=300_000).contains(&(due(&store) - second - 10)));
+}
+
+#[test]
 fn durable_acceptance_and_atomic_import_survive_reopen() {
     let f = Fixture::new();
     let e = envelope();
@@ -842,6 +992,9 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
              source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
              public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
              UNIQUE(source,node_id), UNIQUE(source,public_key));
+         DROP INDEX collect_ready;
+         ALTER TABLE envelopes DROP COLUMN collect_at;
+         ALTER TABLE envelopes DROP COLUMN collect_attempts;
          PRAGMA user_version=3;",
         )
         .unwrap();
@@ -997,7 +1150,10 @@ fn version_four_pin_origin_is_unknown_after_migration() {
             "DROP TABLE writer_generation;
         ALTER TABLE identity_pins DROP COLUMN origin;
         INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
-        PRAGMA user_version=4;",
+        DROP INDEX collect_ready;
+         ALTER TABLE envelopes DROP COLUMN collect_at;
+         ALTER TABLE envelopes DROP COLUMN collect_attempts;
+         PRAGMA user_version=4;",
         )
         .unwrap();
     drop(s);

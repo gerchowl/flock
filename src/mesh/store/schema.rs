@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 7;
+pub(super) const VERSION: i64 = 8;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -72,6 +72,15 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if version == 6 {
         tx.execute_batch("CREATE TABLE writer_generation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL); INSERT INTO writer_generation VALUES(1,0);")?;
+        version = 7;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    if version == 7 {
+        tx.execute_batch(
+            "ALTER TABLE envelopes ADD COLUMN collect_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE envelopes ADD COLUMN collect_attempts INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX collect_ready ON envelopes(origin,collect_at,custody_deadline);",
+        )?;
         tx.pragma_update(None, "user_version", VERSION)?;
     }
     tx.commit()?;

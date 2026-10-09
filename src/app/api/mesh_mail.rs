@@ -12,14 +12,18 @@ use crate::mesh::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Payload {
-    message: PendingMessage,
-    peer: Option<String>,
-    host: Option<String>,
-    direct: bool,
+pub(super) struct Payload {
+    pub(super) message: PendingMessage,
+    pub(super) peer: Option<String>,
+    pub(super) host: Option<String>,
+    pub(super) direct: bool,
 }
 
-fn envelope(origin: &str, target: String, payload: &Payload) -> Result<Envelope, String> {
+pub(super) fn envelope(
+    origin: &str,
+    target: String,
+    payload: &Payload,
+) -> Result<Envelope, String> {
     let key = MessageKey::mint(origin.into(), now_ms()).map_err(|e| e.to_string())?;
     let return_binding =
         ReturnBinding::mint(key.clone(), String::new(), Vec::new()).map_err(|e| e.to_string())?;
@@ -37,7 +41,7 @@ fn envelope(origin: &str, target: String, payload: &Payload) -> Result<Envelope,
     })
 }
 
-fn payload(envelope: &Envelope) -> Result<Payload, String> {
+pub(super) fn payload(envelope: &Envelope) -> Result<Payload, String> {
     serde_json::from_slice(&envelope.body).map_err(|e| e.to_string())
 }
 
@@ -86,7 +90,10 @@ impl App {
                     .return_binding
                     .collection_peers
                     .push(pin.node_id.clone());
-                if send.direct {
+                // In-memory uplink mail has no durable spoke-origin binding until 1-H2.
+                // A direct recipient can first appear through down-gossip. The pinned
+                // accepting edge, not the directory snapshot, establishes the binding.
+                if send.from_host == crate::app::short_host_name() {
                     envelope.return_binding.recipient_node = pin.node_id;
                 }
             }
@@ -117,6 +124,14 @@ impl App {
         &mut self,
         message: &mut PendingMessage,
     ) -> Result<(), String> {
+        // Uplink sends are not origin-attested mesh requests until 1-H2.
+        if message
+            .from_host
+            .as_deref()
+            .is_some_and(|host| host != crate::app::short_host_name())
+        {
+            return Ok(());
+        }
         if self.mailboxes.queued_len(&message.to_pane) >= crate::app::mailboxes::MAX_QUEUED_PER_PANE
         {
             return Err("mailbox_full".into());

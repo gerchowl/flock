@@ -143,6 +143,7 @@ pub struct App {
     delivery_attempt_registry: std::cell::RefCell<delivery_attempts::DeliveryAttempts>,
     /// Installed from the API listener during server startup.
     pub(crate) node_id: Option<String>,
+    pub(crate) mesh_collect_at: Option<Instant>,
     pub(crate) mesh_retry_at: Option<Instant>,
     mesh_store_retry_at: Option<Instant>,
     pub(crate) mesh_enrollment_generation: u64,
@@ -929,6 +930,7 @@ impl App {
             restarts: Default::default(),
             event_hub,
             node_id: None,
+            mesh_collect_at: None,
             mesh_retry_at: None,
             mesh_store_retry_at: None,
             mesh_enrollment_generation: 0,

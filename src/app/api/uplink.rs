@@ -162,15 +162,7 @@ impl App {
             take.answer(response);
         }
         let secs = self.uplink_timeout().as_secs();
-        for (mut send, taken) in expired.sends {
-            if let Some(relay) = send.deferral.take() {
-                self.settle_hub_deferral(
-                    *relay,
-                    None,
-                    Err(format!("no answer from the hub within {secs}s")),
-                );
-                continue;
-            }
+        for (send, taken) in expired.sends {
             let message = if taken {
                 format!(
                     "handed up to the hub's relay, but no answer came back within {secs}s — the \
@@ -279,51 +271,6 @@ impl App {
                 path: None,
             },
         ))
-    }
-
-    /// Hand up a message flock itself sends on a spoke's behalf (#410) — a
-    /// mute's deferral reply, today — to the hub, without parking the request
-    /// that produced it. `false` when no hub holds a relay into this server.
-    ///
-    /// `deferral` is the record the hub's answer settles
-    /// ([`Self::settle_hub_deferral`]): delivered is recorded, refused or
-    /// timed out releases the claim so the next mute retries.
-    pub(super) fn hand_up_detached(
-        &mut self,
-        to_agent: &str,
-        message: MsgSendParams,
-        deferral: Option<crate::events::MsgDeferralRelay>,
-    ) -> bool {
-        if !self.uplink_attached() {
-            return false;
-        }
-        let (Some(from_agent), Some(correlation_id)) =
-            (message.from_agent.clone(), message.correlation_id.clone())
-        else {
-            return false;
-        };
-        let frame = UplinkFrame {
-            uplink_id: mint_uplink_id(&correlation_id),
-            message: MsgSendParams {
-                to: MessageTarget::Agent {
-                    agent: to_agent.to_string(),
-                },
-                from_host: Some(crate::app::short_host_name()),
-                ..message
-            },
-        };
-        let now = Instant::now();
-        let mut parked = ParkedSend::new(
-            "detached".into(),
-            correlation_id,
-            from_agent,
-            to_agent.to_string(),
-            now + self.uplink_timeout(),
-        );
-        parked.deferral = deferral.map(Box::new);
-        self.uplink.hand_up_detached(frame, parked);
-        self.feed_parked_take(now);
-        true
     }
 
     /// `peers.relay_attach` — the hub's relay binds this server's uplink to
@@ -449,24 +396,10 @@ impl App {
         if let Some(hub) = self.uplink.enrolled_hub() {
             params.hub = hub;
         }
-        let Some(mut send) = self.uplink.complete(&params.uplink_id) else {
+        let Some(send) = self.uplink.complete(&params.uplink_id) else {
             return encode_success(id, ResponseResult::MsgUplinkResultAck { matched: false });
         };
         let response = self.uplinked_outcome(&send, &params);
-        // #438: a reply to pushed mail settles its original only now, on the
-        // hub's word that the reply went out.
-        if let Some(settle) = send.settles_on_delivery.take() {
-            if params.response.get("error").is_none() {
-                self.settle_original_in(&settle.pane, &settle.correlation_id);
-            }
-        }
-        if let Some(relay) = send.deferral.take() {
-            let outcome = match params.response.get("error") {
-                Some(error) => Err(error.to_string()),
-                None => Ok(()),
-            };
-            self.settle_hub_deferral(*relay, Some(&params.hub), outcome);
-        }
         send.answer(response);
         encode_success(id, ResponseResult::MsgUplinkResultAck { matched: true })
     }
@@ -926,10 +859,10 @@ mod tests {
         assert_eq!(app.uplink.outbound_len(), 0);
     }
 
-    // ---- ADR-0018 §3 over the hub: a failed deferral is retried ----------
+    // Unbound uplink originals cannot fall back to the former reply transport.
 
     /// A spoke with one local pane holding a `needs_reply` from an agent on
-    /// another spoke — unplaceable here, so its deferral must go up the hub.
+    /// another spoke without a mesh return binding.
     /// Returns the muted pane.
     fn spoke_with_a_remote_question(app: &mut crate::app::App, cid: &str) -> String {
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("spoke")];
@@ -968,6 +901,17 @@ mod tests {
             .expect("deferred count")
     }
 
+    #[tokio::test]
+    async fn an_unbound_question_never_sends_a_legacy_deferral() {
+        let mut app = test_app();
+        let _take = attach_relay(&mut app);
+        let pane = spoke_with_a_remote_question(&mut app, "unbound-deferral");
+        assert_eq!(mute_count(&mut app, &pane), 0);
+        assert_eq!(app.uplink.outbound_len(), 0);
+        assert_eq!(deferred_events(&app), 0);
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+    }
+
     fn deferred_events(app: &crate::app::App) -> usize {
         app.event_hub
             .events_after(0)
@@ -979,205 +923,6 @@ mod tests {
                 )
             })
             .count()
-    }
-
-    /// The hub's answer to the oldest waiting frame, from the bound relay.
-    fn hub_answers(app: &mut crate::app::App, response: serde_json::Value) {
-        let uplink_id = app
-            .uplink
-            .complete_peek_for_test()
-            .expect("a frame is waiting");
-        as_relay(
-            app,
-            Request {
-                id: "r".into(),
-                method: Method::MsgUplinkResult(MsgUplinkResultParams {
-                    uplink_id,
-                    hub: "hub".into(),
-                    response,
-                }),
-            },
-        );
-    }
-
-    /// Review of #417: a deferral the hub REFUSES must release its claim, or
-    /// the question is marked answered while its sender heard nothing — and
-    /// the next mute must then actually send it.
-    #[tokio::test]
-    async fn a_deferral_the_hub_refuses_is_retried_by_the_next_mute() {
-        let mut app = test_app();
-        let _take = attach_relay(&mut app);
-        let pane = spoke_with_a_remote_question(&mut app, "c-refused");
-
-        assert_eq!(mute_count(&mut app, &pane), 1, "handed up");
-        assert_eq!(
-            deferred_events(&app),
-            0,
-            "not recorded as sent before the hub says so"
-        );
-        hub_answers(
-            &mut app,
-            serde_json::json!({
-                "id": "uplink-forward",
-                "error": {"code": "peer_unreachable", "message": "hub cannot reach far"},
-            }),
-        );
-        assert_eq!(
-            deferred_events(&app),
-            0,
-            "a refused deferral is not recorded"
-        );
-        assert_eq!(app.uplink.outbound_len(), 0);
-
-        assert_eq!(
-            mute_count(&mut app, &pane),
-            1,
-            "the claim was released, so the next mute owes it again"
-        );
-        assert_eq!(app.uplink.outbound_len(), 1, "and hands it up again");
-
-        // This time the hub delivers: recorded once, and never owed again.
-        hub_answers(
-            &mut app,
-            serde_json::json!({
-                "id": "uplink-forward",
-                "result": {"type": "msg_queued", "correlation_id": "c-refused:deferred",
-                           "state": "relayed", "to_host": "far"},
-            }),
-        );
-        assert_eq!(deferred_events(&app), 1);
-        assert_eq!(mute_count(&mut app, &pane), 0, "answered once, for good");
-    }
-
-    /// The same for a hub that never answers: the uplink timeout releases the
-    /// claim, and the next mute retries. (A hub that took the frame and went
-    /// quiet may have delivered it; the recipient dedupes the retry on the
-    /// deferral's correlation id.)
-    #[tokio::test]
-    async fn a_deferral_the_hub_never_answers_is_retried_by_the_next_mute() {
-        let mut config = Config::default();
-        config.msg.uplink_timeout_secs = 1;
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app =
-            crate::app::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
-        let _take = attach_relay(&mut app);
-        let pane = spoke_with_a_remote_question(&mut app, "c-silent");
-
-        assert_eq!(mute_count(&mut app, &pane), 1);
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        app.expire_uplink();
-        assert_eq!(
-            app.uplink.outbound_len(),
-            0,
-            "the timed-out frame is dropped"
-        );
-        assert_eq!(deferred_events(&app), 0);
-
-        assert_eq!(mute_count(&mut app, &pane), 1, "released, so retried");
-        assert_eq!(app.uplink.outbound_len(), 1);
-    }
-
-    // ---- #438: a reply to pushed mail, handed up, settles on the hub's word
-
-    /// A spoke agent's pane holding a pushed `needs_reply` from an agent on
-    /// another spoke. Answering it can only go up the hub. Returns the pane.
-    fn spoke_agent_with_pushed_question(app: &mut crate::app::App, cid: &str) -> String {
-        app.state.config.msg.channel_push = true;
-        attest_caller(app);
-        let pane_id = app.state.workspaces[0]
-            .focused_pane_id()
-            .expect("workspace has a pane");
-        let pane = app.public_pane_id(0, pane_id).expect("public id");
-        let queued = value(&app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgSend(MsgSendParams {
-                from_agent: Some("agent_far_1".into()),
-                from_host: Some("far".into()),
-                to: MessageTarget::Pane { pane: pane.clone() },
-                correlation_id: Some(cid.into()),
-                ..send_to("unused")
-            }),
-        }));
-        assert_eq!(queued["result"]["state"], "queued", "{queued}");
-        pane
-    }
-
-    /// The agent answers from its own pane, as `flock_msg_reply` would.
-    fn reply_as_agent(app: &mut crate::app::App, cid: &str) -> std::sync::mpsc::Receiver<String> {
-        app.current_api_peer_pid = Some(std::process::id());
-        let rx = via_transport(
-            app,
-            Method::MsgReply(crate::api::schema::MsgReplyParams {
-                correlation_id: cid.into(),
-                body: "answer".into(),
-                intent: MsgIntent::Fyi,
-                reply_correlation_id: None,
-            }),
-        );
-        app.current_api_peer_pid = None;
-        rx
-    }
-
-    fn replied_settles(app: &crate::app::App, cid: &str) -> usize {
-        app.event_hub
-            .events_after(0)
-            .into_iter()
-            .filter(|(_, envelope)| {
-                matches!(
-                    &envelope.data,
-                    crate::api::schema::EventData::MessageDelivered { correlation_id, outcome, .. }
-                        if correlation_id == cid && outcome == "replied"
-                )
-            })
-            .count()
-    }
-
-    /// #446 review: `handed_up` is a stand-in, not an outcome. A reply the
-    /// hub then REFUSES went nowhere, so the pushed original stays unread
-    /// and the wakes keep knocking for it.
-    #[tokio::test]
-    async fn a_handed_up_reply_the_hub_refuses_leaves_the_original_unread() {
-        let mut app = test_app();
-        let _take = attach_relay(&mut app);
-        let pane = spoke_agent_with_pushed_question(&mut app, "c-pushed-refused");
-
-        let _answer = reply_as_agent(&mut app, "c-pushed-refused");
-        assert_eq!(app.uplink.outbound_len(), 1, "the reply went up the hub");
-        assert_eq!(
-            app.mailboxes.queued_len(&pane),
-            1,
-            "nothing settles on the stand-in"
-        );
-
-        hub_answers(
-            &mut app,
-            serde_json::json!({
-                "id": "uplink-forward",
-                "error": {"code": "peer_unreachable", "message": "hub cannot reach far"},
-            }),
-        );
-        assert_eq!(app.mailboxes.queued_len(&pane), 1, "still unread");
-        assert_eq!(replied_settles(&app, "c-pushed-refused"), 0);
-    }
-
-    #[tokio::test]
-    async fn a_handed_up_reply_the_hub_delivers_settles_the_original() {
-        let mut app = test_app();
-        let _take = attach_relay(&mut app);
-        let pane = spoke_agent_with_pushed_question(&mut app, "c-pushed-ok");
-
-        let _answer = reply_as_agent(&mut app, "c-pushed-ok");
-        assert_eq!(app.mailboxes.queued_len(&pane), 1);
-        hub_answers(
-            &mut app,
-            serde_json::json!({
-                "id": "uplink-forward",
-                "result": {"type": "msg_queued", "correlation_id": "r-1",
-                           "state": "relayed", "to_host": "far"},
-            }),
-        );
-        assert_eq!(app.mailboxes.queued_len(&pane), 0, "settled on delivery");
-        assert_eq!(replied_settles(&app, "c-pushed-ok"), 1);
     }
 
     #[tokio::test]

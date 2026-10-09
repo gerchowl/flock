@@ -3,6 +3,7 @@
 //! The caller authenticates origin and return bindings before admission. This
 //! library does no transport, directory lookup, or audit-body publication.
 use super::{clock::Clock, key::MessageKey};
+mod collection;
 mod schema;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
