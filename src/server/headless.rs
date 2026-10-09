@@ -368,6 +368,7 @@ impl HeadlessServer {
         app.node_id = api_server
             .as_ref()
             .and_then(|server| server.node_id.clone());
+        app.restore_mesh_mail().map_err(io::Error::other)?;
         app.clone_detection_warning = api_server
             .as_ref()
             .and_then(|server| server.clone_detection_warning.clone());

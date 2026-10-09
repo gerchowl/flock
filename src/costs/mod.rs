@@ -266,6 +266,7 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                message_key: None,
                 from_agent: None,
                 from_host: None,
                 correlation_id: cid.into(),

@@ -742,7 +742,7 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
         "the forged row never reached the directory: {listing}"
     );
 
-    assert_eq!(queued["state"], "relayed", "send: {queued}");
+    assert_eq!(queued["state"], "delivered", "send: {queued}");
     assert_eq!(
         queued["path"], "via nodeb",
         "the send result says which hub carried it: {queued}"
@@ -937,32 +937,21 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     );
     carol.call_tool("flock_msg_mute", json!({"seconds": 0}));
 
-    // Break the hub's edge to nodec. The failure is nodeb's hop, and the
-    // sender on nodea is told so — which machine could not reach which, and
-    // why — not a generic "not in [[peers]]".
+    // A partition retains custody at the hub and names the queued destination.
     fleet.refuse_ssh_to("nodec");
-    let error = alice.call_tool_error(
+    fleet.kill_edge("nodeb", "nodec", Duration::from_secs(10));
+    let queued = alice.call_tool(
         "flock_msg_send",
         json!({
             "to": {"type": "agent", "agent": carol.agent_id},
-            "body": "this one cannot land",
+            "body": "this one cannot land yet",
             "correlation_id": "c-410-broken",
             "intent": "fyi",
         }),
     );
-    let text = error.to_string();
-    assert!(
-        text.contains("nodeb cannot reach nodec"),
-        "the failure names the hop that broke: {text}"
-    );
-    assert!(
-        text.contains("connection refused"),
-        "and why it broke: {text}"
-    );
-    assert!(
-        !text.contains("[[peers]]"),
-        "never the generic peers refusal: {text}"
-    );
+    assert_eq!(queued["state"], "queued", "{queued}");
+    assert!(queued["warnings"].to_string().contains("nodec"), "{queued}");
+    assert!(queued["message_key"].is_object(), "{queued}");
 }
 
 /// Hold the actual legacy SSH command until another app-loop API responds.
@@ -1025,7 +1014,7 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
         "responsive"
     );
     let sent = send.join().unwrap();
-    assert_eq!(sent["state"], "relayed", "{sent}");
+    assert_eq!(sent["state"], "delivered", "{sent}");
     assert_eq!(sent["correlation_id"], "slow-hop-question");
     let read = bob.call_tool("flock_msg_read", json!({}));
     assert!(read["messages"]

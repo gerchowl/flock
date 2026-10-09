@@ -13,7 +13,7 @@ use crate::app::App;
 /// cross-host send reported "agent lives on agent_bastion_…" with the id in the
 /// host slot. Two functions in one module do not need a wire format between
 /// them.
-enum ResolvedTarget {
+pub(super) enum ResolvedTarget {
     Local(usize, crate::layout::PaneId),
     Remote(Box<crate::app::directory::AgentLocation>),
 }
@@ -27,9 +27,10 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The durable record of a queued message — the mailbox's restart source.
+/// Audit metadata for mesh mail, or the complete legacy event during migration.
 fn queued_event(message: &PendingMessage) -> EventData {
     EventData::MessageQueued {
+        message_key: message.message_key.clone(),
         correlation_id: message.correlation_id.clone(),
         from_pane: message.from_pane.clone(),
         from_agent: message.from_agent.clone(),
@@ -44,7 +45,11 @@ fn queued_event(message: &PendingMessage) -> EventData {
         in_reply_to: message.in_reply_to.clone(),
         enqueued_at_ms: message.enqueued_at_ms,
         intent: message.intent,
-        body: message.body.clone(),
+        body: if message.message_key.is_some() {
+            String::new()
+        } else {
+            message.body.clone()
+        },
     }
 }
 
@@ -357,6 +362,7 @@ impl App {
             warnings.push("intent_unrecognised_read_as_needs_reply".to_string());
         }
         let message = PendingMessage {
+            message_key: None,
             correlation_id: correlation_id.clone(),
             body,
             from_pane,
@@ -544,6 +550,7 @@ impl App {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
         let message = PendingMessage {
+            message_key: None,
             correlation_id: reply_correlation_id.clone(),
             body,
             from_pane,
@@ -642,6 +649,7 @@ impl App {
         encode_success(
             id,
             ResponseResult::MsgQueued {
+                message_key: None,
                 correlation_id: reply_correlation_id,
                 state: "held".into(),
                 warnings: vec![REPLY_HELD_FOR_WAITER.to_string()],
@@ -1108,7 +1116,8 @@ impl App {
                 let Some(to_pane) = self.public_pane_id(ws_idx, pane_id) else {
                     return false;
                 };
-                let deferral = PendingMessage {
+                let mut deferral = PendingMessage {
+                    message_key: None,
                     correlation_id: deferral_correlation_id.clone(),
                     body,
                     from_pane: Some(message.to_pane.clone()),
@@ -1126,6 +1135,15 @@ impl App {
                 // the deferral is `fyi`, so it could not trigger another, but
                 // not having the recursion at all is cheaper than proving it
                 // terminates.
+                if self.node_id.is_some() || !cfg!(test) {
+                    if let Err(reason) = self.persist_local_mail(&mut deferral) {
+                        crate::logging::mesh_custody_failed(
+                            "local_deferral",
+                            super::mesh_mail::error_code(&reason),
+                        );
+                        return false;
+                    }
+                }
                 let event = queued_event(&deferral);
                 match self.mailboxes.enqueue(deferral) {
                     EnqueueOutcome::Queued => self.emit_event(EventEnvelope {
@@ -1343,6 +1361,9 @@ impl App {
         };
 
         let now = now_ms();
+        if let Err(reason) = self.mark_mesh_inbox_read(&pane) {
+            return encode_error(id, super::mesh_mail::error_code(&reason), reason);
+        }
         let mut messages = Vec::new();
         while let Some(message) = self.mailboxes.pop_next(&pane) {
             self.mailboxes.record_delivered(&message);
@@ -1462,10 +1483,8 @@ impl App {
             .as_deref()
             .filter(|explicit| !explicit.trim().is_empty());
 
-        if params.intent.wakes() {
-            self.mailboxes.start_relaying_question(&correlation_id);
-        }
-        self.message_relays.pending = Some(crate::app::message_relay::RelaySend {
+        let mut send = crate::app::message_relay::RelaySend {
+            mesh: None,
             id,
             peer,
             to_agent: to_agent.to_string(),
@@ -1479,7 +1498,14 @@ impl App {
             intent: params.intent,
             settle_original: None,
             respond_to: None,
-        });
+        };
+        if let Err(reason) = self.persist_mesh_send(&mut send, &location.pane_id) {
+            return encode_error(send.id, super::mesh_mail::error_code(&reason), reason);
+        }
+        if send.intent.wakes() {
+            self.mailboxes.start_relaying_question(&send.correlation_id);
+        }
+        self.message_relays.pending = Some(send);
         // The transport parks its responder before the worker is started.
         String::new()
     }
@@ -1489,6 +1515,10 @@ impl App {
         completion: crate::app::message_relay::RelayCompletion,
     ) {
         let crate::app::message_relay::RelayCompletion { send, result } = completion;
+        if send.mesh.is_some() {
+            self.complete_mesh_send(send, result);
+            return;
+        }
         let crate::app::message_relay::RelaySend {
             id,
             peer,
@@ -1506,7 +1536,7 @@ impl App {
             self.mailboxes.finish_relaying_question(&correlation_id);
         }
         let response = match result {
-            Ok(()) => {
+            Ok(_) => {
                 // Without this the sender's durable log has NO record that a
                 // cross-host message was ever sent — the relay path returned
                 // straight to the caller and never reached `queue_message`,
@@ -1533,6 +1563,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        message_key: None,
                         correlation_id,
                         state: "relayed".into(),
                         warnings: Vec::new(),
@@ -1589,7 +1620,7 @@ impl App {
     /// matching on the reported host is exactly why the first live
     /// cross-host send came back "not in this server's [[peers]]". Falls
     /// back to the host for a directory answer that carried no route.
-    fn peer_for_location(
+    pub(super) fn peer_for_location(
         &self,
         location: &crate::app::directory::AgentLocation,
     ) -> Option<crate::config::PeerConfig> {
@@ -1644,7 +1675,7 @@ impl App {
     /// message is actually in the mailbox: the blocking budget is spent, a
     /// muted recipient's disagreement reaches the operator, and the attention
     /// surface learns the pane has mail waiting on it.
-    fn queue_message_tiered(
+    pub(super) fn queue_message_tiered(
         &mut self,
         id: String,
         message: PendingMessage,
@@ -1750,6 +1781,24 @@ impl App {
 
     /// Settle `correlation_id` out of `pane`'s inbox as answered.
     pub(super) fn settle_original_in(&mut self, pane: &str, correlation_id: &str) {
+        if let Some(key) = self
+            .mailboxes
+            .queued_message(correlation_id)
+            .filter(|m| m.to_pane == pane)
+            .and_then(|m| m.message_key.clone())
+        {
+            if let Err(reason) = crate::mesh::hello::with_store(|store| {
+                store
+                    .finish(&key, crate::mesh::store::Outcome::Read, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            }) {
+                crate::logging::mesh_custody_failed(
+                    "settle",
+                    super::mesh_mail::error_code(&reason),
+                );
+                return;
+            }
+        }
         let Some(message) = self.mailboxes.take_queued(pane, correlation_id) else {
             return;
         };
@@ -1825,9 +1874,15 @@ impl App {
     fn queue_message(
         &mut self,
         id: String,
-        message: PendingMessage,
+        mut message: PendingMessage,
         warnings: Vec<String>,
     ) -> String {
+        if (self.node_id.is_some() || !cfg!(test)) && message.message_key.is_none() {
+            if let Err(reason) = self.persist_local_mail(&mut message) {
+                return encode_error(id, super::mesh_mail::error_code(&reason), reason);
+            }
+        }
+        let message_key = message.message_key.clone();
         let correlation_id = message.correlation_id.clone();
         let to_pane = message.to_pane.clone();
         let event = queued_event(&message);
@@ -1852,6 +1907,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        message_key: message_key.clone(),
                         correlation_id,
                         state: "queued".into(),
                         warnings,
@@ -1863,6 +1919,7 @@ impl App {
             EnqueueOutcome::Duplicate => encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    message_key: message_key.clone(),
                     correlation_id,
                     state: "duplicate".into(),
                     warnings,
@@ -1887,7 +1944,7 @@ impl App {
             .or_else(|| ws.git_space().map(|space| space.label.clone()))
     }
 
-    fn resolve_message_target(
+    pub(super) fn resolve_message_target(
         &mut self,
         target: &MessageTarget,
     ) -> Result<ResolvedTarget, (&'static str, String)> {
@@ -1984,6 +2041,7 @@ impl App {
     /// bare shell prompt. A pull inbox has no such hazards, so what remains is
     /// the one thing still time-based — the TTL sweep.
     pub(crate) fn expire_undeliverable_messages(&mut self) {
+        self.retry_mesh_mail();
         // US-9 (#175 S3 commit 3): fleet pause halts the mailbox clock, so a
         // paused fleet does not quietly age messages out.
         if self.fleet_pause.paused {
@@ -1992,6 +2050,18 @@ impl App {
         let now = now_ms();
         let mut dropped_any = false;
         for expired in self.mailboxes.expire(now) {
+            if let Some(key) = &expired.message_key {
+                if crate::mesh::hello::with_store(|store| {
+                    store
+                        .finish(key, crate::mesh::store::Outcome::InboxExpired, now as i64)
+                        .map_err(|e| e.to_string())
+                })
+                .is_err()
+                {
+                    self.mailboxes.enqueue(expired);
+                    continue;
+                }
+            }
             self.emit_event(EventEnvelope {
                 event: EventKind::MessageDelivered,
                 data: EventData::MessageDelivered {
@@ -3179,6 +3249,7 @@ mod tests {
         // ORIGINAL sender, so the exchange has to start from the other pane.
         app.mailboxes
             .enqueue(crate::app::mailboxes::PendingMessage {
+                message_key: None,
                 correlation_id: "c-orig".into(),
                 body: "which sigma governs the fits?".into(),
                 from_pane: Some(answerer.clone()),
@@ -3224,6 +3295,7 @@ mod tests {
             let answerer = pane_target(&app, 1);
             app.mailboxes
                 .enqueue(crate::app::mailboxes::PendingMessage {
+                    message_key: None,
                     correlation_id: "c-pushed".into(),
                     body: "ready to merge?".into(),
                     from_pane: Some(asker.clone()),
@@ -3325,7 +3397,7 @@ mod tests {
             app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
                 send: attempts.pop().unwrap(),
                 result: if succeeds {
-                    Ok(())
+                    Ok(true)
                 } else {
                     Err(crate::peers::PeerMessageFailure::Unreachable(
                         "timeout".into(),
@@ -3384,7 +3456,7 @@ mod tests {
                 app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
                     send: relay,
                     result: if succeeds {
-                        Ok(())
+                        Ok(true)
                     } else {
                         Err(crate::peers::PeerMessageFailure::Refused(
                             "remote refusal".into(),
@@ -3427,6 +3499,7 @@ mod tests {
         // vehicle here, but since #576 that reply is held, not refused.)
         app.mailboxes
             .enqueue(crate::app::mailboxes::PendingMessage {
+                message_key: None,
                 correlation_id: "c-anon".into(),
                 body: "who sent this?".into(),
                 from_pane: Some("w404:p9".into()),
@@ -3474,6 +3547,7 @@ mod tests {
         let answerer = pane_target(&app, 1);
         app.mailboxes
             .enqueue(crate::app::mailboxes::PendingMessage {
+                message_key: None,
                 correlation_id: "c-theirs".into(),
                 body: "for the answerer only".into(),
                 from_pane: Some(asker.clone()),

@@ -2,19 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::api::schema::{EventData, EventEnvelope, MsgIntent};
 
-/// Per-pane message queues (#175 M1). The durable event log (ADR-0005) is
-/// the source of truth: every admit emits `MessageQueued`, every settle
-/// emits `MessageDelivered`, and [`MailboxRegistry::seed_from_events`]
-/// reconstructs undelivered queues plus the dedupe set at boot — that is
-/// the at-least-once + dedupe-across-restarts contract (§8.4, §8.6).
-/// Queues are keyed by the recipient's *public pane id*, the identity that
-/// survives restarts; panes are re-resolved at drain time.
+/// In-memory projection of per-pane mail. Mesh custody and deduplication live
+/// in the SQLite store, which rebuilds this projection at server startup.
+/// `seed_from_events` stages legacy queued messages for the one-time import.
 ///
-/// Dedupe is BOUNDED, not eternal: the seen-set holds the newest
-/// `MAX_SEEN` correlation ids (and the boot seed only sees what log
-/// rotation kept), so a duplicate older than both windows can be accepted
-/// again. Evicting a seen id also drops its reply-routing history — replies
-/// to sufficiently old messages return `message_not_found`.
+/// Legacy messages still use the bounded correlation seen-set. Mesh imports
+/// are deduplicated by their immutable message key before reaching enqueue,
+/// so distinct sends may share a caller-selected correlation id.
 #[derive(Default)]
 pub(crate) struct MailboxRegistry {
     queues: HashMap<String, VecDeque<PendingMessage>>,
@@ -122,8 +116,10 @@ impl BlockingMail {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingMessage {
+    #[serde(default)]
+    pub message_key: Option<crate::mesh::key::MessageKey>,
     pub correlation_id: String,
     pub body: String,
     pub from_pane: Option<String>,
@@ -192,6 +188,7 @@ impl MailboxRegistry {
         for envelope in events {
             match &envelope.data {
                 EventData::MessageQueued {
+                    message_key,
                     correlation_id,
                     from_pane,
                     from_repo,
@@ -205,10 +202,14 @@ impl MailboxRegistry {
                     intent,
                     ..
                 } => {
+                    if message_key.is_some() {
+                        continue;
+                    }
                     self.mark_seen(correlation_id.clone());
                     queued.insert(
                         correlation_id.clone(),
                         PendingMessage {
+                            message_key: None,
                             correlation_id: correlation_id.clone(),
                             body: body.clone(),
                             from_pane: from_pane.clone(),
@@ -361,8 +362,19 @@ impl MailboxRegistry {
             .push_back(now_ms);
     }
 
+    pub(crate) fn pending_messages(&self) -> Vec<PendingMessage> {
+        self.queues
+            .values()
+            .flat_map(|queue| queue.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn clear_queued_projection(&mut self) {
+        self.queues.clear();
+    }
+
     pub(crate) fn enqueue(&mut self, message: PendingMessage) -> EnqueueOutcome {
-        if self.seen.contains(&message.correlation_id) {
+        if message.message_key.is_none() && self.seen.contains(&message.correlation_id) {
             return EnqueueOutcome::Duplicate;
         }
         if self
@@ -848,6 +860,7 @@ mod tests {
 
     fn message(correlation: &str, to: &str) -> PendingMessage {
         PendingMessage {
+            message_key: None,
             from_agent: None,
             from_host: None,
             correlation_id: correlation.into(),
@@ -867,6 +880,7 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                message_key: None,
                 from_agent: None,
                 from_host: None,
                 correlation_id: message.correlation_id.clone(),

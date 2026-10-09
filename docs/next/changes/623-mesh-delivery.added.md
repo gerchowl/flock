@@ -1,0 +1,1 @@
+- Persist message custody before acknowledging sends, return server-minted message keys, deliver over authenticated mesh edges with transactional inbox deduplication, retry queued mail after restart, and rebuild mailboxes from the custody store; incompatible peers retain queued mail with an upgrade warning (#623)

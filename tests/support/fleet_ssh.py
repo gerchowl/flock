@@ -80,6 +80,7 @@ child = subprocess.Popen(
     stdout=subprocess.PIPE, text=True, bufsize=1,
 )
 lock = threading.Lock()
+deliveries = set()
 
 
 def emit(line):
@@ -102,7 +103,17 @@ def forward_input():
                 child.stdin.flush()
                 continue
             method = request.get("method", "")
-            mode = node["mesh"]
+            mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.deliver":
+                deliveries.add(request.get("id"))
+                gate = base / f"gate-message-{source}-{target}"
+                if gate.is_dir():
+                    (gate / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while not (gate / "release").exists():
+                        if not gate.is_dir() or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
             if isinstance(method, str) and method.startswith("mesh.") and mode == "disabled":
                 emit(json.dumps({"id": request.get("id"), "error": {
                     "code": "invalid_request", "message": f"unknown variant `{method}`",
@@ -143,6 +154,16 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        if response.get("id") in deliveries:
+            deliveries.discard(response.get("id"))
+            gate = base / f"lose-receipt-{source}-{target}"
+            if gate.exists() and response.get("result", {}).get("state") == "delivered":
+                gate.rename(base / f"lost-receipt-{source}-{target}")
+                line = json.dumps({"id": response["id"], "error": {
+                    "code": "lost_receipt", "message": "receipt lost after inbox commit",
+                }}) + "\n"
+            elif response.get("result", {}).get("state") == "duplicate":
+                (base / f"delivered-receipt-{source}-{target}").touch()
         emit(line)
     sys.exit(child.wait())
 finally:

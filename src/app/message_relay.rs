@@ -36,6 +36,7 @@ pub(crate) struct MessageRelays {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RelaySend {
+    pub mesh: Option<crate::mesh::delivery::Deliver>,
     pub id: String,
     pub peer: crate::config::PeerConfig,
     pub to_agent: String,
@@ -54,7 +55,13 @@ pub(crate) struct RelaySend {
 #[derive(Debug)]
 pub(crate) struct RelayCompletion {
     pub send: RelaySend,
-    pub result: Result<(), crate::peers::PeerMessageFailure>,
+    pub result: Result<bool, crate::peers::PeerMessageFailure>,
+}
+
+impl MessageRelays {
+    pub fn is_idle(&self) -> bool {
+        self.running == 0 && self.waiting.is_empty()
+    }
 }
 
 impl RelaySend {
@@ -72,16 +79,22 @@ impl RelaySend {
     }
 
     pub fn run(self) -> AppEvent {
-        let result = crate::peers::send_peer_message(
-            &self.peer,
-            &self.to_agent,
-            &self.from_agent,
-            &self.from_host,
-            &self.body,
-            &self.correlation_id,
-            self.in_reply_to.as_deref(),
-            self.intent,
-        );
+        let result = if let Some(delivery) = &self.mesh {
+            crate::mesh::delivery::send(&self.peer, delivery)
+                .map_err(crate::peers::PeerMessageFailure::Unreachable)
+        } else {
+            crate::peers::send_peer_message(
+                &self.peer,
+                &self.to_agent,
+                &self.from_agent,
+                &self.from_host,
+                &self.body,
+                &self.correlation_id,
+                self.in_reply_to.as_deref(),
+                self.intent,
+            )
+            .map(|()| true)
+        };
         AppEvent::MsgRelayCompleted(Box::new(RelayCompletion { send: self, result }))
     }
 }
@@ -179,6 +192,7 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             replies.push(rx);
             let relay = RelaySend {
+                mesh: None,
                 id: format!("request-{index}"),
                 peer: crate::config::PeerConfig::default(),
                 // An invalid agent id is refused before any SSH is started.

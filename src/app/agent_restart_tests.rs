@@ -892,6 +892,7 @@ async fn restart_messages_detach_leftover_relays_before_the_next_request() {
         crate::api::EventHub::default(),
     );
     app.message_relays.pending = Some(crate::app::message_relay::RelaySend {
+        mesh: None,
         id: "detached".into(),
         peer: crate::config::PeerConfig::default(),
         // Refused locally, without dialing a peer.

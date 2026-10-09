@@ -526,6 +526,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgMute(_) => "msg.mute",
         Method::MsgUplinkTake(_) => "msg.uplink_take",
         Method::MeshHello(_) => "mesh.hello",
+        Method::MeshDeliver(_) => "mesh.deliver",
         Method::PeersEnrollReset(_) => "peers.enroll_reset",
         Method::PeersEnrollment(_) => "peers.enrollment",
         Method::PeersRelayAttach(_) => "peers.relay_attach",
@@ -1341,6 +1342,7 @@ mod tests {
         crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::MessageQueued,
             data: crate::api::schema::EventData::MessageQueued {
+                message_key: None,
                 correlation_id: correlation_id.into(),
                 from_pane: Some("ws_1:p9".into()),
                 from_agent: None,
