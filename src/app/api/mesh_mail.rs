@@ -399,6 +399,9 @@ impl App {
         self.node_id = server.and_then(|server| server.node_id.clone());
         self.clone_detection_warning =
             server.and_then(|server| server.clone_detection_warning.clone());
+        if crate::mesh::runtime_store::suspended()? {
+            return Ok(());
+        }
         self.restore_mesh_mail()
     }
 
@@ -462,11 +465,29 @@ impl App {
                 .mailbox_keys()
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .map(|key| store.get(&key).map_err(|e| e.to_string()))
+                .map(|key| match store.get(&key) {
+                    Err(crate::mesh::store::Error::Json(_)) => {
+                        store.quarantine(&key).map_err(|e| e.to_string())?;
+                        crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                        Ok(None)
+                    }
+                    result => result.map_err(|e| e.to_string()),
+                })
                 .collect::<Result<Vec<_>, _>>()
         })?;
         for record in records.into_iter().flatten() {
-            let mut data = payload(&record.envelope)?;
+            let mut data = match payload(&record.envelope) {
+                Ok(data) => data,
+                Err(_) => {
+                    with_store(|store| {
+                        store
+                            .quarantine(&record.envelope.key)
+                            .map_err(|e| e.to_string())
+                    })?;
+                    crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                    continue;
+                }
+            };
             if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
                 data.message.from_host = with_store(|store| {
                     store
@@ -496,6 +517,15 @@ impl App {
     }
 
     pub(super) fn retry_mesh_mail(&mut self) {
+        if crate::mesh::runtime_store::recovery_reason().is_some() {
+            if self
+                .mesh_store_retry_at
+                .is_none_or(|at| std::time::Instant::now() >= at)
+            {
+                self.resume_mesh_store(0);
+            }
+            return;
+        }
         if self.node_id.is_none() {
             return;
         }

@@ -44,6 +44,8 @@ pub(crate) struct HandoffManifest {
     pub version: u32,
     pub source_version: String,
     pub source_protocol: u32,
+    #[serde(default)]
+    pub store_generation: u64,
     pub expected_version: Option<String>,
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
@@ -479,6 +481,7 @@ pub(crate) fn manifest_for(
         version: HANDOFF_VERSION,
         source_version: crate::build_info::version(),
         source_protocol: crate::protocol::PROTOCOL_VERSION,
+        store_generation: 0,
         expected_version,
         expected_protocol,
         snapshot,

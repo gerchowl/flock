@@ -239,7 +239,8 @@ impl App {
             .iter()
             .map(crate::peer_stream::enrollment)
             .collect();
-        if !peers.is_empty() {
+        let mesh_suspended_reason = crate::mesh::runtime_store::recovery_reason();
+        if !peers.is_empty() && mesh_suspended_reason.is_none() {
             let result = hello::with_store(|store| {
                 for peer in &mut peers {
                     peer.pin_origin = store
@@ -269,6 +270,12 @@ impl App {
             }
             peers.push(inbound);
         }
-        encode_success(id, ResponseResult::PeersEnrollment { peers })
+        encode_success(
+            id,
+            ResponseResult::PeersEnrollment {
+                peers,
+                mesh_suspended_reason,
+            },
+        )
     }
 }

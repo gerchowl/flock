@@ -836,7 +836,8 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
     let s = f.open(0);
     s.connection
         .execute_batch(
-            "DROP TABLE identity_pins;
+            "DROP TABLE writer_generation;
+         DROP TABLE identity_pins;
          CREATE TABLE identity_pins (
              source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
              public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
@@ -993,7 +994,8 @@ fn version_four_pin_origin_is_unknown_after_migration() {
     let s = f.open(0);
     s.connection
         .execute_batch(
-            "ALTER TABLE identity_pins DROP COLUMN origin;
+            "DROP TABLE writer_generation;
+        ALTER TABLE identity_pins DROP COLUMN origin;
         INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
         PRAGMA user_version=4;",
         )

@@ -84,18 +84,24 @@ fn peers_enroll(args: &[String]) -> std::io::Result<i32> {
 pub(super) const ENROLLMENT_UNKNOWN: &str =
     "enrollment: unknown (server predates mesh; restart needed)";
 
-pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<&'static str>) {
-    let peers = super::send_request(&Request {
+pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<String>) {
+    let response = super::send_request(&Request {
         id: "cli:peers:enrollment".into(),
         method: Method::PeersEnrollment(EmptyParams {}),
     })
     .ok()
-    .filter(|response| response.get("error").is_none())
-    .and_then(|response| serde_json::from_value(response["result"]["peers"].clone()).ok());
-    match peers {
-        Some(peers) => (peers, None),
-        None => (Vec::new(), Some(ENROLLMENT_UNKNOWN)),
+    .filter(|response| response.get("error").is_none());
+    if let Some(response) = response {
+        if let Ok(peers) = serde_json::from_value(response["result"]["peers"].clone()) {
+            let warning = response["result"]["mesh_suspended_reason"]
+                .as_str()
+                .map(|reason| {
+                    format!("mesh: suspended: {} (retrying recovery)", printable(reason))
+                });
+            return (peers, warning);
+        }
     }
+    (Vec::new(), Some(ENROLLMENT_UNKNOWN.into()))
 }
 
 pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String {

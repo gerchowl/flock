@@ -144,6 +144,7 @@ pub struct App {
     /// Installed from the API listener during server startup.
     pub(crate) node_id: Option<String>,
     pub(crate) mesh_retry_at: Option<Instant>,
+    mesh_store_retry_at: Option<Instant>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_pause_seen: Option<bool>,
     pub(crate) mesh_maintenance_at: Option<Instant>,
@@ -929,6 +930,7 @@ impl App {
             event_hub,
             node_id: None,
             mesh_retry_at: None,
+            mesh_store_retry_at: None,
             mesh_enrollment_generation: 0,
             mesh_pause_seen: None,
             mesh_maintenance_at: None,
@@ -1002,6 +1004,25 @@ impl App {
         } else {
             None
         };
+    }
+
+    /// Reopen custody only after ownership commits, or the exporter rolls back.
+    pub(crate) fn resume_mesh_store(&mut self, minimum: u64) {
+        let result =
+            crate::mesh::runtime_store::resume(minimum).and_then(|()| self.restore_mesh_mail());
+        match result {
+            Ok(()) => {
+                crate::mesh::runtime_store::recovered();
+                self.mesh_retry_at = None;
+                self.mesh_maintenance_at = None;
+                self.mesh_store_retry_at = None;
+            }
+            Err(reason) => {
+                crate::logging::mesh_store_suspended(&reason);
+                crate::mesh::runtime_store::failed(reason);
+                self.mesh_store_retry_at = Some(Instant::now() + Duration::from_secs(5));
+            }
+        }
     }
 
     #[cfg(unix)]
