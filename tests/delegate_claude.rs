@@ -380,6 +380,12 @@ fn report(server: &Server, pane_id: &str, state: &str) {
             server,
             &format!(r#"{{"id":"ag","method":"agent.get","params":{{"target":"{pane_id}"}}}}"#),
         );
+        // Callers already observed registration. A missing agent here has
+        // disappeared, so waiting for another status cannot make progress.
+        if got.get("error").is_some() {
+            let agents = request(server, r#"{"id":"al","method":"agent.list","params":{}}"#);
+            panic!("pane {pane_id} cannot show {state}: {got}; agent.list: {agents}");
+        }
         let status = got["result"]["agent"]["agent_status"]
             .as_str()
             .unwrap_or("");
@@ -389,29 +395,6 @@ fn report(server: &Server, pane_id: &str, state: &str) {
         assert!(
             Instant::now() < deadline,
             "pane {pane_id} never showed {state}: {got}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Draw an arbitrary screen and wait until flock reports `blocked`.
-fn report_blocked_screen(server: &Server, pane_id: &str, screen: &str) {
-    fs::write(server.base.join("screen"), screen).unwrap();
-    let deadline = Instant::now() + WITHIN;
-    loop {
-        let got = request(
-            server,
-            &format!(r#"{{"id":"ag","method":"agent.get","params":{{"target":"{pane_id}"}}}}"#),
-        );
-        let status = got["result"]["agent"]["agent_status"]
-            .as_str()
-            .unwrap_or("");
-        if status == "blocked" {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "pane {pane_id} never showed blocked on the drawn screen: {got}"
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -749,15 +732,24 @@ fn c2_claude_trust_dialog_is_refused_and_nothing_is_typed() {
             "--json",
         ],
     );
-    let pane = delegate_pane(&server, "w1");
-    report_blocked_screen(
-        &server,
-        &pane,
-        &trust_dialog(&checkout.display().to_string()),
-    );
+    delegate_pane(&server, "w1");
+    // Refusal rolls the pane back as soon as the dialog is detected. Wait for
+    // the command's outcome, since the blocked state may already be gone.
+    fs::write(
+        server.base.join("screen"),
+        trust_dialog(&checkout.display().to_string()),
+    )
+    .unwrap();
 
-    let status = exited_within(&mut child, WITHIN).expect("the start refuses");
+    let status = exited_within(&mut child, WITHIN);
     let out = finish(child);
+    assert!(
+        status.is_some(),
+        "the start did not refuse: {}; agent.list: {}",
+        stderr(&out),
+        request(&server, r#"{"id":"al","method":"agent.list","params":{}}"#)
+    );
+    let status = status.unwrap();
     assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
     let message = stderr(&out);
     assert!(
@@ -915,4 +907,36 @@ fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
     assert!(typed(&server).is_empty());
     let list = cli(&server, &["delegate", "list", "--json"]);
     assert!(!stdout(&list).contains("refused"), "{}", stdout(&list));
+}
+
+#[test]
+fn report_a_removed_agent_fails_with_the_agent_list() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_claude(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let started = stdout_json(&out);
+    let ws = started["workspace_id"].as_str().unwrap();
+    let closed = request(
+        &server,
+        &format!(r#"{{"id":"wc","method":"workspace.close","params":{{"workspace_id":"{ws}"}}}}"#),
+    );
+    assert!(closed.get("error").is_none(), "workspace.close: {closed}");
+
+    let began = Instant::now();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        report(&server, &pane, "idle");
+    }))
+    .expect_err("a removed agent cannot become idle");
+    let message = failure.downcast_ref::<String>().expect("panic diagnostic");
+    assert!(message.contains("agent_not_found"), "{message}");
+    assert!(message.contains("agent.list:"), "{message}");
+    assert!(
+        began.elapsed() < WITHIN,
+        "must fail before the status deadline"
+    );
 }
