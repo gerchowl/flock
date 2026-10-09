@@ -117,6 +117,7 @@ impl Conversation {
                 .any(|entry| entry["agent_id"] == receiver.id)
                 .then_some(())
         });
+        fleet.wait_route("nodea", "nodeb", true);
         Self {
             fleet,
             sender,
@@ -593,7 +594,7 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
 }
 
 #[test]
-fn multihop_chain_is_refused_with_forward_limit() {
+fn multihop_chain_is_delivered_once() {
     let fleet = fleet::spawn(
         "s1chain",
         &[
@@ -625,48 +626,18 @@ fn multihop_chain_is_refused_with_forward_limit() {
             "not forwarded",
         ],
     );
-    assert_eq!(sent["state"], "refused", "{sent}");
     assert!(
-        sent["warnings"].to_string().contains("forward_limit"),
+        matches!(sent["state"].as_str(), Some("queued" | "delivered")),
         "{sent}"
     );
-    assert_eq!(
-        state(fleet.node("nodea"), "too-far", "refused")["detail"],
-        "forward_limit"
-    );
-    let refused = audit_event(
-        fleet.node("nodea"),
-        "message_delivered",
-        "correlation_id",
-        "too-far",
-    );
-    assert_eq!(refused["envelope"]["data"]["delivered"], false);
-    assert_eq!(
-        refused["envelope"]["data"]["outcome"],
-        "refused: forward_limit"
-    );
-    let attempts = delivery_attempts(&fleet, "nodea", "nodeb", "too-far");
-    assert_eq!(attempts, 1);
-    // A retryable probe proves the retry worker actually ran after due().
-    std::fs::write(fleet.base.join("transient-delivery-nodea-nodeb"), "").unwrap();
-    let probe = api(
-        fleet.node("nodea"),
-        "msg.send",
-        json!({
-            "to":{"type":"agent","agent":recipient.id}, "from_agent":sender.id,
-            "body":"retry probe", "correlation_id":"retry-probe", "intent":"fyi"
-        }),
-    );
-    assert_eq!(probe["state"], "queued");
-    due(fleet.node("nodea"));
-    fleet::wait_until("forced retry worker attempt", DEADLINE, || {
-        (delivery_attempts(&fleet, "nodea", "nodeb", "retry-probe") >= 2).then_some(())
+    let messages = fleet::wait_until("forwarded request", DEADLINE, || {
+        let messages = read(fleet.node("nodec"), &recipient.pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
     });
-    assert_eq!(
-        delivery_attempts(&fleet, "nodea", "nodeb", "too-far"),
-        attempts
-    );
-    assert_eq!(status(fleet.node("nodea"), "too-far")["state"], "refused");
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["correlation_id"], "too-far");
+    due(fleet.node("nodea"));
+    due(fleet.node("nodeb"));
     assert_eq!(read(fleet.node("nodec"), &recipient.pane), json!([]));
 }
 
@@ -679,6 +650,7 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
     ]);
     cut(&conversation.fleet, "nodea", "nodeb");
     assert_eq!(conversation.send()["state"], "queued");
+
     conversation
         .fleet
         .node_mut("nodeb")
@@ -726,6 +698,13 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
         ],
     );
     assert_eq!(sent["state"], "queued");
+    fleet::wait_until("probe delivery held and retry scheduled", DEADLINE, || {
+        let captured: Value = serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()?;
+        let scheduled: bool = db(origin).query_row(
+            "SELECT retry_at>0 AND lease_until<=retry_at FROM envelopes WHERE correlation='retry-probe'",
+            [], |row| row.get(0)).ok()?;
+        (captured["envelope"]["correlation_id"] == "retry-probe" && scheduled).then_some(())
+    });
     assert_eq!(
         delivery_attempts(&conversation.fleet, "nodea", "nodec", "retry-probe"),
         1
@@ -749,6 +728,7 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
         )
         .unwrap();
     assert_eq!(retained, "custody");
+
     assert_eq!(
         read(
             conversation.fleet.node("nodeb"),
@@ -1446,7 +1426,7 @@ fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
 }
 
 #[test]
-fn answer_with_wrong_collection_token_is_rejected() {
+fn answer_signature_covers_the_collection_token() {
     let conversation = Conversation::new(SPOKE);
     conversation.send();
     conversation.read_question();
@@ -1476,6 +1456,10 @@ fn answer_with_wrong_collection_token_is_rejected() {
         json!([])
     );
     std::fs::remove_file(replay).unwrap();
-    due(hub);
+    state(hub, correlation, "refused");
+    let refused = status(hub, correlation);
+    assert_eq!(refused["detail"], "invalid_signature");
+    // A terminally refused immutable answer requires a new message key.
+    conversation.reply();
     conversation.answer_once();
 }

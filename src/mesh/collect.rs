@@ -83,6 +83,12 @@ pub struct OutboundAck {
     pub key: MessageKey,
     pub token: Vec<u8>,
     pub refusal: Option<String>,
+    #[serde(default = "delivered_by_default")]
+    pub delivered: bool,
+}
+
+fn delivered_by_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -171,6 +177,7 @@ fn decode(raw: &str) -> Result<Batch, String> {
                     ),
                 ) {
                     batch.quarantined.push(OutboundAck {
+                        delivered: false,
                         key,
                         token,
                         refusal: Some("invalid_envelope".into()),

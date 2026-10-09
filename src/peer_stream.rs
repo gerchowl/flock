@@ -625,6 +625,11 @@ pub(crate) fn enrollment_generation() -> u64 {
     ENROLLMENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+pub(crate) fn test_enroll(peer: &PeerConfig, node: &str) {
+    set_enrollment(peer, Ok(node.into()));
+}
+
 fn set_enrollment(peer: &PeerConfig, result: Result<String, EnrollmentError>) {
     let (node_id, reason, state) = match result {
         Ok(node) => (Some(node), None, "pinned"),

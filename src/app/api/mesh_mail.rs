@@ -98,18 +98,11 @@ impl App {
 
     pub(super) fn persist_mesh_send(
         &mut self,
-        peer: &crate::config::PeerConfig,
+        owner: &str,
+        next: &super::mesh_forward::NextHop,
         to_agent: &str,
         data: &Payload,
     ) -> Result<Deliver, String> {
-        // Pure App fixtures have no server identity or filesystem store.
-        #[cfg(test)]
-        if self.node_id.is_none() {
-            return Ok(Deliver {
-                envelope: envelope("nodea", to_agent.to_string(), data)?,
-                remaining_ms: CUSTODY_TTL_MS,
-            });
-        }
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
@@ -117,32 +110,33 @@ impl App {
             .node_id
             .as_deref()
             .ok_or("mesh node identity unavailable")?;
-        let mut envelope = envelope(origin, to_agent.to_string(), data)?;
-        with_store(|store| {
-            if let Some(pin) = store.get_pin(&peer.name).map_err(|e| e.to_string())? {
-                envelope
-                    .return_binding
-                    .collection_peers
-                    .push(pin.node_id.clone());
-                envelope.return_binding.recipient_node = pin.node_id;
-            }
-            Ok(())
-        })?;
+        let mut envelope = envelope(origin, to_agent.into(), data)?;
+        envelope.return_binding.recipient_node = owner.into();
+        envelope.return_binding.collection_peers = vec![owner.into()];
+        let identity = crate::mesh::identity::NodeIdentity::load().map_err(|e| e.to_string())?;
+        crate::mesh::sign::seal(&mut envelope, &identity);
+        let hops_left = crate::mesh::delivery::hop_limit();
         with_store(|store| {
             store
-                .accept(
+                .accept_origin(
                     &envelope,
-                    CUSTODY_TTL_MS,
-                    Admission::Custody,
+                    &next.node,
+                    next.admission(),
+                    hops_left,
                     now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())?;
-            store
-                .schedule_retry(&envelope.key, 60_000, now_ms() as i64)
-                .map_err(|e| e.to_string())
+            if next.peer.is_some() {
+                store
+                    .schedule_retry(&envelope.key, 60_000, now_ms() as i64)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
         })?;
         self.mesh_retry_at = None;
         Ok(Deliver {
+            visited: vec![origin.into()],
+            hops_left,
             envelope,
             remaining_ms: CUSTODY_TTL_MS,
         })
@@ -236,41 +230,33 @@ impl App {
             .map(|edge| &edge.enrollment)
             .filter(|edge| edge.state == "pinned")
             .ok_or("mesh edge is not enrolled")?;
-        let envelope = &delivery.envelope;
-        if edge.node_id.as_deref() != Some(envelope.key.origin_node.as_str()) {
-            crate::logging::mesh_custody_failed("import", "origin_mismatch");
-            return Err("origin_mismatch".into());
-        }
-        self.import_attested_mesh_mail(delivery)
+        let upstream = edge.node_id.clone().ok_or("mesh edge is not enrolled")?;
+        self.import_attested_mesh_mail(delivery, &upstream)
     }
 
     pub(super) fn import_attested_mesh_mail(
         &mut self,
         delivery: &Deliver,
+        upstream: &str,
     ) -> Result<(Accepted, bool), String> {
-        if self.fleet_pause.paused {
-            return Err("fleet_paused".into());
-        }
+        let sender_host = self.check_mesh_import(delivery, upstream)?;
         let envelope = &delivery.envelope;
-        let sender_host = with_store(|store| {
-            store
-                .origin_name(&envelope.key.origin_node)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "origin_mismatch".into())
-        })?;
-        if !self.state.config.msg.accepts_from(Some(&sender_host)) {
-            return Err("msg_not_allowed".into());
+        if envelope.kind == crate::mesh::store::Kind::Receipt {
+            return self.import_mesh_receipt(envelope);
         }
         if let Some(request) = &envelope.request_key {
             self.import_mesh_answer(request, delivery, None)?;
             return Ok((Accepted::New, true));
         }
-        let mut data = payload(envelope)?;
+        let mut data = payload(envelope).map_err(|_| "invalid_envelope")?;
         if data.message.correlation_id != envelope.correlation_id
             || data.message.from_agent.as_deref().unwrap_or_default() != envelope.sender
             || envelope.return_binding.request != envelope.key
         {
-            return Err("inconsistent mesh envelope".into());
+            return Err("invalid_envelope: inconsistent mesh envelope".into());
+        }
+        if self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str()) {
+            return self.accept_forwarded_request(delivery);
         }
         let duplicate = with_store(|store| {
             let Some(record) = store.get(&envelope.key).map_err(|e| e.to_string())? else {
@@ -303,7 +289,7 @@ impl App {
             .map_err(|(code, reason)| format!("{code}: {reason}"))?
         {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
-            ResolvedTarget::Remote(_) => return Err("forward_limit".into()),
+            ResolvedTarget::Remote(_) => return Err("recipient_offline".into()),
         };
         let (agent, session) = self
             .local_recipient_identity(ws, pane)
@@ -312,7 +298,7 @@ impl App {
             .public_pane_id(ws, pane)
             .ok_or("missing recipient pane")?;
         data.message.from_pane = None;
-        data.message.from_host = Some(sender_host);
+        data.message.from_host = sender_host;
         data.message.message_key = Some(envelope.key.clone());
         data.message.enqueued_at_ms = now_ms();
         let unbound_muted = self.mailboxes.owes_deferral(&data.message)
@@ -369,6 +355,7 @@ impl App {
             result = Ok(true);
         }
         let mut state = "queued";
+        let mut retry = true;
         match result {
             Ok(true) => match with_store(|store| {
                 store
@@ -378,10 +365,31 @@ impl App {
                 Ok(()) => state = "delivered",
                 Err(reason) => warnings.push(reason),
             },
-            Ok(false) => warnings.push(format!(
-                "custody accepted by {}; awaiting delivery",
-                send.peer.name
-            )),
+            Ok(false) => {
+                retry = false;
+                if let Err(reason) = with_store(|store| {
+                    store
+                        .finish(
+                            &delivery.envelope.key,
+                            Outcome::Transferred,
+                            now_ms() as i64,
+                        )
+                        .map_err(|e| e.to_string())
+                }) {
+                    warnings.push(reason);
+                }
+            }
+            Err(crate::peers::PeerMessageFailure::Reroute(reason)) => {
+                retry = false;
+                if let Err(error) = with_store(|store| {
+                    store
+                        .set_next_hop(&delivery.envelope.key, "")
+                        .map_err(|e| e.to_string())
+                }) {
+                    warnings.push(error);
+                }
+                warnings.push(reason);
+            }
             Err(failure) if !failure.retryable() => {
                 let reason = failure.detail();
                 match with_store(|store| {
@@ -416,7 +424,7 @@ impl App {
                 failure.detail()
             )),
         }
-        if state == "queued" {
+        if state == "queued" && retry {
             let spent = CUSTODY_TTL_MS.saturating_sub(delivery.remaining_ms);
             let delay = match spent {
                 0..60_000 => 60_000,
@@ -443,7 +451,7 @@ impl App {
                 warnings.push(reason);
             }
         }
-        if state == "queued" && delivery.envelope.request_key.is_some() {
+        if state == "queued" && retry && delivery.envelope.request_key.is_some() {
             if let Err(reason) = with_store(|store| {
                 store
                     .hold_answer(&delivery.envelope.key)
@@ -688,7 +696,83 @@ impl App {
             }
         }
         self.mesh_enrollment_generation = generation;
-        if self.fleet_pause.paused || !self.message_relays.is_idle() {
+        if paused {
+            return;
+        }
+        let route_generation = self.mesh_routes.table.generation();
+        if self.mesh_forward_generation != Some(route_generation) {
+            let adjacent: Vec<_> = self
+                .mesh_routes
+                .table
+                .routes()
+                .into_iter()
+                .filter(|route| route.hops == 1)
+                .map(|route| route.node)
+                .collect();
+            let targets: Vec<_> = self
+                .mesh_routes
+                .table
+                .routes()
+                .into_iter()
+                .map(|route| route.node)
+                .collect();
+            let after = self
+                .mesh_forward_cursor
+                .as_ref()
+                .filter(|(generation, _)| *generation == route_generation)
+                .map(|(_, key)| key);
+            let keys = with_store(|store| {
+                store
+                    .withdraw_request_hops(&adjacent)
+                    .map_err(|e| e.to_string())?;
+                store
+                    .routable_requests(&targets, after, 256)
+                    .map_err(|e| e.to_string())
+            });
+            if let Ok((keys, more)) = keys {
+                // Advance even if a downstream refusal clears a just-assigned
+                // hop. That row must wait for another generation, not this pass.
+                if let Some(last) = keys.last() {
+                    self.mesh_forward_cursor = Some((route_generation, last.clone()));
+                }
+                for key in keys {
+                    let record = with_store(|store| {
+                        store
+                            .collection_record(&key, now_ms() as i64)
+                            .map_err(|e| e.to_string())
+                    });
+                    let Ok(Some(record)) = record else {
+                        continue;
+                    };
+                    if record.envelope.request_key.is_some()
+                        || record.envelope.kind != crate::mesh::store::Kind::Message
+                    {
+                        continue;
+                    }
+                    let next =
+                        self.request_next_hop(&record.envelope.return_binding.recipient_node);
+                    if next.node != record.next_hop {
+                        let _ = with_store(|store| {
+                            store
+                                .route_custody(&key, &next.node, next.admission())
+                                .map_err(|e| e.to_string())
+                        });
+                        self.emit_mesh_wake(&next.node);
+                    }
+                }
+                if !more {
+                    self.mesh_forward_cursor = None;
+                    self.mesh_forward_generation = Some(route_generation);
+                }
+            }
+        }
+        // Leave a worker available for new user sends when a retry edge stalls.
+        let cap = crate::mesh::delivery::push_concurrency();
+        let limit = self
+            .message_relays
+            .slots(cap)
+            .saturating_sub(usize::from(cap > 1));
+        if limit == 0 {
             return;
         }
         let pushable: Vec<String> = self
@@ -702,69 +786,81 @@ impl App {
                     .flatten()
             })
             .collect();
-        let records = with_store(|store| {
-            let limit = crate::mesh::delivery::push_concurrency();
-            let mut keys = store
+        let keys = with_store(|store| {
+            store
                 .push_ready(now_ms() as i64, limit, &pushable)
-                .map_err(|e| e.to_string())?;
-            // Preserve the existing request retry lane for sends accepted
-            // before their peer had an identity pin.
-            if keys.len() < limit {
-                keys.extend(
-                    store
-                        .retry_ready_limit(now_ms() as i64, limit - keys.len())
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-            keys.into_iter()
-                .map(|key| store.get(&key).map_err(|e| e.to_string()))
-                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
         });
-        let Ok(records) = records else {
+        let Ok(keys) = keys else {
             return;
         };
-        for record in records.into_iter().flatten() {
-            let Ok(data) = payload(&record.envelope) else {
+        for key in keys {
+            let record = with_store(|store| {
+                let Some(mut record) = store
+                    .collection_record(&key, now_ms() as i64)
+                    .map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                store
+                    .seal_local_record(&mut record)
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(record))
+            });
+            let Ok(Some(record)) = record else {
                 continue;
             };
-            if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
+            let Some(peer) = self
+                .outbound_reply_peer(&record.next_hop)
+                .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
+            else {
                 continue;
-            }
-            let peer = if record.envelope.request_key.is_some() {
-                self.outbound_reply_peer(&record.envelope.return_binding.recipient_node)
-                    .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
+            };
+            let decoded = if record.envelope.kind == crate::mesh::store::Kind::Receipt {
+                serde_json::from_slice::<crate::mesh::collect::Receipt>(&record.envelope.body)
+                    .map(|_| {
+                        (
+                            peer.name.clone(),
+                            true,
+                            record.envelope.sender.clone(),
+                            record.envelope.correlation_id.clone(),
+                            crate::api::schema::MsgIntent::Fyi,
+                        )
+                    })
+                    .map_err(|e| e.to_string())
             } else {
-                self.state
-                    .peers
-                    .iter()
-                    .find(|peer| Some(&peer.name) == data.peer.as_ref())
-                    .cloned()
+                payload(&record.envelope).map(|data| {
+                    (
+                        data.host.unwrap_or_else(|| peer.name.clone()),
+                        data.direct,
+                        data.message.from_agent.unwrap_or_default(),
+                        data.message.correlation_id,
+                        data.message.intent,
+                    )
+                })
             };
-            let Some(peer) = peer else {
-                if record.envelope.request_key.is_some() {
-                    let _ = with_store(|store| {
-                        store
-                            .hold_answer(&record.envelope.key)
-                            .map_err(|e| e.to_string())
-                    });
+            let (host, direct, from_agent, correlation_id, intent) = match decoded {
+                Ok(data) => data,
+                Err(_) => {
+                    let _ = with_store(|store| store.quarantine(&key).map_err(|e| e.to_string()));
+                    continue;
                 }
-                continue;
             };
-            let host = data.host.unwrap_or_else(|| peer.name.clone());
-            let message = data.message;
             let send = RelaySend {
                 mesh: Deliver {
                     envelope: record.envelope.clone(),
                     remaining_ms: record.remaining_ms,
+                    hops_left: record.hops_left,
+                    visited: record.visited,
                 },
                 id: String::new(),
                 peer,
                 to_agent: record.envelope.target_agent,
                 host,
-                direct: data.direct,
-                from_agent: message.from_agent.unwrap_or_default(),
-                correlation_id: message.correlation_id,
-                intent: message.intent,
+                direct,
+                from_agent,
+                correlation_id,
+                intent,
                 respond_to: None,
             };
             self.enqueue_message_relay(send.into_work());
@@ -892,7 +988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_batch_uses_fixed_push_concurrency() {
+    async fn retry_never_leases_mail_without_a_pinned_next_hop() {
         use std::os::unix::fs::PermissionsExt;
         let shim = std::env::temp_dir().join(format!("flock-retry-shim-{}", std::process::id()));
         std::fs::create_dir_all(&shim).unwrap();
@@ -956,18 +1052,18 @@ mod tests {
             .unwrap();
         }
         app.retry_mesh_mail();
-        assert_eq!(app.message_relays.slots(5), 1, "four records dispatched");
+        assert_eq!(
+            app.message_relays.slots(5),
+            5,
+            "unpinned peer is not pushable"
+        );
         let remaining = with_store(|store| {
             store
                 .retry_ready_limit(now_ms() as i64, 10)
                 .map_err(|e| e.to_string())
         })
         .unwrap();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "the fifth record is not leased by this batch"
-        );
+        assert_eq!(remaining.len(), 5, "no record was leased by the retry pass");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !app.message_relays.is_idle() {
                 let event = app.event_rx.recv().await.unwrap();
@@ -1000,6 +1096,7 @@ pub(crate) fn load_mesh_mail(
     recipients: std::collections::HashMap<String, (String, String)>,
 ) -> Result<Vec<RecoveredMessage>, String> {
     with_store(|store| {
+        store.set_local_node(&origin);
         if !store
             .migration_done("audit-inbox-v1")
             .map_err(|e| e.to_string())?

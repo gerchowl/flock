@@ -45,7 +45,10 @@ impl Writer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_millis() as i64;
-            self.store = Some(Store::open(path, now).map_err(|e| e.to_string())?);
+            let identity = super::identity::NodeIdentity::load().map_err(|e| e.to_string())?;
+            let mut store = Store::open(path, now).map_err(|e| e.to_string())?;
+            store.set_local_node(&identity.node_id());
+            self.store = Some(store);
             if let Ok(mut read_path) = READ_PATH.write() {
                 *read_path = Some(path.to_owned());
             }
@@ -273,7 +276,7 @@ impl WaitReader {
 }
 
 #[cfg(test)]
-pub(crate) struct TestStore(std::path::PathBuf);
+pub(crate) struct TestStore(std::path::PathBuf, Option<std::ffi::OsString>);
 
 #[cfg(test)]
 impl TestStore {
@@ -285,7 +288,10 @@ impl TestStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let store = Store::open(&path.join("mesh-mail.sqlite"), now).unwrap();
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &path);
+        let mut store = Store::open(&path.join("mesh-mail.sqlite"), now).unwrap();
+        store.set_local_node(&super::identity::NodeIdentity::load().unwrap().node_id());
         *READ_PATH.write().unwrap() = Some(store.path().to_owned());
         SUSPENDED.store(false, Ordering::Release);
         RECOVERING.store(false, Ordering::Release);
@@ -293,12 +299,14 @@ impl TestStore {
             store: Some(store),
             ..Default::default()
         };
-        Self(path)
+        Self(path, previous)
     }
 
     pub(crate) fn delivery(&self) -> super::delivery::Deliver {
         let key = super::key::MessageKey::mint("nodea".into(), 0).unwrap();
         super::delivery::Deliver {
+            hops_left: 8,
+            visited: vec!["nodea".into()],
             remaining_ms: super::store::CUSTODY_TTL_MS,
             envelope: super::store::Envelope {
                 kind: Default::default(),
@@ -331,6 +339,10 @@ impl Drop for TestStore {
             suspended: true,
             ..Default::default()
         };
+        match &self.1 {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -407,7 +419,9 @@ mod tests {
 
     #[test]
     fn suspended_writer_cannot_be_reopened_by_a_worker_and_rollback_restores_it() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
         let fixture = Fixture::new();
+        std::env::set_var("XDG_STATE_HOME", &fixture.0);
         let path = fixture.path();
         let mut writer = Writer::default();
         writer.access(&path, |_| Ok(())).unwrap();
@@ -424,7 +438,9 @@ mod tests {
 
     #[test]
     fn importer_does_not_create_store_before_commit() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
         let fixture = Fixture::new();
+        std::env::set_var("XDG_STATE_HOME", &fixture.0);
         let path = fixture.path();
         let mut writer = Writer::default();
         assert_eq!(writer.suspend().unwrap(), 0);
@@ -436,7 +452,9 @@ mod tests {
 
     #[test]
     fn older_generation_is_refused_without_opening_a_writer_or_changing_disk() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
         let fixture = Fixture::new();
+        std::env::set_var("XDG_STATE_HOME", &fixture.0);
         let path = fixture.path();
         let mut writer = Writer::default();
         writer.access(&path, |_| Ok(())).unwrap();
@@ -448,5 +466,43 @@ mod tests {
         assert!(writer.store.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         writer.open(&path, generation).unwrap();
+    }
+    #[test]
+    fn opening_and_handoff_reopening_preserve_origin_bodies_without_app_loading() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let fixture = Fixture::new();
+        std::env::set_var("XDG_STATE_HOME", &fixture.0);
+        let identity = super::super::identity::NodeIdentity::load().unwrap();
+        let mut writer = Writer::default();
+        for round in 0..2 {
+            writer.open(&fixture.path(), writer.generation).unwrap();
+            let mut envelope = super::super::sign::tests::signed();
+            envelope.key.origin_node = identity.node_id();
+            envelope.return_binding.request = envelope.key.clone();
+            envelope.correlation_id = format!("retained-{round}");
+            super::super::sign::seal(&mut envelope, &identity);
+            let store = writer.store.as_mut().unwrap();
+            let now = store.clock().unwrap().wall_ms;
+            store
+                .accept(
+                    &envelope,
+                    10_000,
+                    super::super::store::Admission::Custody,
+                    now,
+                )
+                .unwrap();
+            store
+                .finish(
+                    &envelope.key,
+                    super::super::store::Outcome::Transferred,
+                    now,
+                )
+                .unwrap();
+            assert_eq!(
+                store.get(&envelope.key).unwrap().unwrap().envelope.body,
+                envelope.body
+            );
+            writer.suspend().unwrap();
+        }
     }
 }

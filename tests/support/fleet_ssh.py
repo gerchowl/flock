@@ -117,6 +117,9 @@ def forward_input():
                 continue
             method = request.get("method", "")
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.hello":
+                with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
+                    log.write(str(time.monotonic()) + "\n")
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"
@@ -280,6 +283,8 @@ try:
             if response.get("error"):
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
+            if (base / f"observe-delivery-{source}-{target}").exists():
+                (base / f"observed-result-{source}-{target}").write_text(line)
             if (base / f"tamper-delivery-{source}-{target}").exists():
                 (base / f"tampered-result-{source}-{target}").write_text(line)
             deliveries.discard(response.get("id"))

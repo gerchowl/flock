@@ -692,9 +692,10 @@ impl<D: DiskSpace> Store<D> {
                 envelope.request_key.as_ref().map(|k| &k.origin_node),envelope.request_key.as_ref().map(|k| &k.message_id),
                 envelope.return_binding.recipient_node,
                 matches!(envelope.intent.as_str(), "\"needs_reply\"" | "\"blocking\""),serde_json::to_string(&envelope.return_binding.collection_token)?])?;
+        let origin_visit = [envelope.key.origin_node.clone()];
         let (hops, visited, next_hop) = route.unwrap_or((
             8,
-            &[],
+            &origin_visit,
             if inbox {
                 ""
             } else {
@@ -767,8 +768,8 @@ impl<D: DiskSpace> Store<D> {
     }
 
     /// Terminal transitions remove bodies but keep immutable fingerprints,
-    /// dedupe, return bindings and receipts. Transferred is for hubs only:
-    /// origins retain custody until final delivery or expiry.
+    /// dedupe, return bindings and receipts. Transferred origins retain bodies
+    /// until a final receipt or expiry, without continuing to send.
     pub fn finish(&mut self, key: &MessageKey, outcome: Outcome, wall_ms: i64) -> Result<()> {
         self.finish_with_detail(key, outcome, None, wall_ms)
     }
@@ -806,14 +807,16 @@ impl<D: DiskSpace> Store<D> {
         let valid = match outcome {
             Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
             Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
-            Outcome::Expired => matches!(state.as_str(), "custody" | "held") && custody <= now,
+            Outcome::Expired => {
+                matches!(state.as_str(), "custody" | "held" | "transferred") && custody <= now
+            }
             _ => matches!(state.as_str(), "custody" | "held") && custody > now,
         };
         if !valid {
             return Err(Error::InvalidState);
         }
         tx.execute(
-            "UPDATE envelopes SET state=?3,body=CASE WHEN ?3='read' THEN body ELSE X'' END,outcome_until=?4,
+            "UPDATE envelopes SET state=?3,body=CASE WHEN ?3='read' OR (?3='transferred' AND origin=?6) THEN body ELSE X'' END,outcome_until=?4,
             delivered=CASE WHEN ?3='delivered' THEN 1 ELSE delivered END,
             collect_error=COALESCE(?5,collect_error) WHERE origin=?1 AND id=?2",
             params![
@@ -821,7 +824,8 @@ impl<D: DiskSpace> Store<D> {
                 key.message_id,
                 outcome.name(),
                 now.saturating_add(CUSTODY_TTL_MS),
-                detail
+                detail,
+                self.local_node
             ],
         )?;
         if outcome == Outcome::Delivered {
@@ -932,7 +936,7 @@ impl<D: DiskSpace> Store<D> {
                 }
                 envelope.body = body;
                 let visited: Vec<String> = serde_json::from_str(&visited)?;
-                if visited.len() > 8 || hops_left > 8 {
+                if visited.len() > 9 || hops_left > 8 {
                     return Err(Error::InvalidEnvelope);
                 }
                 let remaining_ms = if matches!(state.as_str(), "inbox" | "read") {
@@ -1277,7 +1281,7 @@ impl<D: DiskSpace> Store<D> {
         let now = clock.advance(wall_ms);
         let due: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM envelopes WHERE
-             (state IN ('custody','held') AND custody_deadline<=?1)
+             ((state IN ('custody','held') OR (state='transferred' AND length(body)>0)) AND custody_deadline<=?1)
              OR (state='inbox' AND inbox_deadline<=?1)
              OR (state!='quarantined' AND outcome_until<=?1 AND dedupe_until<=?1)) OR EXISTS(SELECT 1 FROM agent_tombstones WHERE until<=?1)",
             [now],
@@ -1301,7 +1305,7 @@ impl<D: DiskSpace> Store<D> {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let expired = tx.execute("UPDATE envelopes SET state=CASE WHEN state='inbox' THEN 'inbox_expired' ELSE 'expired' END,
                 body=X'',outcome_until=?1 WHERE rowid IN (SELECT rowid FROM envelopes
-                WHERE (state IN ('custody','held') AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
+                WHERE ((state IN ('custody','held') OR (state='transferred' AND length(body)>0)) AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
                 params![now.saturating_add(CUSTODY_TTL_MS),now])?;
             tx.commit()?;
             if expired < 500 {

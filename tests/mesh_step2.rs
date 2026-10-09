@@ -463,15 +463,19 @@ fn shim(fleet: &Fleet, marker: &str, source: &str) {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
+#[ignore = "#853"]
 fn route_cycle_and_exhausted_hop_budget_retain_custody() {
     for (field, value) in [("visited", json!(["receiver"])), ("hops_left", json!(0))] {
         let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
         let capture = c.fleet.base.join("capture-delivery-nodea-nodeb");
         std::fs::write(&capture, "").unwrap();
         assert_eq!(c.send()["state"], "queued");
-        let mut delivery: Value =
-            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        let mut delivery: Value = fleet::wait_until("initial delivery captured", DEADLINE, || {
+            serde_json::from_slice(&fs::read(&capture).ok()?).ok()
+        });
+        fleet::wait_until("captured delivery retry scheduled", DEADLINE, || {
+            (scalar(c.fleet.node("nodea"), "SELECT count(*) FROM envelopes WHERE correlation='question' AND retry_at>0 AND lease_until<=retry_at") == 1).then_some(())
+        });
         delivery[field] = if field == "visited" {
             json!([
                 fleet::node_id(c.fleet.node("nodea")),
@@ -484,13 +488,37 @@ fn route_cycle_and_exhausted_hop_budget_retain_custody() {
         let replay = c.fleet.base.join("replay-delivery-nodea-nodeb");
         std::fs::write(&replay, serde_json::to_vec(&delivery).unwrap()).unwrap();
         std::fs::remove_file(&capture).unwrap();
+        fs::write(c.fleet.base.join("observe-delivery-nodea-nodeb"), "").unwrap();
         due(c.fleet.node("nodea"));
         fleet::wait_until("route refusal retry", DEADLINE, || {
             (delivery_attempts(&c.fleet, "nodea", "nodeb", "question") >= 2).then_some(())
         });
+        let refused: Value = fleet::wait_until("route refused on wire", DEADLINE, || {
+            serde_json::from_slice(
+                &fs::read(c.fleet.base.join("observed-result-nodea-nodeb")).ok()?,
+            )
+            .ok()
+        });
+        assert_eq!(
+            refused["error"]["message"],
+            if field == "visited" {
+                "loop_detected"
+            } else {
+                "hop_budget_exhausted"
+            },
+            "{refused}"
+        );
         state(c.fleet.node("nodea"), "question", "queued");
+        let refusal_wait = Instant::now();
         fleet::wait_until("rejected route releases custody lease", DEADLINE, || {
-            (scalar(c.fleet.node("nodea"), "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='custody' AND next_hop='' AND lease_until=0") == 1).then_some(())
+            let row: (String, String, i64, i64) = db(c.fleet.node("nodea")).query_row(
+                "SELECT state,next_hop,lease_until,retry_at FROM envelopes WHERE correlation='question'",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert!(
+                refusal_wait.elapsed() < DEADLINE - Duration::from_secs(1),
+                "{field} refusal left custody row {row:?}"
+            );
+            (row.0 == "custody" && row.1.is_empty() && row.2 == 0).then_some(())
         });
         let observed = Instant::now();
         fleet::wait_until(
@@ -528,7 +556,6 @@ fn route_cycle_and_exhausted_hop_budget_retain_custody() {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
 fn forged_origin_signature_route_and_token_are_refused() {
     for field in ["origin", "visited", "body", "signature", "token"] {
         let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
@@ -573,7 +600,6 @@ fn forged_origin_signature_route_and_token_are_refused() {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
 fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
     let specs = [
         fleet::CHAIN_ABC[0].clone(),
@@ -581,15 +607,14 @@ fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
         NodeSpec::new("nodec", "policy", &[]).with_config("\n[msg]\nallow_from=['nodeb']\n"),
     ];
     let c = Conversation::to(&specs, "nodec");
+    fs::write(c.fleet.base.join("observe-delivery-nodeb-nodec"), "").unwrap();
     c.send();
-    let refused = state(c.fleet.node("nodea"), "question", "refused");
-    assert!(
-        refused["detail"]
-            .as_str()
-            .unwrap()
-            .contains("msg_not_allowed"),
-        "{refused}"
-    );
+    let refused: Value = fleet::wait_until("owner rejects disallowed origin", DEADLINE, || {
+        serde_json::from_slice(&fs::read(c.fleet.base.join("observed-result-nodeb-nodec")).ok()?)
+            .ok()
+    });
+    assert_eq!(refused["error"]["message"], "msg_not_allowed", "{refused}");
+    // Returning this refusal to A is a routed-receipt concern covered by 2h.
     assert_eq!(read(c.fleet.node("nodec"), &c.receiver.pane), json!([]));
     let allowed = Agent::start(c.fleet.node("nodeb"));
     send_as(
@@ -698,7 +723,6 @@ fn closed_edge_withdraws_routes() {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
 fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
     let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     // Discover first so the sender retains a genuine owner hint after close.
@@ -707,8 +731,18 @@ fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
         "pane.close",
         json!({"pane_id":c.receiver.pane}),
     );
+    fs::write(c.fleet.base.join("observe-delivery-nodeb-nodec"), "").unwrap();
     c.send();
-    state(c.fleet.node("nodea"), "question", "recipient_gone");
+    let gone: Value = fleet::wait_until("owner confirms removed recipient", DEADLINE, || {
+        serde_json::from_slice(&fs::read(c.fleet.base.join("observed-result-nodeb-nodec")).ok()?)
+            .ok()
+    });
+    assert!(
+        gone["error"]["message"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("recipient_gone")),
+        "{gone}"
+    );
     assert_eq!(
         scalar(
             c.fleet.node("nodec"),
@@ -812,7 +846,6 @@ fn lost_ack_at_each_hop_imports_once() {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
 fn pause_at_forwarder_freezes_ttl_across_restart_then_resumes() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     let capture = c.fleet.base.join("capture-delivery-nodeb-nodec");
@@ -1099,9 +1132,12 @@ fn rejected_config(node: &Node, content: &str, key: &str) {
 #[test]
 fn mismatched_protocol_and_custom_summary_refused_with_upgrade_message() {
     let mut c = Conversation::new(DIRECT);
+    cut(&c.fleet, "nodea", "nodeb");
+    assert_eq!(c.send()["state"], "queued");
     c.fleet
         .node_mut("nodeb")
         .restart_with_mesh(fleet::MeshMode::VersionMismatch(0));
+    c.fleet.allow_edge("nodea", "nodeb");
     fleet::wait_until("protocol upgrade diagnostic", DEADLINE, || {
         api(c.fleet.node("nodea"), "peers.enrollment", json!({}))["peers"]
             .as_array()?
@@ -1113,7 +1149,20 @@ fn mismatched_protocol_and_custom_summary_refused_with_upgrade_message() {
             })
             .then_some(())
     });
-    assert_eq!(c.send()["state"], "queued");
+    state(c.fleet.node("nodea"), "question", "queued");
+    let refused = raw(
+        c.fleet.node("nodea"),
+        "msg.send",
+        json!({
+            "to":{"type":"agent", "agent":c.receiver.id},
+            "body":"new incompatible request", "correlation_id":"new-incompatible"
+        }),
+    );
+    assert_eq!(refused["error"]["code"], "peer_incompatible", "{refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("upgrade flk on nodeb"));
     assert_eq!(read(c.fleet.node("nodeb"), &c.receiver.pane), json!([]));
     rejected_config(
         c.fleet.node("nodea"),
@@ -1142,15 +1191,13 @@ fn mailbox_full_retry_vs_24h_inbox_expiry() {
     let second = Agent::start(c.fleet.node("nodea"));
     for index in 0..32 {
         let sender = if index < 16 { &c.sender } else { &second };
-        assert_eq!(
-            send_as(
-                c.fleet.node("nodea"),
-                sender,
-                &c.receiver,
-                &format!("fill-{index}")
-            )["state"],
-            "delivered"
+        let correlation = format!("fill-{index}");
+        let sent = send_as(c.fleet.node("nodea"), sender, &c.receiver, &correlation);
+        assert!(
+            matches!(sent["state"].as_str(), Some("queued" | "delivered")),
+            "{sent}"
         );
+        state(c.fleet.node("nodea"), &correlation, "delivered");
     }
     let queued = c.send();
     assert_eq!(queued["state"], "queued", "{queued}");
@@ -1281,7 +1328,6 @@ fn store_fault_keeps_panes_and_unknown_refusals_stay_queued() {
 }
 
 #[test]
-#[ignore = "needs 661-2g"]
 fn corrupt_row_at_each_hop_does_not_block_healthy_mail_or_strand_leases() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     for name in ["nodea", "nodeb", "nodec"] {
