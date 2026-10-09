@@ -1,0 +1,1 @@
+- Upgrade existing mesh mail stores in place to the v12 baseline, retain quarantined records for diagnosis, tighten store permissions, and prepare signed envelopes and durable next-hop custody for mesh routing. (#661)

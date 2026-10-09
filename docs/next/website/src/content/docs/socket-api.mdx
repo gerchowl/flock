@@ -147,6 +147,8 @@ Automatic answer collection closes after the first final answer and a terminal r
 
 Mailbox contents are rebuilt from the custody store at boot, with a one-time import of unread messages from the old event log. New `message_queued` audit events carry message keys and metadata; bodies and return capabilities live in the store. Status and reply waits read durable custody records, independently of audit rotation.
 
+Mesh mail stores from earlier development builds are upgraded in place. A failed open or migration reports the database path and a recovery hint: moving the file aside starts an empty store and loses the custody it held. Quarantined records are retained for diagnosis.
+
 ```json
 {"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1","intent":"needs_reply"}}
 ```
