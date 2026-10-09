@@ -139,7 +139,8 @@ impl<D: DiskSpace> Store<D> {
             return Err(Error::Paused);
         }
         self.connection.execute(
-            "UPDATE envelopes SET next_hop=?3 WHERE origin=?1 AND id=?2 AND next_hop!=?3 AND state IN ('custody','held')",
+            "UPDATE envelopes SET next_hop=?3,lease_until=CASE WHEN ?3='' THEN 0 ELSE lease_until END
+             WHERE origin=?1 AND id=?2 AND (next_hop!=?3 OR (?3='' AND lease_until!=0)) AND state IN ('custody','held')",
             params![key.origin_node,key.message_id,next_hop],
         )?;
         Ok(())
@@ -233,7 +234,7 @@ impl<D: DiskSpace> Store<D> {
             return Err(Error::Paused);
         }
         let live = serde_json::to_string(live)?;
-        let condition = "state IN ('custody','held') AND request_origin IS NULL AND kind='message' AND next_hop!='' AND next_hop NOT IN (SELECT value FROM json_each(?1))";
+        let condition = "state IN ('custody','held') AND next_hop!='' AND next_hop NOT IN (SELECT value FROM json_each(?1))";
         let any: bool = self.connection.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
             [&live],
@@ -248,7 +249,7 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Offline owners, answers and receipts cannot occupy the request window.
+    /// Only reachable recipients occupy the routing window.
     pub fn routable_requests(
         &mut self,
         targets: &[String],
@@ -259,8 +260,7 @@ impl<D: DiskSpace> Store<D> {
         let (origin, id) = after
             .map(|key| (key.origin_node.as_str(), key.message_id.as_str()))
             .unwrap_or(("", ""));
-        let condition = "next_hop='' AND state IN ('custody','held') AND kind='message'
-            AND request_origin IS NULL AND recipient_node IN (SELECT value FROM json_each(?1))
+        let condition = "next_hop='' AND state IN ('custody','held') AND recipient_node IN (SELECT value FROM json_each(?1))
             AND (origin,id) > (?2,?3)";
         let keys = self.routing_keys(
             &format!("SELECT origin,id,rowid FROM envelopes WHERE {condition} ORDER BY origin,id LIMIT ?4"),

@@ -189,7 +189,13 @@ fn collection_migration_preserves_existing_writer_generation_and_custody() {
     store.finish(&request.key, Outcome::Delivered, 0).unwrap();
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 5_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                5_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -207,7 +213,13 @@ fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits
     store.finish(&request.key, Outcome::Delivered, 0).unwrap();
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 5_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                5_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -223,7 +235,13 @@ fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits
     assert!((10_000..=11_000).contains(&first));
     let before = store.connection.total_changes();
     assert!(store
-        .collect_ready(&request.key.origin_node, first - 1, 1, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            first - 1,
+            1,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     assert_eq!(
@@ -235,14 +253,26 @@ fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits
     drop(store);
     let mut store = f.open(100_000);
     assert!(store
-        .collect_ready(&request.key.origin_node, 100_000, 1, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            100_000,
+            1,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     assert_eq!(due(&store), first);
     store.set_paused(false, 100_000).unwrap();
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 100_000 + first - 5_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                100_000 + first - 5_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -251,7 +281,13 @@ fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits
     assert!((60_000..=61_000).contains(&(second - first - 10)));
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 100_000 + second - 5_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                100_000 + second - 5_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -1406,21 +1442,39 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
             .unwrap();
     }
     assert!(store
-        .collect_ready(&request.key.origin_node, 0, 16, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            0,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     for item in [&request, &notice, &foreign] {
         store.finish(&item.key, Outcome::Delivered, 0).unwrap();
     }
     assert!(store
-        .collect_ready(&request.key.origin_node, 4_999, 16, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            4_999,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     // A notice is polled only for its read receipt, and a terminal one ends
     // that. The question's own polling is what the rest of this test pins.
     let _ = store.import_receipt(&notice.key, "read").unwrap();
     let claimed = store
-        .collect_ready(&request.key.origin_node, 5_000, 16, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            5_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()],
+        )
         .unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].envelope.key, request.key);
@@ -1437,7 +1491,13 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
         .unwrap();
     assert!(
         !store
-            .collect_ready(&request.key.origin_node, 20_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                20_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .is_empty(),
         "a deferral keeps the conversation open"
@@ -1458,7 +1518,13 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
     );
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 90_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                90_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1,
@@ -1477,7 +1543,13 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
     );
     assert!(
         !store
-            .collect_ready(&request.key.origin_node, 400_000, 16, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                400_000,
+                16,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .is_empty(),
         "a final answer still needs a terminal read receipt"
@@ -1485,7 +1557,13 @@ fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
     let _ = store.import_receipt(&request.key, "read").unwrap();
     assert!(
         store
-            .collect_ready(&request.key.origin_node, 500_000, 16, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                500_000,
+                16,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .is_empty(),
         "the final answer and read receipt stop polling"
@@ -1583,7 +1661,13 @@ fn collection_quarantines_bad_requests_and_bounds_each_peer_and_import_failures(
         )
         .unwrap();
     let claimed = store
-        .collect_ready(&good.key.origin_node, 5_000, 16, &[])
+        .collect_ready(
+            &good.key.origin_node,
+            5_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()],
+        )
         .unwrap();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].envelope.key, good.key);
@@ -1592,6 +1676,7 @@ fn collection_quarantines_bad_requests_and_bounds_each_peer_and_import_failures(
             &good.key.origin_node,
             6_000,
             16,
+            &["receiver.example".into(), "other.example".into()],
             &["receiver.example".into(), "other.example".into()]
         )
         .unwrap()
@@ -1622,14 +1707,26 @@ fn collection_quarantines_bad_requests_and_bounds_each_peer_and_import_failures(
     drop(store);
     let mut store = f.open(500_000);
     let selected = store
-        .collect_ready(&good.key.origin_node, 500_000, 16, &[])
+        .collect_ready(
+            &good.key.origin_node,
+            500_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()],
+        )
         .unwrap();
     assert!(selected.iter().all(|r| r.envelope.key != good.key));
     store
         .collection_failed(&duplicate_peer.key, "invalid reply binding", true)
         .unwrap();
     assert!(store
-        .collect_ready(&good.key.origin_node, 900_000, 16, &[])
+        .collect_ready(
+            &good.key.origin_node,
+            900_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
 }
@@ -1657,7 +1754,13 @@ fn waiting_or_reenrollment_restores_fast_polling_without_reopening_final_answers
         .unwrap();
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 6_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                6_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -1676,7 +1779,13 @@ fn waiting_or_reenrollment_restores_fast_polling_without_reopening_final_answers
         .unwrap();
     assert_eq!(
         store
-            .collect_ready(&request.key.origin_node, 12_000, 1, &[])
+            .collect_ready(
+                &request.key.origin_node,
+                12_000,
+                1,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1
@@ -1692,7 +1801,13 @@ fn waiting_or_reenrollment_restores_fast_polling_without_reopening_final_answers
         )
         .unwrap();
     assert!(store
-        .collect_ready(&request.key.origin_node, 500_000, 1, &[])
+        .collect_ready(
+            &request.key.origin_node,
+            500_000,
+            1,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     assert_eq!(store.connection.total_changes(), changes);
@@ -1869,7 +1984,13 @@ fn collection_backoff_batch_rolls_back_together() {
         )
         .unwrap();
     assert!(store
-        .collect_ready(&first.key.origin_node, 5_000, 16, &[])
+        .collect_ready(
+            &first.key.origin_node,
+            5_000,
+            16,
+            &[],
+            &["receiver.example".into(), "second.example".into()]
+        )
         .is_err());
     let first_backoff: (i64, i64) = store
         .connection
@@ -2260,7 +2381,13 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
         .unwrap();
     store.finish(&notice.key, Outcome::Delivered, 0).unwrap();
     let claimed = store
-        .collect_ready(&notice.key.origin_node, 5_000, 16, &[])
+        .collect_ready(
+            &notice.key.origin_node,
+            5_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()],
+        )
         .unwrap();
     assert_eq!(claimed.len(), 1, "an unconfirmed notice awaits its receipt");
     let _ = store.import_receipt(&notice.key, "delivered").unwrap();
@@ -2274,7 +2401,13 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
     );
     assert_eq!(
         store
-            .collect_ready(&notice.key.origin_node, 400_000, 16, &[])
+            .collect_ready(
+                &notice.key.origin_node,
+                400_000,
+                16,
+                &[],
+                &["receiver.example".into(), "other.example".into()]
+            )
             .unwrap()
             .len(),
         1,
@@ -2290,7 +2423,13 @@ fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
         "read"
     );
     assert!(store
-        .collect_ready(&notice.key.origin_node, 900_000, 16, &[])
+        .collect_ready(
+            &notice.key.origin_node,
+            900_000,
+            16,
+            &[],
+            &["receiver.example".into(), "other.example".into()]
+        )
         .unwrap()
         .is_empty());
     let _ = store.import_receipt(&notice.key, "delivered").unwrap();
@@ -2423,8 +2562,16 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
             1,
         )
         .unwrap();
+    assert_eq!(
+        store
+            .status("origin.example", "thread", 1)
+            .unwrap()
+            .unwrap()
+            .state,
+        "read"
+    );
     let ack = OutboundAck {
-        delivered: true,
+        delivered: false,
         key: mail.key.clone(),
         token,
         refusal: None,
@@ -4027,7 +4174,7 @@ fn unsigned_local_custody_is_sealed_once_without_resetting_its_budget() {
 }
 
 #[test]
-fn request_route_pages_skip_offline_answers_and_receipts_without_idle_writes() {
+fn route_pages_include_answers_and_receipts_but_skip_offline_without_idle_writes() {
     let fixture = Fixture::new();
     let mut store = fixture.open(0);
     let owner = "reachable.example".to_string();
@@ -4061,8 +4208,134 @@ fn request_route_pages_skip_offline_answers_and_receipts_without_idle_writes() {
     let (last, more) = store
         .routable_requests(&targets, first.last(), 256)
         .unwrap();
-    assert_eq!(last.len(), 44);
+    assert_eq!(last.len(), 46);
     assert!(!more);
     assert!(last.iter().all(|key| !first.contains(key)));
     assert_eq!(store.connection.total_changes(), before);
+}
+
+#[test]
+fn collect_ready_never_selects_unreachable_rows() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mut mail = envelope();
+    for recipient in ["offline.example", "receiver.example"] {
+        mail.key = MessageKey::mint("origin.example".into(), 0).unwrap();
+        mail.return_binding.request = mail.key.clone();
+        mail.return_binding.recipient_node = recipient.into();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&mail.key, Outcome::Delivered, 0).unwrap();
+    }
+    let selected = store
+        .collect_ready("origin.example", 5000, 1, &[], &["receiver.example".into()])
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].envelope.key, mail.key);
+    assert!(store
+        .collect_ready("origin.example", 5000, 1, &[], &[])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn retention_receipt_cannot_replace_final_outcomes() {
+    for terminal in ["read", "recipient_gone", "expired"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&mail.key, Outcome::Delivered, 0).unwrap();
+        assert_eq!(
+            store.import_receipt(&mail.key, terminal).unwrap(),
+            ReceiptImport::Applied
+        );
+        assert_eq!(
+            store
+                .import_receipt(&mail.key, "outcome_retention_elapsed")
+                .unwrap(),
+            ReceiptImport::Duplicate
+        );
+        assert_eq!(
+            store
+                .status("origin.example", "thread", 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            terminal
+        );
+    }
+}
+
+#[test]
+fn not_ready_receipt_does_not_block_other_mail_in_poll() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let mut other = envelope();
+    other.correlation_id = "other".into();
+    store
+        .accept(&other, CUSTODY_TTL_MS, Admission::Held, 0)
+        .unwrap();
+    let batch = store
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &crate::mesh::collect::OutboundCollect {
+                receipts: vec![crate::mesh::collect::Receipt {
+                    key: mail.key.clone(),
+                    token: mail.return_binding.collection_token.clone(),
+                    state: "read".into(),
+                }],
+                ack: vec![],
+            },
+            1,
+        )
+        .unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].envelope.key, other.key);
+    assert_eq!(
+        store.import_receipt(&mail.key, "read").unwrap(),
+        ReceiptImport::OriginalNotReady
+    );
+}
+
+#[test]
+fn clearing_a_route_releases_custody_and_held_leases_idempotently() {
+    for state in ["custody", "held"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE envelopes SET state=?1,lease_until=60000", [state])
+            .unwrap();
+        store.set_next_hop(&mail.key, "").unwrap();
+        let row: (String, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT state,next_hop,lease_until FROM envelopes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (state.into(), String::new(), 0));
+        let before = store.connection.total_changes();
+        store.set_next_hop(&mail.key, "").unwrap();
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store
+            .push_ready(1, 16, &["receiver.example".into()])
+            .unwrap()
+            .is_empty());
+    }
 }

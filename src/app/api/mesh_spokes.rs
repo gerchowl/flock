@@ -11,10 +11,21 @@ impl App {
     pub(super) fn finish_outbound_collection(&mut self, completion: Completion) {
         let mut failed = completion.result.is_err();
         if let Collect::Outbound { outbound } = &completion.query {
-            if completion.result.is_ok() && !outbound.receipts.is_empty() {
+            if let Ok(batch) = &completion.result {
+                failed |= outbound
+                    .receipts
+                    .iter()
+                    .any(|receipt| !batch.receipts_acked.contains(receipt));
                 if let Err(reason) = with_store(|store| {
                     store
-                        .receipts_sent(&outbound.receipts)
+                        .receipts_sent(
+                            &batch
+                                .receipts_acked
+                                .iter()
+                                .filter(|r| outbound.receipts.contains(r))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
                         .map_err(|e| e.to_string())
                 }) {
                     failed = true;
