@@ -1684,18 +1684,23 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let received_marker = base.join("received");
 
     let store_failure = matches!(failure_point, "rollback_store" | "committed_store");
-    let committed = failure_point == "committed_store";
+    let slow_open = matches!(failure_point, "slow_store" | "slow_store_rollback");
+    let committed = failure_point == "committed_store" || slow_open;
     let fail_file = base.join("fail-store-open");
     let hook = match failure_point {
         "rollback_store" => "before_fds",
-        "committed_store" => "",
+        "committed_store" | "slow_store" | "slow_store_rollback" => "",
         other => other,
     };
     let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
     let mut extra_env = vec![
         ("FLOCK_TEST_HANDOFF_IMPORT_FAIL", hook),
         (
-            "FLOCK_TEST_MESH_OPEN_FAIL_FILE",
+            if slow_open {
+                "FLOCK_TEST_MESH_OPEN_WAIT_FILE"
+            } else {
+                "FLOCK_TEST_MESH_OPEN_FAIL_FILE"
+            },
             fail_file.to_str().unwrap(),
         ),
     ];
@@ -1747,7 +1752,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         fs::write(&identity_path, b"corrupt during handoff").unwrap();
     }
     let identity_before = fs::read(&identity_path).unwrap();
-    if store_failure {
+    if store_failure || slow_open {
         fs::write(&fail_file, b"fail").unwrap();
     }
     let failed = request(
@@ -1805,23 +1810,40 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             status["result"]["mesh_suspended_reason"],
             "injected mesh store open failure"
         );
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+        command
             .args(["status", "--json"])
             .env("FLOCK_SOCKET_PATH", &api_socket)
             .envs(support::environment::isolated_env(
                 &config_home,
                 &runtime_dir,
             ))
-            .env("XDG_STATE_HOME", runtime_dir.join("state"))
-            .output()
-            .unwrap();
+            .env("XDG_STATE_HOME", runtime_dir.join("state"));
+        support::environment::assert_command_isolated(&command);
+        let output = command.output().unwrap();
         assert!(output.status.success());
         let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert!(status["enrollment_warning"]
             .as_str()
             .unwrap()
             .contains("mesh: suspended: injected mesh store open failure"));
-    } else {
+    } else if !slow_open {
+        // API responsiveness precedes asynchronous custody recovery.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = request(
+                &api_socket,
+                serde_json::json!({
+                    "id":"rollback-recovery", "method":"peers.enrollment", "params":{}
+                }),
+            );
+            if status.get("error").is_none() && status["result"]["mesh_suspended_reason"].is_null()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{status}");
+            thread::sleep(Duration::from_millis(25));
+        }
         // This API uses the shared writer, unlike ping or pane input.
         assert_ok(request(
             &api_socket,
@@ -1859,7 +1881,76 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     );
 
     wait_for_output(&api_socket, &pane_id, &format!("got:{failure_point}"));
-    if store_failure {
+    if store_failure || slow_open {
+        if slow_open {
+            let started = Instant::now();
+            let status = request(
+                &api_socket,
+                serde_json::json!({"id":"slow-open-status", "method":"peers.enrollment", "params":{}}),
+            );
+            assert_eq!(
+                status["result"]["mesh_suspended_reason"],
+                "recovering store after handoff"
+            );
+            assert!(started.elapsed() < Duration::from_secs(1), "{status}");
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+            command
+                .arg("status")
+                .env("FLOCK_SOCKET_PATH", &api_socket)
+                .envs(support::environment::isolated_env(
+                    &config_home,
+                    &runtime_dir,
+                ))
+                .env("XDG_STATE_HOME", runtime_dir.join("state"));
+            support::environment::assert_command_isolated(&command);
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains("mesh: recovering store after handoff"),
+                "{text}"
+            );
+            assert!(!text.contains("retrying recovery"), "{text}");
+            if failure_point == "slow_store_rollback" {
+                support::wait_for_file(
+                    &fail_file.with_extension("entered"),
+                    Duration::from_secs(5),
+                );
+                let failed = request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"handoff-during-recovery", "method":"server.live_handoff", "params":{}
+                    }),
+                );
+                assert!(
+                    failed["error"]["message"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("mesh store recovery in progress")),
+                    "{failed}"
+                );
+                let started = Instant::now();
+                assert_ok(request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"responsive-after-rollback", "method":"ping", "params":{}
+                    }),
+                ));
+                assert!(started.elapsed() < Duration::from_secs(1));
+                assert!(fail_file.exists(), "recovery must still be blocked");
+                assert_ok(request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"input-after-rollback", "method":"pane.send_input",
+                        "params":{"pane_id":pane_id, "text":"after-recovery-rollback", "keys":["Enter"]}
+                    }),
+                ));
+                wait_for_file_contains(
+                    &received_marker,
+                    "got:after-recovery-rollback",
+                    Duration::from_secs(5),
+                );
+            }
+        }
         fs::remove_file(&fail_file).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1894,7 +1985,17 @@ fn rollback_store_open_failure_preserves_panes_and_original_error() {
 }
 
 #[test]
-fn committed_store_open_failure_preserves_panes_and_retries() {
+fn handoff_rollback_during_slow_recovery_keeps_the_loop_responsive() {
+    live_handoff_import_failure_rolls_back_old_server_at("slow_store_rollback");
+}
+
+#[test]
+fn post_handoff_recovery_does_not_block_the_app_loop() {
+    live_handoff_import_failure_rolls_back_old_server_at("slow_store");
+}
+
+#[test]
+fn recovery_failure_keeps_server_and_panes() {
     live_handoff_import_failure_rolls_back_old_server_at("committed_store");
 }
 

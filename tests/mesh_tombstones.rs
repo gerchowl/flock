@@ -133,6 +133,12 @@ impl Drop for RestoredServer<'_> {
 fn restore_server(node: &Node) -> RestoredServer<'_> {
     let guard = RestoredServer(node);
     api(node, "server.live_handoff", json!({}));
+    // The replacement API is ready before asynchronous custody recovery finishes.
+    fleet::wait_until("mesh store recovered", DEADLINE, || {
+        let status = raw(node, "peers.enrollment", json!({}));
+        (status.get("error").is_none() && status["result"]["mesh_suspended_reason"].is_null())
+            .then_some(())
+    });
     guard
 }
 

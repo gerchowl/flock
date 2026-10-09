@@ -10,6 +10,7 @@ pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
@@ -156,6 +157,7 @@ pub struct App {
     pub(crate) mesh_retry_at: Option<Instant>,
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
+    mesh_store_recovering: bool,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_pause_seen: Option<bool>,
     pub(crate) mesh_maintenance_at: Option<Instant>,
@@ -949,6 +951,7 @@ impl App {
             mesh_retry_at: None,
             pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
+            mesh_store_recovering: false,
             mesh_enrollment_generation: 0,
             mesh_pause_seen: None,
             mesh_maintenance_at: None,
@@ -1024,10 +1027,44 @@ impl App {
 
     /// Reopen custody only after ownership commits, or the exporter rolls back.
     pub(crate) fn resume_mesh_store(&mut self, minimum: u64) {
-        let result =
-            crate::mesh::runtime_store::resume(minimum).and_then(|()| self.restore_mesh_mail());
+        if self.mesh_store_recovering {
+            return;
+        }
+        self.mesh_store_recovering = true;
+        crate::mesh::runtime_store::begin_recovery();
+        let origin = self.node_id.clone();
+        let legacy = self.mailboxes.pending_messages();
+        let recipients = self.mesh_recovery_recipients();
+        let paused = self.fleet_pause.paused;
+        let tx = self.event_tx.clone();
+        let spawn = std::thread::Builder::new()
+            .name("mesh-recovery".into())
+            .spawn(move || {
+                let result = crate::mesh::runtime_store::recovery_work(|| {
+                    crate::mesh::runtime_store::resume(minimum).and_then(|()| match origin {
+                        Some(origin) => {
+                            api::mesh_mail::load_mesh_mail(origin, legacy, paused, recipients)
+                        }
+                        None => Ok(Vec::new()),
+                    })
+                });
+                if let Err(reason) = &result {
+                    crate::mesh::runtime_store::failed(reason.clone());
+                }
+                let _ = tx.blocking_send(AppEvent::MeshStoreRecovered(result));
+            });
+        if let Err(error) = spawn {
+            self.finish_mesh_recovery(Err(error.to_string()));
+        }
+    }
+
+    pub(crate) fn finish_mesh_recovery(&mut self, result: Result<Vec<RecoveredMessage>, String>) {
+        self.mesh_store_recovering = false;
         match result {
-            Ok(()) => {
+            Ok(records) => {
+                if self.node_id.is_some() {
+                    self.apply_mesh_mail(records);
+                }
                 crate::mesh::runtime_store::recovered();
                 self.mesh_retry_at = None;
                 self.mesh_maintenance_at = None;

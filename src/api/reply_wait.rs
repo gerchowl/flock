@@ -195,11 +195,12 @@ struct Watch {
 impl Watch {
     fn refresh_mesh(
         &mut self,
+        reader: &mut crate::mesh::runtime_store::WaitReader,
         origin: Option<&str>,
         correlation: &str,
         reference: Option<&crate::mesh::store::StatusReference>,
     ) -> Result<(), String> {
-        if let Some(status) = crate::mesh::runtime_store::status(origin, correlation, reference)? {
+        if let Some(status) = reader.status(origin, correlation, reference)? {
             let durable = status
                 .reply
                 .map(|reply| {
@@ -298,6 +299,7 @@ pub(super) fn wait_for_reply(
 
     let mut cursor = event_hub.current_sequence();
     let mut watch = Watch::default();
+    let mut reader = crate::mesh::runtime_store::WaitReader::default();
     // The in-memory ring only, as `msg.status` reads it, so the two never
     // disagree. NOT the durable log: `persisted_events_after` re-reads every
     // log file while holding the hub's lock, and every `emit_event` on the
@@ -305,7 +307,12 @@ pub(super) fn wait_for_reply(
     for (_, event) in event_hub.events_after(0) {
         watch.observe(&event, &correlation_id);
     }
-    if let Err(reason) = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref()) {
+    if let Err(reason) = watch.refresh_mesh(
+        &mut reader,
+        origin,
+        &correlation_id,
+        params.reference.as_ref(),
+    ) {
         if params.reference.is_some() {
             return Ok(Some(encode(&ErrorResponse {
                 id: request_id,
@@ -331,12 +338,21 @@ pub(super) fn wait_for_reply(
     }
 
     let _waiting = event_hub.track_reply_wait(&correlation_id);
+    let mut last_read = Instant::now();
+    let mut event_woke = false;
     loop {
-        // One indexed read per wake, bounded by CONNECTION_POLL_INTERVAL. A
-        // transient outage (a handoff suspends the writer) keeps the wait
-        // alive on the event ring rather than ending it. It is not logged:
-        // at this cadence one outage would flood the log.
-        let _ = watch.refresh_mesh(origin, &correlation_id, params.reference.as_ref());
+        if event_woke || last_read.elapsed() >= Duration::from_secs(1) {
+            if let Err(reason) = watch.refresh_mesh(
+                &mut reader,
+                origin,
+                &correlation_id,
+                params.reference.as_ref(),
+            ) {
+                crate::logging::mesh_wait_read_unavailable(&reason);
+            }
+            last_read = Instant::now();
+            event_woke = false;
+        }
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();
             crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, outcome);
@@ -373,6 +389,7 @@ pub(super) fn wait_for_reply(
             .saturating_duration_since(Instant::now())
             .min(CONNECTION_POLL_INTERVAL);
         if event_hub.wait_after(cursor, slice) {
+            event_woke = true;
             let fresh = event_hub.events_after(cursor);
             // More than the ring holds arrived between two wakes: the events
             // just past the cursor are gone. Re-read what the ring still has

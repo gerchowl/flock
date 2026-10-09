@@ -288,6 +288,12 @@ impl App {
         encode_success(
             id,
             ResponseResult::PeersEnrollment {
+                mesh_quarantined: crate::mesh::runtime_store::read(|store| {
+                    store.quarantined_count().map_err(|e| e.to_string())
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(0),
                 routes: self.mesh_route_status(),
                 peers,
                 mesh_suspended_reason,

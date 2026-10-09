@@ -548,139 +548,72 @@ impl App {
         Ok(())
     }
 
-    pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {
-        if self.node_id.is_none() {
-            return Ok(());
+    /// Snapshot native bindings before recovery leaves the app loop.
+    pub(crate) fn mesh_recovery_recipients(
+        &self,
+    ) -> std::collections::HashMap<String, (String, String)> {
+        let mut recipients = std::collections::HashMap::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for pane in ws.tabs.iter().flat_map(|tab| tab.layout.pane_ids()) {
+                if let (Some(public), Some(identity)) = (
+                    self.public_pane_id(ws_idx, pane),
+                    self.local_recipient_identity(ws_idx, pane),
+                ) {
+                    recipients.insert(public, identity);
+                }
+            }
         }
-        let legacy = self.mailboxes.pending_messages();
-        let origin = self
-            .node_id
-            .clone()
-            .ok_or("mesh node identity unavailable")?;
-        with_store(|store| {
-            if !store
-                .migration_done("audit-inbox-v1")
-                .map_err(|e| e.to_string())?
-            {
-                for message in legacy {
-                    // A deterministic migration key makes a crash before the marker harmless.
-                    use sha2::{Digest, Sha256};
-                    let digest = Sha256::digest(
-                        format!("{}:{}", message.to_pane, message.correlation_id).as_bytes(),
-                    );
-                    let data = Payload {
-                        message,
-                        peer: None,
-                        host: None,
-                        direct: true,
-                    };
-                    let mut envelope = envelope(&origin, String::new(), &data)?;
-                    envelope.key.message_id = format!(
-                        "0{}",
-                        digest[..25]
-                            .iter()
-                            .map(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(b & 31) as usize] as char)
-                            .collect::<String>()
-                    );
-                    envelope.return_binding.request = envelope.key.clone();
-                    if store
-                        .get(&envelope.key)
-                        .map_err(|e| e.to_string())?
-                        .is_none()
-                    {
-                        store
-                            .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
-                            .map_err(|e| e.to_string())?;
-                    }
+        // Legacy queued events may still name an alias from before handoff.
+        for message in self.mailboxes.pending_messages() {
+            if let Ok((ws, pane)) = self.resolve_pane_target(&message.to_pane) {
+                if let Some(identity) = self.local_recipient_identity(ws, pane) {
+                    recipients.insert(message.to_pane, identity);
                 }
-                store
-                    .finish_migration("audit-inbox-v1")
-                    .map_err(|e| e.to_string())?;
             }
-            Ok(())
-        })?;
+        }
+        recipients
+    }
+
+    pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {
+        let Some(origin) = self.node_id.clone() else {
+            return Ok(());
+        };
+        let records = load_mesh_mail(
+            origin,
+            self.mailboxes.pending_messages(),
+            self.fleet_pause.paused,
+            self.mesh_recovery_recipients(),
+        )?;
+        self.apply_mesh_mail(records);
+        Ok(())
+    }
+
+    pub(crate) fn apply_mesh_mail(&mut self, records: Vec<RecoveredMessage>) {
         self.mailboxes.clear_queued_projection();
-        let records = with_store(|store| {
-            if !self.fleet_pause.paused {
-                store
-                    .maintain_if_due(now_ms() as i64)
-                    .map_err(|e| e.to_string())?;
-            }
-            store
-                .mailbox_keys()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|key| match store.get(&key) {
-                    Err(crate::mesh::store::Error::Json(_)) => {
-                        store.quarantine(&key).map_err(|e| e.to_string())?;
-                        crate::logging::mesh_custody_failed("restore", "undecodable_record");
-                        Ok(None)
-                    }
-                    result => result.map_err(|e| e.to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        for record in records.into_iter().flatten() {
-            let mut data = match payload(&record.envelope) {
-                Ok(data) => data,
-                Err(_) => {
-                    with_store(|store| {
-                        store
-                            .quarantine(&record.envelope.key)
-                            .map_err(|e| e.to_string())
-                    })?;
-                    crate::logging::mesh_custody_failed("restore", "undecodable_record");
-                    continue;
-                }
-            };
-            if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
-                data.message.from_host = with_store(|store| {
-                    store
-                        .origin_name(&record.envelope.key.origin_node)
-                        .map_err(|e| e.to_string())
-                })?;
-            }
-            data.message.message_key = Some(record.envelope.key.clone());
-            data.message.enqueued_at_ms = now_ms()
-                .saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
-            if !record.envelope.target_agent.is_empty() {
-                if let Some(location) = self
-                    .locate_agent(&record.envelope.target_agent)
-                    .filter(|l| l.local)
-                {
-                    data.message.to_pane = location.pane_id;
-                }
-            }
-            if record.envelope.request_key.is_some() {
-                if self.removed_agent(&record.envelope.target_agent)? {
-                    data.message.to_pane.clear();
-                }
-            } else if !self.fleet_pause.paused {
-                if let Ok((ws, pane)) = self.resolve_pane_target(&data.message.to_pane) {
-                    if let Some((agent, session)) = self.local_recipient_identity(ws, pane) {
-                        if record.envelope.target_agent.is_empty()
-                            || record.envelope.target_agent == agent
-                        {
-                            with_store(|store| {
-                                store
-                                    .bind_local_recipient(&record.envelope.key, &agent, &session)
-                                    .map_err(|e| e.to_string())
-                            })?;
-                        }
-                    }
-                }
-            }
-            if data.message.to_pane.is_empty() {
+        for mut record in records {
+            // Lifecycle removals can arrive while the recovery worker loads rows.
+            if self
+                .pending_agent_removals
+                .iter()
+                .any(|removal| removal.agent == record.target)
+            {
                 continue;
             }
-            if record.state == "read" {
-                self.mailboxes.record_delivered(&data.message);
+            if !record.target.is_empty() {
+                if let Some(location) = self.locate_agent(&record.target).filter(|l| l.local) {
+                    record.message.to_pane = location.pane_id;
+                }
+            }
+            if record.message.to_pane.is_empty() {
+                continue;
+            }
+            if record.read {
+                self.mailboxes.record_delivered(&record.message);
             } else {
-                self.mailboxes.enqueue(data.message);
+                self.mailboxes.enqueue(record.message);
             }
         }
         self.sync_blocking_mail();
-        Ok(())
     }
 
     pub(super) fn retry_mesh_mail(&mut self) {
@@ -857,6 +790,108 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn recovery_keeps_native_bindings_and_filters_removed_recipients() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("recovery")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.terminal_id_for_pane(0, pane).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("fixture".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("native-session").unwrap(),
+        });
+        let agent = terminal.agent_id.to_string();
+        let removal = crate::app::agent_removal::capture(
+            terminal,
+            crate::app::agent_removal::RemovalEvent::Kill,
+        )
+        .unwrap();
+        let public = app.public_pane_id(0, pane).unwrap();
+        let message = PendingMessage {
+            message_key: None,
+            correlation_id: "legacy".into(),
+            body: "pending".into(),
+            from_pane: None,
+            from_agent: None,
+            from_host: None,
+            from_repo: None,
+            to_pane: public.clone(),
+            to_repo: None,
+            in_reply_to: None,
+            enqueued_at_ms: now_ms(),
+            delivery_attempts: 0,
+            intent: crate::api::schema::MsgIntent::NeedsReply,
+        };
+        let loaded = load_mesh_mail(
+            "nodea".into(),
+            vec![message.clone()],
+            false,
+            app.mesh_recovery_recipients(),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].target, agent);
+        let key = loaded[0].message.message_key.clone().unwrap();
+        // A removal arriving after the worker's read cannot resurrect queued mail.
+        app.pending_agent_removals.push_back(removal);
+        app.apply_mesh_mail(loaded);
+        assert_eq!(app.mailboxes.queued_len(&public), 0);
+        let affected = with_store(|store| {
+            store
+                .tombstone(&agent, "native-session", "killed", now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            affected,
+            vec![key.clone()],
+            "worker backfilled the native binding"
+        );
+        let data = Payload {
+            message,
+            peer: None,
+            host: None,
+            direct: true,
+        };
+        let mut answer = envelope("nodeb", agent, &data).unwrap();
+        answer.request_key = Some(key);
+        with_store(|store| {
+            store
+                .accept(&answer, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let loaded = load_mesh_mail(
+            "nodea".into(),
+            Vec::new(),
+            false,
+            app.mesh_recovery_recipients(),
+        )
+        .unwrap();
+        assert!(
+            loaded.is_empty(),
+            "removed senders' answers stay out of the projection"
+        );
+        assert!(
+            with_store(|store| store.get(&answer.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .is_some(),
+            "the answer remains in durable status"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_batch_uses_fixed_push_concurrency() {
         use std::os::unix::fs::PermissionsExt;
         let shim = std::env::temp_dir().join(format!("flock-retry-shim-{}", std::process::id()));
@@ -948,4 +983,139 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(shim);
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveredMessage {
+    message: PendingMessage,
+    target: String,
+    read: bool,
+}
+
+/// Load and decode on the recovery worker, projecting only on the app loop.
+pub(crate) fn load_mesh_mail(
+    origin: String,
+    legacy: Vec<PendingMessage>,
+    paused: bool,
+    recipients: std::collections::HashMap<String, (String, String)>,
+) -> Result<Vec<RecoveredMessage>, String> {
+    with_store(|store| {
+        if !store
+            .migration_done("audit-inbox-v1")
+            .map_err(|e| e.to_string())?
+        {
+            for message in legacy {
+                // A deterministic migration key makes a crash before the marker harmless.
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(
+                    format!("{}:{}", message.to_pane, message.correlation_id).as_bytes(),
+                );
+                let data = Payload {
+                    message,
+                    peer: None,
+                    host: None,
+                    direct: true,
+                };
+                let mut envelope = envelope(&origin, String::new(), &data)?;
+                envelope.key.message_id = format!(
+                    "0{}",
+                    digest[..25]
+                        .iter()
+                        .map(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(b & 31) as usize] as char)
+                        .collect::<String>()
+                );
+                envelope.return_binding.request = envelope.key.clone();
+                if store
+                    .get(&envelope.key)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    store
+                        .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            store
+                .finish_migration("audit-inbox-v1")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })?;
+    let records = with_store(|store| {
+        if !paused {
+            store
+                .maintain_if_due(now_ms() as i64)
+                .map_err(|e| e.to_string())?;
+        }
+        store
+            .mailbox_keys()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|key| match store.get(&key) {
+                Err(
+                    crate::mesh::store::Error::Json(_) | crate::mesh::store::Error::InvalidEnvelope,
+                ) => {
+                    store.quarantine(&key).map_err(|e| e.to_string())?;
+                    crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                    Ok(None)
+                }
+                result => result.map_err(|e| e.to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut loaded = Vec::new();
+    for record in records.into_iter().flatten() {
+        let mut data = match payload(&record.envelope) {
+            Ok(data) => data,
+            Err(_) => {
+                with_store(|store| {
+                    store
+                        .quarantine(&record.envelope.key)
+                        .map_err(|e| e.to_string())
+                })?;
+                crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                continue;
+            }
+        };
+        if Some(record.envelope.key.origin_node.as_str()) != Some(origin.as_str()) {
+            data.message.from_host = with_store(|store| {
+                store
+                    .origin_name(&record.envelope.key.origin_node)
+                    .map_err(|e| e.to_string())
+            })?;
+        }
+        let mut target = record.envelope.target_agent.clone();
+        if record.envelope.request_key.is_some() {
+            let removed = with_store(|store| {
+                store
+                    .agent_removed(&target, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            })?;
+            if removed {
+                continue;
+            }
+        } else if !paused {
+            let identity = recipients
+                .get(&data.message.to_pane)
+                .filter(|(agent, _)| target.is_empty() || target == *agent)
+                .or_else(|| recipients.values().find(|(agent, _)| *agent == target));
+            if let Some((agent, session)) = identity {
+                with_store(|store| {
+                    store
+                        .bind_local_recipient(&record.envelope.key, agent, session)
+                        .map_err(|e| e.to_string())
+                })?;
+                target.clone_from(agent);
+            }
+        }
+        data.message.message_key = Some(record.envelope.key);
+        data.message.enqueued_at_ms =
+            now_ms().saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
+        loaded.push(RecoveredMessage {
+            message: data.message,
+            target,
+            read: record.state == "read",
+        });
+    }
+    Ok(loaded)
 }

@@ -4207,7 +4207,7 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeKillGateFinished(_) => Vec::new(),
             // Applied at the App layer, which owns the mailboxes.
-            AppEvent::MeshRoutesCompleted(_) | AppEvent::MeshCollected(_) | AppEvent::MsgRelayCompleted(_) => Vec::new(),
+            AppEvent::MeshStoreRecovered(_) | AppEvent::MeshRoutesCompleted(_) | AppEvent::MeshCollected(_) | AppEvent::MsgRelayCompleted(_) => Vec::new(),
             AppEvent::WorktreeBranchDeleteFinished(_) => Vec::new(),
             AppEvent::WorktreeKillAllFinished(_) => Vec::new(),
             // #175 phase 4: intercepted in App::handle_internal_event
