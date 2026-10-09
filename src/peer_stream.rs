@@ -51,7 +51,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Enrollment refusals default to the long delay. Only transport failures and
-/// the relay's explicit missing-server response are transient.
+/// missing-server and inbound-capacity responses are transient.
 struct EnrollmentError {
     detail: String,
     transient: bool,
@@ -77,7 +77,10 @@ impl EnrollmentError {
     fn response(error: &serde_json::Value, detail: String) -> Self {
         Self {
             detail,
-            transient: error["code"] == "no_local_server",
+            transient: matches!(
+                error["code"].as_str(),
+                Some("no_local_server" | "inbound_edges_full")
+            ),
         }
     }
 }
@@ -402,7 +405,12 @@ impl PeerStream {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         if matches!(
                             value["error"]["code"].as_str(),
-                            Some("mesh_not_enrolled" | "not_the_relay" | "no_local_server")
+                            Some(
+                                "mesh_not_enrolled"
+                                    | "not_an_edge"
+                                    | "inbound_edges_full"
+                                    | "no_local_server"
+                            )
                         ) {
                             return Err("mesh edge lost enrollment; reconnect required".into());
                         }
@@ -484,8 +492,20 @@ pub(crate) fn enrollment_generation() -> u64 {
     ENROLLMENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<String>) {
-    let enrolled = reason.is_none();
+fn set_enrollment(peer: &PeerConfig, result: Result<String, EnrollmentError>) {
+    let (node_id, reason, state) = match result {
+        Ok(node) => (Some(node), None, "pinned"),
+        Err(error) => (
+            None,
+            Some(error.detail),
+            if error.transient {
+                "retrying"
+            } else {
+                "refused"
+            },
+        ),
+    };
+    let enrolled = node_id.is_some();
     if let Ok(mut statuses) = enrollments().lock() {
         let previous = statuses.get(&peer.name).and_then(|s| s.0.node_id.clone());
         let generation = if enrolled {
@@ -501,12 +521,7 @@ fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<Str
                     source: crate::mesh::store::PinSource::Configured,
                     pin_origin: Default::default(),
                     node_id: node_id.or(previous),
-                    state: if reason.is_some() {
-                        "refused"
-                    } else {
-                        "pinned"
-                    }
-                    .into(),
+                    state: state.into(),
                     reason,
                 },
                 generation,
@@ -649,7 +664,7 @@ fn request_over(
                 Ok(node_id) => {
                     slot.transient_failures = 0;
                     slot.retry_after = None;
-                    set_enrollment(peer, Some(node_id), None);
+                    set_enrollment(peer, Ok(node_id));
                     slot.stream = Some(stream);
                 }
                 Err(err) => {
@@ -658,13 +673,20 @@ fn request_over(
                     } else {
                         RECONNECT_BACKOFF
                     };
+                    let transient = err.transient;
                     let err = err.detail;
                     let (detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED) {
                         stream.explain(&err)
                     } else {
                         (err, None)
                     };
-                    set_enrollment(peer, None, Some(detail.clone()));
+                    set_enrollment(
+                        peer,
+                        Err(EnrollmentError {
+                            detail: detail.clone(),
+                            transient,
+                        }),
+                    );
                     record_establish_failure(
                         &mut slot,
                         &peer.name,
@@ -677,7 +699,7 @@ fn request_over(
                 }
             },
             Err(err) => {
-                set_enrollment(peer, None, Some(err.clone()));
+                set_enrollment(peer, Err(EnrollmentError::transport(err.clone())));
                 record_establish_failure(&mut slot, &peer.name, &err, None, Duration::ZERO);
                 return Err(err);
             }
@@ -701,7 +723,7 @@ fn request_over(
         }
         Err(err) => {
             let (detail, tail) = stream.explain(&err);
-            set_enrollment(peer, None, Some(detail.clone()));
+            set_enrollment(peer, Err(EnrollmentError::transport(detail.clone())));
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
             slot.stream = None;
@@ -878,20 +900,59 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_backoff_classifies_only_missing_server_as_transient() {
+    fn enrollment_backoff_classifies_missing_server_and_edge_capacity_as_transient() {
         for code in [
             "no_local_server",
+            "inbound_edges_full",
             "mesh_version_mismatch",
             "identity_changed",
             "invalid_request",
         ] {
             let failure =
                 EnrollmentError::response(&serde_json::json!({"code": code}), code.into());
-            assert_eq!(failure.transient, code == "no_local_server");
+            assert_eq!(
+                failure.transient,
+                matches!(code, "no_local_server" | "inbound_edges_full")
+            );
             assert_eq!(failure.detail, code);
         }
         assert!(!EnrollmentError::from("identity changed".to_string()).transient);
         assert!(EnrollmentError::transport(CONNECTION_CLOSED.into()).transient);
+    }
+
+    #[test]
+    fn enrollment_status_distinguishes_retrying_transport_from_handshake_refusal() {
+        let target = peer("enrollment-status.test");
+        set_enrollment(&target, Ok("pinned-node".into()));
+        let generation = peer_enrollment_generation(&target);
+        for detail in [CONNECTION_CLOSED, "ConnectionReset", "peer relay wedged"] {
+            set_enrollment(&target, Err(EnrollmentError::transport(detail.into())));
+            let status = enrollment(&target);
+            assert_eq!(status.state, "retrying");
+            assert_eq!(status.reason.as_deref(), Some(detail));
+            assert_eq!(status.node_id.as_deref(), Some("pinned-node"));
+            assert_eq!(peer_enrollment_generation(&target), generation);
+        }
+        for (code, expected) in [
+            ("inbound_edges_full", "retrying"),
+            ("no_local_server", "retrying"),
+            ("mesh_version_mismatch", "refused"),
+            ("mesh_refused", "refused"),
+        ] {
+            set_enrollment(
+                &target,
+                Err(EnrollmentError::response(
+                    &serde_json::json!({"code":code}),
+                    code.into(),
+                )),
+            );
+            let status = enrollment(&target);
+            assert_eq!(status.state, expected);
+            assert_eq!(status.reason.as_deref(), Some(code));
+        }
+        set_enrollment(&target, Ok("pinned-node".into()));
+        assert_eq!(enrollment(&target).state, "pinned");
+        assert!(enrollment(&target).reason.is_none());
     }
 
     #[test]
@@ -939,6 +1000,8 @@ mod tests {
             "{logs}"
         );
         assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
+        assert_eq!(enrollment(&target).state, "retrying");
+        assert_eq!(enrollment(&target).reason.as_deref(), Some(err.as_str()));
     }
 
     /// The same establish failure on every backoff is one WARN, not one per

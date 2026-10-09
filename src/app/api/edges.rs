@@ -60,31 +60,11 @@ impl App {
         }
         let _ = respond_to.send(response);
     }
-    pub(crate) fn expire_uplink(&mut self) {
+    pub(crate) fn expire_relayed_entries(&mut self) {
         self.state.evict_expired_relayed_entries();
     }
-    /// `peers.relay_attach` — the hub's relay binds this server's uplink to
-    /// its own process (#410 review).
-    ///
-    /// The relay methods ride the local socket, which every same-user process
-    /// can reach. Without a binding, a stray process could take a spoke's
-    /// pending messages, kiln the hub's answers, or plant fleet rows. The
-    /// binding is the caller's socket peer pid AND that process's start time
-    /// (so a reused pid is not the relay), refused when either cannot be read,
-    /// refused from inside a pane, refused unless the caller descends from
-    /// sshd — the real relay is started by the hub's ssh session — and never
-    /// displacing a relay that is still alive.
-    ///
-    /// Same-user is still the boundary: `ssh localhost flk peers relay` has
-    /// sshd for a parent too. What this closes is the casual squatter — a
-    /// detached shell, a launchd job, a script — and the pane agent.
-    pub(super) fn handle_peers_relay_attach(&mut self, id: String) -> String {
-        if self.uplink.is_relay(
-            self.current_api_peer_pid,
-            crate::platform::process_start_time,
-        ) {
-            return encode_success(id, ResponseResult::Ok {});
-        }
+    /// Bind only a hello Begin from an attestable SSH relay outside panes.
+    pub(super) fn attach_inbound_edge(&mut self, id: String) -> String {
         let Some(pid) = self.current_api_peer_pid else {
             return encode_error(
                 id,
@@ -114,29 +94,30 @@ impl App {
             );
         }
         match self
-            .uplink
-            .attach_relay(pid, started, crate::platform::process_start_time)
+            .inbound
+            .attach(pid, started, crate::platform::process_start_time)
         {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
-            Err(holder) => encode_error(
+            Err(code) => encode_error(
                 id,
-                "relay_already_attached",
-                format!("relay pid {holder} holds this server's uplink and is still alive"),
+                code,
+                "inbound edge attachment unavailable; retry mesh.hello",
             ),
         }
     }
 
     /// The refusal for a relay-only method called by anyone but the relay.
-    pub(super) fn refuse_unless_relay(&mut self, id: &str, method: &str) -> Option<String> {
+    pub(super) fn refuse_unless_edge(&mut self, id: &str, method: &str) -> Option<String> {
         let caller = self.current_api_peer_pid;
-        (!self
-            .uplink
-            .is_relay(caller, crate::platform::process_start_time))
+        (self
+            .inbound
+            .edge(caller, crate::platform::process_start_time)
+            .is_none())
         .then(|| {
             encode_error(
                 id.to_string(),
-                "not_the_relay",
-                format!("{method} is accepted only from the relay bound by peers.relay_attach"),
+                "not_an_edge",
+                format!("{method} is accepted only from an edge bound by mesh.hello"),
             )
         })
     }

@@ -17,8 +17,12 @@ impl App {
                     .node_id
                     .as_deref()
                     .zip(
-                        self.mesh_inbound
-                            .as_ref()
+                        self.inbound
+                            .edge(
+                                self.current_api_peer_pid,
+                                crate::platform::process_start_time,
+                            )
+                            .map(|edge| &edge.enrollment)
                             .filter(|edge| edge.state == "pinned")
                             .and_then(|edge| edge.node_id.as_deref()),
                     )
@@ -131,7 +135,7 @@ impl App {
     /// from any other source. Each row routes via the hub, which is what a
     /// message for one of its agents then hands up to.
     ///
-    /// Accepted only from the relay bound by `peers.relay_attach`, and the rows
+    /// Accepted only from the relay bound by `mesh.hello`, and the rows
     /// it carries are display-only: a spoke holds no key to anything, so it
     /// never dials a hub-pushed row's ssh target at all.
     ///
@@ -143,15 +147,20 @@ impl App {
         id: String,
         params: crate::api::schema::PeersHubFleetParams,
     ) -> String {
-        // Only the relay bound to this server's uplink may speak for the hub —
-        // the one ingress to the relay cache that listens on a socket rather
-        // than reading its own ssh stdout, so it gets the same binding as the
-        // uplink methods (#410 review).
-        if let Some(refusal) = self.refuse_unless_relay(&id, "peers.hub_fleet") {
+        // The socket caller may speak only for its own enrolled edge.
+        if let Some(refusal) = self.refuse_unless_edge(&id, "peers.hub_fleet") {
             return refusal;
         }
         // The verified key maps to this locally enrolled name.
-        let Some(hub) = self.uplink.enrolled_hub() else {
+        let Some(hub) = self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .filter(|edge| edge.enrolled())
+            .map(|edge| edge.enrollment.peer.clone())
+        else {
             return super::responses::encode_error(
                 id,
                 "mesh_not_enrolled",
@@ -1519,14 +1528,14 @@ mod tests {
         // it knowing nothing past itself. The hub's push is merged through the
         // same validated, freshest-wins path a poller uses.
         let mut app = test_app();
-        // Only the relay bound to this server's uplink may push (#416 review),
+        // Only an enrolled edge may push (#416 review),
         // this live test process stands in for it.
         let relay = std::process::id();
         let started = crate::platform::process_start_time(relay).expect("own start time");
-        app.uplink
-            .attach_relay(relay, started, crate::platform::process_start_time)
+        app.inbound
+            .attach(relay, started, crate::platform::process_start_time)
             .expect("bound");
-        app.uplink.enroll_hub("hub".into());
+        enroll_test_edge(&mut app, "hub");
         app.current_api_peer_pid = Some(relay);
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "down".into(),
@@ -1626,7 +1635,7 @@ mod tests {
             crate::peers::relayed_entry_from_wire(hub_row("old", "operator@old", ttl + 5))
                 .expect("valid"),
         );
-        app.expire_uplink();
+        app.expire_relayed_entries();
         assert!(
             !app.state.relayed_fleet_cache.contains_key("old"),
             "an expired row is removed on the tick"
@@ -1755,14 +1764,27 @@ mod tests {
         ws
     }
 
-    /// Bind this test process as the relay, as `peers.relay_attach` would.
+    fn enroll_test_edge(app: &mut App, peer: &str) {
+        let edge = app
+            .inbound
+            .edge_mut(
+                Some(std::process::id()),
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+        edge.enrollment.peer = peer.into();
+        edge.enrollment.node_id = Some(format!("test-node-{peer}"));
+        edge.enrollment.state = "pinned".into();
+    }
+
+    /// Bind this test process as the relay, as `mesh.hello` would.
     fn bind_relay(app: &mut App, peer: &str) {
         let relay = std::process::id();
         let started = crate::platform::process_start_time(relay).expect("own start time");
-        app.uplink
-            .attach_relay(relay, started, crate::platform::process_start_time)
+        app.inbound
+            .attach(relay, started, crate::platform::process_start_time)
             .expect("bound");
-        app.uplink.enroll_hub(peer.into());
+        enroll_test_edge(app, peer);
         app.current_api_peer_pid = Some(relay);
     }
 

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod checks;
 mod digest;
+mod edges;
 mod fleet;
 mod handoffs;
 mod integrations;
@@ -19,7 +20,6 @@ pub(super) mod responses;
 mod revert;
 mod spawn;
 mod tabs;
-mod uplink;
 pub(crate) mod workspaces;
 mod worktrees;
 
@@ -1300,11 +1300,14 @@ impl App {
 
         if !matches!(
             &request.method,
-            Method::MeshHello(_) | Method::PeersRelayAttach(_) | Method::PeersEnrollReset(_)
-        ) && self.uplink.is_relay(
-            self.current_api_peer_pid,
-            crate::platform::process_start_time,
-        ) && self.uplink.enrolled_hub().is_none()
+            Method::MeshHello(_) | Method::PeersEnrollReset(_)
+        ) && self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some_and(|edge| !edge.enrolled())
         {
             return responses::encode_error(
                 request.id,
@@ -1420,7 +1423,6 @@ impl App {
                 return self.handle_peers_enroll_reset(request.id, params)
             }
             Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
-            Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentResult(params) => return self.handle_agent_result(request.id, params),

@@ -22,6 +22,7 @@ pub(crate) mod config_io;
 mod creation;
 use crate::mesh::store::delivery_attempts;
 pub(crate) mod directory;
+pub(crate) mod edges;
 pub(crate) mod float;
 pub(crate) mod handoffs;
 mod ids;
@@ -38,7 +39,6 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
-pub(crate) mod uplink;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -155,16 +155,12 @@ pub struct App {
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_pause_seen: Option<bool>,
     pub(crate) mesh_maintenance_at: Option<Instant>,
-    pub(crate) mesh_pending: Option<crate::mesh::hello::Pending>,
-    pub(crate) mesh_inbound: Option<crate::mesh::hello::Enrollment>,
     pub(crate) clone_detection_warning: Option<String>,
     /// Mailbox projection, rebuilt from custody at server boot after staging
     /// old log entries at construction for the one-time migration.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
-    /// Messages this server is handing up to its hub, and the requests parked
-    /// on them (#410). In memory on purpose: a parked request dies with the
-    /// connection that made it, so there is nothing a restart could resume.
-    pub(crate) uplink: crate::app::uplink::Uplink,
+    /// Inbound SSH relay processes and their independent mesh handshakes.
+    pub(crate) inbound: crate::app::edges::InboundEdges,
     pub(crate) message_relays: message_relay::MessageRelays,
     /// Canonical pane ids reserved by a guarded client submission.
     pub(crate) active_submissions: std::collections::HashSet<String>,
@@ -929,7 +925,7 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
-            uplink: Default::default(),
+            inbound: Default::default(),
             message_relays: Default::default(),
             pending_agent_submit: None,
             pending_paste: None,
@@ -950,8 +946,6 @@ impl App {
             mesh_enrollment_generation: 0,
             mesh_pause_seen: None,
             mesh_maintenance_at: None,
-            mesh_pending: None,
-            mesh_inbound: None,
             clone_detection_warning: None,
             last_focus,
             no_session,

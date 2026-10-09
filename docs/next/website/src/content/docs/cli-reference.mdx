@@ -65,6 +65,13 @@ enrollment reports `unknown (server predates mesh; restart needed)`.
 `enrollment_reason`; `flk status --json` includes a `peers` array with the same
 `pin_origin` values: `dialed`, `inbound_first_contact`, or `unknown`.
 
+A node can accept up to 32 inbound relay edges. `peers status` lists each live
+inbound edge separately. Each edge authenticates its own identity; a second hub
+can connect without displacing the first. A newer handshake for the same node ID
+supersedes the older edge. Resetting an inbound pin clears all edges enrolled
+under that identity. Transient connection failures show `retrying` with the
+reason; `refused` identifies a handshake or compatibility refusal.
+
 Held SSH edges authenticate both node keys using fresh challenges and require
 matching mesh protocol versions (`mesh: 1`). First contact pins the identity.
 Enrollment uses trust on first use (TOFU): possession of a node key proves the
