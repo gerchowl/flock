@@ -525,7 +525,10 @@ impl App {
                     let current = restored
                         .entry(attempt.attempt_id.clone())
                         .or_insert_with(|| attempt.clone());
-                    if attempt.finished_at_ms > current.finished_at_ms {
+                    // With two unfinished copies, retain the store's previous precedence.
+                    if attempt.finished_at_ms > current.finished_at_ms
+                        || (attempt.finished_at_ms.is_none() && current.finished_at_ms.is_none())
+                    {
                         *current = attempt;
                     }
                 }

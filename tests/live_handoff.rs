@@ -1684,12 +1684,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let received_marker = base.join("received");
 
     let store_failure = matches!(failure_point, "rollback_store" | "committed_store");
-    let slow_open = failure_point == "slow_store";
+    let slow_open = matches!(failure_point, "slow_store" | "slow_store_rollback");
     let committed = failure_point == "committed_store" || slow_open;
     let fail_file = base.join("fail-store-open");
     let hook = match failure_point {
         "rollback_store" => "before_fds",
-        "committed_store" | "slow_store" => "",
+        "committed_store" | "slow_store" | "slow_store_rollback" => "",
         other => other,
     };
     let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
@@ -1889,9 +1889,65 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             );
             assert_eq!(
                 status["result"]["mesh_suspended_reason"],
-                "mesh store recovery in progress"
+                "recovering store after handoff"
             );
             assert!(started.elapsed() < Duration::from_secs(1), "{status}");
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+                .arg("status")
+                .env("FLOCK_SOCKET_PATH", &api_socket)
+                .envs(support::environment::isolated_env(
+                    &config_home,
+                    &runtime_dir,
+                ))
+                .env("XDG_STATE_HOME", runtime_dir.join("state"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains("mesh: recovering store after handoff"),
+                "{text}"
+            );
+            assert!(!text.contains("retrying recovery"), "{text}");
+            if failure_point == "slow_store_rollback" {
+                support::wait_for_file(
+                    &fail_file.with_extension("entered"),
+                    Duration::from_secs(5),
+                );
+                let failed = request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"handoff-during-recovery", "method":"server.live_handoff", "params":{}
+                    }),
+                );
+                assert!(
+                    failed["error"]["message"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("mesh store recovery in progress")),
+                    "{failed}"
+                );
+                let started = Instant::now();
+                assert_ok(request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"responsive-after-rollback", "method":"ping", "params":{}
+                    }),
+                ));
+                assert!(started.elapsed() < Duration::from_secs(1));
+                assert!(fail_file.exists(), "recovery must still be blocked");
+                assert_ok(request(
+                    &api_socket,
+                    serde_json::json!({
+                        "id":"input-after-rollback", "method":"pane.send_input",
+                        "params":{"pane_id":pane_id, "text":"after-recovery-rollback", "keys":["Enter"]}
+                    }),
+                ));
+                wait_for_file_contains(
+                    &received_marker,
+                    "got:after-recovery-rollback",
+                    Duration::from_secs(5),
+                );
+            }
         }
         fs::remove_file(&fail_file).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1924,6 +1980,11 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 #[test]
 fn rollback_store_open_failure_preserves_panes_and_original_error() {
     live_handoff_import_failure_rolls_back_old_server_at("rollback_store");
+}
+
+#[test]
+fn handoff_rollback_during_slow_recovery_keeps_the_loop_responsive() {
+    live_handoff_import_failure_rolls_back_old_server_at("slow_store_rollback");
 }
 
 #[test]

@@ -4,6 +4,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
+pub(crate) const RECOVERING_REASON: &str = "recovering store after handoff";
+
 static RECOVERING: AtomicBool = AtomicBool::new(false);
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
 static READ_PATH: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
@@ -139,6 +141,10 @@ pub(crate) fn suspend() -> Result<u64, String> {
 }
 
 pub(crate) fn suspended() -> Result<bool, String> {
+    // Rollback runs on the app loop while recovery may hold the writer lock.
+    if RECOVERING.load(Ordering::Acquire) {
+        return Ok(true);
+    }
     Ok(writer()
         .lock()
         .map_err(|_| "mesh store poisoned")?
@@ -158,6 +164,7 @@ pub(crate) fn resume(minimum: u64) -> Result<(), String> {
         }
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("FLOCK_TEST_MESH_OPEN_WAIT_FILE") {
+                let _ = std::fs::write(Path::new(&path).with_extension("entered"), b"");
                 while Path::new(&path).exists() {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
@@ -184,7 +191,7 @@ pub(crate) fn failed(reason: String) {
 
 pub(crate) fn recovery_reason() -> Option<String> {
     if RECOVERING.load(Ordering::Acquire) {
-        return Some("mesh store recovery in progress".into());
+        return Some(RECOVERING_REASON.into());
     }
     writer()
         .lock()

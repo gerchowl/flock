@@ -96,7 +96,11 @@ pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<
             let mut warning = response["result"]["mesh_suspended_reason"]
                 .as_str()
                 .map(|reason| {
-                    format!("mesh: suspended: {} (retrying recovery)", printable(reason))
+                    if reason == crate::mesh::runtime_store::RECOVERING_REASON {
+                        format!("mesh: {reason}")
+                    } else {
+                        format!("mesh: suspended: {} (retrying recovery)", printable(reason))
+                    }
                 });
             if let Some(count) = response["result"]["mesh_quarantined"]
                 .as_u64()

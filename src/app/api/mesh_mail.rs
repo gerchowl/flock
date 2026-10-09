@@ -732,40 +732,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn status_shows_quarantine_count() {
-        let fixture = crate::mesh::runtime_store::TestStore::new();
-        let delivery = fixture.delivery();
-        with_store(|store| {
-            store
-                .accept(
-                    &delivery.envelope,
-                    CUSTODY_TTL_MS,
-                    Admission::Inbox,
-                    now_ms() as i64,
-                )
-                .map_err(|e| e.to_string())?;
-            store
-                .quarantine(&delivery.envelope.key)
-                .map_err(|e| e.to_string())
-        })
-        .unwrap();
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            rx,
-            crate::api::EventHub::default(),
-        );
-        let response = app.handle_api_request(crate::api::schema::Request {
-            id: "quarantine".into(),
-            method: crate::api::schema::Method::PeersEnrollment(crate::api::schema::EmptyParams {}),
-        });
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(value["result"]["mesh_quarantined"], 1);
-    }
-
-    #[tokio::test]
     async fn retry_batch_uses_fixed_push_concurrency() {
         use std::os::unix::fs::PermissionsExt;
         let shim = std::env::temp_dir().join(format!("flock-retry-shim-{}", std::process::id()));

@@ -44,8 +44,9 @@ ID, and enrollment state: `pending`, `pinned`, `retrying`, or `refused` with the
 The acceptor shows live inbound edges only; handshake refusals remain visible
 on the dialer. Unknown handshake failures retry as transient failures.
 
-When custody recovery is suspended, status reports the reason while the server
-and panes keep running. Recovery retries every five seconds. Quarantined records
+During post-handoff recovery, status reports `mesh: recovering store after handoff`
+while the server and panes keep running. Failed recovery reports the suspension
+reason and retries every five seconds. Quarantined records
 are reported as `mesh quarantined: N` when the count is nonzero;
 `peers.enrollment` exposes the count as `mesh_quarantined`.
 

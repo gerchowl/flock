@@ -1872,3 +1872,31 @@ async fn restore_prefers_finished_attempt_state() {
     app.restore_delivery_attempts();
     assert_eq!(app.delivery_attempts()[0], newer);
 }
+
+#[tokio::test]
+async fn restore_prefers_store_when_both_attempts_are_unfinished() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let _store = crate::mesh::runtime_store::TestStore::new();
+    app.node_id = Some("nodea".into());
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "unfinished-merge", MsgIntent::NeedsReply);
+    app.tick_idle_wakes(Instant::now());
+    assert!(!drain(&mut pty).is_empty());
+    let mut stored = app.delivery_attempts()[0].clone();
+    assert!(stored.finished_at_ms.is_none());
+    assert!(!stored.retried);
+    stored.retried = true;
+    crate::mesh::runtime_store::with_store(|store| {
+        store.record_attempt(&stored).map_err(|e| e.to_string())
+    })
+    .unwrap();
+    app.restore_delivery_attempts();
+    let restored = app.delivery_attempts();
+    assert_eq!(restored[0].attempt_id, stored.attempt_id);
+    assert!(restored[0].retried);
+    assert_eq!(restored[0].state, "unconfirmed");
+}
