@@ -334,6 +334,10 @@ fn spawn_flock_with_config(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    // The mesh store lives under the state dir. Shared across servers, one
+    // test's mail (and its deferral marks) is restored into the next one's
+    // inbox, and a correlation id reused across tests reads the wrong record.
+    cmd.env("XDG_STATE_HOME", config_home.with_file_name("state"));
     cmd.env("FLOCK_SOCKET_PATH", socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");

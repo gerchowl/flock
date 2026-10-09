@@ -4,10 +4,13 @@
 //! library does no transport, directory lookup, or audit-body publication.
 use super::{clock::Clock, key::MessageKey};
 mod collection;
+pub(crate) mod delivery_attempts;
 mod schema;
+mod status;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub use status::{Status, StatusReference};
 use std::{
     fmt, fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},

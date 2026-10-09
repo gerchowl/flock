@@ -524,10 +524,34 @@ impl App {
         } else {
             Vec::new()
         };
-        Ok(new_evidence(id, pane, wake, ids))
+        let evidence = new_evidence(id, pane, wake, ids);
+        if self.node_id.is_some() {
+            match crate::mesh::hello::with_store(|store| {
+                store.record_attempt(&evidence).map_err(|e| e.to_string())
+            }) {
+                Ok(_) => {}
+                // Only a full durable registry refuses admission. Any other
+                // store failure leaves local typing to the in-memory registry.
+                Err(reason) if reason.starts_with("mail_store_full") => {
+                    return Err("delivery_attempt_capacity")
+                }
+                Err(_) => {
+                    crate::logging::mesh_custody_failed("record_attempt", "mail_store_unavailable")
+                }
+            }
+        }
+        Ok(evidence)
     }
 
     pub(crate) fn record_delivery_attempt(&self, attempt: &crate::api::schema::DeliveryAttempt) {
+        if self.node_id.is_some()
+            && crate::mesh::hello::with_store(|store| {
+                store.record_attempt(attempt).map_err(|e| e.to_string())
+            })
+            .is_err()
+        {
+            crate::logging::mesh_custody_failed("record_attempt", "mail_store_unavailable");
+        }
         self.delivery_attempt_registry
             .borrow_mut()
             .record(attempt.clone());
@@ -557,7 +581,27 @@ impl App {
     }
 
     pub(crate) fn delivery_attempts(&self) -> Vec<crate::api::schema::DeliveryAttempt> {
-        self.delivery_attempt_registry.borrow().snapshot()
+        let mut attempts = self
+            .delivery_attempt_registry
+            .borrow()
+            .snapshot()
+            .into_iter()
+            .map(|a| (a.attempt_id.clone(), a))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if self.node_id.is_some() {
+            match crate::mesh::runtime_store::read(|store| {
+                store.delivery_attempts().map_err(|e| e.to_string())
+            }) {
+                Ok(Some(stored)) => {
+                    attempts.extend(stored.into_iter().map(|a| (a.attempt_id.clone(), a)))
+                }
+                Err(_) => {
+                    crate::logging::mesh_custody_failed("read_attempts", "mail_store_unavailable")
+                }
+                Ok(None) => {}
+            }
+        }
+        attempts.into_values().collect()
     }
 }
 

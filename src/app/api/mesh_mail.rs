@@ -453,7 +453,9 @@ impl App {
         if crate::mesh::runtime_store::suspended()? {
             return Ok(());
         }
-        self.restore_mesh_mail()
+        self.restore_mesh_mail()?;
+        self.restore_delivery_attempts();
+        Ok(())
     }
 
     pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {

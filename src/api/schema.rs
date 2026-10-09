@@ -1238,6 +1238,8 @@ pub struct MsgReadParams {
 /// correlation id and then the trail went cold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgStatusParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::mesh::store::StatusReference>,
     pub correlation_id: String,
 }
 
@@ -1248,6 +1250,8 @@ pub struct MsgStatusParams {
 /// a sender with no pane (an ssh shell, a script) can still be told.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgWaitReplyParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::mesh::store::StatusReference>,
     pub correlation_id: String,
     /// How long to hold the request. Absent means
     /// [`MSG_WAIT_REPLY_MAX_MS`], the age at which an unread message is
@@ -1405,6 +1409,9 @@ pub struct InboxMessage {
     /// `from_pane` is absent — surfaced so the recipient never attempts a
     /// reply that would fail.
     pub replyable: bool,
+    /// Durable return binding, or explicit best-effort pre-mesh routing.
+    #[serde(default)]
+    pub reply_contract: String,
     /// What the sender said it wanted (#280). A field on the envelope, which
     /// is the whole point: `needs_reply` is knowable before the body is read,
     /// where a sentence asking for an answer is not.
@@ -2176,6 +2183,8 @@ pub enum ResponseResult {
         content: String,
     },
     MeshCollected {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<String>,
         answers: Vec<crate::mesh::delivery::Deliver>,
     },
     MeshHello {
@@ -2413,6 +2422,8 @@ pub enum ResponseResult {
         messages: Vec<QueuedMessageInfo>,
     },
     MsgStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<crate::mesh::store::StatusReference>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attempts: Vec<DeliveryAttempt>,
         correlation_id: String,
@@ -4683,6 +4694,7 @@ mod tests {
         assert_eq!(
             request.method,
             Method::MsgWaitReply(MsgWaitReplyParams {
+                reference: None,
                 correlation_id: "c-1".into(),
                 timeout_ms: Some(500),
             })

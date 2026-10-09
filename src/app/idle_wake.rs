@@ -516,6 +516,13 @@ impl App {
                 restored.insert(attempt.attempt_id.clone(), attempt);
             }
         }
+        if self.node_id.is_some() {
+            if let Ok(Some(stored)) = crate::mesh::runtime_store::read(|store| {
+                store.delivery_attempts().map_err(|e| e.to_string())
+            }) {
+                restored.extend(stored.into_iter().map(|a| (a.attempt_id.clone(), a)));
+            }
+        }
         self.delivery_attempt_registry.borrow_mut().clear();
         for attempt in restored.into_values() {
             if attempt.wake {

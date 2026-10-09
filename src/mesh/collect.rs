@@ -7,6 +7,7 @@ pub(crate) const POLL_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Default)]
 pub(crate) struct Batch {
+    pub receipt: Option<String>,
     pub deliveries: Vec<Deliver>,
     pub quarantined: Vec<OutboundAck>,
 }
@@ -55,7 +56,17 @@ pub enum Collect {
 #[serde(deny_unknown_fields)]
 pub struct OutboundCollect {
     #[serde(default)]
+    pub receipts: Vec<Receipt>,
+    #[serde(default)]
     pub ack: Vec<OutboundAck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub key: MessageKey,
+    pub token: Vec<u8>,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -135,7 +146,10 @@ fn decode(raw: &str) -> Result<Batch, String> {
     if answers.len() > BATCH_CAP {
         return Err("mesh collection batch too large".into());
     }
-    let mut batch = Batch::default();
+    let mut batch = Batch {
+        receipt: response["result"]["receipt"].as_str().map(str::to_owned),
+        ..Batch::default()
+    };
     for value in answers {
         match serde_json::from_value::<Deliver>(value.clone()) {
             Ok(delivery) => batch.deliveries.push(delivery),

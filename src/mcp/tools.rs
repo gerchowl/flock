@@ -186,7 +186,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_status",
-            description: "Inspect a sent message by correlation id, including read or relay state and local submission attempts with unconfirmed or abandoned reasons.",
+            description: "Inspect durable message state: queued, custody, delivered, read, held, collected, expired or outcome_retention_elapsed. Includes replies and submission attempts. Retain the returned reference for queries after retention; old local messages remain supported.",
             input_schema: schema_msg_status,
             build: build_msg_status,
         },
@@ -196,8 +196,8 @@ pub(super) fn table() -> &'static [Tool] {
                           other agents. This is how agent-to-agent messages \
                           arrive — they are NOT typed into your session. Omit \
                           `pane` to read your own inbox. Each message carries \
-                          its sender, body, `intent`, and whether you can \
-                          reply. `intent: needs_reply` means the sender is \
+                          its sender, body, `intent`, and whether a durable return binding lets you \
+                          reply even while offline. `reply_contract` discloses best-effort older messages. `intent: needs_reply` means the sender is \
                           waiting on an answer — send one with \
                           `flock_msg_reply` rather than leaving it hanging; \
                           `fyi` wants no reply, and answering it burns the \
@@ -238,7 +238,7 @@ pub(super) fn table() -> &'static [Tool] {
                           Returns `outcome`: `replied` (the reply is in \
                           `reply`), `deferred` (the recipient is muted; its \
                           automatic answer is in `reply`), `expired` (dropped \
-                          unread — no answer is coming) or `timeout` (with \
+                          unread), `recipient_gone`, `outcome_retention_elapsed`, or `timeout` (with \
                           the message's last `state`, e.g. `read`). BLOCKS \
                           this MCP session for up to `timeout_ms` (default \
                           60 s, at most 10 min): to wait longer without \
@@ -610,6 +610,7 @@ fn schema_msg_wait_reply() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "reference": {"type": "object", "description": "The signed reference returned by msg.status."},
             "correlation_id": {
                 "type": "string",
                 "description": "The correlation id `flock_msg_send` returned for the message you are waiting on.",
@@ -654,12 +655,19 @@ fn schema_msg_reply() -> Value {
 
 fn schema_msg_status() -> Value {
     json!({"type": "object", "properties": {
-        "correlation_id": {"type": "string", "minLength": 1}
+        "correlation_id": {"type": "string", "minLength": 1},
+        "reference": {"type": "object", "description": "The signed reference returned by msg.status."}
     }, "required": ["correlation_id"], "additionalProperties": false})
 }
 
 fn build_msg_status(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgStatus(crate::api::schema::MsgStatusParams {
+        reference: args
+            .get("reference")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| McpError::invalid_params("invalid status reference"))?,
         correlation_id: required_string(&args, "correlation_id")?,
     }))
 }
@@ -956,6 +964,12 @@ const MCP_WAIT_REPLY_MAX_MS: u64 = 600_000;
 fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgWaitReply(
         crate::api::schema::MsgWaitReplyParams {
+            reference: args
+                .get("reference")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| McpError::invalid_params("invalid status reference"))?,
             correlation_id: required_string(&args, "correlation_id")?,
             timeout_ms: Some(
                 optional_u64(&args, "timeout_ms")?

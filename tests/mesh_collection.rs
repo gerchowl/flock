@@ -833,6 +833,22 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
                 .then_some(())
         },
     );
+    // The question's read receipt rides nodeb's outbound collection from
+    // nodea and is marked sent once. That is a delivery transition, not an
+    // idle retry, so let it land before the idle window is measured.
+    fleet::wait_until(
+        "question receipt marked sent",
+        Duration::from_secs(10),
+        || {
+            db.query_row(
+                "SELECT receipt_sent IS NOT NULL FROM envelopes WHERE request_id IS NULL",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+            .then_some(())
+        },
+    );
     let version: i64 = db
         .pragma_query_value(None, "data_version", |r| r.get(0))
         .unwrap();
@@ -858,4 +874,99 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
             (idle.elapsed() >= Duration::from_secs(3)).then_some(())
         },
     );
+}
+
+#[test]
+fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
+    use std::io::{BufRead, Write};
+    let mut fleet = fleet::spawn("mesh-status", PAIR);
+    let (_, recipient) = question(&fleet, "durable-status");
+    let origin = fleet.node("nodea");
+    let status = request(
+        origin,
+        "msg.status",
+        json!({"correlation_id":"durable-status"}),
+    );
+    assert_eq!(status["result"]["state"], "delivered", "{status}");
+    let reference = status["result"]["reference"].clone();
+    assert_eq!(
+        cli_status(origin, "durable-status")["result"]["state"],
+        "delivered"
+    );
+    let inbox = read(fleet.node("nodeb"), &recipient["pane_id"]);
+    assert_eq!(inbox[0]["replyable"], true);
+    assert_eq!(inbox[0]["reply_contract"], "durable_return_binding");
+    ready(origin);
+    fleet::wait_until("read receipt at origin", Duration::from_secs(30), || {
+        let status = request(
+            origin,
+            "msg.status",
+            json!({"correlation_id":"durable-status"}),
+        );
+        (status["result"]["state"] == "read").then_some(())
+    });
+    assert_eq!(
+        cli_status(origin, "durable-status")["result"]["state"],
+        "read"
+    );
+    let mut stream = std::os::unix::net::UnixStream::connect(&origin.api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(35)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id":"waiting","method":"msg.wait_reply","params":{
+            "correlation_id":"durable-status","timeout_ms":30000,"reference":reference
+        }})
+    )
+    .unwrap();
+    let result = reply(fleet.node("nodeb"), "durable-status", "durable answer");
+    assert_eq!(result["result"]["state"], "held", "{result}");
+    ready(origin);
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap();
+    let waited: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(waited["result"]["outcome"], "replied", "{waited}");
+    assert_eq!(waited["result"]["reply"]["body"], "durable answer");
+    fleet.node_mut("nodea").stop();
+    let log = fleet
+        .node("nodea")
+        .config_home
+        .join("flock-dev/event-log.jsonl");
+    assert!(log.exists(), "{}", log.display());
+    std::fs::remove_file(log).unwrap();
+    fleet.node_mut("nodea").restart();
+    let restored = request(
+        fleet.node("nodea"),
+        "msg.status",
+        json!({
+            "correlation_id":"durable-status","reference":reference
+        }),
+    );
+    assert_eq!(
+        restored["result"]["reply"]["body"], "durable answer",
+        "{restored}"
+    );
+}
+
+// This integration probe executes the real CLI against only its isolated server.
+#[allow(clippy::disallowed_methods)]
+fn cli_status(node: &Node, correlation: &str) -> Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+        .env_clear()
+        .env("HOME", &node.home)
+        .env("XDG_CONFIG_HOME", &node.config_home)
+        .env("FLOCK_SOCKET_PATH", &node.api_socket)
+        .args(["msg", "status", correlation])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }

@@ -1226,6 +1226,7 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
         serde_json::from_str(&app.handle_api_request(Request {
             id: "status".into(),
             method: Method::MsgStatus(crate::api::schema::MsgStatusParams {
+                reference: None,
                 correlation_id: "attempt-mail".into(),
             }),
         }))

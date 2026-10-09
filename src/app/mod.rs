@@ -19,7 +19,7 @@ pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
 pub(crate) mod config_io;
 mod creation;
-mod delivery_attempts;
+use crate::mesh::store::delivery_attempts;
 pub(crate) mod directory;
 pub(crate) mod float;
 pub(crate) mod handoffs;

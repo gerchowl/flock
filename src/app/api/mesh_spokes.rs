@@ -112,6 +112,20 @@ impl App {
         let Ok(batch) = completion.result else {
             return;
         };
+        if let Collect::Outbound { outbound } = &completion.query {
+            if !outbound.receipts.is_empty() {
+                if let Err(reason) = with_store(|store| {
+                    store
+                        .receipts_sent(&outbound.receipts)
+                        .map_err(|e| e.to_string())
+                }) {
+                    crate::logging::mesh_custody_failed(
+                        "receipts_sent",
+                        super::mesh_mail::error_code(&reason),
+                    );
+                }
+            }
+        }
         let edge = crate::peer_stream::enrollment(&completion.peer);
         if edge.state != "pinned" {
             return;
@@ -153,7 +167,10 @@ impl App {
             self.start_collection(
                 completion.peer,
                 Collect::Outbound {
-                    outbound: OutboundCollect { ack },
+                    outbound: OutboundCollect {
+                        ack,
+                        receipts: Vec::new(),
+                    },
                 },
             );
         }
