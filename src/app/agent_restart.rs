@@ -564,7 +564,7 @@ impl App {
         };
         terminal.restart_idle_observed_since(since)
             && terminal
-                .idle_wake_blocker(
+                .guarded_submit_blocker(
                     now,
                     Duration::from_millis(policy.settle_ms),
                     Duration::from_millis(policy.fresh_ms),
@@ -573,16 +573,22 @@ impl App {
             && runtime.last_operator_input_at().is_none_or(|at| {
                 now.saturating_duration_since(at) >= Duration::from_millis(policy.operator_quiet_ms)
             })
-            && crate::detect::parse_agent_label(
-                &terminal
-                    .persisted_agent_session
-                    .as_ref()
-                    .map(|s| s.agent.clone())
-                    .unwrap_or_default(),
-            )
-            .and_then(|agent| {
-                crate::detect::agent_prompt_is_empty(agent, &runtime.recent_text(100))
-            }) == Some(true)
+            && self.restart_composer_ready(id).is_ok()
+    }
+
+    fn restart_composer_ready(&self, id: &TerminalId) -> Result<(), &'static str> {
+        let terminal = self.state.terminals.get(id).ok_or("terminal_missing")?;
+        let agent = terminal
+            .persisted_agent_session
+            .as_ref()
+            .and_then(|session| crate::detect::parse_agent_label(&session.agent))
+            .ok_or("unknown_composer")?;
+        let runtime = self.terminal_runtimes.get(id).ok_or("runtime_missing")?;
+        match super::guarded_submit::composer(agent, &runtime.detection_text(), "") {
+            super::guarded_submit::Composer::Empty => Ok(()),
+            super::guarded_submit::Composer::Unknown => Err("unknown_composer"),
+            _ => Err("composer_not_empty"),
+        }
     }
 
     fn advance_restart(
@@ -877,8 +883,12 @@ impl App {
                         .get(id)
                         .map(|r| r.recent_text(20))
                         .unwrap_or_default();
+                    let reason = self
+                        .restart_composer_ready(id)
+                        .err()
+                        .unwrap_or("session_or_idle_unconfirmed");
                     self.recover_restart(id, request);
-                    self.report_restart(id, request, "restart_stuck", format!("verification timed out; the running harness remains live; retry plan deferred until it exits, then use flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
+                    self.report_restart(id, request, "restart_stuck", format!("verification timed out ({reason}); the running harness remains live; retry plan deferred until it exits, then use flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
                     return false;
                 }
                 true
