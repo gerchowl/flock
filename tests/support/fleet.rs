@@ -126,7 +126,7 @@ impl Drop for Node {
 }
 
 impl Node {
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let pid = child.process_id();
             let _ = child.kill();

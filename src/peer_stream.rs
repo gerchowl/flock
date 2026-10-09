@@ -46,10 +46,41 @@ use crate::config::PeerConfig;
 /// ServerAlive keeps answering while no response ever comes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Refuse to re-spawn a connection that just died, so a peer that is asleep or
-/// running an old `flk` cannot turn into a reconnect storm. Status retains
-/// the refusal reason while this backoff runs.
+/// Authentication or compatibility refusals retry slowly. Status retains the
+/// refusal reason while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Enrollment refusals default to the long delay. Only transport failures and
+/// the relay's explicit missing-server response are transient.
+struct EnrollmentError {
+    detail: String,
+    transient: bool,
+}
+
+impl From<String> for EnrollmentError {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl EnrollmentError {
+    fn transport(detail: String) -> Self {
+        Self {
+            detail,
+            transient: true,
+        }
+    }
+
+    fn response(error: &serde_json::Value, detail: String) -> Self {
+        Self {
+            detail,
+            transient: error["code"] == "no_local_server",
+        }
+    }
+}
 
 /// How long a failed stream waits for ssh's stderr to drain before it is
 /// explained. ssh writes its error and exits, and the stdout EOF that reports
@@ -298,7 +329,7 @@ impl PeerStream {
         })
     }
 
-    fn enroll(&mut self, peer: &PeerConfig) -> Result<String, String> {
+    fn enroll(&mut self, peer: &PeerConfig) -> Result<String, EnrollmentError> {
         use crate::mesh::{
             hello::{self, Challenge, Hello, Offer},
             identity::NodeIdentity,
@@ -309,7 +340,9 @@ impl PeerStream {
             offer: dialer.clone(),
         })
         .map_err(|e| e.to_string())?;
-        let raw = self.request("mesh.hello", request)?;
+        let raw = self
+            .request("mesh.hello", request)
+            .map_err(EnrollmentError::transport)?;
         let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if let Some(error) = response.get("error") {
             if error["code"] == "mesh_version_mismatch" {
@@ -317,11 +350,9 @@ impl PeerStream {
                     .as_u64()
                     .and_then(|v| u32::try_from(v).ok())
                 {
-                    return Err(hello::version_mismatch(
-                        hello::version(),
-                        remote,
-                        &peer.name,
-                    ));
+                    return Err(
+                        hello::version_mismatch(hello::version(), remote, &peer.name).into(),
+                    );
                 }
             }
             if matches!(
@@ -332,9 +363,12 @@ impl PeerStream {
                     .as_u64()
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "unsupported".into());
-                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::version(), peer.name));
+                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::version(), peer.name).into());
             }
-            return Err(format!("mesh handshake refused for {}: {error}", peer.name));
+            return Err(EnrollmentError::response(
+                error,
+                format!("mesh handshake refused for {}: {error}", peer.name),
+            ));
         }
         let challenge: Challenge = serde_json::from_value(response["result"]["challenge"].clone())
             .map_err(|e| {
@@ -355,13 +389,18 @@ impl PeerStream {
         let signature = hello::sign(&identity, &dialer, &challenge.offer, "dialer")?;
         let finish =
             serde_json::to_value(Hello::Finish { signature }).map_err(|e| e.to_string())?;
-        let raw = self.request("mesh.hello", finish)?;
+        let raw = self
+            .request("mesh.hello", finish)
+            .map_err(EnrollmentError::transport)?;
         let ack: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         if let Some(error) = ack.get("error") {
-            return Err(format!("mesh enrollment refused: {error}"));
+            return Err(EnrollmentError::response(
+                error,
+                format!("mesh enrollment refused: {error}"),
+            ));
         }
         if !ack.get("result").is_some_and(serde_json::Value::is_object) {
-            return Err("invalid mesh enrollment acknowledgement".into());
+            return Err("invalid mesh enrollment acknowledgement".to_string().into());
         }
         hello::check_pin(
             &peer.name,
@@ -436,7 +475,7 @@ impl PeerStream {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         if matches!(
                             value["error"]["code"].as_str(),
-                            Some("mesh_not_enrolled" | "not_the_relay")
+                            Some("mesh_not_enrolled" | "not_the_relay" | "no_local_server")
                         ) {
                             return Err("mesh edge lost enrollment; reconnect required".into());
                         }
@@ -557,6 +596,7 @@ impl Drop for PeerStream {
 struct Slot {
     stream: Option<PeerStream>,
     retry_after: Option<std::time::Instant>,
+    transient_failures: u32,
     /// The ssh destination this connection was opened against, so a config
     /// reload can tell "this peer moved" from "some unrelated key changed".
     target: String,
@@ -564,6 +604,19 @@ struct Slot {
     /// (#418). A stream that was up and later died is not recorded here: that
     /// is an ordinary reconnect, not a peer that cannot hold a stream at all.
     failure: Option<StreamFailure>,
+}
+
+impl Slot {
+    fn transient_backoff(&mut self) -> Duration {
+        let ceiling_ms = (1_000_u64 << self.transient_failures.min(5)).min(30_000);
+        self.transient_failures = self.transient_failures.saturating_add(1);
+        let mut random = [0_u8; 8];
+        if getrandom::fill(&mut random).is_err() {
+            return Duration::from_millis(ceiling_ms);
+        }
+        // Equal jitter avoids synchronized retries without permitting a tight loop.
+        Duration::from_millis(ceiling_ms / 2 + u64::from_ne_bytes(random) % (ceiling_ms / 2 + 1))
+    }
 }
 
 type Registry = Mutex<HashMap<String, Arc<Mutex<Slot>>>>;
@@ -726,10 +779,18 @@ fn request_over(
         match PeerStream::spawn(peer) {
             Ok(mut stream) => match stream.enroll(peer) {
                 Ok(node_id) => {
+                    slot.transient_failures = 0;
+                    slot.retry_after = None;
                     set_enrollment(peer, Some(node_id), None);
                     slot.stream = Some(stream);
                 }
                 Err(err) => {
+                    let backoff = if err.transient {
+                        slot.transient_backoff()
+                    } else {
+                        RECONNECT_BACKOFF
+                    };
+                    let err = err.detail;
                     let (detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED) {
                         stream.explain(&err)
                     } else {
@@ -741,9 +802,9 @@ fn request_over(
                         &peer.name,
                         &detail,
                         tail.as_deref(),
-                        RECONNECT_BACKOFF,
+                        backoff,
                     );
-                    slot.retry_after = Some(std::time::Instant::now() + RECONNECT_BACKOFF);
+                    slot.retry_after = Some(std::time::Instant::now() + backoff);
                     return Err(detail);
                 }
             },
@@ -780,7 +841,7 @@ fn request_over(
             // cost the poll its connection for a whole backoff: the next poll
             // reconnects at once, exactly as if this line had never been sent.
             let backoff = if spawn {
-                RECONNECT_BACKOFF
+                slot.transient_backoff()
             } else {
                 Duration::ZERO
             };
@@ -948,6 +1009,33 @@ mod tests {
         PeerConfig {
             name: name.to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enrollment_backoff_classifies_only_missing_server_as_transient() {
+        for code in [
+            "no_local_server",
+            "mesh_version_mismatch",
+            "identity_changed",
+            "invalid_request",
+        ] {
+            let failure =
+                EnrollmentError::response(&serde_json::json!({"code": code}), code.into());
+            assert_eq!(failure.transient, code == "no_local_server");
+            assert_eq!(failure.detail, code);
+        }
+        assert!(!EnrollmentError::from("identity changed".to_string()).transient);
+        assert!(EnrollmentError::transport(CONNECTION_CLOSED.into()).transient);
+    }
+
+    #[test]
+    fn transient_backoff_grows_with_jitter_and_caps_at_thirty_seconds() {
+        let mut slot = Slot::default();
+        for ceiling in [1, 2, 4, 8, 16, 30, 30, 30] {
+            let delay = slot.transient_backoff();
+            assert!(delay >= Duration::from_millis(ceiling * 500));
+            assert!(delay <= Duration::from_secs(ceiling));
         }
     }
 

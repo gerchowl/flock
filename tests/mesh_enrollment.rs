@@ -53,6 +53,43 @@ fn cli(node: &Node, args: &[&str]) -> Value {
 }
 
 #[test]
+fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
+    let mut fleet = fleet::spawn("mesh-retry", PAIR);
+    let pinned = enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
+    fleet.node_mut("acceptor.test").stop();
+    // Wait for a fresh hello to reach the stopped server, not just for the
+    // previously enrolled stream to notice that its server disappeared.
+    fleet::wait_until("hello to stopped peer", Duration::from_secs(10), || {
+        let status = request(fleet.node("dialer.test"), "peers.enrollment", json!({}));
+        status["result"]["peers"]
+            .as_array()?
+            .iter()
+            .find(|p| {
+                p["peer"] == "acceptor.test"
+                    && p["reason"].as_str().is_some_and(|reason| {
+                        reason.contains("mesh handshake refused")
+                            && reason.contains("no_local_server")
+                    })
+            })
+            .cloned()
+    });
+    fleet.node_mut("acceptor.test").restart();
+    fleet::wait_until("re-enrolled after restart", Duration::from_secs(6), || {
+        let status = request(fleet.node("dialer.test"), "peers.enrollment", json!({}));
+        status["result"]["peers"]
+            .as_array()?
+            .iter()
+            .find(|p| {
+                p["peer"] == "acceptor.test"
+                    && p["state"] == "pinned"
+                    && p["node_id"] == pinned["node_id"]
+            })
+            .cloned()
+    });
+    enrollment(fleet.node("acceptor.test"), "dialer.test", "pinned");
+}
+
+#[test]
 fn mutual_enrollment_and_restart_keep_pins() {
     let mut fleet = fleet::spawn("mesh-enroll", PAIR);
     let remote = enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
