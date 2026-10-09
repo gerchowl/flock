@@ -528,6 +528,31 @@ fn workspace_list_and_create_round_trip() {
         .unwrap()
         .contains("gamma"));
 
+    for text in [
+        "y",
+        "y",
+        "q",
+        "q",
+        "1",
+        "1",
+        "make test",
+        "make test",
+        &"wrapped words ".repeat(12),
+    ] {
+        let pasted = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id":"repeat", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":text}
+            })
+            .to_string(),
+        );
+        assert_eq!(pasted["result"]["outcome"], "delivered", "{pasted}");
+    }
+    let cleared = send_request(&socket_path, &serde_json::json!({
+        "id":"clear_draft", "method":"pane.send_keys", "params":{"pane_id":pane_id,"keys":["C-c"]}
+    }).to_string());
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
+
     let send_input = send_request(
         &socket_path,
         &format!(
@@ -1403,7 +1428,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1657,7 +1682,7 @@ fn pane_report_agent_updates_effective_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1918,7 +1943,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2057,7 +2082,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2114,7 +2139,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
-    assert_eq!(cleared["result"]["type"], "ok");
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
 
     let pane = send_request(
         &socket_path,
@@ -2229,7 +2254,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2329,7 +2354,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
             background_pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "paste");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2503,10 +2528,6 @@ fn agent_send_and_pane_send_text_use_bracketed_paste() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
-    std::env::set_var("HOME", &config_home);
-    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
-        std::env::remove_var(key);
-    }
     std::env::set_var("HOME", &config_home);
     for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
         std::env::remove_var(key);
@@ -2809,4 +2830,147 @@ with log.open('w') as out:
         enter_at - paste_at
     );
     cleanup_spawned_flock(child, base);
+}
+
+#[test]
+fn guarded_submit_cli_reports_exit_8_and_9_with_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    for expected_code in [8, 9] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let config_home = base.join("config");
+        std::env::set_var("HOME", &config_home);
+        for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+            std::env::remove_var(key);
+        }
+        let runtime_dir = base.join("runtime");
+        let socket_path = runtime_dir.join("flock.sock");
+        let script = base.join("codex");
+        let shell = base.join("composer-shell");
+        let log = base.join("input.jsonl");
+        fs::write(
+        &script,
+        r#"import json, os, sys, time, tty
+from pathlib import Path
+tty.setraw(0)
+log = Path(__file__).with_name('input.jsonl')
+os.write(1, b'\x1b[?2004h\x1b[2J\x1b[HOpenAI Codex\r\nREADY\r\n\xe2\x80\xba \r\n  ? for shortcuts\r\n')
+with log.open('w') as out:
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
+        out.flush()
+        if b'\x1b[200~' in data:
+            os.write(1, b'\x1b[2J\x1b[HOpenAI Codex\r\n\xe2\x80\xba failure prompt\r\n  ? for shortcuts\r\n')
+"#,
+    )
+    .unwrap();
+        fs::write(
+            &shell,
+            format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+        let child = spawn_flock_with_shell(
+            &config_home,
+            &runtime_dir,
+            &socket_path,
+            shell.to_str().unwrap(),
+        );
+        wait_for_socket(&socket_path, Duration::from_secs(5));
+        let created = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "create", "method": "workspace.create",
+                "params": {"cwd": base, "focus": true}
+            })
+            .to_string(),
+        );
+        let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "read", "method": "pane.read", "params": {"pane_id": pane, "source": "recent"}
+            })
+            .to_string(),
+        );
+            if read.to_string().contains("READY") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake composer never became ready: {read}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let agent = send_request(
+                &socket_path,
+                &serde_json::json!({"id":"idle", "method":"agent.get", "params":{"target":pane}})
+                    .to_string(),
+            );
+            if matches!(
+                agent["result"]["agent"]["agent_status"].as_str(),
+                Some("idle" | "done")
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "composer never detected idle: {agent}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let cli_socket = socket_path.clone();
+        let cli_pane = pane.to_owned();
+        let cli = thread::spawn(move || {
+            run_flk(
+                &cli_socket,
+                &["agent", "send", "--submit", &cli_pane, "failure prompt"],
+            )
+        });
+        if expected_code == 9 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fs::read_to_string(&log).unwrap_or_default().is_empty() {
+                assert!(Instant::now() < deadline, "submit never typed its prompt");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(run_flk(&socket_path, &["pane", "send-keys", pane, "Esc"])
+                .status
+                .success());
+        }
+        let output = cli.join().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(
+            result["result"]["outcome"],
+            if expected_code == 8 {
+                "unconfirmed"
+            } else {
+                "abandoned"
+            }
+        );
+        assert_eq!(
+            result["result"]["reason"],
+            if expected_code == 8 {
+                "confirm_timeout"
+            } else {
+                "operator_active"
+            }
+        );
+        assert!(result["result"]["attempt"]["attempt_id"].is_string());
+        cleanup_spawned_flock(child, base);
+    }
 }

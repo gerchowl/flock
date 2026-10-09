@@ -7,7 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::api::responses::{encode_error, encode_success};
-use super::guarded_submit::{composer, Composer, CONFIRM_WINDOW};
+use super::guarded_submit::{composer_contents, CONFIRM_WINDOW};
 use super::App;
 use crate::api::schema::ResponseResult;
 use crate::detect::Agent;
@@ -32,20 +32,61 @@ fn digest(screen: &str) -> String {
         .collect()
 }
 
-fn observed(agent: Option<Agent>, before: &str, after: &str, text: &str) -> bool {
-    if text.trim().is_empty() || before == after {
+fn normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Isolate the inserted/changed span instead of searching old transcript text.
+fn gained_text(before: &str, after: &str, text: &str) -> bool {
+    let before = normalize(before);
+    let after = normalize(after);
+    let text = normalize(text);
+    if text.is_empty() || before == after {
         return false;
     }
-    if let Some(agent) = agent {
-        // A recognized harness needs evidence in its editor, not its transcript.
-        return composer(agent, before, text) != Composer::Owned
-            && composer(agent, after, text) == Composer::Owned;
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let before_tail: Vec<_> = before.chars().skip(prefix).collect();
+    let after_tail: Vec<_> = after.chars().skip(prefix).collect();
+    let suffix = before_tail
+        .iter()
+        .rev()
+        .zip(after_tail.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let changed: String = after_tail[..after_tail.len() - suffix].iter().collect();
+    changed.contains(&text)
+}
+
+fn observed(agent: Option<Agent>, before: &str, after: &str, text: &str) -> Option<&'static str> {
+    if before == after {
+        return None;
     }
-    // Ordinary terminals may echo input without a known composer. Require new
-    // visible text, rather than treating unrelated screen activity as delivery.
-    let flatten = |s: &str| s.lines().map(str::trim).collect::<String>();
-    let text = flatten(text);
-    !text.is_empty() && !flatten(before).contains(&text) && flatten(after).contains(&text)
+    if let Some((before, after)) = agent.and_then(|agent| {
+        Some((
+            composer_contents(agent, before)?,
+            composer_contents(agent, after)?,
+        ))
+    }) {
+        if before != after {
+            return Some(if gained_text(&before, &after, text) {
+                "text_matched"
+            } else {
+                "composer_changed"
+            });
+        }
+    }
+
+    // Unsupported harnesses and ordinary terminals share an observational
+    // fallback. A screen change is deliberately weaker evidence than text.
+    Some(if gained_text(before, after, text) {
+        "text_matched"
+    } else {
+        "screen_changed"
+    })
 }
 
 impl App {
@@ -55,12 +96,14 @@ impl App {
         ws: usize,
         pane_id: PaneId,
         text: String,
+        not_found: &str,
+        write_failed: &str,
     ) -> String {
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
-            return encode_error(id, "pane_gone", "pane_gone");
+            return encode_error(id, not_found, "pane runtime not found");
         };
         let Some(runtime) = self.lookup_runtime_sender(ws, pane_id) else {
-            return encode_error(id, "pane_gone", "pane_gone");
+            return encode_error(id, not_found, "pane runtime not found");
         };
         let mut paste = Paste {
             id: id.clone(),
@@ -76,7 +119,7 @@ impl App {
         };
         let encoded = super::api_helpers::encode_api_text(runtime, &text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(encoded)) {
-            return encode_error(id, "pane_send_failed", err.to_string());
+            return encode_error(id, write_failed, err.to_string());
         }
         paste.operator_input = runtime.last_operator_input_at();
         self.pending_paste = Some(paste);
@@ -100,6 +143,9 @@ impl App {
             Some((runtime, terminal))
         });
         let after = current.as_ref().map(|(r, _)| r.detection_text());
+        let level = after
+            .as_deref()
+            .and_then(|after| observed(paste.agent, &paste.before, after, &paste.text));
         let reason = match current {
             None => "pane_gone",
             Some((runtime, terminal))
@@ -110,16 +156,7 @@ impl App {
             Some((runtime, _)) if runtime.last_operator_input_at() != paste.operator_input => {
                 "operator_active"
             }
-            Some(_)
-                if observed(
-                    paste.agent,
-                    &paste.before,
-                    after.as_deref().unwrap_or_default(),
-                    &paste.text,
-                ) =>
-            {
-                "text_observed"
-            }
+            Some(_) if level.is_some() => "change_observed",
             Some(_) if Instant::now() >= paste.deadline => "confirm_timeout",
             Some(_) => {
                 self.schedule_paste(paste, respond_to);
@@ -129,7 +166,7 @@ impl App {
         let _ = respond_to.send(encode_success(
             paste.id,
             ResponseResult::Paste {
-                outcome: if reason == "text_observed" {
+                outcome: if reason == "change_observed" {
                     "delivered"
                 } else {
                     "unconfirmed"
@@ -140,7 +177,7 @@ impl App {
                     "pane_id": paste.pane,
                     "before_digest": digest(&paste.before),
                     "after_digest": after.as_deref().map(digest),
-                    "probe": if paste.agent.is_some() { "composer" } else { "screen_text" },
+                    "level": if reason == "change_observed" { level } else { None },
                 }),
             },
         ));
@@ -152,25 +189,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paste_confirmation_requires_new_text_not_any_screen_change() {
-        assert!(observed(None, "$ ", "$ hello", "hello"));
-        assert!(!observed(None, "$ ", "spinner", "hello"));
-        assert!(!observed(None, "hello\n$ ", "hello\n$ other", "hello"));
-        assert!(!observed(None, "$ ", "$ ", ""));
-        assert!(observed(None, "$ ", "$ hello\r\nworld", "hello\nworld"));
+    fn plain_paste_confirms_short_repeated_and_wrapped_input() {
+        for text in ["y", "q", "1", "make test"] {
+            assert_eq!(
+                observed(
+                    None,
+                    &format!("{text}\n$ "),
+                    &format!("{text}\n$ {text}"),
+                    text
+                ),
+                Some("text_matched")
+            );
+        }
+        assert_eq!(
+            observed(None, "$ ", "$ hello\nworld", "hello world"),
+            Some("text_matched")
+        );
+        assert_eq!(
+            observed(None, "$ ", "$ hello\nworld", "hello\nworld"),
+            Some("text_matched")
+        );
+        assert_eq!(observed(None, "$ ", "$ ", "hello"), None);
     }
 
     #[test]
-    fn paste_confirmation_requires_known_agent_composer() {
-        let before = "OpenAI Codex\n› \n  ? for shortcuts";
-        let after = "OpenAI Codex\n› hello\n  ? for shortcuts";
-        assert!(observed(Some(Agent::Codex), before, after, "hello"));
-        assert!(!observed(
-            Some(Agent::Codex),
-            before,
-            "hello\n› \n  ? for shortcuts",
-            "hello"
-        ));
-        assert!(!observed(Some(Agent::Codex), after, after, "hello"));
+    fn plain_paste_confirms_unsupported_harness_with_weaker_evidence() {
+        for agent in [Agent::Pi, Agent::Gemini, Agent::Cursor, Agent::Kimi] {
+            assert_eq!(
+                observed(Some(agent), "prompt", "changed", "hello"),
+                Some("screen_changed")
+            );
+        }
+        assert_eq!(
+            observed(Some(Agent::Pi), "prompt", "prompt hello", "hello"),
+            Some("text_matched")
+        );
+        assert_eq!(observed(Some(Agent::Pi), "prompt", "prompt", "hello"), None);
+    }
+
+    #[test]
+    fn plain_paste_confirms_claude_and_codex_chips() {
+        for (agent, before, after) in [
+            (
+                Agent::Claude,
+                "────\n❯ \n────",
+                "────\n❯ [Pasted text #1 +20 lines]\n────",
+            ),
+            (
+                Agent::Codex,
+                "› \n? for shortcuts",
+                "› [Pasted Content 4000 chars]\n? for shortcuts",
+            ),
+        ] {
+            assert_eq!(
+                observed(Some(agent), before, after, &"long brief\n".repeat(400)),
+                Some("composer_changed")
+            );
+        }
+    }
+
+    #[test]
+    fn plain_paste_confirms_busy_composer_and_draft_append() {
+        for (agent, before, after) in [
+            (
+                Agent::Claude,
+                "Working (esc to interrupt)\n────\n❯ draft \n────",
+                "Working (esc to interrupt)\n────\n❯ draft hello world\n────",
+            ),
+            (
+                Agent::Codex,
+                "• Working (esc to interrupt)\n› draft \n? for shortcuts",
+                "• Working (esc to interrupt)\n› draft hello\nworld\n? for shortcuts",
+            ),
+        ] {
+            assert_eq!(
+                observed(Some(agent), before, after, "hello world"),
+                Some("text_matched")
+            );
+            assert_eq!(observed(Some(agent), after, after, "hello world"), None);
+        }
     }
 }

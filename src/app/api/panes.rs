@@ -1009,7 +1009,14 @@ impl App {
             Ok(target) => target,
             Err(error) => return encode_error(id, &error.code, error.message),
         };
-        self.begin_paste(id, ws_idx, pane_id, params.text)
+        self.begin_paste(
+            id,
+            ws_idx,
+            pane_id,
+            params.text,
+            "pane_not_found",
+            "pane_send_failed",
+        )
     }
 
     pub(super) fn handle_pane_send_input(

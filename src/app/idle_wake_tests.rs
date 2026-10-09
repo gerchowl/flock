@@ -1541,3 +1541,128 @@ async fn delivery_attempt_unconfirmed_without_queued_mail_cannot_wedge_new_wakes
         .any(|a| a.state == "submit_sent" && a.correlation_ids == ["new-wake-after-expired-mail"]));
     assert_eq!(app.mailboxes.queued_len(&pane), 1);
 }
+
+#[tokio::test]
+async fn plain_paste_reports_interrupted_observation_without_extra_input() {
+    for reason in ["operator_active", "execution_changed", "pane_gone"] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        let response = app.handle_api_request(Request {
+            id: "paste".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane.clone(),
+                text: "hello".into(),
+            }),
+        });
+        assert!(response.contains("ok"));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        app.event_tx = event_tx;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.respond_or_park(sender, response);
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        match reason {
+            "operator_active" => runtime(&app).test_stamp_operator_input_at(Instant::now()),
+            "execution_changed" => terminal(&mut app).restart_in_progress = true,
+            "pane_gone" => {
+                app.state.workspaces.clear();
+            }
+            _ => unreachable!(),
+        }
+        app.handle_internal_event(event_rx.recv().await.unwrap());
+        let result: serde_json::Value =
+            serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(result["result"]["outcome"], "unconfirmed");
+        assert_eq!(result["result"]["reason"], reason);
+        assert!(result["result"]["evidence"]["level"].is_null());
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn plain_paste_retains_missing_runtime_error_codes() {
+    for (agent_send, code) in [(true, "agent_not_found"), (false, "pane_not_found")] {
+        let Rig { mut app, pane, .. } = rig();
+        app.state.workspaces[1].tabs[0].runtimes.clear();
+        let method = if agent_send {
+            Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: pane,
+                text: "hello".into(),
+                submit: false,
+            })
+        } else {
+            Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane,
+                text: "hello".into(),
+            })
+        };
+        let result: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "missing".into(),
+            method,
+        }))
+        .unwrap();
+        assert_eq!(result["error"]["code"], code);
+    }
+}
+
+#[tokio::test]
+async fn plain_paste_observes_folded_and_busy_composers_after_dispatch() {
+    for (agent, before, after, level) in [
+        (
+            Agent::Claude,
+            "────\r\n❯ \r\n────",
+            "────\r\n❯ [Pasted text #1 +20 lines]\r\n────",
+            "composer_changed",
+        ),
+        (
+            Agent::Codex,
+            "› \r\n? for shortcuts",
+            "› [Pasted Content 4000 chars]\r\n? for shortcuts",
+            "composer_changed",
+        ),
+        (
+            Agent::Claude,
+            "Working (esc to interrupt)\r\n────\r\n❯ draft \r\n────",
+            "Working (esc to interrupt)\r\n────\r\n❯ draft hello world\r\n────",
+            "text_matched",
+        ),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        runtime(&app).test_process_pty_bytes(format!("\x1b[2J\x1b[H{before}").as_bytes());
+        terminal(&mut app).set_detected_state_with_screen_signals_at(
+            Some(agent),
+            AgentState::Working,
+            false,
+            false,
+            false,
+            false,
+            Instant::now(),
+        );
+        let response = app.handle_api_request(Request {
+            id: "paste".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane,
+                text: "hello world".into(),
+            }),
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        app.event_tx = event_tx;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.respond_or_park(sender, response);
+        assert_eq!(drain(&mut pty), vec![b"hello world".to_vec()]);
+        runtime(&app).test_process_pty_bytes(format!("\x1b[2J\x1b[H{after}").as_bytes());
+        app.handle_internal_event(event_rx.recv().await.unwrap());
+        let result: serde_json::Value =
+            serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(result["result"]["outcome"], "delivered", "{result}");
+        assert_eq!(result["result"]["reason"], "change_observed");
+        assert_eq!(result["result"]["evidence"]["level"], level);
+        assert!(drain(&mut pty).is_empty());
+    }
+}

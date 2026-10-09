@@ -57,13 +57,11 @@ fn matches_rows(rows: &[&str], text: &str) -> bool {
         && rest.is_empty()
 }
 
-pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
+fn composer_rows(agent: Agent, screen: &str) -> Option<(Vec<&str>, usize, usize)> {
     let lines: Vec<_> = screen.lines().collect();
     let (rows, body_start, body_end): (Vec<&str>, usize, usize) = match agent {
         Agent::Claude => {
-            if crate::detect::claude_composer(screen).is_none() {
-                return Composer::Unknown;
-            }
+            crate::detect::claude_composer(screen)?;
             let rule = |line: &str| {
                 line.trim()
                     .chars()
@@ -71,52 +69,37 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
                     .count()
                     >= 3
             };
-            let Some(end) = lines.iter().rposition(|line| rule(line)) else {
-                return Composer::Unknown;
-            };
-            let Some(start) = lines[..end].iter().rposition(|line| rule(line)) else {
-                return Composer::Unknown;
-            };
+            let end = lines.iter().rposition(|line| rule(line))?;
+            let start = lines[..end].iter().rposition(|line| rule(line))?;
             let body = &lines[start + 1..end];
-            let Some(prompt) = body
+            let prompt = body
                 .iter()
-                .position(|line| line.trim_start().starts_with('❯'))
-            else {
-                return Composer::Unknown;
-            };
+                .position(|line| line.trim_start().starts_with('❯'))?;
             let mut rows = vec![body[prompt].trim_start().trim_start_matches('❯').trim()];
             rows.extend(body[prompt + 1..].iter().map(|line| line.trim()));
             (rows, start + 1, end)
         }
         Agent::Codex => {
-            let Some((start, end)) = crate::detect::codex_composer_region(screen) else {
-                return Composer::Unknown;
-            };
+            let (start, end) = crate::detect::codex_composer_region(screen)?;
             let mut rows = vec![lines[start].trim_start().trim_start_matches('›').trim()];
             rows.extend(lines[start + 1..end].iter().map(|line| line.trim()));
             (rows, start, end)
         }
         Agent::OpenCode => {
-            let Some(end) = lines
+            let end = lines
                 .iter()
-                .rposition(|line| line.trim_start().starts_with('╹'))
-            else {
-                return Composer::Unknown;
-            };
+                .rposition(|line| line.trim_start().starts_with('╹'))?;
             if !lines[end + 1..]
                 .iter()
                 .find(|line| !line.trim().is_empty())
                 .is_some_and(|line| line.contains(" commands") && !line.contains("interrupt"))
             {
-                return Composer::Unknown;
+                return None;
             }
-            let Some(start) = (0..end)
+            let start = (0..end)
                 .rev()
                 .take_while(|&i| lines[i].trim_start().starts_with('┃'))
-                .last()
-            else {
-                return Composer::Unknown;
-            };
+                .last()?;
             let rows = lines[start..end]
                 .iter()
                 .map(|line| line.trim_start().trim_start_matches('┃').trim())
@@ -125,8 +108,21 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
                 .collect();
             (rows, start, end)
         }
-        _ => return Composer::Unknown,
+        _ => return None,
     };
+    Some((rows, body_start, body_end))
+}
+
+/// Read only the editor, without the idle and safety gates used to authorize Enter.
+pub(crate) fn composer_contents(agent: Agent, screen: &str) -> Option<String> {
+    composer_rows(agent, screen).map(|(rows, _, _)| rows.join("\n"))
+}
+
+pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
+    let Some((rows, body_start, body_end)) = composer_rows(agent, screen) else {
+        return Composer::Unknown;
+    };
+    let lines: Vec<_> = screen.lines().collect();
     // Only the live controls around the editor can authorize input. Menu controls
     // make even a retained empty composer unsafe.
     let mut chrome = lines[..body_start].to_vec();

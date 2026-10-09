@@ -615,7 +615,14 @@ impl App {
                 },
             );
         }
-        self.begin_paste(id, resolved.ws_idx, resolved.pane_id, params.text)
+        self.begin_paste(
+            id,
+            resolved.ws_idx,
+            resolved.pane_id,
+            params.text,
+            "agent_not_found",
+            "agent_send_failed",
+        )
     }
 }
 
