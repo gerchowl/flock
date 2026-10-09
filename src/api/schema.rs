@@ -1090,19 +1090,6 @@ impl MsgIntent {
         !matches!(self, Self::Fyi)
     }
 
-    /// Parse a spelling that arrived over the cross-host relay, where the
-    /// sender may run a newer build than this one (ADR-0018 §1). An unknown
-    /// tier is read as `needs_reply`: version skew fails toward the recipient
-    /// hearing about it, never toward silence. The flag is true when that
-    /// degradation happened, so the caller can log it.
-    #[must_use]
-    pub fn from_wire_relayed(value: &str) -> (Self, bool) {
-        match Self::from_wire(value) {
-            Some(intent) => (intent, false),
-            None => (Self::NeedsReply, true),
-        }
-    }
-
     /// Parse a caller-supplied spelling. `needs-reply` is accepted alongside
     /// `needs_reply` because every prose mention of this field hyphenates it,
     /// and refusing the spelling people already write buys nothing.
@@ -1169,19 +1156,6 @@ pub struct MsgSendParams {
     /// never authorization, so a claim is all this ever needs to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_agent: Option<String>,
-    /// Host the sender is on, asserted alongside `from_agent` by a relay.
-    ///
-    /// The receiver cannot derive this: the sending host is by definition not
-    /// itself, and its directory may not carry the sender. Without it the
-    /// receiver had to guess, and guessed its own host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_host: Option<String>,
-    /// The spelling a relay carried when this build did not recognise it
-    /// (ADR-0018 §1). The receiving CLI has already read it as `needs_reply`;
-    /// this travels on so the SERVER — the process with a log — records the
-    /// skew, instead of the note dying on the stderr of an ssh-invoked CLI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent_unrecognised: Option<String>,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,

@@ -7,12 +7,6 @@ use std::sync::mpsc::Sender;
 use crate::api::schema::MsgIntent;
 use crate::events::AppEvent;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SettleOnDelivery {
-    pub(crate) pane: String,
-    pub(crate) correlation_id: String,
-}
-
 pub(crate) struct RelayWork {
     pub run: Box<dyn FnOnce() -> AppEvent + Send>,
     pub failure: AppEvent,
@@ -42,19 +36,15 @@ pub(crate) struct MessageRelays {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RelaySend {
-    pub mesh: Option<crate::mesh::delivery::Deliver>,
+    pub mesh: crate::mesh::delivery::Deliver,
     pub id: String,
     pub peer: crate::config::PeerConfig,
     pub to_agent: String,
     pub host: String,
     pub direct: bool,
     pub from_agent: String,
-    pub from_host: String,
-    pub body: String,
     pub correlation_id: String,
-    pub in_reply_to: Option<String>,
     pub intent: MsgIntent,
-    pub settle_original: Option<SettleOnDelivery>,
     pub respond_to: Option<Sender<String>>,
 }
 
@@ -110,13 +100,7 @@ impl RelaySend {
     }
 
     pub fn run(self) -> AppEvent {
-        let result = if let Some(delivery) = &self.mesh {
-            crate::mesh::delivery::send(&self.peer, delivery)
-        } else {
-            Err(crate::peers::PeerMessageFailure::Refused(
-                "mesh custody required".into(),
-            ))
-        };
+        let result = crate::mesh::delivery::send(&self.peer, &self.mesh);
         AppEvent::MsgRelayCompleted(Box::new(RelayCompletion { send: self, result }))
     }
 }
@@ -142,7 +126,7 @@ impl super::App {
     }
 
     fn pump_message_relays(&mut self) {
-        let cap = self.state.config.msg.deferral_relay_concurrency.max(1);
+        let cap = crate::mesh::delivery::push_concurrency();
         while self.message_relays.running < cap {
             let Some(work) = self.message_relays.waiting.pop_front() else {
                 break;
@@ -165,14 +149,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn relay_workers_wait_for_a_shared_slot_and_start_in_order() {
-        let mut config = crate::config::Config::default();
-        config.msg.deferral_relay_concurrency = 1;
+    async fn relay_workers_use_fixed_push_concurrency() {
+        let config = crate::config::Config::default();
         let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app =
             super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        for index in 0..3 {
+        for index in 0..5 {
             let started = started_tx.clone();
             app.enqueue_message_relay(RelayWork {
                 run: Box::new(move || {
@@ -186,78 +169,87 @@ mod tests {
                 },
             });
         }
-        for index in 0..3 {
+        for _ in 0..4 {
             tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
                 .await
                 .unwrap()
-                .expect("worker completed");
-            assert_eq!(started_rx.try_recv().unwrap(), index);
-            assert!(
-                started_rx.try_recv().is_err(),
-                "no second worker before completion is drained"
-            );
-            assert_eq!(app.message_relays.running, 1);
+                .unwrap();
+        }
+        let mut started: Vec<_> = started_rx.try_iter().collect();
+        started.sort();
+        assert_eq!(started, vec![0, 1, 2, 3]);
+        assert_eq!(app.message_relays.running, 4);
+        assert_eq!(app.message_relays.waiting.len(), 1);
+        app.finish_message_relay();
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started_rx.try_recv().unwrap(), 4);
+        for _ in 0..4 {
             app.finish_message_relay();
         }
-        assert_eq!(app.message_relays.running, 0);
-        assert!(app.message_relays.waiting.is_empty());
+        assert!(app.message_relays.is_idle());
     }
+
     #[tokio::test]
-    async fn a_panicking_relay_answers_with_failure_and_frees_its_slot() {
-        let mut config = crate::config::Config::default();
-        config.msg.deferral_relay_concurrency = 1;
+    async fn a_panicking_relay_answers_queued_and_frees_its_slot() {
+        let store = crate::mesh::runtime_store::TestStore::new();
         let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app =
-            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
-        let mut replies = Vec::new();
-        for index in 0..2 {
-            let (tx, rx) = std::sync::mpsc::channel();
-            replies.push(rx);
-            let relay = RelaySend {
-                mesh: None,
-                id: format!("request-{index}"),
-                peer: crate::config::PeerConfig::default(),
-                // An invalid agent id is refused before any SSH is started.
-                to_agent: "invalid recipient".into(),
-                host: "nodeb".into(),
-                direct: true,
-                from_agent: "agent_nodea_sender".into(),
-                from_host: "nodea".into(),
-                body: "test".into(),
-                correlation_id: format!("question-{index}"),
-                in_reply_to: None,
-                intent: MsgIntent::NeedsReply,
-                settle_original: None,
-                respond_to: Some(tx),
-            };
-            app.mailboxes.start_relaying_question(&relay.correlation_id);
-            let mut work = relay.into_work();
-            if index == 0 {
-                work.run = Box::new(|| panic!("test relay panic"));
-            }
-            app.enqueue_message_relay(work);
-        }
-        for (index, reply) in replies.into_iter().enumerate() {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
-                    .await
-                    .unwrap()
-                    .expect("even a panic must complete");
-            app.handle_internal_event(event);
-            let response: serde_json::Value =
-                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
-            assert_eq!(response["id"], format!("request-{index}"));
-            if index == 0 {
-                assert_eq!(response["error"]["code"], "peer_unreachable");
-                assert_eq!(
-                    response["error"]["data"]["detail"],
-                    "message relay worker panicked"
-                );
-            } else {
-                assert_eq!(response["error"]["code"], "peer_refused_message");
-            }
-        }
-        assert_eq!(app.message_relays.running, 0);
-        assert!(app.message_relays.waiting.is_empty());
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let relay = RelaySend {
+            mesh: store.delivery(),
+            id: "request".into(),
+            peer: crate::config::PeerConfig::default(),
+            to_agent: "agent_nodeb_recipient".into(),
+            host: "nodeb".into(),
+            direct: true,
+            from_agent: "agent_nodea_sender".into(),
+            correlation_id: "question".into(),
+            intent: MsgIntent::NeedsReply,
+            respond_to: Some(tx),
+        };
+        crate::mesh::hello::with_store(|store| {
+            store
+                .accept(
+                    &relay.mesh.envelope,
+                    relay.mesh.remaining_ms,
+                    crate::mesh::store::Admission::Custody,
+                    0,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        app.mailboxes.start_relaying_question(&relay.correlation_id);
+        let mut work = relay.into_work();
+        work.run = Box::new(|| panic!("test relay panic"));
+        app.enqueue_message_relay(work);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_internal_event(event);
+        let response: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], "request");
+        assert_eq!(response["result"]["state"], "queued");
+        assert!(response["result"]["warnings"]
+            .to_string()
+            .contains("message relay worker panicked"));
+        let stored = crate::mesh::hello::with_store(|store| {
+            store
+                .status("nodea", "question", 0)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.state, "queued");
+        assert!(app.message_relays.is_idle());
     }
 }

@@ -1113,14 +1113,6 @@ pub enum PeerMessageFailure {
 }
 
 impl PeerMessageFailure {
-    /// The stable `error.code`.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::Unreachable(_) => "peer_unreachable",
-            Self::Refused(_) => "peer_refused_message",
-        }
-    }
-
     /// Whether retrying the identical relay could ever succeed.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Unreachable(_))
@@ -1130,22 +1122,6 @@ impl PeerMessageFailure {
     pub fn detail(&self) -> &str {
         match self {
             Self::Unreachable(detail) | Self::Refused(detail) => detail,
-        }
-    }
-
-    /// The caller-facing message, naming the hop as a whole — which machine
-    /// failed to reach which, and how (#410). Once a message can cross a hub,
-    /// "could not reach node-b" no longer says enough: the reader needs to know it
-    /// was the HUB that could not, so it is not chasing the spoke's own network.
-    pub fn hop_message(&self, from: &str, host: &str, reason: SshFailureReason) -> String {
-        match self {
-            Self::Unreachable(detail) => {
-                format!(
-                    "{from} cannot reach {host} ({}): {detail}",
-                    reason.describe()
-                )
-            }
-            Self::Refused(detail) => format!("{host} refused the relay from {from}: {detail}"),
         }
     }
 }
@@ -2001,19 +1977,6 @@ mod tests {
         ] {
             assert_eq!(R::classify(stderr), expected, "{stderr}");
         }
-    }
-
-    #[test]
-    fn a_hop_failure_names_both_ends_and_the_reason() {
-        let failure = super::PeerMessageFailure::Unreachable(
-            "ssh: connect to host node-b port 22: Connection refused".into(),
-        );
-        let reason = super::SshFailureReason::classify(failure.detail());
-        let message = failure.hop_message("hopper", "node-b", reason);
-        assert!(
-            message.starts_with("hopper cannot reach node-b (connection refused)"),
-            "{message}"
-        );
     }
 
     #[test]
