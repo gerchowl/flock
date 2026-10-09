@@ -73,13 +73,14 @@ impl Fixture {
             socket: self.0.join(format!("{session}.sock")),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !server.socket.exists() {
+        // Binding creates the path before the server repairs a restrictive umask.
+        while UnixStream::connect(&server.socket).is_err() {
             assert!(
                 server.child.try_wait().unwrap().is_none(),
                 "server exited before binding API"
             );
             assert!(Instant::now() < deadline, "server startup timed out");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::yield_now();
         }
         server
     }

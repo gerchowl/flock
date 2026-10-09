@@ -654,6 +654,37 @@ fn copilot_non_object_stdin_through_run_hook_command_reports_nothing() {
     }
 }
 
+fn read_request_line(stream: &UnixStream) -> String {
+    // Accepted streams inherit the listener's nonblocking mode on macOS.
+    stream.set_nonblocking(false).unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    line
+}
+
+#[test]
+fn request_reader_waits_for_data_on_a_nonblocking_stream() {
+    let (server, mut client) = UnixStream::pair().unwrap();
+    server.set_nonblocking(true).unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (done, received) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        done.send(read_request_line(&server)).unwrap();
+    });
+    let before_write = received.recv_timeout(Duration::from_millis(25));
+    client.write_all(b"request\n").unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        before_write,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    assert_eq!(received.recv().unwrap(), "request\n");
+}
+
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -670,9 +701,7 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
             let hook_exited = hook_finished.load(std::sync::atomic::Ordering::Acquire);
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    reader.read_line(&mut line).unwrap();
+                    let line = read_request_line(&stream);
                     let _ = stream.write_all(br#"{"id":"test","result":{"type":"ok"}}"#);
                     let _ = stream.write_all(b"\n");
                     let _ = stream.flush();
@@ -969,9 +998,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
         while requests.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    reader.read_line(&mut line).unwrap();
+                    let line = read_request_line(&stream);
                     stream
                         .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                         .unwrap();
