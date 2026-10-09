@@ -2,10 +2,12 @@
 
 #![allow(clippy::disallowed_methods)] // The harness drives the compiled binary.
 
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
-use std::process::Command;
 use std::thread;
+use support::environment::Command;
 
 struct TempSocket(std::path::PathBuf);
 

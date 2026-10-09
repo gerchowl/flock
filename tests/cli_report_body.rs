@@ -20,10 +20,12 @@
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 /// A filled-in `flk report template bug`, written by hand rather than by the
 /// command that emits it — a fixture that depends on the code under test can

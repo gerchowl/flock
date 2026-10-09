@@ -33,6 +33,10 @@ fn isolated_environment_overrides_ambient_paths_and_preserves_cargo_cache() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
     assert_eq!(cmd.get_env("CARGO_HOME"), Some(cargo.as_os_str()));
+    let rustup = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rustup"));
+    assert_eq!(cmd.get_env("RUSTUP_HOME"), Some(rustup.as_os_str()));
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -67,4 +71,32 @@ fn state_guard_rejects_symlink_into_real_home() {
     });
     std::fs::remove_dir_all(base).unwrap();
     assert!(result.is_err(), "a symlink must not bypass the state guard");
+}
+
+#[test]
+fn spawn_wrapper_rejects_every_real_user_directory_override() {
+    use support::environment::Command;
+    let base = std::env::temp_dir().join(format!("flock-env-overrides-{}", std::process::id()));
+    for key in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "FLOCK_SOCKET_PATH",
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
+        cmd.arg("--help")
+            .envs(support::environment::isolated_env(
+                &base.join("config"),
+                &base.join("runtime"),
+            ))
+            .env(
+                key,
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join("forbidden-test-write"),
+            );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cmd.output()));
+        assert!(result.is_err(), "{key} escaped the spawn guard");
+    }
+    std::fs::remove_dir_all(base).unwrap();
 }
