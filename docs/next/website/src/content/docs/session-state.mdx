@@ -79,6 +79,8 @@ This is different from snapshot restore, pane history replay, and native agent s
 
 Import startup has a 120-second budget until the replacement is ready. The watchdog is atomically disarmed before readiness is announced, so it cannot terminate a replacement after the old server commits ownership. Before readiness, expiry exits the replacement non-zero and the old server can roll back. Socket reads and writes retain their 30-second timeouts, including the replacement's wait for commit after readiness. Kernel or scheduler stalls can delay deadline enforcement. Rollback waits at most 500 ms to reap a killed importer; a process still waiting in the kernel may remain unreaped until it exits and the exporter exits.
 
+Queued mesh mail survives both a server restart and live handoff. During handoff the old server closes its custody writer before transferring panes, and the replacement opens it after ownership commits. A failed handoff reopens the old writer; a replacement refuses a store older than the generation recorded in the handoff. Pending delivery resumes from durable custody, with duplicate imports suppressed.
+
 Live handoff is experimental and opt-in:
 
 ```bash

@@ -399,6 +399,9 @@ impl App {
         self.node_id = server.and_then(|server| server.node_id.clone());
         self.clone_detection_warning =
             server.and_then(|server| server.clone_detection_warning.clone());
+        if crate::mesh::runtime_store::suspended()? {
+            return Ok(());
+        }
         self.restore_mesh_mail()
     }
 

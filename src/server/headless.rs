@@ -989,7 +989,7 @@ impl HeadlessServer {
         }
 
         if let Err(err) = self.app.cancel_agent_restarts_for_handoff() {
-            self.rollback_handoff_before_commit(&socket_path, &[]);
+            self.rollback_handoff_before_commit(&socket_path, &[])?;
             return Err(err.into());
         }
         self.handoff_in_progress = true;
@@ -1000,7 +1000,7 @@ impl HeadlessServer {
         for terminal_id in pane_by_terminal.keys() {
             if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
                 if let Err(err) = runtime.pause_handoff_reader(Duration::from_secs(2)) {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                     return Err(err.into());
                 }
                 paused_terminal_ids.push(terminal_id.clone());
@@ -1047,12 +1047,25 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
-        let manifest = crate::server::handoff::manifest_for(
+        let store_generation = match crate::mesh::runtime_store::suspend() {
+            Ok(generation) => generation,
+            Err(err) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
+                return Err(io::Error::other(err).into());
+            }
+        };
+        let mut manifest = crate::server::handoff::manifest_for(
             snapshot,
             panes,
             params.expected_protocol,
             params.expected_version,
         );
+        manifest.store_generation = store_generation;
+        if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("stale_generation")
+        {
+            manifest.store_generation = store_generation.saturating_add(1);
+        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1060,7 +1073,7 @@ impl HeadlessServer {
         ) {
             Ok(child) => child,
             Err(err) => {
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                 return Err(err.into());
             }
         };
@@ -1082,7 +1095,7 @@ impl HeadlessServer {
                 let _ = unsafe { libc::close(fd) };
             }
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
             return Err(err.into());
         }
 
@@ -1098,18 +1111,23 @@ impl HeadlessServer {
                     let _ = unsafe { libc::close(fd) };
                 }
                 crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                 return Err(err.into());
             }
         };
 
-        let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        let send_result =
+            if std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_fds") {
+                Err(io::Error::other("test handoff failure before fd transfer"))
+            } else {
+                crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds)
+            };
         for fd in fds {
             let _ = unsafe { libc::close(fd) };
         }
         if let Err(err) = send_result {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
             return Err(err.into());
         }
 
@@ -1123,10 +1141,10 @@ impl HeadlessServer {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                 }
                 Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                     return Err(io::Error::other(format!(
                         "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
                     ))
@@ -1138,14 +1156,20 @@ impl HeadlessServer {
             ))
             .into());
         }
-        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
+        let commit_result =
+            if std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_commit") {
+                Err(io::Error::other("test handoff failure before commit"))
+            } else {
+                crate::server::handoff::report_committed(&mut stream)
+            };
+        if let Err(err) = commit_result {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                 }
                 Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids)?;
                     return Err(io::Error::other(format!(
                         "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
                     ))
@@ -1234,7 +1258,10 @@ impl HeadlessServer {
         &mut self,
         socket_path: &Path,
         paused_terminal_ids: &[crate::terminal::TerminalId],
-    ) {
+    ) -> io::Result<()> {
+        if crate::mesh::runtime_store::suspended().map_err(io::Error::other)? {
+            self.app.resume_mesh_store(0)?;
+        }
         for terminal_id in paused_terminal_ids {
             if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
                 runtime.set_handoff_reader_paused(false);
@@ -1242,6 +1269,7 @@ impl HeadlessServer {
         }
         self.handoff_in_progress = false;
         let _ = std::fs::remove_file(socket_path);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -3836,6 +3864,7 @@ pub fn run_server() -> io::Result<()> {
 
 #[cfg(unix)]
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+    crate::mesh::runtime_store::suspend().map_err(io::Error::other)?;
     let import_deadline = crate::server::handoff::start_import_watchdog()?;
     init_logging();
     let loaded_config = config::Config::load();
@@ -3902,9 +3931,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             Some(api_tx.clone()),
             Some(api_server),
         )?;
+        if std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_ready") {
+            return Err(io::Error::other("test handoff failure before ready"));
+        }
+        if let Err(err) = crate::mesh::store::Store::check_generation(
+            &crate::config::state_dir().join("mesh-mail.sqlite"),
+            received.manifest.store_generation,
+        ) {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(io::Error::other(err));
+        }
         import_deadline.disarm()?;
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        server
+            .app
+            .resume_mesh_store(received.manifest.store_generation)?;
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;

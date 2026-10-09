@@ -1492,7 +1492,10 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         serde_json::json!({"id":"identity-before","method":"ping","params":{}}),
     );
     let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
-    fs::write(&identity_path, b"corrupt during handoff").unwrap();
+    if failure_point == "after_restored" {
+        fs::write(&identity_path, b"corrupt during handoff").unwrap();
+    }
+    let identity_before = fs::read(&identity_path).unwrap();
     let failed = request(
         &api_socket,
         serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
@@ -1501,6 +1504,15 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         failed.get("error").is_some(),
         "{failure_point} handoff should fail: {failed}"
     );
+    if failure_point == "stale_generation" {
+        assert!(
+            failed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("older than handoff generation"),
+            "{failed}"
+        );
+    }
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
     let after = request(
@@ -1511,7 +1523,26 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         before["result"]["capabilities"],
         after["result"]["capabilities"]
     );
-    assert_eq!(fs::read(identity_path).unwrap(), b"corrupt during handoff");
+    assert_eq!(fs::read(identity_path).unwrap(), identity_before);
+    // This API uses the shared writer, unlike ping or pane input.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"writer-after-rollback", "method":"msg.send", "params":{
+            "to":{"type":"pane", "pane":pane_id}, "body":"writer recovered", "intent":"fyi"
+        }}),
+    ));
+    let database = rusqlite::Connection::open_with_flags(
+        runtime_dir.join("state/flock-dev/mesh-mail.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let generation: i64 = database
+        .query_row("SELECT generation FROM writer_generation", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(generation, 1);
+    drop(database);
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
 
     assert_ok(request(
@@ -1539,6 +1570,26 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 #[test]
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
+}
+
+#[test]
+fn live_handoff_refuses_stale_store_generation_and_reopens_writer() {
+    live_handoff_import_failure_rolls_back_old_server_at("stale_generation");
+}
+
+#[test]
+fn live_handoff_before_fds_failure_reopens_writer() {
+    live_handoff_import_failure_rolls_back_old_server_at("before_fds");
+}
+
+#[test]
+fn live_handoff_before_ready_failure_reopens_writer() {
+    live_handoff_import_failure_rolls_back_old_server_at("before_ready");
+}
+
+#[test]
+fn live_handoff_before_commit_failure_reopens_writer() {
+    live_handoff_import_failure_rolls_back_old_server_at("before_commit");
 }
 
 #[test]
@@ -1659,6 +1710,8 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
         peer.read_line(&mut line).unwrap();
         assert_eq!(line.trim_end(), expected);
     }
+    // No custody writer or schema migration is allowed before commit.
+    assert!(!base.join("state/flock-dev/mesh-mail.sqlite").exists());
     // The same clock would have killed the previous importer before commit.
     thread::sleep(Duration::from_secs(6));
     assert!(child.try_wait().unwrap().is_none());

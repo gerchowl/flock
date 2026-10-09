@@ -1004,6 +1004,14 @@ impl App {
         };
     }
 
+    /// Reopen custody only after ownership commits, or the exporter rolls back.
+    pub(crate) fn resume_mesh_store(&mut self, minimum: u64) -> io::Result<()> {
+        crate::mesh::runtime_store::resume(minimum).map_err(io::Error::other)?;
+        self.mesh_retry_at = None;
+        self.mesh_maintenance_at = None;
+        self.restore_mesh_mail().map_err(io::Error::other)
+    }
+
     #[cfg(unix)]
     pub fn new_from_handoff(
         config: &Config,
