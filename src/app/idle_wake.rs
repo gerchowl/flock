@@ -440,7 +440,7 @@ impl App {
         else {
             return Decision::Abandoned("missing_attempt");
         };
-        let enter_due = now >= attempt.due;
+        let before = (attempt.sent, attempt.retried);
         let outcome = if let Some(suppression) =
             self.wake_suppression(pane, super::api::messages::now_ms())
         {
@@ -453,6 +453,7 @@ impl App {
         if let Some(ref outcome) = outcome {
             self.finish_delivery_attempt(&mut attempt, outcome);
         }
+        let enter_sent = before != (attempt.sent, attempt.retried);
         let next = now + Duration::from_millis(50);
         if outcome.is_none() {
             self.idle_wake.note_deadline(next);
@@ -467,7 +468,7 @@ impl App {
             flight.attempt = outcome.is_none().then_some(attempt);
         }
         match outcome {
-            None if enter_due => Decision::Submitted,
+            None if enter_sent => Decision::Submitted,
             None => Decision::Suppressed("confirm_pending"),
             Some(
                 super::guarded_submit::Outcome::Accepted
