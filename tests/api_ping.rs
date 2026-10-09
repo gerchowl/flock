@@ -488,7 +488,7 @@ fn workspace_list_and_create_round_trip() {
             pane_id
         ),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
 
     let send_enter = send_request(
         &socket_path,
@@ -754,7 +754,7 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         })
         .to_string(),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1185,7 +1185,7 @@ fn agent_methods_round_trip_over_socket() {
             terminal_id
         ),
     );
-    assert_eq!(sent["result"]["type"], "ok");
+    assert_eq!(sent["result"]["type"], "paste");
     let enter = send_request(
         &socket_path,
         &serde_json::json!({
@@ -1403,7 +1403,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1657,7 +1657,7 @@ fn pane_report_agent_updates_effective_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1918,7 +1918,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2057,7 +2057,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2200,7 +2200,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
             pane_id
         ),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2229,7 +2229,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2329,7 +2329,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
             background_pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2507,6 +2507,10 @@ fn agent_send_and_pane_send_text_use_bracketed_paste() {
     for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
         std::env::remove_var(key);
     }
+    std::env::set_var("HOME", &config_home);
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
     let script = base.join("composer.py");
@@ -2526,7 +2530,8 @@ with log.open('w') as out:
             break
         out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
         out.flush()
-        os.write(1, b'INPUT RECEIVED')
+        if b'NOECHO' not in data:
+            os.write(1, data.replace(b'\x1b[200~', b'').replace(b'\x1b[201~', b'').replace(b'\n', b'\r\n'))
 "#,
     )
     .unwrap();
@@ -2577,7 +2582,7 @@ with log.open('w') as out:
         })
         .to_string(),
     );
-    assert_eq!(pasted["result"]["type"], "ok");
+    assert_eq!(pasted["result"]["outcome"], "delivered");
     let read_log = || -> Vec<serde_json::Value> {
         fs::read_to_string(&log)
             .unwrap_or_default()
@@ -2607,6 +2612,17 @@ with log.open('w') as out:
     assert!(plain_cli.status.success());
     let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
     assert!(pane_cli.status.success());
+    for command in [["agent", "send"], ["pane", "send-text"]] {
+        let failed = run_flk(&socket_path, &[command[0], command[1], pane, "NOECHO"]);
+        assert_eq!(failed.status.code(), Some(8));
+        let response: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert_eq!(response["result"]["outcome"], "unconfirmed");
+        assert_eq!(response["result"]["reason"], "confirm_timeout");
+        assert_eq!(
+            response["result"]["evidence"]["before_digest"],
+            response["result"]["evidence"]["after_digest"]
+        );
+    }
     let submitted = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2625,7 +2641,7 @@ with log.open('w') as out:
     );
     assert!(!cli.status.success(), "unknown composers must refuse");
     let expected =
-        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~";
+        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~NOECHO\x1b[201~\x1b[200~NOECHO\x1b[201~";
     let deadline = Instant::now() + Duration::from_secs(5);
     while bytes(&read_log()).len() < expected.len() {
         assert!(Instant::now() < deadline);

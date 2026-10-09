@@ -77,6 +77,10 @@ pub struct WorktreeKillAllResult {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
+    PasteConfirm {
+        paste: crate::app::paste_confirm::Paste,
+        respond_to: std::sync::mpsc::Sender<String>,
+    },
     /// Complete an explicit agent submission after its paste settling gap.
     AgentSubmit {
         request_id: String,

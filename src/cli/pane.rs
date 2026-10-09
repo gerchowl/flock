@@ -469,7 +469,10 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::normalize_pane_id(&args[0]);
     let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams { pane_id, text }))
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:send-text".into(),
+        method: Method::PaneSendText(PaneSendTextParams { pane_id, text }),
+    })?)
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {

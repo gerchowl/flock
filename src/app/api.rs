@@ -166,6 +166,10 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if let AppEvent::PasteConfirm { paste, respond_to } = ev {
+            self.advance_paste(paste, respond_to);
+            return;
+        }
         if let AppEvent::AgentSubmit {
             request_id,
             pane_id,
@@ -1284,6 +1288,7 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        self.pending_paste = None;
         self.detach_pending_message_relay();
         debug_assert!(
             self.pending_agent_submit.is_none(),
