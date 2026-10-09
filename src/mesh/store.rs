@@ -147,6 +147,7 @@ pub struct Envelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     Custody,
+    Held,
     Inbox,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,7 +163,6 @@ pub enum Outcome {
     Expired,
     InboxExpired,
     RecipientGone,
-    ReplyUnavailable,
 }
 impl Outcome {
     fn name(self) -> &'static str {
@@ -173,7 +173,6 @@ impl Outcome {
             Self::Expired => "expired",
             Self::InboxExpired => "inbox_expired",
             Self::RecipientGone => "recipient_gone",
-            Self::ReplyUnavailable => "reply_unavailable",
         }
     }
 }
@@ -487,7 +486,7 @@ impl<D: DiskSpace> Store<D> {
         tx.execute("INSERT INTO envelopes(origin,id,correlation,metadata,fingerprint,body,state,custody_deadline,
             inbox_deadline,dedupe_until,delivered,retry_at,metadata_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![envelope.key.origin_node,envelope.key.message_id,envelope.correlation_id,metadata,fingerprint,envelope.body,
-                if inbox { "inbox" } else { "custody" },deadline, if inbox {Some(now.saturating_add(DAY_MS))} else {None},
+                match admission { Admission::Inbox => "inbox", Admission::Custody => "custody", Admission::Held => "held" },deadline, if inbox {Some(now.saturating_add(DAY_MS))} else {None},
                 deadline.saturating_add(DAY_MS),inbox,now,charge as i64])?;
         tx.execute("UPDATE envelopes SET request_origin=?3,request_id=?4,recipient_node=?5,reply_expected=?6,collection_token=?7 WHERE origin=?1 AND id=?2",
             params![envelope.key.origin_node,envelope.key.message_id,
@@ -554,8 +553,8 @@ impl<D: DiskSpace> Store<D> {
         let valid = match outcome {
             Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
             Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
-            Outcome::Expired => state == "custody" && custody <= now,
-            _ => state == "custody" && custody > now,
+            Outcome::Expired => matches!(state.as_str(), "custody" | "held") && custody <= now,
+            _ => matches!(state.as_str(), "custody" | "held") && custody > now,
         };
         if !valid {
             return Err(Error::InvalidState);
@@ -968,6 +967,27 @@ impl<D: DiskSpace> Store<D> {
         Ok(keys)
     }
 
+    /// Idle runtime maintenance is read-only until expiry or deletion is due.
+    pub fn maintain_if_due(&mut self, wall_ms: i64) -> Result<usize> {
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        let now = clock.advance(wall_ms);
+        let due: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE
+             (state IN ('custody','held') AND custody_deadline<=?1)
+             OR (state='inbox' AND inbox_deadline<=?1)
+             OR (outcome_until<=?1 AND dedupe_until<=?1))",
+            [now],
+            |r| r.get(0),
+        )?;
+        if !due {
+            return Ok(0);
+        }
+        self.maintain(wall_ms)
+    }
+
     /// Explicit maintenance records expiry before collection of terminal rows.
     /// Keep dedupe through admitted TTL + 24h even after outcome retention ends.
     pub fn maintain(&mut self, wall_ms: i64) -> Result<usize> {
@@ -980,7 +1000,7 @@ impl<D: DiskSpace> Store<D> {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let expired = tx.execute("UPDATE envelopes SET state=CASE WHEN state='inbox' THEN 'inbox_expired' ELSE 'expired' END,
                 body=X'',outcome_until=?1 WHERE rowid IN (SELECT rowid FROM envelopes
-                WHERE (state='custody' AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
+                WHERE (state IN ('custody','held') AND custody_deadline<=?2) OR (state='inbox' AND inbox_deadline<=?2) LIMIT 500)",
                 params![now.saturating_add(CUSTODY_TTL_MS),now])?;
             tx.commit()?;
             if expired < 500 {

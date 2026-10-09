@@ -106,8 +106,10 @@ impl App {
                     CUSTODY_TTL_MS,
                     if local {
                         Admission::Inbox
-                    } else {
+                    } else if push_peer.is_some() {
                         Admission::Custody
+                    } else {
+                        Admission::Held
                     },
                     now_ms() as i64,
                 )
@@ -258,7 +260,7 @@ impl App {
         }
     }
 
-    fn outbound_reply_peer(&self, node: &str) -> Option<crate::config::PeerConfig> {
+    pub(super) fn outbound_reply_peer(&self, node: &str) -> Option<crate::config::PeerConfig> {
         self.state
             .peers
             .iter()

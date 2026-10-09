@@ -126,7 +126,7 @@ fn collection_migration_preserves_existing_writer_generation_and_custody() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX open_collections;
+            "DROP INDEX open_collections; DROP INDEX held_recipient;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1005,7 +1005,7 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
              source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
              public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
              UNIQUE(source,node_id), UNIQUE(source,public_key));
-         DROP INDEX open_collections;
+         DROP INDEX open_collections; DROP INDEX held_recipient;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1175,7 +1175,7 @@ fn version_four_pin_origin_is_unknown_after_migration() {
             "DROP TABLE writer_generation;
         ALTER TABLE identity_pins DROP COLUMN origin;
         INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
-        DROP INDEX open_collections;
+        DROP INDEX open_collections; DROP INDEX held_recipient;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1588,4 +1588,192 @@ fn waiting_or_reenrollment_restores_fast_polling_without_reopening_final_answers
         .unwrap()
         .is_empty());
     assert_eq!(store.connection.total_changes(), changes);
+}
+
+#[test]
+fn held_answers_do_not_lease_or_starve_outbox_and_idle_ticks_do_not_commit() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    for _ in 0..130 {
+        let mut answer = envelope();
+        answer.request_key = Some(request.key.clone());
+        store
+            .accept(&answer, CUSTODY_TTL_MS, Admission::Held, 0)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        130
+    );
+    let before = store.connection.total_changes();
+    for now in (0..600_000).step_by(1_000) {
+        assert!(store.retry_ready_limit(now, 1).unwrap().is_empty());
+        assert_eq!(
+            store
+                .activate_held(&request.key.origin_node, &["absent.example".into()], now)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.maintain_if_due(now).unwrap(), 0);
+    }
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "idle held rows must not write leases or clock ticks"
+    );
+    let outbox = envelope();
+    store
+        .accept(&outbox, CUSTODY_TTL_MS, Admission::Custody, 600_000)
+        .unwrap();
+    assert_eq!(
+        store.retry_ready_limit(600_000, 1).unwrap(),
+        vec![outbox.key]
+    );
+    assert_eq!(
+        store
+            .activate_held(
+                &request.key.origin_node,
+                &[request.return_binding.recipient_node],
+                600_000
+            )
+            .unwrap(),
+        130
+    );
+    assert_eq!(store.retry_ready_limit(600_000, 500).unwrap().len(), 130);
+}
+
+#[test]
+fn held_answers_remain_collectable_after_a_final_answer_and_expire_normally() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut query = crate::mesh::collect::Collect {
+        request: request.key.clone(),
+        token: request.return_binding.collection_token.clone(),
+        ack: vec![],
+    };
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Held, 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .collect_answers(&request.key.origin_node, &query, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    query.ack.push(answer.key.clone());
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .unwrap()
+        .is_empty());
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET collect_done=1 WHERE origin=?1 AND id=?2",
+            params![request.key.origin_node, request.key.message_id],
+        )
+        .unwrap();
+    let mut later = envelope();
+    later.request_key = Some(request.key.clone());
+    store
+        .accept(&later, CUSTODY_TTL_MS, Admission::Held, 3)
+        .unwrap();
+    query.ack.clear();
+    let collected = store
+        .collect_answers(&request.key.origin_node, &query, 4)
+        .unwrap();
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].envelope.key, later.key);
+    store.maintain(CUSTODY_TTL_MS + 3).unwrap();
+    assert_eq!(store.get(&later.key).unwrap().unwrap().state, "expired");
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn schema_nine_held_answers_migrate_out_of_the_retry_queue() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store
+        .connection
+        .execute_batch("DROP INDEX held_recipient; PRAGMA user_version=9;")
+        .unwrap();
+    drop(store);
+    let mut store = f.open(1);
+    assert_eq!(store.get(&answer.key).unwrap().unwrap().state, "held");
+    assert!(store.retry_ready_limit(1, 500).unwrap().is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn collection_backoff_batch_rolls_back_together() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let first = envelope();
+    let mut second = envelope();
+    second.return_binding.recipient_node = "second.example".into();
+    for item in [&first, &second] {
+        store
+            .accept(item, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&item.key, Outcome::Delivered, 0).unwrap();
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET collect_at=0 WHERE id=?1",
+            [&first.key.message_id],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER fail_second_backoff BEFORE UPDATE OF collect_attempts ON envelopes
+        WHEN NEW.recipient_node='second.example' AND NEW.collect_attempts>0
+        BEGIN SELECT RAISE(ABORT,'second backoff fails'); END;",
+        )
+        .unwrap();
+    assert!(store
+        .collect_ready(&first.key.origin_node, 5_000, 16, &[])
+        .is_err());
+    let first_backoff: (i64, i64) = store
+        .connection
+        .query_row(
+            "SELECT collect_at,collect_attempts FROM envelopes WHERE id=?1",
+            [&first.key.message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        first_backoff,
+        (0, 0),
+        "the first update must roll back with the failed second update"
+    );
 }

@@ -871,7 +871,7 @@ fn spoke_uplink_delivery_has_no_legacy_reply_until_durable_spoke_custody() {
 
     // Unbound questions also cannot produce a legacy mute deferral.
     carol.call_tool("flock_msg_mute", json!({"seconds":600}));
-    let refused = alice.call_tool_error(
+    let refused = alice.call_tool(
         "flock_msg_send",
         json!({
             "to":{"type":"agent","agent":carol.agent_id},
@@ -881,6 +881,11 @@ fn spoke_uplink_delivery_has_no_legacy_reply_until_durable_spoke_custody() {
     assert!(
         refused.to_string().contains("reply_unavailable"),
         "{refused}"
+    );
+    let question = carol.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        question["messages"][0]["body"], "are you there?",
+        "{question}"
     );
     let muted = carol.call_tool("flock_msg_mute", json!({"seconds":900}));
     assert_eq!(muted["deferred"], 0, "{muted}");

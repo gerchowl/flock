@@ -164,7 +164,7 @@ fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
     assert_eq!(
         receiver
             .query_row(
-                "SELECT count(*) FROM envelopes WHERE state='custody'",
+                "SELECT count(*) FROM envelopes WHERE state='held'",
                 [],
                 |r| r.get::<_, i64>(0)
             )
@@ -181,7 +181,7 @@ fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
         || {
             (receiver
                 .query_row(
-                    "SELECT count(*) FROM envelopes WHERE state='custody'",
+                    "SELECT count(*) FROM envelopes WHERE state='held'",
                     [],
                     |r| r.get::<_, i64>(0),
                 )
@@ -342,7 +342,7 @@ fn another_enrolled_node_cannot_collect_even_with_the_origins_token() {
     assert_eq!(
         database(fleet.node("nodeb"))
             .query_row(
-                "SELECT count(*) FROM envelopes WHERE state='custody'",
+                "SELECT count(*) FROM envelopes WHERE state='held'",
                 [],
                 |r| r.get::<_, i64>(0)
             )
@@ -666,4 +666,196 @@ fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
     let received = answers(fleet.node("nodea"), &sender["pane_id"]);
     assert!(start.elapsed() < Duration::from_secs(8));
     assert_eq!(received[0]["body"], "edge is back");
+}
+
+#[test]
+fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
+    let fleet = fleet::spawn("mesh-held-enroll", PAIR);
+    let (sender, _) = question(&fleet, "held-enroll");
+    database(fleet.node("nodea"))
+        .execute("UPDATE envelopes SET collect_at=999999999", [])
+        .unwrap();
+    let sent = reply(
+        fleet.node("nodeb"),
+        "held-enroll",
+        "waiting for an outbound edge",
+    );
+    assert_eq!(sent["result"]["state"], "held", "{sent}");
+    let db = database(fleet.node("nodeb"));
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM envelopes WHERE request_id IS NOT NULL",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "held"
+    );
+    let version: i64 = db
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .unwrap();
+    let idle = std::time::Instant::now();
+    fleet::wait_until("three idle retry ticks", Duration::from_secs(5), || {
+        assert_eq!(
+            db.pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version,
+            "held mail must not commit retry leases on an idle target"
+        );
+        (idle.elapsed() >= Duration::from_secs(3)).then_some(())
+    });
+    for app in ["flock", "flock-dev"] {
+        let path = fleet
+            .node("nodeb")
+            .config_home
+            .join(app)
+            .join("config.toml");
+        let mut config = std::fs::read_to_string(&path).unwrap();
+        config.push_str("\n[[peers]]\nname='nodea'\nssh='nodea'\n");
+        std::fs::write(path, config).unwrap();
+    }
+    let reload = request(fleet.node("nodeb"), "server.reload_config", json!({}));
+    assert!(reload.get("error").is_none(), "{reload}");
+    enrolled(fleet.node("nodeb"), "nodea");
+    let start = std::time::Instant::now();
+    let received = answers(fleet.node("nodea"), &sender["pane_id"]);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "new enrollment must activate held answers promptly"
+    );
+    assert_eq!(received[0]["body"], "waiting for an outbound edge");
+}
+
+#[test]
+fn many_held_answers_do_not_delay_the_targets_own_outbox_retry() {
+    let mut fleet = fleet::spawn(
+        "mesh-held-outbox",
+        &[
+            NodeSpec::new("nodea", "held-origin", &["nodeb"]),
+            NodeSpec::new("nodeb", "held-target", &["nodec"])
+                .with_config("\n[msg]\ndeferral_relay_concurrency=1\n"),
+            NodeSpec::new("nodec", "outbox-recipient", &[]),
+        ],
+    );
+    question(&fleet, "many-held");
+    database(fleet.node("nodea"))
+        .execute("UPDATE envelopes SET collect_at=999999999", [])
+        .unwrap();
+    fleet.refuse_edge("nodea", "nodeb");
+    fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
+    for n in 0..130 {
+        // Each sandbox boot has a fresh per-caller rate window. Keep the
+        // production limiter intact while building a durable backlog.
+        if n > 0 && n % 20 == 0 {
+            fleet.node_mut("nodeb").restart();
+        }
+        let response = reply(fleet.node("nodeb"), "many-held", &format!("held {n}"));
+        assert_eq!(response["result"]["state"], "held", "{response}");
+    }
+    let recipient = agent(fleet.node("nodec"));
+    fleet::wait_until(
+        "target discovers its own recipient",
+        Duration::from_secs(90),
+        || {
+            request(fleet.node("nodeb"), "agent.list", json!({}))["result"]["fleet"]
+                .as_array()?
+                .iter()
+                .find(|row| row["agent_id"] == recipient["agent_id"])
+                .cloned()
+        },
+    );
+    std::fs::write(fleet.base.join("capture-delivery-nodeb-nodec"), "drop").unwrap();
+    let sent = request(
+        fleet.node("nodeb"),
+        "msg.send",
+        json!({
+            "to":{"type":"agent","agent":recipient["agent_id"]},
+            "body":"own outbox", "correlation_id":"own-outbox", "intent":"fyi",
+            "from_agent":agent(fleet.node("nodeb"))["agent_id"]
+        }),
+    );
+    assert_eq!(sent["result"]["state"], "queued", "{sent}");
+    std::fs::remove_file(fleet.base.join("capture-delivery-nodeb-nodec")).unwrap();
+    database(fleet.node("nodeb"))
+        .execute(
+            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE correlation='own-outbox'",
+            [],
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    let delivered = answers(fleet.node("nodec"), &recipient["pane_id"]);
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "collect-only answers must not occupy the outbox retry lease"
+    );
+    assert_eq!(delivered[0]["body"], "own outbox");
+    assert_eq!(
+        database(fleet.node("nodeb"))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE state='held'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        130
+    );
+}
+
+#[test]
+fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
+    let fleet = fleet::spawn(
+        "mesh-push-hold",
+        &[
+            NodeSpec::new("nodea", "push-hold-origin", &["nodeb"]),
+            NodeSpec::new("nodeb", "push-hold-target", &["nodea"]),
+        ],
+    );
+    question(&fleet, "push-fails");
+    enrolled(fleet.node("nodeb"), "nodea");
+    database(fleet.node("nodea"))
+        .execute("UPDATE envelopes SET collect_at=999999999", [])
+        .unwrap();
+    std::fs::write(fleet.base.join("capture-delivery-nodeb-nodea"), "capture").unwrap();
+    let response = reply(fleet.node("nodeb"), "push-fails", "held after refusal");
+    assert!(response.get("error").is_none(), "{response}");
+    let db = database(fleet.node("nodeb"));
+    fleet::wait_until(
+        "failed push returns to held",
+        Duration::from_secs(5),
+        || {
+            (db.query_row(
+                "SELECT state FROM envelopes WHERE request_id IS NOT NULL",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+                == "held")
+                .then_some(())
+        },
+    );
+    let version: i64 = db
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .unwrap();
+    let idle = std::time::Instant::now();
+    fleet::wait_until(
+        "failed answer remains collect-only",
+        Duration::from_secs(5),
+        || {
+            assert_eq!(
+                db.pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT lease_until FROM envelopes WHERE request_id IS NOT NULL",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            (idle.elapsed() >= Duration::from_secs(3)).then_some(())
+        },
+    );
 }

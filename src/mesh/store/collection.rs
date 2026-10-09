@@ -34,6 +34,39 @@ pub(super) fn record_answer(
 }
 
 impl<D: DiskSpace> Store<D> {
+    /// Enrollment makes held answers pushable without changing their identity.
+    /// No writable clock or transaction is opened when no row can be sent.
+    pub fn activate_held(&mut self, origin: &str, peers: &[String], wall_ms: i64) -> Result<usize> {
+        let mut clock = self.clock()?;
+        if clock.paused || peers.is_empty() {
+            return Ok(0);
+        }
+        let now = clock.advance(wall_ms);
+        let peers = serde_json::to_string(peers)?;
+        let ready: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE state='held' AND origin=?1
+             AND recipient_node IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3)",
+            params![origin, peers, now],
+            |r| r.get(0),
+        )?;
+        if !ready {
+            return Ok(0);
+        }
+        Ok(self.connection.execute(
+            "UPDATE envelopes SET state='custody',retry_at=?3,lease_until=0 WHERE state='held'
+             AND origin=?1 AND recipient_node IN (SELECT value FROM json_each(?2)) AND custody_deadline>?3",
+            params![origin,peers,now])?)
+    }
+
+    pub fn hold_answer(&mut self, key: &MessageKey) -> Result<()> {
+        self.connection.execute(
+            "UPDATE envelopes SET state='held',lease_until=0
+            WHERE origin=?1 AND id=?2 AND state='custody' AND request_origin IS NOT NULL",
+            params![key.origin_node, key.message_id],
+        )?;
+        Ok(())
+    }
+
     /// Read TTL using the current logical time without committing the clock.
     pub fn collection_record(&mut self, key: &MessageKey, wall_ms: i64) -> Result<Option<Record>> {
         let mut clock = self.clock()?;
@@ -105,7 +138,7 @@ impl<D: DiskSpace> Store<D> {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
-        let mut records = Vec::new();
+        let mut ready = Vec::new();
         for (key, attempt) in keys {
             let Some(record) = self.collection_record(&key, wall_ms)? else {
                 continue;
@@ -118,15 +151,27 @@ impl<D: DiskSpace> Store<D> {
                 _ => 299_000,
             };
             let delay = base + i64::from(u16::from_le_bytes(random) % 1001);
-            let changed = self.connection.execute(
+            ready.push((record, now + delay));
+        }
+        if ready.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut records = Vec::new();
+        for (record, deadline) in ready {
+            let key = &record.envelope.key;
+            let changed = tx.execute(
                 "UPDATE envelopes SET collect_at=?3,collect_attempts=MIN(collect_attempts+1,3)
                  WHERE origin=?1 AND id=?2 AND collect_at<=?4",
-                params![key.origin_node, key.message_id, now + delay, now],
+                params![key.origin_node, key.message_id, deadline, now],
             )?;
             if changed != 0 {
                 records.push(record);
             }
         }
+        tx.commit()?;
         Ok(records)
     }
 
@@ -239,16 +284,15 @@ impl<D: DiskSpace> Store<D> {
             }
         }
         for ack in &query.ack {
-            if self
-                .collection_record(ack, wall_ms)?
-                .is_some_and(|r| r.state == "custody" && r.remaining_ms > 0)
-            {
+            if self.collection_record(ack, wall_ms)?.is_some_and(|r| {
+                matches!(r.state.as_str(), "custody" | "held") && r.remaining_ms > 0
+            }) {
                 self.finish(ack, Outcome::Delivered, wall_ms)?;
             }
         }
         let keys = {
             let mut stmt = self.connection.prepare(
-                "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 AND state='custody'
+                "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 AND state IN ('custody','held')
                  ORDER BY origin,id LIMIT 16")?;
             let rows = stmt
                 .query_map(

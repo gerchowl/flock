@@ -273,15 +273,12 @@ impl App {
         data.message.from_host = Some(sender_host);
         data.message.message_key = Some(envelope.key.clone());
         data.message.enqueued_at_ms = now_ms();
-        if self.mailboxes.owes_deferral(&data.message)
+        let unbound_muted = self.mailboxes.owes_deferral(&data.message)
             && self
                 .mailboxes
                 .muted_until(&data.message.to_pane, now_ms())
                 .is_some()
-            && self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str())
-        {
-            return Err(super::mesh_replies::UNAVAILABLE.into());
-        }
+            && self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str());
         let accepted = with_store(|store| {
             let existing = store.get(&envelope.key).map_err(|e| e.to_string())?;
             if existing.is_none()
@@ -302,43 +299,33 @@ impl App {
         if accepted == Accepted::New {
             self.queue_message_tiered(String::new(), data.message, Vec::new(), "unattested");
         }
+        if unbound_muted {
+            return Err(super::mesh_replies::UNAVAILABLE.into());
+        }
         Ok((accepted, true))
     }
 
     pub(super) fn complete_mesh_send(
         &mut self,
         send: RelaySend,
-        result: Result<bool, crate::peers::PeerMessageFailure>,
+        mut result: Result<bool, crate::peers::PeerMessageFailure>,
     ) {
         let Some(delivery) = &send.mesh else {
             return;
         };
+        let mut warnings = Vec::new();
         if result
             .as_ref()
             .err()
             .is_some_and(|failure| failure.detail().contains("reply_unavailable"))
         {
-            let _ = with_store(|store| {
-                store
-                    .finish(
-                        &delivery.envelope.key,
-                        Outcome::ReplyUnavailable,
-                        now_ms() as i64,
-                    )
-                    .map_err(|e| e.to_string())
-            });
-            self.mailboxes
-                .finish_relaying_question(&send.correlation_id);
-            if let Some(respond_to) = send.respond_to {
-                let _ = respond_to.send(encode_error(
-                    send.id,
-                    "reply_unavailable",
-                    super::mesh_replies::UNAVAILABLE,
-                ));
-            }
-            return;
+            // The receiver queued the question. Only its return path is unavailable.
+            warnings.push(format!(
+                "reply_unavailable: {}",
+                super::mesh_replies::UNAVAILABLE
+            ));
+            result = Ok(true);
         }
-        let mut warnings = Vec::new();
         let mut state = "queued";
         match result {
             Ok(true) => match with_store(|store| {
@@ -358,6 +345,17 @@ impl App {
                 send.peer.name,
                 failure.detail()
             )),
+        }
+        if state == "queued" && delivery.envelope.request_key.is_some() {
+            if let Err(reason) = with_store(|store| {
+                store
+                    .hold_answer(&delivery.envelope.key)
+                    .map_err(|e| e.to_string())
+            }) {
+                warnings.push(reason);
+            } else {
+                state = "held";
+            }
         }
         if state == "queued" {
             let spent = CUSTODY_TTL_MS.saturating_sub(delivery.remaining_ms);
@@ -514,7 +512,9 @@ impl App {
         self.mailboxes.clear_queued_projection();
         let records = with_store(|store| {
             if !self.fleet_pause.paused {
-                store.maintain(now_ms() as i64).map_err(|e| e.to_string())?;
+                store
+                    .maintain_if_due(now_ms() as i64)
+                    .map_err(|e| e.to_string())?;
             }
             store
                 .mailbox_keys()
@@ -594,7 +594,8 @@ impl App {
             return;
         }
         self.mesh_retry_at = Some(now + std::time::Duration::from_secs(1));
-        self.mesh_enrollment_generation = generation;
+        let enrollment_changed = self.mesh_enrollment_generation != generation;
+        let resumed = self.mesh_pause_seen != Some(false) && !paused;
         self.mesh_pause_seen = Some(paused);
         if let Err(reason) = with_store(|store| {
             store
@@ -609,14 +610,39 @@ impl App {
                 .mesh_maintenance_at
                 .is_none_or(|deadline| std::time::Instant::now() >= deadline)
         {
-            if let Err(reason) =
-                with_store(|store| store.maintain(now_ms() as i64).map_err(|e| e.to_string()))
-            {
+            if let Err(reason) = with_store(|store| {
+                store
+                    .maintain_if_due(now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            }) {
                 crate::logging::mesh_custody_failed("maintenance", error_code(&reason));
             }
             self.mesh_maintenance_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         }
+        if !paused && (enrollment_changed || resumed) {
+            let peers: Vec<String> = self
+                .state
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let status = crate::peer_stream::enrollment(peer);
+                    (status.state == "pinned")
+                        .then_some(status.node_id)
+                        .flatten()
+                })
+                .collect();
+            let origin = self.node_id.as_deref().unwrap_or_default();
+            if let Err(reason) = with_store(|store| {
+                store
+                    .activate_held(origin, &peers, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            }) {
+                crate::logging::mesh_custody_failed("held", error_code(&reason));
+                return;
+            }
+        }
+        self.mesh_enrollment_generation = generation;
         if self.fleet_pause.paused || !self.message_relays.is_idle() {
             return;
         }
@@ -641,15 +667,27 @@ impl App {
             if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
                 continue;
             }
-            let peer = self
-                .state
-                .peers
-                .iter()
-                .find(|peer| Some(&peer.name) == data.peer.as_ref())
-                .cloned();
+            let peer = if record.envelope.request_key.is_some() {
+                self.outbound_reply_peer(&record.envelope.return_binding.recipient_node)
+                    .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
+            } else {
+                self.state
+                    .peers
+                    .iter()
+                    .find(|peer| Some(&peer.name) == data.peer.as_ref())
+                    .cloned()
+            };
             let Some(peer) = peer else {
+                if record.envelope.request_key.is_some() {
+                    let _ = with_store(|store| {
+                        store
+                            .hold_answer(&record.envelope.key)
+                            .map_err(|e| e.to_string())
+                    });
+                }
                 continue;
             };
+            let host = data.host.unwrap_or_else(|| peer.name.clone());
             let message = data.message;
             let send = RelaySend {
                 mesh: Some(Deliver {
@@ -659,7 +697,7 @@ impl App {
                 id: String::new(),
                 peer,
                 to_agent: record.envelope.target_agent,
-                host: data.host.unwrap_or_default(),
+                host,
                 direct: data.direct,
                 from_agent: message.from_agent.unwrap_or_default(),
                 from_host: message.from_host.unwrap_or_default(),

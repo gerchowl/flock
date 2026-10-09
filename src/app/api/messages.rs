@@ -1572,22 +1572,9 @@ impl App {
         &mut self,
         id: String,
         mut message: PendingMessage,
-        warnings: Vec<String>,
+        mut warnings: Vec<String>,
         persist: bool,
     ) -> String {
-        if self.mailboxes.owes_deferral(&message)
-            && self
-                .mailboxes
-                .muted_until(&message.to_pane, now_ms())
-                .is_some()
-            && message
-                .from_host
-                .as_deref()
-                .is_some_and(|host| host != crate::app::short_host_name())
-            && message.message_key.is_none()
-        {
-            return encode_error(id, "reply_unavailable", super::mesh_replies::UNAVAILABLE);
-        }
         if persist && (self.node_id.is_some() || !cfg!(test)) && message.message_key.is_none() {
             if let Err(reason) = self.persist_local_mail(&mut message) {
                 return encode_error(id, super::mesh_mail::error_code(&reason), reason);
@@ -1612,7 +1599,15 @@ impl App {
                     if let Some(until) = self.mailboxes.muted_until(&message.to_pane, now) {
                         let reason = self.mailboxes.mute_reason(&message.to_pane, now);
                         if let Err(reason) = self.defer_message(&message, until, reason) {
-                            return encode_error(id, super::mesh_mail::error_code(&reason), reason);
+                            if reason == super::mesh_replies::UNAVAILABLE {
+                                warnings.push(format!("reply_unavailable: {reason}"));
+                            } else {
+                                return encode_error(
+                                    id,
+                                    super::mesh_mail::error_code(&reason),
+                                    reason,
+                                );
+                            }
                         }
                     }
                 }

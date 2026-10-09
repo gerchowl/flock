@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 9;
+pub(super) const VERSION: i64 = 10;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -116,6 +116,22 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
                AND answer.correlation NOT GLOB '*:deferred');
              CREATE INDEX open_collections ON envelopes(origin,delivered,reply_expected,collect_at);",
         )?;
+        version = 9;
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    if version == 9 {
+        // Routing lives outside immutable envelopes. Earlier drafts left
+        // collect-only answers in the ordinary outbox retry queue.
+        tx.execute_batch(
+            "UPDATE envelopes SET state='held',lease_until=0
+            WHERE state='custody' AND request_origin IS NOT NULL;
+            CREATE INDEX held_recipient ON envelopes(state,origin,recipient_node);
+            DROP TRIGGER usage_insert;
+            DROP TRIGGER usage_delete;
+            DROP TRIGGER usage_update;
+            DROP TABLE usage;",
+        )?;
+        tx.execute_batch(HELD_ACCOUNTING)?;
         tx.pragma_update(None, "user_version", VERSION)?;
     }
     tx.commit()?;
@@ -166,4 +182,25 @@ END;
 CREATE INDEX request_key ON envelopes(json_extract(metadata,'$.request_key.origin_node'),json_extract(metadata,'$.request_key.message_id'));
 CREATE INDEX collection_token ON envelopes(json_extract(metadata,'$.return_binding.collection_token'));
 CREATE INDEX terminal_gc ON envelopes(outcome_until,dedupe_until);
+"#;
+
+const HELD_ACCOUNTING: &str = r#"
+CREATE TABLE usage (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1), total_bytes INTEGER NOT NULL,
+    body_bytes INTEGER NOT NULL, active INTEGER NOT NULL);
+INSERT INTO usage SELECT 1, COALESCE(SUM(metadata_bytes+length(body)),0),
+    COALESCE(SUM(length(body)),0), COALESCE(SUM(state IN ('custody','held','inbox')),0) FROM envelopes;
+CREATE TRIGGER usage_insert AFTER INSERT ON envelopes BEGIN
+    UPDATE usage SET total_bytes=total_bytes+NEW.metadata_bytes+length(NEW.body),
+        body_bytes=body_bytes+length(NEW.body),active=active+(NEW.state IN ('custody','held','inbox')) WHERE singleton=1;
+END;
+CREATE TRIGGER usage_delete AFTER DELETE ON envelopes BEGIN
+    UPDATE usage SET total_bytes=total_bytes-OLD.metadata_bytes-length(OLD.body),
+        body_bytes=body_bytes-length(OLD.body),active=active-(OLD.state IN ('custody','held','inbox')) WHERE singleton=1;
+END;
+CREATE TRIGGER usage_update AFTER UPDATE OF metadata_bytes,body,state ON envelopes BEGIN
+    UPDATE usage SET total_bytes=total_bytes+NEW.metadata_bytes+length(NEW.body)-OLD.metadata_bytes-length(OLD.body),
+        body_bytes=body_bytes+length(NEW.body)-length(OLD.body),
+        active=active+(NEW.state IN ('custody','held','inbox'))-(OLD.state IN ('custody','held','inbox')) WHERE singleton=1;
+END;
 "#;
