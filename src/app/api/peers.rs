@@ -13,6 +13,23 @@ impl App {
         encode_success(
             id,
             ResponseResult::PeersSummary {
+                outbound_pending: self
+                    .node_id
+                    .as_deref()
+                    .zip(
+                        self.mesh_inbound
+                            .as_ref()
+                            .filter(|edge| edge.state == "pinned")
+                            .and_then(|edge| edge.node_id.as_deref()),
+                    )
+                    .is_some_and(|(node, hub)| {
+                        crate::mesh::hello::with_store(|store| {
+                            store
+                                .has_outbound(node, hub, super::messages::now_ms() as i64)
+                                .map_err(|e| e.to_string())
+                        })
+                        .unwrap_or(false)
+                    }),
                 node_id: self.node_id.clone(),
                 clone_detection_warning: self.clone_detection_warning.clone(),
                 host: short_host_name(),
@@ -1685,6 +1702,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    outbound_pending: false,
                     host: "kiln".into(),
                     version: None,
                     protocol: None,

@@ -3999,52 +3999,6 @@ pub(crate) fn peer_push_subscribe_failed(err: &str) {
     );
 }
 
-/// A spoke handed a message up and the hub forwarded it (#410). Debug: one
-/// line per cross-host message on the hub, which is traffic, not an incident.
-pub(crate) fn uplink_frame_forwarded(spoke: &str, uplink_id: &str, answered: bool) {
-    tracing::debug!(
-        target: "flock::peers",
-        event = "peer.uplink.forwarded",
-        subsystem = "peers",
-        outcome = if answered { "ok" } else { "error" },
-        spoke,
-        uplink_id,
-        "forwarded a message a spoke handed up"
-    );
-}
-
-/// The hub could not carry its answer back down to the spoke that handed a
-/// message up (#410). WARN: the spoke's sender is left waiting for an answer
-/// that will never come, and times out without learning what happened.
-pub(crate) fn uplink_result_undelivered(spoke: &str, uplink_id: &str, err: &str) {
-    tracing::warn!(
-        target: "flock::peers",
-        event = "peer.uplink.result_undelivered",
-        subsystem = "peers",
-        outcome = "error",
-        spoke,
-        uplink_id,
-        err,
-        "could not return an uplinked message's outcome to its spoke"
-    );
-}
-
-/// A hub refused a frame whose claimed host its spoke edge cannot vouch for
-/// (#410). WARN: either a misconfigured spoke or one speaking for a machine it
-/// is not, and both deserve an operator's eyes.
-pub(crate) fn uplink_sender_refused(spoke: &str, claimed: &str, why: &str) {
-    tracing::warn!(
-        target: "flock::peers",
-        event = "peer.uplink.sender_refused",
-        subsystem = "peers",
-        outcome = "refused",
-        spoke,
-        claimed,
-        why,
-        "refused a handed-up message claiming a host its edge cannot vouch for"
-    );
-}
-
 /// A relay line carried a push kind this hub does not know (#410). Dropped
 /// rather than fed to the summary parser, where it would fail a poll.
 pub(crate) fn peer_push_unknown_kind(peer: &str, kind: &str) {
@@ -4074,18 +4028,15 @@ pub(crate) fn relay_attach_blocked(err: &str, attempts: u64) {
     );
 }
 
-/// The relay's uplink pull stopped for good (#410): the local server refused
-/// `msg.uplink_take`, most likely because it predates it. WARN for the same
-/// reason as a refused push subscription — otherwise indistinguishable from a
-/// node that simply never sends anything.
-pub(crate) fn uplink_pull_stopped(err: &str) {
+/// The relay could not bind to the local server.
+pub(crate) fn relay_attach_refused(err: &str) {
     tracing::warn!(
         target: "flock::peers",
-        event = "peer.uplink.pull_stopped",
+        event = "peer.relay.attach_refused",
         subsystem = "peers",
         outcome = "error",
         err,
-        "relay uplink pull refused; this node cannot hand messages up to its hub"
+        "relay attachment refused"
     );
 }
 

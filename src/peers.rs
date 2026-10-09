@@ -904,6 +904,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
 /// Parsed summary payload from one peer (everything its `peers.summary` carries).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerSummaryPayload {
+    pub outbound_pending: bool,
     pub host: String,
     pub version: Option<String>,
     pub protocol: Option<u32>,
@@ -1582,6 +1583,10 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
             .map(crate::api::schema::PeerSystemSummary::sanitized);
     }
     Ok(PeerSummaryPayload {
+        outbound_pending: result
+            .get("outbound_pending")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         host,
         version,
         protocol,

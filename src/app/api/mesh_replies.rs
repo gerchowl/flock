@@ -5,10 +5,10 @@ use super::{
     responses::{encode_error, encode_success},
 };
 use crate::{
-    api::schema::{EventEnvelope, EventKind, ResponseResult},
+    api::schema::{EventData, EventEnvelope, EventKind, ResponseResult},
     app::{mailboxes::PendingMessage, App},
     mesh::{
-        collect::{Collect, Completion},
+        collect::{AnswerCollect, Collect, Completion},
         delivery::Deliver,
         hello::with_store,
         key::MessageKey,
@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-pub(super) const UNAVAILABLE: &str = "origin not mesh-reachable (needs 1-H2)";
+pub(super) const UNAVAILABLE: &str = "message has no valid mesh return binding";
 
 impl App {
     pub(super) fn persist_mesh_reply(
@@ -179,13 +179,54 @@ impl App {
                 .and_then(|edge| edge.node_id.as_deref())
                 .ok_or("mesh edge is not enrolled")?;
             with_store(|store| {
-                store
-                    .collect_answers(origin, &query, now_ms() as i64)
-                    .map_err(|e| e.to_string())
+                let mut refusals = Vec::new();
+                if let Collect::Outbound { outbound } = &query {
+                    for ack in &outbound.ack {
+                        if let Some(reason) = &ack.refusal {
+                            if let Some(record) = store
+                                .collection_record(&ack.key, now_ms() as i64)
+                                .map_err(|e| e.to_string())?
+                            {
+                                if record.state == "held" && record.remaining_ms > 0 {
+                                    refusals.push((record.envelope.correlation_id, reason.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let answers = match &query {
+                    Collect::Answers(query) => {
+                        store.collect_answers(origin, query, now_ms() as i64)
+                    }
+                    Collect::Outbound { outbound } => store.collect_outbound(
+                        self.node_id
+                            .as_deref()
+                            .ok_or("mesh node identity unavailable")?,
+                        origin,
+                        outbound,
+                        now_ms() as i64,
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
+                Ok((answers, refusals))
             })
         })();
         match result {
-            Ok(answers) => encode_success(id, ResponseResult::MeshCollected { answers }),
+            Ok((answers, refusals)) => {
+                for (correlation_id, reason) in refusals {
+                    self.emit_event(EventEnvelope {
+                        event: EventKind::MessageDelivered,
+                        data: EventData::MessageDelivered {
+                            correlation_id,
+                            delivered: false,
+                            outcome: format!("refused: {reason}"),
+                            delivery_attempts: 0,
+                            latency_ms: 0,
+                        },
+                    });
+                }
+                encode_success(id, ResponseResult::MeshCollected { answers })
+            }
             Err(reason) => encode_error(id, "mesh_collection_refused", reason),
         }
     }
@@ -202,7 +243,7 @@ impl App {
         if self.fleet_pause.paused {
             return;
         }
-        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+        let cap = crate::mesh::collect::POLL_CONCURRENCY;
         let slots = self.collection_relays.slots(cap);
         if slots == 0 {
             return;
@@ -251,12 +292,38 @@ impl App {
             .unwrap_or_default();
             self.start_collection(
                 peer,
-                Collect {
+                Collect::Answers(AnswerCollect {
                     request: record.envelope.key,
                     token: binding.collection_token,
                     ack,
-                },
+                }),
             );
+        }
+        let mut peers = self.state.peers.clone();
+        if !peers.is_empty() {
+            let count = peers.len();
+            peers.rotate_left(self.mesh_outbound_cursor % count);
+            self.mesh_outbound_cursor = (self.mesh_outbound_cursor + slots) % count;
+        }
+        for peer in peers {
+            if !self.collection_peers.contains_key(&peer.name)
+                && self
+                    .mesh_outbound_polls
+                    .entry(peer.name.clone())
+                    .or_default()
+                    .ready(
+                        now,
+                        crate::peer_stream::enrollment(&peer).state == "pinned",
+                        crate::peer_stream::peer_enrollment_generation(&peer),
+                    )
+            {
+                self.start_collection(
+                    peer,
+                    Collect::Outbound {
+                        outbound: Default::default(),
+                    },
+                );
+            }
         }
     }
 
@@ -273,8 +340,8 @@ impl App {
             .cloned()
     }
 
-    fn start_collection(&mut self, peer: crate::config::PeerConfig, query: Collect) {
-        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+    pub(super) fn start_collection(&mut self, peer: crate::config::PeerConfig, query: Collect) {
+        let cap = crate::mesh::collect::POLL_CONCURRENCY;
         if self.collection_relays.slots(cap) == 0 {
             return;
         }
@@ -287,7 +354,7 @@ impl App {
         self.collection_relays.start_bounded(
             crate::mesh::collect::work(peer, query),
             self.event_tx.clone(),
-            self.state.config.msg.deferral_relay_concurrency.clamp(1, 4),
+            crate::mesh::collect::POLL_CONCURRENCY,
         );
     }
 
@@ -295,13 +362,17 @@ impl App {
         if self.fleet_pause.paused {
             return;
         }
+        let Collect::Answers(query) = completion.query else {
+            self.finish_outbound_collection(completion);
+            return;
+        };
         let answers = match completion.result {
             Ok(answers) => answers,
             Err(reason) => {
                 if reason.starts_with("mesh collection refused") {
                     let _ = with_store(|store| {
                         store
-                            .collection_failed(&completion.query.request, &reason, false)
+                            .collection_failed(&query.request, &reason, false)
                             .map_err(|e| e.to_string())
                     });
                 }
@@ -310,19 +381,17 @@ impl App {
         };
         if with_store(|store| {
             store
-                .collection_acked(&completion.query.request, &completion.query.ack)
+                .collection_acked(&query.request, &query.ack)
                 .map_err(|e| e.to_string())
         })
         .is_err()
         {
             return;
         }
-        for answer in answers {
-            if let Err(reason) = self.import_mesh_answer(
-                &completion.query.request,
-                &answer,
-                Some(&completion.peer.name),
-            ) {
+        for answer in answers.deliveries {
+            if let Err(reason) =
+                self.import_mesh_answer(&query.request, &answer, Some(&completion.peer.name))
+            {
                 crate::logging::mesh_custody_failed(
                     "collect",
                     super::mesh_mail::error_code(&reason),
@@ -338,7 +407,7 @@ impl App {
                     );
                     let _ = with_store(|store| {
                         store
-                            .collection_failed(&completion.query.request, &reason, permanent)
+                            .collection_failed(&query.request, &reason, permanent)
                             .map_err(|e| e.to_string())
                     });
                 }
@@ -346,17 +415,14 @@ impl App {
         }
         let ack = with_store(|store| {
             store
-                .collection_acks(&completion.query.request)
+                .collection_acks(&query.request)
                 .map_err(|e| e.to_string())
         })
         .unwrap_or_default();
         if !ack.is_empty() {
             self.start_collection(
                 completion.peer,
-                Collect {
-                    ack,
-                    ..completion.query
-                },
+                Collect::Answers(AnswerCollect { ack, ..query }),
             );
         }
     }

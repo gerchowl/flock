@@ -2,7 +2,7 @@
 """Local ssh transport for fleet.rs, including directed partitions and faults.
 
 Fault modes alter handshake traffic or attempt an enrollment reset. Requests,
-summary pushes and uplink frames traverse the real relay and enrollment gate.
+summary pushes and custody collections traverse the real relay and enrollment gate.
 """
 import json
 import os
@@ -82,6 +82,7 @@ child = subprocess.Popen(
 lock = threading.Lock()
 deliveries = set()
 collections = set()
+outbound_collections = set()
 
 
 def emit(line):
@@ -106,8 +107,21 @@ def forward_input():
             method = request.get("method", "")
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
             if method == "mesh.collect":
-                collections.add(request.get("id"))
-                hold = base / f"hold-collect-{source}-{target}"
+                outbound = "outbound" in request.get("params", {})
+                kind = "outbound" if outbound else "collect"
+                if outbound:
+                    outbound_collections.add(request.get("id"))
+                    with (base / f"outbound-polls-{source}-{target}").open("a") as log:
+                        log.write(str(time.monotonic()) + "\n")
+                    lose_ack = base / f"lose-outbound-ack-{source}-{target}"
+                    if lose_ack.exists() and request.get("params", {}).get("outbound", {}).get("ack"):
+                        lose_ack.rename(base / f"lost-outbound-ack-{source}-{target}")
+                        outbound_collections.discard(request.get("id"))
+                        emit(json.dumps({"id": request["id"], "result": {"answers": []}}) + "\n")
+                        continue
+                else:
+                    collections.add(request.get("id"))
+                hold = base / f"hold-{kind}-{source}-{target}"
                 if hold.is_dir():
                     (hold / "entered").touch()
                     deadline = time.monotonic() + 30
@@ -115,12 +129,12 @@ def forward_input():
                         if time.monotonic() >= deadline:
                             break
                         time.sleep(0.01)
-                replay = base / f"replay-collect-{source}-{target}"
+                replay = base / f"replay-{kind}-{source}-{target}"
                 if replay.exists():
                     request["params"] = json.loads(replay.read_text())
                     line = json.dumps(request) + "\n"
-                gate = base / f"gate-collect-ack-{source}-{target}"
-                if gate.is_dir() and request.get("params", {}).get("ack"):
+                gate = base / f"gate-{kind}-ack-{source}-{target}"
+                if gate.is_dir() and request.get("params", {}).get("outbound", request.get("params", {})).get("ack"):
                     (gate / "entered").touch()
                     deadline = time.monotonic() + 30
                     while not (gate / "release").exists() and gate.is_dir():
@@ -204,6 +218,17 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        if response.get("id") in outbound_collections:
+            outbound_collections.discard(response.get("id"))
+            answers = response.get("result", {}).get("answers", [])
+            if answers:
+                with (base / f"outbound-offers-{source}-{target}").open("a") as log:
+                    log.write(json.dumps(answers) + "\n")
+                corrupt = base / f"corrupt-outbound-{source}-{target}"
+                if corrupt.exists():
+                    answers[0]["remaining_ms"] = "undecodable"
+                    corrupt.unlink()
+                    line = json.dumps(response) + "\n"
         if response.get("id") in collections:
             answers = response.get("result", {}).get("answers", [])
             if answers and (base / f"corrupt-collect-answer-{source}-{target}").exists():

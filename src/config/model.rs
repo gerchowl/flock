@@ -1306,23 +1306,6 @@ pub struct MsgConfig {
     /// Past it, a `blocking` message is still delivered, as `needs_reply`,
     /// and the send result says so. `0` downgrades every `blocking` message.
     pub blocking_per_hour: usize,
-    /// How long a send handed up to the hub waits for the hub's answer, in
-    /// seconds (#410). Default: 45.
-    ///
-    /// A spoke has no `[[peers]]` of its own, so a message for another host
-    /// goes up the relay the hub holds into it and the hub delivers it. The
-    /// hub's own hop to the recipient can take up to its ssh timeout (30s),
-    /// so this has to sit above that or a slow-but-successful delivery would
-    /// be reported to the sender as a failure.
-    pub uplink_timeout_secs: u64,
-    /// How long the hub's relay may wait on this server for a message to hand
-    /// up before asking again, in seconds (#410). Default: 20.
-    ///
-    /// Also the liveness signal: a relay that has not asked within this window
-    /// is treated as gone, and a send that needs the hub is refused
-    /// with "no hub holds a relay to this server" instead of waiting out
-    /// `uplink_timeout_secs` for an answer nobody will carry.
-    pub uplink_heartbeat_secs: u64,
     /// Wake an idle agent that has mail by typing a fixed sentence into its
     /// pane (ADR-0018 §2). Default: true. The kill switch: false leaves agents
     /// to find mail at their next turn boundary, as before.
@@ -1378,8 +1361,6 @@ impl Default for MsgConfig {
             mute_reason_max_chars: 200,
             deferral_relay_concurrency: 4,
             blocking_per_hour: 6,
-            uplink_timeout_secs: 45,
-            uplink_heartbeat_secs: 20,
             idle_wake: true,
             idle_wake_settle_ms: 2_000,
             idle_wake_operator_quiet_ms: 15_000,
@@ -1870,6 +1851,13 @@ mod tests {
             ..RemoteConfig::default()
         };
         assert!(off.reconnect_policy().is_none());
+    }
+
+    #[test]
+    fn spoke_custody_accepts_removed_uplink_settings() {
+        for key in ["uplink_timeout_secs", "uplink_heartbeat_secs"] {
+            assert!(toml::from_str::<super::MsgConfig>(&format!("{key}=20")).is_ok());
+        }
     }
 
     #[test]

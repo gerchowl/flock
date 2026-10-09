@@ -519,7 +519,6 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     crate::logging::peer_relay_started(pushing);
     if pushing {
         start_summary_push(socket.clone());
-        start_uplink_pull(socket.clone());
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -681,101 +680,12 @@ fn start_summary_push(socket: std::path::PathBuf) {
     });
 }
 
-/// Carry messages this node hands UP to the hub that holds this relay (#410).
-///
-/// A spoke has no `[[peers]]`, so this relay — the hub's ssh edge into it — is
-/// the only way a message for another host can leave. The pull long-polls the
-/// local server's `msg.uplink_take`: the server parks the request until a
-/// frame is due or its heartbeat window passes, so an idle node costs one
-/// request per window and a message leaves the moment it is sent. The asking
-/// is also how the server knows a hub is attached at all.
-///
-/// Its own thread and its own push kind, separate from the summary pusher:
-/// a message must never wait behind the summary debounce, and must never be
-/// coalesced away the way a superseded summary safely is (pitfall 4). Frames
-/// are acknowledged on the NEXT take, only after they are written, so a relay
-/// that dies mid-write leaves them to be re-offered rather than lost.
-fn start_uplink_pull(socket: std::path::PathBuf) {
-    std::thread::spawn(move || {
-        let mut ack: Vec<String> = Vec::new();
-        if !attach_relay(&socket) {
-            return;
-        }
-        loop {
-            let request = serde_json::json!({
-                "id": "relay-uplink",
-                "method": "msg.uplink_take",
-                "params": { "ack": ack },
-            });
-            let line = match relay_local_request(&socket, &request) {
-                Ok(line) => line,
-                // No server right now (restarting, not yet up): ask again
-                // later, keeping the acks owed.
-                Err(_) => {
-                    std::thread::sleep(UPLINK_RETRY);
-                    continue;
-                }
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                std::thread::sleep(UPLINK_RETRY);
-                continue;
-            };
-            if let Some(error) = value.get("error") {
-                // The binding was lost — the server restarted, say. Bind
-                // again rather than give up on a node that is still here.
-                if error.get("code").and_then(|code| code.as_str()) == Some("not_the_relay") {
-                    if !attach_relay(&socket) {
-                        return;
-                    }
-                    continue;
-                }
-                if error.get("code").and_then(|code| code.as_str()) == Some("mesh_not_enrolled") {
-                    std::thread::sleep(UPLINK_RETRY);
-                    continue;
-                }
-                // Anything else is an older build without the method. It will
-                // say no forever, so stop and say so once.
-                crate::logging::uplink_pull_stopped(&error.to_string());
-                return;
-            }
-            ack.clear();
-            let frames = value
-                .get("result")
-                .and_then(|result| result.get("frames"))
-                .and_then(|frames| frames.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for frame in frames {
-                let Some(uplink_id) = frame
-                    .get("uplink_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let push = serde_json::json!({
-                    "push": crate::peer_stream::UPLINK_PUSH,
-                    "frame": frame,
-                });
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                // The hub hung up: this relay is ending, and the frame stays
-                // unacked for the next one to carry.
-                if writeln!(out, "{push}").is_err() || out.flush().is_err() {
-                    return;
-                }
-                ack.push(uplink_id);
-            }
-        }
-    });
-}
-
 /// Bind this relay to the local server's uplink (`peers.relay_attach`), so the
 /// relay methods it and the hub use are accepted from this process and no
 /// other. Retried while an older relay that is still alive holds the binding
-/// — the hub's previous connection winding down — or while no server is up.
-/// `false` when the server refuses for good: a build that predates binding.
-fn attach_relay(socket: &std::path::Path) -> bool {
+/// — the hub's previous connection winding down. Missing servers return an
+/// error immediately so the hello caller can reconnect with transient backoff.
+fn attach_relay(socket: &std::path::Path) -> std::io::Result<bool> {
     let request = serde_json::json!({
         "id": "relay-attach",
         "method": "peers.relay_attach",
@@ -783,16 +693,11 @@ fn attach_relay(socket: &std::path::Path) -> bool {
     });
     let mut blocked_attempts: u64 = 0;
     loop {
-        let Ok(line) = relay_local_request(socket, &request) else {
-            std::thread::sleep(UPLINK_RETRY);
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            std::thread::sleep(UPLINK_RETRY);
-            continue;
-        };
+        let line = relay_local_request(socket, &request)?;
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim()).map_err(std::io::Error::other)?;
         let Some(error) = value.get("error") else {
-            return true;
+            return Ok(true);
         };
         if error.get("code").and_then(|code| code.as_str()) == Some("relay_already_attached") {
             // Never silently: another process holding the binding for long is
@@ -803,19 +708,16 @@ fn attach_relay(socket: &std::path::Path) -> bool {
             if blocked_attempts.is_power_of_two() {
                 crate::logging::relay_attach_blocked(&error.to_string(), blocked_attempts);
             }
-            std::thread::sleep(UPLINK_RETRY);
+            std::thread::sleep(RELAY_ATTACH_RETRY);
             continue;
         }
-        crate::logging::uplink_pull_stopped(&error.to_string());
-        return false;
+        crate::logging::relay_attach_refused(&error.to_string());
+        return Ok(false);
     }
 }
 
-/// How long the uplink pull waits before asking a local server that did not
-/// answer. Not configurable, for the reason `SUMMARY_PUSH_DEBOUNCE` is not: it
-/// only paces retries against a server that is not there, and the server's own
-/// heartbeat (`[msg] uplink_heartbeat_secs`) is what decides liveness.
-const UPLINK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Pace attachment retries while an older relay still owns the binding.
+const RELAY_ATTACH_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One request to this node's own socket, answered by one line.
 fn relay_local_request(
@@ -961,6 +863,13 @@ fn relay_one_request(
         .and_then(|pid| crate::platform::process_start_time(pid).map(|started| (pid, started)));
     let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
     if parsed.as_ref().and_then(|v| v["method"].as_str()) == Some("mesh.hello") {
+        match attach_relay(socket) {
+            Ok(true) => {}
+            Ok(false) => {
+                return write_relay_error(&id, "relay_unavailable", "relay attachment refused")
+            }
+            Err(error) => return write_relay_error(&id, "no_local_server", &error.to_string()),
+        }
         *checked_server = None;
     } else if server.is_none() || *checked_server != server {
         let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});

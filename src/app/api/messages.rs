@@ -131,11 +131,7 @@ impl ReplyOutcome {
         if value.get("error").is_some() {
             return Self::Failed;
         }
-        if value["result"]["state"] == "handed_up" {
-            Self::Failed
-        } else {
-            Self::Sent
-        }
+        Self::Sent
     }
 }
 
@@ -167,21 +163,6 @@ fn escalation_body(sender: &str, recipient: &str, count: usize) -> String {
     )
 }
 
-/// The sender host a relay stamps on a message it hands on.
-///
-/// This host, unless the message is one a spoke handed up and this hub's
-/// uplink path vouched for its edge (#410) — then that edge's configured name,
-/// so the hub does not become the apparent sender (pitfall 1, #213). An
-/// unattested socket caller's own `from_host` is never believed here, or any
-/// process on this machine could make a peer see a message "from" a host it
-/// never came from.
-pub(super) fn relay_sender_host(attested_locally: bool, vouched: Option<&str>) -> String {
-    match vouched {
-        Some(vouched) if !attested_locally => vouched.to_string(),
-        _ => crate::app::short_host_name(),
-    }
-}
-
 /// Why a wake may not fire, whichever channel asked.
 pub(crate) struct WakeSuppression {
     pub reason: &'static str,
@@ -196,19 +177,10 @@ pub(crate) struct WakeSuppression {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
-        self.send_message(id, params, None)
+        self.send_message(id, params)
     }
 
-    /// `msg.send`, with `vouched` naming the spoke edge when — and only when —
-    /// this is the hub delivering a frame that spoke handed up (#410). Passed
-    /// as an argument, never read from params or left in shared state, so no
-    /// wire caller can claim it and no early return can leak it.
-    pub(crate) fn send_message(
-        &mut self,
-        id: String,
-        params: MsgSendParams,
-        vouched: Option<&str>,
-    ) -> String {
+    pub(crate) fn send_message(&mut self, id: String, params: MsgSendParams) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
@@ -247,13 +219,13 @@ impl App {
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
             Err((code, message)) => {
-                return self.hand_up_or_refuse(id, &params.to, &body, &params, code, message)
+                return self.queue_spoke_or_refuse(id, &params.to, &body, &params, code, message)
             }
         };
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
             ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params, vouched)
+                return self.relay_message_to_host(id, &location, &body, params)
             }
         };
         let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
@@ -641,8 +613,19 @@ impl App {
                     id,
                     ResponseResult::MsgStatus {
                         attempts: Vec::new(),
-                        correlation_id: params.correlation_id,
-                        state: "collect_failed".into(),
+                        correlation_id: params.correlation_id.clone(),
+                        state: if crate::mesh::hello::with_store(|store| {
+                            store
+                                .outbound_refused(origin, &params.correlation_id)
+                                .map_err(|e| e.to_string())
+                        })
+                        .unwrap_or(false)
+                        {
+                            "refused"
+                        } else {
+                            "collect_failed"
+                        }
+                        .into(),
                         outcome_known: true,
                         to_host: None,
                         route: None,
@@ -1125,7 +1108,6 @@ impl App {
         location: &crate::app::directory::AgentLocation,
         body: &str,
         params: MsgSendParams,
-        vouched: Option<&str>,
     ) -> String {
         let host = location.host.as_str();
         let to_agent = location.agent_id.as_str();
@@ -1133,7 +1115,7 @@ impl App {
             // #410: no edge of our own. A spoke hands the message up the relay
             // its hub holds — the fix for "not in [[peers]]" is NOT to add the
             // N×N trust the topology refuses.
-            if let Some(response) = self.try_hand_up(&id, to_agent, body, &params) {
+            if let Some(response) = self.try_queue_spoke(&id, to_agent, body, &params) {
                 return response;
             }
             let me = crate::app::short_host_name();
@@ -1174,7 +1156,7 @@ impl App {
 
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();
-        let from_host = relay_sender_host(attested.is_some(), vouched);
+        let from_host = crate::app::short_host_name();
         let from_agent = attested.or_else(|| params.from_agent.clone());
         let Some(from_agent) = from_agent else {
             return encode_error(
@@ -1522,7 +1504,7 @@ impl App {
     /// is a spoke that has one (#410), else refuse — and when the refusal is
     /// "nowhere in the fleet" on a server with no edges at all, say that the
     /// fleet it searched was only itself.
-    fn hand_up_or_refuse(
+    fn queue_spoke_or_refuse(
         &mut self,
         id: String,
         target: &MessageTarget,
@@ -1537,7 +1519,7 @@ impl App {
         if code != "msg_target_not_found" {
             return encode_error(id, code, message);
         }
-        if let Some(response) = self.try_hand_up(&id, agent, body, params) {
+        if let Some(response) = self.try_queue_spoke(&id, agent, body, params) {
             return response;
         }
         if self.state.peers.is_empty() && params.from_host.is_none() {
