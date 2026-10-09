@@ -50,8 +50,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// refusal reason while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Enrollment refusals default to the long delay. Only transport failures and
-/// missing-server and inbound-capacity responses are transient.
+/// Only known identity and compatibility failures use the long refusal delay.
 struct EnrollmentError {
     detail: String,
     transient: bool,
@@ -59,9 +58,20 @@ struct EnrollmentError {
 
 impl From<String> for EnrollmentError {
     fn from(detail: String) -> Self {
+        let permanent = [
+            "mesh version mismatch:",
+            "invalid mesh identity",
+            "invalid mesh signature",
+            "identity changed for ",
+            "impersonation of configured peer ",
+            "mesh handshake refused (local ",
+        ]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
+            || (detail.starts_with("node ") && detail.contains(" is enrolled as "));
         Self {
             detail,
-            transient: false,
+            transient: !permanent,
         }
     }
 }
@@ -75,12 +85,26 @@ impl EnrollmentError {
     }
 
     fn response(error: &serde_json::Value, detail: String) -> Self {
+        let permanent = matches!(
+            error["code"].as_str(),
+            Some(
+                "mesh_version_mismatch"
+                    | "mesh_not_enrolled"
+                    | "identity_changed"
+                    | "invalid_request"
+                    | "invalid_mesh_identity"
+                    | "invalid_mesh_signature"
+                    | "identity_pin_conflict"
+                    | "impersonation"
+                    | "custom_summary_unsupported"
+            )
+        ) || (error["code"] == "mesh_refused"
+            && error["message"]
+                .as_str()
+                .is_some_and(|message| !Self::from(message.to_owned()).transient));
         Self {
             detail,
-            transient: matches!(
-                error["code"].as_str(),
-                Some("no_local_server" | "inbound_edges_full")
-            ),
+            transient: !permanent,
         }
     }
 }
@@ -352,7 +376,7 @@ impl PeerStream {
             }
             return Err(EnrollmentError::response(
                 error,
-                format!("mesh handshake refused for {}: {error}", peer.name),
+                format!("mesh handshake failed for {}: {error}", peer.name),
             ));
         }
         let challenge: Challenge = serde_json::from_value(response["result"]["challenge"].clone())
@@ -381,7 +405,7 @@ impl PeerStream {
         if let Some(error) = ack.get("error") {
             return Err(EnrollmentError::response(
                 error,
-                format!("mesh enrollment refused: {error}"),
+                format!("mesh enrollment failed: {error}"),
             ));
         }
         if !ack.get("result").is_some_and(serde_json::Value::is_object) {
@@ -1123,6 +1147,7 @@ mod tests {
         for code in [
             "no_local_server",
             "inbound_edges_full",
+            "future_unknown_error",
             "mesh_version_mismatch",
             "identity_changed",
             "invalid_request",
@@ -1131,11 +1156,30 @@ mod tests {
                 EnrollmentError::response(&serde_json::json!({"code": code}), code.into());
             assert_eq!(
                 failure.transient,
-                matches!(code, "no_local_server" | "inbound_edges_full")
+                matches!(
+                    code,
+                    "no_local_server" | "inbound_edges_full" | "future_unknown_error"
+                )
             );
             assert_eq!(failure.detail, code);
         }
-        assert!(!EnrollmentError::from("identity changed".to_string()).transient);
+        assert!(!EnrollmentError::from("identity changed for peer".to_string()).transient);
+        assert!(EnrollmentError::from("unparseable response".to_string()).transient);
+        assert!(
+            !EnrollmentError::response(
+                &serde_json::json!({"code":"mesh_refused", "message":"invalid mesh signature"}),
+                "identity refusal".into()
+            )
+            .transient
+        );
+        assert!(
+            EnrollmentError::response(
+                &serde_json::json!({"code":"mesh_refused", "message":"future transient failure"}),
+                "unknown".into()
+            )
+            .transient
+        );
+        assert!(EnrollmentError::response(&serde_json::json!({}), "unparseable".into()).transient);
         assert!(EnrollmentError::transport(CONNECTION_CLOSED.into()).transient);
     }
 
@@ -1156,7 +1200,9 @@ mod tests {
             ("inbound_edges_full", "retrying"),
             ("no_local_server", "retrying"),
             ("mesh_version_mismatch", "refused"),
-            ("mesh_refused", "refused"),
+            ("mesh_not_enrolled", "refused"),
+            ("mesh_refused", "retrying"),
+            ("identity_changed", "refused"),
         ] {
             set_enrollment(
                 &target,

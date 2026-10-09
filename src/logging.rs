@@ -4655,6 +4655,11 @@ pub(crate) fn mesh_store_suspended(reason: &str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.store.suspended", reason, "mesh store suspended; recovery will retry");
 }
 
+/// Waiters retain event evidence through a transient store outage.
+pub(crate) fn mesh_wait_read_unavailable(reason: &str) {
+    tracing::debug!(target: "flock::mesh", event = "mesh.wait.read_unavailable", reason, "mesh reply waiter read unavailable");
+}
+
 /// Routing diagnostics never contain message bodies, keys, or SSH destinations.
 pub(crate) fn mesh_routing_failed(operation: &'static str, peer: &str, reason: &str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.routing.failed", operation, peer, reason, "mesh routing operation failed");

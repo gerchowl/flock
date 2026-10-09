@@ -1838,3 +1838,37 @@ async fn idle_wake_reports_fired_only_when_enter_is_sent() {
     );
     assert!(drain(&mut pty).is_empty());
 }
+
+#[tokio::test]
+async fn restore_prefers_finished_attempt_state() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    let _store = crate::mesh::runtime_store::TestStore::new();
+    app.node_id = Some("nodea".into());
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "attempt-merge", MsgIntent::NeedsReply);
+    app.tick_idle_wakes(Instant::now());
+    assert!(!drain(&mut pty).is_empty());
+    let mut finished = app.delivery_attempts()[0].clone();
+    finished.state = "confirmed".into();
+    finished.finished_at_ms = Some(crate::app::api::messages::now_ms());
+    app.emit_event(crate::api::schema::EventEnvelope {
+        event: crate::api::schema::EventKind::DeliveryAttemptUpdated,
+        data: crate::api::schema::EventData::DeliveryAttemptUpdated {
+            attempt: finished.clone(),
+        },
+    });
+    app.restore_delivery_attempts();
+    assert_eq!(app.delivery_attempts()[0], finished);
+    let mut newer = finished.clone();
+    newer.finished_at_ms = Some(finished.finished_at_ms.unwrap() + 1);
+    crate::mesh::runtime_store::with_store(|store| {
+        store.record_attempt(&newer).map_err(|e| e.to_string())
+    })
+    .unwrap();
+    app.restore_delivery_attempts();
+    assert_eq!(app.delivery_attempts()[0], newer);
+}

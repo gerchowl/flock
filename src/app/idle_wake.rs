@@ -521,7 +521,14 @@ impl App {
             if let Ok(Some(stored)) = crate::mesh::runtime_store::read(|store| {
                 store.delivery_attempts().map_err(|e| e.to_string())
             }) {
-                restored.extend(stored.into_iter().map(|a| (a.attempt_id.clone(), a)));
+                for attempt in stored {
+                    let current = restored
+                        .entry(attempt.attempt_id.clone())
+                        .or_insert_with(|| attempt.clone());
+                    if attempt.finished_at_ms > current.finished_at_ms {
+                        *current = attempt;
+                    }
+                }
             }
         }
         self.delivery_attempt_registry.borrow_mut().clear();

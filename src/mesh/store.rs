@@ -331,6 +331,24 @@ pub struct Store<D = SystemDisk> {
     local_node: String,
 }
 impl Store<SystemDisk> {
+    pub(crate) fn read_only(path: &Path) -> Result<Self> {
+        Ok(Self {
+            connection: Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?,
+            path: path.to_owned(),
+            limits: Limits::default(),
+            disk: SystemDisk,
+            local_node: String::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        Path::new(self.connection.path().expect("file-backed test store"))
+    }
+
     /// `path` is normally `config::state_dir()/mesh-mail.sqlite`. Its parent
     /// must already exist. Writer handoff is the runtime owner's responsibility.
     pub fn open(path: &Path, wall_ms: i64) -> Result<Self> {

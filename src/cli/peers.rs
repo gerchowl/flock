@@ -93,11 +93,21 @@ pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<
     .filter(|response| response.get("error").is_none());
     if let Some(response) = response {
         if let Ok(peers) = serde_json::from_value(response["result"]["peers"].clone()) {
-            let warning = response["result"]["mesh_suspended_reason"]
+            let mut warning = response["result"]["mesh_suspended_reason"]
                 .as_str()
                 .map(|reason| {
                     format!("mesh: suspended: {} (retrying recovery)", printable(reason))
                 });
+            if let Some(count) = response["result"]["mesh_quarantined"]
+                .as_u64()
+                .filter(|n| *n > 0)
+            {
+                let quarantine = format!("mesh quarantined: {count}");
+                warning = Some(match warning {
+                    Some(reason) => format!("{reason}; {quarantine}"),
+                    None => quarantine,
+                });
+            }
             return (peers, warning);
         }
     }

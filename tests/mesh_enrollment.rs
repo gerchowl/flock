@@ -69,7 +69,7 @@ fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
             .find(|p| {
                 p["peer"] == "acceptor.test"
                     && p["reason"].as_str().is_some_and(|reason| {
-                        reason.contains("mesh handshake refused")
+                        reason.contains("mesh handshake failed")
                             && reason.contains("no_local_server")
                     })
             })
@@ -832,7 +832,15 @@ fn two_hubs_hold_edges_to_one_spoke_concurrently() {
     two_hubs_ready(&fleet);
     let status = cli(fleet.node("nodec"), &["status", "--json"]);
     let rows = status["peers"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{status}");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["source"] == "inbound"
+                && row["state"] == "pinned"
+                && row["node_id"].is_string())
+            .count(),
+        2,
+        "{status}"
+    );
     for hub in ["nodea", "nodeb"] {
         assert!(
             rows.iter().any(|row| row["peer"] == hub

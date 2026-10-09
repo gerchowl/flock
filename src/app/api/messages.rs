@@ -1008,6 +1008,16 @@ impl App {
                 .as_ref()
                 .is_some_and(|key| expired.contains(key))
             {
+                self.emit_event(EventEnvelope {
+                    event: EventKind::MessageDelivered,
+                    data: EventData::MessageDelivered {
+                        correlation_id: message.correlation_id.clone(),
+                        delivered: false,
+                        outcome: "dropped_undeliverable".into(),
+                        delivery_attempts: message.delivery_attempts,
+                        latency_ms: now.saturating_sub(message.enqueued_at_ms),
+                    },
+                });
                 continue;
             }
             self.mailboxes.record_delivered(&message);
@@ -1675,6 +1685,103 @@ mod tests {
                 intent: MsgIntent::Fyi,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn recovery_decodes_each_record_and_does_not_recommit_idle_replay() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        basic_send(&mut app, "bad-record", "bad");
+        basic_send(&mut app, "good-record", "good");
+        let path =
+            crate::mesh::runtime_store::with_store(|store| Ok(store.path().to_owned())).unwrap();
+        let observer = rusqlite::Connection::open(path).unwrap();
+        observer
+            .execute(
+                "UPDATE envelopes SET body=X'00' WHERE correlation='bad-record'",
+                [],
+            )
+            .unwrap();
+        app.restore_mesh_mail().unwrap();
+        let pane = pane_target(&app, 1);
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+        assert_eq!(
+            crate::mesh::runtime_store::read(|store| store
+                .quarantined_count()
+                .map_err(|e| e.to_string()))
+            .unwrap(),
+            Some(1)
+        );
+        let before: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        app.restore_mesh_mail().unwrap();
+        let after: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_without_identity_preserves_local_projection() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.node_id = None;
+        basic_send(&mut app, "local-recovery", "local mail");
+        let pane = pane_target(&app, 1);
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+        app.finish_mesh_recovery(Ok(Vec::new()));
+        assert_eq!(app.mailboxes.queued_len(&pane), 1);
+    }
+
+    #[tokio::test]
+    async fn collection_tick_prunes_without_a_node_identity() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.node_id = None;
+        app.inbound.attach(u32::MAX, 1, |_| Some(1)).unwrap();
+        let generation = app.inbound.inbound_generation();
+        app.tick_mesh_collections();
+        assert!(app.inbound.inbound_generation() > generation);
+    }
+
+    #[tokio::test]
+    async fn msg_read_expiry_emits_the_sweep_event_once() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        let response = basic_send(&mut app, "expired-read", "expires");
+        assert!(!response.contains("\"error\""), "{response}");
+        crate::mesh::runtime_store::with_store(|store| {
+            store
+                .maintain_if_due(super::now_ms() as i64 + crate::mesh::store::CUSTODY_TTL_MS)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        let pane = pane_target(&app, 1);
+        for _ in 0..2 {
+            let response = app.handle_msg_read(
+                "read".into(),
+                MsgReadParams {
+                    pane: Some(pane.clone()),
+                },
+            );
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["result"]["messages"].as_array().unwrap().len(), 0);
+        }
+        app.expire_undeliverable_messages();
+        let events = app.event_hub.events_after(0);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| matches!(&event.data,
+            EventData::MessageDelivered { correlation_id, delivered: false, outcome, .. }
+            if correlation_id == "expired-read" && outcome == "dropped_undeliverable"))
+                .count(),
+            1
+        );
     }
 
     /// [`basic_send`] at a tier that wakes: under ADR-0018 an `fyi` never
