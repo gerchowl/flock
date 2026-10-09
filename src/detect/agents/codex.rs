@@ -10,7 +10,7 @@ pub(super) fn detect(content: &str) -> AgentState {
     }
 
     // Working
-    if has_codex_working_status_at_current_prompt(content) {
+    if has_codex_slow_model_notice(content) || has_codex_working_status_at_current_prompt(content) {
         return AgentState::Working;
     }
 
@@ -44,8 +44,30 @@ pub(super) fn has_prompt(content: &str) -> bool {
 }
 
 pub(super) fn has_visible_working(content: &str) -> bool {
-    has_codex_live_working_at_current_prompt(content)
+    has_codex_slow_model_notice(content)
+        || has_codex_live_working_at_current_prompt(content)
         || (!has_codex_current_prompt(content) && has_codex_visible_working_without_prompt(content))
+}
+
+fn has_codex_slow_model_notice(content: &str) -> bool {
+    // Recent-buffer wrapping can split words. Ignore whitespace and the moving
+    // selection marker, but require the menu controls and notice at the live tail.
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let bottom = compact(&bottom_non_empty_lines(content, 16).join("\n"))
+        .replace("›1.", "1.")
+        .replace("›2.", "2.")
+        .replace("›3.", "3.");
+    bottom.contains(&compact("Giving this request a little extra thought"))
+        && bottom.contains(&compact(
+            "1. Retry with a faster model 2. Dismiss and keep waiting 3. Learn more",
+        ))
+        && bottom.ends_with(&compact(
+            "No action is required. Codex will keep waiting, and this menu will close when the response is ready.",
+        ))
 }
 
 pub(super) fn is_transcript_viewer(content: &str) -> bool {
@@ -313,3 +335,59 @@ mod tests {
 #[cfg(test)]
 #[path = "codex/submit_721_tests.rs"]
 mod submit_721_tests;
+
+#[cfg(test)]
+mod slow_model_tests {
+    use super::*;
+    use crate::detect::{detect_agent, Agent};
+
+    const MENU: &str = include_str!("../../../tests/fixtures/codex/slow-model-menu.txt");
+
+    #[test]
+    fn codex_slow_model_menu_is_visible_working_for_every_selection() {
+        for choice in [
+            "1. Retry with a faster model",
+            "2. Dismiss and keep waiting",
+            "3. Learn more",
+        ] {
+            let screen = MENU
+                .replace("› ", "  ")
+                .replace(&format!("  {choice}"), &format!("› {choice}"));
+            let detection = detect_agent(Some(Agent::Codex), &screen);
+            assert_eq!(detection.state, AgentState::Working);
+            assert!(detection.visible_working);
+            assert!(!detection.visible_idle);
+            assert!(!detection.visible_blocker);
+            assert!(!detection.skip_state_update);
+            assert_eq!(composer_region(&screen), None);
+        }
+    }
+
+    #[test]
+    fn codex_slow_model_notice_in_history_is_not_live_working() {
+        for tail in ["› ", "› Ask Codex to do anything\n? for shortcuts"] {
+            let screen = format!("{MENU}\n{tail}");
+            assert_eq!(detect(&screen), AgentState::Idle);
+            assert!(!has_visible_working(&screen));
+        }
+        let screen = format!("{MENU}\nAllow command?\n[y/n]");
+        assert_eq!(detect(&screen), AgentState::Blocked);
+        assert!(!has_visible_working(&screen));
+    }
+
+    #[test]
+    fn codex_slow_model_menu_requires_all_controls() {
+        for line in [
+            "Giving this request a little extra thought",
+            "1. Retry with a faster model",
+            "2. Dismiss and keep waiting",
+            "3. Learn more",
+            "No action is required.",
+            "this menu will close when the response is ready.",
+        ] {
+            let screen = MENU.replace(line, "");
+            assert_eq!(detect(&screen), AgentState::Idle);
+            assert!(!has_visible_working(&screen));
+        }
+    }
+}

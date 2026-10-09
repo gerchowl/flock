@@ -1,0 +1,9 @@
+  Giving this request a little extra thought
+  If you'd rather not wait, retry with a faster mode
+l. It may be less capable of handling complex reques
+ts.
+› 1. Retry with a faster model
+  2. Dismiss and keep waiting
+  3. Learn more
+  No action is required. Codex will keep waiting, an
+d this menu will close when the response is ready.

@@ -23,3 +23,13 @@ screens are replayed by an isolated PTY harness in `delegate_codex.rs`, with
   claim that #748 captured the update dialog. The real `alt-model.txt` capture
   demonstrates that an active menu has selection controls and no composer
   footer. The update menu's selection marker must likewise never receive a brief.
+
+# Codex slow-model notice (#763)
+
+`slow-model-menu.txt` replays the owner-reported Codex 0.160.1 screen from
+#763 through an isolated flk pane, captured with `flk pane read --source recent
+--format text` before changing the detector. The ANSI capture had identical
+content. The 50-column pane wraps the explanatory text and bottom notice.
+This is a replay of the issue's screen, not a fresh live Codex capture.
+The title, three choices and final no-action notice identify the active menu.
+The selection marker may move between choices; none requires action.
