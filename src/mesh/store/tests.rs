@@ -4339,3 +4339,37 @@ fn clearing_a_route_releases_custody_and_held_leases_idempotently() {
             .is_empty());
     }
 }
+
+#[test]
+fn expired_read_receipts_do_not_starve_fresh_routed_receipts() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    store.set_local_node("receiver.example");
+    for i in 0..20 {
+        let mut mail = envelope();
+        mail.key = MessageKey::mint("origin.example".into(), i).unwrap();
+        mail.return_binding.request = mail.key.clone();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store.finish(&mail.key, Outcome::Read, 1).unwrap();
+    }
+    let fresh = envelope();
+    store
+        .accept(&fresh, CUSTODY_TTL_MS, Admission::Inbox, DAY_MS + 1)
+        .unwrap();
+    // All rows arrived through two hops. Expired read rows sort before the fresh row.
+    store
+        .connection
+        .execute(
+            r#"UPDATE envelopes SET visited='["origin.example","hub.example"]'"#,
+            [],
+        )
+        .unwrap();
+    let receipts = store.routed_receipts(DAY_MS + 1).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].key, fresh.key);
+    assert_eq!(receipts[0].state, "delivered");
+    store.receipts_sent(&receipts).unwrap();
+    assert!(store.routed_receipts(DAY_MS + 1).unwrap().is_empty());
+}

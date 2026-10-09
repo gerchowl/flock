@@ -39,7 +39,14 @@ impl App {
         };
         for receipt in receipts {
             if let Err(reason) = self.persist_routed_receipt(&receipt) {
-                crate::logging::mesh_custody_failed("receipt", error_code(&reason));
+                let now = std::time::Instant::now();
+                if self
+                    .mesh_receipt_log_at
+                    .is_none_or(|deadline| now >= deadline)
+                {
+                    crate::logging::mesh_custody_failed("receipt", error_code(&reason));
+                    self.mesh_receipt_log_at = Some(now + std::time::Duration::from_secs(60));
+                }
             }
         }
     }
@@ -213,6 +220,26 @@ mod tests {
         mail.return_binding.recipient_node = original.key.origin_node.clone();
         mail.target_agent = original.sender.clone();
         mail.body = serde_json::to_vec(&serde_json::json!({"state":receipt.state})).unwrap();
+        let forger = crate::mesh::identity::NodeIdentity::fixture([10; 32]);
+        let mut forged = mail.clone();
+        forged.key = MessageKey::mint(forger.node_id(), now_ms()).unwrap();
+        forged.return_binding.request = forged.key.clone();
+        forged.body = br#"{"state":"read"}"#.to_vec();
+        crate::mesh::sign::seal(&mut forged, &forger);
+        crate::mesh::sign::verify(&forged).unwrap();
+        assert_eq!(
+            app.import_mesh_receipt(&forged).unwrap_err(),
+            "invalid reply binding"
+        );
+        with_store(|store| {
+            assert!(store.get(&forged.key).unwrap().is_none());
+            assert_eq!(
+                store.get(&original.key).unwrap().unwrap().state,
+                "delivered"
+            );
+            Ok(())
+        })
+        .unwrap();
         crate::mesh::sign::seal(&mut mail, &signer);
         assert_eq!(app.import_mesh_receipt(&mail), Ok((Accepted::New, true)));
         assert_eq!(
@@ -251,6 +278,28 @@ mod tests {
         mail.return_binding.request = mail.key.clone();
         crate::mesh::sign::seal(&mut mail, &signer);
         assert_eq!(app.import_mesh_receipt(&mail), Ok((Accepted::New, true)));
+        // A separately signed delivered receipt can arrive after the read receipt.
+        mail.key = MessageKey::mint(signer.node_id(), now_ms()).unwrap();
+        mail.return_binding.request = mail.key.clone();
+        mail.body = br#"{"state":"delivered"}"#.to_vec();
+        crate::mesh::sign::seal(&mut mail, &signer);
+        assert_eq!(app.import_mesh_receipt(&mail), Ok((Accepted::New, true)));
+        with_store(|store| {
+            assert_eq!(
+                store
+                    .status(
+                        &original.key.origin_node,
+                        &original.correlation_id,
+                        now_ms() as i64
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "read"
+            );
+            Ok(())
+        })
+        .unwrap();
         with_store(|store| {
             let due = store
                 .collect_ready(

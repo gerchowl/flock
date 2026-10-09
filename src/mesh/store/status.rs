@@ -425,7 +425,7 @@ impl<D: DiskSpace> Store<D> {
         let keys = self.routing_keys(
             "SELECT origin,id,rowid FROM envelopes WHERE json_valid(visited) AND json_array_length(visited)>1
              AND recipient_node=?1 AND custody_deadline>?2
-             AND (state!='inbox' OR inbox_deadline>?2)
+             AND (state NOT IN ('inbox','read') OR COALESCE(inbox_deadline,custody_deadline)>?2)
              AND request_origin IS NULL AND kind='message'
              AND state IN ('inbox','read','recipient_gone')
              AND receipt_sent IS NOT CASE WHEN state='inbox' THEN 'delivered' ELSE state END
@@ -435,17 +435,15 @@ impl<D: DiskSpace> Store<D> {
         let mut receipts = Vec::new();
         for key in keys {
             if let Some(record) = self.collection_record(&key, wall_ms)? {
-                if record.remaining_ms > 0 {
-                    receipts.push(crate::mesh::collect::Receipt {
-                        key,
-                        token: record.envelope.return_binding.collection_token,
-                        state: if record.state == "inbox" {
-                            "delivered".into()
-                        } else {
-                            record.state
-                        },
-                    });
-                }
+                receipts.push(crate::mesh::collect::Receipt {
+                    key,
+                    token: record.envelope.return_binding.collection_token,
+                    state: if record.state == "inbox" {
+                        "delivered".into()
+                    } else {
+                        record.state
+                    },
+                });
             }
         }
         Ok(receipts)
