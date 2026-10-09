@@ -556,24 +556,35 @@ impl App {
         policy: &RestartPolicy,
         since: Instant,
     ) -> bool {
-        let Some(terminal) = self.state.terminals.get(id) else {
-            return false;
-        };
-        let Some(runtime) = self.terminal_runtimes.get(id) else {
-            return false;
-        };
-        terminal.restart_idle_observed_since(since)
-            && terminal
-                .guarded_submit_blocker(
-                    now,
-                    Duration::from_millis(policy.settle_ms),
-                    Duration::from_millis(policy.fresh_ms),
-                )
-                .is_none()
-            && runtime.last_operator_input_at().is_none_or(|at| {
-                now.saturating_duration_since(at) >= Duration::from_millis(policy.operator_quiet_ms)
-            })
-            && self.restart_composer_ready(id).is_ok()
+        self.restart_readiness(id, now, policy, since).is_ok()
+    }
+
+    fn restart_readiness(
+        &self,
+        id: &TerminalId,
+        now: Instant,
+        policy: &RestartPolicy,
+        since: Instant,
+    ) -> Result<(), &'static str> {
+        self.restart_composer_ready(id)?;
+        let terminal = self.state.terminals.get(id).ok_or("terminal_missing")?;
+        let runtime = self.terminal_runtimes.get(id).ok_or("runtime_missing")?;
+        if !terminal.restart_idle_observed_since(since) {
+            return Err("idle_observation_missing");
+        }
+        if let Some(reason) = terminal.guarded_submit_blocker(
+            now,
+            Duration::from_millis(policy.settle_ms),
+            Duration::from_millis(policy.fresh_ms),
+        ) {
+            return Err(reason);
+        }
+        if runtime.last_operator_input_at().is_some_and(|at| {
+            now.saturating_duration_since(at) < Duration::from_millis(policy.operator_quiet_ms)
+        }) {
+            return Err("operator_not_quiet");
+        }
+        Ok(())
     }
 
     fn restart_composer_ready(&self, id: &TerminalId) -> Result<(), &'static str> {
@@ -824,11 +835,14 @@ impl App {
                     return false;
                 }
 
-                if same
-                    && new_pid.is_some()
-                    && new_pid != request.old_pid
-                    && self.restart_ready(id, now, &policy, started)
-                {
+                let verification_blocker = if !same {
+                    Some("session_unconfirmed")
+                } else if new_pid == request.old_pid {
+                    Some("process_unchanged")
+                } else {
+                    self.restart_readiness(id, now, &policy, started).err()
+                };
+                if verification_blocker.is_none() {
                     self.sample_restart_vitals(now);
                     let rss = self.restarts.samples.get(id).map(|v| v.rss);
                     let mut body = format!("Restart verified: old_pid={:?}, new_pid={:?}, session={}, reason={}, rss_before={}, rss_after={:?}. {}", request.old_pid, new_pid, request.session.session_ref.value, request.reason, request.rss_before, rss, request.continuation);
@@ -875,18 +889,15 @@ impl App {
                     return false;
                 }
                 self.answer_restart_dialog(id, request);
-                if now.saturating_duration_since(started)
-                    >= Duration::from_secs(policy.verify_timeout_secs)
-                {
+                if let Some(reason) = verification_blocker.filter(|_| {
+                    now.saturating_duration_since(started)
+                        >= Duration::from_secs(policy.verify_timeout_secs)
+                }) {
                     let screen = self
                         .terminal_runtimes
                         .get(id)
                         .map(|r| r.recent_text(20))
                         .unwrap_or_default();
-                    let reason = self
-                        .restart_composer_ready(id)
-                        .err()
-                        .unwrap_or("session_or_idle_unconfirmed");
                     self.recover_restart(id, request);
                     self.report_restart(id, request, "restart_stuck", format!("verification timed out ({reason}); the running harness remains live; retry plan deferred until it exits, then use flk agent resume <pane>. Last output: {}", screen.chars().take(1024).collect::<String>()));
                     return false;

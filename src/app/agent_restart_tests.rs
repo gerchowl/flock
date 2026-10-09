@@ -971,3 +971,61 @@ async fn restart_opencode_requires_fresh_observation_and_empty_composer_without_
         .app
         .restart_ready(&rig.id, now + Duration::from_secs(10), &policy, now));
 }
+
+async fn claude_verifying_rig() -> Rig {
+    let mut rig = rig();
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    report_session(&mut rig, "restart-session", 1);
+    rig
+}
+
+#[tokio::test]
+async fn restart_claude_empty_composer_verifies_and_delivers_continuation() {
+    let mut rig = claude_verifying_rig().await;
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "");
+    assert_eq!(rig.app.restart_composer_ready(&rig.id), Ok(()));
+    rig.app.tick_agent_restarts(now);
+    assert!(has_phase(&rig, "restarted"));
+    assert!(!has_phase(&rig, "restart_stuck"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 1);
+}
+
+#[tokio::test]
+async fn restart_claude_draft_reports_composer_not_empty_without_continuing() {
+    let mut rig = claude_verifying_rig().await;
+    rig.app.state.config.session.restart.verify_timeout_secs = 0;
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "operator draft");
+    assert_eq!(
+        rig.app.restart_composer_ready(&rig.id),
+        Err("composer_not_empty")
+    );
+    rig.app.tick_agent_restarts(now);
+    assert!(!has_phase(&rig, "restarted"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+        &event.data, EventData::AgentRestart { phase, detail, .. }
+        if phase == "restart_stuck" && detail.contains("verification timed out (composer_not_empty)")
+    )));
+}
+
+#[tokio::test]
+async fn restart_claude_empty_composer_timeout_reports_missing_idle_observation() {
+    let mut rig = claude_verifying_rig().await;
+    rig.app.state.config.session.restart.verify_timeout_secs = 0;
+    let Phase::Verifying(started) = rig.app.state.agent_restarts.pending[&rig.id].phase else {
+        panic!("expected verifying phase");
+    };
+    idle(&mut rig, started - TICK, "");
+    assert_eq!(rig.app.restart_composer_ready(&rig.id), Ok(()));
+    rig.app.tick_agent_restarts(Instant::now() + TICK);
+    assert!(!has_phase(&rig, "restarted"));
+    assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+        &event.data, EventData::AgentRestart { phase, detail, .. }
+        if phase == "restart_stuck" && detail.contains("verification timed out (idle_observation_missing)")
+    )));
+}
