@@ -119,7 +119,7 @@ impl<D: DiskSpace> Store<D> {
                 state = remote;
             }
         }
-        if error.is_some() && state != "refused" {
+        if error.is_some() && !matches!(state.as_str(), "refused" | "recipient_gone") {
             state = "collect_failed".into();
         }
         let mut reply = None;
@@ -274,33 +274,50 @@ impl<D: DiskSpace> Store<D> {
     /// window after one successful exchange and id order cannot starve the
     /// newer ones behind it.
     pub fn pending_receipts(
-        &self,
+        &mut self,
         origin: &str,
         wall_ms: i64,
     ) -> Result<Vec<crate::mesh::collect::Receipt>> {
         let now = self.clock()?.advance(wall_ms);
         let mut stmt = self.connection.prepare(&format!(
-            "SELECT id,state_now FROM (SELECT id,receipt_sent,{RECEIPT_STATE_SQL} AS state_now
-               FROM envelopes WHERE origin=?1 AND state IN ('inbox','read','inbox_expired'))
-             WHERE receipt_sent IS NOT state_now ORDER BY id LIMIT ?3"
+            "WITH due AS MATERIALIZED (
+                SELECT rowid AS record_rowid,* FROM envelopes WHERE origin=?1 AND state IN ('inbox','read','inbox_expired')
+                AND ((outcome_until<=?2 AND receipt_sent IS NOT 'outcome_retention_elapsed')
+                  OR ((outcome_until IS NULL OR outcome_until>?2) AND (
+                    (state='read' AND receipt_sent IS NOT 'read')
+                    OR (state='inbox_expired' AND receipt_sent IS NOT 'expired')
+                    OR (state='inbox' AND inbox_deadline<=?2 AND receipt_sent IS NOT 'expired')
+                    OR (state='inbox' AND (inbox_deadline IS NULL OR inbox_deadline>?2) AND receipt_sent IS NOT 'delivered'))))
+                ORDER BY id LIMIT ?3)
+             SELECT record_rowid,id,{RECEIPT_STATE_SQL} FROM due"
         ))?;
-        let rows = stmt
-            .query_map(
-                params![origin, now, crate::mesh::collect::BATCH_CAP as i64],
-                |r| {
-                    Ok((
-                        MessageKey {
-                            origin_node: origin.into(),
-                            message_id: r.get(0)?,
-                        },
-                        r.get::<_, String>(1)?,
-                    ))
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows = stmt.query(params![origin, now, crate::mesh::collect::BATCH_CAP as i64])?;
+        let mut selected = Vec::new();
+        let mut bad_rows = Vec::new();
+        while let Some(row) = rows.next()? {
+            match (row.get::<_, String>(1), row.get::<_, String>(2)) {
+                (Ok(message_id), Ok(state)) => selected.push((
+                    MessageKey {
+                        origin_node: origin.into(),
+                        message_id,
+                    },
+                    state,
+                )),
+                _ => bad_rows.push(row.get::<_, i64>(0)?),
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        quarantine::rows(
+            &self.connection,
+            &bad_rows,
+            &self.path,
+            "invalid receipt row",
+            wall_ms,
+        )?;
         let mut receipts = Vec::new();
-        for (key, state) in rows {
-            if let Some(record) = self.get(&key)? {
+        for (key, state) in selected {
+            if let Some(record) = self.collection_record(&key, wall_ms)? {
                 receipts.push(crate::mesh::collect::Receipt {
                     key,
                     token: record.envelope.return_binding.collection_token,
