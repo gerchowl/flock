@@ -61,7 +61,7 @@ fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
     // previously enrolled stream to notice that its server disappeared. An
     // in-flight held request can consume its 15-second transport timeout first.
     // This is setup; the six-second recovery assertion below stays strict.
-    fleet::wait_until("hello to stopped peer", Duration::from_secs(30), || {
+    let retrying = fleet::wait_until("hello to stopped peer", Duration::from_secs(30), || {
         let status = request(fleet.node("dialer.test"), "peers.enrollment", json!({}));
         status["result"]["peers"]
             .as_array()?
@@ -75,6 +75,7 @@ fn peer_restart_reenrolls_promptly_after_missing_server_hello() {
             })
             .cloned()
     });
+    assert_eq!(retrying["state"], "retrying", "{retrying}");
     fleet.node_mut("acceptor.test").restart();
     fleet::wait_until("re-enrolled after restart", Duration::from_secs(6), || {
         let status = request(fleet.node("dialer.test"), "peers.enrollment", json!({}));
@@ -247,7 +248,7 @@ fn acceptor_refuses_changed_dialer_key_until_inbound_reset() {
     enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
     remove_identity(fleet.node("dialer.test"));
     fleet.node_mut("dialer.test").restart();
-    let refused = enrollment(fleet.node("acceptor.test"), "dialer.test", "refused");
+    let refused = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
     assert!(
         refused["reason"]
             .as_str()
@@ -261,7 +262,7 @@ fn acceptor_refuses_changed_dialer_key_until_inbound_reset() {
     );
     assert!(reset["result"]["node_id"].is_null(), "{reset}");
     assert_eq!(
-        enrollment(fleet.node("acceptor.test"), "dialer.test", "refused")["state"],
+        enrollment(fleet.node("dialer.test"), "acceptor.test", "refused")["state"],
         "refused"
     );
     let reset = cli(
@@ -291,15 +292,15 @@ fn enrolled_dialer_cannot_reconnect_under_an_unused_name() {
     enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
     rename_node(fleet.node("dialer.test"), "impostor.test");
     fleet.node_mut("dialer.test").restart();
-    let refused = enrollment(fleet.node("acceptor.test"), "impostor.test", "refused");
-    assert_eq!(
-        refused["reason"],
-        format!(
+    // The dialer retains the refusal after its rejected inbound relay exits.
+    let refused = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
+    assert!(
+        refused["reason"].as_str().unwrap().contains(&format!(
             "node {} is enrolled as dialer.test",
             pinned["node_id"].as_str().unwrap()
-        )
+        )),
+        "{refused}"
     );
-    assert!(refused["node_id"].is_null());
     let preview = request(
         fleet.node("acceptor.test"),
         "peers.enroll_reset",
@@ -497,23 +498,17 @@ fn rename_node(node: &Node, name: &str) {
 }
 
 #[test]
-fn old_dialer_is_visible_as_refused_on_acceptor() {
+fn old_dialer_is_refused_without_attaching_an_inbound_edge() {
     let mut specs = PAIR.to_vec();
     specs[1].mesh = MeshMode::LegacyDialer;
     let fleet = fleet::spawn("mesh-old-dialer", &specs);
-    let refused = enrollment(
-        fleet.node("acceptor.test"),
-        "unidentified SSH peer",
-        "refused",
-    );
+    let refused = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
     assert!(
-        refused["reason"]
-            .as_str()
-            .unwrap()
-            .contains("upgrade flk on the dialer"),
+        refused["reason"].as_str().unwrap().contains("upgrade flk"),
         "{refused}"
     );
-    assert!(refused["node_id"].is_null());
+    let status = request(fleet.node("acceptor.test"), "peers.enrollment", json!({}));
+    assert_eq!(status["result"]["peers"], json!([]));
 }
 
 const ALIAS_A_TO_B: &str = "[[peers]]\nname = \"b-ts.test\"\nssh = \"b.test\"\n";
@@ -598,7 +593,20 @@ fn bidirectional_aliases(a_dials_first: bool) {
     // An existing configured alias must not authorize a new inbound name.
     rename_node(fleet.node("b.test"), "impostor.test");
     fleet.node_mut("b.test").restart();
-    let refused = enrollment(fleet.node("a.test"), "b-ts.test", "refused");
+    let refused = fleet::wait_until("renamed peer refusal", Duration::from_secs(90), || {
+        let status = request(fleet.node("b.test"), "peers.enrollment", json!({}));
+        status["result"]["peers"]
+            .as_array()?
+            .iter()
+            .find(|peer| {
+                peer["peer"] == "a-ts.test"
+                    && peer["state"] == "refused"
+                    && peer["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("is enrolled as b.test"))
+            })
+            .cloned()
+    });
     assert!(
         refused["reason"]
             .as_str()
@@ -655,8 +663,15 @@ fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
             );
             assert!(reason.contains(&attacker_id), "{refused}");
             assert_single_configured_row(fleet.node("a.test"));
-            let inbound = enrollment(fleet.node("a.test"), "unidentified SSH peer", "refused");
-            assert!(inbound["node_id"].is_null());
+            let status = request(fleet.node("a.test"), "peers.enrollment", json!({}));
+            assert!(
+                !status["result"]["peers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|peer| peer["node_id"] == attacker_id),
+                "{status}"
+            );
         } else {
             // A caller with SSH access can win the first-contact trust decision.
             enrollment(fleet.node("e.test"), "a.test", "pinned");
@@ -782,4 +797,145 @@ fn assert_single_configured_row(node: &Node) {
             .any(|p| p["source"] == "inbound" && p["state"] == "pinned"),
         "{status}"
     );
+}
+
+fn two_hubs_ready(fleet: &fleet::Fleet) {
+    for hub in ["nodea", "nodeb"] {
+        enrollment(fleet.node(hub), "nodec", "pinned");
+        enrollment(fleet.node("nodec"), hub, "pinned");
+    }
+}
+
+fn mailbox_agent(node: &Node) -> Value {
+    let existing = request(node, "agent.list", json!({}))["result"]["agents"][0].clone();
+    if !existing.is_null() {
+        return existing;
+    }
+    let started = request(
+        node,
+        "agent.start",
+        json!({
+            "name":"mailbox", "argv":["/bin/sh", "-c", "while read line; do :; done"], "cwd":node.repo
+        }),
+    );
+    assert!(started["result"]["agent"].is_object(), "{started}");
+    started["result"]["agent"].clone()
+}
+
+fn hub_send(fleet: &fleet::Fleet, hub: &str, recipient: &Value, correlation: &str) -> Value {
+    fleet::wait_until("hub discovers spoke agent", Duration::from_secs(90), || {
+        request(fleet.node(hub), "agent.list", json!({}))["result"]["fleet"]
+            .as_array()?
+            .iter()
+            .find(|row| row["agent_id"] == recipient["agent_id"])
+            .cloned()
+    });
+    request(
+        fleet.node(hub),
+        "msg.send",
+        json!({
+            "to":{"type":"agent", "agent":recipient["agent_id"]},
+            "body":correlation, "correlation_id":correlation, "intent":"fyi",
+            "from_agent":mailbox_agent(fleet.node(hub))["agent_id"]
+        }),
+    )
+}
+
+#[test]
+fn two_hubs_hold_edges_to_one_spoke_concurrently() {
+    let fleet = fleet::spawn("mesh-two-hubs", fleet::TWO_HUBS);
+    two_hubs_ready(&fleet);
+    let status = cli(fleet.node("nodec"), &["status", "--json"]);
+    let rows = status["peers"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{status}");
+    for hub in ["nodea", "nodeb"] {
+        assert!(
+            rows.iter().any(|row| row["peer"] == hub
+                && row["source"] == "inbound"
+                && row["state"] == "pinned"
+                && row["node_id"] == identity_id(fleet.node(hub))),
+            "{status}"
+        );
+    }
+}
+
+#[test]
+fn each_hub_delivers_over_its_own_edge() {
+    let fleet = fleet::spawn("mesh-two-delivery", fleet::TWO_HUBS);
+    two_hubs_ready(&fleet);
+    let recipient = mailbox_agent(fleet.node("nodec"));
+    for hub in ["nodea", "nodeb"] {
+        let sent = hub_send(&fleet, hub, &recipient, hub);
+        assert_eq!(sent["result"]["state"], "delivered", "{sent}");
+    }
+    let read = request(
+        fleet.node("nodec"),
+        "msg.read",
+        json!({"pane":recipient["pane_id"]}),
+    );
+    let messages = read["result"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{read}");
+    for hub in ["nodea", "nodeb"] {
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg["body"] == hub && msg["from_host"] == hub),
+            "{read}"
+        );
+    }
+}
+
+#[test]
+fn delivery_claiming_hub_a_origin_over_hub_b_edge_is_origin_mismatch() {
+    let fleet = fleet::spawn("mesh-two-forgery", fleet::TWO_HUBS);
+    two_hubs_ready(&fleet);
+    let recipient = mailbox_agent(fleet.node("nodec"));
+    let capture = fleet.base.join("capture-delivery-nodea-nodec");
+    std::fs::write(&capture, "capture").unwrap();
+    let held = hub_send(&fleet, "nodea", &recipient, "authentic-a");
+    assert_eq!(held["result"]["state"], "queued", "{held}");
+    let params = std::fs::read_to_string(capture).unwrap();
+    let parsed: Value = serde_json::from_str(&params).unwrap();
+    assert_eq!(
+        parsed["envelope"]["key"]["origin_node"],
+        identity_id(fleet.node("nodea"))
+    );
+    std::fs::write(fleet.base.join("replay-delivery-nodeb-nodec"), params).unwrap();
+    let forged = hub_send(&fleet, "nodeb", &recipient, "forged-b");
+    assert!(
+        forged["result"]["warnings"]
+            .to_string()
+            .contains("origin_mismatch"),
+        "{forged}"
+    );
+    let read = request(
+        fleet.node("nodec"),
+        "msg.read",
+        json!({"pane":recipient["pane_id"]}),
+    );
+    assert_eq!(read["result"]["messages"], json!([]), "{read}");
+    two_hubs_ready(&fleet);
+}
+
+#[test]
+fn killing_one_hub_edge_leaves_the_other_working() {
+    let fleet = fleet::spawn("mesh-two-disconnect", fleet::TWO_HUBS);
+    two_hubs_ready(&fleet);
+    let recipient = mailbox_agent(fleet.node("nodec"));
+    let sent = hub_send(&fleet, "nodeb", &recipient, "before-disconnect");
+    assert_eq!(sent["result"]["state"], "delivered", "{sent}");
+    fleet.refuse_edge("nodea", "nodec");
+    fleet.kill_edge("nodea", "nodec", Duration::from_secs(10));
+    fleet::wait_until(
+        "dead inbound edge disappears",
+        Duration::from_secs(10),
+        || {
+            let status = request(fleet.node("nodec"), "peers.enrollment", json!({}));
+            let rows = status["result"]["peers"].as_array()?;
+            (rows.len() == 1 && rows[0]["peer"] == "nodeb" && rows[0]["state"] == "pinned")
+                .then_some(())
+        },
+    );
+    let sent = hub_send(&fleet, "nodeb", &recipient, "after-disconnect");
+    assert_eq!(sent["result"]["state"], "delivered", "{sent}");
 }

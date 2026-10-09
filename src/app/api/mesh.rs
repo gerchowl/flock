@@ -9,12 +9,8 @@ use crate::mesh::{
 
 impl App {
     pub(super) fn handle_mesh_hello(&mut self, id: String, hello: Hello) -> String {
-        // An attached process is bound to its PID and start time for this edge.
-        if !self.uplink.is_relay(
-            self.current_api_peer_pid,
-            crate::platform::process_start_time,
-        ) {
-            let attached = self.handle_peers_relay_attach(id.clone());
+        if matches!(&hello, Hello::Begin { .. }) {
+            let attached = self.attach_inbound_edge(id.clone());
             if serde_json::from_str::<serde_json::Value>(&attached)
                 .is_ok_and(|v| v.get("error").is_some())
             {
@@ -25,12 +21,11 @@ impl App {
             Ok(Some(challenge)) => encode_success(id, ResponseResult::MeshHello { challenge }),
             Ok(None) => encode_success(id, ResponseResult::Ok {}),
             Err(reason) => {
-                if let Some(status) = self.mesh_inbound.as_mut() {
-                    if let Some(hub) = self.uplink.enrolled_hub() {
-                        self.uplink.reset_enrollment(&hub);
-                    }
-                    status.state = "refused".into();
-                    status.reason = Some(reason.clone());
+                if let Some(edge) = self.inbound.edge_mut(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                ) {
+                    edge.clear(&reason);
                 }
                 if reason.starts_with("mesh version mismatch:") {
                     return super::responses::encode_error_with_data(
@@ -48,27 +43,23 @@ impl App {
     fn mesh_hello(&mut self, hello: Hello) -> Result<Option<hello::Challenge>, String> {
         match hello {
             Hello::Check => {
-                if self.uplink.enrolled_hub().is_none() && self.mesh_inbound.is_none() {
-                    self.mesh_inbound = Some(Enrollment {
-                        peer: "unidentified SSH peer".into(),
-                        source: PinSource::Inbound,
-                        pin_origin: Default::default(),
-                        node_id: None,
-                        state: "refused".into(),
-                        reason: Some("mesh hello required; upgrade flk on the dialer".into()),
-                    });
-                    return Err("mesh hello required; upgrade flk on the dialer".into());
-                }
-                self.uplink
-                    .enrolled_hub()
-                    .ok_or("mesh edge is not enrolled; repeat mesh.hello")?;
+                self.inbound
+                    .edge(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .filter(|edge| edge.enrolled())
+                    .ok_or("mesh hello required; upgrade flk on the dialer or repeat mesh.hello")?;
                 Ok(None)
             }
             Hello::Begin { offer } => {
-                self.mesh_pending = None;
-                if let Some(peer) = self.uplink.enrolled_hub() {
-                    self.uplink.reset_enrollment(&peer);
-                }
+                self.inbound
+                    .edge_mut(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .ok_or("unattestable relay")?
+                    .clear("mesh handshake in progress");
                 let peer = hello::with_store(|store| {
                     store
                         .pin_name_from(PinSource::Configured, &offer.pin())
@@ -76,7 +67,13 @@ impl App {
                 })?
                 .unwrap_or_else(|| offer.name.clone());
                 let configured_name = self.state.peers.iter().any(|p| p.name == offer.name);
-                self.mesh_inbound = Some(Enrollment {
+                self.inbound
+                    .edge_mut(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .ok_or("unattestable relay")?
+                    .enrollment = Enrollment {
                     peer: if configured_name {
                         "unidentified SSH peer".into()
                     } else {
@@ -87,17 +84,26 @@ impl App {
                     node_id: None,
                     state: "pending".into(),
                     reason: None,
-                });
+                };
                 offer.validate(&peer)?;
                 // The signed remote name stays pinned independently of its local alias.
                 hello::check_inbound_pin(&offer, false, configured_name)?;
-                if let Some(status) = self.mesh_inbound.as_mut() {
-                    status.peer = peer;
+                if let Some(edge) = self.inbound.edge_mut(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                ) {
+                    edge.enrollment.peer = peer;
                 }
                 let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
                 let acceptor = Offer::new(&identity, crate::app::short_host_name())?;
                 let signature = hello::sign(&identity, &offer, &acceptor, "acceptor")?;
-                self.mesh_pending = Some(Pending {
+                self.inbound
+                    .edge_mut(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .ok_or("unattestable relay")?
+                    .pending = Some(Pending {
                     pid: self.current_api_peer_pid.ok_or("unattestable relay")?,
                     process_started: self
                         .current_api_peer_pid
@@ -114,7 +120,13 @@ impl App {
             }
             Hello::Finish { signature } => {
                 let pending = self
-                    .mesh_pending
+                    .inbound
+                    .edge_mut(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .ok_or("unattestable relay")?
+                    .pending
                     .take()
                     .ok_or("no outstanding mesh challenge")?;
                 if self.current_api_peer_pid != Some(pending.pid)
@@ -125,7 +137,15 @@ impl App {
                     return Err("mesh challenge expired or belongs to another edge".into());
                 }
                 hello::verify(&pending.dialer, &pending.acceptor, "dialer", &signature)?;
-                let status = self.mesh_inbound.as_mut().ok_or("no pending enrollment")?;
+                let mut status = self
+                    .inbound
+                    .edge(
+                        self.current_api_peer_pid,
+                        crate::platform::process_start_time,
+                    )
+                    .ok_or("no pending enrollment")?
+                    .enrollment
+                    .clone();
                 hello::check_inbound_pin(
                     &pending.dialer,
                     true,
@@ -143,7 +163,8 @@ impl App {
                 status.node_id = Some(pending.dialer.node_id);
                 status.state = "pinned".into();
                 status.reason = None;
-                self.uplink.enroll_hub(status.peer.clone());
+                self.inbound
+                    .enroll(pending.pid, status, crate::platform::process_start_time)?;
                 self.mesh_retry_at = None;
                 Ok(None)
             }
@@ -165,10 +186,13 @@ impl App {
             || self
                 .parse_pane_id_or_peer("", self.current_api_peer_pid)
                 .is_some()
-            || self.uplink.is_relay(
-                self.current_api_peer_pid,
-                crate::platform::process_start_time,
-            )
+            || self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some()
         {
             return encode_error(
                 id,
@@ -207,16 +231,7 @@ impl App {
                     if source == PinSource::Configured {
                         crate::peer_stream::reset_enrollment(&peer);
                     } else {
-                        self.uplink.reset_enrollment(&pin_peer);
-                        if self.mesh_inbound.as_ref().is_some_and(|status| {
-                            status.peer == peer || (node_id.is_some() && status.node_id == node_id)
-                        }) {
-                            if let Some(hub) = self.uplink.enrolled_hub() {
-                                self.uplink.reset_enrollment(&hub);
-                            }
-                            self.mesh_pending = None;
-                            self.mesh_inbound = None;
-                        }
+                        self.inbound.reset(&pin_peer, node_id.as_deref());
                     }
                 }
                 encode_success(
@@ -260,8 +275,8 @@ impl App {
                 return encode_error(id, "mesh_store_unavailable", reason);
             }
         }
-        if let Some(inbound) = self.mesh_inbound.as_ref() {
-            let mut inbound = inbound.clone();
+        for edge in self.inbound.live(crate::platform::process_start_time) {
+            let mut inbound = edge.enrollment.clone();
             if let Some(configured) = peers
                 .iter()
                 .find(|peer| inbound.node_id.is_some() && peer.node_id == inbound.node_id)

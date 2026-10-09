@@ -545,7 +545,6 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MeshCollect(_) => "mesh.collect",
         Method::PeersEnrollReset(_) => "peers.enroll_reset",
         Method::PeersEnrollment(_) => "peers.enrollment",
-        Method::PeersRelayAttach(_) => "peers.relay_attach",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneMove(_) => "pane.move",
         Method::PaneList(_) => "pane.list",

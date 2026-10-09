@@ -7,6 +7,12 @@ use std::sync::mpsc::Sender;
 use crate::api::schema::MsgIntent;
 use crate::events::AppEvent;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettleOnDelivery {
+    pub(crate) pane: String,
+    pub(crate) correlation_id: String,
+}
+
 pub(crate) struct RelayWork {
     pub run: Box<dyn FnOnce() -> AppEvent + Send>,
     pub failure: AppEvent,
@@ -48,7 +54,7 @@ pub(crate) struct RelaySend {
     pub correlation_id: String,
     pub in_reply_to: Option<String>,
     pub intent: MsgIntent,
-    pub settle_original: Option<super::uplink::SettleOnDelivery>,
+    pub settle_original: Option<SettleOnDelivery>,
     pub respond_to: Option<Sender<String>>,
 }
 
