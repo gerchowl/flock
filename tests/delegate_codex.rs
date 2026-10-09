@@ -8,9 +8,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
     unregister_spawned_flock_pid, wait_for_socket,
@@ -145,7 +146,7 @@ fn start_server_with_rows(rows: u16) -> Server {
     cmd.env_remove("FLOCK_HOST_NAME");
     cmd.env_remove("FLOCK_DISABLE_SOUND");
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     wait_for_socket(&socket, Duration::from_secs(5));
     Server {

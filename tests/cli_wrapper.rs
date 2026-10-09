@@ -16,9 +16,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
@@ -348,7 +349,7 @@ fn spawn_flock_with_config(
     }
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     SpawnedFlock {
         _master: Some(pair.master),
@@ -3702,7 +3703,7 @@ fn agent_result_and_history_read_an_opencode_session() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
-    let data_home = base.join("data");
+    let data_home = config_home.join("data");
     let db_dir = data_home.join("opencode");
     fs::create_dir_all(&db_dir).unwrap();
     let conn = rusqlite::Connection::open(db_dir.join("opencode-stable.db")).unwrap();
@@ -3719,8 +3720,7 @@ fn agent_result_and_history_read_an_opencode_session() {
     )
     .unwrap();
     drop(conn);
-    // Inherited by the server: nextest runs each test in its own process.
-    std::env::set_var("XDG_DATA_HOME", &data_home);
+    // Seed the data directory supplied by the shared isolation wrapper.
 
     let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));

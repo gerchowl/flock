@@ -10,7 +10,10 @@
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
 #![allow(clippy::disallowed_methods)]
 
-use std::process::{Command, Output};
+mod support;
+
+use std::process::Output;
+use support::environment::Command;
 
 /// `flk`'s usage/refusal exit code — and the value `peers::REMOTE_REFUSAL_EXIT`
 /// reads off a peer to tell "it refused" from "it never answered".

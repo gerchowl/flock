@@ -227,14 +227,12 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     assert_eq!(restored["agent"]["agent_id"], replacement["agent_id"]);
 }
 
-// Only the isolated fixture's initial commit bypasses the product subprocess logger.
-#[allow(clippy::disallowed_methods)]
 #[test]
 fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     let fleet = fleet::spawn("ts-kill", PAIR);
     let owner = fleet.node("nodeb");
     let checkout = owner.home.join("kill-checkout");
-    let commit = std::process::Command::new("git")
+    let commit = support::environment::Command::new("git")
         .arg("-C")
         .arg(&owner.repo)
         .args([

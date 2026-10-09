@@ -157,7 +157,7 @@ fn spawn_server_with_path(
     }
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -194,7 +194,7 @@ fn spawn_client_process(
     cmd.env_remove("FLOCK_ENV");
 
     support::environment::assert_pty_isolated(&cmd);
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 

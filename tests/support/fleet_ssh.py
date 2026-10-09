@@ -6,6 +6,7 @@ summary pushes and custody collections traverse the real relay and enrollment ga
 """
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -54,7 +55,7 @@ if "peers relay" in command and not ready.exists():
 # Start empty and admit only the process basics, then set sandbox paths.
 env = {
     key: value for key, value in os.environ.items()
-    if key in {"PATH", "TMPDIR", "USER", "LANG"} or key.startswith("LC_")
+    if key in {"PATH", "TMPDIR", "USER", "LANG", "CARGO_HOME", "RUSTUP_HOME"} or key.startswith("LC_")
 }
 env.update(
     HOME=node["home"],
@@ -77,10 +78,18 @@ if "peers relay" not in command:
 # against this fixture's unique script path before using the pid file.
 os.setsid()
 pid_file = base / "edges" / f"{source}-{target}-{os.getpid()}"
+env["FLOCK_FLEET_EDGE"] = str(pid_file)
 child = subprocess.Popen(
     ["/bin/sh", "-c", command], env=env, stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE, text=True, bufsize=1,
+    stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
 )
+# The shim must survive TERM long enough to reap its child. The relay gets
+# its own group so shells and their grandchildren are covered as well.
+def stop_edge(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, stop_edge)
 lock = threading.Lock()
 deliveries = set()
 collections = set()
@@ -218,7 +227,7 @@ try:
     # Publish only after the group and relay exist. Atomic rename avoids a
     # partially written pid being mistaken for a stale record by the owner.
     pending = pid_file.with_suffix(".pending")
-    pending.write_text(str(os.getpid()))
+    pending.write_text(json.dumps({"shim": os.getpid(), "relay": child.pid}))
     pending.replace(pid_file)
     threading.Thread(target=forward_input, daemon=True).start()
     for line in child.stdout:
@@ -270,11 +279,16 @@ try:
         emit(line)
     sys.exit(child.wait())
 finally:
-    pid_file.unlink(missing_ok=True)
     if child.poll() is None:
-        child.terminate()
+        os.killpg(child.pid, signal.SIGTERM)
         try:
             child.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            child.kill()
+            os.killpg(child.pid, signal.SIGKILL)
             child.wait()
+    # Even an exited shell can leave a descendant holding the output pipe.
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    pid_file.unlink(missing_ok=True)
