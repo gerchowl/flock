@@ -18,7 +18,7 @@ pub(super) enum ResolvedTarget {
     Remote(Box<crate::app::directory::AgentLocation>),
 }
 
-use super::responses::{encode_error, encode_error_with_data, encode_success};
+use super::responses::{encode_error, encode_success};
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -189,9 +189,7 @@ impl App {
         }
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            Err((code, message)) => {
-                return self.queue_spoke_or_refuse(id, &params.to, &body, &params, code, message)
-            }
+            Err((code, message)) => return encode_error(id, code, message),
         };
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
@@ -225,7 +223,7 @@ impl App {
         let from_agent = attested_agent.clone().or_else(|| params.from_agent.clone());
 
         // Remote origin policy is enforced only during authenticated mesh import.
-        if !self.state.config.msg.enabled {
+        if !self.state.config.msg.accepts_from(None) {
             return encode_error(
                 id,
                 "msg_not_allowed",
@@ -1079,24 +1077,13 @@ impl App {
     ) -> String {
         let host = location.host.as_str();
         let to_agent = location.agent_id.as_str();
-        let Some(peer) = self.peer_for_location(location) else {
-            // #410: no edge of our own. A spoke hands the message up the relay
-            // its hub holds — the fix for "not in [[peers]]" is NOT to add the
-            // N×N trust the topology refuses.
-            if let Some(response) = self.try_queue_spoke(&id, to_agent, body, &params) {
-                return response;
-            }
-            let me = crate::app::short_host_name();
-            return encode_error_with_data(
-                id,
-                "peer_not_configured",
-                format!(
-                    "agent lives on {host}, which is not in this server's [[peers]], and no \
-                     hub holds a relay to {me} to hand the message up to"
-                ),
-                serde_json::json!({ "hop": me, "retryable": false }),
-            );
+        let Some(owner) = location.node.as_deref() else {
+            return encode_error(id, "msg_target_not_found", "recipient owner is unknown");
         };
+        let next = self.request_next_hop(owner);
+        if let Some(peer) = self.incompatible_request_peer(owner, &next.node) {
+            return encode_error(id, "peer_incompatible", format!("upgrade flk on {peer}"));
+        }
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();
         let from_host = crate::app::short_host_name();
@@ -1135,13 +1122,31 @@ impl App {
                 delivery_attempts: 0,
                 intent: params.intent,
             },
-            peer: Some(peer.name.clone()),
+            peer: next.peer.as_ref().map(|p| p.name.clone()),
             host: Some(host.to_string()),
-            direct: location.direct,
+            direct: next.node == owner,
         };
-        let mesh = match self.persist_mesh_send(&peer, to_agent, &data) {
+        let mesh = match self.persist_mesh_send(owner, &next, to_agent, &data) {
             Ok(mesh) => mesh,
             Err(reason) => return encode_error(id, super::mesh_mail::error_code(&reason), reason),
+        };
+        let Some(peer) = next.peer else {
+            self.emit_mesh_wake(&next.node);
+            return encode_success(
+                id,
+                ResponseResult::MsgQueued {
+                    message_key: Some(mesh.envelope.key),
+                    correlation_id,
+                    state: "queued".into(),
+                    warnings: Vec::new(),
+                    to_host: Some(host.into()),
+                    path: Some(if next.node == owner || next.node.is_empty() {
+                        "direct".into()
+                    } else {
+                        format!("via {}", next.name)
+                    }),
+                },
+            );
         };
         let send = crate::app::message_relay::RelaySend {
             mesh,
@@ -1149,7 +1154,7 @@ impl App {
             peer,
             to_agent: to_agent.to_string(),
             host: host.to_string(),
-            direct: location.direct,
+            direct: next.node == owner,
             from_agent,
             correlation_id,
             intent: params.intent,
@@ -1169,40 +1174,6 @@ impl App {
     ) {
         let crate::app::message_relay::RelayCompletion { send, result } = completion;
         self.complete_mesh_send(send, result);
-    }
-
-    /// The `[[peers]]` entry that reaches `location`.
-    ///
-    /// Route by the peer entry the DIRECTORY answered from, not by the name
-    /// the far machine calls itself. Those differ in any normal fleet — a
-    /// peer configured as `kiln` reports its hostname as `bastion` — and
-    /// matching on the reported host is exactly why the first live
-    /// cross-host send came back "not in this server's [[peers]]". Falls
-    /// back to the host for a directory answer that carried no route.
-    pub(super) fn peer_for_location(
-        &self,
-        location: &crate::app::directory::AgentLocation,
-    ) -> Option<crate::config::PeerConfig> {
-        if let Some(route) = &location.route {
-            return self
-                .state
-                .peers
-                .iter()
-                .find(|peer| peer.name == *route)
-                .cloned();
-        }
-        // Offline ownership hints must never fall back to an unpinned host label.
-        if !location.live && location.node.is_some() {
-            return None;
-        }
-        let host = location.host.as_str();
-        self.state
-            .peers
-            .iter()
-            .find(|peer| {
-                peer.name.eq_ignore_ascii_case(host) || peer.ssh_target().eq_ignore_ascii_case(host)
-            })
-            .cloned()
     }
 
     /// The `blocking` tier's own budget (ADR-0018 §1): the intent the message
@@ -1373,41 +1344,6 @@ impl App {
             .terminals
             .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
         Some(terminal.agent_id.to_string())
-    }
-
-    /// A target this server could not place: hand it up to the hub when this
-    /// is a spoke that has one (#410), else refuse — and when the refusal is
-    /// "nowhere in the fleet" on a server with no edges at all, say that the
-    /// fleet it searched was only itself.
-    fn queue_spoke_or_refuse(
-        &mut self,
-        id: String,
-        target: &MessageTarget,
-        body: &str,
-        params: &MsgSendParams,
-        code: &'static str,
-        message: String,
-    ) -> String {
-        let MessageTarget::Agent { agent } = target else {
-            return encode_error(id, code, message);
-        };
-        if code != "msg_target_not_found" {
-            return encode_error(id, code, message);
-        }
-        if let Some(response) = self.try_queue_spoke(&id, agent, body, params) {
-            return response;
-        }
-        if self.state.peers.is_empty() {
-            return encode_error(
-                id,
-                code,
-                format!(
-                    "{message} — this server has no [[peers]] and no hub holds a relay to it, \
-                     so it could only search itself"
-                ),
-            );
-        }
-        encode_error(id, code, message)
     }
 
     /// Shared enqueue tail: dedupe, emit the durable `MessageQueued`, and
@@ -2068,13 +2004,8 @@ mod tests {
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        // Routed, then blocked on reachability — never "unknown agent".
-        assert_eq!(error.error.code, "peer_not_configured");
-        assert!(
-            error.error.message.contains("kiln-dev"),
-            "the refusal must name where the agent is: {}",
-            error.error.message
-        );
+        // A display label without an authenticated owning node is unknown.
+        assert_eq!(error.error.code, "msg_target_not_found");
     }
 
     #[tokio::test]
@@ -2225,7 +2156,11 @@ mod tests {
         app: &mut crate::app::App,
     ) -> crate::mesh::runtime_store::TestStore {
         let store = crate::mesh::runtime_store::TestStore::new();
-        app.node_id = Some("nodea".into());
+        app.node_id = Some(
+            crate::mesh::identity::NodeIdentity::load()
+                .unwrap()
+                .node_id(),
+        );
         app.state.peers = vec![crate::config::PeerConfig {
             name: "kiln".into(),
             // Unresolvable, so the ssh attempt fails fast without a network.
@@ -2258,6 +2193,34 @@ mod tests {
             }];
             peer
         }];
+        let remote = crate::mesh::sign::tests::signed();
+        let node = remote.key.origin_node;
+        crate::mesh::hello::with_store(|store| {
+            store
+                .put_pin(
+                    "kiln",
+                    &crate::mesh::store::IdentityPin {
+                        node_id: node.clone(),
+                        public_key: remote.origin_key,
+                    },
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        crate::peer_stream::test_enroll(&app.state.peers[0], &node);
+        app.state.peer_summaries[0].node_id = Some(node.clone());
+        app.refresh_mesh_routes();
+        let remote = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let advert = crate::mesh::routes::Advert::signed(
+            &remote,
+            "kiln".into(),
+            (1, 1),
+            vec![crate::mesh::routes::Adjacency {
+                node_id: app.node_id.clone().unwrap(),
+                name: "origin.example".into(),
+            }],
+        );
+        app.mesh_routes.table.learn(&node, vec![advert]);
         store
     }
 
@@ -2278,7 +2241,7 @@ mod tests {
                 intent: MsgIntent::NeedsReply,
             },
         );
-        assert!(response.is_empty());
+        assert!(response.is_empty(), "{response}");
         assert!(app.message_relays.pending.is_some());
         // This in-process caller never called respond_or_park.
         let response = app.handle_api_request(Request {
@@ -2873,7 +2836,7 @@ mod tests {
                         intent: MsgIntent::NeedsReply,
                     },
                 );
-                assert!(response.is_empty());
+                assert!(response.is_empty(), "{response}");
                 attempts.push(app.message_relays.pending.take().expect("pending send"));
             }
             let response = send(

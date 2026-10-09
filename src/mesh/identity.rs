@@ -47,6 +47,14 @@ impl NodeIdentity {
         self.key.sign(bytes).to_bytes().to_vec()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture(secret: [u8; 32]) -> Self {
+        Self {
+            key: SigningKey::from_bytes(&secret),
+            clone_detection_warning: None,
+        }
+    }
+
     fn load_at(state_dir: &Path, machine: io::Result<String>) -> io::Result<Self> {
         let dir = state_dir.join("mesh");
         create_private_dir(&dir)?;

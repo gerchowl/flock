@@ -104,6 +104,8 @@ impl App {
             original.envelope.return_binding.collection_token.clone();
         answer.return_binding.recipient_node = request.origin_node.clone();
         answer.return_binding.collection_peers = vec![request.origin_node.clone()];
+        let identity = crate::mesh::identity::NodeIdentity::load().map_err(|e| e.to_string())?;
+        crate::mesh::sign::seal(&mut answer, &identity);
         with_store(|store| {
             store
                 .accept(
@@ -135,6 +137,8 @@ impl App {
         } else if let Some(peer) = push_peer {
             let send = crate::app::message_relay::RelaySend {
                 mesh: Deliver {
+                    hops_left: 8,
+                    visited: vec![origin.clone()],
                     envelope: answer.clone(),
                     remaining_ms: CUSTODY_TTL_MS,
                 },
@@ -184,6 +188,9 @@ impl App {
                 if let Collect::Outbound { outbound } = &query {
                     for ack in &outbound.ack {
                         if let Some(reason) = &ack.refusal {
+                            if !crate::mesh::delivery::permanent_refusal(reason) {
+                                continue;
+                            }
                             if let Some(record) = store
                                 .collection_record(&ack.key, now_ms() as i64)
                                 .map_err(|e| e.to_string())?
@@ -473,10 +480,11 @@ impl App {
                     "mailbox_full" | "mail_store_full" | "fleet_paused"
                 ) && crate::mesh::runtime_store::recovery_reason().is_none()
                 {
-                    let permanent = matches!(
-                        reason.as_str(),
-                        "invalid reply binding" | "inconsistent mesh answer" | "msg_not_allowed"
-                    );
+                    let permanent = crate::mesh::delivery::permanent_refusal(&reason)
+                        || matches!(
+                            reason.as_str(),
+                            "invalid reply binding" | "inconsistent mesh answer"
+                        );
                     let _ = with_store(|store| {
                         store
                             .collection_failed(&query.request, &reason, permanent)
@@ -510,13 +518,13 @@ impl App {
             .as_deref()
             .ok_or("mesh node identity unavailable")?;
         let answer = &delivery.envelope;
+        crate::mesh::sign::verify(answer).map_err(|_| "invalid_signature")?;
         let sender_host = with_store(|store| {
             store
                 .origin_name(&answer.key.origin_node)
                 .map_err(|e| e.to_string())
-        })?
-        .ok_or("origin_mismatch")?;
-        if !self.state.config.msg.accepts_from(Some(&sender_host)) {
+        })?;
+        if !self.state.config.msg.accepts_origin(sender_host.as_deref()) {
             return Err("msg_not_allowed".into());
         }
         let original = with_store(|store| {
@@ -563,7 +571,7 @@ impl App {
             data.message.to_pane.clear();
         }
         data.message.from_pane = None;
-        data.message.from_host = Some(sender_host);
+        data.message.from_host = sender_host;
         data.message.message_key = Some(answer.key.clone());
         data.message.enqueued_at_ms = now_ms();
         let accepted = with_store(|store| {

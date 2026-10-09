@@ -35,13 +35,14 @@ fn agent(node: &Node) -> Value {
 }
 
 fn discover(fleet: &fleet::Fleet, recipient: &Value) {
-    fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
+    let location = fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
         request(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
             .as_array()?
             .iter()
             .find(|row| row["agent_id"] == recipient["agent_id"])
             .cloned()
     });
+    fleet.wait_route("nodea", location["host"].as_str().unwrap(), true);
 }
 
 fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
@@ -316,6 +317,7 @@ fn another_enrolled_node_cannot_collect_even_with_the_origins_token() {
             .any(|p| p["peer"] == "nodeb" && p["state"] == "pinned")
             .then_some(())
     });
+    fleet.wait_route("nodec", "nodeb", true);
     let sent = request(
         fleet.node("nodec"),
         "msg.send",
@@ -520,7 +522,7 @@ fn invalid_collected_binding_is_terminal_and_visible_in_message_status() {
         );
         (status["result"]["state"] == "collect_failed").then_some(status)
     });
-    assert_eq!(status["result"]["detail"], "invalid reply binding");
+    assert_eq!(status["result"]["detail"], "invalid_signature");
     let failures: i64 = database(fleet.node("nodea"))
         .query_row(
             "SELECT collect_failures FROM envelopes WHERE correlation='invalid-answer'",

@@ -23,6 +23,8 @@ pub(crate) fn push_concurrency() -> usize {
 pub struct Deliver {
     pub envelope: Envelope,
     pub remaining_ms: i64,
+    pub hops_left: u8,
+    pub visited: Vec<String>,
 }
 
 pub(crate) fn send(
@@ -76,16 +78,11 @@ fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
         // The receiver accepted the question but cannot bind its return path.
         return PeerMessageFailure::Refused(format!("reply_unavailable: {reason}"));
     }
-    let permanent = matches!(
-        reason.split(':').next().unwrap_or(reason),
-        "forward_limit"
-            | "recipient_gone"
-            | "msg_not_allowed"
-            | "origin_mismatch"
-            | "invalid_envelope"
-            | "message_not_found"
-            | "msg_target_not_found"
-    );
+    let reason_code = reason.split(':').next().unwrap_or(reason);
+    if matches!(reason_code, "loop_detected" | "hop_budget_exhausted") {
+        return PeerMessageFailure::Reroute(reason.into());
+    }
+    let permanent = permanent_refusal(reason);
     if permanent
         && matches!(
             error["code"].as_str(),
@@ -96,6 +93,31 @@ fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
     } else {
         PeerMessageFailure::Unreachable(reason.into())
     }
+}
+
+pub(crate) fn permanent_refusal(reason: &str) -> bool {
+    matches!(
+        reason.split(':').next().unwrap_or(reason),
+        "recipient_gone"
+            | "msg_not_allowed"
+            | "origin_mismatch"
+            | "invalid_signature"
+            | "invalid_envelope"
+            | "message_key_conflict"
+    )
+}
+
+pub(crate) fn hop_limit() -> u8 {
+    if cfg!(debug_assertions) {
+        if let Some(limit) = std::env::var("FLOCK_TEST_MESH_HOP_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 8)
+        {
+            return limit;
+        }
+    }
+    8
 }
 
 /// Hydrate a metadata notification without opening another custody writer.
@@ -123,6 +145,15 @@ pub(crate) fn body(key: Option<&super::key::MessageKey>, legacy: &str) -> Option
 #[cfg(test)]
 mod tests {
     #[test]
+    fn origin_budget_honors_debug_test_override() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        std::env::set_var("FLOCK_TEST_MESH_HOP_LIMIT", "0");
+        assert_eq!(super::hop_limit(), 0);
+        std::env::remove_var("FLOCK_TEST_MESH_HOP_LIMIT");
+        assert_eq!(super::hop_limit(), 8);
+    }
+
+    #[test]
     fn delivery_classifies_permanent_refusals_and_transient_backpressure() {
         let accepted_without_reply = super::delivery_failure(&serde_json::json!({
             "code":"reply_unavailable", "message":"message has no valid mesh return binding"
@@ -131,12 +162,10 @@ mod tests {
             .detail()
             .starts_with("reply_unavailable:"));
         for reason in [
-            "forward_limit",
             "recipient_gone",
             "msg_not_allowed",
             "origin_mismatch",
-            "message_not_found",
-            "msg_target_not_found: unknown agent",
+            "invalid_signature",
             "invalid_envelope",
         ] {
             let failure = super::delivery_failure(
@@ -145,7 +174,18 @@ mod tests {
             assert!(!failure.retryable(), "{reason}");
             assert_eq!(failure.detail(), reason);
         }
+        for reason in ["loop_detected", "hop_budget_exhausted"] {
+            let failure = super::delivery_failure(
+                &serde_json::json!({"code":"mesh_delivery_refused", "message":reason}),
+            );
+            assert!(matches!(
+                failure,
+                crate::peers::PeerMessageFailure::Reroute(_)
+            ));
+        }
         for reason in [
+            "message_not_found",
+            "msg_target_not_found: unknown agent",
             "mailbox_full",
             "mail_store_full: quota",
             "fleet_paused",

@@ -1361,6 +1361,15 @@ impl MsgConfig {
     ///
     /// None is a local sender, attested or unattested, with no remote origin
     /// to match. Remote import passes the store's authenticated origin name.
+    /// A remote origin without a configured name matches only the wildcard.
+    pub fn accepts_origin(&self, name: Option<&str>) -> bool {
+        self.enabled
+            && self
+                .allow_from
+                .iter()
+                .any(|rule| rule == "*" || name.is_some_and(|name| rule.eq_ignore_ascii_case(name)))
+    }
+
     pub fn accepts_from(&self, host: Option<&str>) -> bool {
         if !self.enabled {
             return false;

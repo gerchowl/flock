@@ -273,7 +273,7 @@ impl WaitReader {
 }
 
 #[cfg(test)]
-pub(crate) struct TestStore(std::path::PathBuf);
+pub(crate) struct TestStore(std::path::PathBuf, Option<std::ffi::OsString>);
 
 #[cfg(test)]
 impl TestStore {
@@ -293,12 +293,16 @@ impl TestStore {
             store: Some(store),
             ..Default::default()
         };
-        Self(path)
+        let previous = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &path);
+        Self(path, previous)
     }
 
     pub(crate) fn delivery(&self) -> super::delivery::Deliver {
         let key = super::key::MessageKey::mint("nodea".into(), 0).unwrap();
         super::delivery::Deliver {
+            hops_left: 8,
+            visited: vec!["nodea".into()],
             remaining_ms: super::store::CUSTODY_TTL_MS,
             envelope: super::store::Envelope {
                 kind: Default::default(),
@@ -331,6 +335,10 @@ impl Drop for TestStore {
             suspended: true,
             ..Default::default()
         };
+        match &self.1 {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

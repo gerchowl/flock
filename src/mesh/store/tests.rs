@@ -69,7 +69,7 @@ fn refused_custody_is_terminal_and_never_selected_for_retry() {
     store
         .accept(&mail, CUSTODY_TTL_MS, Admission::Custody, 0)
         .unwrap();
-    store.refuse(&mail.key, "forward_limit", 1).unwrap();
+    store.refuse(&mail.key, "invalid_signature", 1).unwrap();
     for now in [2, 60_000, 300_000] {
         assert!(matches!(
             store.schedule_retry(&mail.key, 60_000, now),
@@ -81,7 +81,7 @@ fn refused_custody_is_terminal_and_never_selected_for_retry() {
             .unwrap()
             .unwrap();
         assert_eq!(status.state, "refused");
-        assert_eq!(status.detail.as_deref(), Some("forward_limit"));
+        assert_eq!(status.detail.as_deref(), Some("invalid_signature"));
     }
     drop(store);
     assert!(fixture
@@ -1928,11 +1928,13 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         mail
     );
     let good = OutboundAck {
+        delivered: true,
         key: mail.key.clone(),
         token: mail.return_binding.collection_token.clone(),
         refusal: None,
     };
     let bad = OutboundAck {
+        delivered: true,
         key: other.key.clone(),
         token: other.return_binding.collection_token.clone(),
         refusal: None,
@@ -2422,6 +2424,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
         )
         .unwrap();
     let ack = OutboundAck {
+        delivered: true,
         key: mail.key.clone(),
         token,
         refusal: None,
@@ -2661,6 +2664,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
         ack: [&expired, &live]
             .into_iter()
             .map(|mail| OutboundAck {
+                delivered: true,
                 key: mail.key.clone(),
                 token: mail.return_binding.collection_token.clone(),
                 refusal: None,
@@ -2826,7 +2830,7 @@ fn unrouted_rows_are_never_leased() {
 }
 
 #[test]
-fn collect_outbound_filters_unverifiable_origins_before_leasing() {
+fn collect_outbound_includes_forwarded_origins_for_authenticated_import() {
     use crate::mesh::collect::OutboundCollect;
     let f = Fixture::new();
     let mut s = f.open(0);
@@ -2851,8 +2855,9 @@ fn collect_outbound_filters_unverifiable_origins_before_leasing() {
     let offered = s
         .collect_outbound(Offer::All, "origin.example", "neighbor.example", &query, 0)
         .unwrap();
-    assert_eq!(offered.len(), 2);
-    assert_eq!(s.get(&foreign.key).unwrap().unwrap().retry_at_ms, 0);
+    assert_eq!(offered.len(), 3);
+    assert!(s.get(&foreign.key).unwrap().unwrap().retry_at_ms > 0);
+    assert!(offered.iter().any(|d| d.envelope == foreign));
     assert!(offered.iter().any(|d| d.envelope == answer));
     assert!(offered.iter().any(|d| d.envelope == receipt));
 }
@@ -2867,6 +2872,7 @@ fn ack_from_wrong_neighbor_is_invalid() {
     s.set_next_hop(&e.key, "neighbor.example").unwrap();
     let query = OutboundCollect {
         ack: vec![OutboundAck {
+            delivered: true,
             key: e.key.clone(),
             token: e.return_binding.collection_token.clone(),
             refusal: None,
@@ -3079,7 +3085,7 @@ fn forwarding_verifies_origin_and_duplicate_preserves_transport_state() {
     let mut s = f.open(0);
     s.set_local_node("local.example");
     let e = crate::mesh::sign::tests::signed();
-    let visited = vec![e.key.origin_node.clone()];
+    let visited = vec![e.key.origin_node.clone(), "local.example".into()];
     assert_eq!(
         s.accept_forward(
             &e,
@@ -3094,8 +3100,16 @@ fn forwarding_verifies_origin_and_duplicate_preserves_transport_state() {
         Accepted::New
     );
     assert_eq!(
-        s.accept_forward(&e, 2000, 6, &[], "other.example", Admission::Custody, 10)
-            .unwrap(),
+        s.accept_forward(
+            &e,
+            2000,
+            6,
+            &visited,
+            "other.example",
+            Admission::Custody,
+            10
+        )
+        .unwrap(),
         Accepted::Duplicate
     );
     let record = s.get(&e.key).unwrap().unwrap();
@@ -3110,15 +3124,15 @@ fn forwarding_verifies_origin_and_duplicate_preserves_transport_state() {
         Err(Error::InvalidSignature)
     ));
     assert!(matches!(
-        s.accept_forward(&e, 1000, 0, &[], "", Admission::Custody, 0),
-        Err(Error::HopBudgetExhausted)
+        s.accept_forward(&e, 1000, 0, &visited, "", Admission::Custody, 0),
+        Ok(Accepted::Duplicate)
     ));
     assert!(matches!(
         s.accept_forward(
             &e,
             1000,
             7,
-            &["local.example".into()],
+            &["local.example".into(), "local.example".into()],
             "",
             Admission::Custody,
             0
@@ -3252,8 +3266,8 @@ fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased(
     let offers = s
         .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
         .unwrap();
-    assert_eq!(offers.len(), 2);
-    assert_eq!(s.get(&forwarded.key).unwrap().unwrap().retry_at_ms, 0);
+    assert_eq!(offers.len(), 3);
+    assert!(s.get(&forwarded.key).unwrap().unwrap().retry_at_ms > 0);
     for e in [&answer, &receipt] {
         assert!(offers.iter().any(|delivery| delivery.envelope == *e));
     }
@@ -3272,6 +3286,7 @@ fn step1_ack_cannot_finish_answers_or_forwarded_requests() {
         s.accept(e, 1000, Admission::Held, 0).unwrap();
         let query = OutboundCollect {
             ack: vec![OutboundAck {
+                delivered: true,
                 key: e.key.clone(),
                 token: e.return_binding.collection_token.clone(),
                 refusal: None,
@@ -3668,6 +3683,7 @@ fn outbound_receipts_are_durable_and_acknowledged_individually() {
         .unwrap()
         .is_empty());
     let ack = OutboundAck {
+        delivered: true,
         key: offered[0].envelope.key.clone(),
         token: offered[0].envelope.return_binding.collection_token.clone(),
         refusal: None,
@@ -3928,5 +3944,84 @@ fn tombstone_backfills_legacy_local_inbox_binding_and_survives_reopen() {
             .envelope
             .target_session,
         "w1:p1"
+    );
+}
+
+#[test]
+fn transferred_origin_keeps_body_without_retry_until_receipt_or_expiry() {
+    for receipt in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_origin(&mail, "neighbor.example", Admission::Custody, 8, 0)
+            .unwrap();
+        store.finish(&mail.key, Outcome::Transferred, 1).unwrap();
+        assert_eq!(
+            store.get(&mail.key).unwrap().unwrap().envelope.body,
+            mail.body
+        );
+        assert!(store
+            .push_ready(2, 10, &["neighbor.example".into()])
+            .unwrap()
+            .is_empty());
+        if receipt {
+            assert_eq!(
+                store.import_receipt(&mail.key, "read").unwrap(),
+                ReceiptImport::Applied
+            );
+            assert!(store
+                .get(&mail.key)
+                .unwrap()
+                .unwrap()
+                .envelope
+                .body
+                .is_empty());
+            assert_eq!(
+                store
+                    .status(&mail.key.origin_node, &mail.correlation_id, 2)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "read"
+            );
+        } else {
+            store.maintain(CUSTODY_TTL_MS).unwrap();
+            let record = store.get(&mail.key).unwrap().unwrap();
+            assert_eq!(record.state, "expired");
+            assert!(record.envelope.body.is_empty());
+        }
+    }
+}
+
+#[test]
+fn unsigned_local_custody_is_sealed_once_without_resetting_its_budget() {
+    let _runtime = crate::mesh::runtime_store::TestStore::new();
+    let identity = crate::mesh::identity::NodeIdentity::load().unwrap();
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mut mail = envelope();
+    mail.key.origin_node = identity.node_id();
+    mail.return_binding.request = mail.key.clone();
+    store.set_local_node(&mail.key.origin_node);
+    store.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+    store
+        .connection
+        .execute("UPDATE envelopes SET visited='[]'", [])
+        .unwrap();
+    let mut record = store.collection_record(&mail.key, 20).unwrap().unwrap();
+    store.seal_local_record(&mut record).unwrap();
+    assert_eq!(crate::mesh::sign::verify(&record.envelope), Ok(()));
+    assert_eq!(record.visited, vec![mail.key.origin_node.clone()]);
+    assert_eq!(record.remaining_ms, 980);
+    let before = store.connection.total_changes();
+    store.seal_local_record(&mut record).unwrap();
+    assert_eq!(store.connection.total_changes(), before);
+    assert_eq!(
+        store
+            .accept(&record.envelope, 1000, Admission::Custody, 30)
+            .unwrap(),
+        Accepted::Duplicate
     );
 }
