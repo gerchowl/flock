@@ -2,6 +2,34 @@
 use super::*;
 
 impl<D: DiskSpace> Store<D> {
+    /// Reserve a durable advert epoch once per process. Every sequence in this
+    /// epoch sorts below the next boot, even after rollback or a paused restart.
+    /// This updates only metadata, leaving custody's paused clock untouched.
+    pub fn reserve_route_boot(&mut self, wall_ms: i64) -> Result<u64> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM mesh_meta WHERE name='route_boot_ms'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let clock: i64 =
+            tx.query_row("SELECT wall FROM clock WHERE singleton=1", [], |r| r.get(0))?;
+        let next = previous
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::InvalidState)?
+            .max(clock)
+            .max(wall_ms)
+            .max(0);
+        tx.execute("INSERT INTO mesh_meta VALUES('route_boot_ms',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value", [next])?;
+        tx.commit()?;
+        Ok(next as u64)
+    }
+
     /// Configure the owning node before using forwarding and removal APIs.
     /// This identity is process state, never a persisted route.
     pub fn set_local_node(&mut self, node: &str) {

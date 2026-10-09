@@ -84,19 +84,39 @@ impl App {
                 return None;
             }
         };
+        let route = crate::mesh::runtime_store::read(|store| {
+            for peer in &self.state.peers {
+                if store
+                    .get_pin(&peer.name)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|pin| pin.node_id == owner.node_id)
+                {
+                    return Ok(Some(peer.name.clone()));
+                }
+            }
+            Ok(None)
+        });
+        let route = match route {
+            Ok(route) => route.flatten(),
+            Err(reason) => {
+                crate::logging::mesh_routing_failed("lookup_owner_pin", "", &reason);
+                None
+            }
+        };
         Some(AgentLocation {
             agent_id: agent_id.into(),
             node: Some(owner.node_id),
             live: false,
-            host: owner.name,
+            host: route.clone().unwrap_or(owner.name),
             pane_id: String::new(),
             local: false,
-            route: None,
-            direct: false,
+            direct: route.is_some(),
+            route,
         })
     }
 
-    /// Persist only authenticated directory ownership changes, never on pause.
+    /// Persist ownership changes, never on pause. Direct IDs match the peer pin.
+    /// Relayed IDs are claims made by the enrolled relayer.
     pub(crate) fn note_mesh_owners(&self) {
         if self.fleet_pause.paused {
             return;

@@ -182,7 +182,7 @@ fn agent_owner_hint_survives_restart_as_offline() {
     fleet.node_mut("nodea").restart();
     assert!(routes(fleet.node("nodea")).is_empty());
     let connection =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
     assert_eq!(
         connection
@@ -194,6 +194,14 @@ fn agent_owner_hint_survives_restart_as_offline() {
             .unwrap(),
         id(fleet.node("nodeb"))
     );
+    // A stale advertised label must not override the configured identity pin.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE agent_owners SET name='renamed.example' WHERE agent_id=?1",
+            [&agent],
+        )
+        .unwrap();
     // The public resolver finds the retained owner and queues for its configured
     // edge, despite having no live route or freshly polled directory.
     let response = api(
@@ -228,4 +236,75 @@ fn topology_change_on_acceptor_wakes_its_dialers() {
     let found = route(a, &id(c));
     assert_eq!(found["next_hop"], id(b));
     assert_eq!(found["hops"], 2);
+}
+
+#[test]
+fn failed_exchange_retries_then_success_stays_idle() {
+    let fleet = fault_fleet(
+        "routes-retry",
+        r#"        if "adverts" in response.get("result", {}):
+            counter = base / "route-exchanges"
+            count = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(count + 1))
+            if count == 0:
+                response = {"id": response["id"], "error": {"code": "mesh_not_enrolled", "message": "injected transient failure"}}
+                line = json.dumps(response) + "\n"
+"#,
+    );
+    let a = fleet.node("nodea");
+    route(a, &id(fleet.node("nodeb")));
+    let counter = a.home.parent().unwrap().join("route-exchanges");
+    let count = || {
+        std::fs::read_to_string(&counter)
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    };
+    assert!(count() >= 2, "the failed exchange must be retried");
+    std::thread::sleep(Duration::from_secs(6));
+    let settled = count();
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(count(), settled, "successful exchanges must remain idle");
+}
+
+#[test]
+fn paused_hub_learns_spoke_change_after_resume() {
+    let specs = [
+        NodeSpec::new("nodea", "routes-pause-a", &["nodeb"]),
+        NodeSpec::new("nodeb", "routes-pause-b", &[]),
+        NodeSpec::new("nodec", "routes-pause-c", &["nodea"]),
+    ];
+    let fleet = fleet::spawn_with_startup_probe("routes-paused", &specs, |fleet, name| {
+        if name == "nodea" {
+            let shim = fleet.node(name).home.parent().unwrap().join("bin/ssh");
+            let text = std::fs::read_to_string(&shim).unwrap();
+            let marker = "        response = json.loads(line)\n";
+            let source = r#"        if response.get("error", {}).get("code") == "fleet_paused":
+            (base / "route-paused").write_text("yes")
+"#;
+            assert!(text.contains(marker));
+            std::fs::write(shim, text.replace(marker, &format!("{marker}{source}"))).unwrap();
+        }
+        if name == "nodec" {
+            fleet.refuse_edge("nodec", "nodea");
+        }
+    });
+    let a = fleet.node("nodea");
+    let b = fleet.node("nodeb");
+    let c = fleet.node("nodec");
+    route(b, &id(a));
+    api(b, "fleet.pause", json!({}));
+    fleet.allow_edge("nodec", "nodea");
+    route(a, &id(c));
+    fleet::wait_until("paused route refusal", Duration::from_secs(15), || {
+        a.home
+            .parent()
+            .unwrap()
+            .join("route-paused")
+            .exists()
+            .then_some(())
+    });
+    assert!(routes(b).iter().all(|r| r["node"] != id(c)));
+    api(b, "fleet.resume", json!({}));
+    assert_eq!(route(b, &id(c))["next_hop"], id(a));
 }

@@ -1340,15 +1340,24 @@ impl App {
         &self,
         location: &crate::app::directory::AgentLocation,
     ) -> Option<crate::config::PeerConfig> {
-        let route = location.route.as_deref().unwrap_or_default();
+        if let Some(route) = &location.route {
+            return self
+                .state
+                .peers
+                .iter()
+                .find(|peer| peer.name == *route)
+                .cloned();
+        }
+        // Offline ownership hints must never fall back to an unpinned host label.
+        if !location.live && location.node.is_some() {
+            return None;
+        }
         let host = location.host.as_str();
         self.state
             .peers
             .iter()
             .find(|peer| {
-                (!route.is_empty() && peer.name.eq_ignore_ascii_case(route))
-                    || peer.name.eq_ignore_ascii_case(host)
-                    || peer.ssh_target().eq_ignore_ascii_case(host)
+                peer.name.eq_ignore_ascii_case(host) || peer.ssh_target().eq_ignore_ascii_case(host)
             })
             .cloned()
     }

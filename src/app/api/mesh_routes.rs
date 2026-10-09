@@ -15,6 +15,7 @@ pub(crate) struct Routes {
     live: BTreeMap<String, String>,
     sent: BTreeMap<String, (u64, u64)>,
     busy: BTreeSet<String>,
+    retries: BTreeMap<String, Retry>,
     changed_at: Option<Instant>,
     generation: u64,
     boot_ms: Option<u64>,
@@ -23,11 +24,44 @@ pub(crate) struct Routes {
     tick_at: Option<Instant>,
 }
 
+struct Retry {
+    enrollment: u64,
+    attempts: u32,
+    at: Instant,
+}
+
+impl Retry {
+    fn failed(previous: Option<&Self>, enrollment: u64, now: Instant) -> Self {
+        let attempts = previous
+            .filter(|r| r.enrollment == enrollment)
+            .map_or(0, |r| r.attempts.saturating_add(1));
+        let base = match attempts {
+            0 => 5,
+            1 => 60,
+            _ => 300,
+        };
+        let mut bytes = [0; 8];
+        let jitter = if getrandom::fill(&mut bytes).is_ok() {
+            u64::from_ne_bytes(bytes) % (base * 200 + 1)
+        } else {
+            0
+        };
+        // Jitter stays within the five-minute cap and avoids retry bursts.
+        let delay = Duration::from_millis(base * 800 + jitter);
+        Self {
+            enrollment,
+            attempts,
+            at: now + delay,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Completion {
     peer: crate::config::PeerConfig,
     node: String,
     enrollment: u64,
+    generation: u64,
     result: Result<Vec<Advert>, String>,
 }
 
@@ -85,12 +119,9 @@ impl App {
             let boot = match self.mesh_routes.boot_ms {
                 Some(boot) => boot,
                 None => crate::mesh::hello::with_store(|store| {
-                    Ok(store
-                        .clock()
-                        .map_err(|e| e.to_string())?
-                        .wall_ms
-                        .max(super::messages::now_ms() as i64)
-                        .max(0) as u64)
+                    store
+                        .reserve_route_boot(super::messages::now_ms() as i64)
+                        .map_err(|e| e.to_string())
                 })?,
             };
             let identity =
@@ -149,12 +180,17 @@ impl App {
                 "mesh.routes requires an enrolled edge",
             );
         };
-        self.refresh_mesh_routes();
-        if !self.fleet_pause.paused {
-            self.mesh_routes
-                .table
-                .learn(&supplier, crate::mesh::routes::decode_adverts(adverts));
+        if self.fleet_pause.paused {
+            return encode_error(
+                id,
+                "fleet_paused",
+                "route exchange paused; retry after resume",
+            );
         }
+        self.refresh_mesh_routes();
+        self.mesh_routes
+            .table
+            .learn(&supplier, crate::mesh::routes::decode_adverts(adverts));
         encode_success(
             id,
             ResponseResult::MeshRoutes {
@@ -202,6 +238,22 @@ impl App {
                 continue;
             };
             let enrollment = crate::peer_stream::peer_enrollment_generation(&peer);
+            if self
+                .mesh_routes
+                .retries
+                .get(&peer.name)
+                .is_some_and(|r| r.enrollment != enrollment)
+            {
+                self.mesh_routes.retries.remove(&peer.name);
+            }
+            if self
+                .mesh_routes
+                .retries
+                .get(&peer.name)
+                .is_some_and(|r| now < r.at)
+            {
+                continue;
+            }
             let previous = self.mesh_routes.sent.get(&peer.name).copied();
             let reconnected = previous.is_none_or(|(old, _)| old != enrollment);
             let changed = previous.is_none_or(|(_, old)| old != generation);
@@ -213,14 +265,12 @@ impl App {
                 continue;
             }
             self.mesh_routes.busy.insert(peer.name.clone());
-            self.mesh_routes
-                .sent
-                .insert(peer.name.clone(), (enrollment, generation));
             let adverts = self.mesh_routes.table.adverts();
             let failure = AppEvent::MeshRoutesCompleted(Box::new(Completion {
                 peer: peer.clone(),
                 node: node.clone(),
                 enrollment,
+                generation,
                 result: Err("route worker panicked".into()),
             }));
             self.mesh_routes.workers.start_bounded(
@@ -245,6 +295,7 @@ impl App {
                             peer,
                             node,
                             enrollment,
+                            generation,
                             result,
                         }))
                     }),
@@ -272,11 +323,27 @@ impl App {
             return;
         }
         match completion.result {
-            Ok(adverts) => self.mesh_routes.table.learn(
-                &completion.node,
-                adverts.into_iter().take(crate::mesh::routes::MAX_RECORDS),
-            ),
+            Ok(adverts) => {
+                self.mesh_routes.sent.insert(
+                    completion.peer.name.clone(),
+                    (completion.enrollment, completion.generation),
+                );
+                self.mesh_routes.retries.remove(&completion.peer.name);
+                self.mesh_routes.table.learn(
+                    &completion.node,
+                    adverts.into_iter().take(crate::mesh::routes::MAX_RECORDS),
+                );
+            }
             Err(reason) => {
+                self.mesh_routes.sent.remove(&completion.peer.name);
+                let retry = Retry::failed(
+                    self.mesh_routes.retries.get(&completion.peer.name),
+                    completion.enrollment,
+                    Instant::now(),
+                );
+                self.mesh_routes
+                    .retries
+                    .insert(completion.peer.name.clone(), retry);
                 crate::logging::mesh_routing_failed("exchange", &completion.peer.name, &reason)
             }
         }
@@ -302,5 +369,27 @@ impl App {
                 route
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_back_off_and_reset_on_new_enrollment() {
+        let now = Instant::now();
+        let mut retry = Retry::failed(None, 1, now);
+        for (attempt, seconds) in [5, 60, 300, 300].into_iter().enumerate() {
+            if attempt != 0 {
+                retry = Retry::failed(Some(&retry), 1, now);
+            }
+            let delay = retry.at.duration_since(now);
+            assert!(delay >= Duration::from_millis(seconds * 800));
+            assert!(delay <= Duration::from_secs(seconds));
+        }
+        let reset = Retry::failed(Some(&retry), 2, now);
+        assert_eq!(reset.attempts, 0);
+        assert!(reset.at.duration_since(now) <= Duration::from_secs(5));
     }
 }

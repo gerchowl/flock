@@ -30,8 +30,13 @@ key, name, mesh version, generation `[boot_ms, seq]`, and live adjacencies to it
 own signature. Invalid adverts are discarded individually. Exchanges contain
 no SSH addresses, and never authorize dialing a discovered node. Routes remain
 live through silence and are withdrawn on edge closure, without a route TTL.
-Exchanges run on enrollment, debounced topology changes, or `mesh.wake` pushes;
-there is no periodic route refresh.
+Exchanges run on enrollment, debounced topology changes, or `mesh.routes_changed` pushes;
+there is no periodic route refresh. Failed exchanges retry with jittered backoff
+through five seconds, one minute, and five minutes. Paused acceptors return
+`fleet_paused`; resuming triggers another exchange. Each batch replaces that
+supplier's full view, withdrawing omitted records when no supplier remains.
+Advert boot generations are persisted so clock rollback across restart cannot
+make a new advert older than its predecessor.
 `peers.summary.node_id` is accepted only when it matches the enrolled peer pin;
 relayed directory rows carry the owning node ID. Last-known agent owners are
 retained across restart as offline hints.

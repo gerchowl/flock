@@ -195,7 +195,7 @@ fn route_relay_lines<R: BufRead>(
         // JSON at all, which surfaces to the caller as a parse error rather
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
-            if push_kind(&line).as_deref() == Some("mesh.wake") {
+            if push_kind(&line).as_deref() == Some("mesh.routes_changed") {
                 if let Ok(mut wakes) = route_wake_registry().lock() {
                     wakes
                         .entry(peer.into())
@@ -1015,7 +1015,7 @@ mod tests {
         let slot = Arc::new(Mutex::new(None));
         let wire = concat!(
             "{\"id\":\"one\"}\n",
-            "{\"push\":\"mesh.wake\"}\n",
+            "{\"push\":\"mesh.routes_changed\"}\n",
             "{\"push\":\"unknown\"}\n",
             "{\"id\":\"two\"}\n"
         );

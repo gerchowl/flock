@@ -88,8 +88,8 @@ impl Advert {
         if self.node_id != node_id(&self.public_key) {
             return Err("advert key does not match node id");
         }
-        if self.mesh != super::hello::version()
-            || !valid_name(&self.name)
+        // The signed v1 advert format is independent of the edge protocol version.
+        if !valid_name(&self.name)
             || self.adjacencies.len() > MAX_ADJACENCIES
             || self.adjacencies.iter().any(|a| {
                 !valid_name(&a.name)
@@ -118,6 +118,7 @@ pub struct RouteTable {
     records: BTreeMap<String, Record>,
     live_edges: BTreeSet<String>,
     generation: u64,
+    cap_warned: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +132,10 @@ pub struct Route {
 impl RouteTable {
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn own(&self) -> Option<&Advert> {
@@ -159,14 +164,35 @@ impl RouteTable {
         }
     }
 
-    /// A batch is a bounded view. Invalid records never prevent valid siblings
+    /// A batch is the supplier's complete bounded view. Invalid records never prevent valid siblings
     /// being learned, and a neighbor cannot replace another node's signature.
     pub fn learn(&mut self, supplier_edge: &str, adverts: impl IntoIterator<Item = Advert>) {
-        for advert in adverts {
-            if let Err(reason) = advert.verify() {
-                crate::logging::mesh_routing_failed("verify_advert", supplier_edge, reason);
-                continue;
+        let adverts: Vec<_> = adverts
+            .into_iter()
+            .filter(|advert| {
+                if let Err(reason) = advert.verify() {
+                    crate::logging::mesh_routing_failed("verify_advert", supplier_edge, reason);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let listed: BTreeSet<_> = adverts
+            .iter()
+            .map(|advert| advert.node_id.as_str())
+            .collect();
+        let mut changed = false;
+        self.records.retain(|node, record| {
+            if !listed.contains(node.as_str()) {
+                changed |= record.suppliers.remove(supplier_edge);
             }
+            !record.suppliers.is_empty()
+        });
+        if changed {
+            self.invalidate();
+        }
+        for advert in adverts {
             if self
                 .own
                 .as_ref()
@@ -205,6 +231,13 @@ impl RouteTable {
                     },
                 );
                 self.generation = self.generation.wrapping_add(1);
+            } else if !self.cap_warned {
+                self.cap_warned = true;
+                crate::logging::mesh_routing_failed(
+                    "learn_advert",
+                    supplier_edge,
+                    "route table cap reached; additional adverts dropped",
+                );
             }
         }
     }
@@ -318,6 +351,30 @@ mod tests {
         table.set_own(own);
         table.learn("edge", others);
         table
+    }
+
+    #[test]
+    fn full_view_withdraws_omitted_records_only_for_that_supplier() {
+        let mut t = RouteTable::default();
+        t.learn("one", vec![advert(2, &[]), advert(3, &[])]);
+        t.learn("two", vec![advert(3, &[])]);
+        t.learn("one", vec![]);
+        assert_eq!(t.records.len(), 1);
+        t.learn("two", vec![]);
+        assert!(t.records.is_empty());
+    }
+
+    #[test]
+    fn unchanged_advert_format_accepts_another_mesh_version() {
+        let mut a = advert(2, &[]);
+        a.mesh += 1;
+        let mut bytes = [0; 32];
+        bytes[..2].copy_from_slice(&2_u16.to_le_bytes());
+        a.signature = SigningKey::from_bytes(&bytes)
+            .sign(&a.canonical())
+            .to_bytes()
+            .to_vec();
+        assert!(a.verify().is_ok());
     }
 
     #[test]

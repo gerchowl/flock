@@ -662,7 +662,11 @@ fn start_summary_push(socket: std::path::PathBuf) {
             if route_wake.take_due().is_some() {
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                if writeln!(out, "{{\"push\":\"mesh.wake\"}}").is_err() || out.flush().is_err() {
+                if out
+                    .write_all(b"{\"push\":\"mesh.routes_changed\"}\n")
+                    .is_err()
+                    || out.flush().is_err()
+                {
                     return;
                 }
             }
@@ -699,7 +703,8 @@ fn start_summary_push(socket: std::path::PathBuf) {
             let push = serde_json::json!({ "push": "peers.summary", "result": result });
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            if writeln!(out, "{push}").is_err() || out.flush().is_err() {
+            let line = format!("{push}\n");
+            if out.write_all(line.as_bytes()).is_err() || out.flush().is_err() {
                 return;
             }
             drop(out);

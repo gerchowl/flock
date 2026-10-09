@@ -68,6 +68,7 @@ impl App {
         self.fleet_pause = state.clone();
         App::sync_fleet_pause_banner(&self.fleet_pause, &mut self.state);
         if was_paused {
+            self.mesh_routes.table.invalidate();
             self.event_hub.push(EventEnvelope {
                 event: EventKind::FleetResumed,
                 data: EventData::FleetResumed {

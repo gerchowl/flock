@@ -3550,3 +3550,17 @@ fn quarantine_sidecar_rotation_keeps_two_bounded_private_files() {
     assert!(quarantine::append(directory, b"oversized record\n", 8).is_err());
     assert_eq!(fs::read_to_string(active).unwrap(), "{\"n\":4}\n");
 }
+
+#[test]
+fn route_boot_epoch_survives_restart_and_clock_rollback() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    store.set_paused(true, 1500).unwrap();
+    let first = store.reserve_route_boot(2000).unwrap();
+    let clock = store.clock().unwrap();
+    drop(store);
+    let mut store = fixture.open(500);
+    let second = store.reserve_route_boot(500).unwrap();
+    assert!(second > first);
+    assert_eq!(store.clock().unwrap(), clock);
+}
