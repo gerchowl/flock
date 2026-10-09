@@ -140,7 +140,6 @@ pub enum Method {
     /// event hub rather than a poll — see [`MsgWaitReplyParams`].
     #[serde(rename = "msg.wait_reply")]
     MsgWaitReply(MsgWaitReplyParams),
-
     #[serde(rename = "mesh.hello")]
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.routes")]
@@ -2183,6 +2182,8 @@ pub enum ResponseResult {
         adverts: Vec<crate::mesh::routes::Advert>,
     },
     PeersEnrollment {
+        #[serde(default)]
+        mesh_quarantined: usize,
         routes: Vec<crate::mesh::routes::Route>,
         peers: Vec<crate::mesh::hello::Enrollment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

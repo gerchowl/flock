@@ -530,116 +530,33 @@ impl App {
     }
 
     pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {
-        if self.node_id.is_none() {
+        let Some(origin) = self.node_id.clone() else {
             return Ok(());
-        }
-        let legacy = self.mailboxes.pending_messages();
-        let origin = self
-            .node_id
-            .clone()
-            .ok_or("mesh node identity unavailable")?;
-        with_store(|store| {
-            if !store
-                .migration_done("audit-inbox-v1")
-                .map_err(|e| e.to_string())?
-            {
-                for message in legacy {
-                    // A deterministic migration key makes a crash before the marker harmless.
-                    use sha2::{Digest, Sha256};
-                    let digest = Sha256::digest(
-                        format!("{}:{}", message.to_pane, message.correlation_id).as_bytes(),
-                    );
-                    let data = Payload {
-                        message,
-                        peer: None,
-                        host: None,
-                        direct: true,
-                    };
-                    let mut envelope = envelope(&origin, String::new(), &data)?;
-                    envelope.key.message_id = format!(
-                        "0{}",
-                        digest[..25]
-                            .iter()
-                            .map(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(b & 31) as usize] as char)
-                            .collect::<String>()
-                    );
-                    envelope.return_binding.request = envelope.key.clone();
-                    if store
-                        .get(&envelope.key)
-                        .map_err(|e| e.to_string())?
-                        .is_none()
-                    {
-                        store
-                            .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                store
-                    .finish_migration("audit-inbox-v1")
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })?;
+        };
+        let records = load_mesh_mail(
+            origin,
+            self.mailboxes.pending_messages(),
+            self.fleet_pause.paused,
+        )?;
+        self.apply_mesh_mail(records);
+        Ok(())
+    }
+
+    pub(crate) fn apply_mesh_mail(&mut self, records: Vec<RecoveredMessage>) {
         self.mailboxes.clear_queued_projection();
-        let records = with_store(|store| {
-            if !self.fleet_pause.paused {
-                store
-                    .maintain_if_due(now_ms() as i64)
-                    .map_err(|e| e.to_string())?;
-            }
-            store
-                .mailbox_keys()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|key| match store.get(&key) {
-                    Err(crate::mesh::store::Error::Json(_)) => {
-                        store.quarantine(&key).map_err(|e| e.to_string())?;
-                        crate::logging::mesh_custody_failed("restore", "undecodable_record");
-                        Ok(None)
-                    }
-                    result => result.map_err(|e| e.to_string()),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        for record in records.into_iter().flatten() {
-            let mut data = match payload(&record.envelope) {
-                Ok(data) => data,
-                Err(_) => {
-                    with_store(|store| {
-                        store
-                            .quarantine(&record.envelope.key)
-                            .map_err(|e| e.to_string())
-                    })?;
-                    crate::logging::mesh_custody_failed("restore", "undecodable_record");
-                    continue;
-                }
-            };
-            if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
-                data.message.from_host = with_store(|store| {
-                    store
-                        .origin_name(&record.envelope.key.origin_node)
-                        .map_err(|e| e.to_string())
-                })?;
-            }
-            data.message.message_key = Some(record.envelope.key);
-            data.message.enqueued_at_ms = now_ms()
-                .saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
-            if !record.envelope.target_agent.is_empty() {
-                if let Some(location) = self
-                    .locate_agent(&record.envelope.target_agent)
-                    .filter(|l| l.local)
-                {
-                    data.message.to_pane = location.pane_id;
+        for mut record in records {
+            if !record.target.is_empty() {
+                if let Some(location) = self.locate_agent(&record.target).filter(|l| l.local) {
+                    record.message.to_pane = location.pane_id;
                 }
             }
-            if record.state == "read" {
-                self.mailboxes.record_delivered(&data.message);
+            if record.read {
+                self.mailboxes.record_delivered(&record.message);
             } else {
-                self.mailboxes.enqueue(data.message);
+                self.mailboxes.enqueue(record.message);
             }
         }
         self.sync_blocking_mail();
-        Ok(())
     }
 
     pub(super) fn retry_mesh_mail(&mut self) {
@@ -906,4 +823,114 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(shim);
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveredMessage {
+    message: PendingMessage,
+    target: String,
+    read: bool,
+}
+
+/// Load and decode on the recovery worker, projecting only on the app loop.
+pub(crate) fn load_mesh_mail(
+    origin: String,
+    legacy: Vec<PendingMessage>,
+    paused: bool,
+) -> Result<Vec<RecoveredMessage>, String> {
+    with_store(|store| {
+        if !store
+            .migration_done("audit-inbox-v1")
+            .map_err(|e| e.to_string())?
+        {
+            for message in legacy {
+                // A deterministic migration key makes a crash before the marker harmless.
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(
+                    format!("{}:{}", message.to_pane, message.correlation_id).as_bytes(),
+                );
+                let data = Payload {
+                    message,
+                    peer: None,
+                    host: None,
+                    direct: true,
+                };
+                let mut envelope = envelope(&origin, String::new(), &data)?;
+                envelope.key.message_id = format!(
+                    "0{}",
+                    digest[..25]
+                        .iter()
+                        .map(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ"[(b & 31) as usize] as char)
+                        .collect::<String>()
+                );
+                envelope.return_binding.request = envelope.key.clone();
+                if store
+                    .get(&envelope.key)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    store
+                        .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            store
+                .finish_migration("audit-inbox-v1")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })?;
+    let records = with_store(|store| {
+        if !paused {
+            store
+                .maintain_if_due(now_ms() as i64)
+                .map_err(|e| e.to_string())?;
+        }
+        store
+            .mailbox_keys()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|key| match store.get(&key) {
+                Err(
+                    crate::mesh::store::Error::Json(_) | crate::mesh::store::Error::InvalidEnvelope,
+                ) => {
+                    store.quarantine(&key).map_err(|e| e.to_string())?;
+                    crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                    Ok(None)
+                }
+                result => result.map_err(|e| e.to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut loaded = Vec::new();
+    for record in records.into_iter().flatten() {
+        let mut data = match payload(&record.envelope) {
+            Ok(data) => data,
+            Err(_) => {
+                with_store(|store| {
+                    store
+                        .quarantine(&record.envelope.key)
+                        .map_err(|e| e.to_string())
+                })?;
+                crate::logging::mesh_custody_failed("restore", "undecodable_record");
+                continue;
+            }
+        };
+        if Some(record.envelope.key.origin_node.as_str()) != Some(origin.as_str()) {
+            data.message.from_host = with_store(|store| {
+                store
+                    .origin_name(&record.envelope.key.origin_node)
+                    .map_err(|e| e.to_string())
+            })?;
+        }
+        data.message.message_key = Some(record.envelope.key);
+        data.message.enqueued_at_ms =
+            now_ms().saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
+        loaded.push(RecoveredMessage {
+            message: data.message,
+            target: record.envelope.target_agent,
+            read: record.state == "read",
+        });
+    }
+    Ok(loaded)
 }
