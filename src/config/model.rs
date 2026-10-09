@@ -1004,13 +1004,7 @@ pub struct PeerConfig {
     /// there. Prefer a name that resolves everywhere (a tailnet name) or
     /// define the same alias on the clients.
     pub ssh: String,
-    /// Command run on the peer to fetch its summary. The default wraps the
-    /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
-    pub summary_command: String,
-    /// Command run on the peer to serve the held connection. Mirrors
-    /// `summary_command`: the default wraps `flk` in a login shell so
-    /// profile-managed PATHs (nix, brew) apply, and an override handles a peer
-    /// whose `flk` is not on the non-interactive PATH at all.
+    /// Command serving the held mesh edge, in a login shell by default.
     pub relay_command: String,
     /// Optional per-peer override for the summary poll cadence (#96). Unset
     /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
@@ -1025,15 +1019,10 @@ impl Default for PeerConfig {
         Self {
             name: String::new(),
             ssh: String::new(),
-            summary_command: default_peer_summary_command().to_string(),
             relay_command: default_peer_relay_command().to_string(),
             poll_interval_secs: None,
         }
     }
-}
-
-pub fn default_peer_summary_command() -> &'static str {
-    "sh -lc 'flk peers summary --json'"
 }
 
 pub fn default_peer_relay_command() -> &'static str {
@@ -1279,8 +1268,8 @@ pub struct MsgConfig {
     /// A node that sets this false still SENDS — this governs what it is
     /// willing to have delivered into its own agents' turns.
     pub enabled: bool,
-    /// Hosts whose agents may message this node's agents. `["*"]` (the
-    /// default) allows the whole fleet.
+    /// Configured names of authenticated origin nodes allowed to send mail.
+    /// Forwarding hubs are never checked. `["*"]` allows the whole fleet.
     ///
     /// Open by default because a flock fleet is already one trust domain —
     /// SSH keys plus a host CA — so a mandatory allowlist would be friction
@@ -1292,11 +1281,6 @@ pub struct MsgConfig {
     /// sender the mute defers, so it is bounded like any other body, and a
     /// mute must never fail over its own explanation. Default: 200.
     pub mute_reason_max_chars: usize,
-    /// How many legacy message sends, replies and mute deferrals to other
-    /// hosts may be in flight at once (ADR-0018 §3). Each is an ssh hop; one mute over a full inbox of
-    /// remote questions owes up to a mailbox's worth, and the rest wait for
-    /// a slot rather than opening that many sessions at once. Default: 4.
-    pub deferral_relay_concurrency: usize,
     /// How many `blocking` messages one sender may send per rolling hour
     /// (ADR-0018 §1). Default: 6.
     ///
@@ -1359,7 +1343,6 @@ impl Default for MsgConfig {
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,
-            deferral_relay_concurrency: 4,
             blocking_per_hour: 6,
             idle_wake: true,
             idle_wake_settle_ms: 2_000,
@@ -1376,9 +1359,8 @@ impl Default for MsgConfig {
 impl MsgConfig {
     /// Whether a message originating on `host` may be delivered here.
     ///
-    /// A message with no known origin host is treated as LOCAL — it was
-    /// attested by this server's own process ancestry, so there is no remote
-    /// party to gate.
+    /// None is a local sender, attested or unattested, with no remote origin
+    /// to match. Remote import passes the store's authenticated origin name.
     pub fn accepts_from(&self, host: Option<&str>) -> bool {
         if !self.enabled {
             return false;
@@ -1851,13 +1833,6 @@ mod tests {
             ..RemoteConfig::default()
         };
         assert!(off.reconnect_policy().is_none());
-    }
-
-    #[test]
-    fn spoke_custody_accepts_removed_uplink_settings() {
-        for key in ["uplink_timeout_secs", "uplink_heartbeat_secs"] {
-            assert!(toml::from_str::<super::MsgConfig>(&format!("{key}=20")).is_ok());
-        }
     }
 
     #[test]

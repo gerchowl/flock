@@ -100,38 +100,18 @@ pub(super) fn mint_correlation_id() -> String {
 ///
 /// An attested agent is keyed by its id, one attested only as a pane by that
 /// pane. EVERY unattested sender — each relayed message, each socket client
-/// outside a pane — shares one bucket, because on that path both `from_agent`
-/// and `from_host` are claims: keying on them let a caller mint fresh budget
-/// per invented name, or name a real agent and spend its budget for it. One
-/// shared bucket is safe because a spent budget downgrades rather than
-/// refuses ([`App::apply_blocking_budget`]), so nobody can be silenced by
-/// someone else exhausting it. The key space is therefore bounded by the
-/// panes on this server, plus one.
+/// outside a pane — shares one bucket, because `from_agent` is a claim.
+/// Keying on it let a caller mint fresh budget per invented name, or name a
+/// real agent and spend its budget for it. One shared bucket is safe because
+/// a spent budget downgrades rather than refuses
+/// ([`App::apply_blocking_budget`]), so nobody can be silenced by someone
+/// else exhausting it. The key space is therefore bounded by the panes on
+/// this server, plus one.
 fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
     match (attested_agent, from_pane) {
         (Some(agent), _) => agent.to_string(),
         (None, Some(pane)) => format!("pane/{pane}"),
         (None, None) => UNATTESTED_BLOCKING_BUCKET.to_string(),
-    }
-}
-
-/// What became of a `msg.reply`, read off its response (#438).
-#[derive(Debug, PartialEq, Eq)]
-enum ReplyOutcome {
-    /// Queued here, or relayed over a peer's ssh: the reply went out.
-    Sent,
-    Failed,
-}
-
-impl ReplyOutcome {
-    fn of(response: &str) -> Self {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(response) else {
-            return Self::Failed;
-        };
-        if value.get("error").is_some() {
-            return Self::Failed;
-        }
-        Self::Sent
     }
 }
 
@@ -185,11 +165,7 @@ impl App {
         if body.trim().is_empty() {
             return encode_error(id, "invalid_request", "message body is empty");
         }
-        // An asserted sender is an identity or it is nothing (ADR-0018 §1).
-        // Both fields reach operator surfaces — the attention label, the
-        // escalation notification — so a claim that is not shaped like an
-        // id is refused here rather than rendered there. Every relay builds
-        // these from server-minted values, so only a hand-made request fails.
+        // An asserted agent label reaches operator surfaces and must be an id.
         if let Some(agent) = params
             .from_agent
             .as_deref()
@@ -201,18 +177,6 @@ impl App {
                 format!("from_agent {agent:?} is not an agent id"),
             );
         }
-        if let Some(host) = params
-            .from_host
-            .as_deref()
-            .filter(|host| !crate::app::mailboxes::is_host_name(host))
-        {
-            return encode_error(
-                id,
-                "invalid_request",
-                format!("from_host {host:?} is not a host name"),
-            );
-        }
-
         // Resolved to another host: hand the message to the server that owns
         // the recipient and let ITS mailbox do the rest. One delivery
         // implementation, wherever the sender was.
@@ -238,11 +202,8 @@ impl App {
         let sender = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
         let from_pane = sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
         let from_repo = sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx));
-        // Provenance is a claim PLUS whatever this server could attest, kept
-        // apart. Locally, ancestry attests an identity. A message relayed from
-        // another host has no local ancestry — that is precisely why it used
-        // to arrive anonymous — so the relay's asserted `from_agent` carries
-        // it instead. Absence of proof must not mean absence of a name.
+        // Ancestry attests local identity. Operator tooling may still name an
+        // unattested sender with from_agent, which grants no remote authority.
         let attested_agent = sender.and_then(|(ws_idx, pane_id)| {
             let ws = self.state.workspaces.get(ws_idx)?;
             let terminal = self
@@ -251,41 +212,17 @@ impl App {
                 .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
             Some(terminal.agent_id.to_string())
         });
-        // The sender's host: asserted by a relay, else this host when WE
-        // attested the sender locally. Never guessed — a relayed message whose
-        // sender the local directory cannot see used to fall back to
-        // `short_host_name()` and claim the recipient's own host as the
-        // origin, which read as "atlas sent this" on the machine that received
-        // it from atlas.
-        let from_host = params.from_host.clone().or_else(|| {
-            attested_agent
-                .as_ref()
-                .map(|_| crate::app::short_host_name())
-        });
+        let from_host = attested_agent
+            .as_ref()
+            .map(|_| crate::app::short_host_name());
         let from_agent = attested_agent.clone().or_else(|| params.from_agent.clone());
 
-        // Allow policy (ADR-0008), enforced HERE because the receiver is the
-        // only party that cannot be bypassed — a sender-side check is advice,
-        // and once the hub forwards for spokes, reachability is no longer
-        // gated by which SSH keys happen to exist. A locally-attested sender
-        // has no remote party to gate, so it is always accepted.
-        let origin_host = if attested_agent.is_some() {
-            None
-        } else {
-            params.from_host.as_deref()
-        };
-        if !self.state.config.msg.accepts_from(origin_host) {
+        // Remote origin policy is enforced only during authenticated mesh import.
+        if !self.state.config.msg.enabled {
             return encode_error(
                 id,
                 "msg_not_allowed",
-                match origin_host {
-                    Some(host) => format!(
-                        "this node does not accept agent messages from {host} \
-                         (see [msg] allow_from)"
-                    ),
-                    None => "this node does not accept agent messages ([msg] enabled = false)"
-                        .to_string(),
-                },
+                "this node does not accept agent messages ([msg] enabled = false)",
             );
         }
 
@@ -315,16 +252,6 @@ impl App {
         if from_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
-        // ADR-0018 §1: the receiving CLI already read an unknown relayed tier
-        // as `needs_reply`. Recorded here because this is the process with a
-        // log; the relay's own stderr is thrown away on success.
-        if let Some(raw) = &params.intent_unrecognised {
-            crate::logging::msg_intent_unrecognised(
-                raw,
-                params.from_host.as_deref().unwrap_or("unknown"),
-            );
-            warnings.push("intent_unrecognised_read_as_needs_reply".to_string());
-        }
         let message = PendingMessage {
             message_key: None,
             correlation_id: correlation_id.clone(),
@@ -349,7 +276,8 @@ impl App {
         let response = self.route_msg_reply(id, params);
         // Durable acceptance settles channel-pushed mail in the replier's inbox.
         if self.state.config.msg.channel_push
-            && matches!(ReplyOutcome::of(&response), ReplyOutcome::Sent)
+            && serde_json::from_str::<serde_json::Value>(&response)
+                .is_ok_and(|value| value.get("error").is_none())
         {
             self.settle_replied_original(&correlation_id);
         }
@@ -1145,38 +1073,13 @@ impl App {
             return encode_error_with_data(
                 id,
                 "peer_not_configured",
-                if params.from_host.is_some() {
-                    format!(
-                        "agent lives on {host}, which {me} has no [[peers]] edge to — and a \
-                         message that already crossed a hub is not handed on again"
-                    )
-                } else {
-                    format!(
-                        "agent lives on {host}, which is not in this server's [[peers]], and no \
-                         hub holds a relay to {me} to hand the message up to"
-                    )
-                },
-                serde_json::json!({ "hop": me, "retryable": false }),
-            );
-        };
-        // #410 loop guard. A message that arrived from another host is handed
-        // on only over a DIRECT edge, so it crosses at most one hub and cannot
-        // bounce spoke → hub → spoke → hub. Relayed routes are for messages
-        // that start here.
-        if params.from_host.is_some() && !location.direct {
-            let me = crate::app::short_host_name();
-            return encode_error_with_data(
-                id,
-                "forward_limit",
                 format!(
-                    "{me} knows {to_agent} only through {}, and a message that already crossed \
-                     a hub is not forwarded a second time",
-                    peer.name
+                    "agent lives on {host}, which is not in this server's [[peers]], and no \
+                     hub holds a relay to {me} to hand the message up to"
                 ),
                 serde_json::json!({ "hop": me, "retryable": false }),
             );
-        }
-
+        };
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();
         let from_host = crate::app::short_host_name();
@@ -1199,25 +1102,42 @@ impl App {
             .as_deref()
             .filter(|explicit| !explicit.trim().is_empty());
 
-        let mut send = crate::app::message_relay::RelaySend {
-            mesh: None,
+        let data = super::mesh_mail::Payload {
+            message: PendingMessage {
+                message_key: None,
+                correlation_id: correlation_id.clone(),
+                body: body.to_string(),
+                from_pane: None,
+                from_agent: Some(from_agent.clone()),
+                from_host: Some(from_host),
+                from_repo: None,
+                to_pane: location.pane_id.clone(),
+                to_repo: None,
+                in_reply_to: in_reply_to.map(str::to_string),
+                enqueued_at_ms: now_ms(),
+                delivery_attempts: 0,
+                intent: params.intent,
+            },
+            peer: Some(peer.name.clone()),
+            host: Some(host.to_string()),
+            direct: location.direct,
+        };
+        let mesh = match self.persist_mesh_send(&peer, to_agent, &data) {
+            Ok(mesh) => mesh,
+            Err(reason) => return encode_error(id, super::mesh_mail::error_code(&reason), reason),
+        };
+        let send = crate::app::message_relay::RelaySend {
+            mesh,
             id,
             peer,
             to_agent: to_agent.to_string(),
             host: host.to_string(),
             direct: location.direct,
             from_agent,
-            from_host,
-            body: body.to_string(),
             correlation_id,
-            in_reply_to: in_reply_to.map(str::to_string),
             intent: params.intent,
-            settle_original: None,
             respond_to: None,
         };
-        if let Err(reason) = self.persist_mesh_send(&mut send, &location.pane_id) {
-            return encode_error(send.id, super::mesh_mail::error_code(&reason), reason);
-        }
         if send.intent.wakes() {
             self.mailboxes.start_relaying_question(&send.correlation_id);
         }
@@ -1231,101 +1151,7 @@ impl App {
         completion: crate::app::message_relay::RelayCompletion,
     ) {
         let crate::app::message_relay::RelayCompletion { send, result } = completion;
-        if send.mesh.is_some() {
-            self.complete_mesh_send(send, result);
-            return;
-        }
-        let crate::app::message_relay::RelaySend {
-            id,
-            peer,
-            to_agent,
-            host,
-            direct,
-            from_agent,
-            correlation_id,
-            intent,
-            settle_original,
-            respond_to,
-            ..
-        } = send;
-        if intent.wakes() {
-            self.mailboxes.finish_relaying_question(&correlation_id);
-        }
-        let response = match result {
-            Ok(_) => {
-                // Without this the sender's durable log has NO record that a
-                // cross-host message was ever sent — the relay path returned
-                // straight to the caller and never reached `queue_message`,
-                // which is what emits the local audit event. A message that
-                // left the machine was the one kind that vanished from the
-                // audit substrate it is supposed to be recorded in (#175).
-                self.emit_event(EventEnvelope {
-                    event: EventKind::MessageRelayed,
-                    data: EventData::MessageRelayed {
-                        correlation_id: correlation_id.clone(),
-                        from_agent: from_agent.clone(),
-                        to_agent: to_agent.to_string(),
-                        to_host: host.to_string(),
-                        route: peer.name.clone(),
-                        relayed_at_ms: now_ms(),
-                        intent,
-                        via: (!direct).then(|| peer.name.clone()),
-                    },
-                });
-                if intent.wakes() {
-                    self.mailboxes
-                        .record_relayed_question(correlation_id.clone());
-                }
-                encode_success(
-                    id,
-                    ResponseResult::MsgQueued {
-                        message_key: None,
-                        correlation_id,
-                        state: "relayed".into(),
-                        warnings: Vec::new(),
-                        to_host: Some(host.to_string()),
-                        path: Some(if direct {
-                            "direct".into()
-                        } else {
-                            format!("via {}", peer.name)
-                        }),
-                    },
-                )
-            }
-            // #380: a peer that READ the command and rejected it is not an
-            // unreachable peer. The relay is `flk msg send` on the far side,
-            // so a flag that build does not understand now comes back here as
-            // a refusal — the same failure that used to arrive as flag text
-            // welded to the front of somebody's message body, with a success
-            // reported to the sender.
-            // #410: the failure names the hop that failed — which machine
-            // could not reach which — and why, so a message that crossed a hub
-            // first reports the leg that broke rather than a generic miss.
-            Err(failure) => {
-                let me = crate::app::short_host_name();
-                let reason = crate::peers::SshFailureReason::classify(failure.detail());
-                encode_error_with_data(
-                    id,
-                    failure.code(),
-                    failure.hop_message(&me, &host, reason),
-                    serde_json::json!({
-                        "retryable": failure.retryable(),
-                        "peer": peer.name,
-                        "detail": failure.detail(),
-                        "hop": format!("{me} → {host}"),
-                        "reason": reason.as_str(),
-                    }),
-                )
-            }
-        };
-        if matches!(ReplyOutcome::of(&response), ReplyOutcome::Sent) {
-            if let Some(original) = settle_original {
-                self.settle_original_in(&original.pane, &original.correlation_id);
-            }
-        }
-        if let Some(respond_to) = respond_to {
-            let _ = respond_to.send(response);
-        }
+        self.complete_mesh_send(send, result);
     }
 
     /// The `[[peers]]` entry that reaches `location`.
@@ -1545,7 +1371,7 @@ impl App {
         if let Some(response) = self.try_queue_spoke(&id, agent, body, params) {
             return response;
         }
-        if self.state.peers.is_empty() && params.from_host.is_none() {
+        if self.state.peers.is_empty() {
             return encode_error(
                 id,
                 code,
@@ -1833,13 +1659,11 @@ mod tests {
             app,
             MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Pane { pane: to },
                 body: body.into(),
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             },
         )
     }
@@ -1852,13 +1676,11 @@ mod tests {
             app,
             MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Pane { pane: to },
                 body: body.into(),
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
                 intent: MsgIntent::NeedsReply,
-                intent_unrecognised: None,
             },
         )
     }
@@ -1940,7 +1762,6 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Pane {
                     pane: "w9:p9".into(),
                 },
@@ -1948,7 +1769,6 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1958,7 +1778,6 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Pane {
                     pane: "no-such".into(),
                 },
@@ -1966,7 +1785,6 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -1976,7 +1794,6 @@ mod tests {
             &mut app,
             MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::RepoPane {
                     repo: "ghost-repo".into(),
                     pane: "p1".into(),
@@ -1985,7 +1802,6 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -2119,7 +1935,6 @@ mod tests {
             id: "req".into(),
             method: Method::MsgSend(MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_kiln-dev_beef".into(),
                 },
@@ -2127,7 +1942,6 @@ mod tests {
                 correlation_id: Some("c-remote".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -2149,7 +1963,6 @@ mod tests {
             id: "req".into(),
             method: Method::MsgSend(MsgSendParams {
                 from_agent: None,
-                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_nowhere_0".into(),
                 },
@@ -2157,7 +1970,6 @@ mod tests {
                 correlation_id: None,
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -2165,49 +1977,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_disallowed_origin_host_is_refused_at_the_receiver() {
-        // The policy has to bite on the RECEIVING side: a sender-side check is
-        // advice, and once the hub forwards for spokes, "can reach" stops
-        // being decided by which SSH keys exist.
+    async fn socket_caller_cannot_assert_from_host() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
-        app.state.config.msg.allow_from = vec!["hopper".into()];
-        let to_pane = app
-            .state
-            .workspaces
-            .get(1)
-            .and_then(|ws| ws.focused_pane_id())
-            .and_then(|pane_id| app.public_pane_id(1, pane_id))
-            .expect("recipient pane");
+        app.state.config.msg.allow_from = vec!["nodeb".into()];
+        let pane = pane_target(&app, 1);
+        for host in ["nodea", "nodeb", "bad;host"] {
+            let response = claimed_send(
+                &mut app,
+                &pane,
+                serde_json::json!({"from_host":host, "from_agent":"agent_nodea_sender"}),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let messages = read_inbox(&mut app, &pane);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| message.from_host.is_none()));
+    }
 
-        let send = |app: &mut crate::app::App, host: &str, cid: &str| {
-            app.handle_api_request(Request {
-                id: "req".into(),
-                method: Method::MsgSend(MsgSendParams {
-                    from_agent: Some("agent_elsewhere_1".into()),
-                    from_host: Some(host.into()),
-                    to: MessageTarget::Pane {
-                        pane: to_pane.clone(),
-                    },
-                    body: "knock knock".into(),
-                    correlation_id: Some(cid.into()),
-                    in_reply_to: None,
-                    intent: MsgIntent::Fyi,
-                    intent_unrecognised: None,
-                }),
-            })
-        };
-
-        let refused = send(&mut app, "kiln", "c-blocked");
-        let error: ErrorResponse = serde_json::from_str(&refused).unwrap();
-        assert_eq!(error.error.code, "msg_not_allowed");
-        assert!(
-            error.error.message.contains("kiln"),
-            "{}",
-            error.error.message
-        );
-
-        let allowed = send(&mut app, "hopper", "c-allowed");
-        assert!(!allowed.contains("\"error\""), "{allowed}");
+    #[tokio::test]
+    async fn allow_from_is_not_consulted_for_local_senders() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.config.msg.allow_from.clear();
+        let pane = pane_target(&app, 1);
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"from_agent":"agent_nodea_sender"}),
+        ] {
+            let response = claimed_send(&mut app, &pane, params);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let sender_pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        app.test_pane_child_pids
+            .insert(sender_pane, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        let response = claimed_send(&mut app, &pane, serde_json::json!({}));
+        assert!(response.get("error").is_none(), "{response}");
+        app.current_api_peer_pid = None;
+        app.state.config.msg.enabled = false;
+        let response = claimed_send(&mut app, &pane, serde_json::json!({}));
+        assert_eq!(response["error"]["code"], "msg_not_allowed");
     }
 
     #[tokio::test]
@@ -2290,7 +2098,11 @@ mod tests {
         );
     }
 
-    fn configure_unreachable_message_peer(app: &mut crate::app::App) {
+    fn configure_unreachable_message_peer(
+        app: &mut crate::app::App,
+    ) -> crate::mesh::runtime_store::TestStore {
+        let store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
         app.state.peers = vec![crate::config::PeerConfig {
             name: "kiln".into(),
             // Unresolvable, so the ssh attempt fails fast without a network.
@@ -2323,17 +2135,17 @@ mod tests {
             }];
             peer
         }];
+        store
     }
 
     #[tokio::test]
     async fn an_unparked_relay_cannot_steal_the_next_requests_responder() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
-        configure_unreachable_message_peer(&mut app);
+        let _store = configure_unreachable_message_peer(&mut app);
         let response = send(
             &mut app,
             MsgSendParams {
                 from_agent: Some("agent_atlas_cafe".into()),
-                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_kiln-dev_beef".into(),
                 },
@@ -2341,7 +2153,6 @@ mod tests {
                 correlation_id: Some("detached-question".into()),
                 in_reply_to: None,
                 intent: MsgIntent::NeedsReply,
-                intent_unrecognised: None,
             },
         );
         assert!(response.is_empty());
@@ -2374,7 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relay_without_custody_is_refused_without_an_audit_record() {
+    async fn an_unreachable_mesh_relay_stays_queued_without_a_delivery_audit() {
         // `MessageRelayed` has to mean "this message left, and went there".
         // Emitting it on the attempt rather than the success would make the
         // audit trail claim delivery for messages that never crossed the
@@ -2382,13 +2193,12 @@ mod tests {
         // record reads as a true one.
         let hub = crate::api::EventHub::default();
         let mut app = test_app_with_hub(hub.clone());
-        configure_unreachable_message_peer(&mut app);
+        let _store = configure_unreachable_message_peer(&mut app);
 
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::MsgSend(MsgSendParams {
                 from_agent: Some("agent_atlas_cafe".into()),
-                from_host: None,
                 to: MessageTarget::Agent {
                     agent: "agent_kiln-dev_beef".into(),
                 },
@@ -2396,7 +2206,6 @@ mod tests {
                 correlation_id: Some("c-unreachable".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             }),
         });
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2415,19 +2224,10 @@ mod tests {
             }
         })
         .await
-        .expect("custody refusal must answer the caller");
-        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            error.error.code, "peer_refused_message",
-            "the worker refuses a send without custody"
-        );
-        let data: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let data = &data["error"]["data"];
-        assert_eq!(
-            data["retryable"], false,
-            "missing custody is a refusal: {data}"
-        );
-        assert_eq!(data["detail"], "mesh custody required");
+        .expect("queued result must answer the caller");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["state"], "queued", "{value}");
+        assert!(value["result"]["message_key"].is_object());
         let relayed = hub
             .events_after(0)
             .iter()
@@ -2437,11 +2237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_old_relay_stays_replyable_but_discloses_best_effort_replies() {
-        // The failure that started all of this: a message from another host
-        // arrived with no sender and a reply command that could not work.
-        // A relay asserts `from_agent`, so the recipient reads a named sender
-        // and `replyable` is true.
+    async fn an_asserted_agent_stays_replyable_but_has_no_remote_host() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         let to_pane = app
             .state
@@ -2456,7 +2252,6 @@ mod tests {
             method: Method::MsgSend(MsgSendParams {
                 // No local ancestry attests this — it came off the wire.
                 from_agent: Some("agent_hopper_cafe".into()),
-                from_host: Some("hopper".into()),
                 to: MessageTarget::Pane {
                     pane: to_pane.clone(),
                 },
@@ -2464,7 +2259,6 @@ mod tests {
                 correlation_id: Some("c-relayed".into()),
                 in_reply_to: None,
                 intent: MsgIntent::Fyi,
-                intent_unrecognised: None,
             }),
         });
         assert!(!response.contains("\"error\""), "{response}");
@@ -2481,9 +2275,8 @@ mod tests {
         };
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].from_agent.as_deref(), Some("agent_hopper_cafe"));
-        // The relay's asserted host, not the receiver's own — a receiver that
-        // guesses reports itself as the origin.
-        assert_eq!(messages[0].from_host.as_deref(), Some("hopper"));
+        // An operator-supplied agent id does not attest a remote host.
+        assert!(messages[0].from_host.is_none());
         assert!(
             messages[0].replyable,
             "a named sender is routable through the directory"
@@ -2932,7 +2725,7 @@ mod tests {
     async fn a_reply_arriving_before_ssh_completion_still_wakes_its_sender() {
         for succeeds in [false, true] {
             let mut app = test_app_with_hub(crate::api::EventHub::default());
-            configure_unreachable_message_peer(&mut app);
+            let _store = configure_unreachable_message_peer(&mut app);
             let asker = pane_target(&app, 0);
             let mut attempts = Vec::new();
             for _ in 0..2 {
@@ -2940,7 +2733,6 @@ mod tests {
                     &mut app,
                     MsgSendParams {
                         from_agent: Some("agent_atlas_cafe".into()),
-                        from_host: None,
                         to: MessageTarget::Agent {
                             agent: "agent_kiln-dev_beef".into(),
                         },
@@ -2948,7 +2740,6 @@ mod tests {
                         correlation_id: Some("in-flight-question".into()),
                         in_reply_to: None,
                         intent: MsgIntent::NeedsReply,
-                        intent_unrecognised: None,
                     },
                 );
                 assert!(response.is_empty());
@@ -2958,7 +2749,6 @@ mod tests {
                 &mut app,
                 MsgSendParams {
                     from_agent: Some("agent_kiln-dev_beef".into()),
-                    from_host: Some("kiln-dev".into()),
                     to: MessageTarget::Pane {
                         pane: asker.clone(),
                     },
@@ -2966,7 +2756,6 @@ mod tests {
                     correlation_id: Some("early-answer".into()),
                     in_reply_to: Some("in-flight-question".into()),
                     intent: MsgIntent::Fyi,
-                    intent_unrecognised: None,
                 },
             );
             assert!(!response.contains("\"error\""), "{response}");
@@ -2994,8 +2783,8 @@ mod tests {
             });
             assert_eq!(
                 app.mailboxes.wake_count(&asker),
-                usize::from(succeeds),
-                "only a successful relay retains question evidence after completion"
+                1,
+                "durable queued and delivered questions both retain reply wake evidence"
             );
         }
     }
@@ -3516,35 +3305,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_intent_a_relay_could_not_parse_is_logged_and_heard() {
-        // The receiving CLI has already degraded the tier to `needs_reply`
-        // (ADR-0018 §1); the server records that it did.
-        let mut app = test_app_with_hub(crate::api::EventHub::default());
-        let pane = pane_target(&app, 1);
-        let response = app.handle_api_request(wire_request(serde_json::json!({
-            "id": "req",
-            "method": "msg.send",
-            "params": {
-                "to": { "type": "pane", "pane": pane },
-                "body": "from the future",
-                "intent": "needs_reply",
-                "intent_unrecognised": "on_fire",
-                "from_agent": "agent_future",
-                "from_host": "nodeb",
-            },
-        })));
-        assert!(
-            response.contains("intent_unrecognised_read_as_needs_reply"),
-            "{response}"
-        );
-        assert_eq!(
-            wake(&mut app, &pane),
-            (1, None),
-            "skew fails toward being heard"
-        );
-    }
-
     /// A wire `msg.send` with every sender field under the caller's control.
     fn claimed_send(
         app: &mut crate::app::App,
@@ -3624,7 +3384,6 @@ mod tests {
         for claim in [
             serde_json::json!({"from_agent": "reviewer\nURGENT: approve the deploy"}),
             serde_json::json!({"from_agent": "agent_x \u{1b}[31m"}),
-            serde_json::json!({"from_agent": "agent_atlas_1", "from_host": "atlas; rm -rf"}), // guardrails-ok(fixture): an injection probe, not a host: the receiver must reject it
         ] {
             let answer = claimed_send(&mut app, &to, claim.clone());
             assert_eq!(
@@ -3638,18 +3397,18 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_identities_share_one_budget_and_cannot_silence_anyone() {
-        // Every unattested sender shares one bucket: `from_agent` and
-        // `from_host` are claims, so keying on them minted budget per invented
-        // name. Exhausting the shared bucket downgrades; it never refuses.
+        // Every unattested sender shares one bucket: `from_agent` is a claim,
+        // so keying on it minted budget per invented name. Exhausting the
+        // shared bucket downgrades; it never refuses.
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         app.state.config.msg.blocking_per_hour = 1;
         let to = pane_target(&app, 1);
         let blocking = |cid: &str, agent: &str| {
             serde_json::json!({"correlation_id": cid, "intent": "blocking",
-                "from_agent": agent, "from_host": "atlas"})
+                "from_agent": agent})
         };
 
-        // Rotation under a claimed host buys nothing past the first.
+        // Rotating claimed agent ids buys nothing past the first.
         let first = claimed_send(&mut app, &to, blocking("c-1", "agent_x_1"));
         assert!(
             !first.to_string().contains(super::BLOCKING_BUDGET_SPENT),
@@ -3717,13 +3476,11 @@ mod tests {
             app,
             MsgSendParams {
                 from_agent: Some(from_agent),
-                from_host: None,
                 to: MessageTarget::Pane { pane: to },
                 body: format!("question {correlation}"),
                 correlation_id: Some(correlation.into()),
                 in_reply_to: None,
                 intent,
-                intent_unrecognised: None,
             },
         )
     }
