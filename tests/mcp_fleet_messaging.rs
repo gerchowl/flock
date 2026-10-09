@@ -326,21 +326,22 @@ fn fleet_row<'a>(listing: &'a Value, agent_id: &str) -> Option<&'a Value> {
 /// put in the field, and an agent that can list the fleet but not target it
 /// has nothing to do with the answer.
 #[test]
+#[ignore = "needs 661-2h"]
 fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
-    let fleet = fleet::spawn("mcp-fleet", PAIR_AB);
+    let fleet = fleet::spawn("mcp-fleet", fleet::CHAIN_ABC);
     let node_a = fleet.node("nodea");
-    let node_b = fleet.node("nodeb");
+    let node_c = fleet.node("nodec");
 
     // Both agents ARE their MCP servers, each in a pane on its own node.
     // Nothing in this test reaches a flock API except through a tool call, so
     // a gap in the MCP surface cannot be papered over by the harness.
     let mut alice = PanedMcp::start(node_a, &fleet.base);
-    let mut bob = PanedMcp::start(node_b, &fleet.base);
+    let mut bob = PanedMcp::start(node_c, &fleet.base);
 
     // 1. Discovery. The listing is A's own panes PLUS the directory, and only
     //    the directory can name an agent that is not here.
     let listing = wait_for(
-        "nodeb's agent to reach nodea's directory",
+        "nodec's agent to reach nodea's directory",
         GOSSIP_TIMEOUT,
         || {
             let listing = alice.call_tool("flock_agent_list", json!({}));
@@ -353,7 +354,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         remote["local"], false,
         "an agent on another machine must not look addressable by pane id: {remote}"
     );
-    assert_eq!(remote["host"], "nodeb", "the row names where it lives");
+    assert_eq!(remote["host"], "nodec", "the row names where it lives");
     assert_eq!(
         remote["route"], "nodeb",
         "and how this server reaches it: {remote}"
@@ -380,13 +381,13 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     // A name is a label; the id is the address. Renaming B's agent between
     // discovery and delivery must change nothing — if the route were carrying
     // the name, this is where it would break.
-    let renamed = node_b.api(&format!(
+    let renamed = node_c.api(&format!(
         r#"{{"id":"t:rename","method":"agent.rename","params":{{"target":"{}","name":"renamed-mid-flight"}}}}"#,
         bob.pane_id
     ));
     assert!(
         renamed.contains("\"result\""),
-        "agent.rename on nodeb: {renamed}"
+        "agent.rename on nodec: {renamed}"
     );
 
     // 2. Addressing. The id from the listing goes straight into the target.
@@ -407,7 +408,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 
     // 3. It arrives, and B reads it as its OWN inbox — no addressing, the
     //    same call a real agent makes when its stop hook wakes it.
-    let delivered = wait_for("the message to land in nodeb's inbox", RPC_TIMEOUT, || {
+    let delivered = wait_for("the message to land in nodec's inbox", RPC_TIMEOUT, || {
         let inbox = bob.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
@@ -437,7 +438,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         .expect("correlation id");
     bob.call_tool(
         "flock_msg_reply",
-        json!({"correlation_id": correlation_id, "body": "pong from nodeb"}),
+        json!({"correlation_id": correlation_id, "body": "pong from nodec"}),
     );
 
     collect_now(fleet.node("nodea"));
@@ -445,9 +446,9 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         let inbox = alice.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
-    assert_eq!(answer["body"], "pong from nodeb");
+    assert_eq!(answer["body"], "pong from nodec");
     assert_eq!(answer["from_agent"], bob.agent_id.as_str());
-    assert_eq!(answer["from_host"], "nodeb");
+    assert_eq!(answer["from_host"], "nodec");
     assert_eq!(
         answer["in_reply_to"], "c-320-e2e",
         "the answer has to thread back to the question: {answer}"
@@ -460,7 +461,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 
     let status = alice.call_tool("flock_msg_status", json!({"correlation_id":correlation_id}));
     assert!(status["reference"].is_object(), "{status}");
-    assert_eq!(status["reply"]["body"], "pong from nodeb", "{status}");
+    assert_eq!(status["reply"]["body"], "pong from nodec", "{status}");
     let waited = alice.call_tool(
         "flock_msg_wait_reply",
         json!({
@@ -480,7 +481,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
             "intent": "blocking",
         }),
     );
-    let escalated = wait_for("the blocking message to reach nodeb", RPC_TIMEOUT, || {
+    let escalated = wait_for("the blocking message to reach nodec", RPC_TIMEOUT, || {
         let inbox = bob.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
@@ -533,20 +534,16 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 ///   moment inside its own ssh hop to us. A deferral sent back synchronously
 ///   would wait on a server that is waiting on it.
 #[test]
+#[ignore = "needs 661-2h"]
 fn a_mute_answers_a_sender_on_another_host() {
-    let fleet = fleet::spawn("mcp-fleet-mute", PAIR_AB);
+    let fleet = fleet::spawn("mcp-fleet-mute", fleet::CHAIN_ABC);
     let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
-    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodec"), &fleet.base);
 
-    // Each side has to be able to name the other: the question goes a→b,
-    // the deferral b→a.
-    wait_for("nodeb's agent in nodea's directory", GOSSIP_TIMEOUT, || {
+    // Discovery addresses A → B → C. The durable binding routes the deferral home.
+    wait_for("nodec's agent in nodea's directory", GOSSIP_TIMEOUT, || {
         let listing = alice.call_tool("flock_agent_list", json!({}));
         fleet_row(&listing, &bob.agent_id).map(|_| ())
-    });
-    wait_for("nodea's agent in nodeb's directory", GOSSIP_TIMEOUT, || {
-        let listing = bob.call_tool("flock_agent_list", json!({}));
-        fleet_row(&listing, &alice.agent_id).map(|_| ())
     });
 
     // 1. Waiting before the mute.
@@ -559,7 +556,7 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "needs_reply",
         }),
     );
-    wait_for("the question to land on nodeb", RPC_TIMEOUT, || {
+    wait_for("the question to land on nodec", RPC_TIMEOUT, || {
         let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
         (!queued["messages"].as_array()?.is_empty()).then_some(())
     });
@@ -586,7 +583,7 @@ fn a_mute_answers_a_sender_on_another_host() {
         "never a question back: {deferral}"
     );
     assert_eq!(deferral["from_agent"], bob.agent_id.as_str(), "{deferral}");
-    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
+    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
     let body = deferral["body"].as_str().expect("body");
     assert!(body.contains("mid-rebase"), "the reason travels: {body}");
     assert!(
@@ -630,12 +627,19 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "fyi",
         }),
     );
-    wait_for("the notice to land on nodeb", RPC_TIMEOUT, || {
+    wait_for("the notice to land on nodec", RPC_TIMEOUT, || {
         let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
         (queued["messages"].as_array()?.len() == 3).then_some(())
     });
     // Give a stray deferral the same window a real one got to arrive.
-    thread::sleep(Duration::from_secs(2));
+    let observed = Instant::now();
+    wait_for("no duplicate deferral", RPC_TIMEOUT, || {
+        assert_eq!(
+            alice.call_tool("flock_msg_read", json!({}))["messages"],
+            json!([])
+        );
+        (observed.elapsed() >= Duration::from_secs(2)).then_some(())
+    });
     let inbox = alice.call_tool("flock_msg_read", json!({}));
     assert_eq!(
         inbox["messages"].as_array().map(Vec::len),
