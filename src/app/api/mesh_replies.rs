@@ -192,6 +192,7 @@ impl App {
                         store.collect_answers(origin, query, now_ms() as i64)
                     }
                     Collect::Outbound { outbound } => store.collect_outbound(
+                        crate::mesh::store::Offer::Step1RequestsOnly,
                         self.node_id
                             .as_deref()
                             .ok_or("mesh node identity unavailable")?,

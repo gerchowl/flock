@@ -67,7 +67,10 @@ pub(crate) fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> 
 pub(crate) fn read<T>(f: impl FnOnce(&Store) -> Result<T, String>) -> Result<Option<T>, String> {
     let writer = writer().lock().map_err(|_| "mesh store poisoned")?;
     if writer.suspended {
-        return Err("mesh store suspended for handoff".into());
+        return Err(writer
+            .reason
+            .clone()
+            .unwrap_or_else(|| "mesh store suspended for handoff".into()));
     }
     writer.store.as_ref().map(f).transpose()
 }
@@ -177,6 +180,9 @@ impl TestStore {
         super::delivery::Deliver {
             remaining_ms: super::store::CUSTODY_TTL_MS,
             envelope: super::store::Envelope {
+                kind: Default::default(),
+                origin_key: Vec::new(),
+                signature: Vec::new(),
                 return_binding: super::store::ReturnBinding::mint(
                     key.clone(),
                     "nodeb".into(),

@@ -109,8 +109,9 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  without --after it waits from the cursor the delegate recorded with its latest submit\n",
     "  --timeout MS        counted from this command, not from the submit that started the round\n",
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
+    "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 8 not started, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -327,6 +328,7 @@ mod exit {
     /// settle with no reply at all inside the grace.
     pub(super) const NO_SENTINEL: i32 = 5;
     pub(super) const STALLED: i32 = 7;
+    pub(super) const NOT_STARTED: i32 = 8;
 }
 
 /// Characters a brief path may not contain.
@@ -3775,6 +3777,7 @@ enum Outcome {
     NoResult,
     AgentBlocked,
     Stalled,
+    NotStarted,
     Timeout,
 }
 
@@ -3789,6 +3792,7 @@ impl Outcome {
             Self::NoResult => "no_result",
             Self::AgentBlocked => "agent_blocked",
             Self::Stalled => "stalled",
+            Self::NotStarted => "not_started",
             Self::Timeout => "timeout",
         }
     }
@@ -3800,6 +3804,7 @@ impl Outcome {
             Self::Gone => super::settled::exit::GONE,
             Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
             Self::Stalled => exit::STALLED,
+            Self::NotStarted => exit::NOT_STARTED,
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
         }
@@ -3880,6 +3885,25 @@ enum TurnCheck {
     Failed(String),
 }
 
+#[path = "delegate_start_watch.rs"]
+mod start_watch;
+
+fn idle_without_new_turn(
+    before: &super::settled::Cursor,
+    current: &super::settled::Cursor,
+    status: crate::api::schema::AgentStatus,
+) -> bool {
+    !before.working
+        && !current.working
+        && before.terminal_id == current.terminal_id
+        && before.epoch == current.epoch
+        && before.entries == current.entries
+        && matches!(
+            status,
+            crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+        )
+}
+
 struct Await<'a> {
     /// The harness whose store this await polls and whose grace it waits out.
     ///
@@ -3920,7 +3944,24 @@ impl Await<'_> {
             Instant::now(),
         );
 
+        let baseline = self
+            .after
+            .as_deref()
+            .and_then(|raw| super::settled::Cursor::parse(raw).ok());
+        let now = Instant::now();
+        let submitted = now
+            .checked_sub(Duration::from_millis(
+                now_ms().saturating_sub(self.submitted_at_ms),
+            ))
+            .unwrap_or(now);
+        let mut start_watch = start_watch::StartWatch::new(
+            baseline,
+            crate::detect::parse_agent_label(self.harness.name),
+            submitted,
+            Duration::from_millis(self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS)),
+        );
         loop {
+            let mut not_started = false;
             let remaining = self.remaining_timeout_ms();
             let settled = super::settled::settled_wait_observed(
                 "delegate",
@@ -3933,16 +3974,24 @@ impl Await<'_> {
                 remaining,
                 &mut |sample| {
                     let Some(super::settled::Sample::Record {
-                        status, pane_id, ..
+                        status,
+                        pane_id,
+                        cursor,
                     }) = sample
                     else {
                         monitor.interrupted(Instant::now());
+                        start_watch.interrupted();
                         return false;
                     };
                     let Some(screen) = detection_screen(pane_id, self.deadline) else {
                         monitor.interrupted(Instant::now());
+                        start_watch.interrupted();
                         return false;
                     };
+                    if start_watch.observe(cursor, *status, &screen, Instant::now()) {
+                        not_started = true;
+                        return true;
+                    }
                     let status = match status {
                         crate::api::schema::AgentStatus::Working => "working",
                         crate::api::schema::AgentStatus::Blocked => "blocked",
@@ -3954,7 +4003,17 @@ impl Await<'_> {
             )?;
 
             let settled_cursor = settled.turn_cursor().unwrap_or_default().to_string();
-            match self.after_settle(settled, &settled_cursor) {
+            let decision = if not_started
+                && matches!(settled, super::settled::SettledOutcome::Stalled { .. })
+            {
+                SettledDecision::Report {
+                    outcome: Outcome::NotStarted,
+                    info: None,
+                }
+            } else {
+                self.after_settle(settled, &settled_cursor)
+            };
+            match decision {
                 SettledDecision::Report { outcome, info } => {
                     let code = outcome.exit_code();
                     let screen = detection_screen(&self.entry.pane_id, None)
@@ -3964,7 +4023,12 @@ impl Await<'_> {
                         .flatten()
                         .unwrap_or_else(|| super::delegate_verdict::Verdict {
                             verdict: outcome.as_str().into(),
-                            reason: "round_end".into(),
+                            reason: if outcome == Outcome::NotStarted {
+                                "idle_without_new_turn"
+                            } else {
+                                "round_end"
+                            }
+                            .into(),
                             retry_after_ms: None,
                             last_line: super::delegate_verdict::last_line(&screen),
                         });
@@ -4286,9 +4350,13 @@ fn event_observation(
     verdict: &super::delegate_verdict::Verdict,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(verdict).unwrap_or_else(|_| serde_json::json!({}));
-    value["s1"] = serde_json::to_value(
-        super::delegate_s1::Client::from_config().judge(&format!("flk delegate {name}"), screen),
-    )
+    value["s1"] = serde_json::to_value(super::delegate_s1::Client::from_config().judge(
+        &format!(
+            "flk delegate {name}\nObserved outcome: {}; reason: {}",
+            verdict.verdict, verdict.reason
+        ),
+        screen,
+    ))
     .unwrap_or(serde_json::Value::Null);
     value
 }
@@ -4418,6 +4486,32 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_started_requires_idle_same_execution_and_no_new_turn() {
+        use super::super::settled::Cursor;
+        use crate::api::schema::AgentStatus;
+        let before = Cursor::parse("term_fixture:0:3:8:i").unwrap();
+        for (raw, status, expected) in [
+            ("term_fixture:0:3:8:i", AgentStatus::Idle, true),
+            ("term_fixture:0:3:10:i", AgentStatus::Done, true),
+            ("term_fixture:0:4:10:i", AgentStatus::Idle, false),
+            ("term_fixture:1:3:8:i", AgentStatus::Idle, false),
+            ("term_other:0:3:8:i", AgentStatus::Idle, false),
+            ("term_fixture:0:3:8:w", AgentStatus::Working, false),
+            ("term_fixture:0:3:8:i", AgentStatus::Blocked, false),
+            ("term_fixture:0:3:8:i", AgentStatus::Unknown, false),
+        ] {
+            assert_eq!(
+                idle_without_new_turn(&before, &Cursor::parse(raw).unwrap(), status),
+                expected
+            );
+        }
+        let working = Cursor::parse("term_fixture:0:3:8:w").unwrap();
+        assert!(!idle_without_new_turn(&working, &before, AgentStatus::Idle));
+        assert_eq!(Outcome::NotStarted.as_str(), "not_started");
+        assert_eq!(Outcome::NotStarted.exit_code(), 8);
+    }
 
     #[test]
     fn submit_confirmation_requires_a_new_working_entry() {

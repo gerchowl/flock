@@ -629,7 +629,7 @@ fn cold_restart_quarantines_undecodable_mail_and_restores_valid_records() {
             .unwrap();
     let count: i64 = db
         .query_row(
-            "SELECT count(*) FROM envelopes WHERE state='quarantined' AND length(body)>0",
+            "SELECT count(*) FROM envelopes WHERE state='quarantined' AND length(body)=0 AND length(metadata)>0",
             [],
             |row| row.get(0),
         )
