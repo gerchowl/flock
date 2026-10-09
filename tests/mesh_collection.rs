@@ -673,6 +673,24 @@ fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
 fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
     let fleet = fleet::spawn("mesh-held-enroll", PAIR);
     let (sender, _) = question(&fleet, "held-enroll");
+    let db = database(fleet.node("nodeb"));
+    let sender_node = fleet.node_id("nodea");
+    // Delivery does not imply that reverse gossip and route exchange finished.
+    // Complete discovery while the edge is live: after the cut an undiscovered
+    // owner cannot arrive, and waiting for it would measure a partition (#833).
+    fleet::wait_until("route and owner discovery", Duration::from_secs(10), || {
+        let status = request(fleet.node("nodeb"), "peers.enrollment", json!({}));
+        let route_ready = status["result"]["routes"]
+            .as_array()?
+            .iter()
+            .any(|route| route["node"] == sender_node);
+        let owner_ready: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mesh_meta WHERE name='route_boot_ms') AND EXISTS(SELECT 1 FROM agent_owners WHERE agent_id=?1 AND node_id=?2)",
+            rusqlite::params![sender["agent_id"].as_str().unwrap(), sender_node],
+            |r| r.get(0),
+        ).unwrap();
+        (route_ready && owner_ready).then_some(())
+    });
     // Both collection lanes must be unavailable to exercise an idle holder.
     fleet.refuse_edge("nodea", "nodeb");
     fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
@@ -682,7 +700,6 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
         "waiting for an outbound edge",
     );
     assert_eq!(sent["result"]["state"], "held", "{sent}");
-    let db = database(fleet.node("nodeb"));
     assert_eq!(
         db.query_row(
             "SELECT state FROM envelopes WHERE request_id IS NOT NULL",
@@ -692,16 +709,6 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
         .unwrap(),
         "held"
     );
-    // Initial route and directory discovery legitimately persist metadata.
-    // Finish both before measuring an otherwise idle custody database.
-    fleet::wait_until("route and owner discovery", Duration::from_secs(10), || {
-        let ready: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mesh_meta WHERE name='route_boot_ms') AND EXISTS(SELECT 1 FROM agent_owners WHERE agent_id=?1)",
-            [sender["agent_id"].as_str().unwrap()],
-            |r| r.get(0),
-        ).unwrap();
-        ready.then_some(())
-    });
     let mut timeline = diagnostics::WriteTimeline::install(&db);
     let version = timeline.sample(&db, "idle baseline");
     let idle = std::time::Instant::now();
@@ -970,7 +977,7 @@ fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
 // This integration probe executes the real CLI against only its isolated server.
 #[allow(clippy::disallowed_methods)]
 fn cli_status(node: &Node, correlation: &str) -> Value {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .env_clear()
         .env("HOME", &node.home)
         .env("XDG_CONFIG_HOME", &node.config_home)

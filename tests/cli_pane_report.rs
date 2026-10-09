@@ -13,14 +13,17 @@
 
 #![allow(clippy::disallowed_methods)] // The harness drives the compiled binary.
 
+mod support;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 const OK_RESPONSE: &str = r#"{"id":"cli:request","result":{"type":"ok"}}"#;
 const PANE_NOT_FOUND: &str =
@@ -112,7 +115,10 @@ fn run_without_a_server(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["pane", "report-agent"])
         .args(args)
-        .env("FLOCK_SOCKET_PATH", "/nonexistent/flk-454-no-server.sock")
+        .env(
+            "FLOCK_SOCKET_PATH",
+            std::env::temp_dir().join(format!("flk-454-no-server-{}.sock", std::process::id())),
+        )
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_SESSION")
         .env_remove("FLOCK_ENV")
@@ -363,7 +369,10 @@ fn a_flag_value_is_still_its_flags_at_any_position() {
 fn help_advertises_the_optional_pane() {
     let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(["pane", "help"])
-        .env("FLOCK_SOCKET_PATH", "/nonexistent/flk-454-help.sock")
+        .env(
+            "FLOCK_SOCKET_PATH",
+            std::env::temp_dir().join(format!("flk-454-help-{}.sock", std::process::id())),
+        )
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_SESSION")
         .env_remove("FLOCK_ENV")

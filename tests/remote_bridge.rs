@@ -11,10 +11,13 @@
 // — TracedCommand (logging redesign PR-3) is a source-code lint, not a test-scaffolding one.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()

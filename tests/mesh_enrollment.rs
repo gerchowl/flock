@@ -30,7 +30,7 @@ fn enrollment(node: &Node, peer: &str, state: &str) -> Value {
 // Integration scaffolding launches the public CLI outside the product logging funnel.
 #[allow(clippy::disallowed_methods)]
 fn cli_text(node: &Node, args: &[&str]) -> String {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
         .env_clear()
         .env("HOME", &node.home)
@@ -324,7 +324,8 @@ fn authenticated_relay_cannot_reset_enrollment() {
 #[test]
 fn mcp_cannot_reset_enrollment() {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
+    use support::environment::Command;
     let fleet = fleet::spawn("mesh-reset-mcp", PAIR);
     let node = fleet.node("dialer.test");
     let pinned = enrollment(node, "acceptor.test", "pinned");
@@ -431,7 +432,7 @@ fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
         vec!["peers", "status", "--json"],
     ] {
         outputs.push(
-            std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+            support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
                 .args(args)
                 .env_clear()
                 .env("HOME", dir.as_path())
