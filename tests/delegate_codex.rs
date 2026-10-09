@@ -908,7 +908,12 @@ while True:
             if delay_file.exists():
                 sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› ' + text.decode() + '\r\n')
                 sys.stdout.flush()
-                time.sleep(float(delay_file.read_text()) / 1000)
+                delay = float(delay_file.read_text())
+                if delay > 2000:
+                    while not (log.parent / 'footer-observed').exists(): time.sleep(0.01)
+                    while not (log.parent / 'release-footer').exists(): time.sleep(0.01)
+                else:
+                    time.sleep(delay / 1000)
             draw()
         continue
     if byte == b'\r' and not paste:
@@ -995,11 +1000,46 @@ while True:
     );
     assert!(ansi.status.success());
     fs::write(server.base.join("idle-detected"), "").unwrap();
-    let response = request(&server, &serde_json::json!({
+    let submit = serde_json::json!({
         "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
-    }).to_string());
+    });
+    let response = if footer_delay_ms > 2000 {
+        let mut stream = UnixStream::connect(&server.socket).unwrap();
+        writeln!(stream, "{submit}").unwrap();
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let screen = request(
+                &server,
+                &serde_json::json!({
+                    "id":"partial", "method":"pane.read", "params":{
+                        "pane_id":pane, "source":"detection", "format":"text"
+                    }
+                })
+                .to_string(),
+            );
+            let text = screen["result"]["read"]["text"].as_str().unwrap();
+            if text.contains("› hello") && !text.contains("? for shortcuts") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partial frame not observed: {screen}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(server.base.join("footer-observed"), "").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    } else {
+        request(&server, &submit.to_string())
+    };
     if footer_delay_ms > 2000 {
         assert_eq!(response["result"]["outcome"], "unconfirmed", "{response}");
+        assert!(
+            response["result"]["attempt"]["submit_sent_at_ms"].is_null(),
+            "{response}"
+        );
         assert_eq!(
             response["result"]["reason"], "owned_composer_not_visible",
             "{response}"
@@ -1008,6 +1048,7 @@ while True:
             fs::read(server.base.join("guarded-bytes")).unwrap(),
             b"\x1b[200~hello\x1b[201~"
         );
+        fs::write(server.base.join("release-footer"), "").unwrap();
         return;
     }
     assert_eq!(

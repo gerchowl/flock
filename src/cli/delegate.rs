@@ -109,7 +109,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  without --after it waits from the cursor the delegate recorded with its latest submit\n",
     "  --timeout MS        counted from this command, not from the submit that started the round\n",
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
-    "  not_started means idle with no new turn since the submit cursor (reason: idle_without_new_turn)\n",
+    "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
     "                    6 agent blocked, 7 stalled, 8 not started, 124 timeout, 2 usage, 1 failure",
 );
@@ -3885,6 +3885,9 @@ enum TurnCheck {
     Failed(String),
 }
 
+#[path = "delegate_start_watch.rs"]
+mod start_watch;
+
 fn idle_without_new_turn(
     before: &super::settled::Cursor,
     current: &super::settled::Cursor,
@@ -3945,6 +3948,18 @@ impl Await<'_> {
             .after
             .as_deref()
             .and_then(|raw| super::settled::Cursor::parse(raw).ok());
+        let now = Instant::now();
+        let submitted = now
+            .checked_sub(Duration::from_millis(
+                now_ms().saturating_sub(self.submitted_at_ms),
+            ))
+            .unwrap_or(now);
+        let mut start_watch = start_watch::StartWatch::new(
+            baseline,
+            crate::detect::parse_agent_label(self.harness.name),
+            submitted,
+            Duration::from_millis(self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS)),
+        );
         loop {
             let mut not_started = false;
             let remaining = self.remaining_timeout_ms();
@@ -3965,16 +3980,15 @@ impl Await<'_> {
                     }) = sample
                     else {
                         monitor.interrupted(Instant::now());
+                        start_watch.interrupted();
                         return false;
                     };
                     let Some(screen) = detection_screen(pane_id, self.deadline) else {
                         monitor.interrupted(Instant::now());
+                        start_watch.interrupted();
                         return false;
                     };
-                    if baseline
-                        .as_ref()
-                        .is_some_and(|before| idle_without_new_turn(before, cursor, *status))
-                    {
+                    if start_watch.observe(cursor, *status, &screen, Instant::now()) {
                         not_started = true;
                         return true;
                     }

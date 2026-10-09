@@ -1811,3 +1811,34 @@ async fn guarded_submit_waits_for_unknown_or_other_until_original_deadline() {
         assert!(drain(&mut pty).is_empty());
     }
 }
+
+#[tokio::test]
+async fn idle_wake_reports_fired_only_when_enter_is_sent() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    let text = super::idle_wake_text(1);
+    assert_eq!(drain(&mut pty), vec![text.clone().into_bytes()]);
+    let now = Instant::now() + GAP;
+    runtime(&app).test_process_pty_bytes(b"\x1b[2J\x1b[H");
+    assert_eq!(
+        app.submit_idle_wake(&pane, now),
+        super::Decision::Suppressed("confirm_pending")
+    );
+    assert!(drain(&mut pty).is_empty());
+    runtime(&app).test_process_pty_bytes(&claude_screen(&text));
+    assert_eq!(
+        app.submit_idle_wake(&pane, now + Duration::from_millis(50)),
+        super::Decision::Submitted
+    );
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    assert_eq!(
+        app.submit_idle_wake(&pane, now + Duration::from_millis(100)),
+        super::Decision::Suppressed("confirm_pending")
+    );
+    assert!(drain(&mut pty).is_empty());
+}
