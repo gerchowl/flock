@@ -55,6 +55,8 @@ png = "0.18"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+# Detect unknown config fields using the deserializer, including aliases and dynamic maps.
+serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
