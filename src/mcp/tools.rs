@@ -149,10 +149,10 @@ pub(super) fn table() -> &'static [Tool] {
                           Limits: 20 messages/min, 32 \
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
-                          the fleet), `peer_not_configured` (found it, but \
-                          no edge or hub reaches its host), \
-                          `peer_unreachable` (a hop failed; the message names \
-                          which machine could not reach which, and why), \
+                          the fleet). Mesh outcomes: `queued` or `held` \
+                          while waiting for a path, `refused` with a reason; \
+                          `peer_incompatible` requires upgrading the peer. \
+                          Other refusals: \
                           `msg_not_allowed` (the receiver declines), \
                           `sender_unresolved` (a cross-host send needs an \
                           attestable sender, so it must come from inside a \
@@ -915,10 +915,7 @@ fn build_agent_result(args: Value) -> Result<Method, McpError> {
 }
 
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
-    // `from_agent`/`from_host` stay unset on purpose: they are a RELAY's
-    // assertion about a sender it could not attest locally. The server reads
-    // this caller's identity from process ancestry, and letting an MCP client
-    // name itself would make the sender stamp a free-text claim.
+    // MCP sender identity comes from the server's process ancestry.
     let to_value = args
         .get("to")
         .cloned()
@@ -927,7 +924,6 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
-        from_host: None,
         to,
         body: required_string(&args, "body")?,
         correlation_id: optional_string(&args, "correlation_id")?,
@@ -938,7 +934,6 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         // envelope, and the receiver trusts it more for looking deliberate.
         // Refusing the call is the cheapest forcing function there is.
         intent: required_intent(&args, "intent")?,
-        intent_unrecognised: None,
     }))
     .and_then(|method| {
         // #576: waiting on an `fyi` waits for an answer nobody was asked for.

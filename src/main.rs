@@ -414,7 +414,14 @@ fn switch_failure_reason(err: &io::Error) -> String {
     peers::failure_text(&err.to_string())
 }
 
-fn main() -> io::Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
@@ -680,10 +687,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let loaded_config = config::Config::load();
-    exit_if_nested_disabled(&loaded_config.config);
-
     let no_session = args.iter().any(|a| a == "--no-session");
+    let loaded_config = if no_session {
+        config::Config::load_for_server()?
+    } else {
+        config::Config::load()
+    };
+    exit_if_nested_disabled(&loaded_config.config);
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.

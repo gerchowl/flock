@@ -22,7 +22,7 @@ impl App {
         body: &str,
         params: &MsgSendParams,
     ) -> Option<String> {
-        if params.from_host.is_some() || !self.state.peers.is_empty() {
+        if !self.state.peers.is_empty() {
             return None;
         }
         let hub = self

@@ -38,16 +38,10 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// Every option `flk msg send` understands, named once.
-///
-/// The list is not decoration: the cross-host relay IS `flk msg send` run on
-/// the peer that owns the recipient (`send_peer_message`), so when a peer
-/// refuses a flag this list is that peer telling the sender which build it is
-/// running. In a version-skewed fleet that is the entire diagnosis (#380).
 const SEND_OPTIONS: &[&str] = &[
     "--repo",
     "--agent",
     "--from-agent",
-    "--from-host",
     "--correlation-id",
     "--reply-to",
     "--intent",
@@ -83,15 +77,10 @@ fn unknown_option(command: &str, flag: &str, known: &[&str]) -> String {
 struct SendArgs {
     repo: Option<String>,
     intent: MsgIntent,
-    /// A `--intent` spelling this build does not know, kept until the whole
-    /// argv is read: whether it is a refusal or a degradation depends on
-    /// whether this is a relay, and `--from-host` may come after it.
-    unknown_intent: Option<String>,
     correlation_id: Option<String>,
     in_reply_to: Option<String>,
     agent: Option<String>,
     from_agent: Option<String>,
-    from_host: Option<String>,
     /// #576: after sending, wait for the answer (`flk wait reply`).
     await_reply: bool,
     /// How long `--await` waits, in ms.
@@ -111,12 +100,10 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
     let mut parsed = SendArgs {
         repo: None,
         intent: MsgIntent::default(),
-        unknown_intent: None,
         correlation_id: None,
         in_reply_to: None,
         agent: None,
         from_agent: None,
-        from_host: None,
         await_reply: false,
         timeout_ms: None,
         json: false,
@@ -147,10 +134,6 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
                 parsed.agent = Some(value()?);
                 index += 2;
             }
-            "--from-host" => {
-                parsed.from_host = Some(value()?);
-                index += 2;
-            }
             "--from-agent" => {
                 parsed.from_agent = Some(value()?);
                 index += 2;
@@ -161,9 +144,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             // noticing is the one worth forcing.
             "--intent" => {
                 let raw = value()?;
-                let (intent, unknown) = MsgIntent::from_wire_relayed(&raw);
-                parsed.intent = intent;
-                parsed.unknown_intent = unknown.then_some(raw);
+                parsed.intent = MsgIntent::from_wire(&raw).ok_or_else(|| {
+                    format!("unknown --intent {raw:?}: expected {}", intent_spellings())
+                })?;
                 index += 2;
             }
             "--json" => {
@@ -206,18 +189,6 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             }
         }
     }
-    // ADR-0018 §1. A relayed send comes from a peer that may run a newer
-    // build, so a tier this build does not know is read as `needs_reply`:
-    // skew fails toward the recipient hearing about it. An operator typing
-    // `--intent` by hand gets the refusal instead — a typo is not skew.
-    if let Some(raw) = &parsed.unknown_intent {
-        if parsed.from_host.is_none() {
-            return Err(format!(
-                "unknown --intent {raw:?}: expected {}",
-                intent_spellings()
-            ));
-        }
-    }
     // #576. Waiting on an `fyi` would wait for an answer nobody was asked
     // for, and `--timeout` without `--await` would be silently ignored.
     if parsed.await_reply && parsed.intent == MsgIntent::Fyi {
@@ -254,12 +225,10 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     let SendArgs {
         repo,
         intent,
-        unknown_intent,
         correlation_id,
         in_reply_to,
         agent,
         from_agent,
-        from_host,
         await_reply,
         timeout_ms,
         json,
@@ -289,13 +258,11 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         id: "cli:msg:send".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent,
-            from_host,
             to,
             body,
             correlation_id,
             in_reply_to,
             intent,
-            intent_unrecognised: unknown_intent,
         }),
     })?;
     if !await_reply {
@@ -955,32 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn the_relays_own_command_line_still_parses() {
-        // The exact argv `peer_message_command` builds. If refusing unknown
-        // flags ever broke this, the fix would have closed the corruption by
-        // breaking cross-host messaging outright.
-        let parsed = parse_send_args(&argv(&[
-            "--agent",
-            "agent_atlas_1",
-            "--from-agent",
-            "agent_hopper_2",
-            "--from-host",
-            "hopper",
-            "--correlation-id",
-            "c-1",
-            "--reply-to",
-            "c-0",
-            "--intent",
-            "needs_reply",
-            "--json",
-            "--",
-            "re-derive both parameters",
-        ]))
-        .expect("the relay's own command line must survive its own refusal rule");
-        assert_eq!(parsed.agent.as_deref(), Some("agent_atlas_1"));
-        assert_eq!(parsed.from_host.as_deref(), Some("hopper"));
-        assert_eq!(parsed.in_reply_to.as_deref(), Some("c-0"));
-        assert_eq!(parsed.intent, MsgIntent::NeedsReply);
-        assert_eq!(parsed.positional, vec!["re-derive both parameters"]);
+    fn removed_from_host_flag_is_refused() {
+        let error = parse_send_args(&argv(&["--from-host", "nodea", "p1", "hello"]))
+            .expect_err("removed flag");
+        assert!(error.contains("unknown option \"--from-host\""), "{error}");
     }
 }
