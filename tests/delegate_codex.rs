@@ -861,12 +861,33 @@ fn guarded_submit_first_enter_works_with_late_composer_repaint() {
     guarded_socket("codex", false, true);
 }
 
+#[test]
+fn guarded_submit_codex_waits_for_footer_after_partial_repaint() {
+    guarded_socket_repaint("codex", false, true, 600, false);
+}
+
+#[test]
+fn guarded_submit_codex_missing_footer_refuses_before_typing() {
+    guarded_socket_repaint("codex", false, true, 0, true);
+}
+
 fn guarded_socket(kind: &str, slow: bool, first_works: bool) {
+    guarded_socket_repaint(kind, slow, first_works, 0, false);
+}
+
+fn guarded_socket_repaint(
+    kind: &str,
+    slow: bool,
+    first_works: bool,
+    footer_delay_ms: u64,
+    missing_footer: bool,
+) {
     let server = start_server();
     let script = r#"import os, sys, tty, time
 from pathlib import Path
 tty.setraw(0)
 log = Path(__file__).parent.parent / 'guarded-bytes'
+log.write_bytes(b'')
 text = b''
 enters = 0
 paste = False
@@ -877,7 +898,11 @@ def draw(working=False):
     sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n' + chrome + '› ' + body + '\r\n  ? for shortcuts\r\n')
     sys.stdout.flush()
 sys.stdout.write('\x1b[?2004h')
-draw()
+if (log.parent / 'missing-footer').exists():
+    sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› hello\r\n')
+    sys.stdout.flush()
+else:
+    draw()
 if (log.parent / 'slow-reader').exists():
     while not (log.parent / 'idle-detected').exists(): time.sleep(0.01)
     time.sleep(0.35)
@@ -887,7 +912,15 @@ while True:
     if byte == b'\x1b' or pending:
         pending += byte
         if pending == b'\x1b[200~': paste = True; pending = b''
-        elif pending == b'\x1b[201~': paste = False; pending = b''; draw()
+        elif pending == b'\x1b[201~':
+            paste = False
+            pending = b''
+            delay_file = log.parent / 'footer-delay'
+            if delay_file.exists():
+                sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n› ' + text.decode() + '\r\n')
+                sys.stdout.flush()
+                time.sleep(float(delay_file.read_text()) / 1000)
+            draw()
         continue
     if byte == b'\r' and not paste:
         enters += 1
@@ -918,6 +951,16 @@ while True:
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    if missing_footer {
+        fs::write(server.base.join("missing-footer"), "").unwrap();
+    }
+    if footer_delay_ms > 0 {
+        fs::write(
+            server.base.join("footer-delay"),
+            footer_delay_ms.to_string(),
+        )
+        .unwrap();
+    }
     if slow {
         fs::write(server.base.join("slow-reader"), "").unwrap();
     }
@@ -953,7 +996,9 @@ while True:
         ],
     );
     assert!(capture.status.success(), "{}", stderr(&capture));
-    assert!(stdout(&capture).contains(if kind == "opencode" {
+    assert!(stdout(&capture).contains(if missing_footer {
+        "› hello"
+    } else if kind == "opencode" {
         "commands"
     } else {
         "? for shortcuts"
@@ -966,9 +1011,41 @@ while True:
     );
     assert!(ansi.status.success());
     fs::write(server.base.join("idle-detected"), "").unwrap();
-    let response = request(&server, &serde_json::json!({
+    let submit = serde_json::json!({
         "id":"submit", "method":"agent.send", "params":{"target":pane,"text":"hello","submit":true}
-    }).to_string());
+    });
+    if missing_footer {
+        // Observe the partial FIRST frame before issuing submit. There is no
+        // earlier empty editor that could authorize Enter if PTY reads lag.
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let screen = request(
+                &server,
+                &serde_json::json!({
+                    "id":"partial", "method":"pane.read", "params":{
+                        "pane_id":pane, "source":"detection", "format":"text"
+                    }
+                })
+                .to_string(),
+            );
+            let text = screen["result"]["read"]["text"].as_str().unwrap();
+            if text.contains("› hello") && !text.contains("? for shortcuts") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partial frame not observed: {screen}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let response = request(&server, &submit.to_string());
+        assert_eq!(response["error"]["code"], "unknown_composer", "{response}");
+        assert!(fs::read(server.base.join("guarded-bytes"))
+            .unwrap()
+            .is_empty());
+        return;
+    }
+    let response = request(&server, &submit.to_string());
     assert_eq!(
         response["result"]["outcome"], "observed_accepted",
         "{response}"
