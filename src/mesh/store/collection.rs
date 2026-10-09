@@ -353,13 +353,13 @@ impl<D: DiskSpace> Store<D> {
 
 impl<D: DiskSpace> Store<D> {
     /// The existing summary carries only ready work, so a backed-off row cannot cause hot polling.
-    pub fn has_outbound(&self, local: &str, hub: &str, wall_ms: i64) -> Result<bool> {
+    pub fn has_outbound(&self, hub: &str, wall_ms: i64) -> Result<bool> {
         let mut clock = self.clock()?;
         if clock.paused {
             return Ok(false);
         }
         let now = clock.advance(wall_ms);
-        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND request_origin IS NULL AND state='held' AND recipient_node=?3 AND retry_at<=?2 AND custody_deadline>?2)", params![local, now, hub], |r| r.get(0))?)
+        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2)", params![hub, now], |r| r.get(0))?)
     }
 
     /// Step-1 importers accept only local requests addressed to their neighbor.

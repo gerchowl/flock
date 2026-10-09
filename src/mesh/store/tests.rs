@@ -2183,15 +2183,9 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
     assert!(rest
         .iter()
         .all(|r| !first.iter().any(|f| f.envelope.key == r.envelope.key)));
-    assert!(!store
-        .has_outbound("origin.example", "receiver.example", 3)
-        .unwrap());
-    assert!(!store
-        .has_outbound("origin.example", "other.example", 5002)
-        .unwrap());
-    assert!(store
-        .has_outbound("origin.example", "receiver.example", 5002)
-        .unwrap());
+    assert!(!store.has_outbound("receiver.example", 3).unwrap());
+    assert!(!store.has_outbound("other.example", 5002).unwrap());
+    assert!(store.has_outbound("receiver.example", 5002).unwrap());
 }
 
 #[test]
@@ -4423,4 +4417,106 @@ fn delivered_receipt_does_not_acknowledge_a_held_offer() {
     let settled = store.get(&mail.key).unwrap().unwrap();
     assert_eq!(settled.state, "delivered");
     assert!(settled.envelope.body.is_empty());
+}
+
+#[test]
+fn forwarded_returns_are_advertised_by_next_hop_without_committing() {
+    for kind in [Kind::Message, Kind::Receipt] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        store.set_local_node("hub.example");
+        let mut mail = envelope();
+        mail.kind = kind;
+        mail.request_key = Some(MessageKey::mint("request.example".into(), 0).unwrap());
+        store
+            .accept_origin(&mail, "next.example", Admission::Held, 7, 0)
+            .unwrap();
+        let before = store.connection.total_changes();
+        assert!(store.has_outbound("next.example", 1).unwrap());
+        assert!(!store.has_outbound("receiver.example", 1).unwrap());
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute("UPDATE envelopes SET retry_at=5000", [])
+            .unwrap();
+        assert!(!store.has_outbound("next.example", 4999).unwrap());
+        assert!(store.has_outbound("next.example", 5000).unwrap());
+    }
+}
+
+#[test]
+fn routed_receipt_and_forwarded_answer_replays_do_not_commit() {
+    for (kind, admission) in [
+        (Kind::Receipt, Admission::Inbox),
+        (Kind::Receipt, Admission::Held),
+        (Kind::Message, Admission::Held),
+        (Kind::Message, Admission::Custody),
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mut mail = envelope();
+        mail.kind = kind;
+        mail.request_key = Some(MessageKey::mint("request.example".into(), 0).unwrap());
+        store.accept(&mail, CUSTODY_TTL_MS, admission, 0).unwrap();
+        let observer = rusqlite::Connection::open(&fixture.path).unwrap();
+        let version = || {
+            observer
+                .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = version();
+        let changes = store.connection.total_changes();
+        for now in 1..20 {
+            assert_eq!(
+                store
+                    .accept(&mail, CUSTODY_TTL_MS - now, admission, now)
+                    .unwrap(),
+                Accepted::Duplicate
+            );
+        }
+        assert_eq!(store.connection.total_changes(), changes);
+        assert_eq!(version(), before);
+    }
+}
+
+#[test]
+fn forwarding_refuses_a_known_return_loop_before_taking_custody() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    store.set_local_node("hub.example");
+    let mail = crate::mesh::sign::tests::signed();
+    let visited = vec![mail.key.origin_node.clone(), "hub.example".into()];
+    let before = store.connection.total_changes();
+    assert!(matches!(
+        store.accept_forward(
+            &mail,
+            CUSTODY_TTL_MS,
+            7,
+            &visited,
+            &mail.key.origin_node,
+            Admission::Custody,
+            1
+        ),
+        Err(Error::LoopDetected)
+    ));
+    assert!(store.get(&mail.key).unwrap().is_none());
+    assert_eq!(store.connection.total_changes(), before);
+    assert_eq!(
+        store
+            .accept_forward(
+                &mail,
+                CUSTODY_TTL_MS,
+                7,
+                &visited,
+                "next.example",
+                Admission::Held,
+                2
+            )
+            .unwrap(),
+        Accepted::New
+    );
+    assert_eq!(
+        store.get(&mail.key).unwrap().unwrap().envelope.body,
+        mail.body
+    );
 }

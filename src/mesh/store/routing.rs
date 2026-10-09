@@ -61,10 +61,14 @@ impl<D: DiskSpace> Store<D> {
         if hops_left > 8 || visited.len() > 9 || visited.last() != Some(&self.local_node) {
             return Err(Error::InvalidEnvelope);
         }
-        if visited
-            .iter()
-            .enumerate()
-            .any(|(i, node)| visited[..i].contains(node))
+        // Refuse a known return loop before taking custody. The upstream can
+        // choose another route after convergence, but this node cannot send
+        // the accepted envelope back through its immutable visited path.
+        if visited.iter().any(|node| node == next_hop)
+            || visited
+                .iter()
+                .enumerate()
+                .any(|(i, node)| visited[..i].contains(node))
         {
             return Err(Error::LoopDetected);
         }

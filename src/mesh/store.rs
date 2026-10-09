@@ -639,8 +639,12 @@ impl<D: DiskSpace> Store<D> {
             + envelope.key.message_id.len() as u64
             + envelope.correlation_id.len() as u64
             + ROW_RESERVE;
-        // Retransmitting an accepted request must not advance the clock or write WAL.
-        if envelope.request_key.is_none() {
+        // Only inbox answers can add collection debt on replay. Requests,
+        // receipts and forwarded answers must not advance the clock or write WAL.
+        if envelope.request_key.is_none()
+            || envelope.kind == Kind::Receipt
+            || admission != Admission::Inbox
+        {
             let prior: Option<Vec<u8>> = self
                 .connection
                 .query_row(

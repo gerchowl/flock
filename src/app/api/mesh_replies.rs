@@ -274,6 +274,19 @@ impl App {
     }
 
     pub(crate) fn tick_mesh_collections(&mut self) {
+        // A custody wake is actionable work, not an idle scan. Consume it only
+        // once the prior collection finishes, and before the idle tick gate.
+        for peer in &self.state.peers {
+            if !self.collection_peers.contains_key(&peer.name)
+                && crate::peer_stream::take_wake(peer)
+            {
+                self.mesh_outbound_polls
+                    .entry(peer.name.clone())
+                    .or_default()
+                    .note_wake();
+                self.mesh_collect_at = None;
+            }
+        }
         let now = std::time::Instant::now();
         if self.mesh_collect_at.is_some_and(|deadline| deadline > now) {
             return;
@@ -364,14 +377,6 @@ impl App {
         for peer in peers {
             let edge = crate::peer_stream::enrollment(&peer);
             if let Some(node) = edge.node_id.as_deref().filter(|_| edge.state == "pinned") {
-                if !self.collection_peers.contains_key(&peer.name)
-                    && crate::peer_stream::take_wake(&peer)
-                {
-                    self.mesh_outbound_polls
-                        .entry(peer.name.clone())
-                        .or_default()
-                        .note_wake();
-                }
                 // The hub's own read receipts are work even after the spoke
                 // has drained its outbox and stopped advertising pending mail.
                 let receipts_pending = with_store(|store| {
