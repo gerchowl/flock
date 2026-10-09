@@ -13,6 +13,7 @@ pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
+pub(crate) mod paste_confirm;
 pub(crate) mod self_compact;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
@@ -167,6 +168,8 @@ pub struct App {
     pub(crate) message_relays: message_relay::MessageRelays,
     /// Canonical pane ids reserved by a guarded client submission.
     pub(crate) active_submissions: std::collections::HashSet<String>,
+    /// Plain paste observation parked by `respond_or_park` after dispatch.
+    pub(crate) pending_paste: Option<paste_confirm::Paste>,
     /// Deferred submit set by `handle_agent_send` and consumed by
     /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
     /// request. A response path bypassing `respond_or_park` would reply ok
@@ -929,6 +932,7 @@ impl App {
             uplink: Default::default(),
             message_relays: Default::default(),
             pending_agent_submit: None,
+            pending_paste: None,
             active_submissions: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,

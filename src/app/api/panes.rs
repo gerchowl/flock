@@ -1009,18 +1009,17 @@ impl App {
             Ok(target) => target,
             Err(error) => return encode_error(id, &error.code, error.message),
         };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            let public = self
-                .public_pane_id(ws_idx, pane_id)
-                .unwrap_or_else(|| pane_id.raw().to_string());
-            return pane_not_found(id, &public);
-        };
-        let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
-            return encode_error(id, "pane_send_failed", err.to_string());
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        let public = self
+            .public_pane_id(ws_idx, pane_id)
+            .unwrap_or_else(|| pane_id.raw().to_string());
+        self.begin_paste(
+            id,
+            ws_idx,
+            pane_id,
+            params.text,
+            ("pane_not_found", format!("pane {public} not found")),
+            "pane_send_failed",
+        )
     }
 
     pub(super) fn handle_pane_send_input(

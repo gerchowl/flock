@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 use crate::api::schema::{
     AgentHistoryParams, AgentHistoryResult, AgentRenameParams, AgentResultInfo, AgentResultParams,
     AgentSendParams, AgentStartParams, AgentTarget, ErrorBody, HistoryTurnInfo, PaneReadResult,
@@ -617,15 +615,17 @@ impl App {
                 },
             );
         }
-        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
-        };
-        let text = crate::app::api_helpers::encode_api_text(runtime, &params.text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
-            return encode_error(id, "agent_send_failed", err.to_string());
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        self.begin_paste(
+            id,
+            resolved.ws_idx,
+            resolved.pane_id,
+            params.text,
+            (
+                "agent_not_found",
+                format!("agent target {} not found", params.target),
+            ),
+            "agent_send_failed",
+        )
     }
 }
 
