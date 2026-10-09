@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+pub(crate) mod agent_removal;
 pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
@@ -154,6 +155,7 @@ pub struct App {
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
     pub(crate) mesh_retry_at: Option<Instant>,
+    pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
     pub(crate) mesh_enrollment_generation: u64,
@@ -947,6 +949,7 @@ impl App {
             collection_peers: Default::default(),
             collection_generation: 0,
             mesh_retry_at: None,
+            pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
             mesh_enrollment_generation: 0,
@@ -1031,6 +1034,7 @@ impl App {
         crate::mesh::runtime_store::begin_recovery();
         let origin = self.node_id.clone();
         let legacy = self.mailboxes.pending_messages();
+        let recipients = self.mesh_recovery_recipients();
         let paused = self.fleet_pause.paused;
         let tx = self.event_tx.clone();
         let spawn = std::thread::Builder::new()
@@ -1038,7 +1042,9 @@ impl App {
             .spawn(move || {
                 let result = crate::mesh::runtime_store::recovery_work(|| {
                     crate::mesh::runtime_store::resume(minimum).and_then(|()| match origin {
-                        Some(origin) => api::mesh_mail::load_mesh_mail(origin, legacy, paused),
+                        Some(origin) => {
+                            api::mesh_mail::load_mesh_mail(origin, legacy, paused, recipients)
+                        }
                         None => Ok(Vec::new()),
                     })
                 });

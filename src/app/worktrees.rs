@@ -1093,6 +1093,9 @@ impl App {
             .collect();
         self.state.worktree_kill_all = None;
         if !indices.is_empty() {
+            for &ws in &indices {
+                self.remove_workspace_agents(ws);
+            }
             self.state.close_workspace_indices(indices);
         }
         self.state.mode = if self.state.active.is_some() {
@@ -2008,6 +2011,7 @@ impl App {
                                 .git_space()
                                 .is_some_and(|space| space.repo_root == result.path));
                     if still_same_linked_worktree {
+                        self.remove_workspace_agents(ws_idx);
                         self.state.close_workspace(ws_idx);
                     }
                 }

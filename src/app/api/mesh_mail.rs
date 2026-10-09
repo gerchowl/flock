@@ -171,9 +171,17 @@ impl App {
         };
         let mut envelope = envelope(origin, String::new(), &data)?;
         envelope.return_binding.recipient_node = origin.into();
+        let (ws, pane) = self
+            .resolve_pane_target(&message.to_pane)
+            .map_err(|e| e.message)?;
+        let (agent, session) = self
+            .local_recipient_identity(ws, pane)
+            .ok_or("missing recipient")?;
+        envelope.target_agent = agent.clone();
+        envelope.target_session = session.clone();
         with_store(|store| {
             store
-                .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                .accept_local(&envelope, CUSTODY_TTL_MS, &agent, &session, now_ms() as i64)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })?;
@@ -284,6 +292,9 @@ impl App {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
+        if self.removed_agent(&envelope.target_agent)? {
+            return Err(crate::mesh::store::Error::RecipientGone.to_string());
+        }
         let target = MessageTarget::Agent {
             agent: envelope.target_agent.clone(),
         };
@@ -294,6 +305,9 @@ impl App {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
             ResolvedTarget::Remote(_) => return Err("forward_limit".into()),
         };
+        let (agent, session) = self
+            .local_recipient_identity(ws, pane)
+            .ok_or("missing recipient")?;
         data.message.to_pane = self
             .public_pane_id(ws, pane)
             .ok_or("missing recipient pane")?;
@@ -316,10 +330,11 @@ impl App {
                 return Err("mailbox_full".into());
             }
             store
-                .accept(
+                .accept_local(
                     envelope,
                     delivery.remaining_ms,
-                    Admission::Inbox,
+                    &agent,
+                    &session,
                     now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())
@@ -375,7 +390,11 @@ impl App {
                         .map_err(|e| e.to_string())
                 }) {
                     Ok(()) => {
-                        state = "refused";
+                        state = if reason.split(':').next() == Some("recipient_gone") {
+                            "recipient_gone"
+                        } else {
+                            "refused"
+                        };
                         warnings.push(format!("refused by {}: {reason}", send.peer.name));
                         self.emit_event(EventEnvelope {
                             event: EventKind::MessageDelivered,
@@ -492,7 +511,7 @@ impl App {
             .filter(|message| message.to_pane == pane)
             .filter_map(|message| message.message_key)
             .collect();
-        let (expired, changed) = with_store(|store| {
+        let (rejected, changed) = with_store(|store| {
             let mut changed = Vec::new();
             for key in &keys {
                 if store
@@ -503,15 +522,15 @@ impl App {
                     changed.push(key.origin_node.clone());
                 }
             }
-            let expired = store
+            let rejected = store
                 .read_inbox(&keys, now_ms() as i64)
                 .map_err(|e| e.to_string())?;
-            Ok((expired, changed))
+            Ok((rejected, changed))
         })?;
         for node in changed {
             self.emit_mesh_wake(&node);
         }
-        Ok(expired)
+        Ok(rejected)
     }
 
     pub(crate) fn initialize_mesh_mail(
@@ -529,6 +548,32 @@ impl App {
         Ok(())
     }
 
+    /// Snapshot native bindings before recovery leaves the app loop.
+    pub(crate) fn mesh_recovery_recipients(
+        &self,
+    ) -> std::collections::HashMap<String, (String, String)> {
+        let mut recipients = std::collections::HashMap::new();
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for pane in ws.tabs.iter().flat_map(|tab| tab.layout.pane_ids()) {
+                if let (Some(public), Some(identity)) = (
+                    self.public_pane_id(ws_idx, pane),
+                    self.local_recipient_identity(ws_idx, pane),
+                ) {
+                    recipients.insert(public, identity);
+                }
+            }
+        }
+        // Legacy queued events may still name an alias from before handoff.
+        for message in self.mailboxes.pending_messages() {
+            if let Ok((ws, pane)) = self.resolve_pane_target(&message.to_pane) {
+                if let Some(identity) = self.local_recipient_identity(ws, pane) {
+                    recipients.insert(message.to_pane, identity);
+                }
+            }
+        }
+        recipients
+    }
+
     pub(crate) fn restore_mesh_mail(&mut self) -> Result<(), String> {
         let Some(origin) = self.node_id.clone() else {
             return Ok(());
@@ -537,6 +582,7 @@ impl App {
             origin,
             self.mailboxes.pending_messages(),
             self.fleet_pause.paused,
+            self.mesh_recovery_recipients(),
         )?;
         self.apply_mesh_mail(records);
         Ok(())
@@ -545,10 +591,21 @@ impl App {
     pub(crate) fn apply_mesh_mail(&mut self, records: Vec<RecoveredMessage>) {
         self.mailboxes.clear_queued_projection();
         for mut record in records {
+            // Lifecycle removals can arrive while the recovery worker loads rows.
+            if self
+                .pending_agent_removals
+                .iter()
+                .any(|removal| removal.agent == record.target)
+            {
+                continue;
+            }
             if !record.target.is_empty() {
                 if let Some(location) = self.locate_agent(&record.target).filter(|l| l.local) {
                     record.message.to_pane = location.pane_id;
                 }
+            }
+            if record.message.to_pane.is_empty() {
+                continue;
             }
             if record.read {
                 self.mailboxes.record_delivered(&record.message);
@@ -718,6 +775,7 @@ impl App {
 pub(super) fn error_code(reason: &str) -> &'static str {
     match reason.split(':').next() {
         Some("mailbox_full") => "mailbox_full",
+        Some("recipient_gone") => "recipient_gone",
         Some("mail_store_full") => "mail_store_full",
         Some("fleet_paused") => "fleet_paused",
         Some("message_expired") => "message_expired",
@@ -730,6 +788,108 @@ pub(super) fn error_code(reason: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_keeps_native_bindings_and_filters_removed_recipients() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("recovery")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.terminal_id_for_pane(0, pane).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("fixture".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("native-session").unwrap(),
+        });
+        let agent = terminal.agent_id.to_string();
+        let removal = crate::app::agent_removal::capture(
+            terminal,
+            crate::app::agent_removal::RemovalEvent::Kill,
+        )
+        .unwrap();
+        let public = app.public_pane_id(0, pane).unwrap();
+        let message = PendingMessage {
+            message_key: None,
+            correlation_id: "legacy".into(),
+            body: "pending".into(),
+            from_pane: None,
+            from_agent: None,
+            from_host: None,
+            from_repo: None,
+            to_pane: public.clone(),
+            to_repo: None,
+            in_reply_to: None,
+            enqueued_at_ms: now_ms(),
+            delivery_attempts: 0,
+            intent: crate::api::schema::MsgIntent::NeedsReply,
+        };
+        let loaded = load_mesh_mail(
+            "nodea".into(),
+            vec![message.clone()],
+            false,
+            app.mesh_recovery_recipients(),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].target, agent);
+        let key = loaded[0].message.message_key.clone().unwrap();
+        // A removal arriving after the worker's read cannot resurrect queued mail.
+        app.pending_agent_removals.push_back(removal);
+        app.apply_mesh_mail(loaded);
+        assert_eq!(app.mailboxes.queued_len(&public), 0);
+        let affected = with_store(|store| {
+            store
+                .tombstone(&agent, "native-session", "killed", now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            affected,
+            vec![key.clone()],
+            "worker backfilled the native binding"
+        );
+        let data = Payload {
+            message,
+            peer: None,
+            host: None,
+            direct: true,
+        };
+        let mut answer = envelope("nodeb", agent, &data).unwrap();
+        answer.request_key = Some(key);
+        with_store(|store| {
+            store
+                .accept(&answer, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let loaded = load_mesh_mail(
+            "nodea".into(),
+            Vec::new(),
+            false,
+            app.mesh_recovery_recipients(),
+        )
+        .unwrap();
+        assert!(
+            loaded.is_empty(),
+            "removed senders' answers stay out of the projection"
+        );
+        assert!(
+            with_store(|store| store.get(&answer.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .is_some(),
+            "the answer remains in durable status"
+        );
+    }
 
     #[tokio::test]
     async fn retry_batch_uses_fixed_push_concurrency() {
@@ -837,6 +997,7 @@ pub(crate) fn load_mesh_mail(
     origin: String,
     legacy: Vec<PendingMessage>,
     paused: bool,
+    recipients: std::collections::HashMap<String, (String, String)>,
 ) -> Result<Vec<RecoveredMessage>, String> {
     with_store(|store| {
         if !store
@@ -923,12 +1084,36 @@ pub(crate) fn load_mesh_mail(
                     .map_err(|e| e.to_string())
             })?;
         }
+        let mut target = record.envelope.target_agent.clone();
+        if record.envelope.request_key.is_some() {
+            let removed = with_store(|store| {
+                store
+                    .agent_removed(&target, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            })?;
+            if removed {
+                continue;
+            }
+        } else if !paused {
+            let identity = recipients
+                .get(&data.message.to_pane)
+                .filter(|(agent, _)| target.is_empty() || target == *agent)
+                .or_else(|| recipients.values().find(|(agent, _)| *agent == target));
+            if let Some((agent, session)) = identity {
+                with_store(|store| {
+                    store
+                        .bind_local_recipient(&record.envelope.key, agent, session)
+                        .map_err(|e| e.to_string())
+                })?;
+                target.clone_from(agent);
+            }
+        }
         data.message.message_key = Some(record.envelope.key);
         data.message.enqueued_at_ms =
             now_ms().saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
         loaded.push(RecoveredMessage {
             message: data.message,
-            target: record.envelope.target_agent,
+            target,
             read: record.state == "read",
         });
     }

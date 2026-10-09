@@ -421,6 +421,30 @@ impl MailboxRegistry {
         Some(message)
     }
 
+    /// Remove custody rows that can no longer be delivered to any pane.
+    pub(crate) fn discard_mesh_messages(&mut self, keys: &[crate::mesh::key::MessageKey]) {
+        let keys: HashSet<_> = keys
+            .iter()
+            .map(|key| (&key.origin_node, &key.message_id))
+            .collect();
+        for queue in self.queues.values_mut() {
+            queue.retain(|message| {
+                if message
+                    .message_key
+                    .as_ref()
+                    .is_some_and(|key| keys.contains(&(&key.origin_node, &key.message_id)))
+                {
+                    self.deferred.remove(&message.correlation_id);
+                    self.escalated.remove(&message.correlation_id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.queues.retain(|_, queue| !queue.is_empty());
+    }
+
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
         let root = message
             .in_reply_to
@@ -866,6 +890,25 @@ mod tests {
             delivery_attempts: 0,
             intent: MsgIntent::Fyi,
         }
+    }
+
+    #[test]
+    fn discard_mesh_messages_matches_keys_not_panes_or_correlations() {
+        let mut mailboxes = MailboxRegistry::default();
+        let mut removed = message("shared-correlation", "pane");
+        let key = crate::mesh::key::MessageKey::mint("origin.example".into(), 0).unwrap();
+        removed.message_key = Some(key.clone());
+        let mut retained = removed.clone();
+        retained.message_key =
+            Some(crate::mesh::key::MessageKey::mint("other.example".into(), 0).unwrap());
+        mailboxes.enqueue(removed);
+        mailboxes.enqueue(retained.clone());
+        mailboxes.discard_mesh_messages(&[key]);
+        assert_eq!(mailboxes.queued_len("pane"), 1);
+        assert_eq!(
+            mailboxes.pop_next("pane").unwrap().message_key,
+            retained.message_key
+        );
     }
 
     fn queued_event(message: &PendingMessage) -> EventEnvelope {

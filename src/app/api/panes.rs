@@ -17,7 +17,7 @@ use super::super::api_helpers::{
 use super::responses::{encode_error, encode_success};
 
 impl App {
-    fn resolve_pane_target(
+    pub(super) fn resolve_pane_target(
         &self,
         target: &str,
     ) -> Result<(usize, crate::layout::PaneId), crate::api::schema::ErrorBody> {
@@ -1202,6 +1202,11 @@ impl App {
         };
         let workspace_id = self.state.workspaces[ws_idx].id.clone();
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        self.remove_agent_for_pane(
+            ws_idx,
+            pane_id,
+            crate::app::agent_removal::RemovalEvent::Close,
+        );
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return pane_not_found(id, &target.pane_id);

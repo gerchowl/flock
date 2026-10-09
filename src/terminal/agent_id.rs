@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// That gap is why a message relayed from another machine arrived `from
 /// unknown`: the sender was inferred from local process ancestry, and there was
 /// no name to fall back to. An `AgentId` is minted once when the pane is
-/// created, persisted in the session snapshot, and never rewritten — so it
+/// created and persisted in the session snapshot. Only authoritative removal
+/// retires it and allocates a fresh identity for the next agent — so it
 /// still names the same agent after a restart, a pane move, or a workspace
 /// rename, and it is unique across the fleet.
 ///
@@ -37,7 +38,7 @@ static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_AGENT_ID_LEN: usize = 96;
 
 impl AgentId {
-    /// Mint a new identity. Called exactly once per pane, at creation.
+    /// Mint a new identity at pane creation or after authoritative agent removal.
     ///
     /// Fleet-uniqueness comes from the host name plus a wallclock/pid/counter
     /// triple: two hosts cannot collide because the host differs, and two

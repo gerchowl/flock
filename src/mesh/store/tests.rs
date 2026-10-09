@@ -1306,6 +1306,47 @@ fn batch_read_expires_overdue_rows_and_reads_live_rows() {
 }
 
 #[test]
+fn batch_read_rejects_non_inbox_and_missing_rows_without_rewriting_evidence() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    for state in [
+        "recipient_gone",
+        "expired",
+        "inbox_expired",
+        "read",
+        "custody",
+        "held",
+        "delivered",
+    ] {
+        let stale = envelope();
+        let live = envelope();
+        let missing = envelope();
+        store
+            .accept(&stale, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store
+            .accept(&live, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE envelopes SET state=?3 WHERE origin=?1 AND id=?2",
+                params![stale.key.origin_node, stale.key.message_id, state],
+            )
+            .unwrap();
+        let rejected = store
+            .read_inbox(
+                &[stale.key.clone(), live.key.clone(), missing.key.clone()],
+                1,
+            )
+            .unwrap();
+        assert_eq!(rejected, vec![stale.key.clone(), missing.key], "{state}");
+        assert_eq!(store.get(&stale.key).unwrap().unwrap().state, state);
+        assert_eq!(store.get(&live.key).unwrap().unwrap().state, "read");
+    }
+}
+
+#[test]
 fn dedupe_is_scoped_to_authenticated_origin() {
     let fixture = Fixture::new();
     let mut store = fixture.open(1000);
@@ -3750,4 +3791,142 @@ fn unacknowledged_receipt_for_unknown_original_stops_being_offered_at_its_own_tt
         .unwrap()
         .is_empty());
     assert_eq!(store.connection.total_changes(), before);
+}
+
+#[test]
+fn tombstone_uses_owner_session_binding_without_rewriting_envelope() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    store.set_local_node("receiver.example");
+    let mut mail = envelope();
+    mail.target_session = "w1:p1".into();
+    store
+        .accept_local(&mail, 1000, "recipient", "native-session", 0)
+        .unwrap();
+    assert!(store
+        .tombstone("recipient", "another-session", "closed", 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .tombstone("recipient", "native-session", "killed", 2)
+            .unwrap(),
+        vec![mail.key.clone()]
+    );
+    let record = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(record.envelope.target_session, "w1:p1");
+    assert_eq!(record.state, "recipient_gone");
+    assert!(
+        record.delivered,
+        "removal must retain prior delivery evidence"
+    );
+}
+
+#[test]
+fn tombstone_excludes_unbound_legacy_outbound_with_matching_remote_identity() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    store.set_local_node("origin.example");
+    let mut mail = envelope();
+    mail.key.origin_node = "origin.example".into();
+    mail.return_binding.request = mail.key.clone();
+    mail.return_binding.recipient_node.clear();
+    store.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().next_hop, "");
+    assert!(store
+        .tombstone("recipient", "session", "killed", 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "custody");
+}
+
+#[test]
+fn tombstone_preserves_read_evidence_and_accepts_conversation_answers() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mail = envelope();
+    store
+        .accept_local(&mail, 1000, "recipient", "session", 0)
+        .unwrap();
+    store.finish(&mail.key, Outcome::Read, 1).unwrap();
+    assert!(store
+        .tombstone("recipient", "session", "killed", 2)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.receipt(&mail.key, 3).unwrap().as_deref(),
+        Some("read")
+    );
+    let mut answer = envelope();
+    answer.request_key = Some(mail.key.clone());
+    answer.in_reply_to = Some(mail.correlation_id.clone());
+    store.accept(&answer, 1000, Admission::Inbox, 3).unwrap();
+    assert_eq!(store.get(&answer.key).unwrap().unwrap().state, "inbox");
+}
+
+#[test]
+fn recipient_gone_is_a_receipt_and_terminal_refusal() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mail = envelope();
+    store.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+    store.refuse(&mail.key, "recipient_gone", 1).unwrap();
+    assert_eq!(
+        store.receipt(&mail.key, 2).unwrap().as_deref(),
+        Some("recipient_gone")
+    );
+    let other = envelope();
+    store.accept(&other, 1000, Admission::Custody, 0).unwrap();
+    store.finish(&other.key, Outcome::Delivered, 1).unwrap();
+    assert_eq!(
+        store.import_receipt(&other.key, "recipient_gone").unwrap(),
+        ReceiptImport::Applied
+    );
+    assert_eq!(
+        store
+            .status(&other.key.origin_node, &other.correlation_id, 2)
+            .unwrap()
+            .unwrap()
+            .state,
+        "recipient_gone"
+    );
+}
+
+#[test]
+fn tombstone_backfills_legacy_local_inbox_binding_and_survives_reopen() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mut mail = envelope();
+    mail.target_agent.clear();
+    mail.target_session = "w1:p1".into();
+    store.accept(&mail, 1000, Admission::Inbox, 0).unwrap();
+    store
+        .connection
+        .execute_batch("DROP TABLE local_recipients")
+        .unwrap();
+    drop(store);
+    let mut store = f.open(1);
+    store
+        .bind_local_recipient(&mail.key, "recipient", "native-session")
+        .unwrap();
+    store
+        .bind_local_recipient(&mail.key, "recipient", "different-session")
+        .unwrap();
+    drop(store);
+    let mut store = f.open(2);
+    assert_eq!(
+        store
+            .tombstone("recipient", "native-session", "closed", 3)
+            .unwrap(),
+        vec![mail.key.clone()]
+    );
+    assert_eq!(
+        store
+            .get(&mail.key)
+            .unwrap()
+            .unwrap()
+            .envelope
+            .target_session,
+        "w1:p1"
+    );
 }

@@ -180,6 +180,13 @@ impl App {
         // Resolved to another host: hand the message to the server that owns
         // the recipient and let ITS mailbox do the rest. One delivery
         // implementation, wherever the sender was.
+        if let MessageTarget::Agent { agent } = &params.to {
+            match self.removed_agent(agent) {
+                Ok(true) => return encode_error(id, "recipient_gone", "recipient_gone"),
+                Err(reason) => return encode_error(id, "mail_store_unavailable", reason),
+                Ok(false) => (),
+            }
+        }
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
             Err((code, message)) => {
@@ -997,8 +1004,8 @@ impl App {
         };
 
         let now = now_ms();
-        let expired = match self.mark_mesh_inbox_read(&pane) {
-            Ok(expired) => expired,
+        let rejected = match self.mark_mesh_inbox_read(&pane) {
+            Ok(rejected) => rejected,
             Err(reason) => return encode_error(id, super::mesh_mail::error_code(&reason), reason),
         };
         let mut messages = Vec::new();
@@ -1006,7 +1013,7 @@ impl App {
             if message
                 .message_key
                 .as_ref()
-                .is_some_and(|key| expired.contains(key))
+                .is_some_and(|key| rejected.contains(key))
             {
                 self.emit_event(EventEnvelope {
                     event: EventKind::MessageDelivered,

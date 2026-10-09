@@ -632,6 +632,9 @@ impl App {
                 self.render_notify.notify_one();
                 return;
             }
+            if let Some((ws, _)) = self.find_pane(*pane_id) {
+                self.remove_agent_for_pane(ws, *pane_id, super::agent_removal::RemovalEvent::Exit);
+            }
             match self.runtime_exit_action(*pane_id) {
                 RuntimeExitAction::RespawnShell => {
                     if self.respawn_shell_for_launch_pane(*pane_id) {
@@ -926,7 +929,10 @@ impl App {
         // #175 C3: hibernation wins over the respawn-shell path. The stashed
         // resume plan means the child died BECAUSE we asked it to; keeping
         // the pane empty is the whole point.
-        if terminal.hibernated_resume_plan.is_some() || terminal.restart_in_progress {
+        if terminal.hibernated_resume_plan.is_some()
+            || terminal.pending_agent_resume_plan.is_some()
+            || terminal.restart_in_progress
+        {
             RuntimeExitAction::HoldHibernated
         } else if terminal.respawn_shell_on_exit {
             RuntimeExitAction::RespawnShell
@@ -1086,6 +1092,10 @@ impl App {
         }
         for pending in std::mem::take(&mut self.state.pending_ui_events) {
             let envelope = match pending {
+                crate::app::state::PendingUiEvent::AgentRemoved(removal) => {
+                    self.record_agent_removal(removal);
+                    continue;
+                }
                 crate::app::state::PendingUiEvent::PaneCreated {
                     workspace_id,
                     pane_id,

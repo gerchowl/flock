@@ -139,9 +139,11 @@ pub struct TerminalState {
     /// say who sent it.
     ///
     /// This is minted once when the pane is created, persisted in the session
-    /// snapshot, and never rewritten. Address ≠ location: host and pane are
-    /// resolvable *metadata* about an agent, not its name.
+    /// snapshot, and replaced only after authoritative agent removal. Address ≠
+    /// location: host and pane are resolvable *metadata* about an agent, not its name.
     pub agent_id: AgentId,
+    /// Suppress duplicate teardown captures until the replacement shell is ready.
+    pub(crate) agent_identity_retired: bool,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
@@ -203,6 +205,8 @@ pub struct TerminalState {
     last_state_authority: StateAuthority,
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
+    /// Failed resume retains identity and mail while the process is offline.
+    pub resume_failed: bool,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// True when `persisted_agent_session` was established by a hook report
     /// from the process running in this pane, rather than restored from a
@@ -315,6 +319,7 @@ impl TerminalState {
         Self {
             id,
             agent_id,
+            agent_identity_retired: false,
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,
@@ -340,6 +345,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
+            resume_failed: false,
             session_ref_hook_confirmed: false,
             manual_label: None,
             agent_name: None,
@@ -1312,6 +1318,8 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.agent_identity_retired = false;
+        self.resume_failed = false;
         self.restart_retry = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
