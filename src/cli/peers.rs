@@ -113,6 +113,13 @@ pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String
         printable(&node),
         printable(&status.state)
     );
+    if status.node_id.is_some() {
+        line.push_str(match status.pin_origin {
+            crate::mesh::store::PinOrigin::InboundFirstContact => " (first contact inbound)",
+            crate::mesh::store::PinOrigin::Dialed => " (dialed)",
+            crate::mesh::store::PinOrigin::Unknown => " (pin origin unknown)",
+        });
+    }
     if let Some(reason) = &status.reason {
         line.push_str(&format!(": {}", printable(reason)));
     }
@@ -337,6 +344,7 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
                     .ok_or_else(|| std::io::Error::other("missing peer row"))?
             };
             row["source"] = serde_json::json!(status.source);
+            row["pin_origin"] = serde_json::json!(status.pin_origin);
             row["node_id"] = serde_json::json!(status.node_id);
             row["enrollment"] = serde_json::json!(status.state);
             row["enrollment_reason"] = serde_json::json!(status.reason);
@@ -1003,6 +1011,23 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    #[test]
+    fn enrollment_origin_labels_and_older_server_default() {
+        use crate::mesh::store::PinOrigin;
+        let mut status: crate::mesh::hello::Enrollment = serde_json::from_value(
+            serde_json::json!({"peer":"peer.example", "node_id":"abc", "state":"pinned", "reason":null})
+        ).unwrap();
+        assert_eq!(status.pin_origin, PinOrigin::Unknown);
+        for (origin, label) in [
+            (PinOrigin::Unknown, "pin origin unknown"),
+            (PinOrigin::Dialed, "dialed"),
+            (PinOrigin::InboundFirstContact, "first contact inbound"),
+        ] {
+            status.pin_origin = origin;
+            assert!(super::enrollment_line(&status).ends_with(&format!("pinned ({label})")));
+        }
+    }
 
     /// #418 review: `error` is ssh's last stderr line from another host, and
     /// a shell rc on the far side can print escape sequences into it. The

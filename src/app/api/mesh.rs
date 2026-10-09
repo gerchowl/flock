@@ -52,6 +52,7 @@ impl App {
                     self.mesh_inbound = Some(Enrollment {
                         peer: "unidentified SSH peer".into(),
                         source: PinSource::Inbound,
+                        pin_origin: Default::default(),
                         node_id: None,
                         state: "refused".into(),
                         reason: Some("mesh hello required; upgrade flk on the dialer".into()),
@@ -82,6 +83,7 @@ impl App {
                         peer.clone()
                     },
                     source: PinSource::Inbound,
+                    pin_origin: Default::default(),
                     node_id: None,
                     state: "pending".into(),
                     reason: None,
@@ -132,6 +134,12 @@ impl App {
                         .iter()
                         .any(|p| p.name == pending.dialer.name),
                 )?;
+                status.pin_origin = hello::with_store(|store| {
+                    store
+                        .pin_origin(PinSource::Inbound, &pending.dialer.name)
+                        .map(|origin| origin.unwrap_or_default())
+                        .map_err(|e| e.to_string())
+                })?;
                 status.node_id = Some(pending.dialer.node_id);
                 status.state = "pinned".into();
                 status.reason = None;
@@ -230,6 +238,26 @@ impl App {
             .iter()
             .map(crate::peer_stream::enrollment)
             .collect();
+        if !peers.is_empty() {
+            let result = hello::with_store(|store| {
+                for peer in &mut peers {
+                    peer.pin_origin = store
+                        .pin_origin(peer.source, &peer.peer)
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_default();
+                    if peer.node_id.is_none() {
+                        peer.node_id = store
+                            .get_pin(&peer.peer)
+                            .map_err(|e| e.to_string())?
+                            .map(|pin| pin.node_id);
+                    }
+                }
+                Ok(())
+            });
+            if let Err(reason) = result {
+                return encode_error(id, "mesh_store_unavailable", reason);
+            }
+        }
         if let Some(inbound) = self.mesh_inbound.as_ref() {
             let mut inbound = inbound.clone();
             if let Some(configured) = peers

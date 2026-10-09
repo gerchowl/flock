@@ -951,3 +951,59 @@ fn concurrent_first_contact_and_outbound_pins_match_or_refuse() {
         }
     }
 }
+
+#[test]
+fn pin_origin_survives_reconnect_restart_and_reset() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let pin = IdentityPin {
+        node_id: "node.example".into(),
+        public_key: vec![7; 32],
+    };
+    s.put_inbound_configured_pin("peer.example", &pin).unwrap();
+    s.put_pin("peer.example", &pin).unwrap();
+    drop(s);
+    let mut s = f.open(0);
+    for source in [PinSource::Configured, PinSource::Inbound] {
+        assert_eq!(
+            s.pin_origin(source, "peer.example").unwrap(),
+            Some(PinOrigin::InboundFirstContact)
+        );
+    }
+    s.reset_pin("peer.example").unwrap();
+    assert_eq!(
+        s.pin_origin(PinSource::Configured, "peer.example").unwrap(),
+        None
+    );
+    s.put_pin("peer.example", &pin).unwrap();
+    s.put_inbound_configured_pin("peer.example", &pin).unwrap();
+    assert_eq!(
+        s.pin_origin(PinSource::Configured, "peer.example").unwrap(),
+        Some(PinOrigin::Dialed)
+    );
+    assert_eq!(
+        s.pin_origin(PinSource::Inbound, "peer.example").unwrap(),
+        Some(PinOrigin::InboundFirstContact)
+    );
+}
+
+#[test]
+fn version_four_pin_origin_is_unknown_after_migration() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    s.connection
+        .execute_batch(
+            "ALTER TABLE identity_pins DROP COLUMN origin;
+        INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
+        PRAGMA user_version=4;",
+        )
+        .unwrap();
+    drop(s);
+    let mut s = f.open(0);
+    let pin = s.get_pin("peer.example").unwrap().unwrap();
+    s.put_pin("peer.example", &pin).unwrap();
+    assert_eq!(
+        s.pin_origin(PinSource::Configured, "peer.example").unwrap(),
+        Some(PinOrigin::Unknown)
+    );
+}
