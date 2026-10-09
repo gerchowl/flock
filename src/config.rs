@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+mod diagnostics;
 mod env;
 mod io;
 mod keybinds;
@@ -31,6 +32,8 @@ pub use self::{
     spawn_env::{SpawnConfig, SpawnEnvConfig},
     theme::{parse_color, CustomThemeColors, ThemeConfig},
 };
+
+pub(crate) use self::diagnostics::{file_key_diagnostics, removed_config_warnings};
 
 pub(crate) use self::io::upsert_top_level_bool;
 

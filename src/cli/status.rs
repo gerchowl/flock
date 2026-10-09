@@ -102,6 +102,7 @@ pub(crate) enum ServerRuntimeStatus {
 }
 
 fn print_full_status(json: bool) -> std::io::Result<i32> {
+    let config_warnings = crate::config::removed_config_warnings();
     let server = read_server_runtime_status()?;
     let installed = read_installed_status(&server);
     let (peers, enrollment_warning) = if matches!(server, ServerRuntimeStatus::Running { .. }) {
@@ -112,6 +113,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
 
     if json {
         print_json(&FullStatusJson {
+            config_warnings: config_warnings.clone(),
             client: client_status_json(),
             server: server_status_json(&server),
             update: update_status_json(&server),
@@ -122,6 +124,9 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
         return Ok(0);
     }
 
+    for warning in config_warnings {
+        println!("config warning: {warning}");
+    }
     println!("client:");
     println!("  version: {}", crate::build_info::version());
     println!(
@@ -314,6 +319,7 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    config_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enrollment_warning: Option<String>,
     peers: Vec<crate::mesh::hello::Enrollment>,

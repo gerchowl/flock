@@ -108,6 +108,9 @@ fn spawn_server_with_env(
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
+    // Config diagnostics must come from the fixture, not the runner's name aliases.
+    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env_remove("FLOCK_NAME");
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
     }
@@ -1348,166 +1351,132 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
 }
 
 #[test]
-fn removed_config_key_refuses_startup_without_creating_sockets() {
-    assert_removed_config_refusal(&["server"]);
-}
-
-#[test]
-fn removed_config_key_refuses_plain_auto_launch_without_creating_sockets() {
-    assert_removed_config_refusal(&[]);
-}
-
-#[test]
-fn removed_config_key_refuses_remote_bridge_launch_without_creating_sockets() {
-    assert_removed_config_refusal(&["remote-client-bridge"]);
-}
-
-#[test]
-fn removed_config_key_survives_handoff_refusal_reporting_failure() {
-    assert_removed_config_refusal(&["server", "--handoff-import"]);
-}
-
-fn assert_removed_config_refusal(args: &[&str]) {
+fn removed_config_keys_warn_on_cold_start_and_live_reload() {
     let _lock = test_lock();
     let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
     let runtime = base.join("runtime");
-    let config = base.join("config.toml");
-    let overlay = base.join("config.local.toml");
     let api = runtime.join("flock.sock");
-    let client = runtime.join("client.sock");
-    let env = support::environment::isolated_env(&config_home, &runtime);
-    for (settings, key, line) in [
-        (
-            "[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
-            "msg.uplink_timeout_secs",
-            4,
-        ),
-        (
-            "[msg]\nuplink_timeout_secs=1\nuplink_heartbeat_secs=1\n",
-            "msg.uplink_heartbeat_secs",
-            3,
-        ),
-        (
-            "[msg]\nuplink_heartbeat_secs=1\n",
-            "msg.uplink_heartbeat_secs",
-            2,
-        ),
-        (
-            "[msg]\ndeferral_relay_concurrency=1\n",
-            "msg.deferral_relay_concurrency",
-            2,
-        ),
-        (
-            "[[peers]]\nname='nodea'\nsummary_command='false'\n",
-            "peers.summary_command",
-            3,
-        ),
-    ] {
-        for in_overlay in [false, true] {
-            fs::write(
-                &config,
-                if in_overlay {
-                    "[msg]\nenabled=false\nallow_from=[]\n"
-                } else {
-                    settings
-                },
-            )
-            .unwrap();
-            if in_overlay {
-                fs::write(&overlay, settings).unwrap();
-            }
-            let source = if in_overlay { &overlay } else { &config };
-            let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
-            command.args(args);
-            if args.contains(&"--handoff-import") {
-                command
-                    .arg(base.join("missing-handoff.sock"))
-                    .arg("test-token");
-            }
-            for (key, _) in
-                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
-            {
-                command.env_remove(key);
-            }
-            command
-                .envs(env.iter().cloned())
-                .env("FLOCK_CONFIG_PATH", &config)
-                .env("FLOCK_SOCKET_PATH", &api)
-                .env("FLOCK_CLIENT_SOCKET_PATH", &client)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped());
-            support::environment::assert_command_isolated(&command);
-            let mut child = command.spawn().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let exited = loop {
-                if child.try_wait().unwrap().is_some() {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    break false;
-                }
-                thread::sleep(Duration::from_millis(10));
-            };
-            let output = child.wait_with_output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(exited, "server started on defaults: {stderr}");
-            assert!(!output.status.success(), "{stderr}");
-            assert!(!stderr.contains("Custom {"), "{stderr}");
-            if settings.contains("uplink_timeout_secs")
-                && settings.contains("uplink_heartbeat_secs")
-            {
-                assert!(
-                    stderr.contains(&format!(
-                        "\n{}:3: msg.uplink_heartbeat_secs",
-                        source.display()
-                    )),
-                    "{stderr}"
-                );
-            }
-            if args.first() == Some(&"server") {
-                let log =
-                    fs::read_to_string(config_home.join("flock-dev/flock-server.log")).unwrap();
-                let records: Vec<serde_json::Value> = log
-                    .lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
-                    .collect();
-                assert!(
-                    records
-                        .iter()
-                        .any(|record| record["event"] == "server.config.refused"
-                            && record["level"] == "ERROR"
-                            && record["err"].as_str().is_some_and(|error| error.contains(
-                                &format!("{}:{line}: {key} was removed", source.display())
-                            ))),
-                    "{log}"
-                );
-                if args.contains(&"--handoff-import") {
-                    assert!(records.iter().any(|record| record["event"] == "handoff.import.refusal_report_failed"), "{log}");
-                }
-            }
-            assert!(
-                stderr.contains(&format!(
-                    "{}:{line}: {key} was removed in flk 1.0.0 (mesh); delete this line",
-                    source.display()
-                )),
-                "{stderr}"
-            );
-            assert!(
-                !api.exists() && !client.exists(),
-                "no public socket may be created"
-            );
-            if in_overlay {
-                fs::remove_file(&overlay).unwrap();
-            }
+    let config = base.join("config.toml");
+    fs::write(
+        &config,
+        "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
+    )
+    .unwrap();
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime,
+        &api,
+        &[("FLOCK_CONFIG_PATH", config.to_str().unwrap())],
+    );
+    wait_for_socket(&api, Duration::from_secs(10));
+    register_runtime_dir(&runtime);
+    let created = request(
+        &api,
+        serde_json::json!({"id":"create", "method":"workspace.create", "params":{"cwd":base,"focus":true}}),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    for reload in [false, true] {
+        if reload {
+            fs::write(&config, "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\nuplink_heartbeat_secs=2\ndeferral_relay_concurrency=4\n").unwrap();
         }
+        let report = request(
+            &api,
+            serde_json::json!({"id":"reload", "method":"server.reload_config", "params":{}}),
+        );
+        assert_eq!(report["result"]["status"], "partial", "{report}");
+        assert!(report.to_string().contains("delete this line"), "{report}");
+        let refused = request(
+            &api,
+            serde_json::json!({"id":"policy", "method":"msg.send", "params":{"to":{"type":"pane","pane":pane},"body":"still disabled"}}),
+        );
+        assert_eq!(refused["error"]["code"], "msg_not_allowed", "{refused}");
     }
+    let log = fs::read_to_string(config_home.join("flock-dev/flock-server.log")).unwrap();
+    assert!(log.contains("config.removed_key"), "{log}");
+    assert_ok(request(
+        &api,
+        serde_json::json!({"id":"stop", "method":"server.stop", "params":{}}),
+    ));
+    drop(spawned);
     cleanup_test_base(&base);
 }
 
 #[test]
-fn removed_config_key_during_handoff_rolls_back_with_migration_reason() {
+fn config_check_json_and_cli_warnings_name_source_keys() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime = base.join("runtime");
+    let env = support::environment::isolated_env(&config_home, &runtime);
+    let config = base.join("config.toml");
+    fs::write(&config, "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\nfuture_setting=true\n").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
+        command
+            .args(args)
+            .env_remove("FLOCK_HOST_NAME")
+            .env_remove("FLOCK_NAME")
+            .envs(env.iter().cloned())
+            .env("FLOCK_CONFIG_PATH", &config);
+        support::environment::assert_command_isolated(&command);
+        command.output().unwrap()
+    };
+    let checked = run(&["config", "check", "--json"]);
+    assert_eq!(checked.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(json["exit_code"], 1);
+    assert_eq!(json["diagnostics"].as_array().unwrap().len(), 2, "{json}");
+    assert!(
+        json.to_string()
+            .contains(&format!("{}:5: msg.uplink_timeout_secs", config.display())),
+        "{json}"
+    );
+    assert!(
+        json.to_string().contains(&format!(
+            "{}:6: unknown msg.future_setting",
+            config.display()
+        )),
+        "{json}"
+    );
+    let text = run(&["config", "check"]);
+    assert_eq!(text.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&text.stderr).contains("delete this line"));
+    let status = run(&["status", "--json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        json["config_warnings"].as_array().unwrap().len(),
+        1,
+        "{json}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&status.stderr)
+            .matches("delete this line")
+            .count(),
+        1
+    );
+    let version = run(&["--version"]);
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&version.stderr)
+            .matches("delete this line")
+            .count(),
+        1
+    );
+    fs::write(&config, "onboarding=false\n").unwrap();
+    assert_eq!(run(&["config", "check", "--json"]).status.code(), Some(0));
+    fs::write(&config, "[broken\n").unwrap();
+    assert_eq!(run(&["config", "check", "--json"]).status.code(), Some(2));
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn removed_config_key_during_handoff_succeeds_preserving_policy() {
     let _lock = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
@@ -1520,7 +1489,7 @@ fn removed_config_key_during_handoff_rolls_back_with_migration_reason() {
         "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\n",
     )
     .unwrap();
-    let mut spawned = spawn_server_with_env(
+    let spawned = spawn_server_with_env(
         &config_home,
         &runtime,
         &api,
@@ -1538,25 +1507,12 @@ fn removed_config_key_during_handoff_rolls_back_with_migration_reason() {
         "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
     )
     .unwrap();
-    let failed = request(
+    assert_ok(request(
         &api,
         serde_json::json!({"id":"handoff", "method":"server.live_handoff", "params":{}}),
-    );
-    let message = failed["error"]["message"].as_str().unwrap();
-    assert!(message.contains("handoff import refused:"), "{failed}");
-    assert!(
-        message.contains(&format!(
-            "{}:5: msg.uplink_timeout_secs was removed in flk 1.0.0 (mesh); delete this line",
-            config.display()
-        )),
-        "{failed}"
-    );
-    assert!(
-        spawned.child.try_wait().unwrap().is_none(),
-        "old server remains alive"
-    );
+    ));
     wait_for_api(&api, Duration::from_secs(5));
-    let marker = base.join("after-rollback");
+    let marker = base.join("after-handoff");
     assert_ok(request(
         &api,
         serde_json::json!({"id":"after", "method":"pane.send_input", "params":{"pane_id":pane, "text":format!("printf survived > '{}'", marker.display()), "keys":["Enter"]}}),
