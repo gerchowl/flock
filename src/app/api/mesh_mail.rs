@@ -171,9 +171,17 @@ impl App {
         };
         let mut envelope = envelope(origin, String::new(), &data)?;
         envelope.return_binding.recipient_node = origin.into();
+        let (ws, pane) = self
+            .resolve_pane_target(&message.to_pane)
+            .map_err(|e| e.message)?;
+        let (agent, session) = self
+            .local_recipient_identity(ws, pane)
+            .ok_or("missing recipient")?;
+        envelope.target_agent = agent.clone();
+        envelope.target_session = session.clone();
         with_store(|store| {
             store
-                .accept(&envelope, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                .accept_local(&envelope, CUSTODY_TTL_MS, &agent, &session, now_ms() as i64)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })?;
@@ -284,6 +292,9 @@ impl App {
         if let Some(receipt) = duplicate {
             return Ok(receipt);
         }
+        if self.removed_agent(&envelope.target_agent)? {
+            return Err(crate::mesh::store::Error::RecipientGone.to_string());
+        }
         let target = MessageTarget::Agent {
             agent: envelope.target_agent.clone(),
         };
@@ -294,6 +305,9 @@ impl App {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
             ResolvedTarget::Remote(_) => return Err("forward_limit".into()),
         };
+        let (agent, session) = self
+            .local_recipient_identity(ws, pane)
+            .ok_or("missing recipient")?;
         data.message.to_pane = self
             .public_pane_id(ws, pane)
             .ok_or("missing recipient pane")?;
@@ -316,10 +330,11 @@ impl App {
                 return Err("mailbox_full".into());
             }
             store
-                .accept(
+                .accept_local(
                     envelope,
                     delivery.remaining_ms,
-                    Admission::Inbox,
+                    &agent,
+                    &session,
                     now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())
@@ -375,7 +390,11 @@ impl App {
                         .map_err(|e| e.to_string())
                 }) {
                     Ok(()) => {
-                        state = "refused";
+                        state = if reason.split(':').next() == Some("recipient_gone") {
+                            "recipient_gone"
+                        } else {
+                            "refused"
+                        };
                         warnings.push(format!("refused by {}: {reason}", send.peer.name));
                         self.emit_event(EventEnvelope {
                             event: EventKind::MessageDelivered,
@@ -621,7 +640,7 @@ impl App {
                         .map_err(|e| e.to_string())
                 })?;
             }
-            data.message.message_key = Some(record.envelope.key);
+            data.message.message_key = Some(record.envelope.key.clone());
             data.message.enqueued_at_ms = now_ms()
                 .saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
             if !record.envelope.target_agent.is_empty() {
@@ -631,6 +650,28 @@ impl App {
                 {
                     data.message.to_pane = location.pane_id;
                 }
+            }
+            if record.envelope.request_key.is_some() {
+                if self.removed_agent(&record.envelope.target_agent)? {
+                    data.message.to_pane.clear();
+                }
+            } else if !self.fleet_pause.paused {
+                if let Ok((ws, pane)) = self.resolve_pane_target(&data.message.to_pane) {
+                    if let Some((agent, session)) = self.local_recipient_identity(ws, pane) {
+                        if record.envelope.target_agent.is_empty()
+                            || record.envelope.target_agent == agent
+                        {
+                            with_store(|store| {
+                                store
+                                    .bind_local_recipient(&record.envelope.key, &agent, &session)
+                                    .map_err(|e| e.to_string())
+                            })?;
+                        }
+                    }
+                }
+            }
+            if data.message.to_pane.is_empty() {
+                continue;
             }
             if record.state == "read" {
                 self.mailboxes.record_delivered(&data.message);
@@ -801,6 +842,7 @@ impl App {
 pub(super) fn error_code(reason: &str) -> &'static str {
     match reason.split(':').next() {
         Some("mailbox_full") => "mailbox_full",
+        Some("recipient_gone") => "recipient_gone",
         Some("mail_store_full") => "mail_store_full",
         Some("fleet_paused") => "fleet_paused",
         Some("message_expired") => "message_expired",

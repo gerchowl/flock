@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+pub(crate) mod agent_removal;
 pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
@@ -153,6 +154,7 @@ pub struct App {
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
     pub(crate) mesh_retry_at: Option<Instant>,
+    pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_pause_seen: Option<bool>,
@@ -945,6 +947,7 @@ impl App {
             collection_peers: Default::default(),
             collection_generation: 0,
             mesh_retry_at: None,
+            pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
             mesh_enrollment_generation: 0,
             mesh_pause_seen: None,

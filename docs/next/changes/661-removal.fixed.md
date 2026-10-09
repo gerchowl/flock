@@ -1,0 +1,1 @@
+- Retain mail through hibernation, same-session restart and resume failure; authoritative agent removal now reports `recipient_gone`, while replies to removed senders remain available in conversation status. (#661)

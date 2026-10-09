@@ -180,6 +180,13 @@ impl App {
         // Resolved to another host: hand the message to the server that owns
         // the recipient and let ITS mailbox do the rest. One delivery
         // implementation, wherever the sender was.
+        if let MessageTarget::Agent { agent } = &params.to {
+            match self.removed_agent(agent) {
+                Ok(true) => return encode_error(id, "recipient_gone", "recipient_gone"),
+                Err(reason) => return encode_error(id, "mail_store_unavailable", reason),
+                Ok(false) => (),
+            }
+        }
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
             Err((code, message)) => {

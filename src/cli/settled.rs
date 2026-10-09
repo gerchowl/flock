@@ -580,7 +580,7 @@ impl SettledWait {
             // `hibernated`, it must still not become `Waiting`: that is how an
             // agent with no process behind it would settle.
             AgentStatus::Hibernated => return Step::Gone(GoneReason::Hibernated),
-            AgentStatus::Working | AgentStatus::Unknown => Class::Waiting,
+            AgentStatus::Working | AgentStatus::Unknown | AgentStatus::Offline => Class::Waiting,
         };
 
         match class {
@@ -1364,6 +1364,7 @@ fn reported_status_name(status: AgentStatus) -> &'static str {
         AgentStatus::Done => "done",
         AgentStatus::Unknown => "unknown",
         AgentStatus::Hibernated => "hibernated",
+        AgentStatus::Offline => "offline",
     }
 }
 

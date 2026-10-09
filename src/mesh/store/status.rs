@@ -11,8 +11,13 @@ pub struct StatusReference {
 }
 
 /// The receiver-side states a read receipt may carry back to the origin.
-pub(super) const RECEIPT_STATES: [&str; 4] =
-    ["delivered", "read", "expired", "outcome_retention_elapsed"];
+pub(super) const RECEIPT_STATES: [&str; 5] = [
+    "delivered",
+    "recipient_gone",
+    "read",
+    "expired",
+    "outcome_retention_elapsed",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]

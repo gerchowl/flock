@@ -196,6 +196,10 @@ Flock waits for settled idle or a hard limit, stops the whole snapshotted proces
 
 `agent.hibernate` parks a pane: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. `AgentStatus::Hibernated` appears on the record and a durable `agent_hibernated` event is emitted. Panes without a resumable session are refused with `hibernate_unsupported` (data-loss guard); a pane that is already hibernated returns `already_hibernated`. `agent.resume` respawns the stashed argv into the same terminal and clears the plan (`not_hibernated` if the pane is not parked); the next `focus` of a hibernated pane triggers the same resume implicitly. Both verbs emit durable events (`agent_hibernated`, `agent_resumed_from_hibernation`).
 
+A failed resume retains the AgentId, native session binding and pending mail. The agent reports `agent_status: "offline"` and `blocked_reason: "resume_failed"` until a successful resume. Hibernation, restart and temporary disconnection do not remove an agent.
+
+An explicit worktree kill, or a permanent pane close/exit without a resumable session, records an owner-authoritative tombstone and emits metadata-only `agent_removed { agent_id, session, reason }` (`killed`, `closed` or `exited`). Pending mail for that identity reports `recipient_gone`; new sends are refused with that reason. Store failures never block teardown and are retried in bounded batches. Replies to a removed sender remain in the origin's conversation status/wait store and do not enter a replacement agent's inbox. Existing read and delivery evidence is retained.
+
 ```json
 {"id":"req_h","method":"agent.hibernate","params":{"target":"1-1"}}
 {"id":"req_r","method":"agent.resume","params":{"target":"1-1"}}

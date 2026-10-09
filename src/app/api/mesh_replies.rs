@@ -77,6 +77,9 @@ impl App {
                 .map(|location| location.pane_id)
                 .unwrap_or_default();
         }
+        if self.removed_agent(&original.envelope.sender)? {
+            message.to_pane.clear();
+        }
         if !message.to_pane.is_empty()
             && self.mailboxes.queued_len(&message.to_pane)
                 >= crate::app::mailboxes::MAX_QUEUED_PER_PANE
@@ -251,6 +254,7 @@ impl App {
         if self.fleet_pause.paused {
             return;
         }
+        self.retry_agent_removals();
         let cap = crate::mesh::collect::POLL_CONCURRENCY;
         let slots = self.collection_relays.slots(cap);
         if slots == 0 {
@@ -555,6 +559,9 @@ impl App {
             .filter(|location| location.local)
             .map(|location| location.pane_id)
             .unwrap_or_default();
+        if self.removed_agent(&original.envelope.sender)? {
+            data.message.to_pane.clear();
+        }
         data.message.from_pane = None;
         data.message.from_host = Some(sender_host);
         data.message.message_key = Some(answer.key.clone());

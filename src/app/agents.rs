@@ -1080,7 +1080,11 @@ impl App {
             title: pane.title,
             display_agent: pane.display_agent,
             agent_status: pane.agent_status,
-            blocked_reason: provider_wait.as_ref().map(|_| "provider_limit".into()),
+            blocked_reason: if terminal.resume_failed {
+                Some("resume_failed".into())
+            } else {
+                provider_wait.as_ref().map(|_| "provider_limit".into())
+            },
             retry_after_ms: provider_wait.and_then(|wait| wait.retry_after_ms),
             custom_status: pane.custom_status,
             state_labels: pane.state_labels,
