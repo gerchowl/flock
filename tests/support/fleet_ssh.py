@@ -68,6 +68,8 @@ env.update(
     PATH=manifest["bin"] + os.pathsep + os.environ["PATH"],
 )
 if "peers relay" not in command:
+    if "msg send" in command:
+        (base / f"legacy-message-{source}-{target}").touch()
     os.execve("/bin/sh", ["sh", "-c", command], env)
 
 # Killing this group closes both halves of the held edge, without touching
@@ -111,6 +113,9 @@ def forward_input():
                 kind = "outbound" if outbound else "collect"
                 if outbound:
                     outbound_collections.add(request.get("id"))
+                    if request.get("params", {}).get("outbound", {}).get("receipts"):
+                        with (base / f"receipt-polls-{source}-{target}").open("a") as log:
+                            log.write(str(time.monotonic()) + "\n")
                     with (base / f"outbound-polls-{source}-{target}").open("a") as log:
                         log.write(str(time.monotonic()) + "\n")
                     lose_ack = base / f"lose-outbound-ack-{source}-{target}"
@@ -142,6 +147,13 @@ def forward_input():
                             break
                         time.sleep(0.01)
             if method == "mesh.deliver":
+                with (base / f"delivery-attempts-{source}-{target}").open("a") as log:
+                    log.write(request["params"]["envelope"]["correlation_id"] + "\n")
+                if (base / f"transient-delivery-{source}-{target}").exists():
+                    emit(json.dumps({"id": request["id"], "error": {
+                        "code": "mesh_delivery_refused", "message": "fleet_paused",
+                    }}) + "\n")
+                    continue
                 deliveries.add(request.get("id"))
                 if (base / f"spoof-host-{source}-{target}").exists():
                     envelope = request["params"]["envelope"]
@@ -239,6 +251,14 @@ try:
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
             deliveries.discard(response.get("id"))
+            gate = base / f"gate-delivery-ack-{source}-{target}"
+            if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:
+                (gate / "entered").touch()
+                deadline = time.monotonic() + 30
+                while gate.is_dir() and not (gate / "release").exists():
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
             gate = base / f"lose-receipt-{source}-{target}"
             if gate.exists() and response.get("result", {}).get("state") == "delivered":
                 gate.rename(base / f"lost-receipt-{source}-{target}")

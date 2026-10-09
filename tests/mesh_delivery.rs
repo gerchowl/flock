@@ -259,7 +259,7 @@ fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
     let attack = fleet.base.join("forge-origin-nodea-nodeb");
     std::fs::write(&attack, "forge").unwrap();
     let sent = send(&fleet, &recipient, "forged-origin");
-    assert_eq!(sent["result"]["state"], "queued", "{sent}");
+    assert_eq!(sent["result"]["state"], "refused", "{sent}");
     assert!(
         sent["result"]["warnings"]
             .to_string()
@@ -273,14 +273,18 @@ fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
         0
     );
     std::fs::remove_file(attack).unwrap();
-    database(fleet.node("nodea"))
-        .execute(
-            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE state='custody'",
-            [],
-        )
-        .unwrap();
+    let refused = request(
+        fleet.node("nodea"),
+        "msg.status",
+        json!({"correlation_id":"forged-origin"}),
+    );
+    assert_eq!(refused["result"]["state"], "refused");
+    assert_eq!(refused["result"]["detail"], "origin_mismatch");
+    // Correcting the transport requires a new send, not revival of refused mail.
+    let sent = send(&fleet, &recipient, "authentic-origin");
+    assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     let messages = fleet::wait_until(
-        "authentic retry after forgery",
+        "new authentic send after forgery refusal",
         Duration::from_secs(30),
         || {
             let messages = read(fleet.node("nodeb"), &recipient["pane_id"]);

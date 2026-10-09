@@ -21,6 +21,12 @@
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# Acceptance must expose flakes even without a command-line retry override.
+filter = 'binary(mesh_step1)'
+test-group = 'serial-pty'
+retries = 0
+
+[[profile.default.overrides]]
 # The federation hub/spoke and detach/reattach suites stand up multiple servers
 # + clients per test and race hardest under contention — serialize them.
 # live_handoff belongs here too: its live-handoff cases spawn a REPLACEMENT
@@ -35,7 +41,8 @@ serial-pty = { max-threads = 1 }
 # miss its deadline, and it fails as "the MCP pane did not start" — a message
 # that reads like a product bug and is not one.
 # fleet_gossip also exercises multi-node restart and held-edge faults.
-filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging) | binary(fleet_gossip) | binary(mesh_enrollment)'
+# mesh_step1 includes live handoff and a two-second reverse-edge assertion.
+filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging) | binary(fleet_gossip) | binary(mesh_enrollment) | binary(mesh_step1)'
 test-group = 'serial-pty'
 retries = 2
 
