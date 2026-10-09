@@ -4716,6 +4716,11 @@ pub(crate) fn node_clone_detection_unavailable(warning: &str) {
     );
 }
 
+/// Custody errors expose a bounded code, never envelope bodies or return tokens.
+pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
+    tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

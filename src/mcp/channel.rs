@@ -100,6 +100,7 @@ impl Arrival {
     pub(super) fn from_event(value: &Value) -> Option<Self> {
         let envelope: EventEnvelope = serde_json::from_value(value.clone()).ok()?;
         let EventData::MessageQueued {
+            message_key,
             correlation_id,
             from_pane,
             from_agent,
@@ -111,6 +112,7 @@ impl Arrival {
         else {
             return None;
         };
+        let body = crate::mesh::delivery::body(message_key.as_ref(), &body)?;
         Some(Self {
             correlation_id,
             from_pane,

@@ -80,6 +80,7 @@ child = subprocess.Popen(
     stdout=subprocess.PIPE, text=True, bufsize=1,
 )
 lock = threading.Lock()
+deliveries = set()
 
 
 def emit(line):
@@ -102,7 +103,44 @@ def forward_input():
                 child.stdin.flush()
                 continue
             method = request.get("method", "")
-            mode = node["mesh"]
+            mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.deliver":
+                deliveries.add(request.get("id"))
+                if (base / f"spoof-host-{source}-{target}").exists():
+                    envelope = request["params"]["envelope"]
+                    payload = json.loads(bytes(envelope["body"]))
+                    payload["message"]["from_host"] = "spoofed.example"
+                    envelope["body"] = list(json.dumps(payload).encode())
+                    line = json.dumps(request) + "\n"
+                capture = base / f"capture-delivery-{source}-{target}"
+                if capture.exists():
+                    capture.write_text(json.dumps(request["params"]))
+                    emit(json.dumps({"id": request.get("id"), "error": {
+                        "code": "held_by_test", "message": "captured before receiver import",
+                    }}) + "\n")
+                    continue
+                replay = base / f"replay-delivery-{source}-{target}"
+                if replay.exists():
+                    params = json.loads(replay.read_text())
+                    params["forwarded_by"] = request["params"]["envelope"]["key"]["origin_node"]
+                    request["params"] = params
+                    line = json.dumps(request) + "\n"
+                attack = base / f"forge-origin-{source}-{target}"
+                if attack.exists():
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    params["forwarded_by"] = envelope["key"]["origin_node"]
+                    envelope["key"]["origin_node"] = "disallowed.example"
+                    envelope["return_binding"]["request"] = dict(envelope["key"])
+                    line = json.dumps(request) + "\n"
+                gate = base / f"gate-message-{source}-{target}"
+                if gate.is_dir():
+                    (gate / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while not (gate / "release").exists():
+                        if not gate.is_dir() or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
             if isinstance(method, str) and method.startswith("mesh.") and mode == "disabled":
                 emit(json.dumps({"id": request.get("id"), "error": {
                     "code": "invalid_request", "message": f"unknown variant `{method}`",
@@ -143,6 +181,16 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        if response.get("id") in deliveries:
+            deliveries.discard(response.get("id"))
+            gate = base / f"lose-receipt-{source}-{target}"
+            if gate.exists() and response.get("result", {}).get("state") == "delivered":
+                gate.rename(base / f"lost-receipt-{source}-{target}")
+                line = json.dumps({"id": response["id"], "error": {
+                    "code": "lost_receipt", "message": "receipt lost after inbox commit",
+                }}) + "\n"
+            elif response.get("result", {}).get("state") == "duplicate":
+                (base / f"delivered-receipt-{source}-{target}").touch()
         emit(line)
     sys.exit(child.wait())
 finally:

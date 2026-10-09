@@ -1007,3 +1007,93 @@ fn version_four_pin_origin_is_unknown_after_migration() {
         Some(PinOrigin::Unknown)
     );
 }
+
+#[test]
+fn idle_retry_and_unchanged_pause_do_not_write() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    let changes = store.connection.total_changes();
+    for now in 1000..1100 {
+        store.set_paused(false, now).unwrap();
+        assert!(store.retry_ready_limit(now, 4).unwrap().is_empty());
+    }
+    assert_eq!(store.connection.total_changes(), changes);
+    let message = envelope();
+    store
+        .accept(&message, CUSTODY_TTL_MS, Admission::Custody, 1100)
+        .unwrap();
+    store.schedule_retry(&message.key, 60_000, 1100).unwrap();
+    let changes = store.connection.total_changes();
+    assert!(store.retry_ready(1200).unwrap().is_empty());
+    assert_eq!(store.connection.total_changes(), changes);
+    assert_eq!(store.retry_ready(61_100).unwrap(), vec![message.key]);
+}
+
+#[test]
+fn batch_read_expires_overdue_rows_and_reads_live_rows() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    let expired = envelope();
+    let live = envelope();
+    store
+        .accept(&expired, CUSTODY_TTL_MS, Admission::Inbox, 1000)
+        .unwrap();
+    store
+        .accept(&live, CUSTODY_TTL_MS, Admission::Inbox, 2000)
+        .unwrap();
+    store
+        .read_inbox(&[expired.key.clone(), live.key.clone()], 1000 + DAY_MS)
+        .unwrap();
+    assert_eq!(
+        store.get(&expired.key).unwrap().unwrap().state,
+        "inbox_expired"
+    );
+    let record = store.get(&live.key).unwrap().unwrap();
+    assert_eq!(record.state, "read");
+    assert_eq!(record.remaining_ms, 1000);
+    assert_eq!(record.mailbox_ttl_ms, DAY_MS);
+}
+
+#[test]
+fn dedupe_is_scoped_to_authenticated_origin() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    let first = envelope();
+    let mut second = first.clone();
+    second.key.origin_node = "another.example".into();
+    second.return_binding.request = second.key.clone();
+    assert_eq!(
+        store
+            .accept(&first, DAY_MS, Admission::Inbox, 1000)
+            .unwrap(),
+        Accepted::New
+    );
+    assert_eq!(
+        store
+            .accept(&second, DAY_MS, Admission::Inbox, 1000)
+            .unwrap(),
+        Accepted::New
+    );
+}
+
+#[test]
+fn origin_policy_prefers_configured_alias_to_inbound_name() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(1000);
+    let pin = IdentityPin {
+        node_id: "origin.example".into(),
+        public_key: vec![1; 32],
+    };
+    store
+        .put_pin_from(PinSource::Inbound, "inbound.example", &pin)
+        .unwrap();
+    assert_eq!(
+        store.origin_name(&pin.node_id).unwrap().as_deref(),
+        Some("inbound.example")
+    );
+    store.put_pin("configured.example", &pin).unwrap();
+    assert_eq!(
+        store.origin_name(&pin.node_id).unwrap().as_deref(),
+        Some("configured.example")
+    );
+}

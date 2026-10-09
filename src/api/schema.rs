@@ -150,6 +150,8 @@ pub enum Method {
     PeersRelayAttach(EmptyParams),
     #[serde(rename = "mesh.hello")]
     MeshHello(crate::mesh::hello::Hello),
+    #[serde(rename = "mesh.deliver")]
+    MeshDeliver(crate::mesh::delivery::Deliver),
     #[serde(rename = "peers.enroll_reset")]
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
@@ -2429,6 +2431,8 @@ pub enum ResponseResult {
         chain: Vec<LineageEdge>,
     },
     MsgQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_key: Option<crate::mesh::key::MessageKey>,
         correlation_id: String,
         /// "queued" | "duplicate" | "relayed"
         state: String,
@@ -3186,6 +3190,8 @@ pub enum EventData {
         attempt: DeliveryAttempt,
     },
     MessageQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_key: Option<crate::mesh::key::MessageKey>,
         correlation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_pane: Option<String>,

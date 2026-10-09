@@ -237,10 +237,22 @@ fn spawn_flock_no_session(
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
+    let home = config_home.join("home");
+    fs::create_dir_all(&home).unwrap();
+    cmd.env("HOME", &home);
+    cmd.env("XDG_STATE_HOME", home.join("state"));
+    cmd.env("XDG_DATA_HOME", home.join("data"));
+    cmd.env("XDG_CACHE_HOME", home.join("cache"));
+    cmd.env_remove("FLOCK_AGENT_ID");
+    cmd.env_remove("FLOCK_SESSION");
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
     SpawnedFlock {
         _master: pair.master,
         child,
@@ -567,6 +579,38 @@ fn no_session_flag_runs_monolithically() {
     assert!(
         response.contains("pong"),
         "monolithic API should respond: {response}"
+    );
+
+    let rpc = |method: &str, params: Value| -> Value {
+        let mut stream = UnixStream::connect(&api_socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id":"mail", "method":method, "params":params})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let started = rpc(
+        "agent.start",
+        serde_json::json!({"name":"mailbox", "argv":["/bin/sh","-c","while read line; do :; done"], "cwd":config_home}),
+    );
+    let pane = &started["result"]["agent"]["pane_id"];
+    assert!(pane.is_string(), "{started}");
+    let sent = rpc(
+        "msg.send",
+        serde_json::json!({"to":{"type":"pane", "pane":pane},"body":"monolithic custody", "intent":"fyi"}),
+    );
+    assert!(sent["result"]["message_key"].is_object(), "{sent}");
+    let inbox = rpc("msg.read", serde_json::json!({"pane":pane}));
+    assert_eq!(
+        inbox["result"]["messages"][0]["body"], "monolithic custody",
+        "{inbox}"
     );
 
     // Verify NO client socket was created — this is the key distinction

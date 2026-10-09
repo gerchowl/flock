@@ -271,6 +271,7 @@ impl App {
         Some(encode_success(
             id.to_string(),
             ResponseResult::MsgQueued {
+                message_key: None,
                 correlation_id,
                 state: "handed_up".into(),
                 warnings: Vec::new(),
@@ -539,6 +540,10 @@ impl App {
         encode_success(
             send.request_id.clone(),
             ResponseResult::MsgQueued {
+                message_key: result
+                    .get("message_key")
+                    .cloned()
+                    .and_then(|key| serde_json::from_value(key).ok()),
                 correlation_id: send.correlation_id.clone(),
                 state,
                 warnings,
