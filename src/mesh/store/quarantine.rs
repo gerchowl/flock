@@ -123,7 +123,7 @@ pub(super) fn append(directory: &Path, line: &[u8], limit: u64) -> std::io::Resu
         file.seek(SeekFrom::End(-1))?;
         let mut last = [0];
         file.read_exact(&mut last)?;
-        if last != [b'\n'] {
+        if last != *b"\n" {
             return Err(std::io::Error::other(
                 "quarantine sidecar has an incomplete final record",
             ));

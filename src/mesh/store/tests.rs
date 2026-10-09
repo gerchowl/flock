@@ -3432,7 +3432,7 @@ fn migration_archives_full_raw_quarantined_rows_before_clearing() {
     let mail = envelope();
     s.accept(&mail, 1000, Admission::Held, 0).unwrap();
     let body = [0xff, 0, 0x80];
-    let metadata = [0xfe, 0, b'{'];
+    let metadata = *b"\xfe\0{";
     s.connection
         .execute(
             "UPDATE envelopes SET state='quarantined',body=?1,metadata=?2",
