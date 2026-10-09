@@ -562,8 +562,9 @@ impl App {
         }
 
         if let AppEvent::MeshCollected(completion) = ev {
+            self.collection_relays.complete();
+            self.collection_peers.remove(&completion.peer.name);
             self.finish_mesh_collection(*completion);
-            self.finish_message_relay();
             return;
         }
 

@@ -384,6 +384,61 @@ impl App {
         response
     }
 
+    fn local_reply(
+        &mut self,
+        key: Option<&crate::mesh::key::MessageKey>,
+        from_pane: Option<String>,
+        from_agent: Option<String>,
+        enqueued: u64,
+        mut message: PendingMessage,
+    ) -> Result<(Option<crate::mesh::key::MessageKey>, &'static str), String> {
+        if self.fleet_pause.paused {
+            return Err("fleet_paused".into());
+        }
+        if now_ms().saturating_sub(enqueued) >= crate::mesh::store::DAY_MS as u64 {
+            return Err("message_expired".into());
+        }
+        if let Some(key) = key {
+            match self.persist_mesh_reply(key, message.clone()) {
+                Ok((answer, state)) => return Ok((Some(answer.key), state)),
+                Err(reason) if matches!(reason.as_str(), "message_expired" | "mailbox_full") => {
+                    return Err(reason)
+                }
+                // Local mailbox addressing remains usable during mesh-store recovery.
+                Err(_) => {}
+            }
+        }
+        message.to_pane = from_agent
+            .as_deref()
+            .and_then(|agent| self.locate_agent(agent))
+            .filter(|location| location.local)
+            .map(|location| location.pane_id)
+            .or(from_pane)
+            .unwrap_or_default();
+        if message.to_pane.is_empty() {
+            self.emit_event(EventEnvelope {
+                event: EventKind::MessageQueued,
+                data: queued_event(&message),
+            });
+            return Ok((None, "held"));
+        }
+        let blocking = message.intent == MsgIntent::Blocking;
+        let to_pane = message.to_pane.clone();
+        let at = message.enqueued_at_ms;
+        let response = self.queue_message_inner(String::new(), message, Vec::new(), false);
+        let result: serde_json::Value =
+            serde_json::from_str(&response).map_err(|e| e.to_string())?;
+        if let Some(code) = result["error"]["code"].as_str() {
+            return Err(code.into());
+        }
+        if blocking {
+            self.mailboxes.record_blocking("unattested", at);
+            self.escalate_muted_blocking(&to_pane);
+            self.sync_blocking_mail();
+        }
+        Ok((None, "queued"))
+    }
+
     fn route_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
         let body = crate::app::api_helpers::sanitize_reported_prompt(&params.body);
         if body.trim().is_empty() {
@@ -397,6 +452,9 @@ impl App {
                     meta.message_key.clone(),
                     meta.enqueued_at_ms,
                     meta.root.clone(),
+                    meta.from_pane.clone(),
+                    meta.from_agent.clone(),
+                    meta.from_host.clone(),
                 )
             })
             .or_else(|| {
@@ -407,19 +465,32 @@ impl App {
                             message.message_key.clone(),
                             message.enqueued_at_ms,
                             message.correlation_id.clone(),
+                            message.from_pane.clone(),
+                            message.from_agent.clone(),
+                            message.from_host.clone(),
                         )
                     })
             });
-        let Some((key, enqueued, root)) = original else {
+        let Some((key, enqueued, root, from_pane, from_agent, from_host)) = original else {
             return encode_error(
                 id,
                 "message_not_found",
                 format!("no message with correlation id {}", params.correlation_id),
             );
         };
-        let Some(key) = key else {
+        let local = from_host
+            .as_deref()
+            .is_none_or(|host| host == crate::app::short_host_name());
+        if !local && self.node_id.is_none() {
+            return encode_error(
+                id,
+                "mail_store_unavailable",
+                "mesh node identity unavailable",
+            );
+        }
+        if !local && key.is_none() {
             return encode_error(id, "reply_unavailable", super::mesh_replies::UNAVAILABLE);
-        };
+        }
         let caller = self.api_caller();
         let now = now_ms();
         let sender_key = caller.from_pane.clone().unwrap_or_else(|| "unknown".into());
@@ -454,8 +525,16 @@ impl App {
             delivery_attempts: 0,
             intent,
         };
-        match self.persist_mesh_reply(&key, message) {
-            Ok((answer, state)) => {
+        let result = if local {
+            self.local_reply(key.as_ref(), from_pane, from_agent, enqueued, message)
+        } else if let Some(key) = &key {
+            self.persist_mesh_reply(key, message)
+                .map(|(answer, state)| (Some(answer.key), state))
+        } else {
+            Err(super::mesh_replies::UNAVAILABLE.into())
+        };
+        match result {
+            Ok((answer_key, state)) => {
                 let round_trips = self.mailboxes.bump_round_trips(&root);
                 self.emit_event(EventEnvelope {
                     event: EventKind::MessageReplied,
@@ -471,13 +550,13 @@ impl App {
                     },
                 });
                 let mut warnings: Vec<String> = downgrade.into_iter().map(str::to_owned).collect();
-                if state == "held" && self.node_id.as_deref() == Some(key.origin_node.as_str()) {
+                if state == "held" && local {
                     warnings.push(REPLY_HELD_FOR_WAITER.into());
                 }
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
-                        message_key: Some(answer.key),
+                        message_key: answer_key,
                         correlation_id: reply_correlation_id,
                         state: state.into(),
                         warnings,
@@ -552,6 +631,28 @@ impl App {
     /// #175 O1 makes that monotonic across restarts, so "last" is a real
     /// ordering rather than whatever the file happened to yield.
     pub(super) fn handle_msg_status(&mut self, id: String, params: MsgStatusParams) -> String {
+        if let Some(origin) = self.node_id.as_deref() {
+            if let Ok(Some(reason)) = crate::mesh::hello::with_store(|store| {
+                store
+                    .collection_error(origin, &params.correlation_id)
+                    .map_err(|e| e.to_string())
+            }) {
+                return encode_success(
+                    id,
+                    ResponseResult::MsgStatus {
+                        attempts: Vec::new(),
+                        correlation_id: params.correlation_id,
+                        state: "collect_failed".into(),
+                        outcome_known: true,
+                        to_host: None,
+                        route: None,
+                        path: None,
+                        detail: Some(reason),
+                        reply: None,
+                    },
+                );
+            }
+        }
         let mut found: Option<ResponseResult> = None;
         for (_, event) in self.event_hub.events_after(0) {
             match &event.data {
@@ -823,12 +924,18 @@ impl App {
         // same disagreement as blocking mail arriving during one.
         self.escalate_muted_blocking(&pane);
         let mut deferred = 0;
+        let mut failed = None;
         if muted_until_ms != 0 {
             for message in self.mailboxes.owed_deferrals(&pane) {
-                if self.defer_message(&message, muted_until_ms, reason.clone()) {
-                    deferred += 1;
+                match self.defer_message(&message, muted_until_ms, reason.clone()) {
+                    Ok(true) => deferred += 1,
+                    Err(reason) => failed = Some(reason),
+                    Ok(false) => {}
                 }
             }
+        }
+        if let Some(reason) = failed {
+            return encode_error(id, super::mesh_mail::error_code(&reason), reason);
         }
         encode_success(
             id,
@@ -845,14 +952,20 @@ impl App {
         message: &PendingMessage,
         muted_until_ms: u64,
         reason: Option<String>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         if !self.mailboxes.owes_deferral(message) {
-            return false;
+            return Ok(false);
         }
-        let Some(key) = message.message_key.as_ref() else {
-            tracing::warn!("reply_unavailable: origin not mesh-reachable (needs 1-H2)");
-            return false;
-        };
+        let local = message
+            .from_host
+            .as_deref()
+            .is_none_or(|host| host == crate::app::short_host_name());
+        if !local && self.node_id.is_none() {
+            return Err("mesh node identity unavailable".into());
+        }
+        if !local && message.message_key.is_none() {
+            return Err(super::mesh_replies::UNAVAILABLE.into());
+        }
         let muter = self
             .resolve_terminal_target(&message.to_pane)
             .ok()
@@ -879,9 +992,25 @@ impl App {
             delivery_attempts: 0,
             intent: MsgIntent::Fyi,
         };
-        if let Err(reason) = self.persist_mesh_reply(key, answer) {
-            crate::logging::mesh_custody_failed("deferral", super::mesh_mail::error_code(&reason));
-            return false;
+        let result = if local {
+            self.local_reply(
+                message.message_key.as_ref(),
+                message.from_pane.clone(),
+                message.from_agent.clone(),
+                message.enqueued_at_ms,
+                answer,
+            )
+            .map(|_| ())
+        } else if let Some(key) = message.message_key.as_ref() {
+            self.persist_mesh_reply(key, answer).map(|_| ())
+        } else {
+            Err(super::mesh_replies::UNAVAILABLE.into())
+        };
+        if let Err(reason) = result {
+            if reason == "fleet_paused" {
+                return Ok(false);
+            }
+            return Err(reason);
         }
         self.mailboxes.mark_deferred(&message.correlation_id);
         self.emit_message_deferred(
@@ -895,7 +1024,7 @@ impl App {
         if self.state.config.msg.channel_push {
             self.settle_original_in(&message.to_pane, &message.correlation_id);
         }
-        true
+        Ok(true)
     }
 
     fn emit_message_deferred(
@@ -1433,10 +1562,33 @@ impl App {
     fn queue_message(
         &mut self,
         id: String,
-        mut message: PendingMessage,
+        message: PendingMessage,
         warnings: Vec<String>,
     ) -> String {
-        if (self.node_id.is_some() || !cfg!(test)) && message.message_key.is_none() {
+        self.queue_message_inner(id, message, warnings, true)
+    }
+
+    fn queue_message_inner(
+        &mut self,
+        id: String,
+        mut message: PendingMessage,
+        warnings: Vec<String>,
+        persist: bool,
+    ) -> String {
+        if self.mailboxes.owes_deferral(&message)
+            && self
+                .mailboxes
+                .muted_until(&message.to_pane, now_ms())
+                .is_some()
+            && message
+                .from_host
+                .as_deref()
+                .is_some_and(|host| host != crate::app::short_host_name())
+            && message.message_key.is_none()
+        {
+            return encode_error(id, "reply_unavailable", super::mesh_replies::UNAVAILABLE);
+        }
+        if persist && (self.node_id.is_some() || !cfg!(test)) && message.message_key.is_none() {
             if let Err(reason) = self.persist_local_mail(&mut message) {
                 return encode_error(id, super::mesh_mail::error_code(&reason), reason);
             }
@@ -1459,7 +1611,9 @@ impl App {
                     let now = now_ms();
                     if let Some(until) = self.mailboxes.muted_until(&message.to_pane, now) {
                         let reason = self.mailboxes.mute_reason(&message.to_pane, now);
-                        self.defer_message(&message, until, reason);
+                        if let Err(reason) = self.defer_message(&message, until, reason) {
+                            return encode_error(id, super::mesh_mail::error_code(&reason), reason);
+                        }
                     }
                 }
                 self.idle_wake_on_enqueue(&to_pane);
@@ -1893,22 +2047,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unbound_original_is_explicitly_unavailable_without_legacy_reply() {
+    async fn local_replies_do_not_require_a_mesh_node_or_writer() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
-        waking_send(&mut app, "unbound", "question");
-        let response = reply_to(&mut app, "unbound", "answer");
-        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(response.error.code, "reply_unavailable");
-        assert_eq!(
-            response.error.message,
-            super::super::mesh_replies::UNAVAILABLE
-        );
-        assert!(app.message_relays.pending.is_none());
-        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "unbound") else {
+        waking_send(&mut app, "local", "question");
+        let response = reply_to(&mut app, "local", "answer");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let ResponseResult::MsgStatus { reply, .. } = status_of(&mut app, "local") else {
             panic!("expected status");
         };
-        assert!(reply.is_none());
-        assert_eq!(app.mailboxes.queued_len(&pane_target(&app, 1)), 1);
+        assert_eq!(reply.unwrap().body, "answer");
+    }
+
+    #[tokio::test]
+    async fn unbound_remote_mail_and_missing_node_identity_have_distinct_errors() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        waking_send(&mut app, "unbound", "question");
+        let mut original = app.mailboxes.queued_message("unbound").unwrap().clone();
+        original.from_host = Some("remote.example".into());
+        app.mailboxes.record_delivered(&original);
+        let response: serde_json::Value =
+            serde_json::from_str(&reply_to(&mut app, "unbound", "answer")).unwrap();
+        assert_eq!(response["error"]["code"], "mail_store_unavailable");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("node identity"));
+        app.node_id = Some("local.example".into());
+        let response: serde_json::Value =
+            serde_json::from_str(&reply_to(&mut app, "unbound", "answer")).unwrap();
+        assert_eq!(response["error"]["code"], "reply_unavailable");
+        assert!(app.message_relays.pending.is_none());
     }
 
     #[tokio::test]
@@ -2764,9 +2933,7 @@ mod tests {
         let mut app = test_app_with_hub(hub.clone());
         app.state.config.msg.channel_push = true;
         let answerer = pane_target(&app, 1);
-        // The sender's pane is gone: `msg.reply` looks the original up and
-        // then cannot place its sender. (A sender with NO pane used to be the
-        // vehicle here, but since #576 that reply is held, not refused.)
+        // Expired originals must remain unsettled when a reply is refused.
         app.mailboxes
             .enqueue(crate::app::mailboxes::PendingMessage {
                 message_key: None,
@@ -2794,7 +2961,7 @@ mod tests {
         })));
         app.current_api_peer_pid = None;
         assert!(
-            response.contains("\"code\":\"reply_unavailable\""),
+            response.contains("\"code\":\"message_expired\""),
             "{response}"
         );
         assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");

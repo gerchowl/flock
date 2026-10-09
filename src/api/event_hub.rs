@@ -15,6 +15,7 @@ struct PersistedEvent {
 
 #[derive(Clone, Default)]
 pub struct EventHub {
+    reply_waiters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
     /// The newest sequence pushed, behind its own lock so a waiter can sleep
     /// on it (#438). Kept apart from `inner` because a condvar pairs with ONE
@@ -202,7 +203,41 @@ fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
     Ok(events)
 }
 
+pub(crate) struct ReplyWaitGuard {
+    hub: EventHub,
+    correlation: String,
+}
+impl Drop for ReplyWaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = self.hub.reply_waiters.lock() {
+            if let Some(count) = waiters.get_mut(&self.correlation) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    waiters.remove(&self.correlation);
+                }
+            }
+        }
+    }
+}
+
 impl EventHub {
+    pub(crate) fn track_reply_wait(&self, correlation: &str) -> ReplyWaitGuard {
+        if let Ok(mut waiters) = self.reply_waiters.lock() {
+            *waiters.entry(correlation.into()).or_default() += 1;
+        }
+        ReplyWaitGuard {
+            hub: self.clone(),
+            correlation: correlation.into(),
+        }
+    }
+
+    pub(crate) fn reply_waits(&self) -> Vec<String> {
+        self.reply_waiters
+            .lock()
+            .map(|waiters| waiters.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     // #175 phase 4: bumped 512 → 4096 so the check-runner's per-tick fan-out
     // (CheckRan / CheckFired / CheckErrored / ChecksHeartbeat) can't starve the
     // pane-lifecycle events that share the in-memory ring. Operator-approved.

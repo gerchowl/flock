@@ -400,3 +400,270 @@ fn local_held_answer_and_deferral_use_custody_and_keep_existing_wait_semantics()
         3
     );
 }
+
+fn enrolled(node: &Node, peer: &str) {
+    fleet::wait_until("outbound edge enrolled", Duration::from_secs(30), || {
+        request(node, "peers.enrollment", json!({}))["result"]["peers"]
+            .as_array()?
+            .iter()
+            .find(|entry| {
+                entry["peer"] == peer
+                    && entry["source"] == "configured"
+                    && entry["state"] == "pinned"
+            })
+            .cloned()
+    });
+}
+
+#[test]
+fn bidirectional_answers_push_immediately_without_waiting_for_collection() {
+    let fleet = fleet::spawn(
+        "mesh-push-answer",
+        &[
+            NodeSpec::new("nodea", "push-origin", &["nodeb"]),
+            NodeSpec::new("nodeb", "push-target", &["nodea"]),
+        ],
+    );
+    let (sender, _) = question(&fleet, "push");
+    enrolled(fleet.node("nodeb"), "nodea");
+    database(fleet.node("nodea"))
+        .execute("UPDATE envelopes SET collect_at=999999999", [])
+        .unwrap();
+    let start = std::time::Instant::now();
+    let sent = reply(fleet.node("nodeb"), "push", "immediate");
+    assert!(sent.get("error").is_none(), "{sent}");
+    let received = answers(fleet.node("nodea"), &sender["pane_id"]);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "an enrolled reverse edge must push immediately"
+    );
+    assert_eq!(received[0]["body"], "immediate");
+    fleet::wait_until("pushed reply receipt", Duration::from_secs(5), || {
+        (database(fleet.node("nodeb"))
+            .query_row(
+                "SELECT state FROM envelopes WHERE request_id IS NOT NULL",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+            == "delivered")
+            .then_some(())
+    });
+}
+
+#[test]
+fn one_way_answer_arrives_on_the_first_fast_poll_without_a_waiter() {
+    let fleet = fleet::spawn("mesh-fast-collect", PAIR);
+    let (sender, _) = question(&fleet, "fast");
+    let start = std::time::Instant::now();
+    assert_eq!(
+        reply(fleet.node("nodeb"), "fast", "five seconds")["result"]["state"],
+        "held"
+    );
+    let received = answers(fleet.node("nodea"), &sender["pane_id"]);
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "first collection must use the fast interval"
+    );
+    assert_eq!(received[0]["body"], "five seconds");
+}
+
+#[test]
+fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
+    let fleet = fleet::spawn(
+        "mesh-collect-lane",
+        &[
+            NodeSpec::new("nodea", "lane-origin", &["nodeb", "nodec"])
+                .with_config("[msg]\ndeferral_relay_concurrency=1\n"),
+            NodeSpec::new("nodeb", "lane-blocked", &[]),
+            NodeSpec::new("nodec", "lane-healthy", &[]),
+        ],
+    );
+    question(&fleet, "blocked-collection");
+    let target = agent(fleet.node("nodec"));
+    discover(&fleet, &target);
+    let hold = fleet.base.join("hold-collect-nodea-nodeb");
+    std::fs::create_dir(&hold).unwrap();
+    ready(fleet.node("nodea"));
+    fleet::wait_until(
+        "collection blocked on offline transport",
+        Duration::from_secs(10),
+        || hold.join("entered").exists().then_some(()),
+    );
+    let start = std::time::Instant::now();
+    let sent = send(&fleet, &target, "user-send");
+    assert_eq!(sent["result"]["state"], "delivered", "{sent}");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "background collection must not occupy the user relay lane"
+    );
+    std::fs::write(hold.join("release"), "").unwrap();
+}
+
+#[test]
+fn invalid_collected_binding_is_terminal_and_visible_in_message_status() {
+    let fleet = fleet::spawn("mesh-collect-failed", PAIR);
+    question(&fleet, "invalid-answer");
+    std::fs::write(fleet.base.join("corrupt-collect-answer-nodea-nodeb"), "").unwrap();
+    reply(
+        fleet.node("nodeb"),
+        "invalid-answer",
+        "bad binding in transit",
+    );
+    ready(fleet.node("nodea"));
+    let status = fleet::wait_until("terminal import failure", Duration::from_secs(10), || {
+        let status = request(
+            fleet.node("nodea"),
+            "msg.status",
+            json!({"correlation_id":"invalid-answer"}),
+        );
+        (status["result"]["state"] == "collect_failed").then_some(status)
+    });
+    assert_eq!(status["result"]["detail"], "invalid reply binding");
+    let failures: i64 = database(fleet.node("nodea"))
+        .query_row(
+            "SELECT collect_failures FROM envelopes WHERE correlation='invalid-answer'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failures, 1, "permanent failures stop immediately");
+}
+
+#[test]
+fn local_reply_survives_a_mesh_writer_failure() {
+    let fleet = fleet::spawn(
+        "mesh-local-writer-failure",
+        &[NodeSpec::new("nodea", "local-writer", &[])],
+    );
+    let node = fleet.node("nodea");
+    let target = agent(node);
+    let sent = request(
+        node,
+        "msg.send",
+        json!({
+            "to":{"type":"pane","pane":target["pane_id"]},"body":"question","correlation_id":"local-outage","intent":"needs_reply"
+        }),
+    );
+    assert!(sent.get("error").is_none(), "{sent}");
+    database(node)
+        .execute_batch(
+            "CREATE TRIGGER refuse_answer BEFORE INSERT ON envelopes
+         WHEN json_extract(NEW.metadata,'$.request_key') IS NOT NULL
+         BEGIN SELECT RAISE(ABORT,'test mesh writer unavailable'); END;",
+        )
+        .unwrap();
+    let response = reply(node, "local-outage", "local answer survives");
+    assert_eq!(response["result"]["state"], "held", "{response}");
+    let status = request(node, "msg.status", json!({"correlation_id":"local-outage"}));
+    assert_eq!(
+        status["result"]["reply"]["body"], "local answer survives",
+        "{status}"
+    );
+}
+
+#[test]
+fn collection_policy_uses_the_stored_origin_name_not_the_current_ssh_alias() {
+    let fleet = fleet::spawn("mesh-collect-alias",&[
+        NodeSpec::new("nodea","alias-origin",&[]).with_config(
+            "[msg]\nallow_from=['b-policy.test']\n[[peers]]\nname='b-policy.test'\nssh='nodeb'\n"),
+        NodeSpec::new("nodeb","alias-target",&[]),
+    ]);
+    let (sender, _) = question(&fleet, "alias-answer");
+    // The trusted node gains a new transport alias. Its stable policy name
+    // remains the earlier configured pin, just as on mesh.deliver ingress.
+    for app in ["flock", "flock-dev"] {
+        let path = fleet
+            .node("nodea")
+            .config_home
+            .join(app)
+            .join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            config.replace("name='b-policy.test'", "name='zz-transport.test'"),
+        )
+        .unwrap();
+    }
+    let reload = request(fleet.node("nodea"), "server.reload_config", json!({}));
+    assert!(reload.get("error").is_none(), "{reload}");
+    enrolled(fleet.node("nodea"), "zz-transport.test");
+    reply(fleet.node("nodeb"), "alias-answer", "identity policy");
+    ready(fleet.node("nodea"));
+    let received = answers(fleet.node("nodea"), &sender["pane_id"]);
+    assert_eq!(received[0]["body"], "identity policy");
+    assert_eq!(received[0]["from_host"], "b-policy.test");
+}
+
+#[test]
+fn an_active_reply_wait_shortens_a_backed_off_collection_deadline() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let fleet = fleet::spawn("mesh-collect-wait", PAIR);
+    question(&fleet, "waiting");
+    database(fleet.node("nodea"))
+        .execute(
+            "UPDATE envelopes SET collect_at=300000,collect_attempts=3",
+            [],
+        )
+        .unwrap();
+    let mut waiter = UnixStream::connect(&fleet.node("nodea").api_socket).unwrap();
+    waiter
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(waiter,"{}",json!({"id":"wait","method":"msg.wait_reply","params":{"correlation_id":"waiting","timeout_ms":10000}})).unwrap();
+    fleet::wait_until(
+        "waiter requests fast collection",
+        Duration::from_secs(5),
+        || {
+            (database(fleet.node("nodea"))
+                .query_row(
+                    "SELECT collect_at FROM envelopes WHERE correlation='waiting'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                < 300000)
+                .then_some(())
+        },
+    );
+    reply(fleet.node("nodeb"), "waiting", "wait accelerated");
+    let mut response = String::new();
+    BufReader::new(waiter).read_line(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["outcome"], "replied", "{response}");
+    assert_eq!(response["result"]["reply"]["body"], "wait accelerated");
+}
+
+#[test]
+fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
+    let fleet = fleet::spawn("mesh-collect-reenroll", PAIR);
+    let (sender, _) = question(&fleet, "reenroll");
+    database(fleet.node("nodea"))
+        .execute(
+            "UPDATE envelopes SET collect_at=300000,collect_attempts=3",
+            [],
+        )
+        .unwrap();
+    fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
+    fleet::wait_until(
+        "reenrollment restores fast polling",
+        Duration::from_secs(30),
+        || {
+            (database(fleet.node("nodea"))
+                .query_row(
+                    "SELECT collect_at FROM envelopes WHERE correlation='reenroll'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                < 300000)
+                .then_some(())
+        },
+    );
+    reply(fleet.node("nodeb"), "reenroll", "edge is back");
+    let start = std::time::Instant::now();
+    let received = answers(fleet.node("nodea"), &sender["pane_id"]);
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert_eq!(received[0]["body"], "edge is back");
+}

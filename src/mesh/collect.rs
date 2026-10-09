@@ -53,9 +53,17 @@ fn fetch(peer: &crate::config::PeerConfig, query: &Collect) -> Result<Vec<Delive
         "mesh.collect",
         serde_json::to_value(query).map_err(|e| e.to_string())?,
     )?;
-    let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    if response.get("error").is_some() {
-        return Err("mesh collection refused".into());
+    decode(&raw)
+}
+
+fn decode(raw: &str) -> Result<Vec<Deliver>, String> {
+    let response: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if let Some(error) = response.get("error") {
+        let reason = error["message"].as_str().unwrap_or("unknown refusal");
+        if matches!(reason, "fleet_paused" | "mailbox_full" | "mail_store_full") {
+            return Err(reason.into());
+        }
+        return Err(format!("mesh collection refused: {reason}"));
     }
     let answers: Vec<Deliver> =
         serde_json::from_value(response["result"]["answers"].clone()).map_err(|e| e.to_string())?;
@@ -63,4 +71,20 @@ fn fetch(peer: &crate::config::PeerConfig, query: &Collect) -> Result<Vec<Delive
         return Err("mesh collection batch too large".into());
     }
     Ok(answers)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn remote_pause_and_backpressure_do_not_spend_the_import_failure_budget() {
+        for reason in ["fleet_paused", "mailbox_full", "mail_store_full"] {
+            let raw = serde_json::json!({"error": {
+                "code": "mesh_collection_refused", "message": reason
+            }});
+            assert_eq!(super::decode(&raw.to_string()).unwrap_err(), reason);
+        }
+        assert!(super::decode(r#"{"error":{"message":"invalid envelope"}}"#)
+            .unwrap_err()
+            .starts_with("mesh collection refused:"));
+    }
 }

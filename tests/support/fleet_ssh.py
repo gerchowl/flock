@@ -107,6 +107,14 @@ def forward_input():
             mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
             if method == "mesh.collect":
                 collections.add(request.get("id"))
+                hold = base / f"hold-collect-{source}-{target}"
+                if hold.is_dir():
+                    (hold / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while hold.is_dir() and not (hold / "release").exists():
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
                 replay = base / f"replay-collect-{source}-{target}"
                 if replay.exists():
                     request["params"] = json.loads(replay.read_text())
@@ -197,6 +205,10 @@ try:
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
         if response.get("id") in collections:
+            answers = response.get("result", {}).get("answers", [])
+            if answers and (base / f"corrupt-collect-answer-{source}-{target}").exists():
+                answers[0]["envelope"]["request_key"]["message_id"] = "wrong-conversation"
+                line = json.dumps(response) + "\n"
             collections.discard(response.get("id"))
             if response.get("error"):
                 (base / f"collect-refused-{source}-{target}").write_text(line)

@@ -260,6 +260,7 @@ pub(super) fn wait_for_reply(
         })));
     }
 
+    let _waiting = event_hub.track_reply_wait(&correlation_id);
     loop {
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();

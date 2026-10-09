@@ -132,6 +132,9 @@ pub(crate) struct PendingMessage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveredMeta {
+    pub from_pane: Option<String>,
+    pub from_agent: Option<String>,
+    pub from_host: Option<String>,
     pub message_key: Option<crate::mesh::key::MessageKey>,
     pub enqueued_at_ms: u64,
     /// Correlation id of the thread root (self for a fresh message).
@@ -224,6 +227,9 @@ impl MailboxRegistry {
                         self.history.insert(
                             correlation_id.clone(),
                             DeliveredMeta {
+                                from_pane: message.from_pane.clone(),
+                                from_agent: message.from_agent.clone(),
+                                from_host: message.from_host.clone(),
                                 message_key: message.message_key.clone(),
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
@@ -425,6 +431,9 @@ impl MailboxRegistry {
         self.history.insert(
             message.correlation_id.clone(),
             DeliveredMeta {
+                from_pane: message.from_pane.clone(),
+                from_agent: message.from_agent.clone(),
+                from_host: message.from_host.clone(),
                 message_key: message.message_key.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,

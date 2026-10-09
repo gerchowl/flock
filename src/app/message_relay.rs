@@ -59,6 +59,31 @@ pub(crate) struct RelayCompletion {
 }
 
 impl MessageRelays {
+    pub(crate) fn start_bounded(
+        &mut self,
+        work: RelayWork,
+        event_tx: tokio::sync::mpsc::Sender<AppEvent>,
+        cap: usize,
+    ) {
+        // Callers claim durable work only when a slot is free.
+        debug_assert!(self.running < cap);
+        self.running += 1;
+        std::thread::spawn(move || {
+            let mut guard = CompletionGuard {
+                event_tx,
+                completion: Some(work.failure),
+            };
+            guard.completion = Some((work.run)());
+        });
+    }
+
+    pub(crate) fn slots(&self, cap: usize) -> usize {
+        cap.saturating_sub(self.running)
+    }
+    pub(crate) fn complete(&mut self) {
+        self.running = self.running.saturating_sub(1);
+    }
+
     pub fn is_idle(&self) -> bool {
         self.running == 0 && self.waiting.is_empty()
     }

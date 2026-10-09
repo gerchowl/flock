@@ -185,6 +185,8 @@ impl App {
                 id,
                 if reason == "origin_mismatch" {
                     "origin_mismatch"
+                } else if reason == super::mesh_replies::UNAVAILABLE {
+                    "reply_unavailable"
                 } else {
                     "mesh_delivery_refused"
                 },
@@ -222,6 +224,10 @@ impl App {
         })?;
         if !self.state.config.msg.accepts_from(Some(&sender_host)) {
             return Err("msg_not_allowed".into());
+        }
+        if let Some(request) = &envelope.request_key {
+            self.import_mesh_answer(request, delivery, None)?;
+            return Ok((Accepted::New, true));
         }
         let mut data = payload(envelope)?;
         if data.message.correlation_id != envelope.correlation_id
@@ -267,6 +273,15 @@ impl App {
         data.message.from_host = Some(sender_host);
         data.message.message_key = Some(envelope.key.clone());
         data.message.enqueued_at_ms = now_ms();
+        if self.mailboxes.owes_deferral(&data.message)
+            && self
+                .mailboxes
+                .muted_until(&data.message.to_pane, now_ms())
+                .is_some()
+            && self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str())
+        {
+            return Err(super::mesh_replies::UNAVAILABLE.into());
+        }
         let accepted = with_store(|store| {
             let existing = store.get(&envelope.key).map_err(|e| e.to_string())?;
             if existing.is_none()
@@ -298,6 +313,31 @@ impl App {
         let Some(delivery) = &send.mesh else {
             return;
         };
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|failure| failure.detail().contains("reply_unavailable"))
+        {
+            let _ = with_store(|store| {
+                store
+                    .finish(
+                        &delivery.envelope.key,
+                        Outcome::ReplyUnavailable,
+                        now_ms() as i64,
+                    )
+                    .map_err(|e| e.to_string())
+            });
+            self.mailboxes
+                .finish_relaying_question(&send.correlation_id);
+            if let Some(respond_to) = send.respond_to {
+                let _ = respond_to.send(encode_error(
+                    send.id,
+                    "reply_unavailable",
+                    super::mesh_replies::UNAVAILABLE,
+                ));
+            }
+            return;
+        }
         let mut warnings = Vec::new();
         let mut state = "queued";
         match result {
@@ -640,6 +680,9 @@ pub(super) fn error_code(reason: &str) -> &'static str {
         Some("mailbox_full") => "mailbox_full",
         Some("mail_store_full") => "mail_store_full",
         Some("fleet_paused") => "fleet_paused",
+        Some("message_expired") => "message_expired",
+        Some("message_not_found") => "message_not_found",
+        Some("origin not mesh-reachable (needs 1-H2)") => "reply_unavailable",
         _ => "mail_store_unavailable",
     }
 }

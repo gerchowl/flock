@@ -886,27 +886,21 @@ mod tests {
         pane
     }
 
-    /// `msg.mute` on `pane`; returns how many senders it deferred.
-    fn mute_count(app: &mut crate::app::App, pane: &str) -> u64 {
-        let muted = value(&app.handle_api_request(Request {
-            id: "req".into(),
-            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
-                pane: Some(pane.into()),
-                seconds: 600,
-                reason: None,
-            }),
-        }));
-        muted["result"]["deferred"]
-            .as_u64()
-            .expect("deferred count")
-    }
-
     #[tokio::test]
     async fn an_unbound_question_never_sends_a_legacy_deferral() {
         let mut app = test_app();
         let _take = attach_relay(&mut app);
         let pane = spoke_with_a_remote_question(&mut app, "unbound-deferral");
-        assert_eq!(mute_count(&mut app, &pane), 0);
+        app.node_id = Some("local.example".into());
+        let response = app.handle_api_request(Request {
+            id: "mute".into(),
+            method: Method::MsgMute(crate::api::schema::MsgMuteParams {
+                pane: Some(pane.clone()),
+                seconds: 600,
+                reason: None,
+            }),
+        });
+        assert!(response.contains("reply_unavailable"), "{response}");
         assert_eq!(app.uplink.outbound_len(), 0);
         assert_eq!(deferred_events(&app), 0);
         assert_eq!(app.mailboxes.queued_len(&pane), 1);

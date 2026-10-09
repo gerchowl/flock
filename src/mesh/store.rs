@@ -162,6 +162,7 @@ pub enum Outcome {
     Expired,
     InboxExpired,
     RecipientGone,
+    ReplyUnavailable,
 }
 impl Outcome {
     fn name(self) -> &'static str {
@@ -172,6 +173,7 @@ impl Outcome {
             Self::Expired => "expired",
             Self::InboxExpired => "inbox_expired",
             Self::RecipientGone => "recipient_gone",
+            Self::ReplyUnavailable => "reply_unavailable",
         }
     }
 }
@@ -403,6 +405,26 @@ impl<D: DiskSpace> Store<D> {
         admission: Admission,
         wall_ms: i64,
     ) -> Result<Accepted> {
+        self.accept_inner(envelope, ttl_ms, admission, wall_ms, false)
+    }
+
+    pub fn accept_collected(
+        &mut self,
+        envelope: &Envelope,
+        ttl_ms: i64,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        self.accept_inner(envelope, ttl_ms, Admission::Inbox, wall_ms, true)
+    }
+
+    fn accept_inner(
+        &mut self,
+        envelope: &Envelope,
+        ttl_ms: i64,
+        admission: Admission,
+        wall_ms: i64,
+        collect_ack: bool,
+    ) -> Result<Accepted> {
         let now = self.writable(wall_ms)?;
         if !envelope.key.is_valid()
             || !(1..=CUSTODY_TTL_MS).contains(&ttl_ms)
@@ -440,6 +462,7 @@ impl<D: DiskSpace> Store<D> {
             }
             // No TTL or inbox lifetime renewal on retry. Import of existing
             // custody is explicit through import(), not implicit retransmission.
+            collection::record_answer(&tx, envelope, admission, collect_ack)?;
             tx.commit()?;
             return Ok(Accepted::Duplicate);
         }
@@ -466,6 +489,12 @@ impl<D: DiskSpace> Store<D> {
             params![envelope.key.origin_node,envelope.key.message_id,envelope.correlation_id,metadata,fingerprint,envelope.body,
                 if inbox { "inbox" } else { "custody" },deadline, if inbox {Some(now.saturating_add(DAY_MS))} else {None},
                 deadline.saturating_add(DAY_MS),inbox,now,charge as i64])?;
+        tx.execute("UPDATE envelopes SET request_origin=?3,request_id=?4,recipient_node=?5,reply_expected=?6,collection_token=?7 WHERE origin=?1 AND id=?2",
+            params![envelope.key.origin_node,envelope.key.message_id,
+                envelope.request_key.as_ref().map(|k| &k.origin_node),envelope.request_key.as_ref().map(|k| &k.message_id),
+                envelope.return_binding.recipient_node,
+                matches!(envelope.intent.as_str(), "\"needs_reply\"" | "\"blocking\""),serde_json::to_string(&envelope.return_binding.collection_token)?])?;
+        collection::record_answer(&tx, envelope, admission, collect_ack)?;
         if inbox {
             tx.execute(
                 "INSERT INTO inbox_imports VALUES(?1,?2)",
@@ -541,6 +570,12 @@ impl<D: DiskSpace> Store<D> {
                 now.saturating_add(CUSTODY_TTL_MS)
             ],
         )?;
+        if outcome == Outcome::Delivered {
+            tx.execute(
+                "UPDATE envelopes SET collect_at=?3,collect_attempts=0 WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id, now.saturating_add(5_000)],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -665,8 +700,7 @@ impl<D: DiskSpace> Store<D> {
     /// Replies referencing a full request identity, independently of threading labels.
     pub fn by_request_key(&self, request: &MessageKey) -> Result<Vec<MessageKey>> {
         let mut stmt = self.connection.prepare(
-            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.request_key.origin_node')=?1
-             AND json_extract(metadata,'$.request_key.message_id')=?2 ORDER BY origin,id",
+            "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 ORDER BY origin,id",
         )?;
         let keys = stmt
             .query_map(params![request.origin_node, request.message_id], |r| {
@@ -684,7 +718,7 @@ impl<D: DiskSpace> Store<D> {
     pub fn by_collection_token(&self, token: &[u8]) -> Result<Vec<MessageKey>> {
         let encoded = serde_json::to_string(token)?;
         let mut stmt = self.connection.prepare(
-            "SELECT origin,id FROM envelopes WHERE json_extract(metadata,'$.return_binding.collection_token')=?1 ORDER BY origin,id",
+            "SELECT origin,id FROM envelopes WHERE collection_token=?1 ORDER BY origin,id",
         )?;
         let keys = stmt
             .query_map([encoded], |r| {

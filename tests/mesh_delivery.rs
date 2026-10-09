@@ -55,7 +55,9 @@ fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
 }
 
 fn read(node: &Node, pane: &Value) -> Value {
-    request(node, "msg.read", json!({"pane":pane}))["result"]["messages"].clone()
+    let response = request(node, "msg.read", json!({"pane":pane}));
+    assert!(response["result"]["messages"].is_array(), "{response}");
+    response["result"]["messages"].clone()
 }
 
 #[test]

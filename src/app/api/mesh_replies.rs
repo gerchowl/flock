@@ -27,9 +27,21 @@ impl App {
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
-        let origin = self.node_id.clone().ok_or(UNAVAILABLE)?;
-        let original = with_store(|store| store.get(request).map_err(|e| e.to_string()))?
-            .ok_or(UNAVAILABLE)?;
+        let origin = self
+            .node_id
+            .clone()
+            .ok_or("mesh node identity unavailable")?;
+        let original = with_store(|store| {
+            store
+                .collection_record(request, now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })?
+        .ok_or("message_not_found")?;
+        if original.remaining_ms == 0
+            || matches!(original.state.as_str(), "expired" | "inbox_expired")
+        {
+            return Err("message_expired".into());
+        }
         if original.envelope.return_binding.request != *request
             || original.envelope.return_binding.recipient_node != origin
             || !matches!(original.state.as_str(), "inbox" | "read")
@@ -71,10 +83,16 @@ impl App {
         {
             return Err("mailbox_full".into());
         }
+        let push_peer = if local {
+            None
+        } else {
+            self.outbound_reply_peer(&request.origin_node)
+                .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
+        };
         let data = Payload {
             message: message.clone(),
-            peer: None,
-            host: None,
+            peer: push_peer.as_ref().map(|peer| peer.name.clone()),
+            host: push_peer.as_ref().map(|peer| peer.name.clone()),
             direct: true,
         };
         let mut answer = envelope(&origin, original.envelope.sender.clone(), &data)?;
@@ -104,6 +122,27 @@ impl App {
         };
         if local {
             self.project_mesh_answer(message);
+        } else if let Some(peer) = push_peer {
+            let send = crate::app::message_relay::RelaySend {
+                mesh: Some(Deliver {
+                    envelope: answer.clone(),
+                    remaining_ms: CUSTODY_TTL_MS,
+                }),
+                id: answer.key.message_id.clone(),
+                host: peer.name.clone(),
+                peer,
+                to_agent: answer.target_agent.clone(),
+                direct: true,
+                from_agent: answer.sender.clone(),
+                from_host: crate::app::short_host_name(),
+                body: message.body,
+                correlation_id: answer.correlation_id.clone(),
+                in_reply_to: answer.in_reply_to.clone(),
+                intent: message.intent,
+                settle_original: None,
+                respond_to: None,
+            };
+            self.enqueue_message_relay(send.into_work());
         }
         Ok((answer, state))
     }
@@ -158,96 +197,204 @@ impl App {
             return;
         }
         self.mesh_collect_at = Some(now + std::time::Duration::from_secs(1));
-        if self.fleet_pause.paused || !self.message_relays.is_idle() {
+        if self.fleet_pause.paused {
             return;
         }
+        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+        let slots = self.collection_relays.slots(cap);
+        if slots == 0 {
+            return;
+        }
+        let generation = crate::peer_stream::enrollment_generation();
+        let reconnected: Vec<String> = if generation != self.collection_generation {
+            self.state
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let status = crate::peer_stream::enrollment(peer);
+                    (status.state == "pinned")
+                        .then_some(status.node_id)
+                        .flatten()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.collection_generation = generation;
+        let busy: Vec<String> = self.collection_peers.values().cloned().collect();
         let records = with_store(|store| {
             store
-                .collect_ready(
+                .collect_fast(
                     &origin,
+                    &self.event_hub.reply_waits(),
+                    &reconnected,
                     now_ms() as i64,
-                    self.state.config.msg.deferral_relay_concurrency.max(1),
                 )
+                .map_err(|e| e.to_string())?;
+            store
+                .collect_ready(&origin, now_ms() as i64, slots, &busy)
                 .map_err(|e| e.to_string())
         });
         let Ok(records) = records else { return };
         for record in records {
             let binding = record.envelope.return_binding;
-            let peer = self
-                .state
-                .peers
-                .iter()
-                .find(|peer| {
-                    with_store(|store| store.get_pin(&peer.name).map_err(|e| e.to_string()))
-                        .ok()
-                        .flatten()
-                        .is_some_and(|pin| pin.node_id == binding.recipient_node)
-                })
-                .cloned();
-            let Some(peer) = peer else { continue };
-            self.enqueue_message_relay(crate::mesh::collect::work(
+            let Some(peer) = self.outbound_reply_peer(&binding.recipient_node) else {
+                continue;
+            };
+            let ack = with_store(|store| {
+                store
+                    .collection_acks(&record.envelope.key)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap_or_default();
+            self.start_collection(
                 peer,
                 Collect {
                     request: record.envelope.key,
                     token: binding.collection_token,
-                    ack: Vec::new(),
+                    ack,
                 },
-            ));
+            );
         }
+    }
+
+    fn outbound_reply_peer(&self, node: &str) -> Option<crate::config::PeerConfig> {
+        self.state
+            .peers
+            .iter()
+            .find(|peer| {
+                with_store(|store| store.get_pin(&peer.name).map_err(|e| e.to_string()))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|pin| pin.node_id == node)
+            })
+            .cloned()
+    }
+
+    fn start_collection(&mut self, peer: crate::config::PeerConfig, query: Collect) {
+        let cap = self.state.config.msg.deferral_relay_concurrency.clamp(1, 4);
+        if self.collection_relays.slots(cap) == 0 {
+            return;
+        }
+        let node = with_store(|store| store.get_pin(&peer.name).map_err(|e| e.to_string()))
+            .ok()
+            .flatten()
+            .map(|pin| pin.node_id)
+            .unwrap_or_default();
+        self.collection_peers.insert(peer.name.clone(), node);
+        self.collection_relays.start_bounded(
+            crate::mesh::collect::work(peer, query),
+            self.event_tx.clone(),
+            self.state.config.msg.deferral_relay_concurrency.clamp(1, 4),
+        );
     }
 
     pub(crate) fn finish_mesh_collection(&mut self, completion: Completion) {
         if self.fleet_pause.paused {
             return;
         }
-        let Ok(answers) = completion.result else {
-            return;
+        let answers = match completion.result {
+            Ok(answers) => answers,
+            Err(reason) => {
+                if reason.starts_with("mesh collection refused") {
+                    let _ = with_store(|store| {
+                        store
+                            .collection_failed(&completion.query.request, &reason, false)
+                            .map_err(|e| e.to_string())
+                    });
+                }
+                return;
+            }
         };
-        let mut ack = Vec::new();
+        if with_store(|store| {
+            store
+                .collection_acked(&completion.query.request, &completion.query.ack)
+                .map_err(|e| e.to_string())
+        })
+        .is_err()
+        {
+            return;
+        }
         for answer in answers {
-            match self.import_mesh_answer(&completion.peer.name, &completion.query.request, &answer)
-            {
-                Ok(()) => ack.push(answer.envelope.key),
-                Err(reason) => crate::logging::mesh_custody_failed(
+            if let Err(reason) = self.import_mesh_answer(
+                &completion.query.request,
+                &answer,
+                Some(&completion.peer.name),
+            ) {
+                crate::logging::mesh_custody_failed(
                     "collect",
                     super::mesh_mail::error_code(&reason),
-                ),
+                );
+                if !matches!(
+                    reason.as_str(),
+                    "mailbox_full" | "mail_store_full" | "fleet_paused"
+                ) && crate::mesh::runtime_store::recovery_reason().is_none()
+                {
+                    let permanent = matches!(
+                        reason.as_str(),
+                        "invalid reply binding" | "inconsistent mesh answer" | "msg_not_allowed"
+                    );
+                    let _ = with_store(|store| {
+                        store
+                            .collection_failed(&completion.query.request, &reason, permanent)
+                            .map_err(|e| e.to_string())
+                    });
+                }
             }
         }
+        let ack = with_store(|store| {
+            store
+                .collection_acks(&completion.query.request)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap_or_default();
         if !ack.is_empty() {
-            self.enqueue_message_relay(crate::mesh::collect::work(
+            self.start_collection(
                 completion.peer,
                 Collect {
                     ack,
                     ..completion.query
                 },
-            ));
+            );
         }
     }
 
-    fn import_mesh_answer(
+    pub(super) fn import_mesh_answer(
         &mut self,
-        peer: &str,
         request: &MessageKey,
         delivery: &Deliver,
+        collecting_peer: Option<&str>,
     ) -> Result<(), String> {
-        let origin = self.node_id.as_deref().ok_or(UNAVAILABLE)?;
+        let origin = self
+            .node_id
+            .as_deref()
+            .ok_or("mesh node identity unavailable")?;
         let answer = &delivery.envelope;
-        if !self.state.config.msg.accepts_from(Some(peer)) {
+        let sender_host = with_store(|store| {
+            store
+                .origin_name(&answer.key.origin_node)
+                .map_err(|e| e.to_string())
+        })?
+        .ok_or("origin_mismatch")?;
+        if !self.state.config.msg.accepts_from(Some(&sender_host)) {
             return Err("msg_not_allowed".into());
         }
         let original = with_store(|store| {
+            if let Some(peer) = collecting_peer {
+                if store
+                    .get_pin(peer)
+                    .map_err(|e| e.to_string())?
+                    .is_none_or(|pin| pin.node_id != answer.key.origin_node)
+                {
+                    return Err("invalid reply binding".into());
+                }
+            }
             let original = store
                 .get(request)
                 .map_err(|e| e.to_string())?
                 .ok_or(UNAVAILABLE)?;
-            let pin = store
-                .get_pin(peer)
-                .map_err(|e| e.to_string())?
-                .ok_or(UNAVAILABLE)?;
             if request.origin_node != origin
-                || pin.node_id != original.envelope.return_binding.recipient_node
-                || answer.key.origin_node != pin.node_id
+                || answer.key.origin_node != original.envelope.return_binding.recipient_node
                 || answer.request_key.as_ref() != Some(request)
                 || answer.target_agent != original.envelope.sender
                 || answer.in_reply_to.as_deref() != Some(original.envelope.correlation_id.as_str())
@@ -271,7 +418,7 @@ impl App {
             .map(|location| location.pane_id)
             .unwrap_or_default();
         data.message.from_pane = None;
-        data.message.from_host = Some(peer.into());
+        data.message.from_host = Some(sender_host);
         data.message.message_key = Some(answer.key.clone());
         data.message.enqueued_at_ms = now_ms();
         let accepted = with_store(|store| {
@@ -282,14 +429,17 @@ impl App {
             {
                 return Err("mailbox_full".into());
             }
-            store
-                .accept(
+            if collecting_peer.is_some() {
+                store.accept_collected(answer, delivery.remaining_ms, now_ms() as i64)
+            } else {
+                store.accept(
                     answer,
                     delivery.remaining_ms,
                     Admission::Inbox,
                     now_ms() as i64,
                 )
-                .map_err(|e| e.to_string())
+            }
+            .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
             self.project_mesh_answer(data.message);
