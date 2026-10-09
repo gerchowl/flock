@@ -84,6 +84,7 @@ fn answer_kind(reply_correlation_id: &str, reply: MsgReplyInfo) -> Answer {
 pub(crate) fn answer_in(event: &EventEnvelope, correlation_id: &str) -> Option<Answer> {
     match &event.data {
         EventData::MessageQueued {
+            message_key,
             correlation_id: reply_id,
             in_reply_to: Some(original),
             from_pane,
@@ -96,7 +97,7 @@ pub(crate) fn answer_in(event: &EventEnvelope, correlation_id: &str) -> Option<A
             MsgReplyInfo {
                 correlation_id: reply_id.clone(),
                 kind: "reply".into(),
-                body: body.clone(),
+                body: crate::mesh::delivery::body(message_key.as_ref(), body)?,
                 from_agent: from_agent.clone(),
                 from_pane: from_pane.clone(),
                 from_host: from_host.clone(),
@@ -321,6 +322,7 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                message_key: None,
                 correlation_id: id.into(),
                 from_pane: Some("w1:p1".into()),
                 from_agent: Some("agent_example_1".into()),

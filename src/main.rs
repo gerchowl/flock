@@ -703,7 +703,7 @@ fn main() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
-    let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
+    let _api_server = match api::start_server_for_mode(api_tx, event_hub.clone(), false) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
@@ -783,7 +783,10 @@ fn main() -> io::Result<()> {
             api_rx,
             event_hub,
         );
-        let result = app.run(&mut terminal).await;
+        let result = match app.initialize_mesh_mail(Some(&_api_server)) {
+            Ok(()) => app.run(&mut terminal).await,
+            Err(reason) => Err(std::io::Error::other(reason)),
+        };
 
         // Hand the host window title back (#361) — only if this session ever
         // took it. `[title] enabled = false` publishes nothing, so there is
