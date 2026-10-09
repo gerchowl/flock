@@ -139,9 +139,11 @@ pub struct TerminalState {
     /// say who sent it.
     ///
     /// This is minted once when the pane is created, persisted in the session
-    /// snapshot, and never rewritten. Address ≠ location: host and pane are
-    /// resolvable *metadata* about an agent, not its name.
+    /// snapshot, and replaced only after authoritative agent removal. Address ≠
+    /// location: host and pane are resolvable *metadata* about an agent, not its name.
     pub agent_id: AgentId,
+    /// Suppress duplicate teardown captures until the replacement shell is ready.
+    pub(crate) agent_identity_retired: bool,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
@@ -317,6 +319,7 @@ impl TerminalState {
         Self {
             id,
             agent_id,
+            agent_identity_retired: false,
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,
@@ -1315,6 +1318,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.agent_identity_retired = false;
         self.resume_failed = false;
         self.restart_retry = None;
         self.detected_agent = None;

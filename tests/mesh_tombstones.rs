@@ -86,17 +86,104 @@ fn session(node: &Node, agent: &Value) {
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
-fn native_agent(node: &Node) -> Value {
+fn native_executable(node: &Node) -> std::path::PathBuf {
     let executable = node.home.join("claude");
     let report = format!("printf '%s\\n' '{{\"session_id\":\"retained-session\"}}' | {0} hook claude session\n{0} pane report-agent --source flock:claude --agent claude --state idle --agent-session-id retained-session", quote(env!("CARGO_BIN_EXE_flk")));
     fs::write(&executable, format!("#!/bin/sh\n{report}\nprintf 'Claude Code\\nTask complete.\\n─────────────\\n❯ \\n─────────────\\n'\nwhile IFS= read -r line\ndo\n{report}\ndone\n")).unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    executable
+}
+fn native_agent(node: &Node) -> Value {
+    let executable = native_executable(node);
     let agent = start_at(node, &node.repo, &executable);
     fleet::wait_until("native session hook", DEADLINE, || {
         let current = api(node, "agent.get", json!({"target":agent["pane_id"]}))["agent"].clone();
         (current["agent_session"]["value"] == "retained-session").then_some(())
     });
     agent
+}
+
+// The respawn-shell path belongs to imported agent runtimes. Keep the
+// replacement sandbox server owned through assertions, including panic cleanup.
+struct RestoredServer<'a>(&'a Node);
+impl Drop for RestoredServer<'_> {
+    fn drop(&mut self) {
+        use std::io::Write;
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.0.api_socket) {
+            let _ = stream
+                .write_all(b"{\"id\":\"cleanup\",\"method\":\"server.stop\",\"params\":{}}\n");
+        }
+    }
+}
+fn restore_server(node: &Node) -> RestoredServer<'_> {
+    let guard = RestoredServer(node);
+    api(node, "server.live_handoff", json!({}));
+    guard
+}
+
+fn exit_to_shell(node: &Node, agent: &Value) {
+    api(
+        node,
+        "pane.send_text",
+        json!({"pane_id":agent["pane_id"],"text":"exit\n"}),
+    );
+    fleet::wait_until("agent exited to shell", DEADLINE, || {
+        // A successful pane lookup plus absent agent proves shell respawn, not close.
+        api(node, "pane.get", json!({"pane_id":agent["pane_id"]}));
+        raw(node, "agent.get", json!({"target":agent["pane_id"]}))
+            .get("error")
+            .map(|_| ())
+    });
+}
+fn replacement_in_same_pane(node: &Node, previous: &Value) -> Value {
+    let imported = api(node, "agent.get", json!({"target":previous["pane_id"]}))["agent"].clone();
+    assert_eq!(imported["agent_id"], previous["agent_id"]);
+    exit_to_shell(node, previous);
+    let executable = native_executable(node);
+    api(
+        node,
+        "pane.send_text",
+        json!({"pane_id":previous["pane_id"],
+        "text":format!("exec {}\n", quote(executable.to_str().unwrap()))}),
+    );
+    let replacement = fleet::wait_until("replacement agent", DEADLINE, || {
+        let result = raw(node, "agent.get", json!({"target":previous["pane_id"]}));
+        let agent = &result["result"]["agent"];
+        (agent["agent_session"]["value"] == "retained-session").then(|| agent.clone())
+    });
+    assert_eq!(replacement["pane_id"], previous["pane_id"]);
+    assert_eq!(replacement["terminal_id"], imported["terminal_id"]);
+    assert_ne!(replacement["agent_id"], previous["agent_id"]);
+    replacement
+}
+
+#[test]
+fn replacement_after_exit_accepts_mail_with_fresh_identity() {
+    let fleet = fleet::spawn("ts-reuse", SINGLE);
+    let node = fleet.node("nodea");
+    let old = start(node);
+    let sender = start(node);
+    let _restored = restore_server(node);
+    let replacement = replacement_in_same_pane(node, &old);
+    assert_eq!(removals(node), 1);
+    send(node, &sender, &replacement, "replacement-mail");
+    state(node, "replacement-mail", "delivered");
+    let messages = api(node, "msg.read", json!({"pane":replacement["pane_id"]}));
+    assert!(messages["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["correlation_id"] == "replacement-mail"));
+    let refused = raw(
+        node,
+        "msg.send",
+        json!({"to":{"type":"agent","agent":old["agent_id"]},"body":"old address"}),
+    );
+    assert_eq!(refused["error"]["code"], "recipient_gone");
+    // A second import proves the new identity is persisted by the normal snapshot.
+    api(node, "server.live_handoff", json!({}));
+    let restored = api(node, "agent.get", json!({"target":replacement["pane_id"]}));
+    assert_eq!(restored["agent"]["agent_id"], replacement["agent_id"]);
 }
 
 // Only the isolated fixture's initial commit bypasses the product subprocess logger.
@@ -259,8 +346,8 @@ fn reply_to_removed_sender_lands_in_origin_status_not_a_replacement_inbox() {
     discover(&fleet, &target);
     send(origin, &sender, &target, "removed-sender");
     api(owner, "msg.read", json!({"pane":target["pane_id"]}));
-    close(origin, &sender);
-    let replacement = start(origin);
+    let _restored = restore_server(origin);
+    let replacement = replacement_in_same_pane(origin, &sender);
     assert_ne!(sender["agent_id"], replacement["agent_id"]);
     api(
         owner,
@@ -306,29 +393,18 @@ fn confirmed_exit_only_removes_agents_without_resumable_sessions() {
     let fleet = fleet::spawn("ts-exit", SINGLE);
     let node = fleet.node("nodea");
     let sender = start(node);
-    for retained in [false, true] {
-        let target = start(node);
-        if retained {
-            session(node, &target);
-        }
+    let targets = [start(node), start(node)];
+    session(node, &targets[1]);
+    let _restored = restore_server(node);
+    for (retained, target) in [false, true].into_iter().zip(targets) {
         let correlation = if retained {
             "retained-exit"
         } else {
             "permanent-exit"
         };
         send(node, &sender, &target, correlation);
-        api(
-            node,
-            "pane.send_text",
-            json!({"pane_id":target["pane_id"],"text":"exit\n"}),
-        );
+        exit_to_shell(node, &target);
         if retained {
-            fleet::wait_until("exited session retained", DEADLINE, || {
-                (api(node, "agent.get", json!({"target":target["pane_id"]}))["agent"]
-                    ["agent_status"]
-                    == "hibernated")
-                    .then_some(())
-            });
             state(node, correlation, "delivered");
         } else {
             state(node, correlation, "recipient_gone");

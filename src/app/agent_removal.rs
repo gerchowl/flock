@@ -59,7 +59,7 @@ pub(crate) fn identity(terminal: &TerminalState) -> (String, String) {
 }
 
 pub(crate) fn capture(terminal: &TerminalState, event: RemovalEvent) -> Option<Removal> {
-    if !terminal.is_agent_terminal() {
+    if terminal.agent_identity_retired || !terminal.is_agent_terminal() {
         return None;
     }
     let resumable = terminal.pending_agent_resume_plan.is_some()
@@ -78,29 +78,6 @@ pub(crate) fn capture(terminal: &TerminalState, event: RemovalEvent) -> Option<R
 }
 
 impl App {
-    pub(crate) fn retain_exited_session(&mut self, pane: crate::layout::PaneId) {
-        let id = self
-            .find_pane(pane)
-            .map(|(_, p)| p.attached_terminal_id.clone());
-        let Some(terminal) = id.and_then(|id| self.state.terminals.get_mut(&id)) else {
-            return;
-        };
-        if terminal.hibernated_resume_plan.is_none()
-            && terminal.pending_agent_resume_plan.is_none()
-            && !terminal.restart_in_progress
-        {
-            if let Some(plan) = terminal
-                .persisted_agent_session
-                .as_ref()
-                .and_then(|s| crate::agent_resume::plan(&s.source, &s.agent, &s.session_ref))
-            {
-                terminal.set_hibernated_resume_plan(Some(plan));
-                terminal.respawn_shell_on_exit = false;
-                self.state.mark_session_dirty();
-            }
-        }
-    }
-
     pub(crate) fn remove_agent_for_pane(
         &mut self,
         ws: usize,
@@ -170,6 +147,19 @@ impl App {
     }
 
     pub(crate) fn record_agent_removal(&mut self, removal: Removal) {
+        // Retire the identity before attempting storage: a queued tombstone must
+        // never apply to the next agent launched in this terminal, either.
+        let mut retired = false;
+        for terminal in self.state.terminals.values_mut() {
+            if terminal.agent_id.to_string() == removal.agent {
+                terminal.agent_id = crate::terminal::AgentId::alloc(&super::short_host_name());
+                terminal.agent_identity_retired = true;
+                retired = true;
+            }
+        }
+        if retired {
+            self.state.mark_session_dirty();
+        }
         if self
             .pending_agent_removals
             .iter()
@@ -234,6 +224,61 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn removal_retires_identity_once_and_schedules_persistence() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("retired")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let id = app.state.terminal_id_for_pane(0, pane).unwrap();
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.set_agent_name("fixture".into());
+        let removal = capture(terminal, RemovalEvent::Exit).unwrap();
+        app.state.session_dirty = false;
+        app.record_agent_removal(removal.clone());
+        assert!(app.state.session_dirty);
+        let replacement = app.state.terminals[&id].agent_id.clone();
+        assert_ne!(replacement.to_string(), removal.agent);
+        assert!(capture(&app.state.terminals[&id], RemovalEvent::Close).is_none());
+        app.record_agent_removal(removal);
+        assert_eq!(app.state.terminals[&id].agent_id, replacement);
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.clear_agent_runtime_identity_after_respawn();
+        terminal.set_agent_name("replacement".into());
+        assert_eq!(
+            capture(terminal, RemovalEvent::Exit).unwrap().agent,
+            replacement.to_string()
+        );
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+            Default::default(),
+            24,
+            0.5,
+            Default::default(),
+            Default::default(),
+        );
+        let saved = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(
+            saved.agent_id.as_deref(),
+            Some(replacement.to_string().as_str())
+        );
+    }
+
     #[test]
     fn removal_decision_table() {
         for retained in [false, true] {

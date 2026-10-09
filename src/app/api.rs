@@ -628,7 +628,6 @@ impl App {
                 self.render_notify.notify_one();
                 return;
             }
-            self.retain_exited_session(*pane_id);
             if let Some((ws, _)) = self.find_pane(*pane_id) {
                 self.remove_agent_for_pane(ws, *pane_id, super::agent_removal::RemovalEvent::Exit);
             }
@@ -2688,7 +2687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pane_died_retains_restored_agent_session_for_resume() {
+    async fn pane_died_respawns_shell_and_clears_restored_agent_session() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -2720,25 +2719,16 @@ mod tests {
 
         assert!(
             app.find_pane(pane_id).is_some(),
-            "resumable agent pane should stay attached after the agent process exits"
+            "respawnable agent pane should stay attached after the agent process exits"
         );
         let terminal = app
             .state
             .terminals
             .get(&terminal_id)
-            .expect("terminal should retain its resume binding");
+            .expect("terminal should survive respawn");
         assert!(!terminal.respawn_shell_on_exit);
-        assert_eq!(
-            terminal
-                .persisted_agent_session
-                .as_ref()
-                .unwrap()
-                .session_ref
-                .value,
-            "codex-session"
-        );
-        assert_eq!(terminal.agent_name.as_deref(), Some("codex"));
-        assert!(terminal.hibernated_resume_plan.is_some());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.agent_name.is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
