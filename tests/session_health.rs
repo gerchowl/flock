@@ -102,19 +102,21 @@ impl Harness {
         } else {
             Command::new(env!("CARGO_BIN_EXE_flk"))
         };
-        let child = command
+        command
             .arg("server")
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .envs(support::environment::isolated_env(
+                &self.config_home,
+                &self.runtime_dir,
+            ))
             .env("FLOCK_SOCKET_PATH", &self.socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("server should spawn");
+            .stderr(Stdio::null());
+        support::environment::assert_command_isolated(&command);
+        let child = command.spawn().expect("server should spawn");
         self.server = Some(child);
         wait_for_socket(&self.socket, Duration::from_secs(30));
     }
@@ -128,8 +130,10 @@ impl Harness {
     fn client(&self, args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_flk"))
             .args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .envs(support::environment::isolated_env(
+                &self.config_home,
+                &self.runtime_dir,
+            ))
             .env("FLOCK_SOCKET_PATH", &self.socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
