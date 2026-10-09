@@ -1,4 +1,5 @@
 pub mod client;
+pub(crate) mod compatibility;
 mod event_hub;
 mod reply_wait;
 pub mod schema;
