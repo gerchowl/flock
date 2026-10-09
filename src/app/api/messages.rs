@@ -2168,16 +2168,24 @@ mod tests {
         assert_eq!(response["id"], "unrelated");
         assert!(response.get("result").is_some());
         assert!(app.message_relays.pending.is_none());
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), app.event_rx.recv())
-            .await
-            .unwrap()
-            .expect("detached relay completes");
-        let crate::events::AppEvent::MsgRelayCompleted(completion) = &event else {
-            panic!("expected relay completion");
-        };
-        assert_eq!(completion.send.id, "req");
+        // Background samples can arrive before the detached relay completes.
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = app.event_rx.recv().await.expect("detached relay completes");
+                match event {
+                    crate::events::AppEvent::MsgRelayCompleted(completion)
+                        if completion.send.id == "req" =>
+                    {
+                        break completion;
+                    }
+                    event => app.handle_internal_event(event),
+                }
+            }
+        })
+        .await
+        .expect("detached relay completes within the original deadline");
         assert!(completion.send.respond_to.is_none());
-        app.handle_internal_event(event);
+        app.handle_internal_event(crate::events::AppEvent::MsgRelayCompleted(completion));
         assert!(
             rx.try_recv().is_err(),
             "the detached result is never delivered to the new caller"
