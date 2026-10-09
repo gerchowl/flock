@@ -4373,3 +4373,54 @@ fn expired_read_receipts_do_not_starve_fresh_routed_receipts() {
     store.receipts_sent(&receipts).unwrap();
     assert!(store.routed_receipts(DAY_MS + 1).unwrap().is_empty());
 }
+
+#[test]
+fn delivered_receipt_does_not_acknowledge_a_held_offer() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect, Receipt};
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept_origin(&mail, "receiver.example", Admission::Held, 8, 0)
+        .unwrap();
+    let query = OutboundCollect {
+        receipts: vec![Receipt {
+            key: mail.key.clone(),
+            token: mail.return_binding.collection_token.clone(),
+            state: "delivered".into(),
+        }],
+        ack: Vec::new(),
+    };
+    let offered = store
+        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 1)
+        .unwrap();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].envelope.body, mail.body);
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "held");
+    let repeated = store
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            6001,
+        )
+        .unwrap();
+    assert_eq!(repeated.len(), 1);
+    let ack = OutboundCollect {
+        receipts: Vec::new(),
+        ack: vec![OutboundAck {
+            key: mail.key.clone(),
+            token: mail.return_binding.collection_token.clone(),
+            delivered: true,
+            refusal: None,
+        }],
+    };
+    assert!(store
+        .collect_outbound(Offer::All, "origin.example", "receiver.example", &ack, 6002)
+        .unwrap()
+        .is_empty());
+    let settled = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(settled.state, "delivered");
+    assert!(settled.envelope.body.is_empty());
+}

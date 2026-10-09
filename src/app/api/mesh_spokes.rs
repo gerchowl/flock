@@ -10,9 +10,10 @@ use crate::{
 impl App {
     pub(super) fn finish_outbound_collection(&mut self, completion: Completion) {
         let mut failed = completion.result.is_err();
+        let mut unacked_receipts = false;
         if let Collect::Outbound { outbound } = &completion.query {
             if let Ok(batch) = &completion.result {
-                failed |= outbound
+                unacked_receipts = outbound
                     .receipts
                     .iter()
                     .any(|receipt| !batch.receipts_acked.contains(receipt));
@@ -39,7 +40,7 @@ impl App {
         self.mesh_outbound_polls
             .entry(completion.peer.name.clone())
             .or_default()
-            .finished(std::time::Instant::now(), failed);
+            .finished_receipts(std::time::Instant::now(), failed, unacked_receipts);
         let Ok(batch) = completion.result else {
             return;
         };

@@ -237,9 +237,16 @@ impl<D: DiskSpace> Store<D> {
         ) {
             return Ok(ReceiptImport::OriginalNotReady);
         }
+        // Delivery evidence does not acknowledge a held offer. Keep its body
+        // for retransmission until the custody ack arrives. Final outcomes can
+        // settle it immediately, including a read that outran its own ack.
+        let settle = original_state != "held" || state != "delivered";
         let changed = self.connection.execute(
-            "UPDATE envelopes SET remote_state=?3,delivered=1,body=CASE WHEN state IN ('held','transferred') THEN X'' ELSE body END,state=CASE WHEN state IN ('held','transferred') THEN 'delivered' ELSE state END WHERE origin=?1 AND id=?2",
-            params![key.origin_node, key.message_id, state],
+            "UPDATE envelopes SET remote_state=?3,delivered=1,
+             body=CASE WHEN ?4 AND state IN ('held','transferred') THEN X'' ELSE body END,
+             state=CASE WHEN ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END
+             WHERE origin=?1 AND id=?2",
+            params![key.origin_node, key.message_id, state, settle],
         )?;
         Ok(if changed == 1 {
             ReceiptImport::Applied

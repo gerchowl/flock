@@ -22,6 +22,8 @@ pub(crate) struct Poll {
     attempts: usize,
     generation: u64,
     failed: bool,
+    receipts_pending: bool,
+    receipts_deferred: bool,
 }
 impl Poll {
     pub fn note_wake(&mut self) {
@@ -29,7 +31,7 @@ impl Poll {
     }
 
     pub fn note_receipts(&mut self, pending: bool) {
-        self.pending |= pending;
+        self.receipts_pending |= pending;
     }
 
     pub fn ready(&mut self, now: std::time::Instant, pinned: bool, generation: u64) -> bool {
@@ -37,13 +39,25 @@ impl Poll {
             self.deadline = None;
             self.attempts = 0;
             self.failed = false;
+            self.receipts_deferred = false;
         }
         self.pinned = pinned;
         self.generation = generation;
-        pinned && (self.deadline.is_none_or(|at| at <= now) || (self.pending && !self.failed))
+        pinned
+            && (self.deadline.is_none_or(|at| at <= now)
+                || (!self.failed
+                    && (self.pending || (self.receipts_pending && !self.receipts_deferred))))
     }
+    /// Unaccepted receipts wait for the bounded poll deadline, but a healthy
+    /// edge can still wake for new mail or retry a lost custody acknowledgement.
+    pub fn finished_receipts(&mut self, now: std::time::Instant, failed: bool, unacked: bool) {
+        self.finished(now, failed);
+        self.receipts_deferred = unacked;
+    }
+
     pub fn finished(&mut self, now: std::time::Instant, failed: bool) {
         self.pending = false;
+        self.receipts_pending = false;
         self.failed = failed;
         let seconds = [5, 60, 299][self.attempts.min(2)];
         self.attempts = self.attempts.saturating_add(1);
@@ -197,6 +211,22 @@ fn decode(raw: &str) -> Result<Batch, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unacked_receipts_back_off_without_blocking_custody_wakes() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+    }
+
     #[test]
     fn wake_does_not_bypass_failed_backoff() {
         let now = std::time::Instant::now();
