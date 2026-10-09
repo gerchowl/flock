@@ -97,6 +97,8 @@ impl App {
         };
         let mut answer = envelope(&origin, original.envelope.sender.clone(), &data)?;
         answer.request_key = Some(request.clone());
+        answer.return_binding.collection_token =
+            original.envelope.return_binding.collection_token.clone();
         answer.return_binding.recipient_node = request.origin_node.clone();
         answer.return_binding.collection_peers = vec![request.origin_node.clone()];
         with_store(|store| {
@@ -116,6 +118,9 @@ impl App {
                 .map_err(|e| e.to_string())?;
             Ok(())
         })?;
+        if !local && push_peer.is_none() {
+            self.emit_mesh_wake(&request.origin_node);
+        }
         message.message_key = Some(answer.key.clone());
         let state = if local && !message.to_pane.is_empty() {
             "queued"
@@ -192,7 +197,7 @@ impl App {
                         store.collect_answers(origin, query, now_ms() as i64)
                     }
                     Collect::Outbound { outbound } => store.collect_outbound(
-                        crate::mesh::store::Offer::Step1RequestsOnly,
+                        crate::mesh::store::Offer::All,
                         self.node_id
                             .as_deref()
                             .ok_or("mesh node identity unavailable")?,
@@ -309,6 +314,14 @@ impl App {
         for peer in peers {
             let edge = crate::peer_stream::enrollment(&peer);
             if let Some(node) = edge.node_id.as_deref().filter(|_| edge.state == "pinned") {
+                if !self.collection_peers.contains_key(&peer.name)
+                    && crate::peer_stream::take_wake(&peer)
+                {
+                    self.mesh_outbound_polls
+                        .entry(peer.name.clone())
+                        .or_default()
+                        .note_wake();
+                }
                 // The hub's own read receipts are work even after the spoke
                 // has drained its outbox and stopped advertising pending mail.
                 let receipts_pending = with_store(|store| {
@@ -521,6 +534,8 @@ impl App {
                 || answer.in_reply_to.as_deref() != Some(original.envelope.correlation_id.as_str())
                 || answer.return_binding.request != answer.key
                 || answer.return_binding.recipient_node != origin
+                || answer.return_binding.collection_token
+                    != original.envelope.return_binding.collection_token
             {
                 return Err("invalid reply binding".into());
             }
@@ -563,6 +578,7 @@ impl App {
             .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
+            self.emit_mesh_wake(&answer.key.origin_node);
             self.project_mesh_answer(data.message);
         }
         Ok(())

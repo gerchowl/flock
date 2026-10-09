@@ -79,7 +79,7 @@ impl<D: DiskSpace> Store<D> {
         }
         let now = clock.advance(wall_ms);
         let peers = serde_json::to_string(pushable_nodes)?;
-        let condition = "state='custody' AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?1)) AND retry_at<=?2 AND custody_deadline>?2 AND lease_until<=?2";
+        let condition = "(state='custody' OR (state='held' AND request_origin IS NOT NULL)) AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?1)) AND retry_at<=?2 AND custody_deadline>?2 AND lease_until<=?2";
         let ready: bool = self.connection.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
             params![peers, now],
@@ -123,7 +123,7 @@ impl<D: DiskSpace> Store<D> {
         let mut leased = Vec::new();
         for key in valid {
             if tx.execute(
-                "UPDATE envelopes SET lease_until=?3 WHERE origin=?1 AND id=?2 AND state='custody' AND lease_until<=?4 AND retry_at<=?4 AND custody_deadline>?4 AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?5))",
+                "UPDATE envelopes SET state='custody',lease_until=?3 WHERE origin=?1 AND id=?2 AND (state='custody' OR (state='held' AND request_origin IS NOT NULL)) AND lease_until<=?4 AND retry_at<=?4 AND custody_deadline>?4 AND next_hop!='' AND next_hop IN (SELECT value FROM json_each(?5))",
                 params![key.origin_node, key.message_id, now.saturating_add(60_000),now,peers],
             )? == 1 { leased.push(key); }
         }

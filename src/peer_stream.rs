@@ -155,6 +155,23 @@ fn push_kind(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
+    static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    WAKES.get_or_init(Default::default)
+}
+
+pub(crate) fn take_wake(peer: &PeerConfig) -> bool {
+    wake_registry()
+        .lock()
+        .ok()
+        .and_then(|wakes| {
+            wakes
+                .get(&peer.name)
+                .map(|wake| wake.swap(false, std::sync::atomic::Ordering::AcqRel))
+        })
+        .unwrap_or(false)
+}
+
 /// Split the relay's inbound lines: pushes to the single-slot buffer, every
 /// other line to whoever is waiting on a response.
 ///
@@ -178,6 +195,15 @@ fn route_relay_lines<R: BufRead>(
         // JSON at all, which surfaces to the caller as a parse error rather
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
+            if push_kind(&line).as_deref() == Some("mesh.wake") {
+                if let Ok(mut wakes) = wake_registry().lock() {
+                    wakes
+                        .entry(peer.into())
+                        .or_default()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
             // A kind this build does not know is dropped, never fed to the
             // summary parser, where it would fail the poll it answered.
             if let Some(kind) = push_kind(&line).filter(|kind| kind != SUMMARY_PUSH) {
@@ -863,6 +889,9 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
 /// its peer is gone from config, or when its ssh destination changed — the two
 /// cases where the held connection no longer points where the config says.
 pub fn retain_configured(peers: &[PeerConfig]) {
+    if let Ok(mut wakes) = wake_registry().lock() {
+        wakes.retain(|name, _| peers.iter().any(|peer| &peer.name == name));
+    }
     let Ok(mut registry) = registry().lock() else {
         return;
     };
@@ -897,6 +926,30 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_wake_push_interleaved_with_a_response_disturbs_neither() {
+        let peer = crate::config::PeerConfig {
+            name: "wake.example".into(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slot = Arc::new(Mutex::new(None));
+        let wire = concat!(
+            "{\"id\":\"one\"}\n",
+            "{\"push\":\"mesh.wake\"}\n",
+            "{\"push\":\"unknown\"}\n",
+            "{\"id\":\"two\"}\n"
+        );
+        route_relay_lines(&peer.name, std::io::Cursor::new(wire), &tx, &slot);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![r#"{"id":"one"}"#, r#"{"id":"two"}"#]
+        );
+        assert!(take_wake(&peer));
+        assert!(!take_wake(&peer));
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[test]

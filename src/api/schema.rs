@@ -1738,6 +1738,8 @@ pub struct EventsSubscribeParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Subscription {
+    #[serde(rename = "mesh.outbound_pending")]
+    MeshOutboundPending {},
     #[serde(rename = "workspace.created")]
     WorkspaceCreated {},
     #[serde(rename = "workspace.updated")]
@@ -1921,6 +1923,7 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    MeshOutboundPending,
     WorkspaceCreated,
     WorkspaceUpdated,
     WorkspaceClosed,
@@ -2039,7 +2042,7 @@ impl EventKind {
             | Self::NotificationFiled
             | Self::NotificationSeen
             | Self::FileHandedOver => true,
-            Self::PaneOutputChanged => false,
+            Self::PaneOutputChanged | Self::MeshOutboundPending => false,
         }
     }
 }
@@ -3044,6 +3047,7 @@ pub struct PaneAgentStatusChangedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    MeshOutboundPending {},
     WorkspaceCreated {
         workspace: WorkspaceInfo,
     },

@@ -439,7 +439,35 @@ impl<D: DiskSpace> Store<D> {
         // takes the receipt too, rather than the hub marking it sent for
         // nothing.
         for receipt in receipts {
-            self.import_receipt(&receipt.key, &receipt.state)?;
+            if self.import_receipt(&receipt.key, &receipt.state)? == ReceiptImport::OriginalNotReady
+            {
+                return Err(Error::InvalidState);
+            }
+        }
+        if offer == Offer::All {
+            // Materialize only changed inbox receipts. The sent mark follows
+            // durable custody, so a failed commit leaves the receipt owed.
+            for receipt in self.pending_receipts(hub, wall_ms)? {
+                let Some(original) = self.collection_record(&receipt.key, wall_ms)? else {
+                    continue;
+                };
+                let key = MessageKey::mint(local.into(), wall_ms.max(0) as u64)
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                let mut envelope = original.envelope;
+                envelope.key = key.clone();
+                envelope.correlation_id = format!("receipt:{}", key.message_id);
+                envelope.intent = "\"fyi\"".into();
+                envelope.in_reply_to = None;
+                envelope.kind = Kind::Receipt;
+                envelope.request_key = None;
+                envelope.return_binding = ReturnBinding::mint(key, hub.into(), vec![hub.into()])
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                envelope.body = serde_json::to_vec(&receipt)?;
+                envelope.origin_key.clear();
+                envelope.signature.clear();
+                self.accept(&envelope, CUSTODY_TTL_MS, Admission::Held, wall_ms)?;
+                self.receipts_sent(&[receipt])?;
+            }
         }
         let now = self.clock()?.advance(wall_ms);
         let keys = match offer {
@@ -448,8 +476,8 @@ impl<D: DiskSpace> Store<D> {
                 params![local,hub,now,BATCH_CAP as i64],
             )?,
             Offer::All => self.routing_keys(
-                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
-                params![hub,now,BATCH_CAP as i64],
+                "SELECT origin,id,rowid FROM envelopes WHERE next_hop=?1 AND origin IN (?1,?4) AND state='held' AND retry_at<=?2 AND custody_deadline>?2 ORDER BY retry_at,origin,id LIMIT ?3",
+                params![hub,now,BATCH_CAP as i64,local],
             )?,
         };
         let mut outbound = Vec::new();

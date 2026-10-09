@@ -14,6 +14,14 @@ pub struct StatusReference {
 pub(super) const RECEIPT_STATES: [&str; 4] =
     ["delivered", "read", "expired", "outcome_retention_elapsed"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ReceiptImport {
+    Applied,
+    Duplicate,
+    OriginalNotReady,
+}
+
 pub struct Status {
     pub state: String,
     pub reference: StatusReference,
@@ -170,17 +178,47 @@ impl<D: DiskSpace> Store<D> {
             .filter(|state| RECEIPT_STATES.contains(&state.as_str())))
     }
 
-    pub fn import_receipt(&mut self, key: &MessageKey, state: &str) -> Result<()> {
-        if !RECEIPT_STATES.contains(&state) {
-            return Err(Error::InvalidEnvelope);
+    pub fn import_receipt(&mut self, key: &MessageKey, state: &str) -> Result<ReceiptImport> {
+        let incoming = RECEIPT_STATES
+            .iter()
+            .position(|candidate| *candidate == state)
+            .ok_or(Error::InvalidEnvelope)?;
+        let original: Option<(String, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT state,remote_state FROM envelopes WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((original_state, remote)) = original else {
+            return Ok(ReceiptImport::OriginalNotReady);
+        };
+        let current = remote
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(original_state.as_str()))
+            .filter_map(|state| {
+                RECEIPT_STATES
+                    .iter()
+                    .position(|candidate| *candidate == state)
+            })
+            .max();
+        if current.is_some_and(|current| current >= incoming) {
+            return Ok(ReceiptImport::Duplicate);
         }
-        self.connection.execute(
-            "UPDATE envelopes SET remote_state=?3 WHERE origin=?1 AND id=?2
-            AND (remote_state IS NULL OR remote_state='delivered') AND remote_state IS NOT ?3
-            AND state IN ('delivered','held')",
+        if !matches!(original_state.as_str(), "delivered" | "held") {
+            return Ok(ReceiptImport::OriginalNotReady);
+        }
+        let changed = self.connection.execute(
+            "UPDATE envelopes SET remote_state=?3 WHERE origin=?1 AND id=?2",
             params![key.origin_node, key.message_id, state],
         )?;
-        Ok(())
+        Ok(if changed == 1 {
+            ReceiptImport::Applied
+        } else {
+            ReceiptImport::OriginalNotReady
+        })
     }
 }
 
