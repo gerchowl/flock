@@ -76,9 +76,11 @@ enrollment reports `unknown (server predates mesh; restart needed)`.
 `pin_origin` values: `dialed`, `inbound_first_contact`, or `unknown`.
 
 Each JSON peer row also includes `routes: [{node, name, next_hop, hops}]`
-for destinations reached through that peer. Routes use enrolled live edges in
-either direction and disappear when their path closes. Unpinned names are
-marked `(advertised)` with an eight-character node ID suffix.
+for destinations reached through that peer. Use `flk peers status --json` to
+inspect destinations, next hops and hop counts. Routes use enrolled live edges in
+either direction and disappear when their path closes. Healthy silence does
+not expire a route; a last-known owner remains an offline hint, not a live
+route. Unpinned names are marked `(advertised)` with an eight-character node ID suffix.
 
 A node can accept up to 32 inbound relay edges. `peers status` lists each live
 inbound edge separately. Each edge authenticates its own identity; a second hub
@@ -88,7 +90,9 @@ under that identity. Transient connection failures show `retrying` with the
 reason; `refused` identifies a handshake or compatibility refusal.
 
 Held SSH edges authenticate both node keys using fresh challenges and require
-matching mesh protocol versions (`mesh: 1`). First contact pins the identity.
+identical mesh protocol versions. Mismatches name both versions and say
+`upgrade flk on <peer>`; upgrade the fleet together. First contact pins the
+identity.
 Enrollment uses trust on first use (TOFU): possession of a node key proves the
 key holder, not that its claimed name belongs to the intended machine. Inbound
 edges arrive over SSH into this host; a caller with that access who wins first
@@ -450,10 +454,24 @@ flk wait agent-status <pane_id> --status <idle|working|blocked|done|unknown|hibe
 Wait for the answer to a message you sent:
 
 ```bash
-flk wait reply <correlation_id> [--timeout MS] [--json]
+flk wait reply <correlation_id> [--timeout MS] [--reference JSON] [--json]
 ```
 
-Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after a `msg send --intent needs-reply`: it prints the reply's body (metadata on stderr, or everything with `--json`) and exits 0 replied, 3 deferred by a muted recipient or dropped unread, 124 timed out. It works for a sender outside any pane, whose reply is held for it under the correlation id. `msg send --await` sends and waits in one command.
+Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after `msg send --intent needs-reply`: it prints the reply body to stdout and metadata to stderr, or the full result with `--json`. A sender outside any pane can wait for its held answer. `msg send --await` sends and uses the same waiter and exit codes:
+
+| Exit | Reply-wait outcome |
+| --- | --- |
+| `0` | `replied` |
+| `3` | `deferred`, `expired`, `recipient_gone`, or `outcome_retention_elapsed` |
+| `4` | `refused`; `detail` gives the reason |
+| `124` | `timeout`; accepted mail continues retrying |
+| `1` | API or transport error |
+
+`recipient_gone` means the owner permanently removed that agent incarnation,
+not that its host is offline. `outcome_retention_elapsed` means the retained
+result has been collected by GC; it makes no delivery claim. Keep the signed
+`reference` from `msg status` and pass `--reference JSON` to query that exact
+message after cleanup. A correlation alone cannot prove elapsed retention.
 
 `agent restart` returns after scheduling the restart. Finish the requesting turn normally: Flock waits for a settled idle prompt, stops the agent process tree through the runtime, and resumes the same conversation with its original executable, flags, profile environment, cwd, and agent name. `self` requires the caller to be inside the agent pane; an explicit target accepts the usual pane ID, terminal ID, or unique name.
 
@@ -731,6 +749,29 @@ Upgrade the fleet together for mesh transport. Remove these settings and callers
 - `[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`, and `deferral_relay_concurrency`: delete these lines. Custody pushes use a fixed concurrency of four.
 - `[[peers]] summary_command`: delete this line; peers now always hold a mesh edge. Use `relay_command` if the remote executable needs a custom path.
 - `flk msg send --from-host` and the `msg.send` fields `from_host` and `intent_unrecognised`: remote origins come from authenticated mesh envelopes. `--from-agent` remains available for operator tooling.
-- The old `msg.uplink_*` methods: use enrolled mesh edges for delivery and collection.
+- The old `msg.uplink_*` and `peers.relay_attach` methods: use per-edge
+  `mesh.hello` enrollment, delivery and collection.
+- The `forward_limit` and `peer_not_configured` routing refusals: known owners
+  route through the mesh or queue while offline. New sends outside the gossip
+  horizon with no stored owner hint are refused as unknown.
 
 Removed config keys are errors with migration instructions. The server refuses to start and names the file, line, and key to delete. A replacement server reports the refusal to the old server so live handoff rolls back safely. A live reload fails, surfaces the diagnostic, and keeps the previous configuration and running panes. Unknown future keys still only warn.
+
+Existing peer lists become a mesh with fewer edges; reciprocal SSH access is
+not required. `[msg] allow_from` names are the authenticated origin's local
+pin names (configured or inbound first-contact), never a forwarding hub or
+an unpinned advertised name.
+
+Before upgrading a development fleet, make a consistent SQLite backup of
+`mesh-mail.sqlite` in Flock's state directory, preserve `mesh/identity.json`,
+and copy `mesh-quarantine.jsonl` and `mesh-quarantine.jsonl.1` if present.
+Use SQLite's backup facility while the server is running; a raw copy of the
+main database can omit committed WAL data. Dev schemas v1–v11 upgrade in
+place, idempotently, to the v1.0.0 baseline (v12). Moving a failed store aside
+starts empty and loses its custody; preserve it before attempting recovery.
+
+`mesh quarantined: N` in status means malformed records were isolated. The
+mode-0600 quarantine sidecar retains full typed rows before bodies are
+cleared, with two files capped at 64 MiB each. Copy both before another
+rotation; decode `body.base64` and `envelope.base64` for inspection. Repair a database copy rather than blindly resending mail.
+See [custody recovery](./socket-api.mdx) for storage details.
