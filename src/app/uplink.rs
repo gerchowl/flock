@@ -53,13 +53,6 @@ pub(crate) struct ParkedSend {
     /// a question relayed away (ADR-0018 §1's reply rule). `fyi` until the
     /// caller says otherwise.
     pub(crate) intent: crate::api::schema::MsgIntent,
-    /// Set when this send is a mute's automatic deferral (ADR-0018 §3): the
-    /// record the hub's answer settles, since there is no caller to answer.
-    pub(crate) deferral: Option<Box<crate::events::MsgDeferralRelay>>,
-    /// Set when this send is a reply to channel-pushed mail (#438): the
-    /// original it answers, settled only once the hub says the reply was
-    /// delivered. A refusal or a timeout leaves the original unread.
-    pub(crate) settles_on_delivery: Option<SettleOnDelivery>,
     deadline: Instant,
     /// `None` until the transport attaches it, and forever when the request
     /// did not come through a transport that can park (a direct in-process
@@ -81,8 +74,6 @@ impl ParkedSend {
             from_agent,
             to_agent,
             intent: crate::api::schema::MsgIntent::Fyi,
-            deferral: None,
-            settles_on_delivery: None,
             deadline,
             respond_to: None,
         }
@@ -252,19 +243,6 @@ impl Uplink {
         }
     }
 
-    /// Queue a frame nobody waits on — flock's own automatic reply, such as a
-    /// mute's deferral (#410). Tracked like any other so the hub's answer and
-    /// the timeout still resolve it, but the request that caused it is
-    /// answered at once rather than parked.
-    pub(crate) fn hand_up_detached(&mut self, frame: UplinkFrame, send: ParkedSend) {
-        let uplink_id = frame.uplink_id.clone();
-        self.outbound.push_back(Outbound {
-            frame,
-            offered_at: None,
-        });
-        self.sends.insert(uplink_id, send);
-    }
-
     /// Queue a frame for the hub and park its sender.
     pub(crate) fn hand_up(&mut self, frame: UplinkFrame, send: ParkedSend) {
         let uplink_id = frame.uplink_id.clone();
@@ -368,14 +346,6 @@ impl Uplink {
         }
     }
 
-    /// The parked send carrying `correlation_id`, while it still waits on the
-    /// hub.
-    pub(crate) fn parked_send_mut(&mut self, correlation_id: &str) -> Option<&mut ParkedSend> {
-        self.sends
-            .values_mut()
-            .find(|send| send.correlation_id == correlation_id)
-    }
-
     /// The hub answered: resolve the send waiting on `uplink_id`. `None` when
     /// nothing is waiting — a re-offered frame answered twice, or one whose
     /// sender already timed out.
@@ -474,30 +444,6 @@ mod tests {
             "agent_c_1".into(),
             deadline,
         )
-    }
-
-    /// A deferral is handed up from INSIDE another request — the mute, or
-    /// the send that arrived into it. Parking would capture that request's
-    /// response behind a frame it has nothing to do with; the frame must
-    /// still go up, and still be answerable.
-    #[test]
-    fn a_detached_hand_up_parks_nobody_but_is_still_carried_and_completed() {
-        let mut uplink = Uplink::default();
-        let now = Instant::now();
-        uplink.hand_up_detached(frame("up-d"), parked(now + HEARTBEAT));
-        assert_eq!(
-            uplink.take_pending_park(),
-            None,
-            "the surrounding request is answered normally"
-        );
-        let frames = uplink
-            .take("take-1".into(), &[], now, HEARTBEAT)
-            .expect("the frame is due");
-        assert_eq!(frames.len(), 1);
-        assert!(
-            uplink.complete("up-d").is_some(),
-            "the hub's answer resolves it"
-        );
     }
 
     #[test]

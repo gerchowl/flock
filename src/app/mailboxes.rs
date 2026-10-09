@@ -43,10 +43,6 @@ pub(crate) struct MailboxRegistry {
     /// mute answered it again. Queue lifetime bounds the set just as well:
     /// it can never hold more than the queues do.
     deferred: HashSet<String>,
-    /// Cross-host deferral hops waiting for a slot, and how many are running.
-    /// See `App::pump_deferral_hops`.
-    deferral_hops: VecDeque<DeferralHop>,
-    deferral_hops_running: usize,
     /// Sender → recent `blocking` send timestamps (ms), for the tier's own
     /// hourly budget (ADR-0018 §1). Separate from `rate` so a sender's
     /// ordinary traffic cannot spend its escalation budget, or vice versa.
@@ -75,13 +71,6 @@ pub(crate) struct MailboxRegistry {
     relaying_questions: HashMap<String, usize>,
     /// Insertion order of `relayed_questions`, for eviction.
     relayed_questions_order: VecDeque<String>,
-}
-
-/// One cross-host deferral waiting to be sent (ADR-0018 §3).
-pub(crate) struct DeferralHop {
-    pub peer: crate::config::PeerConfig,
-    pub body: String,
-    pub relay: crate::events::MsgDeferralRelay,
 }
 
 /// A live receiver-side mute: when it lifts, and why, in the muter's words.
@@ -144,9 +133,9 @@ pub(crate) struct PendingMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveredMeta {
     pub from_pane: Option<String>,
-    /// Fleet-global sender, so a reply can be routed after the original has
-    /// left the queue.
     pub from_agent: Option<String>,
+    pub from_host: Option<String>,
+    pub message_key: Option<crate::mesh::key::MessageKey>,
     pub enqueued_at_ms: u64,
     /// Correlation id of the thread root (self for a fresh message).
     pub root: String,
@@ -240,6 +229,8 @@ impl MailboxRegistry {
                             DeliveredMeta {
                                 from_pane: message.from_pane.clone(),
                                 from_agent: message.from_agent.clone(),
+                                from_host: message.from_host.clone(),
+                                message_key: message.message_key.clone(),
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
                                 round_trips: 0,
@@ -440,8 +431,10 @@ impl MailboxRegistry {
         self.history.insert(
             message.correlation_id.clone(),
             DeliveredMeta {
-                from_agent: message.from_agent.clone(),
                 from_pane: message.from_pane.clone(),
+                from_agent: message.from_agent.clone(),
+                from_host: message.from_host.clone(),
+                message_key: message.message_key.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,
                 round_trips: 0,
@@ -578,29 +571,6 @@ impl MailboxRegistry {
     /// already was — the caller must then send nothing.
     pub(crate) fn mark_deferred(&mut self, correlation_id: &str) -> bool {
         self.deferred.insert(correlation_id.to_string())
-    }
-
-    pub(crate) fn push_deferral_hop(&mut self, hop: DeferralHop) {
-        self.deferral_hops.push_back(hop);
-    }
-
-    /// Hand out as many queued hops as fit under `cap` running at once, and
-    /// count them as running.
-    pub(crate) fn start_deferral_hops(&mut self, cap: usize) -> Vec<DeferralHop> {
-        let free = cap.saturating_sub(self.deferral_hops_running);
-        let take = free.min(self.deferral_hops.len());
-        self.deferral_hops_running += take;
-        self.deferral_hops.drain(..take).collect()
-    }
-
-    pub(crate) fn finish_deferral_hop(&mut self) {
-        self.deferral_hops_running = self.deferral_hops_running.saturating_sub(1);
-    }
-
-    /// Withdraw a claim whose answer never left: a cross-host deferral the
-    /// peer could not be reached for. Unclaimed, the next mute retries it.
-    pub(crate) fn unmark_deferred(&mut self, correlation_id: &str) {
-        self.deferred.remove(correlation_id);
     }
 
     /// The pane's live mute expiry, or `None` when it is not muted. Expired
@@ -1128,46 +1098,6 @@ mod tests {
     /// Review of #411: one mute can owe a whole inbox of cross-host
     /// deferrals. They go out at most `cap` at a time, in order, and a
     /// finished hop frees exactly one slot.
-    #[test]
-    fn deferral_hops_are_capped_and_start_in_order() {
-        let hop = |correlation: &str| DeferralHop {
-            peer: crate::config::PeerConfig::default(),
-            body: String::new(),
-            relay: crate::events::MsgDeferralRelay {
-                correlation_id: correlation.into(),
-                deferral_correlation_id: format!("{correlation}:deferred"),
-                pane: "w1:p2".into(),
-                muted_until_ms: 0,
-                reason: None,
-                from_agent: "agent_a".into(),
-                to_agent: "agent_b".into(),
-                to_host: "far".into(),
-                route: "far".into(),
-                result: Ok(()),
-            },
-        };
-        let ids = |hops: Vec<DeferralHop>| -> Vec<String> {
-            hops.into_iter()
-                .map(|hop| hop.relay.correlation_id)
-                .collect()
-        };
-        let mut registry = MailboxRegistry::default();
-        for index in 0..5 {
-            registry.push_deferral_hop(hop(&format!("c-{index}")));
-        }
-
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-0", "c-1"]);
-        assert!(
-            registry.start_deferral_hops(2).is_empty(),
-            "no slot until one finishes"
-        );
-        registry.finish_deferral_hop();
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-2"]);
-        registry.finish_deferral_hop();
-        registry.finish_deferral_hop();
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-3", "c-4"]);
-        assert!(registry.start_deferral_hops(2).is_empty(), "queue drained");
-    }
 
     #[test]
     fn expire_drops_only_past_ttl_and_reports_them() {

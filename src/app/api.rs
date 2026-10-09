@@ -10,6 +10,7 @@ mod integrations;
 mod lineage;
 mod mesh;
 mod mesh_mail;
+mod mesh_replies;
 pub(super) mod messages;
 mod panes;
 pub(crate) mod peers;
@@ -560,14 +561,15 @@ impl App {
             return;
         }
 
-        if let AppEvent::MsgRelayCompleted(completion) = ev {
-            self.handle_msg_relay_completed(*completion);
-            self.finish_message_relay();
+        if let AppEvent::MeshCollected(completion) = ev {
+            self.collection_relays.complete();
+            self.collection_peers.remove(&completion.peer.name);
+            self.finish_mesh_collection(*completion);
             return;
         }
 
-        if let AppEvent::MsgDeferralRelayed(relay) = ev {
-            self.handle_msg_deferral_relayed(relay);
+        if let AppEvent::MsgRelayCompleted(completion) = ev {
+            self.handle_msg_relay_completed(*completion);
             self.finish_message_relay();
             return;
         }
@@ -1419,6 +1421,7 @@ impl App {
             }
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
             Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, params),
+            Method::MeshCollect(params) => return self.handle_mesh_collect(request.id, params),
             Method::PeersEnrollReset(params) => {
                 return self.handle_peers_enroll_reset(request.id, params)
             }

@@ -53,9 +53,172 @@ fn envelope() -> Envelope {
         correlation_id: "thread".into(),
         in_reply_to: None,
         request_key: None,
-        intent: "needs_reply".into(),
+        intent: "\"needs_reply\"".into(),
         body: b"answer me".to_vec(),
     }
+}
+
+#[test]
+fn collection_is_origin_token_and_request_scoped_and_ack_is_idempotent() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut reply = envelope();
+    reply.request_key = Some(request.key.clone());
+    store
+        .accept(&reply, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let unrelated = envelope();
+    store
+        .accept(&unrelated, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    let mut query = crate::mesh::collect::Collect {
+        request: request.key.clone(),
+        token: request.return_binding.collection_token.clone(),
+        ack: vec![],
+    };
+    assert!(store.collect_answers("other.example", &query, 1).is_err());
+    query.token[0] ^= 1;
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 1)
+        .is_err());
+    query.token[0] ^= 1;
+    assert_eq!(
+        store
+            .collect_answers(&request.key.origin_node, &query, 1)
+            .unwrap()[0]
+            .envelope,
+        reply
+    );
+    query.ack = vec![reply.key.clone(), unrelated.key.clone()];
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .is_err());
+    assert_eq!(
+        store.get(&reply.key).unwrap().unwrap().state,
+        "custody",
+        "invalid batch ack is atomic"
+    );
+    query.ack = vec![reply.key.clone()];
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 3)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.get(&unrelated.key).unwrap().unwrap().state, "custody");
+}
+
+#[test]
+fn collection_migration_preserves_existing_writer_generation_and_custody() {
+    let f = Fixture::new();
+    let request = envelope();
+    let mut store = f.open(0);
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    assert_eq!(store.handoff_generation().unwrap(), 1);
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX collection_token;
+        ALTER TABLE envelopes DROP COLUMN collection_token;
+        DROP INDEX request_answers;
+        DROP TABLE collect_acks;
+        ALTER TABLE envelopes DROP COLUMN request_origin;
+        ALTER TABLE envelopes DROP COLUMN request_id;
+        ALTER TABLE envelopes DROP COLUMN recipient_node;
+        ALTER TABLE envelopes DROP COLUMN reply_expected;
+        ALTER TABLE envelopes DROP COLUMN collect_done;
+        ALTER TABLE envelopes DROP COLUMN collect_failures;
+        ALTER TABLE envelopes DROP COLUMN collect_error;
+        DROP INDEX collect_ready;
+        ALTER TABLE envelopes DROP COLUMN collect_at;
+        ALTER TABLE envelopes DROP COLUMN collect_attempts;
+        PRAGMA user_version=7;",
+        )
+        .unwrap();
+    drop(store);
+    let mut store = f.open(0);
+    assert_eq!(store.handoff_generation().unwrap(), 2);
+    assert_eq!(store.get(&request.key).unwrap().unwrap().envelope, request);
+    store.finish(&request.key, Outcome::Delivered, 0).unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 5_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn collection_deadlines_back_off_survive_restart_and_freeze_without_idle_commits() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&request.key, Outcome::Delivered, 0).unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 5_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+    let due = |s: &Store<Disk>| {
+        s.connection
+            .query_row("SELECT collect_at FROM envelopes", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let first = due(&store);
+    assert!((10_000..=11_000).contains(&first));
+    let before = store.connection.total_changes();
+    assert!(store
+        .collect_ready(&request.key.origin_node, first - 1, 1, &[])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "idle scans must not commit"
+    );
+    store.set_paused(true, 5_010).unwrap();
+    drop(store);
+    let mut store = f.open(100_000);
+    assert!(store
+        .collect_ready(&request.key.origin_node, 100_000, 1, &[])
+        .unwrap()
+        .is_empty());
+    assert_eq!(due(&store), first);
+    store.set_paused(false, 100_000).unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 100_000 + first - 5_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+    let second = due(&store);
+    assert!((60_000..=61_000).contains(&(second - first - 10)));
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 100_000 + second - 5_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!((299_000..=300_000).contains(&(due(&store) - second - 10)));
 }
 
 #[test]
@@ -842,6 +1005,21 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
              source TEXT NOT NULL, peer TEXT NOT NULL, node_id TEXT NOT NULL,
              public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
              UNIQUE(source,node_id), UNIQUE(source,public_key));
+         DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX collection_token;
+        ALTER TABLE envelopes DROP COLUMN collection_token;
+        DROP INDEX request_answers;
+        DROP TABLE collect_acks;
+        ALTER TABLE envelopes DROP COLUMN request_origin;
+        ALTER TABLE envelopes DROP COLUMN request_id;
+        ALTER TABLE envelopes DROP COLUMN recipient_node;
+        ALTER TABLE envelopes DROP COLUMN reply_expected;
+        ALTER TABLE envelopes DROP COLUMN collect_done;
+        ALTER TABLE envelopes DROP COLUMN collect_failures;
+        ALTER TABLE envelopes DROP COLUMN collect_error;
+        DROP INDEX collect_ready;
+         ALTER TABLE envelopes DROP COLUMN collect_at;
+         ALTER TABLE envelopes DROP COLUMN collect_attempts;
          PRAGMA user_version=3;",
         )
         .unwrap();
@@ -997,7 +1175,22 @@ fn version_four_pin_origin_is_unknown_after_migration() {
             "DROP TABLE writer_generation;
         ALTER TABLE identity_pins DROP COLUMN origin;
         INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
-        PRAGMA user_version=4;",
+        DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX collection_token;
+        ALTER TABLE envelopes DROP COLUMN collection_token;
+        DROP INDEX request_answers;
+        DROP TABLE collect_acks;
+        ALTER TABLE envelopes DROP COLUMN request_origin;
+        ALTER TABLE envelopes DROP COLUMN request_id;
+        ALTER TABLE envelopes DROP COLUMN recipient_node;
+        ALTER TABLE envelopes DROP COLUMN reply_expected;
+        ALTER TABLE envelopes DROP COLUMN collect_done;
+        ALTER TABLE envelopes DROP COLUMN collect_failures;
+        ALTER TABLE envelopes DROP COLUMN collect_error;
+        DROP INDEX collect_ready;
+         ALTER TABLE envelopes DROP COLUMN collect_at;
+         ALTER TABLE envelopes DROP COLUMN collect_attempts;
+         PRAGMA user_version=4;",
         )
         .unwrap();
     drop(s);
@@ -1097,5 +1290,490 @@ fn origin_policy_prefers_configured_alias_to_inbound_name() {
     assert_eq!(
         store.origin_name(&pin.node_id).unwrap().as_deref(),
         Some("configured.example")
+    );
+}
+
+#[test]
+fn collection_only_polls_delivered_open_local_questions_and_retains_ack_debt() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    let mut notice = envelope();
+    notice.intent = "\"fyi\"".into();
+    let mut foreign = envelope();
+    foreign.key.origin_node = "foreign.example".into();
+    foreign.return_binding.request = foreign.key.clone();
+    for item in [&request, &notice, &foreign] {
+        store
+            .accept(item, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+    }
+    assert!(store
+        .collect_ready(&request.key.origin_node, 0, 16, &[])
+        .unwrap()
+        .is_empty());
+    for item in [&request, &notice, &foreign] {
+        store.finish(&item.key, Outcome::Delivered, 0).unwrap();
+    }
+    assert!(store
+        .collect_ready(&request.key.origin_node, 4_999, 16, &[])
+        .unwrap()
+        .is_empty());
+    let claimed = store
+        .collect_ready(&request.key.origin_node, 5_000, 16, &[])
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].envelope.key, request.key);
+    let mut answer = envelope();
+    answer.key.origin_node = request.return_binding.recipient_node.clone();
+    answer.return_binding.request = answer.key.clone();
+    answer.request_key = Some(request.key.clone());
+    answer.correlation_id = "question:deferred".into();
+    store
+        .accept_collected(&answer, CUSTODY_TTL_MS, 5_000)
+        .unwrap();
+    store
+        .collection_acked(&request.key, &[answer.key.clone()])
+        .unwrap();
+    assert!(
+        !store
+            .collect_ready(&request.key.origin_node, 20_000, 1, &[])
+            .unwrap()
+            .is_empty(),
+        "a deferral keeps the conversation open"
+    );
+    answer.key.message_id = MessageKey::mint(answer.key.origin_node.clone(), 20_000)
+        .unwrap()
+        .message_id;
+    answer.return_binding.request = answer.key.clone();
+    answer.correlation_id = "final".into();
+    store
+        .accept_collected(&answer, CUSTODY_TTL_MS, 20_000)
+        .unwrap();
+    drop(store);
+    let mut store = f.open(90_000);
+    assert_eq!(
+        store.collection_acks(&request.key).unwrap(),
+        vec![answer.key.clone()]
+    );
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 90_000, 1, &[])
+            .unwrap()
+            .len(),
+        1,
+        "lost acknowledgements remain collectable after restart"
+    );
+    store.collection_acked(&request.key, &[answer.key]).unwrap();
+    store
+        .collection_failed(&request.key, "invalid reply binding", true)
+        .unwrap();
+    assert!(
+        store
+            .collection_error(&request.key.origin_node, &request.correlation_id)
+            .unwrap()
+            .is_none(),
+        "a later bad answer cannot override a final answer"
+    );
+    assert!(
+        store
+            .collect_ready(&request.key.origin_node, 500_000, 16, &[])
+            .unwrap()
+            .is_empty(),
+        "the first final answer stops polling"
+    );
+}
+
+#[test]
+fn collection_empty_polls_are_read_only_and_bad_answers_are_quarantined_individually() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let query = crate::mesh::collect::Collect {
+        request: request.key.clone(),
+        token: request.return_binding.collection_token.clone(),
+        ack: vec![],
+    };
+    let changes = store.connection.total_changes();
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 10_000)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.connection.total_changes(), changes);
+    let mut bad = envelope();
+    bad.request_key = Some(request.key.clone());
+    let mut good = envelope();
+    good.request_key = Some(request.key.clone());
+    for item in [&bad, &good] {
+        store
+            .accept(item, CUSTODY_TTL_MS, Admission::Custody, 10_000)
+            .unwrap();
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET metadata='broken' WHERE id=?1",
+            [&bad.key.message_id],
+        )
+        .unwrap();
+    let answers = store
+        .collect_answers(&request.key.origin_node, &query, 20_000)
+        .unwrap();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].envelope.key, good.key);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT state FROM envelopes WHERE id=?1",
+                [&bad.key.message_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "quarantined"
+    );
+    assert_eq!(
+        answers[0].remaining_ms,
+        CUSTODY_TTL_MS - 10_000,
+        "TTL advances without a clock commit"
+    );
+    let plan:String = store.connection.query_row(
+        "EXPLAIN QUERY PLAN SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2",
+        params![request.key.origin_node,request.key.message_id],|r|r.get(3)).unwrap();
+    assert!(plan.contains("request_answers"), "{plan}");
+}
+
+#[test]
+fn collection_quarantines_bad_requests_and_bounds_each_peer_and_import_failures() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let bad = envelope();
+    let mut good = envelope();
+    good.return_binding.recipient_node = "other.example".into();
+    let duplicate_peer = envelope();
+    for item in [&bad, &good, &duplicate_peer] {
+        store
+            .accept(item, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&item.key, Outcome::Delivered, 0).unwrap();
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET collect_at=0 WHERE id=?1",
+            [&bad.key.message_id],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET metadata='broken' WHERE id=?1",
+            [&bad.key.message_id],
+        )
+        .unwrap();
+    let claimed = store
+        .collect_ready(&good.key.origin_node, 5_000, 16, &[])
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].envelope.key, good.key);
+    assert!(store
+        .collect_ready(
+            &good.key.origin_node,
+            6_000,
+            16,
+            &["receiver.example".into(), "other.example".into()]
+        )
+        .unwrap()
+        .is_empty());
+    let before = store.connection.total_changes();
+    for _ in 0..5 {
+        store
+            .collection_failed(&good.key, "mailbox_full", false)
+            .unwrap();
+    }
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "backpressure must not spend the import-failure budget"
+    );
+    for attempt in 1..=3 {
+        store
+            .collection_failed(&good.key, "undecodable answer", false)
+            .unwrap();
+        assert_eq!(
+            store
+                .collection_error(&good.key.origin_node, &good.correlation_id)
+                .unwrap()
+                .is_some(),
+            attempt == 3
+        );
+    }
+    drop(store);
+    let mut store = f.open(500_000);
+    let selected = store
+        .collect_ready(&good.key.origin_node, 500_000, 16, &[])
+        .unwrap();
+    assert!(selected.iter().all(|r| r.envelope.key != good.key));
+    store
+        .collection_failed(&duplicate_peer.key, "invalid reply binding", true)
+        .unwrap();
+    assert!(store
+        .collect_ready(&good.key.origin_node, 900_000, 16, &[])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn waiting_or_reenrollment_restores_fast_polling_without_reopening_final_answers() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.finish(&request.key, Outcome::Delivered, 0).unwrap();
+    store
+        .connection
+        .execute("UPDATE envelopes SET collect_at=300000", [])
+        .unwrap();
+    store
+        .collect_fast(
+            &request.key.origin_node,
+            std::slice::from_ref(&request.correlation_id),
+            &[],
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 6_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .connection
+        .execute("UPDATE envelopes SET collect_at=300000", [])
+        .unwrap();
+    store
+        .collect_fast(
+            &request.key.origin_node,
+            &[],
+            std::slice::from_ref(&request.return_binding.recipient_node),
+            7_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .collect_ready(&request.key.origin_node, 12_000, 1, &[])
+            .unwrap()
+            .len(),
+        1
+    );
+    store.set_paused(true, 12_000).unwrap();
+    let changes = store.connection.total_changes();
+    store
+        .collect_fast(
+            &request.key.origin_node,
+            &[request.correlation_id],
+            &[],
+            500_000,
+        )
+        .unwrap();
+    assert!(store
+        .collect_ready(&request.key.origin_node, 500_000, 1, &[])
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.connection.total_changes(), changes);
+}
+
+#[test]
+fn held_answers_do_not_lease_or_starve_outbox_and_idle_ticks_do_not_commit() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    for _ in 0..130 {
+        let mut answer = envelope();
+        answer.request_key = Some(request.key.clone());
+        store
+            .accept(&answer, CUSTODY_TTL_MS, Admission::Held, 0)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        130
+    );
+    let before = store.connection.total_changes();
+    for now in (0..600_000).step_by(1_000) {
+        assert!(store.retry_ready_limit(now, 1).unwrap().is_empty());
+        assert_eq!(
+            store
+                .activate_held(&request.key.origin_node, &["absent.example".into()], now)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.maintain_if_due(now).unwrap(), 0);
+    }
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "idle held rows must not write leases or clock ticks"
+    );
+    let outbox = envelope();
+    store
+        .accept(&outbox, CUSTODY_TTL_MS, Admission::Custody, 600_000)
+        .unwrap();
+    assert_eq!(
+        store.retry_ready_limit(600_000, 1).unwrap(),
+        vec![outbox.key]
+    );
+    assert_eq!(
+        store
+            .activate_held(
+                &request.key.origin_node,
+                &[request.return_binding.recipient_node],
+                600_000
+            )
+            .unwrap(),
+        130
+    );
+    assert_eq!(store.retry_ready_limit(600_000, 500).unwrap().len(), 130);
+}
+
+#[test]
+fn held_answers_remain_collectable_after_a_final_answer_and_expire_normally() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut query = crate::mesh::collect::Collect {
+        request: request.key.clone(),
+        token: request.return_binding.collection_token.clone(),
+        ack: vec![],
+    };
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Held, 0)
+        .unwrap();
+    assert_eq!(
+        store
+            .collect_answers(&request.key.origin_node, &query, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    query.ack.push(answer.key.clone());
+    assert!(store
+        .collect_answers(&request.key.origin_node, &query, 2)
+        .unwrap()
+        .is_empty());
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET collect_done=1 WHERE origin=?1 AND id=?2",
+            params![request.key.origin_node, request.key.message_id],
+        )
+        .unwrap();
+    let mut later = envelope();
+    later.request_key = Some(request.key.clone());
+    store
+        .accept(&later, CUSTODY_TTL_MS, Admission::Held, 3)
+        .unwrap();
+    query.ack.clear();
+    let collected = store
+        .collect_answers(&request.key.origin_node, &query, 4)
+        .unwrap();
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].envelope.key, later.key);
+    store.maintain(CUSTODY_TTL_MS + 3).unwrap();
+    assert_eq!(store.get(&later.key).unwrap().unwrap().state, "expired");
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn schema_nine_held_answers_migrate_out_of_the_retry_queue() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store
+        .connection
+        .execute_batch("DROP INDEX held_recipient; PRAGMA user_version=9;")
+        .unwrap();
+    drop(store);
+    let mut store = f.open(1);
+    assert_eq!(store.get(&answer.key).unwrap().unwrap().state, "held");
+    assert!(store.retry_ready_limit(1, 500).unwrap().is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT active FROM usage", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn collection_backoff_batch_rolls_back_together() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let first = envelope();
+    let mut second = envelope();
+    second.return_binding.recipient_node = "second.example".into();
+    for item in [&first, &second] {
+        store
+            .accept(item, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&item.key, Outcome::Delivered, 0).unwrap();
+    }
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET collect_at=0 WHERE id=?1",
+            [&first.key.message_id],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER fail_second_backoff BEFORE UPDATE OF collect_attempts ON envelopes
+        WHEN NEW.recipient_node='second.example' AND NEW.collect_attempts>0
+        BEGIN SELECT RAISE(ABORT,'second backoff fails'); END;",
+        )
+        .unwrap();
+    assert!(store
+        .collect_ready(&first.key.origin_node, 5_000, 16, &[])
+        .is_err());
+    let first_backoff: (i64, i64) = store
+        .connection
+        .query_row(
+            "SELECT collect_at,collect_attempts FROM envelopes WHERE id=?1",
+            [&first.key.message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        first_backoff,
+        (0, 0),
+        "the first update must roll back with the failed second update"
     );
 }

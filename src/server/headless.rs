@@ -3545,6 +3545,7 @@ impl HeadlessServer {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the TUI runtime loop (the #25 dual-loop lesson).
         self.app.expire_undeliverable_messages();
+        self.app.tick_mesh_collections();
         self.app.expire_uplink();
         // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_idle_wakes(now);

@@ -1101,89 +1101,6 @@ fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, Str
     Ok(lines)
 }
 
-/// Run one command on a peer over SSH (batch mode, short timeouts), returning
-/// stdout. Shared by the summary poll and the checkout-prepare invocation.
-/// Wrap a value as one POSIX single-quoted shell word.
-///
-/// `'` cannot appear inside single quotes, so each one closes the quote, emits
-/// an escaped quote, and reopens — the standard `'\''` idiom.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Hand a message to the peer that owns the recipient, for it to enqueue in
-/// its own mailbox (ADR-0008).
-///
-/// The same SSH-invoked verb surface `run_summary_command` and
-/// `run_checkout_prepare_command` use: we ask the owning server to act on its
-/// own state rather than reaching into it. That keeps ADR-0001 intact — the
-/// constraint there is that fleet *gossip* is pull, with no push/broadcast
-/// between servers; a directed, user-initiated verb call is neither, which is
-/// why cross-machine checkout-prepare already works this way.
-///
-/// The recipient's own flock does the queueing, the inbox and the wake, so
-/// there is exactly one delivery implementation no matter which host the
-/// sender was on.
-pub fn send_peer_message(
-    peer: &PeerConfig,
-    to_agent: &str,
-    from_agent: &str,
-    from_host: &str,
-    body: &str,
-    correlation_id: &str,
-    in_reply_to: Option<&str>,
-    intent: crate::api::schema::MsgIntent,
-) -> Result<(), PeerMessageFailure> {
-    // A command this host refuses to build never leaves the machine, so it is
-    // a refusal too — and a terminal one. Retrying an id that cannot be
-    // shell-quoted safely produces the same answer forever.
-    let attempt = |intent| {
-        let remote = peer_message_command(
-            to_agent,
-            from_agent,
-            from_host,
-            body,
-            correlation_id,
-            in_reply_to,
-            intent,
-        )
-        .map_err(PeerMessageFailure::Refused)?;
-        run_peer_ssh_status(peer, &remote)
-            .map(|_| ())
-            .map_err(classify_message_failure)
-    };
-    match attempt(intent) {
-        // ADR-0018 §1, the other direction of skew. A peer that predates
-        // `blocking` but has #380 refuses the tier by name; asking again as
-        // `needs_reply` keeps the message heard — it still nudges — and only
-        // loses the escalation that peer could not have performed anyway.
-        Err(PeerMessageFailure::Refused(detail))
-            if intent == crate::api::schema::MsgIntent::Blocking && refused_the_intent(&detail) =>
-        {
-            attempt(crate::api::schema::MsgIntent::NeedsReply)
-        }
-        outcome => outcome,
-    }
-}
-
-/// Whether a peer's refusal was about the intent VALUE — the one refusal a
-/// retry at a lower tier can answer. Matched on `unknown --intent`, the
-/// refusal every build since #280 prints for a tier it does not know; the bare
-/// flag name is not enough, because the unknown-option refusal lists every
-/// flag a build understands, `--intent` among them.
-fn refused_the_intent(detail: &str) -> bool {
-    detail.contains("unknown --intent")
-}
-
-/// Why a relayed message did not land on the peer that owns the recipient.
-///
-/// The split is #380's point. A message the far side never saw and one it read
-/// and rejected want different answers from the caller, and before this both
-/// arrived as "could not reach" — which is a lie about the second, and the
-/// wrong advice: an unreachable peer is worth retrying and a refused flag
-/// never will be. A refusal carries the remote CLI's own words, so a flag a
-/// peer's build does not understand comes back as data instead of being glued
-/// to the front of the message body. Same posture as [`crate::spawn::SpawnRefusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessageFailure {
     /// The hop itself failed: ssh transport, auth, timeout, or a peer with no
@@ -1445,98 +1362,6 @@ impl std::fmt::Display for FleetFailureNotice {
     }
 }
 
-/// `flk`'s usage/refusal exit code, and the one thing separating a peer that
-/// refused from a peer that was never reached: ssh reports the remote
-/// command's own status and keeps 255 for its own transport failures, so a 2
-/// here is the far side's CLI answering rather than a network that never got
-/// there.
-const REMOTE_REFUSAL_EXIT: i32 = 2;
-
-fn classify_message_failure(failure: PeerSshFailure) -> PeerMessageFailure {
-    if failure.exit_code == Some(REMOTE_REFUSAL_EXIT) {
-        PeerMessageFailure::Refused(failure.detail)
-    } else {
-        PeerMessageFailure::Unreachable(failure.detail)
-    }
-}
-
-/// Build the `sh -lc …` the relay hands to the owning server.
-///
-/// Split out from [`send_peer_message`] so the quoting and the id guard — the
-/// two things here that have actually been wrong in production — can be
-/// asserted without an SSH round trip.
-fn peer_message_command(
-    to_agent: &str,
-    from_agent: &str,
-    from_host: &str,
-    body: &str,
-    correlation_id: &str,
-    in_reply_to: Option<&str>,
-    intent: crate::api::schema::MsgIntent,
-) -> Result<String, String> {
-    // Ids are server-minted and travel into a remote shell command; refuse
-    // anything that could escape it (same guard shape as checkout-prepare).
-    for (label, value) in [
-        ("agent id", to_agent),
-        ("sender id", from_agent),
-        ("sender host", from_host),
-        ("correlation id", correlation_id),
-    ]
-    .into_iter()
-    .chain(in_reply_to.map(|id| ("in-reply-to id", id)))
-    {
-        if value.is_empty()
-            || !value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':')
-        {
-            return Err(format!("invalid {label}: {value:?}"));
-        }
-    }
-    // Threading has to survive the hop as well as the message does. Without
-    // `--reply-to` a cross-host answer arrived with `in_reply_to` empty, so an
-    // agent that had asked two questions could not tell which one it had just
-    // been answered — the reply routed home and still lost the one field that
-    // made it an answer.
-    let reply_to = in_reply_to
-        .map(|id| format!(" --reply-to {id}"))
-        .unwrap_or_default();
-    // Intent has to survive the hop too, or a cross-host question arrives
-    // stamped `fyi` — the exact mislabel #280 exists to remove, reintroduced
-    // by the one leg that rebuilds the send from scratch (#280).
-    //
-    // Appended only for `needs_reply`, the same shape `--reply-to` uses. That
-    // containment shipped with #377 because `flk msg send` swallowed unknown
-    // flags into the body; #380 fixed the swallowing, and this KEPT it anyway.
-    // The reason is that the fix lives on the RECEIVING side: a peer only
-    // refuses `--intent` once it runs a build that has #380 in it, and the
-    // hosts this protects are precisely the ones that do not. Dropping the
-    // containment now would trade a silent corruption for a loud one on every
-    // relay to an already-deployed peer, including the `fyi` majority that
-    // carries no new signal at all. It costs one match arm and buys the whole
-    // roll-forward window, so it stays until the fleet has crossed #380.
-    let intent_flag = match intent {
-        crate::api::schema::MsgIntent::Fyi => String::new(),
-        stamped => format!(" --intent {}", stamped.as_wire()),
-    };
-    // Quote ONCE, at the outside. The body is caller-supplied and cannot be
-    // validated like the ids, so it must never reach the remote shell as
-    // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
-    // closes the outer quote and the shell then word-splits the message. A
-    // live cross-host send arrived as "cross-machine" instead of
-    // "cross-machine hello from atlas" for exactly that reason.
-    //
-    // So: build the inner command with the body quoted, then quote the whole
-    // inner command once more for `sh -lc`. Nesting handled by the same POSIX
-    // idiom at both levels rather than by hand at one.
-    let inner = format!(
-        "flk msg send --agent {to_agent} --from-agent {from_agent} --from-host {from_host} \
-         --correlation-id {correlation_id}{reply_to}{intent_flag} --json -- {}",
-        shell_single_quote(body)
-    );
-    Ok(format!("sh -lc {}", shell_single_quote(&inner)))
-}
-
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
     run_peer_ssh_status(peer, remote_command).map_err(|failure| failure.detail)
 }
@@ -1635,7 +1460,6 @@ enum DialCadence {
 struct PeerSshFailure {
     /// The remote command's exit status, or `None` when it was killed by a
     /// signal before producing one.
-    exit_code: Option<i32>,
     detail: String,
 }
 
@@ -1660,7 +1484,6 @@ fn run_peer_ssh_with(
     let output = command
         .output_traced_with_timeout(PEER_SSH_TIMEOUT)
         .map_err(|err| PeerSshFailure {
-            exit_code: None,
             // A dial that hung past the deadline was killed, not refused to
             // start: saying "spawn failed" would send the operator after the
             // local ssh binary instead of the link (#418).
@@ -1680,12 +1503,10 @@ fn run_peer_ssh_with(
             stderr.lines().next_back().unwrap_or(stderr).to_string()
         };
         return Err(PeerSshFailure {
-            exit_code: output.status.code(),
             detail: attribute_dial_failure(detail, &agent),
         });
     }
     String::from_utf8(output.stdout).map_err(|_| PeerSshFailure {
-        exit_code: output.status.code(),
         detail: "non-utf8 ssh output".to_string(),
     })
 }
@@ -1933,127 +1754,6 @@ mod tests {
         assert_eq!(kept, vec!["operator@spoke2.invalid".to_string()]);
     }
 
-    #[test]
-    fn shell_quoting_survives_spaces_and_quotes() {
-        // A live cross-host send arrived truncated at the first space, because
-        // the body was quoted INSIDE an already single-quoted `sh -lc '...'`:
-        // the inner quote closed the outer one and the remote shell then word-
-        // split the message. Quote once per level.
-        assert_eq!(super::shell_single_quote("hello world"), "'hello world'");
-        assert_eq!(super::shell_single_quote("it's fine"), r#"'it'\''s fine'"#);
-
-        // Nesting the way the relay does: inner command quoted, then the whole
-        // thing quoted again for `sh -lc`. The body must survive both.
-        let inner = format!("flk msg send -- {}", super::shell_single_quote("a b c"));
-        let outer = super::shell_single_quote(&inner);
-        assert!(outer.starts_with('\''), "{outer}");
-        assert!(outer.contains("a b c"), "body must survive: {outer}");
-    }
-
-    #[test]
-    fn a_relayed_message_carries_its_threading() {
-        // The reply routed home and arrived unthreaded: `relay_message_to_host`
-        // filled `in_reply_to`, and the relay command dropped it on the floor
-        // (#320). An answer that cannot be matched to its question is not an
-        // answer when an agent has more than one outstanding.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c-question"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(
-            command.contains("--reply-to c-question"),
-            "threading must reach the owning server: {command}"
-        );
-
-        // A first message has nothing to thread to, and must not grow an
-        // empty flag the remote CLI would then reject.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "ping",
-            "c-first",
-            None,
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(!command.contains("--reply-to"), "{command}");
-    }
-
-    #[test]
-    fn a_needs_reply_relay_carries_its_stamp_and_a_fyi_one_is_unchanged() {
-        // #280. The relay is the one leg that REBUILDS the send from scratch,
-        // as a `flk msg send` on the owning server — so a stamp not passed
-        // here is a cross-host question arriving as a notice, which is the
-        // mislabel the field exists to remove.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "re-derive both parameters and report back",
-            "c-question",
-            None,
-            crate::api::schema::MsgIntent::NeedsReply,
-        )
-        .expect("valid ids");
-        assert!(
-            command.contains("--intent needs_reply"),
-            "the stamp must reach the owning server: {command}"
-        );
-
-        // The default relays byte-identically to what shipped before the flag
-        // existed, so the far side needing a build that understands `--intent`
-        // is confined to the case that actually carries new signal.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "landed the fix",
-            "c-notice",
-            None,
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(!command.contains("--intent"), "{command}");
-    }
-
-    #[test]
-    fn a_blocking_relay_carries_its_tier_and_a_peer_refusing_it_is_recognised() {
-        // ADR-0018 §1: the tier rides the envelope across the hop, so the
-        // escalation happens on the recipient's own server.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "I cannot merge until you rebase",
-            "c-blocking",
-            None,
-            crate::api::schema::MsgIntent::Blocking,
-        )
-        .expect("valid ids");
-        assert!(command.contains("--intent blocking"), "{command}");
-
-        // What a peer that has #380 but predates the tier prints: the refusal
-        // the relay retries at `needs_reply` rather than surfacing as a
-        // failure. Any other refusal is not the intent's fault.
-        assert!(super::refused_the_intent(
-            "unknown --intent \"blocking\": expected fyi or needs-reply"
-        ));
-        // The unknown-option refusal names `--intent` in its list of what
-        // the build understands; that must not trigger a second ssh hop.
-        assert!(!super::refused_the_intent(
-            "flk msg send: unknown option \"--from-host\" — this build understands --repo \
-             --intent --correlation-id --reply-to --agent --from-agent --json, and `--` ends \
-             flag parsing so a body may begin with dashes"
-        ));
-    }
-
     /// #418 with a REAL ssh: a dial that fails comes back classified from
     /// ssh's own words, and those words reach the `process.exec` record as
     /// its stderr tail. `.invalid` is reserved (RFC 2606) and never resolves,
@@ -2084,7 +1784,6 @@ mod tests {
             "{}",
             failure.detail
         );
-        assert_eq!(failure.exit_code, Some(255), "ssh's own failure status");
         assert!(logs.contains("stderr_tail="), "{logs}");
         assert!(
             logs.to_ascii_lowercase()
@@ -2312,92 +2011,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_peer_that_refuses_is_not_a_peer_that_was_never_reached() {
-        // #380. Both used to arrive as "could not reach {host}", which is a
-        // lie about the second and the wrong advice about both: an unreachable
-        // peer is worth retrying and a rejected flag never will be.
-        //
-        // ssh reports the remote command's own exit status and keeps 255 for
-        // its own transport failures, so the status is the whole distinction.
-        let refused = super::classify_message_failure(super::PeerSshFailure {
-            exit_code: Some(super::REMOTE_REFUSAL_EXIT),
-            detail: "flk msg send: unknown option \"--intent\" — this build understands …"
-                .to_string(),
-        });
-        assert_eq!(refused.code(), "peer_refused_message");
-        assert!(!refused.retryable(), "the identical relay is refused again");
-        assert!(
-            refused
-                .hop_message("hopper", "atlas", super::SshFailureReason::Other)
-                .contains("--intent"),
-            "the peer's own words ARE the diagnosis and must survive the hop: {}",
-            refused.hop_message("hopper", "atlas", super::SshFailureReason::Other)
-        );
-
-        for (exit_code, what) in [
-            (Some(255), "ssh itself failed"),
-            (None, "killed by a signal"),
-        ] {
-            let failure = super::classify_message_failure(super::PeerSshFailure {
-                exit_code,
-                detail: "Connection timed out".to_string(),
-            });
-            assert_eq!(failure.code(), "peer_unreachable", "{what}");
-            assert!(failure.retryable(), "{what}");
-        }
-    }
-
-    #[test]
-    fn a_command_this_host_will_not_build_is_a_refusal_too() {
-        // An id that cannot be shell-quoted safely never leaves the machine,
-        // so it is terminal for the same reason a rejected flag is — and used
-        // to be reported as the host being unreachable, which it plainly was
-        // not.
-        // Never dials: the guard rejects shell-unsafe ids before ssh is spawned,
-        // which is what lets this drive the real entry point rather than
-        // hand-building the variant it is supposed to produce.
-        let peer = PeerConfig {
-            name: "atlas".into(),
-            ..Default::default()
-        };
-        let failure = super::send_peer_message(
-            &peer,
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c'; rm -rf /"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect_err("a shell-escaping id must be refused");
-        assert_eq!(failure.code(), "peer_refused_message");
-        assert!(!failure.retryable());
-        assert!(
-            failure.detail().contains("in-reply-to id"),
-            "the caller learns which id was rejected: {}",
-            failure.detail()
-        );
-    }
-
-    #[test]
-    fn a_threading_id_is_guarded_like_every_other_id() {
-        // Every id in this command is interpolated into a remote shell, so the
-        // new one is guarded by the same rule as the rest rather than trusted
-        // for being server-minted.
-        let err = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c'; rm -rf /"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect_err("a shell-escaping id must be refused");
-        assert!(err.contains("in-reply-to id"), "{err}");
-    }
     #[test]
     fn to_wire_dedups_origin_and_caps_peer_count() {
         let mk = |name: &str| PeerSummaryState {
