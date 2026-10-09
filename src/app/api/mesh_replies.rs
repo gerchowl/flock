@@ -116,6 +116,9 @@ impl App {
                 .map_err(|e| e.to_string())?;
             Ok(())
         })?;
+        if !local && push_peer.is_none() {
+            self.emit_mesh_wake();
+        }
         message.message_key = Some(answer.key.clone());
         let state = if local && !message.to_pane.is_empty() {
             "queued"
@@ -196,7 +199,7 @@ impl App {
                         store.collect_answers(origin, query, now_ms() as i64)
                     }
                     Collect::Outbound { outbound } => store.collect_outbound(
-                        crate::mesh::store::Offer::Step1RequestsOnly,
+                        crate::mesh::store::Offer::All,
                         self.node_id
                             .as_deref()
                             .ok_or("mesh node identity unavailable")?,
@@ -313,6 +316,14 @@ impl App {
         for peer in peers {
             let edge = crate::peer_stream::enrollment(&peer);
             if let Some(node) = edge.node_id.as_deref().filter(|_| edge.state == "pinned") {
+                if !self.collection_peers.contains_key(&peer.name)
+                    && crate::peer_stream::take_wake(&peer)
+                {
+                    self.mesh_outbound_polls
+                        .entry(peer.name.clone())
+                        .or_default()
+                        .note_wake();
+                }
                 // The hub's own read receipts are work even after the spoke
                 // has drained its outbox and stopped advertising pending mail.
                 let receipts_pending = with_store(|store| {
@@ -567,6 +578,7 @@ impl App {
             .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
+            self.emit_mesh_wake();
             self.project_mesh_answer(data.message);
         }
         Ok(())

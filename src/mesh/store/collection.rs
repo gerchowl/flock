@@ -441,6 +441,31 @@ impl<D: DiskSpace> Store<D> {
         for receipt in receipts {
             self.import_receipt(&receipt.key, &receipt.state)?;
         }
+        if offer == Offer::All {
+            // Materialize only changed inbox receipts. The sent mark follows
+            // durable custody, so a failed commit leaves the receipt owed.
+            for receipt in self.pending_receipts(hub, wall_ms)? {
+                let Some(original) = self.collection_record(&receipt.key, wall_ms)? else {
+                    continue;
+                };
+                let key = MessageKey::mint(local.into(), wall_ms.max(0) as u64)
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                let mut envelope = original.envelope;
+                envelope.key = key.clone();
+                envelope.correlation_id = format!("receipt:{}", key.message_id);
+                envelope.intent = "\"fyi\"".into();
+                envelope.in_reply_to = None;
+                envelope.kind = Kind::Receipt;
+                envelope.request_key = None;
+                envelope.return_binding = ReturnBinding::mint(key, hub.into(), vec![hub.into()])
+                    .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+                envelope.body = serde_json::to_vec(&receipt)?;
+                envelope.origin_key.clear();
+                envelope.signature.clear();
+                self.accept(&envelope, CUSTODY_TTL_MS, Admission::Held, wall_ms)?;
+                self.receipts_sent(&[receipt])?;
+            }
+        }
         let now = self.clock()?.advance(wall_ms);
         let keys = match offer {
             Offer::Step1RequestsOnly => self.routing_keys(

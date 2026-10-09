@@ -49,6 +49,37 @@ pub(super) fn payload(envelope: &Envelope) -> Result<Payload, String> {
 }
 
 impl App {
+    pub(super) fn emit_mesh_wake(&mut self) {
+        self.emit_event(EventEnvelope {
+            event: EventKind::MeshOutboundPending,
+            data: EventData::MeshOutboundPending {},
+        });
+    }
+
+    pub(super) fn import_mesh_receipt(
+        &mut self,
+        mail: &Envelope,
+    ) -> Result<(Accepted, bool), String> {
+        let receipt: crate::mesh::collect::Receipt =
+            serde_json::from_slice(&mail.body).map_err(|_| "invalid_envelope".to_string())?;
+        with_store(|store| {
+            let original = store
+                .get(&receipt.key)
+                .map_err(|e| e.to_string())?
+                .ok_or("invalid_envelope")?;
+            if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str())
+                || original.envelope.return_binding.recipient_node != mail.key.origin_node
+                || original.envelope.return_binding.collection_token != receipt.token
+            {
+                return Err("invalid reply binding".into());
+            }
+            store
+                .import_receipt(&receipt.key, &receipt.state)
+                .map_err(|e| e.to_string())?;
+            Ok((Accepted::New, true))
+        })
+    }
+
     pub(super) fn persist_mesh_send(
         &mut self,
         send: &mut RelaySend,
@@ -295,6 +326,7 @@ impl App {
                 .map_err(|e| e.to_string())
         })?;
         if accepted == Accepted::New {
+            self.emit_mesh_wake();
             self.queue_message_tiered(String::new(), data.message, Vec::new(), "unattested");
         }
         if unbound_muted {
@@ -368,17 +400,6 @@ impl App {
                 failure.detail()
             )),
         }
-        if state == "queued" && delivery.envelope.request_key.is_some() {
-            if let Err(reason) = with_store(|store| {
-                store
-                    .hold_answer(&delivery.envelope.key)
-                    .map_err(|e| e.to_string())
-            }) {
-                warnings.push(reason);
-            } else {
-                state = "held";
-            }
-        }
         if state == "queued" {
             let spent = CUSTODY_TTL_MS.saturating_sub(delivery.remaining_ms);
             let delay = match spent {
@@ -404,6 +425,23 @@ impl App {
                     .map_err(|e| e.to_string())
             }) {
                 warnings.push(reason);
+            }
+        }
+        if state == "queued" && delivery.envelope.request_key.is_some() {
+            if let Err(reason) = with_store(|store| {
+                store
+                    .hold_answer(&delivery.envelope.key)
+                    .map_err(|e| e.to_string())
+            }) {
+                warnings.push(reason);
+            } else {
+                state = "held";
+                if self
+                    .outbound_reply_peer(&delivery.envelope.return_binding.recipient_node)
+                    .is_none()
+                {
+                    self.emit_mesh_wake();
+                }
             }
         }
         if state == "delivered" {
@@ -460,11 +498,23 @@ impl App {
             .filter(|message| message.to_pane == pane)
             .filter_map(|message| message.message_key)
             .collect();
-        with_store(|store| {
-            store
+        let (expired, changed) = with_store(|store| {
+            let mut changed = false;
+            for key in &keys {
+                changed |= store
+                    .get(key)
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|record| record.state == "inbox");
+            }
+            let expired = store
                 .read_inbox(&keys, now_ms() as i64)
-                .map_err(|e| e.to_string())
-        })
+                .map_err(|e| e.to_string())?;
+            Ok((expired, changed))
+        })?;
+        if changed {
+            self.emit_mesh_wake();
+        }
+        Ok(expired)
     }
 
     pub(crate) fn initialize_mesh_mail(
@@ -670,14 +720,32 @@ impl App {
         if self.fleet_pause.paused || !self.message_relays.is_idle() {
             return;
         }
+        let pushable: Vec<String> = self
+            .state
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                let status = crate::peer_stream::enrollment(peer);
+                (status.state == "pinned")
+                    .then_some(status.node_id)
+                    .flatten()
+            })
+            .collect();
         let records = with_store(|store| {
-            store
-                .retry_ready_limit(
-                    now_ms() as i64,
-                    self.state.config.msg.deferral_relay_concurrency.max(1),
-                )
-                .map_err(|e| e.to_string())?
-                .into_iter()
+            let limit = self.state.config.msg.deferral_relay_concurrency.max(1);
+            let mut keys = store
+                .push_ready(now_ms() as i64, limit, &pushable)
+                .map_err(|e| e.to_string())?;
+            // Preserve the existing request retry lane for sends accepted
+            // before their peer had an identity pin.
+            if keys.len() < limit {
+                keys.extend(
+                    store
+                        .retry_ready_limit(now_ms() as i64, limit - keys.len())
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            keys.into_iter()
                 .map(|key| store.get(&key).map_err(|e| e.to_string()))
                 .collect::<Result<Vec<_>, _>>()
         });

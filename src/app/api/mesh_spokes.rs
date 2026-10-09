@@ -84,6 +84,7 @@ impl App {
                     .accept(&mail, CUSTODY_TTL_MS, Admission::Held, now_ms() as i64)
                     .map_err(|e| e.to_string())
             })?;
+            self.emit_mesh_wake();
             Ok((mail.key, correlation))
         })();
         Some(match result {
@@ -148,18 +149,25 @@ impl App {
             if edge.node_id.as_deref() != Some(mail.key.origin_node.as_str()) {
                 continue;
             }
-            let result = if self.node_id.as_deref()
-                != Some(mail.return_binding.recipient_node.as_str())
-                || mail.request_key.is_some()
-            {
-                Err("invalid_envelope".into())
-            } else {
-                self.import_attested_mesh_mail(&delivery)
-            };
+            let result =
+                if self.node_id.as_deref() != Some(mail.return_binding.recipient_node.as_str()) {
+                    Err("invalid_envelope".into())
+                } else if mail.kind == crate::mesh::store::Kind::Receipt {
+                    self.import_mesh_receipt(mail)
+                } else if super::mesh_mail::payload(mail).is_err() {
+                    Err("invalid_envelope".into())
+                } else if let Some(request) = &mail.request_key {
+                    // The edge origin was checked above. This lane acknowledges
+                    // via OutboundAck, without creating answer-collection debt.
+                    self.import_mesh_answer(request, &delivery, None)
+                        .map(|()| (crate::mesh::store::Accepted::New, true))
+                } else {
+                    self.import_attested_mesh_mail(&delivery)
+                };
             let refusal = match result {
                 Ok(_) => None,
                 Err(reason) => {
-                    if transient_import_error(&reason) {
+                    if !permanent_import_error(&reason) {
                         continue;
                     }
                     Some(reason.chars().take(512).collect())
@@ -185,10 +193,39 @@ impl App {
     }
 }
 
-fn transient_import_error(reason: &str) -> bool {
+fn permanent_import_error(reason: &str) -> bool {
     matches!(
         reason.split(':').next().unwrap_or(reason),
-        "mailbox_full" | "mail_store_full" | "fleet_paused" | "mail_store_unavailable"
-    ) || crate::mesh::runtime_store::recovery_reason().is_some()
-        || crate::mesh::runtime_store::suspended().unwrap_or(true)
+        "invalid_envelope"
+            | "invalid reply binding"
+            | "inconsistent mesh answer"
+            | "inconsistent mesh envelope"
+            | "msg_not_allowed"
+            | "origin_mismatch"
+            | "message_key_conflict"
+            | "message_expired"
+            | "expired"
+            | super::mesh_replies::UNAVAILABLE
+            | "recipient_gone"
+            | "forward_limit"
+            | "msg_target_not_found"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unknown_import_errors_remain_retryable() {
+        for error in [
+            "database is locked",
+            "disk I/O error",
+            "mailbox_full",
+            "mail_store_full",
+            "fleet_paused",
+        ] {
+            assert!(!super::permanent_import_error(error));
+        }
+        assert!(super::permanent_import_error("invalid_envelope"));
+        assert!(super::permanent_import_error("msg_target_not_found: gone"));
+    }
 }

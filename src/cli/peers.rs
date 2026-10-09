@@ -519,6 +519,7 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     crate::logging::peer_relay_started(pushing);
     if pushing {
         start_summary_push(socket.clone());
+        start_mesh_wake_push(socket.clone());
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -678,6 +679,59 @@ fn start_summary_push(socket: std::path::PathBuf) {
             crate::logging::peer_push_emitted(coalesced);
         }
     });
+}
+
+/// Wake failures are confined to this worker, never the request relay.
+fn start_mesh_wake_push(socket: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        if let Err(error) = mesh_wake_push(&socket) {
+            crate::logging::peer_mesh_wake_failed("push", &error.to_string());
+        }
+    });
+}
+
+fn mesh_wake_push(socket: &std::path::Path) -> std::io::Result<()> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id":"relay-wake", "method":"events.subscribe",
+            "params":{"subscriptions":[{"type":"mesh.outbound_pending"}]}
+        })
+    )?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut ack = String::new();
+    if reader.read_line(&mut ack)? == 0 || ack.contains("\"error\"") {
+        return Err(std::io::Error::other(format!(
+            "mesh wake subscription refused: {ack}"
+        )));
+    }
+    let debounce = PushDebounce::default();
+    let events = debounce.clone();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(_) => events.note_event(),
+                Err(error) => {
+                    crate::logging::peer_mesh_wake_failed("subscription", &error.to_string());
+                    break;
+                }
+            }
+        }
+        events.note_closed();
+    });
+    loop {
+        std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+        if debounce.take_due().is_some() {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            writeln!(out, "{{\"push\":\"mesh.wake\"}}")?;
+            out.flush()?;
+        } else if debounce.is_finished() {
+            return Ok(());
+        }
+    }
 }
 
 /// One request to this node's own socket, answered by one line.
@@ -880,6 +934,23 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    #[test]
+    fn wake_debounce_coalesces_a_burst_and_ships_the_last() {
+        let wake = PushDebounce::default();
+        let summary = PushDebounce::default();
+        for _ in 0..100 {
+            wake.note_event();
+        }
+        assert_eq!(wake.take_due(), Some(99));
+        assert_eq!(summary.take_due(), None);
+        assert_eq!(wake.take_due(), None);
+        wake.note_event();
+        wake.note_closed();
+        assert_eq!(wake.take_due(), Some(0));
+        assert_eq!(wake.take_due(), None);
+        assert!(wake.is_finished());
+    }
 
     #[test]
     fn enrollment_origin_labels_and_older_server_default() {

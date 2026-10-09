@@ -3550,3 +3550,89 @@ fn quarantine_sidecar_rotation_keeps_two_bounded_private_files() {
     assert!(quarantine::append(directory, b"oversized record\n", 8).is_err());
     assert_eq!(fs::read_to_string(active).unwrap(), "{\"n\":4}\n");
 }
+
+#[test]
+fn held_answer_push_ready_honors_due_time_without_reenrollment_or_idle_commits() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mut answer = envelope();
+    answer.request_key = Some(envelope().key);
+    store
+        .accept(&answer, CUSTODY_TTL_MS, Admission::Custody, 0)
+        .unwrap();
+    store.schedule_retry(&answer.key, 60_000, 0).unwrap();
+    store.hold_answer(&answer.key).unwrap();
+    let peers = vec![answer.return_binding.recipient_node.clone()];
+    let before = store.connection.total_changes();
+    for now in 1..100 {
+        assert!(store.push_ready(now, 16, &peers).unwrap().is_empty());
+    }
+    assert_eq!(store.connection.total_changes(), before);
+    assert_eq!(
+        store.push_ready(60_000, 16, &peers).unwrap(),
+        vec![answer.key.clone()]
+    );
+    assert_eq!(store.get(&answer.key).unwrap().unwrap().state, "custody");
+}
+
+#[test]
+fn outbound_receipts_are_durable_and_acknowledged_individually() {
+    use crate::mesh::collect::{OutboundAck, OutboundCollect, Receipt};
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    store
+        .read_inbox(std::slice::from_ref(&request.key), 1)
+        .unwrap();
+    let offered = store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect::default(),
+            2,
+        )
+        .unwrap();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].envelope.kind, Kind::Receipt);
+    let receipt: Receipt = serde_json::from_slice(&offered[0].envelope.body).unwrap();
+    assert_eq!(receipt.key, request.key);
+    assert_eq!(receipt.state, "read");
+    assert!(store
+        .pending_receipts("origin.example", 2)
+        .unwrap()
+        .is_empty());
+    let ack = OutboundAck {
+        key: offered[0].envelope.key.clone(),
+        token: offered[0].envelope.return_binding.collection_token.clone(),
+        refusal: None,
+    };
+    assert!(store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect {
+                ack: vec![ack],
+                receipts: vec![]
+            },
+            3
+        )
+        .unwrap()
+        .is_empty());
+    let before = store.connection.total_changes();
+    assert!(store
+        .collect_outbound(
+            Offer::All,
+            "receiver.example",
+            "origin.example",
+            &OutboundCollect::default(),
+            4
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.connection.total_changes(), before);
+}

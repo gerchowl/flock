@@ -954,3 +954,263 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     assert_eq!(retried[0]["body"], "retry body");
     conversation.answer_once();
 }
+
+#[test]
+fn spoke_read_receipt_reaches_origin_within_seconds() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    let origin = conversation.fleet.node("nodea");
+    // End request-scoped polling so only the edge wake can carry this read.
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(7));
+    let started = Instant::now();
+    conversation.read_question();
+    fleet::wait_until("wake carries read receipt", Duration::from_secs(4), || {
+        (status(origin, "question")["state"] == "read").then_some(())
+    });
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn follow_up_reply_after_final_answer_on_one_way_edge_is_collected() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    conversation.reply();
+    conversation.answer_once();
+    // Let the idle outbound poll enter its long backoff after the final answer.
+    std::thread::sleep(Duration::from_secs(7));
+    let reply = conversation.receiver.cli(
+        conversation.fleet.node("nodeb"),
+        &["msg", "reply", "question", "follow-up body"],
+    );
+    let origin = conversation.fleet.node("nodea");
+    let messages = fleet::wait_until("follow-up wake collection", Duration::from_secs(4), || {
+        let messages = read(origin, &conversation.sender.pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    });
+    assert_eq!(messages[0]["body"], "follow-up body");
+    assert_eq!(messages[0]["correlation_id"], reply["correlation_id"]);
+    assert_eq!(read(origin, &conversation.sender.pane), json!([]));
+}
+
+#[test]
+fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let fault = conversation
+        .fleet
+        .base
+        .join("transient-delivery-nodeb-nodea");
+    std::fs::write(&fault, b"").unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("first reply push fails", DEADLINE, || {
+        (delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) == 1).then_some(())
+    });
+    let hub = conversation.fleet.node("nodeb");
+    let enrollment = api(hub, "peers.enrollment", json!({}));
+    let store = db(hub);
+    fleet::wait_until("failed reply scheduled", DEADLINE, || {
+        store
+            .query_row(
+                "SELECT retry_at>0 FROM envelopes WHERE correlation=?1",
+                [correlation],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()?
+            .then_some(())
+    });
+    std::fs::remove_file(fault).unwrap();
+    // Move the persisted deadline, not the edge's enrollment generation.
+    store
+        .execute(
+            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE correlation=?1",
+            [correlation],
+        )
+        .unwrap();
+    conversation.answer_once();
+    assert_eq!(api(hub, "peers.enrollment", json!({})), enrollment);
+    assert!(delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2);
+}
+
+#[test]
+fn idle_edge_emits_no_wakes_and_no_commits() {
+    use std::io::{BufRead, BufReader, Write};
+    let conversation = Conversation::new(DIRECT);
+    std::thread::sleep(Duration::from_secs(4));
+    let spoke = conversation.fleet.node("nodeb");
+    let mut stream = std::os::unix::net::UnixStream::connect(&spoke.api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id":"idle", "method":"events.subscribe", "params":{
+            "subscriptions":[{"type":"mesh.outbound_pending"}]
+        }})
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.contains("error"), "{line}");
+    let store = db(spoke);
+    let version = || {
+        store
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    line.clear();
+    assert!(
+        reader.read_line(&mut line).is_err(),
+        "unexpected wake: {line}"
+    );
+    assert_eq!(version(), before);
+}
+
+#[test]
+fn hundred_held_answers_cause_bounded_polls() {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    let receivers: Vec<_> = (0..5)
+        .map(|index| {
+            let started = api(
+                spoke,
+                "agent.start",
+                json!({
+                    "name":format!("burst-{index}"), "argv":["/bin/sh"], "cwd":spoke.repo
+                }),
+            );
+            Agent {
+                id: started["agent"]["agent_id"].as_str().unwrap().into(),
+                pane: started["agent"]["pane_id"].as_str().unwrap().into(),
+            }
+        })
+        .collect();
+    for (index, receiver) in receivers.iter().enumerate() {
+        fleet::wait_until("burst recipient discovery", DEADLINE, || {
+            api(origin, "agent.list", json!({}))["fleet"]
+                .as_array()?
+                .iter()
+                .any(|entry| entry["agent_id"] == receiver.id)
+                .then_some(())
+        });
+        conversation.sender.cli(
+            origin,
+            &[
+                "msg",
+                "send",
+                "--agent",
+                &receiver.id,
+                "--intent",
+                "needs-reply",
+                "--correlation-id",
+                &format!("burst-{index}"),
+                "question",
+            ],
+        );
+        assert_eq!(mail(spoke, &receiver.pane).as_array().unwrap().len(), 1);
+    }
+    api(origin, "fleet.pause", json!({}));
+    // Stop conversation polling: this test exercises the outbound edge lane.
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    // Five real senders each stay within the production 20/minute limit.
+    for (index, receiver) in receivers.iter().enumerate() {
+        let output = spoke.home.join(format!("burst-{index}.json"));
+        let command = format!(
+            "i=0; while [ $i -lt 20 ]; do {} msg reply burst-{index} answer-$i >/dev/null || break; i=$((i+1)); done; printf '{{\"result\":{{\"count\":%s}}}}\\n' \"$i\" >{}\n",
+            quote(env!("CARGO_BIN_EXE_flk")), quote(output.to_str().unwrap())
+        );
+        api(
+            spoke,
+            "pane.send_text",
+            json!({"pane_id":receiver.pane,"text":command}),
+        );
+        assert_eq!(cli_result(&output)["count"], 20);
+    }
+    let polls = conversation.fleet.base.join("outbound-polls-nodea-nodeb");
+    let count = || {
+        std::fs::read_to_string(&polls)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = count();
+    api(origin, "fleet.resume", json!({}));
+    let mut received = std::collections::HashSet::new();
+    fleet::wait_until("all held answers collected", DEADLINE, || {
+        for message in read(origin, &conversation.sender.pane).as_array().unwrap() {
+            assert!(received.insert(message["correlation_id"].as_str().unwrap().to_owned()));
+        }
+        (received.len() == 100).then_some(())
+    });
+    // Seven batches of 16 plus their acks, with room for one wake/idle poll.
+    assert!(
+        count() - before <= 16,
+        "{} polls for 100 answers",
+        count() - before
+    );
+}
+
+#[test]
+fn outbound_answer_import_failure_skips_only_its_own_ack() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    api(origin, "fleet.pause", json!({}));
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    let first = conversation.reply();
+    let second = conversation
+        .receiver
+        .cli(spoke, &["msg", "reply", "question", "second answer"]);
+    let store = db(origin);
+    store
+        .execute_batch(
+            "CREATE TRIGGER fail_first_answer BEFORE INSERT ON envelopes
+        WHEN json_extract(CAST(NEW.body AS TEXT), '$.message.body')='answer body'
+        BEGIN SELECT RAISE(FAIL, 'transient import fault'); END;",
+        )
+        .unwrap();
+    api(origin, "fleet.resume", json!({}));
+    let imported = mail(origin, &conversation.sender.pane);
+    assert_eq!(imported.as_array().unwrap().len(), 1);
+    assert_eq!(imported[0]["correlation_id"], second["correlation_id"]);
+    state(
+        spoke,
+        second["correlation_id"].as_str().unwrap(),
+        "collected",
+    );
+    assert_eq!(
+        status(spoke, first["correlation_id"].as_str().unwrap())["state"],
+        "held"
+    );
+    store
+        .execute_batch("DROP TRIGGER fail_first_answer")
+        .unwrap();
+    due(spoke);
+    conversation
+        .receiver
+        .cli(spoke, &["msg", "reply", "question", "wake retry"]);
+    let mut correlations = std::collections::HashSet::new();
+    fleet::wait_until("retry imports unacknowledged answer", DEADLINE, || {
+        for message in read(origin, &conversation.sender.pane).as_array().unwrap() {
+            correlations.insert(message["correlation_id"].as_str().unwrap().to_owned());
+        }
+        correlations
+            .contains(first["correlation_id"].as_str().unwrap())
+            .then_some(())
+    });
+}
