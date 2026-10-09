@@ -640,9 +640,7 @@ pub(crate) fn enrollment_generation() -> u64 {
 }
 
 fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<String>) {
-    if reason.is_none() {
-        ENROLLMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    let enrolled = reason.is_none();
     if let Ok(mut statuses) = enrollments().lock() {
         let previous = statuses.get(&peer.name).and_then(|s| s.node_id.clone());
         statuses.insert(
@@ -661,6 +659,10 @@ fn set_enrollment(peer: &PeerConfig, node_id: Option<String>, reason: Option<Str
                 reason,
             },
         );
+        // Publish the wake only after the enrolled status is visible.
+        if enrolled {
+            ENROLLMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

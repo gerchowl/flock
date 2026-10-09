@@ -12,14 +12,18 @@ use crate::mesh::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Payload {
-    message: PendingMessage,
-    peer: Option<String>,
-    host: Option<String>,
-    direct: bool,
+pub(super) struct Payload {
+    pub(super) message: PendingMessage,
+    pub(super) peer: Option<String>,
+    pub(super) host: Option<String>,
+    pub(super) direct: bool,
 }
 
-fn envelope(origin: &str, target: String, payload: &Payload) -> Result<Envelope, String> {
+pub(super) fn envelope(
+    origin: &str,
+    target: String,
+    payload: &Payload,
+) -> Result<Envelope, String> {
     let key = MessageKey::mint(origin.into(), now_ms()).map_err(|e| e.to_string())?;
     let return_binding =
         ReturnBinding::mint(key.clone(), String::new(), Vec::new()).map_err(|e| e.to_string())?;
@@ -37,7 +41,7 @@ fn envelope(origin: &str, target: String, payload: &Payload) -> Result<Envelope,
     })
 }
 
-fn payload(envelope: &Envelope) -> Result<Payload, String> {
+pub(super) fn payload(envelope: &Envelope) -> Result<Payload, String> {
     serde_json::from_slice(&envelope.body).map_err(|e| e.to_string())
 }
 
@@ -86,7 +90,10 @@ impl App {
                     .return_binding
                     .collection_peers
                     .push(pin.node_id.clone());
-                if send.direct {
+                // In-memory uplink mail has no durable spoke-origin binding until 1-H2.
+                // A direct recipient can first appear through down-gossip. The pinned
+                // accepting edge, not the directory snapshot, establishes the binding.
+                if send.from_host == crate::app::short_host_name() {
                     envelope.return_binding.recipient_node = pin.node_id;
                 }
             }
@@ -117,6 +124,14 @@ impl App {
         &mut self,
         message: &mut PendingMessage,
     ) -> Result<(), String> {
+        // Uplink sends are not origin-attested mesh requests until 1-H2.
+        if message
+            .from_host
+            .as_deref()
+            .is_some_and(|host| host != crate::app::short_host_name())
+        {
+            return Ok(());
+        }
         if self.mailboxes.queued_len(&message.to_pane) >= crate::app::mailboxes::MAX_QUEUED_PER_PANE
         {
             return Err("mailbox_full".into());
@@ -170,6 +185,8 @@ impl App {
                 id,
                 if reason == "origin_mismatch" {
                     "origin_mismatch"
+                } else if reason == super::mesh_replies::UNAVAILABLE {
+                    "reply_unavailable"
                 } else {
                     "mesh_delivery_refused"
                 },
@@ -207,6 +224,10 @@ impl App {
         })?;
         if !self.state.config.msg.accepts_from(Some(&sender_host)) {
             return Err("msg_not_allowed".into());
+        }
+        if let Some(request) = &envelope.request_key {
+            self.import_mesh_answer(request, delivery, None)?;
+            return Ok((Accepted::New, true));
         }
         let mut data = payload(envelope)?;
         if data.message.correlation_id != envelope.correlation_id
@@ -252,6 +273,12 @@ impl App {
         data.message.from_host = Some(sender_host);
         data.message.message_key = Some(envelope.key.clone());
         data.message.enqueued_at_ms = now_ms();
+        let unbound_muted = self.mailboxes.owes_deferral(&data.message)
+            && self
+                .mailboxes
+                .muted_until(&data.message.to_pane, now_ms())
+                .is_some()
+            && self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str());
         let accepted = with_store(|store| {
             let existing = store.get(&envelope.key).map_err(|e| e.to_string())?;
             if existing.is_none()
@@ -272,18 +299,33 @@ impl App {
         if accepted == Accepted::New {
             self.queue_message_tiered(String::new(), data.message, Vec::new(), "unattested");
         }
+        if unbound_muted {
+            return Err(super::mesh_replies::UNAVAILABLE.into());
+        }
         Ok((accepted, true))
     }
 
     pub(super) fn complete_mesh_send(
         &mut self,
         send: RelaySend,
-        result: Result<bool, crate::peers::PeerMessageFailure>,
+        mut result: Result<bool, crate::peers::PeerMessageFailure>,
     ) {
         let Some(delivery) = &send.mesh else {
             return;
         };
         let mut warnings = Vec::new();
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|failure| failure.detail().contains("reply_unavailable"))
+        {
+            // The receiver queued the question. Only its return path is unavailable.
+            warnings.push(format!(
+                "reply_unavailable: {}",
+                super::mesh_replies::UNAVAILABLE
+            ));
+            result = Ok(true);
+        }
         let mut state = "queued";
         match result {
             Ok(true) => match with_store(|store| {
@@ -303,6 +345,17 @@ impl App {
                 send.peer.name,
                 failure.detail()
             )),
+        }
+        if state == "queued" && delivery.envelope.request_key.is_some() {
+            if let Err(reason) = with_store(|store| {
+                store
+                    .hold_answer(&delivery.envelope.key)
+                    .map_err(|e| e.to_string())
+            }) {
+                warnings.push(reason);
+            } else {
+                state = "held";
+            }
         }
         if state == "queued" {
             let spent = CUSTODY_TTL_MS.saturating_sub(delivery.remaining_ms);
@@ -459,7 +512,9 @@ impl App {
         self.mailboxes.clear_queued_projection();
         let records = with_store(|store| {
             if !self.fleet_pause.paused {
-                store.maintain(now_ms() as i64).map_err(|e| e.to_string())?;
+                store
+                    .maintain_if_due(now_ms() as i64)
+                    .map_err(|e| e.to_string())?;
             }
             store
                 .mailbox_keys()
@@ -539,7 +594,8 @@ impl App {
             return;
         }
         self.mesh_retry_at = Some(now + std::time::Duration::from_secs(1));
-        self.mesh_enrollment_generation = generation;
+        let enrollment_changed = self.mesh_enrollment_generation != generation;
+        let resumed = self.mesh_pause_seen != Some(false) && !paused;
         self.mesh_pause_seen = Some(paused);
         if let Err(reason) = with_store(|store| {
             store
@@ -554,14 +610,39 @@ impl App {
                 .mesh_maintenance_at
                 .is_none_or(|deadline| std::time::Instant::now() >= deadline)
         {
-            if let Err(reason) =
-                with_store(|store| store.maintain(now_ms() as i64).map_err(|e| e.to_string()))
-            {
+            if let Err(reason) = with_store(|store| {
+                store
+                    .maintain_if_due(now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            }) {
                 crate::logging::mesh_custody_failed("maintenance", error_code(&reason));
             }
             self.mesh_maintenance_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         }
+        if !paused && (enrollment_changed || resumed) {
+            let peers: Vec<String> = self
+                .state
+                .peers
+                .iter()
+                .filter_map(|peer| {
+                    let status = crate::peer_stream::enrollment(peer);
+                    (status.state == "pinned")
+                        .then_some(status.node_id)
+                        .flatten()
+                })
+                .collect();
+            let origin = self.node_id.as_deref().unwrap_or_default();
+            if let Err(reason) = with_store(|store| {
+                store
+                    .activate_held(origin, &peers, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            }) {
+                crate::logging::mesh_custody_failed("held", error_code(&reason));
+                return;
+            }
+        }
+        self.mesh_enrollment_generation = generation;
         if self.fleet_pause.paused || !self.message_relays.is_idle() {
             return;
         }
@@ -586,15 +667,27 @@ impl App {
             if Some(record.envelope.key.origin_node.as_str()) != self.node_id.as_deref() {
                 continue;
             }
-            let peer = self
-                .state
-                .peers
-                .iter()
-                .find(|peer| Some(&peer.name) == data.peer.as_ref())
-                .cloned();
+            let peer = if record.envelope.request_key.is_some() {
+                self.outbound_reply_peer(&record.envelope.return_binding.recipient_node)
+                    .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned")
+            } else {
+                self.state
+                    .peers
+                    .iter()
+                    .find(|peer| Some(&peer.name) == data.peer.as_ref())
+                    .cloned()
+            };
             let Some(peer) = peer else {
+                if record.envelope.request_key.is_some() {
+                    let _ = with_store(|store| {
+                        store
+                            .hold_answer(&record.envelope.key)
+                            .map_err(|e| e.to_string())
+                    });
+                }
                 continue;
             };
+            let host = data.host.unwrap_or_else(|| peer.name.clone());
             let message = data.message;
             let send = RelaySend {
                 mesh: Some(Deliver {
@@ -604,7 +697,7 @@ impl App {
                 id: String::new(),
                 peer,
                 to_agent: record.envelope.target_agent,
-                host: data.host.unwrap_or_default(),
+                host,
                 direct: data.direct,
                 from_agent: message.from_agent.unwrap_or_default(),
                 from_host: message.from_host.unwrap_or_default(),
@@ -625,6 +718,9 @@ pub(super) fn error_code(reason: &str) -> &'static str {
         Some("mailbox_full") => "mailbox_full",
         Some("mail_store_full") => "mail_store_full",
         Some("fleet_paused") => "fleet_paused",
+        Some("message_expired") => "message_expired",
+        Some("message_not_found") => "message_not_found",
+        Some("origin not mesh-reachable (needs 1-H2)") => "reply_unavailable",
         _ => "mail_store_unavailable",
     }
 }

@@ -10,3 +10,5 @@ pub mod store;
 pub mod delivery;
 
 pub(crate) mod runtime_store;
+
+pub mod collect;

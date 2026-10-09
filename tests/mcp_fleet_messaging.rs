@@ -35,10 +35,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use support::fleet::{self, NodeSpec, HUB_SPOKES};
 
-/// Two nodes that poll EACH OTHER. A one-way chain is enough to send, but a
-/// reply has to resolve the original sender through the replier's own
-/// directory — so a fleet where B never hears about A can deliver a message
-/// and never answer it.
+/// Reciprocal peers exercise discovery racing with down-gossip. Replies use
+/// the persisted binding and collection, independent of the return directory.
 const PAIR_AB: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &["nodeb"]),
     NodeSpec::new("nodeb", "beta", &["nodea"]),
@@ -46,6 +44,15 @@ const PAIR_AB: &[NodeSpec] = &[
 
 const GOSSIP_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+// Advance only the sandbox's durable collection deadline after a held answer.
+// An earlier empty poll correctly backs off for 60s in production.
+fn collect_now(node: &fleet::Node) {
+    rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite"))
+        .unwrap()
+        .execute("UPDATE envelopes SET collect_at=0", [])
+        .unwrap();
+}
 
 // ---- MCP client that lives inside a pane ---------------------------------
 
@@ -442,6 +449,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         json!({"correlation_id": correlation_id, "body": "pong from nodeb"}),
     );
 
+    collect_now(fleet.node("nodea"));
     let answer = wait_for("the reply to come back to nodea", RPC_TIMEOUT, || {
         let inbox = alice.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
@@ -564,6 +572,7 @@ fn a_mute_answers_a_sender_on_another_host() {
         muted["deferred"], 1,
         "the waiting question is answered: {muted}"
     );
+    collect_now(fleet.node("nodea"));
 
     let deferral = wait_for("the deferral to reach nodea", RPC_TIMEOUT, || {
         let inbox = alice.call_tool("flock_msg_read", json!({}));
@@ -593,6 +602,7 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "needs_reply",
         }),
     );
+    collect_now(fleet.node("nodea"));
     let arrived = wait_for(
         "the arrival-time deferral to reach nodea",
         RPC_TIMEOUT,
@@ -632,18 +642,10 @@ fn a_mute_answers_a_sender_on_another_host() {
     );
 }
 
-/// #410, the acceptance case. A spoke messages another spoke through the hub,
-/// and the answer comes back the same way — with neither spoke holding a key
-/// to anything.
-///
-/// Before this, `nodea` could not message `nodec` at all: it has no
-/// `[[peers]]`, so the relay refused with `peer_not_configured` and advised
-/// adding the very N×N trust the topology refuses. The message now goes UP the
-/// relay `nodeb` holds into `nodea`, `nodeb` delivers it with its ordinary
-/// `msg.send`, and the outcome — including a failure on `nodeb`'s own hop —
-/// comes back down to the sender.
+/// Uplink sends remain pending 1-H2, but unbound replies must fail explicitly.
+/// The direct-edge collection tests exercise the supported 1-H1 return path.
 #[test]
-fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
+fn spoke_uplink_delivery_has_no_legacy_reply_until_durable_spoke_custody() {
     for spec in HUB_SPOKES {
         if spec.name != "nodeb" {
             assert!(spec.peers.is_empty(), "no spoke may carry [[peers]]");
@@ -768,22 +770,18 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     assert_eq!(delivered["replyable"], true, "{delivered}");
     assert_eq!(delivered["intent"], "needs_reply", "{delivered}");
 
-    // The reply: nodec cannot place alice either, so it goes up nodeb's
-    // relay into nodec, and nodeb delivers it down to nodea.
-    let replied = carol.call_tool(
+    // No return capability can be minted on behalf of the unpersisted spoke.
+    let replied = carol.call_tool_error(
         "flock_msg_reply",
         json!({"correlation_id": "c-410-hub", "body": "pong from spoke c"}),
     );
-    assert_eq!(replied["path"], "via nodeb", "reply: {replied}");
-
-    let answer = wait_for("the reply to reach nodea", RPC_TIMEOUT, || {
-        let inbox = alice.call_tool("flock_msg_read", json!({}));
-        inbox["messages"].as_array()?.first().cloned()
-    });
-    assert_eq!(answer["body"], "pong from spoke c");
-    assert_eq!(answer["from_agent"], carol.agent_id.as_str(), "{answer}");
-    assert_eq!(answer["from_host"], "nodeb", "{answer}");
-    assert_eq!(answer["in_reply_to"], "c-410-hub", "{answer}");
+    assert!(
+        replied.to_string().contains("reply_unavailable"),
+        "{replied}"
+    );
+    assert!(replied.to_string().contains("needs 1-H2"), "{replied}");
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    assert_eq!(inbox["messages"], json!([]));
 
     // The sender's own log says how it went, too.
     let status: Value =
@@ -871,71 +869,29 @@ fn a_spoke_messages_another_spoke_through_the_hub_and_hears_back() {
     assert_eq!(arrived["intent"], "blocking", "{arrived}");
     assert_eq!(arrived["from_host"], "nodeb", "{arrived}");
 
-    // ADR-0018 §3 rides the route too: carol mutes, so a question from alice
-    // is answered by carol's OWN server with a deferral — and nodec cannot
-    // reach nodea itself, so that deferral goes up nodeb's relay and back
-    // down to alice like any other reply.
-    carol.call_tool(
-        "flock_msg_mute",
-        json!({"seconds": 600, "reason": "deep in a refactor"}),
-    );
-    alice.call_tool(
+    // Unbound questions also cannot produce a legacy mute deferral.
+    carol.call_tool("flock_msg_mute", json!({"seconds":600}));
+    let refused = alice.call_tool(
         "flock_msg_send",
         json!({
-            "to": {"type": "agent", "agent": carol.agent_id},
-            "body": "are you there?",
-            "correlation_id": "c-410-muted",
-            "intent": "needs_reply",
+            "to":{"type":"agent","agent":carol.agent_id},
+            "body":"are you there?", "correlation_id":"c-410-muted", "intent":"needs_reply"
         }),
     );
-    // Peek first, so the wake can be asked about while it is still queued.
-    wait_for("carol's deferral to reach nodea", RPC_TIMEOUT, || {
-        let queued = alice.call_tool("flock_msg_list", json!({"pane": alice.pane_id}));
-        queued["messages"]
-            .as_array()?
-            .iter()
-            .any(|message| message["in_reply_to"] == "c-410-muted")
-            .then_some(())
-    });
-    let wake: Value = serde_json::from_str(&node_a.api(&format!(
-        r#"{{"id":"t:wake","method":"msg.wake","params":{{"pane":"{}"}}}}"#,
-        alice.pane_id
-    )))
-    .expect("msg.wake parses");
-    assert_eq!(
-        wake["result"]["count"], 0,
-        "a deferral must not cost its receiver a turn: {wake}"
-    );
-    let inbox = alice.call_tool("flock_msg_read", json!({}));
-    let deferrals: Vec<&Value> = inbox["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .filter(|message| message["in_reply_to"] == "c-410-muted")
-        .collect();
-    assert_eq!(deferrals.len(), 1, "exactly one deferral: {inbox}");
-    let deferral = deferrals[0];
-    assert_eq!(
-        deferral["correlation_id"], "c-410-muted:deferred",
-        "{deferral}"
-    );
-    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
-    assert_eq!(
-        deferral["from_agent"],
-        carol.agent_id.as_str(),
-        "{deferral}"
-    );
-    assert_eq!(
-        deferral["intent"], "fyi",
-        "a deferral is fyi by construction: {deferral}"
-    );
     assert!(
-        deferral["body"]
-            .as_str()
-            .is_some_and(|body| body.contains("deep in a refactor")),
-        "the reason survives both hops: {deferral}"
+        refused.to_string().contains("reply_unavailable"),
+        "{refused}"
     );
-    carol.call_tool("flock_msg_mute", json!({"seconds": 0}));
+    let question = carol.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        question["messages"][0]["body"], "are you there?",
+        "{question}"
+    );
+    let muted = carol.call_tool("flock_msg_mute", json!({"seconds":900}));
+    assert_eq!(muted["deferred"], 0, "{muted}");
+    let inbox = alice.call_tool("flock_msg_read", json!({}));
+    assert_eq!(inbox["messages"], json!([]));
+    carol.call_tool("flock_msg_mute", json!({"seconds":0}));
 
     // A partition retains custody at the hub and names the queued destination.
     fleet.refuse_ssh_to("nodec");

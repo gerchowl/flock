@@ -91,6 +91,7 @@ pub(crate) fn answer_in(event: &EventEnvelope, correlation_id: &str) -> Option<A
             from_agent,
             from_host,
             body,
+            to_pane,
             ..
         } if original == correlation_id => Some(answer_kind(
             reply_id,
@@ -101,7 +102,7 @@ pub(crate) fn answer_in(event: &EventEnvelope, correlation_id: &str) -> Option<A
                 from_agent: from_agent.clone(),
                 from_pane: from_pane.clone(),
                 from_host: from_host.clone(),
-                held: false,
+                held: to_pane.is_empty(),
             },
         )),
         EventData::MessageReplied {
@@ -259,6 +260,7 @@ pub(super) fn wait_for_reply(
         })));
     }
 
+    let _waiting = event_hub.track_reply_wait(&correlation_id);
     loop {
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();
