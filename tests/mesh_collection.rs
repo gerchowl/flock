@@ -475,7 +475,7 @@ fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
     let fleet = fleet::spawn(
         "mesh-collect-lane",
         &[
-            NodeSpec::new("nodea", "lane-origin", &["nodeb", "nodec"]),
+            NodeSpec::new("nodea", "lane-origin", &["nodeb", "nodec"]).with_push_concurrency(1),
             NodeSpec::new("nodeb", "lane-blocked", &[]),
             NodeSpec::new("nodec", "lane-healthy", &[]),
         ],
@@ -733,7 +733,7 @@ fn many_held_answers_do_not_delay_the_targets_own_outbox_retry() {
         "mesh-held-outbox",
         &[
             NodeSpec::new("nodea", "held-origin", &["nodeb"]),
-            NodeSpec::new("nodeb", "held-target", &["nodec"]),
+            NodeSpec::new("nodeb", "held-target", &["nodec"]).with_push_concurrency(1),
             NodeSpec::new("nodec", "outbox-recipient", &[]),
         ],
     );

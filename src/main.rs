@@ -680,10 +680,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let loaded_config = config::Config::load();
-    exit_if_nested_disabled(&loaded_config.config);
-
     let no_session = args.iter().any(|a| a == "--no-session");
+    let loaded_config = if no_session {
+        config::Config::load_for_server()?
+    } else {
+        config::Config::load()
+    };
+    exit_if_nested_disabled(&loaded_config.config);
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.

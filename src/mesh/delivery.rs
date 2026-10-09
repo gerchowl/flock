@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 /// Maximum concurrent custody pushes and records admitted to one retry batch.
 pub(crate) const PUSH_CONCURRENCY: usize = 4;
 
+pub(crate) fn push_concurrency() -> usize {
+    if cfg!(debug_assertions) {
+        if let Some(limit) = std::env::var("FLOCK_TEST_MESH_PUSH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+        {
+            return limit;
+        }
+    }
+    PUSH_CONCURRENCY
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Deliver {
     pub envelope: Envelope,

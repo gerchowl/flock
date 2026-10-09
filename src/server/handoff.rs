@@ -370,12 +370,7 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    stream.set_write_timeout(Some(READY_TIMEOUT))?;
-    stream.write_all(token.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    let mut stream = connect_import(socket_path, token)?;
 
     match receive_after_token(&mut stream) {
         Ok((manifest, fds)) => Ok(ReceivedHandoff {
@@ -399,6 +394,31 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             Err(err)
         }
     }
+}
+
+#[cfg(unix)]
+fn connect_import(socket_path: &Path, token: &str) -> io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(READY_TIMEOUT))?;
+    stream.set_write_timeout(Some(READY_TIMEOUT))?;
+    stream.write_all(token.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    Ok(stream)
+}
+
+/// Refuse before transferring any PTYs, using the authenticated refusal path
+/// so the old server rolls back with the startup error instead of a timeout.
+#[cfg(unix)]
+pub(crate) fn report_startup_refusal(
+    socket_path: &Path,
+    token: &str,
+    reason: &str,
+) -> io::Result<()> {
+    let mut stream = connect_import(socket_path, token)?;
+    let _manifest = read_line_unbuffered(&mut stream)?;
+    report_import_refusal(&mut stream, reason)
 }
 
 /// Everything after the token write that may fail without the exporter

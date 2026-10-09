@@ -101,8 +101,9 @@ pub(super) fn mint_correlation_id() -> String {
 /// An attested agent is keyed by its id, one attested only as a pane by that
 /// pane. EVERY unattested sender — each relayed message, each socket client
 /// outside a pane — shares one bucket, because `from_agent` is a claim.
-/// Keying on it let a caller mint fresh budget per invented name, or name a real agent and spend its budget for it. One
-/// shared bucket is safe because a spent budget downgrades rather than
+/// Keying on it let a caller mint fresh budget per invented name, or name a
+/// real agent and spend its budget for it. One shared bucket is safe because
+/// a spent budget downgrades rather than
 /// refuses ([`App::apply_blocking_budget`]), so nobody can be silenced by
 /// someone else exhausting it. The key space is therefore bounded by the
 /// panes on this server, plus one.
@@ -3396,18 +3397,18 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_identities_share_one_budget_and_cannot_silence_anyone() {
-        // Every unattested sender shares one bucket: `from_agent` and
-        // `from_host` are claims, so keying on them minted budget per invented
-        // name. Exhausting the shared bucket downgrades; it never refuses.
+        // Every unattested sender shares one bucket: `from_agent` is a claim,
+        // so keying on it minted budget per invented name. Exhausting the
+        // shared bucket downgrades; it never refuses.
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         app.state.config.msg.blocking_per_hour = 1;
         let to = pane_target(&app, 1);
         let blocking = |cid: &str, agent: &str| {
             serde_json::json!({"correlation_id": cid, "intent": "blocking",
-                "from_agent": agent, "from_host": "atlas"})
+                "from_agent": agent})
         };
 
-        // Rotation under a claimed host buys nothing past the first.
+        // Rotating claimed agent ids buys nothing past the first.
         let first = claimed_send(&mut app, &to, blocking("c-1", "agent_x_1"));
         assert!(
             !first.to_string().contains(super::BLOCKING_BUDGET_SPENT),

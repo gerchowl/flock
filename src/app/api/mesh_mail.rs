@@ -650,7 +650,7 @@ impl App {
         }
         let records = with_store(|store| {
             store
-                .retry_ready_limit(now_ms() as i64, crate::mesh::delivery::PUSH_CONCURRENCY)
+                .retry_ready_limit(now_ms() as i64, crate::mesh::delivery::push_concurrency())
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|key| store.get(&key).map_err(|e| e.to_string()))
@@ -726,6 +726,14 @@ mod tests {
 
     #[tokio::test]
     async fn retry_batch_uses_fixed_push_concurrency() {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = std::env::temp_dir().join(format!("flock-retry-shim-{}", std::process::id()));
+        std::fs::create_dir_all(&shim).unwrap();
+        let ssh = shim.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &shim);
         let _store = crate::mesh::runtime_store::TestStore::new();
         let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -789,14 +797,19 @@ mod tests {
             1,
             "the fifth record is not leased by this batch"
         );
-        for _ in 0..4 {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(20), app.event_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            app.handle_internal_event(event);
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !app.message_relays.is_idle() {
+                let event = app.event_rx.recv().await.unwrap();
+                app.handle_internal_event(event);
+            }
+        })
+        .await
+        .unwrap();
         assert!(app.message_relays.is_idle());
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(shim);
     }
 }

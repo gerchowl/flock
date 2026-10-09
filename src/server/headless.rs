@@ -3798,7 +3798,7 @@ pub fn run_server() -> io::Result<()> {
     }
 
     init_logging();
-    let loaded_config = config::Config::load();
+    let loaded_config = config::Config::load_for_server()?;
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
@@ -3869,7 +3869,13 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     crate::mesh::runtime_store::suspend().map_err(io::Error::other)?;
     let import_deadline = crate::server::handoff::start_import_watchdog()?;
     init_logging();
-    let loaded_config = config::Config::load();
+    let loaded_config = match config::Config::load_for_server() {
+        Ok(config) => config,
+        Err(error) => {
+            crate::server::handoff::report_startup_refusal(socket_path, token, &error.to_string())?;
+            return Err(error);
+        }
+    };
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 

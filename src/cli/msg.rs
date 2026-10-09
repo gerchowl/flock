@@ -144,14 +144,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             // noticing is the one worth forcing.
             "--intent" => {
                 let raw = value()?;
-                let (intent, unknown) = MsgIntent::from_wire_relayed(&raw);
-                if unknown {
-                    return Err(format!(
-                        "unknown --intent {raw:?}: expected {}",
-                        intent_spellings()
-                    ));
-                }
-                parsed.intent = intent;
+                parsed.intent = MsgIntent::from_wire(&raw).ok_or_else(|| {
+                    format!("unknown --intent {raw:?}: expected {}", intent_spellings())
+                })?;
                 index += 2;
             }
             "--json" => {

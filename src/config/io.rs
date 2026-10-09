@@ -64,7 +64,23 @@ impl Config {
     /// parse error dropped the WHOLE file to defaults where the live path
     /// keeps every valid section.
     pub fn load() -> LoadedConfig {
-        match load_live_config() {
+        Self::finish_load(load_live_config())
+    }
+
+    /// Server startup must not replace a removed security setting with defaults.
+    /// Other parse/read errors retain the existing diagnostic-and-default policy.
+    pub fn load_for_server() -> std::io::Result<LoadedConfig> {
+        match load_config() {
+            Err(LoadError::Removed(diagnostics)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                diagnostics.join("\n"),
+            )),
+            result => Ok(Self::finish_load(result.map_err(LoadError::diagnostics))),
+        }
+    }
+
+    fn finish_load(result: Result<LoadedConfig, Vec<String>>) -> LoadedConfig {
+        match result {
             Ok(mut loaded) => {
                 // Field-level validation (keybinds, sound files, idle
                 // thresholds) belongs to the startup report; the live path
@@ -141,7 +157,95 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+#[derive(Debug)]
+enum LoadError {
+    Invalid(Vec<String>),
+    Removed(Vec<String>),
+}
+
+impl LoadError {
+    fn diagnostics(self) -> Vec<String> {
+        match self {
+            Self::Invalid(messages) | Self::Removed(messages) => messages,
+        }
+    }
+}
+
+impl From<Vec<String>> for LoadError {
+    fn from(messages: Vec<String>) -> Self {
+        Self::Invalid(messages)
+    }
+}
+
+/// Inspect source keys before merging, retaining file/line information even
+/// when an overlay would replace the removed setting. Malformed TOML still
+/// follows the existing parse-error policy in the normal loader.
+fn reject_removed_keys(content: &str, path: &Path) -> Result<(), LoadError> {
+    let Ok(document) = toml_edit::Document::parse(content) else {
+        return Ok(());
+    };
+    let mut diagnostics = Vec::new();
+    let mut check = |table: &dyn toml_edit::TableLike, section: &str, key: &str| {
+        if let Some(key_token) = table.key(key) {
+            let line = key_token
+                .span()
+                .map(|span| {
+                    content[..span.start]
+                        .bytes()
+                        .filter(|b| *b == b'\n')
+                        .count()
+                        + 1
+                })
+                .unwrap_or(1);
+            diagnostics.push(format!(
+                "{}:{line}: {}",
+                path.display(),
+                removed_key_message(section, key)
+            ));
+        }
+    };
+    if let Some(msg) = document.get("msg").and_then(toml_edit::Item::as_table_like) {
+        for key in REMOVED_MSG_KEYS {
+            check(msg, "msg", key);
+        }
+    }
+    if let Some(peers) = document.get("peers") {
+        if let Some(peers) = peers.as_array_of_tables() {
+            for peer in peers {
+                check(peer, "peers", "summary_command");
+            }
+        } else if let Some(peers) = peers.as_array() {
+            for peer in peers.iter().filter_map(toml_edit::Value::as_inline_table) {
+                check(peer, "peers", "summary_command");
+            }
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(LoadError::Removed(diagnostics))
+    }
+}
+
+const REMOVED_MSG_KEYS: [&str; 3] = [
+    "uplink_timeout_secs",
+    "uplink_heartbeat_secs",
+    "deferral_relay_concurrency",
+];
+
+fn removed_key_message(section: &str, key: &str) -> String {
+    let mut message = format!("{section}.{key} was removed in flk 1.0.0 (mesh); delete this line");
+    if section == "peers" {
+        message.push_str("; peers now always hold a mesh edge");
+    }
+    message
+}
+
 pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
+    load_config().map_err(LoadError::diagnostics)
+}
+
+fn load_config() -> Result<LoadedConfig, LoadError> {
     let path = config_path();
     let base = if path.exists() {
         Some(
@@ -152,6 +256,9 @@ pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
         None
     };
 
+    if let Some(content) = &base {
+        reject_removed_keys(content, &path)?;
+    }
     let overlay_path = config_overlay_path();
     let overlay = if overlay_path.exists() {
         match std::fs::read_to_string(&overlay_path) {
@@ -165,14 +272,18 @@ pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
                     "overlay read error at {}: {err}; keeping base config",
                     overlay_path.display()
                 );
-                return load_with_overlay_diagnostic(base.as_deref(), Some(diagnostic));
+                return load_with_overlay_diagnostic(base.as_deref(), Some(diagnostic))
+                    .map_err(Into::into);
             }
         }
     } else {
         None
     };
 
-    load_with_overlay(base.as_deref(), overlay.as_deref(), &overlay_path)
+    if let Some(content) = &overlay {
+        reject_removed_keys(content, &overlay_path)?;
+    }
+    load_with_overlay(base.as_deref(), overlay.as_deref(), &overlay_path).map_err(Into::into)
 }
 
 /// Load the base config with the user overlay (`config.local.toml`)
@@ -316,22 +427,16 @@ fn load_live_config_from_table(
 ) -> Result<LoadedConfig, Vec<String>> {
     let mut removed = Vec::new();
     if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
-        for key in [
-            "uplink_timeout_secs",
-            "uplink_heartbeat_secs",
-            "deferral_relay_concurrency",
-        ] {
+        for key in REMOVED_MSG_KEYS {
             if msg.contains_key(key) {
-                removed.push(format!(
-                    "msg.{key} was removed in flk 1.0.0 (mesh); delete this line"
-                ));
+                removed.push(removed_key_message("msg", key));
             }
         }
     }
     if let Some(peers) = table.get("peers").and_then(toml::Value::as_array) {
         for peer in peers {
             if peer.get("summary_command").is_some() {
-                removed.push("peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge".to_string());
+                removed.push(removed_key_message("peers", "summary_command"));
             }
         }
     }
@@ -1543,16 +1648,47 @@ mod spoke_config_tests {
         ] {
             std::fs::write(&path, format!("[msg]\n{key}=20\nenabled=false")).unwrap();
             let expected = vec![format!(
-                "msg.{key} was removed in flk 1.0.0 (mesh); delete this line"
+                "{}:2: msg.{key} was removed in flk 1.0.0 (mesh); delete this line",
+                path.display()
             )];
             assert_eq!(super::load_live_config().unwrap_err(), expected);
-            let startup = super::Config::load();
-            assert_eq!(startup.diagnostics, expected);
-            assert!(
-                startup.config.msg.enabled,
-                "failed startup load falls back to defaults"
-            );
+            let refusal = super::Config::load_for_server().unwrap_err();
+            assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(refusal.to_string(), expected[0]);
         }
+        match previous {
+            Some(value) => std::env::set_var(super::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(super::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_key_locations_follow_toml_keys_not_comments_or_values() {
+        let source = "# summary_command is only a comment\npeers = [{ name='nodea', 'summary_command' = 'false' }]\nmsg = { enabled=false, uplink_timeout_secs=1 }\n";
+        let errors = super::reject_removed_keys(source, std::path::Path::new("fixture.toml"))
+            .unwrap_err()
+            .diagnostics();
+        assert_eq!(errors, vec![
+            "fixture.toml:3: msg.uplink_timeout_secs was removed in flk 1.0.0 (mesh); delete this line",
+            "fixture.toml:2: peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge",
+        ]);
+    }
+
+    #[test]
+    fn unrelated_startup_parse_errors_keep_the_existing_defaults_policy() {
+        let _guard = crate::config::test_config_env_guard();
+        let path =
+            std::env::temp_dir().join(format!("flock-config-parse-{}.toml", std::process::id()));
+        let previous = std::env::var_os(super::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(super::CONFIG_PATH_ENV_VAR, &path);
+        std::fs::write(&path, "[msg\n").unwrap();
+        let loaded = super::Config::load_for_server().unwrap();
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("config parse error")));
+        assert!(loaded.config.msg.enabled);
         match previous {
             Some(value) => std::env::set_var(super::CONFIG_PATH_ENV_VAR, value),
             None => std::env::remove_var(super::CONFIG_PATH_ENV_VAR),

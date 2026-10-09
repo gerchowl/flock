@@ -1093,19 +1093,6 @@ impl MsgIntent {
         !matches!(self, Self::Fyi)
     }
 
-    /// Parse a spelling that arrived over the cross-host relay, where the
-    /// sender may run a newer build than this one (ADR-0018 §1). An unknown
-    /// tier is read as `needs_reply`: version skew fails toward the recipient
-    /// hearing about it, never toward silence. The flag is true when that
-    /// degradation happened, so the caller can log it.
-    #[must_use]
-    pub fn from_wire_relayed(value: &str) -> (Self, bool) {
-        match Self::from_wire(value) {
-            Some(intent) => (intent, false),
-            None => (Self::NeedsReply, true),
-        }
-    }
-
     /// Parse a caller-supplied spelling. `needs-reply` is accepted alongside
     /// `needs_reply` because every prose mention of this field hyphenates it,
     /// and refusing the spelling people already write buys nothing.

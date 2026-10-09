@@ -1348,6 +1348,172 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
 }
 
 #[test]
+fn removed_config_key_refuses_startup_without_creating_sockets() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime = base.join("runtime");
+    let config = base.join("config.toml");
+    let overlay = base.join("config.local.toml");
+    let api = runtime.join("flock.sock");
+    let client = runtime.join("client.sock");
+    let env = support::environment::isolated_env(&config_home, &runtime);
+    for (settings, key, line) in [
+        (
+            "[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
+            "msg.uplink_timeout_secs",
+            4,
+        ),
+        (
+            "[msg]\nuplink_heartbeat_secs=1\n",
+            "msg.uplink_heartbeat_secs",
+            2,
+        ),
+        (
+            "[msg]\ndeferral_relay_concurrency=1\n",
+            "msg.deferral_relay_concurrency",
+            2,
+        ),
+        (
+            "[[peers]]\nname='nodea'\nsummary_command='false'\n",
+            "peers.summary_command",
+            3,
+        ),
+    ] {
+        for in_overlay in [false, true] {
+            fs::write(
+                &config,
+                if in_overlay {
+                    "[msg]\nenabled=false\nallow_from=[]\n"
+                } else {
+                    settings
+                },
+            )
+            .unwrap();
+            if in_overlay {
+                fs::write(&overlay, settings).unwrap();
+            }
+            let source = if in_overlay { &overlay } else { &config };
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flk"));
+            command.arg("server");
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
+            {
+                command.env_remove(key);
+            }
+            command
+                .envs(env.iter().cloned())
+                .env("FLOCK_CONFIG_PATH", &config)
+                .env("FLOCK_SOCKET_PATH", &api)
+                .env("FLOCK_CLIENT_SOCKET_PATH", &client)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            support::environment::assert_command_isolated(&command);
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exited = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(exited, "server started on defaults: {stderr}");
+            assert!(!output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "{}:{line}: {key} was removed in flk 1.0.0 (mesh); delete this line",
+                    source.display()
+                )),
+                "{stderr}"
+            );
+            assert!(
+                !api.exists() && !client.exists(),
+                "no public socket may be created"
+            );
+            if in_overlay {
+                fs::remove_file(&overlay).unwrap();
+            }
+        }
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn removed_config_key_during_handoff_rolls_back_with_migration_reason() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let config_home = base.join("config");
+    let runtime = base.join("runtime");
+    let api = runtime.join("flock.sock");
+    let config = base.join("config.toml");
+    fs::write(
+        &config,
+        "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\n",
+    )
+    .unwrap();
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime,
+        &api,
+        &[("FLOCK_CONFIG_PATH", config.to_str().unwrap())],
+    );
+    wait_for_socket(&api, Duration::from_secs(10));
+    register_runtime_dir(&runtime);
+    let created = request(
+        &api,
+        serde_json::json!({"id":"create", "method":"workspace.create", "params":{"cwd":base,"focus":true}}),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    fs::write(
+        &config,
+        "onboarding=false\n[msg]\nenabled=false\nallow_from=[]\nuplink_timeout_secs=1\n",
+    )
+    .unwrap();
+    let failed = request(
+        &api,
+        serde_json::json!({"id":"handoff", "method":"server.live_handoff", "params":{}}),
+    );
+    let message = failed["error"]["message"].as_str().unwrap();
+    assert!(message.contains("handoff import refused:"), "{failed}");
+    assert!(
+        message.contains(&format!(
+            "{}:5: msg.uplink_timeout_secs was removed in flk 1.0.0 (mesh); delete this line",
+            config.display()
+        )),
+        "{failed}"
+    );
+    assert!(
+        spawned.child.try_wait().unwrap().is_none(),
+        "old server remains alive"
+    );
+    wait_for_api(&api, Duration::from_secs(5));
+    let marker = base.join("after-rollback");
+    assert_ok(request(
+        &api,
+        serde_json::json!({"id":"after", "method":"pane.send_input", "params":{"pane_id":pane, "text":format!("printf survived > '{}'", marker.display()), "keys":["Enter"]}}),
+    ));
+    wait_for_file_contains(&marker, "survived", Duration::from_secs(5));
+    let refused = request(
+        &api,
+        serde_json::json!({"id":"policy", "method":"msg.send", "params":{"to":{"type":"pane","pane":pane},"body":"still disabled"}}),
+    );
+    assert_eq!(refused["error"]["code"], "msg_not_allowed", "{refused}");
+    assert_ok(request(
+        &api,
+        serde_json::json!({"id":"stop", "method":"server.stop", "params":{}}),
+    ));
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     let _lock = test_lock();
     let base = unique_test_dir();

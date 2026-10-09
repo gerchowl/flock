@@ -705,6 +705,6 @@ Upgrade the fleet together for mesh transport. Remove these settings and callers
 - `[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`, and `deferral_relay_concurrency`: delete these lines. Custody pushes use a fixed concurrency of four.
 - `[[peers]] summary_command`: delete this line; peers now always hold a mesh edge. Use `relay_command` if the remote executable needs a custom path.
 - `flk msg send --from-host` and the `msg.send` fields `from_host` and `intent_unrecognised`: remote origins come from authenticated mesh envelopes. `--from-agent` remains available for operator tooling.
-- `peers.relay_attach` and the old `msg.uplink_*` methods: use enrolled mesh edges for delivery and collection.
+- The old `msg.uplink_*` methods: use enrolled mesh edges for delivery and collection.
 
-Removed config keys are errors with migration instructions. Cold-start config loading falls back to defaults with diagnostics, as for an invalid file. A live reload fails, surfaces the diagnostic, and keeps the previous configuration and running panes. Unknown future keys still only warn.
+Removed config keys are errors with migration instructions. The server refuses to start and names the file, line, and key to delete. A replacement server reports the refusal to the old server so live handoff rolls back safely. A live reload fails, surfaces the diagnostic, and keeps the previous configuration and running panes. Unknown future keys still only warn.

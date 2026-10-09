@@ -126,7 +126,7 @@ impl super::App {
     }
 
     fn pump_message_relays(&mut self) {
-        let cap = crate::mesh::delivery::PUSH_CONCURRENCY;
+        let cap = crate::mesh::delivery::push_concurrency();
         while self.message_relays.running < cap {
             let Some(work) = self.message_relays.waiting.pop_front() else {
                 break;
