@@ -74,6 +74,7 @@ pub enum Error {
     OriginMismatch,
     LoopDetected,
     HopBudgetExhausted,
+    SchemaRepair(String),
     Migration {
         path: PathBuf,
         version: i64,
@@ -104,7 +105,7 @@ impl Error {
             Self::MailStoreFull => "mail_store_full",
             Self::Paused => "fleet_paused",
             Self::InvalidEnvelope => "invalid_envelope",
-            Self::ConflictingKey => "conflicting_key",
+            Self::ConflictingKey => "message_key_conflict",
             Self::NotFound => "message_not_found",
             Self::InvalidState => "invalid_custody_state",
             Self::NewerSchema { .. } => "mail_store_schema_too_new",
@@ -356,27 +357,6 @@ impl Store<SystemDisk> {
 }
 impl<D: DiskSpace> Store<D> {
     pub fn open_with(path: &Path, wall_ms: i64, limits: Limits, disk: D) -> Result<Self> {
-        let version = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()
-            .and_then(|c| {
-                c.pragma_query_value(None, "user_version", |r| r.get(0))
-                    .ok()
-            })
-            .unwrap_or(0);
-        Self::open_inner(path, wall_ms, limits, disk).map_err(|error| {
-            if matches!(error, Error::NewerSchema { .. }) {
-                error
-            } else {
-                Error::Migration {
-                    path: path.into(),
-                    version,
-                    detail: error.to_string(),
-                }
-            }
-        })
-    }
-
-    fn open_inner(path: &Path, wall_ms: i64, limits: Limits, disk: D) -> Result<Self> {
         if limits.metadata_reserve > limits.logical_bytes || limits.logical_bytes > i64::MAX as u64
         {
             return Err(Error::InvalidEnvelope);
@@ -393,18 +373,24 @@ impl<D: DiskSpace> Store<D> {
             .mode(0o600)
             .open(path)
         {
-            Ok(file) => file.set_permissions(fs::Permissions::from_mode(0o600))?,
+            Ok(file) => {
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    warn_mode_failure(path, &error);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(error) => return Err(error.into()),
         }
-        tighten_mode(parent, 0o700)?;
-        tighten_mode(path, 0o600)?;
+        if let Some(directory) = mode_directory(path) {
+            tighten_mode(directory, 0o700);
+        }
+        tighten_mode(path, 0o600);
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = path.as_os_str().to_os_string();
             sidecar.push(suffix);
             let sidecar = Path::new(&sidecar);
             if sidecar.exists() {
-                tighten_mode(sidecar, 0o600)?;
+                tighten_mode(sidecar, 0o600);
             }
         }
         let mut connection = Connection::open(path)?;
@@ -415,7 +401,18 @@ impl<D: DiskSpace> Store<D> {
             PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=1048576;",
         )?;
-        schema::migrate(&mut connection)?;
+        let version = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        schema::migrate(&mut connection).map_err(|error| {
+            if schema::is_schema_failure(&error) {
+                Error::Migration {
+                    path: path.into(),
+                    version,
+                    detail: error.to_string(),
+                }
+            } else {
+                error
+            }
+        })?;
         connection.execute("INSERT OR IGNORE INTO clock VALUES(1,?1,0,0)", [wall_ms])?;
         fs::File::open(path)?.sync_all()?;
         fs::File::open(parent)?.sync_all()?;
@@ -1110,10 +1107,10 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Retain undecodable bytes for diagnosis, excluding them from delivery and projection.
+    /// Retain undecodable metadata for diagnosis and discard the body to release quota.
     pub fn quarantine(&mut self, key: &MessageKey) -> Result<()> {
         self.connection.execute(
-            "UPDATE envelopes SET state='quarantined' WHERE origin=?1 AND id=?2",
+            "UPDATE envelopes SET state='quarantined',body=X'' WHERE origin=?1 AND id=?2",
             params![key.origin_node, key.message_id],
         )?;
         Ok(())
@@ -1266,11 +1263,29 @@ impl<D: DiskSpace> Store<D> {
 #[cfg(test)]
 mod tests;
 
-fn tighten_mode(path: &Path, mode: u32) -> Result<()> {
-    if fs::metadata(path)?.permissions().mode() & 0o777 & !mode != 0 {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+fn mode_directory(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != Path::new("."))
+}
+
+fn warn_mode_failure(path: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        path = path.display().to_string(),
+        error = error.to_string(),
+        "could not tighten mesh store permissions"
+    );
+}
+
+fn tighten_mode(path: &Path, mode: u32) {
+    let result = (|| -> std::io::Result<()> {
+        if fs::metadata(path)?.permissions().mode() & 0o777 & !mode != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        warn_mode_failure(path, &error);
     }
-    Ok(())
 }
 
 fn fingerprint(envelope: &Envelope) -> Result<Vec<u8>> {

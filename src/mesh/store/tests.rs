@@ -2719,6 +2719,7 @@ fn failed_migration_reports_path_and_hint() {
         )),
         "{error}"
     );
+    assert!(error.contains("missing column envelopes.id"), "{error}");
     assert!(
         error.ends_with("move the file aside to start an empty store (custody in it will be lost)")
     );
@@ -3243,5 +3244,182 @@ fn step1_ack_cannot_finish_answers_or_forwarded_requests() {
         s.collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
             .unwrap();
         assert_eq!(s.get(&e.key).unwrap().unwrap().state, "delivered");
+    }
+}
+
+fn strip_step2_schema(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP INDEX push_ready; DROP INDEX unrouted;
+         ALTER TABLE envelopes DROP COLUMN next_hop;
+         ALTER TABLE envelopes DROP COLUMN hops_left;
+         ALTER TABLE envelopes DROP COLUMN visited;
+         ALTER TABLE envelopes DROP COLUMN kind;
+         ALTER TABLE envelopes DROP COLUMN mailbox_ttl_ms;
+         DROP TABLE agent_owners; DROP TABLE agent_tombstones;
+         PRAGMA user_version=11;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn genuine_v11_backfills_live_mail_and_second_migration_is_read_only() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let rows: Vec<_> = [Admission::Held, Admission::Custody, Admission::Inbox]
+        .into_iter()
+        .map(|admission| {
+            let mail = envelope();
+            s.accept(&mail, 1000, admission, 0).unwrap();
+            (mail, admission)
+        })
+        .collect();
+    strip_step2_schema(&s.connection);
+    drop(s);
+    let mut s = f.open(0);
+    for (mail, admission) in rows {
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.envelope, mail);
+        assert_eq!(row.mailbox_ttl_ms, DAY_MS);
+        assert_eq!(
+            row.remaining_ms,
+            if admission == Admission::Inbox {
+                DAY_MS
+            } else {
+                1000
+            }
+        );
+        assert_eq!(
+            row.next_hop,
+            if admission == Admission::Inbox {
+                ""
+            } else {
+                &mail.return_binding.recipient_node
+            }
+        );
+        assert_eq!(
+            row.state,
+            match admission {
+                Admission::Held => "held",
+                Admission::Custody => "custody",
+                Admission::Inbox => "inbox",
+            }
+        );
+    }
+    let changes = s.connection.total_changes();
+    let wal = fs::read(f.path.with_extension("sqlite-wal")).unwrap();
+    schema::migrate(&mut s.connection).unwrap();
+    assert_eq!(s.connection.total_changes(), changes);
+    assert_eq!(fs::read(f.path.with_extension("sqlite-wal")).unwrap(), wal);
+}
+
+#[test]
+fn stamped_stores_repair_missing_columns_in_each_table() {
+    for version in [11, 12] {
+        let f = Fixture::new();
+        let mut s = f.open(0);
+        let mail = envelope();
+        s.accept(&mail, 1000, Admission::Held, 0).unwrap();
+        if version == 11 {
+            strip_step2_schema(&s.connection);
+        }
+        s.connection
+            .execute_batch(
+                "ALTER TABLE envelopes DROP COLUMN receipt_sent;
+             ALTER TABLE identity_pins DROP COLUMN origin;
+             INSERT INTO identity_pins VALUES('configured','peer.example','node.example',X'42');",
+            )
+            .unwrap();
+        drop(s);
+        let s = f.open(0);
+        assert_eq!(s.get(&mail.key).unwrap().unwrap().envelope, mail);
+        let receipt: Option<String> = s
+            .connection
+            .query_row("SELECT receipt_sent FROM envelopes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(receipt, None);
+        let origin: String = s
+            .connection
+            .query_row("SELECT origin FROM identity_pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(origin, "unknown");
+    }
+}
+
+#[test]
+fn busy_migration_and_transient_open_errors_never_advise_discarding_mail() {
+    let f = Fixture::new();
+    let s = f.open(0);
+    strip_step2_schema(&s.connection);
+    s.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = Store::open_with(&f.path, 0, Limits::default(), f.disk.clone())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, Error::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.code == rusqlite::ErrorCode::DatabaseBusy)
+    );
+    assert_eq!(error.code(), "mail_store_unavailable");
+    assert!(!error.is_permanent());
+    assert!(!error.to_string().contains("move the file aside"));
+    s.connection.execute_batch("ROLLBACK").unwrap();
+    let missing_parent = f.path.join("not-a-directory.sqlite");
+    let error = Store::open_with(&missing_parent, 0, Limits::default(), f.disk.clone())
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), "mail_store_unavailable");
+    assert!(!error.is_permanent());
+    assert!(!error.to_string().contains("move the file aside"));
+}
+
+#[test]
+fn permission_tightening_is_best_effort_and_skips_current_directory() {
+    let f = Fixture::new();
+    tighten_mode(&f.path, 0o600);
+    assert_eq!(mode_directory(Path::new("mail.sqlite")), None);
+    assert_eq!(mode_directory(Path::new("./mail.sqlite")), None);
+    assert_eq!(mode_directory(&f.path), f.path.parent());
+    f.open(0);
+}
+
+#[test]
+fn conflicting_key_keeps_its_public_error_code() {
+    assert_eq!(Error::ConflictingKey.code(), "message_key_conflict");
+    assert!(Error::ConflictingKey.is_permanent());
+}
+
+#[test]
+fn quarantine_discards_bodies_and_releases_quota_including_older_quarantines() {
+    for older in [false, true] {
+        let f = Fixture::new();
+        let limits = Limits {
+            logical_bytes: 10_000,
+            metadata_reserve: 4000,
+            ..Limits::default()
+        };
+        let mut s = f.limited(0, limits);
+        let mut mail = envelope();
+        mail.body = vec![42; 6000];
+        s.accept(&mail, 1000, Admission::Custody, 0).unwrap();
+        let mut next = envelope();
+        next.body = mail.body.clone();
+        assert!(matches!(
+            s.accept(&next, 1000, Admission::Custody, 0),
+            Err(Error::MailStoreFull)
+        ));
+        if older {
+            s.connection
+                .execute("UPDATE envelopes SET state='quarantined'", [])
+                .unwrap();
+            drop(s);
+            s = f.limited(0, limits);
+        } else {
+            s.quarantine(&mail.key).unwrap();
+        }
+        let row = s.get(&mail.key).unwrap().unwrap();
+        assert_eq!(row.state, "quarantined");
+        assert!(row.envelope.body.is_empty());
+        assert_eq!(row.envelope.target_agent, mail.target_agent);
+        s.accept(&next, 1000, Admission::Custody, 0).unwrap();
+        assert_eq!(s.quarantined_count().unwrap(), 1);
     }
 }

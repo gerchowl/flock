@@ -179,11 +179,93 @@ pub(super) fn migrate(connection: &mut Connection) -> Result<()> {
         version = 11;
     }
     if version == 11 {
+        repair_columns(&tx, true)?;
         upgrade(&tx, STEP2)?;
         tx.execute("UPDATE envelopes SET next_hop=recipient_node WHERE next_hop='' AND state IN ('held','custody')", [])?;
     }
-    tx.pragma_update(None, "user_version", VERSION)?;
+    repair_columns(&tx, false)?;
+    tx.execute(
+        "UPDATE envelopes SET body=X'' WHERE state='quarantined' AND length(body)>0",
+        [],
+    )?;
+    if version != VERSION {
+        tx.pragma_update(None, "user_version", VERSION)?;
+    }
     tx.commit()?;
+    Ok(())
+}
+
+/// Only structural migration failures warrant advice to replace the store.
+/// Operational failures (busy, locked, IO, disk full) can recover in place.
+pub(super) fn is_schema_failure(error: &Error) -> bool {
+    match error {
+        Error::SchemaRepair(_) => true,
+        Error::Sql(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+            error.code,
+            rusqlite::ErrorCode::Unknown
+                | rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::ConstraintViolation
+                | rusqlite::ErrorCode::TypeMismatch
+        ),
+        _ => false,
+    }
+}
+
+/// Derive repairs from the same DDL used for fresh stores, including tables
+/// whose columns were added by an in-place edit without a version bump.
+fn repair_columns(connection: &Connection, allow_missing_tables: bool) -> Result<()> {
+    let baseline = Connection::open_in_memory()?;
+    baseline.execute_batch(BASELINE)?;
+    let mut tables =
+        baseline.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+    let tables = tables.query_map([], |row| row.get::<_, String>(0))?;
+    for table in tables {
+        let table = table?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [&table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            if allow_missing_tables {
+                continue;
+            }
+            return Err(Error::SchemaRepair(format!(
+                "missing table {table}: cannot reconstruct durable data"
+            )));
+        }
+        let mut columns = baseline
+            .prepare("SELECT name,type,[notnull],dflt_value,pk FROM pragma_table_info(?1)")?;
+        let columns = columns.query_map([&table], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for column in columns {
+            let (name, kind, required, default, primary_key) = column?;
+            if has_column(connection, &table, &name)? {
+                continue;
+            }
+            if primary_key != 0 || (required && default.is_none()) {
+                return Err(Error::SchemaRepair(format!(
+                    "missing column {table}.{name}: cannot restore a primary key or required value without a baseline default"
+                )));
+            }
+            let nullable = if required { " NOT NULL" } else { "" };
+            let default = default
+                .map(|value| format!(" DEFAULT {value}"))
+                .unwrap_or_default();
+            // Identifiers and defaults come exclusively from the static baseline.
+            connection.execute_batch(&format!(
+                "ALTER TABLE \"{table}\" ADD COLUMN \"{name}\" {kind}{nullable}{default}"
+            ))?;
+        }
+    }
     Ok(())
 }
 

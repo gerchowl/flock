@@ -62,7 +62,7 @@ impl<D: DiskSpace> Store<D> {
         }
         for rowid in bad_rows {
             tx.execute(
-                "UPDATE envelopes SET state='quarantined' WHERE rowid=?1",
+                "UPDATE envelopes SET state='quarantined',body=X'' WHERE rowid=?1",
                 [rowid],
             )?;
         }

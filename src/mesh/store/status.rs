@@ -310,7 +310,7 @@ impl<D: DiskSpace> Store<D> {
         drop(stmt);
         for rowid in bad_rows {
             self.connection.execute(
-                "UPDATE envelopes SET state='quarantined' WHERE rowid=?1",
+                "UPDATE envelopes SET state='quarantined',body=X'' WHERE rowid=?1",
                 [rowid],
             )?;
         }
