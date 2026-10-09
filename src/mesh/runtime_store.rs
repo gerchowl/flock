@@ -152,6 +152,63 @@ pub(crate) fn recovered() {
 }
 
 #[cfg(test)]
+pub(crate) struct TestStore(std::path::PathBuf);
+
+#[cfg(test)]
+impl TestStore {
+    pub(crate) fn new() -> Self {
+        let key = super::key::MessageKey::mint("fixture.example".into(), 0).unwrap();
+        let path = std::env::temp_dir().join(format!("flock-relay-{}", key.message_id));
+        std::fs::create_dir_all(&path).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let store = Store::open(&path.join("mesh-mail.sqlite"), now).unwrap();
+        *writer().lock().unwrap() = Writer {
+            store: Some(store),
+            ..Default::default()
+        };
+        Self(path)
+    }
+
+    pub(crate) fn delivery(&self) -> super::delivery::Deliver {
+        let key = super::key::MessageKey::mint("nodea".into(), 0).unwrap();
+        super::delivery::Deliver {
+            remaining_ms: super::store::CUSTODY_TTL_MS,
+            envelope: super::store::Envelope {
+                return_binding: super::store::ReturnBinding::mint(
+                    key.clone(),
+                    "nodeb".into(),
+                    Vec::new(),
+                )
+                .unwrap(),
+                key,
+                sender: "agent_nodea_sender".into(),
+                target_agent: "agent_nodeb_recipient".into(),
+                target_session: "session".into(),
+                correlation_id: "question".into(),
+                in_reply_to: None,
+                request_key: None,
+                intent: "\"needs_reply\"".into(),
+                body: Vec::new(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStore {
+    fn drop(&mut self) {
+        *writer().lock().unwrap() = Writer {
+            suspended: true,
+            ..Default::default()
+        };
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

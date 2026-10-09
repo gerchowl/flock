@@ -3,6 +3,9 @@ use super::store::Envelope;
 use crate::peers::PeerMessageFailure;
 use serde::{Deserialize, Serialize};
 
+/// Maximum concurrent custody pushes and records admitted to one retry batch.
+pub(crate) const PUSH_CONCURRENCY: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Deliver {
     pub envelope: Envelope,

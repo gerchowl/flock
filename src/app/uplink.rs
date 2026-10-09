@@ -1,11 +1,5 @@
 //! Single-hub relay process binding for mesh and fleet requests.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SettleOnDelivery {
-    pub(crate) pane: String,
-    pub(crate) correlation_id: String,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct Uplink {
     relay: Option<AttachedRelay>,

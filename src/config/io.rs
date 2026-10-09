@@ -314,13 +314,37 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
 fn load_live_config_from_table(
     table: toml::map::Map<String, toml::Value>,
 ) -> Result<LoadedConfig, Vec<String>> {
+    let mut removed = Vec::new();
+    if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
+        for key in [
+            "uplink_timeout_secs",
+            "uplink_heartbeat_secs",
+            "deferral_relay_concurrency",
+        ] {
+            if msg.contains_key(key) {
+                removed.push(format!(
+                    "msg.{key} was removed in flk 1.0.0 (mesh); delete this line"
+                ));
+            }
+        }
+    }
+    if let Some(peers) = table.get("peers").and_then(toml::Value::as_array) {
+        for peer in peers {
+            if peer.get("summary_command").is_some() {
+                removed.push("peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge".to_string());
+            }
+        }
+    }
+    if !removed.is_empty() {
+        return Err(removed);
+    }
     let mut config = Config::default();
     let mut diagnostics = unknown_top_level_section_diagnostics(&table);
     if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
         let known = toml::Value::try_from(super::model::MsgConfig::default())
             .map_err(|err| vec![err.to_string()])?;
         for key in msg.keys().filter(|key| known.get(key.as_str()).is_none()) {
-            diagnostics.push(format!("unknown or obsolete msg.{key} setting ignored"));
+            diagnostics.push(format!("unknown msg.{key} setting ignored"));
         }
     }
 
@@ -1506,15 +1530,56 @@ stale_after_secs = 30
 #[cfg(test)]
 mod spoke_config_tests {
     #[test]
-    fn spoke_custody_obsolete_and_unknown_keys_warn_without_discarding_config() {
-        let loaded = super::load_live_config_from_str("[msg]\nuplink_timeout_secs=20\nuplink_heartbeat_secs=3\nfuture_setting=true\nenabled=false").unwrap();
-        assert!(!loaded.config.msg.enabled);
+    fn removed_msg_keys_fail_startup_with_migration_message() {
+        let _guard = crate::config::test_config_env_guard();
+        let path =
+            std::env::temp_dir().join(format!("flock-removed-config-{}.toml", std::process::id()));
+        let previous = std::env::var_os(super::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(super::CONFIG_PATH_ENV_VAR, &path);
         for key in [
             "uplink_timeout_secs",
             "uplink_heartbeat_secs",
-            "future_setting",
+            "deferral_relay_concurrency",
         ] {
-            assert!(loaded.diagnostics.iter().any(|d| d.contains(key)), "{key}");
+            std::fs::write(&path, format!("[msg]\n{key}=20\nenabled=false")).unwrap();
+            let expected = vec![format!(
+                "msg.{key} was removed in flk 1.0.0 (mesh); delete this line"
+            )];
+            assert_eq!(super::load_live_config().unwrap_err(), expected);
+            let startup = super::Config::load();
+            assert_eq!(startup.diagnostics, expected);
+            assert!(
+                startup.config.msg.enabled,
+                "failed startup load falls back to defaults"
+            );
         }
+        match previous {
+            Some(value) => std::env::set_var(super::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(super::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn summary_command_key_is_rejected() {
+        for command in ["false", "sh -lc 'flk peers summary --json'"] {
+            let diagnostics = super::load_live_config_from_str(&format!(
+                "[[peers]]\nname=\"nodea\"\nsummary_command=\"{command}\"\n"
+            ))
+            .unwrap_err();
+            assert_eq!(diagnostics, vec!["peers.summary_command was removed in flk 1.0.0 (mesh); delete this line; peers now always hold a mesh edge"]);
+        }
+    }
+
+    #[test]
+    fn unknown_future_key_still_only_warns() {
+        let loaded =
+            super::load_live_config_from_str("[msg]\nfuture_setting=true\nenabled=false").unwrap();
+        assert!(!loaded.config.msg.enabled);
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["unknown msg.future_setting setting ignored"]
+        );
+        assert!(loaded.invalid_sections.is_empty());
     }
 }

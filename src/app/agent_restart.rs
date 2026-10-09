@@ -1090,8 +1090,6 @@ impl App {
                 correlation_id: None,
                 in_reply_to: None,
                 from_agent: None,
-                from_host: None,
-                intent_unrecognised: None,
             },
         );
         self.current_api_peer_pid = peer;

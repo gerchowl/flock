@@ -1,13 +1,6 @@
 //! E2E (#380): `flk msg send` must refuse a flag it does not understand
 //! rather than deliver it as the first words of the message body.
 //!
-//! Driven through the compiled binary, not the parser, because the thing this
-//! protects is a binary: the cross-host relay is `flk msg send` invoked over
-//! ssh on the peer that owns the recipient (`send_peer_message`), and the
-//! peer's exit status is the only channel the refusal has. A test that called
-//! the parser directly would assert on the words and not on the exit code the
-//! relay actually classifies.
-//!
 //! No server is needed and none is started: the refusal happens during
 //! parsing, before the socket. `FLOCK_SOCKET_PATH` points at a path that
 //! cannot exist so that anything which *does* get past parsing fails quickly
@@ -120,7 +113,7 @@ fn reply_refuses_unknown_flags_and_honours_the_terminator() {
 }
 
 #[test]
-fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
+fn an_unknown_tier_and_removed_from_host_are_refused() {
     // ADR-0018 §1. Driven through the binary for the reason the rest of this
     // file is: the relay is `flk msg send` on the recipient's host, and its
     // exit status is what the sender classifies.
@@ -144,25 +137,9 @@ fn an_unknown_tier_is_a_typo_by_hand_and_skew_over_the_relay() {
         stderr_of(&typed)
     );
 
-    // The same spelling arriving from a peer (it carries `--from-host`) is a
-    // newer build talking, and must be heard: parsing succeeds, and the
-    // command fails only on the server this test deliberately does not run.
-    let relayed = flk_msg(&[
-        "send",
-        "--agent",
-        "agent_atlas_1",
-        "--from-agent",
-        "agent_hopper_2",
-        "--from-host",
-        "hopper",
-        "--intent",
-        "on_fire",
-        "--",
-        "hello",
-    ]);
-    let stderr = stderr_of(&relayed);
-    assert!(!stderr.contains("unknown --intent"), "{stderr}");
-    assert!(!stderr.contains("usage: flk msg send"), "{stderr}");
+    let removed = flk_msg(&["send", "--from-host", "nodea", "p1", "hello"]);
+    assert_eq!(removed.status.code(), Some(REFUSAL_EXIT));
+    assert!(stderr_of(&removed).contains("unknown option \"--from-host\""));
 
     let blocking = flk_msg(&[
         "send",

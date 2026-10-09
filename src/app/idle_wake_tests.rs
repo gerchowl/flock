@@ -100,13 +100,11 @@ fn send(app: &mut App, pane: &str, correlation: &str, intent: MsgIntent) -> Stri
         id: "req".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent: None,
-            from_host: None,
             to: MessageTarget::Pane { pane: pane.into() },
             body: format!("please look at this: {MARKER}"),
             correlation_id: Some(correlation.into()),
             in_reply_to: None,
             intent,
-            intent_unrecognised: None,
         }),
     })
 }
@@ -675,13 +673,11 @@ async fn a_message_relayed_from_another_host_wakes_the_same_way() {
         id: "req".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent: Some("agent_kiln_far".into()),
-            from_host: Some("kiln".into()),
             to: MessageTarget::Pane { pane: pane.clone() },
             body: format!("from the other host: {MARKER}"),
             correlation_id: Some("relayed-1".into()),
             in_reply_to: None,
             intent: MsgIntent::NeedsReply,
-            intent_unrecognised: None,
         }),
     });
     assert!(response.contains("\"queued\""), "{response}");
