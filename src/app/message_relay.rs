@@ -106,7 +106,6 @@ impl RelaySend {
     pub fn run(self) -> AppEvent {
         let result = if let Some(delivery) = &self.mesh {
             crate::mesh::delivery::send(&self.peer, delivery)
-                .map_err(crate::peers::PeerMessageFailure::Unreachable)
         } else {
             Err(crate::peers::PeerMessageFailure::Refused(
                 "mesh custody required".into(),

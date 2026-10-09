@@ -566,6 +566,20 @@ impl<D: DiskSpace> Store<D> {
     /// dedupe, return bindings and receipts. Transferred is for hubs only:
     /// origins retain custody until final delivery or expiry.
     pub fn finish(&mut self, key: &MessageKey, outcome: Outcome, wall_ms: i64) -> Result<()> {
+        self.finish_with_detail(key, outcome, None, wall_ms)
+    }
+
+    pub fn refuse(&mut self, key: &MessageKey, reason: &str, wall_ms: i64) -> Result<()> {
+        self.finish_with_detail(key, Outcome::Refused, Some(reason), wall_ms)
+    }
+
+    fn finish_with_detail(
+        &mut self,
+        key: &MessageKey,
+        outcome: Outcome,
+        detail: Option<&str>,
+        wall_ms: i64,
+    ) -> Result<()> {
         let now = self.writable(wall_ms)?;
         let tx = self
             .connection
@@ -587,12 +601,14 @@ impl<D: DiskSpace> Store<D> {
         }
         tx.execute(
             "UPDATE envelopes SET state=?3,body=CASE WHEN ?3='read' THEN body ELSE X'' END,outcome_until=?4,
-            delivered=CASE WHEN ?3='delivered' THEN 1 ELSE delivered END WHERE origin=?1 AND id=?2",
+            delivered=CASE WHEN ?3='delivered' THEN 1 ELSE delivered END,
+            collect_error=COALESCE(?5,collect_error) WHERE origin=?1 AND id=?2",
             params![
                 key.origin_node,
                 key.message_id,
                 outcome.name(),
-                now.saturating_add(CUSTODY_TTL_MS)
+                now.saturating_add(CUSTODY_TTL_MS),
+                detail
             ],
         )?;
         if outcome == Outcome::Delivered {

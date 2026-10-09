@@ -338,6 +338,30 @@ impl App {
                 "custody accepted by {}; awaiting delivery",
                 send.peer.name
             )),
+            Err(failure) if !failure.retryable() => {
+                let reason = failure.detail();
+                match with_store(|store| {
+                    store
+                        .refuse(&delivery.envelope.key, reason, now_ms() as i64)
+                        .map_err(|e| e.to_string())
+                }) {
+                    Ok(()) => {
+                        state = "refused";
+                        warnings.push(format!("refused by {}: {reason}", send.peer.name));
+                        self.emit_event(EventEnvelope {
+                            event: EventKind::MessageDelivered,
+                            data: EventData::MessageDelivered {
+                                correlation_id: send.correlation_id.clone(),
+                                delivered: false,
+                                outcome: format!("refused: {reason}"),
+                                delivery_attempts: 0,
+                                latency_ms: 0,
+                            },
+                        });
+                    }
+                    Err(error) => warnings.push(error),
+                }
+            }
             Err(failure) => warnings.push(format!(
                 "queued for {}: {}",
                 send.peer.name,
@@ -402,7 +426,7 @@ impl App {
         }
         self.mailboxes
             .finish_relaying_question(&send.correlation_id);
-        if send.intent.wakes() {
+        if send.intent.wakes() && state != "refused" {
             self.mailboxes
                 .record_relayed_question(send.correlation_id.clone());
         }

@@ -1107,8 +1107,8 @@ pub enum PeerMessageFailure {
     /// The hop itself failed: ssh transport, auth, timeout, or a peer with no
     /// `flk` on its PATH. Retry can succeed.
     Unreachable(String),
-    /// The peer's `flk msg send` ran and rejected the command — or this host
-    /// refused to build one. Terminal: the identical relay is refused again.
+    /// The peer rejected the envelope, or this host refused to build it.
+    /// Terminal: the identical relay is refused again.
     Refused(String),
 }
 
