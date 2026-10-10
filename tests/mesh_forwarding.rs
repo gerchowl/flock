@@ -1025,6 +1025,19 @@ fn refuse_at_hub(fleet: &Fleet, next: &str, correlation: &str, field: &str, valu
     let mut delivery: Value = fleet::wait_until("hub delivery captured", WAIT, || {
         serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()
     });
+    // The shim writes the capture before the hub reads its failure, and the
+    // hub then schedules the retry a minute out. Making the row due before
+    // that would be overwritten, and the replay would never be sent.
+    fleet::wait_until("hub schedules the captured delivery's retry", WAIT, || {
+        let ready: bool = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT retry_at>0 AND lease_until<=retry_at FROM envelopes WHERE correlation=?1",
+                [correlation],
+                |r| r.get(0),
+            )
+            .ok()?;
+        ready.then_some(())
+    });
     delivery[field] = value;
     std::fs::write(
         fleet.base.join(format!("replay-delivery-nodeb-{next}")),
