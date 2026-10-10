@@ -160,6 +160,7 @@ fn collection_migration_preserves_existing_writer_generation_and_custody() {
         .connection
         .execute_batch(
             "DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX routed_receipts;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1088,6 +1089,7 @@ fn version_three_pin_migration_preserves_both_directions_and_allows_local_aliase
              public_key BLOB NOT NULL, PRIMARY KEY(source,peer),
              UNIQUE(source,node_id), UNIQUE(source,public_key));
          DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX routed_receipts;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1263,6 +1265,7 @@ fn version_four_pin_origin_is_unknown_after_migration() {
         ALTER TABLE identity_pins DROP COLUMN origin;
         INSERT INTO identity_pins VALUES ('configured','peer.example','node.example',zeroblob(32));
         DROP INDEX open_collections; DROP INDEX held_recipient;
+        DROP INDEX routed_receipts;
         DROP INDEX collection_token;
         ALTER TABLE envelopes DROP COLUMN collection_token;
         DROP INDEX request_answers;
@@ -1940,7 +1943,7 @@ fn schema_nine_held_answers_migrate_out_of_the_retry_queue() {
         .unwrap();
     store
         .connection
-        .execute_batch("DROP INDEX held_recipient; ALTER TABLE envelopes DROP COLUMN remote_state; ALTER TABLE envelopes DROP COLUMN receipt_sent; DROP TABLE delivery_attempts; DROP TABLE status_signer; DROP INDEX status_correlation; PRAGMA user_version=9;")
+        .execute_batch("DROP INDEX held_recipient; DROP INDEX routed_receipts; ALTER TABLE envelopes DROP COLUMN remote_state; ALTER TABLE envelopes DROP COLUMN receipt_sent; DROP TABLE delivery_attempts; DROP TABLE status_signer; DROP INDEX status_correlation; PRAGMA user_version=9;")
         .unwrap();
     drop(store);
     let mut store = f.open(1);
@@ -3535,7 +3538,8 @@ fn stamped_stores_repair_missing_columns_in_each_table() {
         }
         s.connection
             .execute_batch(
-                "ALTER TABLE envelopes DROP COLUMN receipt_sent;
+                "DROP INDEX routed_receipts;
+             ALTER TABLE envelopes DROP COLUMN receipt_sent;
              ALTER TABLE identity_pins DROP COLUMN origin;
              INSERT INTO identity_pins VALUES('configured','peer.example','node.example',X'42');",
             )
@@ -4368,9 +4372,14 @@ fn late_read_receipts_route_without_starving_fresh_routed_receipts() {
             [],
         )
         .unwrap();
+    // Page until a pass comes back empty, so the count does not lean on the
+    // page size, and the empty pass proves nothing more is owed.
     let mut routed = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..=21 {
         let receipts = store.routed_receipts(DAY_MS + 1).unwrap();
+        if receipts.is_empty() {
+            break;
+        }
         store.receipts_sent(&receipts).unwrap();
         routed.extend(receipts);
     }
@@ -4420,6 +4429,75 @@ fn routed_receipts_carry_expiry_and_retention_to_multihop_origins() {
     let retained = DAY_MS + 1 + CUSTODY_TTL_MS;
     assert_eq!(route(&mut store, retained), ["outcome_retention_elapsed"]);
     assert!(route(&mut store, retained + 1).is_empty());
+}
+
+#[test]
+fn routed_recipient_gone_is_final_past_retention() {
+    let route = |store: &mut Store<Disk>, at: i64| {
+        let receipts = store.routed_receipts(at).unwrap();
+        store.receipts_sent(&receipts).unwrap();
+        receipts.into_iter().map(|r| r.state).collect::<Vec<_>>()
+    };
+    let retained = 1 + CUSTODY_TTL_MS;
+    // Routed before retention ends: nothing more is owed once it does.
+    // Never routed until after: the origin still learns the recipient is
+    // gone, which it accepts over a `transferred` original.
+    for (first, expected) in [(1, ["recipient_gone"]), (retained, ["recipient_gone"])] {
+        let f = Fixture::new();
+        let mut store = f.open(0);
+        store.set_local_node("receiver.example");
+        let mail = envelope();
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                r#"UPDATE envelopes SET visited='["origin.example","hub.example"]',
+                   receipt_sent='delivered'"#,
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .tombstone("recipient", "session", "killed", 1)
+                .unwrap(),
+            std::slice::from_ref(&mail.key)
+        );
+        assert_eq!(route(&mut store, first), expected);
+        assert!(route(&mut store, retained).is_empty());
+        assert!(route(&mut store, retained + 1).is_empty());
+    }
+}
+
+#[test]
+fn routed_receipts_skip_settled_rows_by_index() {
+    for upgraded in [false, true] {
+        let f = Fixture::new();
+        if upgraded {
+            Connection::open(&f.path)
+                .unwrap()
+                .execute_batch(schema::BASE)
+                .unwrap();
+        }
+        let store = f.open(0);
+        let plan: Vec<String> = store
+            .connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                status::routed_receipts_sql()
+            ))
+            .unwrap()
+            .query_map(params!["receiver.example", 0], |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("INDEX routed_receipts")),
+            "{plan:?}"
+        );
+    }
 }
 
 #[test]
