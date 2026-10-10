@@ -3,10 +3,12 @@
 //! The owner never sees a message that a hub refuses or lets expire, so only
 //! the hub can report it. The hub signs an `undeliverable` receipt, a state
 //! no recipient receipt uses, and the origin applies it only while no
-//! recipient outcome is known.
+//! recipient outcome is known. Requests, answers and routed receipts are all
+//! owed one (#902). An `undeliverable` receipt is never owed one itself, so
+//! an outcome that dies in turn ends there instead of bouncing between hubs.
 use super::*;
 
-/// One forwarded message whose custody ended at this hub without transfer.
+/// One forwarded envelope whose custody ended at this hub without transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubOutcome {
     pub key: MessageKey,
@@ -16,6 +18,10 @@ pub struct HubOutcome {
 
 /// The receipt state of a hub-decided outcome.
 pub const UNDELIVERABLE: &str = "undeliverable";
+
+/// How many times a signer routes one receipt before it gives up: the
+/// original and one retry once a hub reports the first undeliverable.
+pub const RECEIPT_ROUTES: i64 = 2;
 
 impl<D: DiskSpace> Store<D> {
     /// Remember why the next hop refused a route, and clear it for rerouting.
@@ -35,9 +41,10 @@ impl<D: DiskSpace> Store<D> {
         Ok(())
     }
 
-    /// Forwarded requests whose custody ended here: refused by this hub or
-    /// downstream without a recipient receipt, or past the custody deadline.
-    /// A row leaves this window once its receipt is in custody.
+    /// Forwarded requests, answers and signed receipts whose custody ended
+    /// here: refused by this hub or downstream without a recipient receipt,
+    /// or past the custody deadline. A row leaves this window once its
+    /// receipt is in custody. A hub outcome never owes one of its own.
     pub fn hub_outcomes(&mut self, wall_ms: i64) -> Result<Vec<HubOutcome>> {
         if self.local_node.is_empty() {
             return Ok(Vec::new());
@@ -47,7 +54,8 @@ impl<D: DiskSpace> Store<D> {
             "SELECT rowid,origin,id,CASE WHEN state='refused' THEN COALESCE(collect_error,'refused')
                 ELSE COALESCE(collect_error,CASE WHEN next_hop='' THEN 'no_route' ELSE 'custody_expired' END) END
              FROM envelopes e WHERE origin!=?1 AND recipient_node NOT IN ('',?1)
-             AND request_origin IS NULL AND kind='message'
+             AND (kind='message' OR (kind='receipt' AND request_origin IS NOT NULL
+                AND correlation NOT LIKE '%:' || ?3))
              AND json_valid(visited) AND json_array_length(visited)>1
              AND receipt_sent IS NULL AND (outcome_until IS NULL OR outcome_until>?2)
              AND (state IN ('refused','expired') OR (state IN ('custody','held') AND custody_deadline<=?2))
@@ -55,7 +63,7 @@ impl<D: DiskSpace> Store<D> {
                 AND r.request_id=e.id AND r.kind='receipt')
              ORDER BY origin,id LIMIT 16",
         )?;
-        let mut rows = stmt.query(params![self.local_node, now])?;
+        let mut rows = stmt.query(params![self.local_node, now, UNDELIVERABLE])?;
         let mut outcomes = Vec::new();
         let mut bad_rows = Vec::new();
         while let Some(row) = rows.next()? {
@@ -136,5 +144,38 @@ impl<D: DiskSpace> Store<D> {
             ],
         )?;
         Ok(ReceiptImport::Applied)
+    }
+
+    /// A hub reported this node's routed `receipt` undeliverable (#902).
+    /// Owe the request's receipt again, so the next routing pass mints a
+    /// fresh one on the current route, unless it already took
+    /// [`RECEIPT_ROUTES`] routes. A request that has since owed a newer
+    /// state needs nothing: that receipt supersedes this one. Returns false
+    /// only when the routes are spent.
+    pub fn retry_receipt(&mut self, receipt: &crate::mesh::collect::Receipt) -> Result<bool> {
+        let routes: i64 = self.connection.query_row(
+            "SELECT count(*) FROM envelopes WHERE origin=?1 AND kind='receipt' AND state=?5
+             AND request_origin=?2 AND request_id=?3 AND correlation=?4",
+            params![
+                self.local_node,
+                receipt.key.origin_node,
+                receipt.key.message_id,
+                format!("receipt:{}:{}", receipt.key.message_id, receipt.state),
+                UNDELIVERABLE
+            ],
+            |row| row.get(0),
+        )?;
+        if routes >= RECEIPT_ROUTES {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "UPDATE envelopes SET receipt_sent=NULL WHERE origin=?1 AND id=?2 AND receipt_sent=?3",
+            params![
+                receipt.key.origin_node,
+                receipt.key.message_id,
+                receipt.state
+            ],
+        )?;
+        Ok(true)
     }
 }

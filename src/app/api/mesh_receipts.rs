@@ -268,6 +268,7 @@ impl App {
                     .map_err(|e| e.to_string())?
                 {
                     if record.envelope.kind == crate::mesh::store::Kind::Receipt
+                        && record.state != crate::mesh::store::UNDELIVERABLE
                         && record.envelope.correlation_id
                             == format!("receipt:{}:{}", receipt.key.message_id, receipt.state)
                         && key.origin_node == origin
@@ -377,7 +378,8 @@ impl App {
 }
 
 impl App {
-    /// A forwarding hub's signed `undeliverable` outcome (#876). The signature
+    /// A forwarding hub's signed `undeliverable` outcome (#876) for a request,
+    /// an answer or a routed receipt this node sent (#902). The signature
     /// authenticates the hub, and the collection token proves it held this
     /// message: only the custody path carries it before the recipient has an
     /// outcome, and any recipient outcome outranks this one. A hub can never
@@ -428,6 +430,19 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?
             {
+                crate::mesh::store::ReceiptImport::Applied
+                    if original.envelope.kind == crate::mesh::store::Kind::Receipt =>
+                {
+                    // A dead receipt is routed once more, then surfaced. Its
+                    // outcome is never answered with another (#902).
+                    let owed = decode_receipt(&original.envelope)?;
+                    if owed.state == crate::mesh::store::UNDELIVERABLE
+                        || !store.retry_receipt(&owed).map_err(|e| e.to_string())?
+                    {
+                        crate::logging::mesh_custody_failed("receipt", "undeliverable");
+                    }
+                    Ok((accepted, true))
+                }
                 crate::mesh::store::ReceiptImport::Applied
                 | crate::mesh::store::ReceiptImport::Duplicate => Ok((accepted, true)),
                 crate::mesh::store::ReceiptImport::OriginalNotReady => {
