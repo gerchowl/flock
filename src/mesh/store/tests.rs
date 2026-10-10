@@ -2053,12 +2053,14 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
         key: mail.key.clone(),
         token: mail.return_binding.collection_token.clone(),
         refusal: None,
+        receipt: None,
     };
     let bad = OutboundAck {
         delivered: true,
         key: other.key.clone(),
         token: other.return_binding.collection_token.clone(),
         refusal: None,
+        receipt: None,
     };
     assert!(store
         .collect_outbound(
@@ -2569,6 +2571,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
         key: mail.key.clone(),
         token,
         refusal: None,
+        receipt: None,
     };
     store
         .collect_outbound(
@@ -2809,6 +2812,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
                 key: mail.key.clone(),
                 token: mail.return_binding.collection_token.clone(),
                 refusal: None,
+                receipt: None,
             })
             .collect(),
         receipts: Vec::new(),
@@ -3017,6 +3021,7 @@ fn ack_from_wrong_neighbor_is_invalid() {
             key: e.key.clone(),
             token: e.return_binding.collection_token.clone(),
             refusal: None,
+            receipt: None,
         }],
         receipts: Vec::new(),
     };
@@ -3431,6 +3436,7 @@ fn step1_ack_cannot_finish_answers_or_forwarded_requests() {
                 key: e.key.clone(),
                 token: e.return_binding.collection_token.clone(),
                 refusal: None,
+                receipt: None,
             }],
             receipts: Vec::new(),
         };
@@ -3828,6 +3834,7 @@ fn outbound_receipts_are_durable_and_acknowledged_individually() {
         key: offered[0].envelope.key.clone(),
         token: offered[0].envelope.return_binding.collection_token.clone(),
         refusal: None,
+        receipt: None,
     };
     assert!(store
         .collect_outbound(
@@ -4408,6 +4415,7 @@ fn delivered_receipt_does_not_acknowledge_a_held_offer() {
             token: mail.return_binding.collection_token.clone(),
             delivered: true,
             refusal: None,
+            receipt: None,
         }],
     };
     assert!(store
@@ -4519,4 +4527,136 @@ fn forwarding_refuses_a_known_return_loop_before_taking_custody() {
         store.get(&mail.key).unwrap().unwrap().envelope.body,
         mail.body
     );
+}
+
+#[test]
+fn refused_receipt_settles_the_origin_with_its_reason_and_read_stays_final() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let refused = envelope();
+    let read = envelope();
+    let gone = envelope();
+    for mail in [&refused, &read, &gone] {
+        store
+            .accept(mail, CUSTODY_TTL_MS, Admission::Custody, 0)
+            .unwrap();
+        store.finish(&mail.key, Outcome::Transferred, 1).unwrap();
+    }
+    let status = |store: &Store<Disk>, mail: &Envelope| {
+        let status = store
+            .status_key(&mail.key, 10, None)
+            .unwrap()
+            .expect("status");
+        (status.state, status.detail)
+    };
+    assert_eq!(status(&store, &refused).0, "custody");
+    assert_eq!(
+        store
+            .import_receipt_with_detail(&refused.key, "refused", Some("msg_not_allowed"))
+            .unwrap(),
+        ReceiptImport::Applied
+    );
+    assert_eq!(
+        status(&store, &refused),
+        ("refused".into(), Some("msg_not_allowed".into()))
+    );
+    assert_eq!(
+        store
+            .import_receipt_with_detail(
+                &gone.key,
+                "recipient_gone",
+                Some("recipient_gone: RecipientGone")
+            )
+            .unwrap(),
+        ReceiptImport::Applied
+    );
+    assert_eq!(status(&store, &gone).0, "recipient_gone");
+    assert_eq!(
+        store.import_receipt(&read.key, "read").unwrap(),
+        ReceiptImport::Applied
+    );
+    // Replays and late outcomes never move a final state and never write.
+    let changes = store.connection.total_changes();
+    for (mail, state) in [
+        (&refused, "refused"),
+        (&refused, "read"),
+        (&refused, "delivered"),
+        (&read, "refused"),
+        (&read, "recipient_gone"),
+        (&gone, "refused"),
+    ] {
+        assert_eq!(
+            store
+                .import_receipt_with_detail(&mail.key, state, Some("late"))
+                .unwrap(),
+            ReceiptImport::Duplicate,
+            "{state}"
+        );
+    }
+    assert_eq!(store.connection.total_changes(), changes);
+    assert_eq!(status(&store, &read), ("read".into(), None));
+    assert_eq!(
+        status(&store, &refused),
+        ("refused".into(), Some("msg_not_allowed".into()))
+    );
+}
+
+#[test]
+fn recipient_signed_refusal_receipt_is_selected_and_routed_toward_the_origin() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    store.set_local_node("hub.example");
+    let original = crate::mesh::sign::tests::signed();
+    let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+    let mut receipt = original.clone();
+    receipt.key = MessageKey::mint(recipient.node_id(), 1000).unwrap();
+    receipt.kind = Kind::Receipt;
+    receipt.request_key = Some(original.key.clone());
+    receipt.correlation_id = format!("receipt:{}:refused", original.key.message_id);
+    receipt.return_binding.request = receipt.key.clone();
+    receipt.return_binding.recipient_node = original.key.origin_node.clone();
+    receipt.body = br#"{"state":"refused","detail":"msg_not_allowed"}"#.to_vec();
+    crate::mesh::sign::seal(&mut receipt, &recipient);
+    let visited = vec![recipient.node_id(), "hub.example".into()];
+    let origin = original.key.origin_node.clone();
+    assert_eq!(
+        store
+            .accept_forward(
+                &receipt,
+                CUSTODY_TTL_MS,
+                7,
+                &visited,
+                &origin,
+                Admission::Custody,
+                1
+            )
+            .unwrap(),
+        Accepted::New
+    );
+    assert_eq!(
+        store
+            .push_ready(2, 10, std::slice::from_ref(&origin))
+            .unwrap(),
+        vec![receipt.key.clone()]
+    );
+    let record = store.get(&receipt.key).unwrap().unwrap();
+    assert_eq!(record.next_hop, origin);
+    assert_eq!(record.visited, visited);
+    // A replay of the same signed receipt is a fingerprint duplicate.
+    let changes = store.connection.total_changes();
+    assert_eq!(
+        store
+            .accept_forward(
+                &receipt,
+                CUSTODY_TTL_MS,
+                7,
+                &visited,
+                &origin,
+                Admission::Custody,
+                3
+            )
+            .unwrap(),
+        Accepted::Duplicate
+    );
+    assert_eq!(store.connection.total_changes(), changes);
 }

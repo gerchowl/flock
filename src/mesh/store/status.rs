@@ -11,9 +11,10 @@ pub struct StatusReference {
 }
 
 /// The receiver-side states a read receipt may carry back to the origin.
-pub(super) const RECEIPT_STATES: [&str; 5] = [
+pub(super) const RECEIPT_STATES: [&str; 6] = [
     "delivered",
     "recipient_gone",
+    "refused",
     "read",
     "expired",
     "outcome_retention_elapsed",
@@ -195,6 +196,17 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn import_receipt(&mut self, key: &MessageKey, state: &str) -> Result<ReceiptImport> {
+        self.import_receipt_with_detail(key, state, None)
+    }
+
+    /// A terminal refusal carries the recipient's reason, shown as the
+    /// sender's status `detail`.
+    pub fn import_receipt_with_detail(
+        &mut self,
+        key: &MessageKey,
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<ReceiptImport> {
         let incoming = RECEIPT_STATES
             .iter()
             .position(|candidate| *candidate == state)
@@ -224,7 +236,7 @@ impl<D: DiskSpace> Store<D> {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(original_state.as_str()))
-            .any(|state| matches!(state, "read" | "recipient_gone" | "expired"))
+            .any(|state| matches!(state, "read" | "recipient_gone" | "refused" | "expired"))
             || (state == "outcome_retention_elapsed"
                 && remote.as_deref().unwrap_or(&original_state) != "delivered")
             || current.is_some_and(|current| current >= incoming)
@@ -244,9 +256,10 @@ impl<D: DiskSpace> Store<D> {
         let changed = self.connection.execute(
             "UPDATE envelopes SET remote_state=?3,delivered=1,
              body=CASE WHEN ?4 AND state IN ('held','transferred') THEN X'' ELSE body END,
-             state=CASE WHEN ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END
+             state=CASE WHEN ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END,
+             collect_error=COALESCE(?5,collect_error)
              WHERE origin=?1 AND id=?2",
-            params![key.origin_node, key.message_id, state, settle],
+            params![key.origin_node, key.message_id, state, settle, detail],
         )?;
         Ok(if changed == 1 {
             ReceiptImport::Applied

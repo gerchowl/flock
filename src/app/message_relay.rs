@@ -52,6 +52,8 @@ pub(crate) struct RelaySend {
 pub(crate) struct RelayCompletion {
     pub send: RelaySend,
     pub result: Result<bool, crate::peers::PeerMessageFailure>,
+    /// The recipient's signed terminal receipt carried by a refusal (#872).
+    pub receipt: Option<crate::mesh::store::Envelope>,
 }
 
 impl MessageRelays {
@@ -93,6 +95,7 @@ impl RelaySend {
             result: Err(crate::peers::PeerMessageFailure::Unreachable(
                 "message relay worker panicked".into(),
             )),
+            receipt: None,
         }));
         RelayWork {
             run: Box::new(move || self.run()),
@@ -101,8 +104,12 @@ impl RelaySend {
     }
 
     pub fn run(self) -> AppEvent {
-        let result = crate::mesh::delivery::send(&self.peer, &self.mesh);
-        AppEvent::MsgRelayCompleted(Box::new(RelayCompletion { send: self, result }))
+        let (result, receipt) = crate::mesh::delivery::send(&self.peer, &self.mesh);
+        AppEvent::MsgRelayCompleted(Box::new(RelayCompletion {
+            send: self,
+            result,
+            receipt,
+        }))
     }
 }
 

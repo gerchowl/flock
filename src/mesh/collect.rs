@@ -100,6 +100,9 @@ pub struct OutboundAck {
     pub refusal: Option<String>,
     #[serde(default = "delivered_by_default")]
     pub delivered: bool,
+    /// The recipient's signed terminal receipt for a refused forward (#872).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Box<crate::mesh::store::Envelope>>,
 }
 
 fn delivered_by_default() -> bool {
@@ -201,6 +204,7 @@ fn decode(raw: &str) -> Result<Batch, String> {
                         key,
                         token,
                         refusal: Some("invalid_envelope".into()),
+                        receipt: None,
                     });
                 }
             }
