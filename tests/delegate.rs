@@ -107,7 +107,8 @@ fn search_path(base: &Path) -> String {
 }
 
 /// The fake harness: records its argv and cwd, dies at once when
-/// `<base>/die` exists, redraws its screen whenever `<base>/screen` changes,
+/// `<base>/die` exists, dies on its first input line when `<base>/die-on-input`
+/// exists, redraws its screen whenever `<base>/screen` changes,
 /// and appends every line typed into its pane to `<base>/typed.log`.
 fn write_fake_opencode(base: &Path) {
     let bin = bin_dir(base);
@@ -139,6 +140,7 @@ pending=
 first=1
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{base}/input.log'
+  if [ -e '{base}/die-on-input' ]; then exit 1; fi
   if [ -e '{base}/ignore-input-ms' ] && [ ! -e '{base}/accept-input' ]; then continue; fi
   if [ -e '{base}/hold-first-enter' ] && [ -z "$pending" ]; then
     pending=$line
@@ -1326,6 +1328,89 @@ fn a11_failed_start_rolls_back() {
             .any(|p| p.ends_with("d1.json")),
         "no registry entry"
     );
+}
+
+/// #817: a harness that exits as the brief arrives is a failed start, never a
+/// submitted round, and the delegate it leaves behind still answers `status`
+/// and `result` as `gone` instead of "not a delegate".
+#[test]
+fn a21_harness_that_dies_at_the_brief_fails_the_start_and_reports_gone() {
+    let server = start_server();
+    operator_workspace(&server);
+    fs::write(server.base.join("die-on-input"), "").unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    let status = exited_within(&mut child, Duration::from_secs(40)).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(4), "stderr {}", stderr(&out));
+    assert_eq!(stdout_json(&out)["outcome"], "gone", "{}", stdout(&out));
+    assert!(
+        !server.base.join("typed.log").exists(),
+        "the harness never took the brief"
+    );
+
+    let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let json = stdout_json(&status);
+    assert_eq!(json["agent_status"], "gone", "{json}");
+    assert_eq!(json["round"], 1, "{json}");
+
+    let result = cli(&server, &["delegate", "result", "d1", "--json"]);
+    assert_eq!(result.status.code(), Some(4), "{}", stderr(&result));
+    assert_eq!(stdout_json(&result)["outcome"], "gone");
+
+    let reaped = cli(&server, &["delegate", "reap", "d1"]);
+    assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
+    let gone = cli(&server, &["delegate", "status", "d1"]);
+    assert_eq!(gone.status.code(), Some(2), "{}", stderr(&gone));
+    assert!(
+        stderr(&gone).contains("not a delegate"),
+        "{}",
+        stderr(&gone)
+    );
+}
+
+/// #817: once a delegate's agent is gone, `send` and `wait` answer `gone`
+/// (exit 4) from its record like `status` and `result`, and `send` types nothing
+/// and leaves the round where it was.
+#[test]
+fn a22_send_and_wait_on_a_gone_delegate_report_gone() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    finish(child);
+    wait_typed(&server, 1);
+    let closed = request(
+        &server,
+        &format!(r#"{{"id":"pc","method":"pane.close","params":{{"pane_id":"{pane}"}}}}"#),
+    );
+    assert!(closed.get("error").is_none(), "{closed}");
+
+    let b2 = brief(&server, "fix.md", "y\n");
+    let sent = cli(
+        &server,
+        &["delegate", "send", "d1", "--brief", &b2, "--json"],
+    );
+    assert_eq!(sent.status.code(), Some(4), "{}", stderr(&sent));
+    let json = stdout_json(&sent);
+    assert_eq!(json["outcome"], "gone", "{json}");
+    assert_eq!(json["round"], 1, "{json}");
+    assert_eq!(typed(&server).len(), 1, "send typed nothing");
+
+    let waited = cli(&server, &["delegate", "wait", "d1", "--json"]);
+    assert_eq!(waited.status.code(), Some(4), "{}", stderr(&waited));
+    assert_eq!(stdout_json(&waited)["outcome"], "gone");
+
+    let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["round"], 1);
 }
 
 /// E12: `status` shows the delegate with a null goal; `result` maps an
