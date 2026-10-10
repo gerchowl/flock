@@ -581,6 +581,25 @@ impl<D: DiskSpace> Store<D> {
         )
     }
 
+    /// Keep the inbound path with inbox admission so routed receipts survive restart.
+    pub fn accept_local_delivery(
+        &mut self,
+        delivery: &crate::mesh::delivery::Deliver,
+        agent: &str,
+        session: &str,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        self.accept_inner(
+            &delivery.envelope,
+            delivery.remaining_ms,
+            Admission::Inbox,
+            wall_ms,
+            false,
+            Some((delivery.hops_left, &delivery.visited, "")),
+            Some((agent, session)),
+        )
+    }
+
     // Admission atomically binds immutable mail, transport state, and collection debt.
     #[allow(clippy::too_many_arguments)]
     fn accept_inner(
@@ -620,8 +639,12 @@ impl<D: DiskSpace> Store<D> {
             + envelope.key.message_id.len() as u64
             + envelope.correlation_id.len() as u64
             + ROW_RESERVE;
-        // Retransmitting an accepted request must not advance the clock or write WAL.
-        if envelope.request_key.is_none() {
+        // Only inbox answers can add collection debt on replay. Requests,
+        // receipts and forwarded answers must not advance the clock or write WAL.
+        if envelope.request_key.is_none()
+            || envelope.kind == Kind::Receipt
+            || admission != Admission::Inbox
+        {
             let prior: Option<Vec<u8>> = self
                 .connection
                 .query_row(
@@ -1210,7 +1233,7 @@ impl<D: DiskSpace> Store<D> {
     fn projection_keys(&self, include_read: bool) -> Result<Vec<MessageKey>> {
         let mut stmt = self
             .connection
-            .prepare("SELECT origin,id FROM envelopes WHERE state='inbox' OR (?1 AND state='read') ORDER BY origin,id")?;
+            .prepare("SELECT origin,id FROM envelopes WHERE kind='message' AND (state='inbox' OR (?1 AND state='read')) ORDER BY origin,id")?;
         let keys = stmt
             .query_map([include_read], |r| {
                 Ok(MessageKey {

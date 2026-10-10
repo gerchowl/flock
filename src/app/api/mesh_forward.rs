@@ -28,7 +28,20 @@ impl NextHop {
 impl App {
     pub(super) fn request_next_hop(&mut self, owner: &str) -> NextHop {
         self.refresh_mesh_routes();
-        let node = self.mesh_routes.table.next_hop(owner).unwrap_or_default();
+        // A live authenticated direct edge already proves reachability to its
+        // owner. Directory discovery can precede the reciprocal topology advert.
+        let node = self
+            .mesh_routes
+            .table
+            .next_hop(owner)
+            .or_else(|| {
+                self.outbound_reply_peer(owner).and_then(|peer| {
+                    let edge = crate::peer_stream::enrollment(&peer);
+                    (edge.state == "pinned" && edge.node_id.as_deref() == Some(owner))
+                        .then(|| owner.to_owned())
+                })
+            })
+            .unwrap_or_default();
         let peer = self
             .outbound_reply_peer(&node)
             .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned");
