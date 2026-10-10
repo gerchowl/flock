@@ -351,6 +351,7 @@ const RECEIPT_STATE_SQL: &str = "CASE
     WHEN state='inbox' AND inbox_deadline IS NOT NULL AND inbox_deadline<=?2 THEN 'expired'
     WHEN state='inbox' THEN 'delivered'
     WHEN state='read' THEN 'read'
+    WHEN state='recipient_gone' THEN 'recipient_gone'
     ELSE 'expired' END";
 
 impl<D: DiskSpace> Store<D> {
@@ -439,30 +440,56 @@ impl<D: DiskSpace> Store<D> {
 }
 
 impl<D: DiskSpace> Store<D> {
-    /// Read only changed, multihop inbox outcomes. Custody is created before marking sent.
+    /// Read only changed, multihop inbox outcomes. Custody is created before
+    /// marking sent. The owed state is [`pending_receipts`]' own, so expiry
+    /// and retention reach a multihop origin too, and a late read still does.
+    ///
+    /// [`pending_receipts`]: Store::pending_receipts
     pub fn routed_receipts(&mut self, wall_ms: i64) -> Result<Vec<crate::mesh::collect::Receipt>> {
         let now = self.clock()?.advance(wall_ms);
-        let keys = self.routing_keys(
-            "SELECT origin,id,rowid FROM envelopes WHERE json_valid(visited) AND json_array_length(visited)>1
-             AND recipient_node=?1 AND custody_deadline>?2
-             AND (state NOT IN ('inbox','read') OR COALESCE(inbox_deadline,custody_deadline)>?2)
-             AND request_origin IS NULL AND kind='message'
-             AND state IN ('inbox','read','recipient_gone')
-             AND receipt_sent IS NOT CASE WHEN state='inbox' THEN 'delivered' ELSE state END
-             ORDER BY origin,id LIMIT 16",
-            params![self.local_node, now],
+        let mut stmt = self.connection.prepare(&format!(
+            "SELECT rowid,origin,id,{RECEIPT_STATE_SQL} FROM envelopes
+             WHERE json_valid(visited) AND json_array_length(visited)>1
+             AND recipient_node=?1 AND request_origin IS NULL AND kind='message'
+             AND state IN ('inbox','read','inbox_expired','recipient_gone')
+             AND receipt_sent IS NOT {RECEIPT_STATE_SQL}
+             ORDER BY origin,id LIMIT 16"
+        ))?;
+        let mut rows = stmt.query(params![self.local_node, now])?;
+        let mut selected = Vec::new();
+        let mut bad_rows = Vec::new();
+        while let Some(row) = rows.next()? {
+            match (
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, String>(3),
+            ) {
+                (Ok(origin_node), Ok(message_id), Ok(state)) => selected.push((
+                    MessageKey {
+                        origin_node,
+                        message_id,
+                    },
+                    state,
+                )),
+                _ => bad_rows.push(row.get::<_, i64>(0)?),
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        quarantine::rows(
+            &self.connection,
+            &bad_rows,
+            &self.path,
+            "invalid routing key",
+            wall_ms,
         )?;
         let mut receipts = Vec::new();
-        for key in keys {
+        for (key, state) in selected {
             if let Some(record) = self.collection_record(&key, wall_ms)? {
                 receipts.push(crate::mesh::collect::Receipt {
                     key,
                     token: record.envelope.return_binding.collection_token,
-                    state: if record.state == "inbox" {
-                        "delivered".into()
-                    } else {
-                        record.state
-                    },
+                    state,
                 });
             }
         }
