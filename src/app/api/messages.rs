@@ -1548,6 +1548,7 @@ impl App {
     /// bare shell prompt. A pull inbox has no such hazards, so what remains is
     /// the one thing still time-based — the TTL sweep.
     pub(crate) fn expire_undeliverable_messages(&mut self) {
+        self.expire_recovery_parked(std::time::Instant::now());
         self.retry_mesh_mail();
         // US-9 (#175 S3 commit 3): fleet pause halts the mailbox clock, so a
         // paused fleet does not quietly age messages out.
@@ -1952,6 +1953,117 @@ mod tests {
         assert!(response.get("error").is_none(), "{response}");
         // The fixture sender has no pane, so the answer waits for its waiter.
         assert_eq!(response["result"]["state"], "held", "{response}");
+    }
+
+    fn park(app: &mut crate::app::App, method: Method) -> std::sync::mpsc::Receiver<String> {
+        let (respond_to, responses) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: Request {
+                id: "parked".into(),
+                method,
+            },
+            respond_to,
+            peer_pid: None,
+        });
+        assert!(responses.try_recv().is_err(), "parked, not answered");
+        responses
+    }
+
+    fn fyi_send(app: &crate::app::App, correlation: &str) -> Method {
+        Method::MsgSend(MsgSendParams {
+            from_agent: None,
+            to: MessageTarget::Pane {
+                pane: pane_target(app, 1),
+            },
+            body: correlation.into(),
+            correlation_id: Some(correlation.into()),
+            in_reply_to: None,
+            intent: MsgIntent::Fyi,
+        })
+    }
+
+    async fn recovered(
+        app: &mut crate::app::App,
+    ) -> Result<Vec<crate::app::RecoveredMessage>, String> {
+        loop {
+            match app.event_rx.recv().await {
+                Some(crate::events::AppEvent::MeshStoreRecovered(result)) => return result,
+                Some(_) => continue,
+                None => panic!("recovery worker dropped its channel"),
+            }
+        }
+    }
+
+    fn answer(responses: &std::sync::mpsc::Receiver<String>) -> serde_json::Value {
+        serde_json::from_str(&responses.try_recv().expect("answered")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn parked_mail_replays_in_arrival_order() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        app.resume_mesh_store(0);
+        let send = fyi_send(&app, "first");
+        let first = park(&mut app, send);
+        let send = fyi_send(&app, "second");
+        let second = park(&mut app, send);
+        let result = recovered(&mut app).await;
+        app.finish_mesh_recovery(result);
+        for responses in [&first, &second] {
+            let response = answer(responses);
+            assert!(response.get("error").is_none(), "{response}");
+        }
+        let pane = pane_target(&app, 1);
+        let order: Vec<_> = read_inbox(&mut app, &pane)
+            .into_iter()
+            .map(|message| message.correlation_id)
+            .collect();
+        assert_eq!(order, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn mail_parked_through_a_failed_recovery_gets_the_store_error() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        app.resume_mesh_store(0);
+        let send = fyi_send(&app, "failed");
+        let parked = park(&mut app, send);
+        let _ = recovered(&mut app).await;
+        app.finish_mesh_recovery(Err("injected recovery failure".into()));
+        let response = answer(&parked);
+        assert_eq!(
+            response["error"]["code"], "mail_store_unavailable",
+            "{response}"
+        );
+    }
+
+    /// A caller whose wait ran out must not have its send replayed later:
+    /// its own retry would then deliver the message twice.
+    #[tokio::test]
+    async fn expired_parked_mail_is_refused_and_never_replayed() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        app.resume_mesh_store(0);
+        let send = fyi_send(&app, "ghost");
+        let parked = park(&mut app, send);
+        app.expire_recovery_parked(std::time::Instant::now());
+        assert!(parked.try_recv().is_err(), "still within its wait");
+        app.expire_recovery_parked(std::time::Instant::now() + crate::app::RECOVERY_PARK_LIMIT);
+        let response = answer(&parked);
+        assert_eq!(
+            response["error"]["code"], "mail_store_unavailable",
+            "{response}"
+        );
+        let result = recovered(&mut app).await;
+        app.finish_mesh_recovery(result);
+        let pane = pane_target(&app, 1);
+        assert!(read_inbox(&mut app, &pane).is_empty());
     }
 
     fn reply_to(app: &mut crate::app::App, correlation: &str, body: &str) -> String {

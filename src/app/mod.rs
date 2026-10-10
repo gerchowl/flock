@@ -135,7 +135,14 @@ struct ParkedApiRequest {
     request: crate::api::schema::Request,
     peer_pid: Option<u32>,
     respond_to: std::sync::mpsc::Sender<String>,
+    deadline: Instant,
 }
+
+/// How long a mail request waits for post-handoff recovery before it is
+/// refused. Well below the CLI's client timeout, so a caller that gives up
+/// never has its request replayed behind its back, and a Stop-hook wake
+/// cannot stall a turn on a slow store reopen.
+pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 
 pub struct App {
     pub state: AppState,
@@ -1128,7 +1135,24 @@ impl App {
             request,
             peer_pid,
             respond_to,
+            deadline: Instant::now() + RECOVERY_PARK_LIMIT,
         });
+    }
+
+    /// Refuse parked requests whose wait ran out. They are dropped, never
+    /// replayed later: the caller already has its answer and may retry.
+    pub(crate) fn expire_recovery_parked(&mut self, now: Instant) {
+        let (expired, waiting) = std::mem::take(&mut self.recovery_parked)
+            .into_iter()
+            .partition(|parked| now >= parked.deadline);
+        self.recovery_parked = waiting;
+        for parked in expired {
+            let _ = parked.respond_to.send(api::responses::encode_error(
+                parked.request.id,
+                "mail_store_unavailable",
+                crate::mesh::runtime_store::RECOVERING_REASON,
+            ));
+        }
     }
 
     /// Answer parked mail requests in arrival order, each with its own caller.
