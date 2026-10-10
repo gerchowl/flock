@@ -78,7 +78,12 @@ jobs:
     # mac leg's zig build of the vendored libghostty-vt, which has no cache
     # entry, plus the serialized suites, on a runner that may be carrying other
     # work.
-    timeout-minutes: 25
+    #
+    # 25 was then reached in turn, on 2026-10-10 (#873). The macOS leg was
+    # cancelled at 25m0s after nextest had finished all 5865 tests (Summary
+    # 1254 s), because the step-2 acceptance suite adds deterministic idle
+    # windows, so 40 gives headroom.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v7
