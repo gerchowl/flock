@@ -282,7 +282,8 @@ fn unrelated_errors_are_preserved() {
 fn delegate_success_has_no_diagnostic_ping() {
     let (output, methods) = run(&["delegate", "status", "fixture"], None, None, false);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(methods, ["agent.get", "agent.get"]);
+    // The screen read asks whether an idle turn left shells running (#911).
+    assert_eq!(methods, ["agent.get", "agent.get", "pane.read"]);
     assert!(output.stderr.is_empty());
 }
 
