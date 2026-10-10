@@ -1153,3 +1153,211 @@ fn no_route_at_a_hub_reaches_the_origin_after_its_own_expiry() {
     hub_outcome(&fleet, "hub-no-route", "no_route at nodeb");
     std::fs::remove_file(capture).unwrap();
 }
+
+/// Wait for the hub's push to the spoke `nodea` to be captured with
+/// `correlation`, then for its retry to be scheduled, so lapsing the row's
+/// custody is not overwritten by the failed attempt (#902).
+fn captured_at_hub(fleet: &Fleet, correlation: &str) -> String {
+    let capture = fleet.base.join("capture-delivery-nodeb-nodea");
+    let key: String = fleet::wait_until("hub delivery captured", WAIT, || {
+        let delivery: Value = serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()?;
+        (delivery["envelope"]["correlation_id"] == correlation)
+            .then(|| {
+                delivery["envelope"]["key"]["message_id"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten()
+    });
+    fleet::wait_until("hub schedules the captured delivery's retry", WAIT, || {
+        let ready: bool = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT retry_at>0 AND lease_until<=retry_at FROM envelopes WHERE id=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .ok()?;
+        ready.then_some(())
+    });
+    let lapsed = db(fleet.node("nodeb"))
+        .execute(
+            "UPDATE envelopes SET custody_deadline=0 WHERE id=?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(lapsed, 1);
+    key
+}
+
+/// The hub's own `undeliverable` outcome for the row `key`, once in custody.
+fn hub_outcome_for(fleet: &Fleet, key: &str) {
+    fleet::wait_until("hub mints its outcome", WAIT, || {
+        let count: i64 = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE kind='receipt' AND request_id=?1
+                 AND correlation LIKE '%:undeliverable'",
+                [key],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (count == 1).then_some(())
+    });
+}
+
+#[test]
+fn answer_that_dies_at_a_hub_is_undeliverable_at_the_replier() {
+    let (fleet, sender, recipient) = setup("hub-answer", HUB);
+    send(&fleet, &sender, &recipient, "hub-answer");
+    read_once(&fleet, &recipient, "hub-answer");
+    // Every receipt has crossed the hub first, so the capture holds the answer.
+    remote_state(&fleet, "hub-answer", "read");
+    let capture = fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, "").unwrap();
+    let response = api(
+        fleet.node("nodec"),
+        "msg.reply",
+        json!({"correlation_id":"hub-answer", "reply_correlation_id":"hub-answer-reply",
+               "body":"lost at the hub"}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    captured_at_hub(&fleet, "hub-answer-reply");
+    let status = fleet::wait_until("hub-signed outcome at the replier", WAIT, || {
+        let response = api(
+            fleet.node("nodec"),
+            "msg.status",
+            json!({"correlation_id":"hub-answer-reply"}),
+        );
+        (response["result"]["state"] == "undeliverable").then_some(response)
+    });
+    assert_eq!(
+        status["result"]["detail"], "custody_expired at nodeb",
+        "{status}"
+    );
+    std::fs::remove_file(capture).unwrap();
+}
+
+#[test]
+fn receipt_that_dies_at_a_hub_is_routed_once_more_and_reaches_the_origin() {
+    let (fleet, sender, recipient) = setup("hub-receipt", HUB);
+    let capture = fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, "").unwrap();
+    send(&fleet, &sender, &recipient, "hub-receipt");
+    let id: String = fleet::wait_until("delivered at the owner", WAIT, || {
+        db(fleet.node("nodec"))
+            .query_row(
+                "SELECT id FROM envelopes WHERE correlation='hub-receipt' AND state='inbox'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    });
+    let receipt = format!("receipt:{id}:delivered");
+    let first = captured_at_hub(&fleet, &receipt);
+    hub_outcome_for(&fleet, &first);
+    std::fs::remove_file(capture).unwrap();
+    remote_state(&fleet, "hub-receipt", "delivered");
+    let states: Vec<String> = {
+        let connection = db(fleet.node("nodec"));
+        let mut stmt = connection
+            .prepare("SELECT state FROM envelopes WHERE correlation=?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map([&receipt], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(states.len(), 2, "{states:?}");
+    assert_eq!(
+        states.iter().filter(|s| *s == "undeliverable").count(),
+        1,
+        "{states:?}"
+    );
+}
+
+#[test]
+fn receipt_that_dies_twice_at_a_hub_is_surfaced_without_bouncing() {
+    let (fleet, sender, recipient) = setup("hub-receipt-twice", HUB);
+    let capture = fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, "").unwrap();
+    send(&fleet, &sender, &recipient, "hub-twice");
+    let id: String = fleet::wait_until("delivered at the owner", WAIT, || {
+        db(fleet.node("nodec"))
+            .query_row(
+                "SELECT id FROM envelopes WHERE correlation='hub-twice' AND state='inbox'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+    });
+    let receipt = format!("receipt:{id}:delivered");
+    let first = captured_at_hub(&fleet, &receipt);
+    hub_outcome_for(&fleet, &first);
+    // The retry is a fresh receipt, captured and lapsed in turn.
+    fleet::wait_until("owner routes the receipt again", WAIT, || {
+        let count: i64 = db(fleet.node("nodec"))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE correlation=?1",
+                [&receipt],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (count == 2).then_some(())
+    });
+    let second = fleet::wait_until("retry captured", WAIT, || {
+        let delivery: Value = serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()?;
+        let key = delivery["envelope"]["key"]["message_id"]
+            .as_str()?
+            .to_owned();
+        (key != first).then_some(key)
+    });
+    assert_eq!(captured_at_hub(&fleet, &receipt), second);
+    hub_outcome_for(&fleet, &second);
+    // The hub's push of its second outcome settles only after the owner has
+    // imported it and decided against a third route.
+    fleet::wait_until("owner imports the second outcome", WAIT, || {
+        let state: String = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT state FROM envelopes WHERE kind='receipt' AND request_id=?1
+                 AND correlation LIKE '%:undeliverable'",
+                [&second],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (!matches!(state.as_str(), "custody" | "held")).then_some(())
+    });
+    let connection = db(fleet.node("nodec"));
+    let states: Vec<String> = {
+        let mut stmt = connection
+            .prepare("SELECT state FROM envelopes WHERE correlation=?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map([&receipt], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(states, ["undeliverable", "undeliverable"]);
+    let owed: Option<String> = connection
+        .query_row(
+            "SELECT receipt_sent FROM envelopes WHERE correlation='hub-twice' AND kind='message'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owed.as_deref(), Some("delivered"), "no third route is owed");
+    let status = api(
+        fleet.node("nodec"),
+        "msg.status",
+        json!({"correlation_id":receipt}),
+    );
+    assert_eq!(status["result"]["state"], "undeliverable", "{status}");
+    // Two outcomes at the hub, and none for an outcome.
+    let outcomes: i64 = db(fleet.node("nodeb"))
+        .query_row(
+            "SELECT count(*) FROM envelopes WHERE correlation LIKE '%:undeliverable'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcomes, 2);
+    std::fs::remove_file(capture).unwrap();
+}
