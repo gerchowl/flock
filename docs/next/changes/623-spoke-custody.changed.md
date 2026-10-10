@@ -1,1 +1,0 @@
-- Persist spoke-originated messages for authenticated hub collection, deduplicate across lost acknowledgements and restarts, and hold replies for push-down after reconnect; refuse forwarding beyond the hub in mesh step 1; mesh wire version 4 replaces version 3, so connected nodes must upgrade together (#623)

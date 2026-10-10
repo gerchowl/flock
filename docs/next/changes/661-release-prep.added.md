@@ -1,1 +1,0 @@
-- Document multi-hop custody for requests, answers and receipts, live routes in peer status, and reply-wait exit codes for refusal, recipient removal and elapsed outcome retention (#661)

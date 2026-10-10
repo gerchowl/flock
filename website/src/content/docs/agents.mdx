@@ -49,6 +49,8 @@ The sidebar rolls state upward.
 
 A blocked agent makes its pane, tab, and workspace look blocked. A working agent makes the workspace look active. A done agent stays visible until you view it.
 
+Codex’s “Giving this request a little extra thought” menu counts as working. It is a non-blocking notice: Codex keeps waiting for the response, and no action is required.
+
 OpenCode provider quota and rate-limit retry screens count as blocked, even while the progress bar animates. `agent get` reports `blocked_reason: "provider_limit"` and `retry_after_ms` while that screen is live. The sidebar and attention notifications show the provider reason and retry time; blocked-alert digests retain those details. Detection returns to working or idle when the provider wait clears; Flock leaves subscription overlays for you to handle.
 
 An unselected tab in the tab strip wears the tint of its own panes, so a blocked agent waiting in a background tab is visible in the strip rather than hidden behind a tab number. The selected tab stays accent — the tint speaks for tabs you are not looking at, and is drawn dimmed so it never shouts over the one you are in. The strip is only drawn for the active workspace, so this tells you about that workspace's tabs and nothing about another workspace's.
@@ -167,6 +169,8 @@ the agent in that target's checkout:
 ```bash
 flk agent start docs --workspace 1 --tab 1-1 -- claude
 ```
+
+Without `--split`, `--workspace` replaces the workspace’s only pane when it is an untouched root shell created by Flock. `--tab` does the same for a lone root shell in that tab. The pane must have been created with the default shell rather than a custom command, and must never have received input; shell startup scripts may still be running. Otherwise the agent opens a new tab, or a sibling workspace under `tab_mode = "workspace"`. An explicit `--split right|down` always requests a split. Replacement preserves the tab and public pane address, and a failed start leaves the shell running. A dry-run placement can differ from the real run if the shell receives input between the two requests.
 
 ## Where a start lands when you named nothing
 

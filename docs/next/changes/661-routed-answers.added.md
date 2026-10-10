@@ -1,1 +1,0 @@
-- Route answers, follow-up replies, and delivery/read/removal receipts back across mesh hops, including when a laptop reconnects through another hub. Pre-upgrade dev-store answers missing their copied collection token are refused as `invalid reply binding` after migration. (#661)
