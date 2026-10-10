@@ -2075,6 +2075,10 @@ impl PaneRuntime {
         self.terminal.detection_ansi()
     }
 
+    pub fn detection_text_and_unfaint(&self) -> (String, String) {
+        self.terminal.detection_text_and_unfaint()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.terminal.recent_text(lines)
     }

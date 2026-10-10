@@ -133,8 +133,8 @@ fn observed(agent: Option<Agent>, before: &str, after: &str, text: &str) -> Opti
     }
     if let Some((before, after)) = agent.and_then(|agent| {
         Some((
-            composer_contents(agent, before)?,
-            composer_contents(agent, after)?,
+            composer_contents(agent, before, before)?,
+            composer_contents(agent, after, after)?,
         ))
     }) {
         if before == after {

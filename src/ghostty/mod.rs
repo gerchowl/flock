@@ -752,8 +752,23 @@ impl Terminal {
         grid_ref_graphemes(&grid_ref)
     }
 
+    pub fn screen_graphemes_and_style(
+        &self,
+        x: u16,
+        y: u32,
+    ) -> Result<(Vec<u32>, CellStyle), Error> {
+        self.graphemes_and_style(ghostty_screen_point(x, y))
+    }
+
     fn viewport_graphemes_and_style(&self, x: u16, y: u32) -> Result<(Vec<u32>, CellStyle), Error> {
-        let grid_ref = self.grid_ref(ghostty_viewport_point(x, y))?;
+        self.graphemes_and_style(ghostty_viewport_point(x, y))
+    }
+
+    fn graphemes_and_style(
+        &self,
+        point: ffi::GhosttyPoint,
+    ) -> Result<(Vec<u32>, CellStyle), Error> {
+        let grid_ref = self.grid_ref(point)?;
         let graphemes = grid_ref_graphemes(&grid_ref)?;
         let mut style = ffi::GhosttyStyle {
             size: mem::size_of::<ffi::GhosttyStyle>(),

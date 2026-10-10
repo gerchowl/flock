@@ -286,6 +286,10 @@ impl TerminalRuntime {
         self.0.detection_ansi()
     }
 
+    pub fn detection_text_and_unfaint(&self) -> (String, String) {
+        self.0.detection_text_and_unfaint()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.0.recent_text(lines)
     }
