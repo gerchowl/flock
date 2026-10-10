@@ -998,6 +998,54 @@ fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
 }
 
 #[test]
+fn direct_message_delivers_before_topology_adverts_arrive() {
+    let fleet = fleet::spawn_with_startup_probe("direct-before-routes", PAIR_AB, |fleet, _| {
+        std::fs::write(fleet.base.join("withhold-route-adverts"), "").unwrap();
+    });
+    let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+    wait_for(
+        "direct recipient discovery before topology exchange",
+        GOSSIP_TIMEOUT,
+        || {
+            let listing = alice.call_tool("flock_agent_list", json!({}));
+            fleet_row(&listing, &bob.agent_id).map(|_| ())
+        },
+    );
+    let enrollment = spoke_api(fleet.node("nodea"), "peers.enrollment", json!({}));
+    assert_eq!(enrollment["result"]["routes"], json!([]));
+    assert!(
+        enrollment["result"]["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["source"] == "configured" && peer["state"] == "pinned"),
+        "{enrollment}"
+    );
+    let sent = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type":"agent", "agent":bob.agent_id},
+            "body":"direct before adverts", "intent":"needs_reply",
+            "correlation_id":"direct-before-routes"
+        }),
+    );
+    assert_eq!(sent["state"], "delivered", "{sent}");
+    assert_eq!(sent["path"], "direct", "{sent}");
+    let read = bob.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["correlation_id"] == "direct-before-routes")
+            .count(),
+        1,
+        "{read}"
+    );
+}
+
+#[test]
 fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
     let (fleet, mut alice, bob) = spoke_pair("h2bad", SPOKE_PAIR);
     let hold = fleet.base.join("hold-outbound-nodeb-nodea");

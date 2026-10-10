@@ -123,6 +123,11 @@ def forward_input():
                     log.write(str(time.monotonic()) + "\n")
             if method == "peers.summary" and (base / f"observe-summary-{source}-{target}").exists():
                 summary_probes.add(request.get("id"))
+            if method == "mesh.routes" and (base / "withhold-route-adverts").exists():
+                emit(json.dumps({"id": request["id"], "error": {
+                    "code": "routes_unavailable", "message": "route exchange withheld by fixture",
+                }}) + "\n")
+                continue
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"
