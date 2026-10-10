@@ -344,14 +344,17 @@ impl<D: DiskSpace> Store<D> {
 }
 
 /// The receipt a receiver owes for one inbox row, in the same precedence as
-/// [`Store::status_key`]. Evaluated in SQL so selection and the sent mark
-/// can never disagree and a row cannot sit unsendable at the window's head.
+/// [`Store::status_key`], except that `recipient_gone` is terminal and wins
+/// over retention: the origin may hold the original as `transferred` and
+/// applies retention only over `delivered`. Evaluated in SQL so selection and
+/// the sent mark can never disagree and a row cannot sit unsendable at the
+/// window's head.
 const RECEIPT_STATE_SQL: &str = "CASE
+    WHEN state='recipient_gone' THEN 'recipient_gone'
     WHEN outcome_until IS NOT NULL AND outcome_until<=?2 THEN 'outcome_retention_elapsed'
     WHEN state='inbox' AND inbox_deadline IS NOT NULL AND inbox_deadline<=?2 THEN 'expired'
     WHEN state='inbox' THEN 'delivered'
     WHEN state='read' THEN 'read'
-    WHEN state='recipient_gone' THEN 'recipient_gone'
     ELSE 'expired' END";
 
 impl<D: DiskSpace> Store<D> {
@@ -443,18 +446,13 @@ impl<D: DiskSpace> Store<D> {
     /// Read only changed, multihop inbox outcomes. Custody is created before
     /// marking sent. The owed state is [`pending_receipts`]' own, so expiry
     /// and retention reach a multihop origin too, and a late read still does.
+    /// Both final receipts settle a row, so the `routed_receipts` index skips
+    /// it and the pass does not rescan every multihop row until GC.
     ///
     /// [`pending_receipts`]: Store::pending_receipts
     pub fn routed_receipts(&mut self, wall_ms: i64) -> Result<Vec<crate::mesh::collect::Receipt>> {
         let now = self.clock()?.advance(wall_ms);
-        let mut stmt = self.connection.prepare(&format!(
-            "SELECT rowid,origin,id,{RECEIPT_STATE_SQL} FROM envelopes
-             WHERE json_valid(visited) AND json_array_length(visited)>1
-             AND recipient_node=?1 AND request_origin IS NULL AND kind='message'
-             AND state IN ('inbox','read','inbox_expired','recipient_gone')
-             AND receipt_sent IS NOT {RECEIPT_STATE_SQL}
-             ORDER BY origin,id LIMIT 16"
-        ))?;
+        let mut stmt = self.connection.prepare(&routed_receipts_sql())?;
         let mut rows = stmt.query(params![self.local_node, now])?;
         let mut selected = Vec::new();
         let mut bad_rows = Vec::new();
@@ -495,4 +493,18 @@ impl<D: DiskSpace> Store<D> {
         }
         Ok(receipts)
     }
+}
+
+/// Settled rows are excluded in the `routed_receipts` partial index's own
+/// words, so the planner can use it.
+pub(super) fn routed_receipts_sql() -> String {
+    format!(
+        "SELECT rowid,origin,id,{RECEIPT_STATE_SQL} FROM envelopes
+         WHERE json_valid(visited) AND json_array_length(visited)>1
+         AND recipient_node=?1 AND request_origin IS NULL AND kind='message'
+         AND state IN ('inbox','read','inbox_expired','recipient_gone')
+         AND receipt_sent IS NOT 'outcome_retention_elapsed' AND receipt_sent IS NOT 'recipient_gone'
+         AND receipt_sent IS NOT {RECEIPT_STATE_SQL}
+         ORDER BY origin,id LIMIT 16"
+    )
 }
