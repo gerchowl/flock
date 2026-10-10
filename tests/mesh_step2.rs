@@ -224,10 +224,55 @@ fn read(node: &Node, pane: &str) -> Value {
 }
 
 fn mail(node: &Node, pane: &str) -> Value {
+    let started = Instant::now();
     fleet::wait_until("inbox delivery", DEADLINE, || {
         let messages = read(node, pane);
+        assert!(
+            started.elapsed() < DEADLINE - Duration::from_secs(1),
+            "no inbox delivery to {} {pane}; custody: {}",
+            node.name,
+            custody(node)
+        );
         (!messages.as_array()?.is_empty()).then_some(messages)
     })
+}
+
+// Every node's rows, so a stalled leg names its sender and its backoff.
+fn custody(node: &Node) -> String {
+    let Some(Ok(entries)) = node.home.parent().map(fs::read_dir) else {
+        return String::new();
+    };
+    let mut nodes: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("home-"))
+        .collect();
+    nodes.sort_by_key(|entry| entry.file_name());
+    nodes
+        .iter()
+        .map(|entry| {
+            let rows = rusqlite::Connection::open(entry.path().join("state/flock-dev/mesh-mail.sqlite"))
+                .and_then(|db| {
+                    db.prepare(
+                        "SELECT correlation,kind,state,next_hop,retry_at,collect_attempts,collect_error FROM envelopes ORDER BY rowid",
+                    )?
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "{}/{}/{} next_hop={} retry_at={} attempts={} error={:?}",
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Option<String>>(6)?
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                });
+            format!("{}: {rows:?}", entry.file_name().to_string_lossy())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn db(node: &Node) -> rusqlite::Connection {
@@ -445,8 +490,9 @@ fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
     let started = Instant::now();
     fleet::wait_until("sender CLI receives routed outcome", DEADLINE, || {
         let output = operator(c.fleet.node("nodea"), &["msg", "status", "question"]);
+        // Terminal no-answer states exit non-zero by design (3 or 4).
         assert!(
-            output.status.success(),
+            matches!(output.status.code(), Some(0 | 3 | 4)),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -650,7 +696,6 @@ fn forged_origin_signature_route_and_token_are_refused() {
 }
 
 #[test]
-#[ignore = "#872"]
 fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
     let specs = [
         fleet::CHAIN_ABC[0].clone(),
@@ -826,7 +871,6 @@ fn closed_edge_withdraws_routes() {
 }
 
 #[test]
-#[ignore = "#872"]
 fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
     let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     // Discover first so the sender retains a genuine owner hint after close.

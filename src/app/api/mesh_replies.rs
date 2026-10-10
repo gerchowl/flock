@@ -165,7 +165,7 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mesh_collect(&mut self, id: String, query: Collect) -> String {
+    pub(super) fn handle_mesh_collect(&mut self, id: String, mut query: Collect) -> String {
         let result = (|| {
             if self.fleet_pause.paused {
                 return Err("fleet_paused".into());
@@ -178,8 +178,12 @@ impl App {
                 )
                 .map(|edge| &edge.enrollment)
                 .filter(|edge| edge.state == "pinned")
-                .and_then(|edge| edge.node_id.as_deref())
+                .and_then(|edge| edge.node_id.clone())
                 .ok_or("mesh edge is not enrolled")?;
+            let origin = origin.as_str();
+            if let Collect::Outbound { outbound } = &mut query {
+                self.take_refusal_receipts(outbound, origin);
+            }
             with_store(|store| {
                 let mut refusals = Vec::new();
                 if let Collect::Outbound { outbound } = &query {
@@ -271,6 +275,51 @@ impl App {
             }
             Err(reason) => encode_error(id, "mesh_collection_refused", reason),
         }
+    }
+
+    /// Take custody of each refusal receipt before its ack can refuse the
+    /// held original. An ack whose receipt cannot be kept is dropped, so the
+    /// original stays held and is offered again.
+    pub(super) fn take_refusal_receipts(
+        &mut self,
+        outbound: &mut crate::mesh::collect::OutboundCollect,
+        downstream: &str,
+    ) {
+        let mut kept = Vec::with_capacity(outbound.ack.len());
+        for ack in std::mem::take(&mut outbound.ack) {
+            let refused = ack
+                .refusal
+                .as_deref()
+                .is_some_and(crate::mesh::delivery::permanent_refusal);
+            if let (true, Some(receipt)) = (refused, ack.receipt.as_deref()) {
+                let record = with_store(|store| {
+                    store
+                        .collection_record(&ack.key, now_ms() as i64)
+                        .map_err(|e| e.to_string())
+                });
+                let original = match record {
+                    Ok(record) => record.filter(|record| {
+                        record.state == "held"
+                            && record.remaining_ms > 0
+                            && record.next_hop == downstream
+                            && record.envelope.return_binding.collection_token == ack.token
+                            && self.node_id.as_deref()
+                                != Some(record.envelope.key.origin_node.as_str())
+                    }),
+                    Err(_) => continue,
+                };
+                if let Some(original) = original {
+                    if self
+                        .forward_refusal_receipt(&original.envelope, receipt, downstream)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+            }
+            kept.push(ack);
+        }
+        outbound.ack = kept;
     }
 
     pub(crate) fn tick_mesh_collections(&mut self) {
