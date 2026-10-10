@@ -333,10 +333,15 @@ thread_local! {
 /// carry no deadline, but the verb's own clock has run out, so each of them
 /// costs at most one cap against a frozen server, as it did before retries.
 fn without_retries<T>(work: impl FnOnce() -> T) -> T {
-    let before = RETRIES.replace(false);
-    let result = work();
-    RETRIES.set(before);
-    result
+    /// Puts the flag back on the way out, unwinding included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RETRIES.set(self.0);
+        }
+    }
+    let _restore = Restore(RETRIES.replace(false));
+    work()
 }
 
 /// `delegate`'s own exit codes.

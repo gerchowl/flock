@@ -57,6 +57,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// retrying forever (#614).
 const UNREACHABLE_LIMIT: Duration = Duration::from_secs(30);
 
+/// How long the wait keeps retrying a server that takes the connection but
+/// never answers in time, measured across back-to-back request timeouts.
+///
+/// Longer than [`UNREACHABLE_LIMIT`] because under load every poll can time
+/// out as `EAGAIN` while the server and the agent are alive, and giving up
+/// after 30 s of that ended waits on live delegates (#910). Still a bound: a
+/// frozen server that holds the socket and never answers must not keep a wait
+/// without `--timeout` going forever (#614).
+const SLOW_LIMIT: Duration = Duration::from_secs(300);
+
 /// `flk agent wait` / `flk wait agent-status` settled exit codes.
 ///
 /// Distinct from the plain-status waits (which keep their historical codes,
@@ -736,12 +746,13 @@ pub(super) fn settled_wait_observed(
         settle_ms,
         timeout_ms,
         UNREACHABLE_LIMIT,
+        SLOW_LIMIT,
         observer,
     )
 }
 
-/// The wait itself, over an injected transport and an injected unreachable
-/// window.
+/// The wait itself, over an injected transport and injected unreachable and
+/// slow windows.
 ///
 /// Both exist for the same reason and follow [`PinnedRequests`]: the loop's
 /// decisions — when to give up on a server, whether a deadline got there first —
@@ -758,6 +769,7 @@ fn settled_core(
     settle_ms: u64,
     timeout_ms: Option<u64>,
     unreachable_window: Duration,
+    slow_window: Duration,
 ) -> std::io::Result<SettledOutcome> {
     settled_core_observed(
         requests,
@@ -767,6 +779,7 @@ fn settled_core(
         settle_ms,
         timeout_ms,
         unreachable_window,
+        slow_window,
         &mut |_| false,
     )
 }
@@ -780,6 +793,7 @@ fn settled_core_observed(
     settle_ms: u64,
     timeout_ms: Option<u64>,
     unreachable_window: Duration,
+    slow_window: Duration,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let now = Instant::now();
@@ -793,7 +807,7 @@ fn settled_core_observed(
         Some(_) => None,
         None => Some(unreachable_window),
     };
-    let mut interrupted = Interrupted::new(window);
+    let mut interrupted = Interrupted::new(window).with_slow_window(slow_window);
 
     let after = match after {
         Some(raw) => match Cursor::parse(raw) {
@@ -909,16 +923,17 @@ fn settled_core_observed(
             // answering entirely would keep a supervisor waiting indefinitely
             // (#614). With one, the deadline is the bound and it keeps that.
             // A poll that timed out on a server that took the connection is a
-            // server too busy to answer in time, not one that is gone: it ends
-            // a run of failures rather than extending it, so an unbounded wait
-            // on a live delegate under load keeps waiting (#910).
-            Err(PinnedFailure::Slow) => {
+            // server too busy to answer in time, so it is held to the longer
+            // slow window rather than the unreachable one: an unbounded wait on
+            // a live delegate under load keeps waiting, and one on a server
+            // that never answers still ends (#910).
+            Err(failure @ (PinnedFailure::Slow | PinnedFailure::Retry)) => {
                 observer(None);
-                interrupted.reached();
-            }
-            Err(PinnedFailure::Retry) => {
-                observer(None);
-                interrupted.note(verb);
+                if failure == PinnedFailure::Slow {
+                    interrupted.note_slow(verb);
+                } else {
+                    interrupted.note(verb);
+                }
                 if let Some(window) = interrupted.spent_window() {
                     return Ok(SettledOutcome::Error(unreachable_reason(window)));
                 }
@@ -983,22 +998,54 @@ enum InitialFailure {
 /// The window is present only when the caller gave no `--timeout`, the one case
 /// where the wait had no bound of its own. `None` here is not "no limit": it is
 /// the deadline doing that job, and the deadline's answer is `124`.
+///
+/// A request timeout (#910) is a failure too, but of a server that is there
+/// and slow, so it is timed against its own, longer window: `slow_since`
+/// marks the first failure of ANY kind in the run, `since` the first one that
+/// could not reach the server. A timeout neither resets nor feeds the
+/// unreachable clock, and only an answer clears either.
 struct Interrupted {
     said: bool,
-    /// When the current run of transport failures began.
+    said_slow: bool,
+    /// When the current run's first unreachable failure happened.
     since: Option<Instant>,
+    /// When the current run of failures of any kind began.
+    slow_since: Option<Instant>,
     /// How long that run may last before the wait gives up, or `None` when a
     /// `--timeout` bounds the wait instead.
     window: Option<Duration>,
+    /// The same for a run that is all timeouts, present exactly when `window`
+    /// is.
+    slow_window: Option<Duration>,
 }
 
 impl Interrupted {
     fn new(window: Option<Duration>) -> Self {
         Self {
             said: false,
+            said_slow: false,
             since: None,
+            slow_since: None,
             window,
+            slow_window: window.map(|_| SLOW_LIMIT),
         }
+    }
+
+    fn with_slow_window(mut self, slow_window: Duration) -> Self {
+        self.slow_window = self.window.map(|_| slow_window);
+        self
+    }
+
+    /// Record one request timeout, and say so the first time.
+    fn note_slow(&mut self, verb: &str) {
+        if self.slow_since.is_none() {
+            self.slow_since = Some(Instant::now());
+        }
+        if self.said_slow {
+            return;
+        }
+        self.said_slow = true;
+        eprintln!("{}", slow_notice(verb, self.slow_window));
     }
 
     /// Record one transport failure, and say so the first time.
@@ -1008,6 +1055,9 @@ impl Interrupted {
         // server that fails every 199 ms would then never reach it.
         if self.since.is_none() {
             self.since = Some(Instant::now());
+        }
+        if self.slow_since.is_none() {
+            self.slow_since = self.since;
         }
         if self.said {
             return;
@@ -1019,6 +1069,7 @@ impl Interrupted {
     /// The server answered: the run of failures is over, latch or no latch.
     fn reached(&mut self) {
         self.since = None;
+        self.slow_since = None;
     }
 
     /// The window, once a run of failures has outlasted it.
@@ -1028,10 +1079,13 @@ impl Interrupted {
     /// retrying. Returning the window rather than a bool is what lets the
     /// message name the one number the notice already printed.
     fn spent_window(&self) -> Option<Duration> {
-        let window = self.window?;
-        self.since
-            .filter(|since| since.elapsed() >= window)
-            .map(|_| window)
+        let spent = |window: Option<Duration>, since: Option<Instant>| {
+            let window = window?;
+            since
+                .filter(|since| since.elapsed() >= window)
+                .map(|_| window)
+        };
+        spent(self.window, self.since).or_else(|| spent(self.slow_window, self.slow_since))
     }
 }
 
@@ -1054,6 +1108,16 @@ fn interrupted_notice(verb: &str, window: Option<Duration>) -> String {
         None => "retrying until the deadline".to_string(),
     };
     format!("{verb}: connection to the server interrupted, {tail}")
+}
+
+/// The notice for a server that takes the connection but does not answer in
+/// time, worded by the bound the same way as [`interrupted_notice`].
+fn slow_notice(verb: &str, window: Option<Duration>) -> String {
+    let tail = match window {
+        Some(window) => format!("retrying for up to {}s", window.as_secs()),
+        None => "retrying until the deadline".to_string(),
+    };
+    format!("{verb}: the server is not answering in time, {tail}")
 }
 
 /// Resolve the target to the record the wait will pin itself to.
@@ -1079,19 +1143,17 @@ fn resolve_initial(
             InitialTarget::Pane(pane_id) => requests.pane_get(pane_id, timeout),
         };
         let value = match reply {
-            // Busy, not gone: see the same arm in the poll loop (#910).
-            Err(Unanswered::Slow) => {
-                interrupted.reached();
-                sleep_bounded(deadline);
-                continue;
-            }
-            Err(Unanswered::Unreachable) => {
+            Err(unanswered) => {
                 // Retried rather than reported: the same live handoff that
                 // interrupts a wait can land between this process starting and
-                // its first request. Bounded by the same window when the caller
+                // its first request. Bounded by the same windows when the caller
                 // set no `--timeout`, so a server that is not there at all does
-                // not leave them waiting in the resolve forever (#614).
-                interrupted.note(verb);
+                // not leave them waiting in the resolve forever (#614), and a
+                // busy one gets the longer slow window (#910).
+                match unanswered {
+                    Unanswered::Slow => interrupted.note_slow(verb),
+                    Unanswered::Unreachable => interrupted.note(verb),
+                }
                 if let Some(window) = interrupted.spent_window() {
                     return Err(InitialFailure::Unreachable(unreachable_reason(window)));
                 }
@@ -2417,6 +2479,20 @@ mod tests {
         timeout_ms: Option<u64>,
         unreachable: Duration,
     ) -> (SettledOutcome, Duration, usize) {
+        wait_over_script_with(replies, settle_ms, timeout_ms, unreachable, TEST_SLOW)
+    }
+
+    /// The slow window the scripted waits get unless a test names its own:
+    /// longer than [`TEST_UNREACHABLE`], as the shipped pair is.
+    const TEST_SLOW: Duration = Duration::from_secs(3);
+
+    fn wait_over_script_with(
+        replies: Vec<Result<serde_json::Value, Unanswered>>,
+        settle_ms: u64,
+        timeout_ms: Option<u64>,
+        unreachable: Duration,
+        slow: Duration,
+    ) -> (SettledOutcome, Duration, usize) {
         let mut requests = Scripted::new(replies, Duration::ZERO);
         let started = Instant::now();
         let outcome = settled_core(
@@ -2427,6 +2503,7 @@ mod tests {
             settle_ms,
             timeout_ms,
             unreachable,
+            slow,
         )
         .expect("the wait core does no io of its own");
         (outcome, started.elapsed(), requests.granted.len())
@@ -2437,15 +2514,40 @@ mod tests {
     const TEST_CEILING: Duration = Duration::from_secs(5);
 
     /// #614, the bug itself. With no `--timeout` and a server that answers one
-    /// `agent.get` and then fails at the transport level, the wait used to retry
-    /// forever — the reported shape was a `delegate wait` a `timeout` wrapper had
-    /// to kill. It ends on the unreachable window instead, as the error outcome
-    /// both wait verbs and the delegate already map to exit 1.
+    /// `agent.get` and then holds the socket and never answers again, every
+    /// request times out and the wait used to retry forever — the reported
+    /// shape was a `delegate wait` a `timeout` wrapper had to kill. It ends on
+    /// the slow window instead (#910 made a timeout its own kind of failure, not
+    /// a free pass), as the error outcome both wait verbs and the delegate
+    /// already map to exit 1.
     #[test]
-    fn a_wait_with_no_timeout_gives_up_on_a_server_that_stays_unreachable() {
+    fn a_wait_with_no_timeout_gives_up_on_a_server_that_never_answers() {
         // One answer, then nothing at all for the rest of the run. The scripted
         // budget is more than the window can spend, so a regression that keeps
         // polling runs out of replies and fails rather than hanging.
+        let mut replies = vec![Ok(working_agent())];
+        replies.extend(vec![Err(Unanswered::Slow); 8]);
+
+        let (outcome, elapsed, asked) =
+            wait_over_script_with(replies, 0, None, TEST_UNREACHABLE, TEST_UNREACHABLE);
+        match outcome {
+            SettledOutcome::Error(reason) => assert_eq!(
+                reason, "server unreachable for 1s; giving up",
+                "the window is named from the limit the wait was given"
+            ),
+            other => panic!("a server that stopped answering is not a settle: {other:?}"),
+        }
+        assert!(
+            asked >= 2,
+            "the retry is kept: giving up takes more than the one request that failed"
+        );
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// The same bound for a server that refuses the connection outright: a run
+    /// of unreachable failures ends on the shorter unreachable window.
+    #[test]
+    fn a_wait_with_no_timeout_gives_up_on_a_server_that_stays_unreachable() {
         let mut replies = vec![Ok(working_agent())];
         replies.extend(vec![Err(Unanswered::Unreachable); 8]);
 
@@ -2466,8 +2568,9 @@ mod tests {
 
     /// #910: a server that takes the connection but answers too slowly is not
     /// unreachable. Under load every 2 s poll timed out as `EAGAIN`, the window
-    /// ran out, and `delegate wait` gave up on a live delegate. Slow requests
-    /// for longer than the window, in both the resolve and the polls, must
+    /// ran out, and `delegate wait` gave up on a live delegate. Runs of slow
+    /// requests longer than the unreachable window but shorter than the slow
+    /// one, in both the resolve and the polls, each ended by an answer, must
     /// leave the wait running until the agent settles.
     #[test]
     fn a_slow_server_outlasting_the_window_is_still_waited_on() {

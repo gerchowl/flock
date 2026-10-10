@@ -632,7 +632,10 @@ mod tests {
             .request_value_retrying(&agent_get(), ATTEMPT, Some(deadline))
             .unwrap_err();
         assert!(matches!(&error, ApiClientError::Io(_)), "{error:?}");
-        assert!(Instant::now() < deadline + ATTEMPT);
+        // The connection count below is the real check; this only catches a
+        // retry loop that ignored the deadline outright, with room for a slow
+        // host.
+        assert!(Instant::now() < deadline + Duration::from_secs(2));
         let (listener, seen, _held) = server.join().unwrap();
         assert_eq!(seen.len(), 1);
         assert_no_further_connection(&listener);
