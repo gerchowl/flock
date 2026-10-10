@@ -726,10 +726,15 @@ impl App {
                     let next =
                         self.request_next_hop(&record.envelope.return_binding.recipient_node);
                     // A node this mail already crossed refuses it as a loop.
-                    // Leave it unrouted until the routes offer another hop (#866).
+                    // Leave it unrouted until the routes offer another hop (#866),
+                    // or the loop outlasts its grace and is reported (#928).
                     if record.visited.contains(&next.node) {
+                        self.mesh_looped
+                            .entry(key)
+                            .or_insert_with(std::time::Instant::now);
                         continue;
                     }
+                    self.mesh_looped.remove(&key);
                     if next.node != record.next_hop {
                         let _ = with_store(|store| {
                             store
@@ -745,6 +750,7 @@ impl App {
                 }
             }
         }
+        self.settle_looped_custody();
         // Leave a worker available for new user sends when a retry edge stalls.
         let cap = crate::mesh::delivery::push_concurrency();
         let limit = self
@@ -843,6 +849,66 @@ impl App {
                 respond_to: None,
             };
             self.enqueue_message_relay(send.into_work());
+        }
+    }
+}
+
+impl App {
+    /// End custody whose only onward route has crossed a visited node for
+    /// the whole grace, so the sender learns now through the hub outcome
+    /// path rather than at the custody deadline (#928). A route that turned
+    /// loop-free meanwhile is taken instead, and a recipient with no route
+    /// at all keeps waiting for one, as before.
+    fn settle_looped_custody(&mut self) {
+        if self.mesh_looped.is_empty() {
+            return;
+        }
+        let grace = crate::mesh::delivery::loop_grace();
+        let due: Vec<MessageKey> = self
+            .mesh_looped
+            .iter()
+            .filter(|(_, since)| since.elapsed() >= grace)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut settled = false;
+        for key in due {
+            self.mesh_looped.remove(&key);
+            let record = with_store(|store| {
+                store
+                    .collection_record(&key, now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            });
+            let Ok(Some(record)) = record else {
+                continue;
+            };
+            if !matches!(record.state.as_str(), "custody" | "held")
+                || !record.next_hop.is_empty()
+                || self.node_id.as_deref() == Some(key.origin_node.as_str())
+            {
+                continue;
+            }
+            let next = self.request_next_hop(&record.envelope.return_binding.recipient_node);
+            if next.node.is_empty() {
+                continue;
+            }
+            if !record.visited.contains(&next.node) {
+                let _ = with_store(|store| {
+                    store
+                        .route_custody(&key, &next.node, next.admission())
+                        .map_err(|e| e.to_string())
+                });
+                self.emit_mesh_wake(&next.node);
+                continue;
+            }
+            settled |= with_store(|store| {
+                store
+                    .refuse(&key, "loop_detected", now_ms() as i64)
+                    .map_err(|e| e.to_string())
+            })
+            .is_ok();
+        }
+        if settled {
+            self.route_mesh_receipts();
         }
     }
 }

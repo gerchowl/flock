@@ -1,7 +1,7 @@
 //! Message identity is server-minted, never a caller correlation id.
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageKey {
     pub origin_node: String,
     pub message_id: String,

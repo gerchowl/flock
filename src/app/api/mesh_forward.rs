@@ -350,6 +350,49 @@ mod tests {
         assert_eq!(next_hop.as_deref(), Some(""), "never offered to the spoke");
     }
     #[tokio::test]
+    async fn hub_reports_custody_whose_only_route_stays_looped_past_the_grace() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        std::env::set_var("FLOCK_TEST_MESH_LOOP_GRACE_MS", "0");
+        let (mut app, delivery) = hub_reachable_only_through_spoke();
+        let hub = app.node_id.clone().unwrap();
+        // Custody taken over an edge that has since gone, so the only route
+        // left leads back through the spoke (#928).
+        with_store(|store| {
+            store
+                .accept_forward(
+                    &delivery.envelope,
+                    delivery.remaining_ms,
+                    delivery.hops_left - 1,
+                    &[delivery.visited[0].clone(), hub.clone()],
+                    "",
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        app.mesh_retry_at = None;
+        app.retry_mesh_mail();
+        std::env::remove_var("FLOCK_TEST_MESH_LOOP_GRACE_MS");
+        assert!(app.mesh_looped.is_empty());
+        with_store(|store| {
+            let row = store.get(&delivery.envelope.key).unwrap().unwrap();
+            assert_eq!(row.state, "refused");
+            assert_eq!(row.next_hop, "", "never offered to the spoke");
+            let receipts = store.by_request_key(&delivery.envelope.key).unwrap();
+            assert_eq!(receipts.len(), 1, "the hub outcome is minted");
+            let mail = store.get(&receipts[0]).unwrap().unwrap().envelope;
+            assert_eq!(mail.key.origin_node, hub);
+            assert_eq!(
+                mail.return_binding.recipient_node,
+                delivery.envelope.key.origin_node
+            );
+            assert!(store.hub_outcomes(now_ms() as i64).unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+    #[tokio::test]
     async fn hop_budget_exhausted_refuses_only_forwarding() {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let mut app = app();
