@@ -359,7 +359,7 @@ impl App {
                 retry = false;
                 if let Err(error) = with_store(|store| {
                     store
-                        .set_next_hop(&delivery.envelope.key, "")
+                        .refuse_route(&delivery.envelope.key, &reason)
                         .map_err(|e| e.to_string())
                 }) {
                     warnings.push(error);

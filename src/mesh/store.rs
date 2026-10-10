@@ -5,11 +5,13 @@
 use super::{clock::Clock, key::MessageKey};
 mod collection;
 pub(crate) mod delivery_attempts;
+mod hub_outcomes;
 mod quarantine;
 mod routing;
 mod schema;
 mod status;
 mod tombstones;
+pub use hub_outcomes::{HubOutcome, UNDELIVERABLE};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

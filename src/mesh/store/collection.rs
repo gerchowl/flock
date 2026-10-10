@@ -427,7 +427,7 @@ impl<D: DiskSpace> Store<D> {
                         reason.split(':').next(),
                         Some("loop_detected" | "hop_budget_exhausted")
                     ) {
-                        self.set_next_hop(&ack.key, "")?;
+                        self.refuse_route(&ack.key, reason)?;
                         continue;
                     }
                     if !crate::mesh::delivery::permanent_refusal(reason) {
