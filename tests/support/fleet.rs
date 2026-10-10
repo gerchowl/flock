@@ -329,6 +329,35 @@ impl Node {
         std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
         response
     }
+
+    /// Type one command line into a shell pane and press Enter.
+    ///
+    /// `pane.send_text` is a paste: while the shell has bracketed paste on
+    /// (bash 5.1+ readline at every prompt, and NixOS `/bin/sh` is bash), a
+    /// newline inside the paste is inserted into the edit buffer rather than
+    /// executed, so the command never runs. Enter is a separate key here,
+    /// sent once the paste is confirmed on screen.
+    pub fn run_in_pane(&self, pane: &str, command: &str) {
+        for (method, params) in [
+            (
+                "pane.send_text",
+                serde_json::json!({"pane_id":pane, "text":command}),
+            ),
+            (
+                "pane.send_input",
+                serde_json::json!({"pane_id":pane, "keys":["Enter"]}),
+            ),
+        ] {
+            let request = serde_json::json!({"id":"run-in-pane", "method":method, "params":params});
+            let response: serde_json::Value =
+                serde_json::from_str(&self.api(&request.to_string())).unwrap();
+            assert!(
+                response.get("error").is_none(),
+                "{} {method}: {response}",
+                self.name
+            );
+        }
+    }
 }
 
 /// Hold mesh message deliveries on one edge while other traffic proceeds.

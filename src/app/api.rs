@@ -1331,6 +1331,11 @@ impl App {
         if let Some((_, pane, _)) = self.pending_agent_submit.take() {
             self.active_submissions.remove(&pane);
         }
+        self.pending_recovery_park = None;
+        if self.waits_for_mesh_recovery(&request.method) {
+            self.pending_recovery_park = Some((request, self.current_api_peer_pid));
+            return String::new();
+        }
 
         if !matches!(
             &request.method,

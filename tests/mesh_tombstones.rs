@@ -279,11 +279,9 @@ fn replacement_in_same_pane(node: &Node, previous: &Value) -> Value {
     assert_eq!(imported["agent_id"], previous["agent_id"]);
     exit_to_shell(node, previous);
     let executable = native_executable(node);
-    api(
-        node,
-        "pane.send_text",
-        json!({"pane_id":previous["pane_id"],
-        "text":format!("exec {}\n", quote(executable.to_str().unwrap()))}),
+    node.run_in_pane(
+        previous["pane_id"].as_str().unwrap(),
+        &format!("exec {}", quote(executable.to_str().unwrap())),
     );
     let replacement = fleet::wait_until("replacement agent", DEADLINE, || {
         let result = raw(node, "agent.get", json!({"target":previous["pane_id"]}));

@@ -777,16 +777,14 @@ fn channel_original_settles_on_reply_custody_multihop() {
     remote_state(&fleet, "channel", "delivered");
     let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
     let output = fleet.node("nodec").home.join("channel-reply.json");
-    let response = api(
-        fleet.node("nodec"),
-        "pane.send_text",
-        json!({
-            "pane_id":recipient["pane_id"],
-            "text":format!("{} msg reply channel 'channel answer' >{}\n",
-                quote(env!("CARGO_BIN_EXE_flk")), quote(output.to_str().unwrap()))
-        }),
+    fleet.node("nodec").run_in_pane(
+        recipient["pane_id"].as_str().unwrap(),
+        &format!(
+            "{} msg reply channel 'channel answer' >{}",
+            quote(env!("CARGO_BIN_EXE_flk")),
+            quote(output.to_str().unwrap())
+        ),
     );
-    assert!(response.get("error").is_none(), "{response}");
     let response: Value = fleet::wait_until("reply from recipient ancestry", WAIT, || {
         serde_json::from_slice(&std::fs::read(&output).ok()?).ok()
     });

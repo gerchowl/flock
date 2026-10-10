@@ -130,6 +130,13 @@ impl PaneClickState {
     }
 }
 
+/// An API request held back until the mesh store finishes recovering.
+struct ParkedApiRequest {
+    request: crate::api::schema::Request,
+    peer_pid: Option<u32>,
+    respond_to: std::sync::mpsc::Sender<String>,
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -159,6 +166,12 @@ pub struct App {
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
+    /// Mail requests that arrived while the recovery worker was still
+    /// rebuilding the inbox projection after a handoff (#887). Answering them
+    /// then would read an empty projection, so they wait for the rebuild.
+    recovery_parked: Vec<ParkedApiRequest>,
+    /// Set by dispatch, taken by `respond_or_park`, which owns the responder.
+    pub(crate) pending_recovery_park: Option<(crate::api::schema::Request, Option<u32>)>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_forward_generation: Option<u64>,
     pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
@@ -956,6 +969,8 @@ impl App {
             pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
+            recovery_parked: Vec::new(),
+            pending_recovery_park: None,
             mesh_enrollment_generation: 0,
             mesh_forward_generation: None,
             mesh_forward_cursor: None,
@@ -1082,6 +1097,49 @@ impl App {
                 self.mesh_store_retry_at = Some(Instant::now() + Duration::from_secs(5));
             }
         }
+        // After a failure too: the store's own error is then the honest answer.
+        self.replay_recovery_parked();
+    }
+
+    /// Whether a request reads the inbox projection or the custody store, both
+    /// of which a replacement server rebuilds asynchronously after handoff.
+    pub(crate) fn waits_for_mesh_recovery(&self, method: &crate::api::schema::Method) -> bool {
+        use crate::api::schema::Method;
+        self.mesh_store_recovering
+            && matches!(
+                method,
+                Method::MsgSend(_)
+                    | Method::MsgReply(_)
+                    | Method::MsgList(_)
+                    | Method::MsgRead(_)
+                    | Method::MsgStatus(_)
+                    | Method::MsgWake(_)
+                    | Method::MsgMute(_)
+            )
+    }
+
+    pub(crate) fn park_until_mesh_recovered(
+        &mut self,
+        request: crate::api::schema::Request,
+        peer_pid: Option<u32>,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        self.recovery_parked.push(ParkedApiRequest {
+            request,
+            peer_pid,
+            respond_to,
+        });
+    }
+
+    /// Answer parked mail requests in arrival order, each with its own caller.
+    fn replay_recovery_parked(&mut self) {
+        let caller = self.current_api_peer_pid;
+        for parked in std::mem::take(&mut self.recovery_parked) {
+            self.current_api_peer_pid = parked.peer_pid;
+            let response = self.handle_api_request_after_internal_events_drained(parked.request);
+            self.respond_or_park(parked.respond_to, response);
+        }
+        self.current_api_peer_pid = caller;
     }
 
     #[cfg(unix)]

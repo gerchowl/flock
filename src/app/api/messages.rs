@@ -1904,6 +1904,56 @@ mod tests {
         assert_eq!(error.error.code, "message_not_found");
     }
 
+    /// #887: a replacement server answers the API while its recovery worker is
+    /// still rebuilding the inbox projection. A reply sent in that window must
+    /// wait for the rebuild, not report the read message as not found.
+    #[tokio::test]
+    async fn a_reply_during_handoff_recovery_waits_for_the_rebuilt_inbox() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        waking_send(&mut app, "question", "question body");
+        let pane = pane_target(&app, 1);
+        assert_eq!(read_inbox(&mut app, &pane).len(), 1);
+
+        let mut replacement = test_app_with_hub(crate::api::EventHub::default());
+        replacement.node_id = app.node_id.clone();
+        replacement.resume_mesh_store(0);
+        let (respond_to, responses) = std::sync::mpsc::channel();
+        replacement.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: Request {
+                id: "reply".into(),
+                method: Method::MsgReply(MsgReplyParams {
+                    correlation_id: "question".into(),
+                    body: "answer body".into(),
+                    reply_correlation_id: None,
+                    intent: MsgIntent::Fyi,
+                }),
+            },
+            respond_to,
+            peer_pid: None,
+        });
+        assert!(
+            responses.try_recv().is_err(),
+            "a reply must not be answered before the inbox is rebuilt"
+        );
+
+        let recovered = loop {
+            match replacement.event_rx.recv().await {
+                Some(crate::events::AppEvent::MeshStoreRecovered(result)) => break result,
+                Some(_) => continue,
+                None => panic!("recovery worker dropped its channel"),
+            }
+        };
+        replacement.finish_mesh_recovery(recovered);
+        let response: serde_json::Value =
+            serde_json::from_str(&responses.try_recv().expect("parked reply answered")).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        // The fixture sender has no pane, so the answer waits for its waiter.
+        assert_eq!(response["result"]["state"], "held", "{response}");
+    }
+
     fn reply_to(app: &mut crate::app::App, correlation: &str, body: &str) -> String {
         app.handle_api_request(Request {
             id: "req".into(),
