@@ -55,7 +55,7 @@ impl<D: DiskSpace> Store<D> {
                 ELSE COALESCE(collect_error,CASE WHEN next_hop='' THEN 'no_route' ELSE 'custody_expired' END) END
              FROM envelopes e WHERE origin!=?1 AND recipient_node NOT IN ('',?1)
              AND (kind='message' OR (kind='receipt' AND request_origin IS NOT NULL
-                AND correlation NOT LIKE '%:' || ?3))
+                AND correlation IS NOT 'receipt:' || request_id || ':' || ?3))
              AND json_valid(visited) AND json_array_length(visited)>1
              AND receipt_sent IS NULL AND (outcome_until IS NULL OR outcome_until>?2)
              AND (state IN ('refused','expired') OR (state IN ('custody','held') AND custody_deadline<=?2))
