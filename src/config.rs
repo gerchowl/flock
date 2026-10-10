@@ -34,6 +34,7 @@ pub use self::{
 };
 
 pub(crate) use self::diagnostics::{file_key_diagnostics, removed_config_warnings};
+pub(crate) use self::model::KeyDiagnosticKind;
 
 pub(crate) use self::io::upsert_top_level_bool;
 

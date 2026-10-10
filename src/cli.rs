@@ -391,19 +391,19 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
     if json {
         let (code, diagnostics) = match &outcome {
             ConfigCheckOutcome::Clean => (0, &[][..]),
-            ConfigCheckOutcome::Warnings(diagnostics) => {
+            ConfigCheckOutcome::Warnings {
+                diagnostics,
+                removed,
+            } => {
+                for diagnostic in removed {
+                    eprintln!("warning: {diagnostic}");
+                }
                 (CONFIG_CHECK_ADVISORY, diagnostics.as_slice())
             }
             ConfigCheckOutcome::DidNotLoad(diagnostics) => {
                 (CONFIG_CHECK_PARSE_FAILURE, diagnostics.as_slice())
             }
         };
-        for diagnostic in diagnostics
-            .iter()
-            .filter(|message| message.contains("was removed (mesh)"))
-        {
-            eprintln!("warning: {diagnostic}");
-        }
         println!(
             "{}",
             serde_json::json!({
@@ -419,7 +419,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
             println!("{}: ok", checked.display());
             Ok(0)
         }
-        ConfigCheckOutcome::Warnings(diagnostics) => {
+        ConfigCheckOutcome::Warnings { diagnostics, .. } => {
             let count = diagnostics.len();
             let noun = if count == 1 { "warning" } else { "warnings" };
             eprintln!("{}: {count} {noun}", checked.display());
@@ -442,8 +442,12 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
 enum ConfigCheckOutcome {
     Clean,
     /// The config loaded; these are advisory. Every diagnostic is carried, not
-    /// the four-line summary the TUI banner shows.
-    Warnings(Vec<String>),
+    /// the four-line summary the TUI banner shows. `removed` repeats the
+    /// removed-key ones, which `--json` also echoes to stderr.
+    Warnings {
+        diagnostics: Vec<String>,
+        removed: Vec<String>,
+    },
     /// The config did not load at all — the session would run on defaults.
     DidNotLoad(Vec<String>),
 }
@@ -451,32 +455,43 @@ enum ConfigCheckOutcome {
 fn config_check_outcome() -> ConfigCheckOutcome {
     match crate::config::load_live_config() {
         Err(diagnostics) => ConfigCheckOutcome::DidNotLoad(diagnostics),
-        Ok(loaded) => {
+        Ok(mut loaded) => {
+            // The source scan names file and line, so it replaces the loader's
+            // warning for every key it found. A key it missed keeps the
+            // loader's, which is how no warning gets lost.
+            let file_keys = crate::config::file_key_diagnostics();
+            loaded.remove_key_diagnostics(|loader| {
+                file_keys
+                    .iter()
+                    .any(|source| source.kind == loader.kind && source.key == loader.key)
+            });
+            let removed = file_keys
+                .iter()
+                .chain(&loaded.key_diagnostics)
+                .filter(|diagnostic| diagnostic.kind == crate::config::KeyDiagnosticKind::Removed)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect();
+            let mut diagnostics: Vec<String> = file_keys
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect();
+            diagnostics.extend(loaded.diagnostics);
             // `load_live_config` reports parse- and section-level problems, but
             // keybind conflicts and deprecation renames only surface once the
             // bindings are actually resolved — and those are the warnings this
             // command mostly exists to catch.
-            let mut diagnostics = crate::config::file_key_diagnostics();
-            diagnostics.extend(
-                loaded
-                    .diagnostics
-                    .into_iter()
-                    .filter(|message| !diagnostics_duplicate_source_key(message)),
-            );
             diagnostics.extend(loaded.config.collect_diagnostics());
 
             if diagnostics.is_empty() {
                 ConfigCheckOutcome::Clean
             } else {
-                ConfigCheckOutcome::Warnings(diagnostics)
+                ConfigCheckOutcome::Warnings {
+                    diagnostics,
+                    removed,
+                }
             }
         }
     }
-}
-
-fn diagnostics_duplicate_source_key(message: &str) -> bool {
-    message.contains("was removed (mesh)")
-        || (message.starts_with("unknown ") && message.ends_with(" setting ignored"))
 }
 
 fn config_edit(args: &[String]) -> std::io::Result<i32> {
@@ -1325,7 +1340,7 @@ mod config_check_tests {
 
         let (outcome, code) = check(&base);
         assert_eq!(code, CONFIG_CHECK_ADVISORY);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected advisory warnings, got {outcome:?}");
         };
         assert!(
@@ -1350,7 +1365,7 @@ mod config_check_tests {
 
         let (outcome, code) = check(&base);
         assert_eq!(code, CONFIG_CHECK_ADVISORY);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected a conflict warning, got {outcome:?}");
         };
         assert!(
@@ -1392,12 +1407,65 @@ mod config_check_tests {
         .unwrap();
 
         let (outcome, _) = check(&base);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected warnings, got {outcome:?}");
         };
         assert!(
             diagnostics.len() > 4,
             "the CLI must not truncate like the banner: {diagnostics:?}"
+        );
+    }
+
+    /// A misplaced `[toast]` is reported once, with the `[ui.toast]` hint and
+    /// its line, not again as an unknown setting (#860).
+    #[test]
+    fn misplaced_toast_section_warns_once() {
+        let dir = unique_dir("flk-config-check-toast");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "onboarding = false\n[toast]\ndelivery = \"flock\"\n").unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
+            panic!("expected one warning, got {outcome:?}");
+        };
+        assert_eq!(
+            diagnostics,
+            vec![format!(
+                "{}:2: unknown config section [toast]; did you mean [ui.toast]? ignoring section",
+                base.display()
+            )]
+        );
+    }
+
+    /// A bad-typed `[msg]` value stopped serde before the unknown key after it,
+    /// and the check dropped the loader's copy of that warning (#860).
+    #[test]
+    fn unknown_msg_key_survives_a_type_error_in_the_same_section() {
+        let dir = unique_dir("flk-config-check-msg-type");
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            "onboarding = false\n[msg]\nenabled = \"yes\"\nfuture_setting = true\n",
+        )
+        .unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
+            panic!("expected warnings, got {outcome:?}");
+        };
+        let unknown: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("msg.future_setting"))
+            .collect();
+        assert_eq!(
+            unknown,
+            vec![&format!(
+                "{}:4: unknown msg.future_setting setting ignored",
+                base.display()
+            )],
+            "{diagnostics:?}"
         );
     }
 
