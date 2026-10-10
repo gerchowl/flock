@@ -138,7 +138,12 @@ impl<D: DiskSpace> Store<D> {
                 state = remote;
             }
         }
-        if error.is_some() && !matches!(state.as_str(), "refused" | "recipient_gone") {
+        if error.is_some()
+            && !matches!(
+                state.as_str(),
+                "refused" | "recipient_gone" | hub_outcomes::UNDELIVERABLE
+            )
+        {
             state = "collect_failed".into();
         }
         let mut reply = None;
@@ -243,9 +248,10 @@ impl<D: DiskSpace> Store<D> {
         {
             return Ok(ReceiptImport::Duplicate);
         }
+        // A hub's undeliverable outcome gives way to the recipient's own.
         if !matches!(
             original_state.as_str(),
-            "delivered" | "held" | "transferred"
+            "delivered" | "held" | "transferred" | hub_outcomes::UNDELIVERABLE
         ) {
             return Ok(ReceiptImport::OriginalNotReady);
         }
@@ -256,8 +262,8 @@ impl<D: DiskSpace> Store<D> {
         let changed = self.connection.execute(
             "UPDATE envelopes SET remote_state=?3,delivered=1,
              body=CASE WHEN ?4 AND state IN ('held','transferred') THEN X'' ELSE body END,
-             state=CASE WHEN ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END,
-             collect_error=COALESCE(?5,collect_error)
+             state=CASE WHEN state='undeliverable' OR ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END,
+             collect_error=CASE WHEN state='undeliverable' THEN ?5 ELSE COALESCE(?5,collect_error) END
              WHERE origin=?1 AND id=?2",
             params![key.origin_node, key.message_id, state, settle, detail],
         )?;

@@ -41,6 +41,8 @@ pub(crate) enum Answer {
     RecipientGone,
     /// The receiver refused custody; the reason, when it gave one.
     Refused(Option<String>),
+    /// A forwarding hub could not deliver it; the hub's reason (#876).
+    Undeliverable(Option<String>),
 }
 
 impl Answer {
@@ -52,6 +54,7 @@ impl Answer {
             Self::RetentionElapsed => "outcome_retention_elapsed",
             Self::RecipientGone => "recipient_gone",
             Self::Refused(_) => "refused",
+            Self::Undeliverable(_) => "undeliverable",
         }
     }
 
@@ -64,13 +67,17 @@ impl Answer {
         match self {
             Self::Replied(_) => 3,
             Self::Deferred(_) => 2,
-            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => 1,
+            Self::Expired
+            | Self::RetentionElapsed
+            | Self::RecipientGone
+            | Self::Refused(_)
+            | Self::Undeliverable(_) => 1,
         }
     }
 
     fn detail(&self) -> Option<String> {
         match self {
-            Self::Refused(reason) => reason.clone(),
+            Self::Refused(reason) | Self::Undeliverable(reason) => reason.clone(),
             _ => None,
         }
     }
@@ -78,7 +85,11 @@ impl Answer {
     pub(crate) fn into_reply(self) -> Option<MsgReplyInfo> {
         match self {
             Self::Replied(reply) | Self::Deferred(reply) => Some(reply),
-            Self::Expired | Self::RetentionElapsed | Self::RecipientGone | Self::Refused(_) => None,
+            Self::Expired
+            | Self::RetentionElapsed
+            | Self::RecipientGone
+            | Self::Refused(_)
+            | Self::Undeliverable(_) => None,
         }
     }
 }
@@ -215,6 +226,7 @@ impl Watch {
                     "outcome_retention_elapsed" => Some(Answer::RetentionElapsed),
                     "recipient_gone" => Some(Answer::RecipientGone),
                     "refused" => Some(Answer::Refused(status.detail.clone())),
+                    "undeliverable" => Some(Answer::Undeliverable(status.detail.clone())),
                     _ => None,
                 });
             // Merge by rank, as `observe` does: a local answer the mesh
