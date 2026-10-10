@@ -171,17 +171,24 @@ impl App {
                     path: None,
                 },
             ),
-            Err(reason) => encode_error(
-                id,
-                if reason == "origin_mismatch" {
+            Err(reason) => {
+                let code = if reason == "origin_mismatch" {
                     "origin_mismatch"
                 } else if reason == super::mesh_replies::UNAVAILABLE {
                     "reply_unavailable"
                 } else {
                     "mesh_delivery_refused"
-                },
-                reason,
-            ),
+                };
+                match self.refusal_receipt(&delivery, &reason) {
+                    Some(receipt) => super::responses::encode_error_with_data(
+                        id,
+                        code,
+                        reason,
+                        serde_json::json!({ "receipt": receipt }),
+                    ),
+                    None => encode_error(id, code, reason),
+                }
+            }
         }
     }
 
@@ -307,6 +314,7 @@ impl App {
         &mut self,
         send: RelaySend,
         mut result: Result<bool, crate::peers::PeerMessageFailure>,
+        receipt: Option<Envelope>,
     ) {
         let delivery = &send.mesh;
         let mut warnings = Vec::new();
@@ -360,11 +368,13 @@ impl App {
             }
             Err(failure) if !failure.retryable() => {
                 let reason = failure.detail();
-                match with_store(|store| {
-                    store
-                        .refuse(&delivery.envelope.key, reason, now_ms() as i64)
-                        .map_err(|e| e.to_string())
-                }) {
+                let downstream = crate::peer_stream::enrollment(&send.peer).node_id;
+                match self.settle_refusal(
+                    &delivery.envelope,
+                    reason,
+                    receipt.as_ref(),
+                    downstream.as_deref(),
+                ) {
                     Ok(()) => {
                         state = if reason.split(':').next() == Some("recipient_gone") {
                             "recipient_gone"

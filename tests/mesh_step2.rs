@@ -445,8 +445,9 @@ fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
     let started = Instant::now();
     fleet::wait_until("sender CLI receives routed outcome", DEADLINE, || {
         let output = operator(c.fleet.node("nodea"), &["msg", "status", "question"]);
+        // Terminal no-answer states exit non-zero by design (3 or 4).
         assert!(
-            output.status.success(),
+            matches!(output.status.code(), Some(0 | 3 | 4)),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -650,7 +651,6 @@ fn forged_origin_signature_route_and_token_are_refused() {
 }
 
 #[test]
-#[ignore = "#872"]
 fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
     let specs = [
         fleet::CHAIN_ABC[0].clone(),
@@ -826,7 +826,6 @@ fn closed_edge_withdraws_routes() {
 }
 
 #[test]
-#[ignore = "#872"]
 fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
     let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     // Discover first so the sender retains a genuine owner hint after close.

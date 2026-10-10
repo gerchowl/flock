@@ -60,6 +60,11 @@ impl App {
             };
             let result = self.import_attested_mesh_mail(&delivery, upstream);
             let delivered = result.as_ref().is_ok_and(|(_, delivered)| *delivered);
+            let receipt = result
+                .as_ref()
+                .err()
+                .and_then(|reason| self.refusal_receipt(&delivery, reason))
+                .map(Box::new);
             let refusal = match result {
                 Ok(_) => None,
                 Err(reason) => {
@@ -79,6 +84,7 @@ impl App {
                 key: mail.key.clone(),
                 token: mail.return_binding.collection_token.clone(),
                 refusal,
+                receipt,
             });
         }
         if !ack.is_empty() {
