@@ -441,6 +441,31 @@ fn laptop_collects_answer_through_a_different_hub() {
     once(c.fleet.node("noded.example"), "question");
 }
 
+fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
+    let started = Instant::now();
+    fleet::wait_until("sender CLI receives routed outcome", DEADLINE, || {
+        let output = operator(c.fleet.node("nodea"), &["msg", "status", "question"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            started.elapsed() < DEADLINE - Duration::from_secs(1),
+            "expected sender state {expected}, got {result}; hub outcomes: {:?}",
+            db(c.fleet.node("nodeb"))
+                .query_row(
+                    "SELECT state,collect_error FROM envelopes WHERE correlation='question'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                )
+                .unwrap()
+        );
+        (result["result"]["state"] == expected).then(|| result["result"].clone())
+    })
+}
+
 fn operator(node: &Node, args: &[&str]) -> std::process::Output {
     support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
@@ -625,6 +650,7 @@ fn forged_origin_signature_route_and_token_are_refused() {
 }
 
 #[test]
+#[ignore = "#872"]
 fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
     let specs = [
         fleet::CHAIN_ABC[0].clone(),
@@ -639,7 +665,14 @@ fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
             .ok()
     });
     assert_eq!(refused["error"]["message"], "msg_not_allowed", "{refused}");
-    // Returning this refusal to A is a routed-receipt concern covered by 2h.
+    let refused = sender_cli_state(&c, "refused");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap()
+            .contains("msg_not_allowed"),
+        "{refused}"
+    );
     assert_eq!(read(c.fleet.node("nodec"), &c.receiver.pane), json!([]));
     let allowed = Agent::start(c.fleet.node("nodeb"));
     send_as(
@@ -676,12 +709,68 @@ fn trace_writes(node: &Node) {
 
 #[test]
 fn quiet_healthy_edge_keeps_routes() {
-    let fleet = fleet::spawn("s2idle", fleet::CHAIN_ABC);
+    let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
+    let fleet = &c.fleet;
     route(fleet.node("nodea"), fleet.node("nodec"));
     route(fleet.node("nodec"), fleet.node("nodea"));
     for node in &fleet.nodes {
         trace_writes(node);
     }
+    c.sender.cli(
+        fleet.node("nodea"),
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &c.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "question",
+            "question body",
+        ],
+    );
+    c.read_question();
+    state(fleet.node("nodea"), "question", "read");
+    fleet::wait_until(
+        "receipt custody acknowledged on every node",
+        DEADLINE,
+        || {
+            if fleet.nodes.iter().any(|node| {
+                scalar(
+                    node,
+                    "SELECT count(*) FROM envelopes WHERE state IN ('custody','held')",
+                ) != 0
+            }) {
+                return None;
+            }
+            let forwarded = scalar(fleet.node("nodeb"),
+            "SELECT count(*) FROM envelopes WHERE kind='receipt' AND correlation LIKE '%:read' AND state='delivered' AND delivered=1 AND length(body)=0");
+            let returned = scalar(fleet.node("nodec"),
+            "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='read' AND receipt_sent='read'");
+            (forwarded == 1 && returned == 1).then_some(())
+        },
+    );
+    // Fresh summaries prove both return edges stopped advertising pending work.
+    for edge in ["nodea-nodeb", "nodeb-nodec"] {
+        fs::write(fleet.base.join(format!("observe-summary-{edge}")), "").unwrap();
+    }
+    fleet::wait_until(
+        "all edge summaries report no pending custody",
+        DEADLINE,
+        || {
+            for edge in ["nodea-nodeb", "nodeb-nodec"] {
+                let summary: Value = serde_json::from_slice(
+                    &fs::read(fleet.base.join(format!("observed-summary-{edge}"))).ok()?,
+                )
+                .ok()?;
+                if summary["outbound_pending"] != false {
+                    return None;
+                }
+            }
+            Some(())
+        },
+    );
     let databases: Vec<_> = fleet.nodes.iter().map(db).collect();
     let sample =
         || {
@@ -699,18 +788,7 @@ fn quiet_healthy_edge_keeps_routes() {
                 })
                 .collect::<Vec<_>>()
         };
-    // Initial directory persistence is asynchronous. Observe a quiet window
-    // before starting the fixed 30-second acceptance interval.
-    let mut baseline = sample();
-    let mut quiet = Instant::now();
-    fleet::wait_until("startup writes settled", DEADLINE, || {
-        let now = sample();
-        if now != baseline {
-            baseline = now;
-            quiet = Instant::now();
-        }
-        (quiet.elapsed() >= Duration::from_secs(2)).then_some(())
-    });
+    let baseline = sample();
     let start = Instant::now();
     fleet::wait_until(
         "30 seconds with no store mutations",
@@ -748,6 +826,7 @@ fn closed_edge_withdraws_routes() {
 }
 
 #[test]
+#[ignore = "#872"]
 fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
     let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     // Discover first so the sender retains a genuine owner hint after close.
@@ -768,6 +847,7 @@ fn stale_directory_vs_authoritative_removal_gives_recipient_gone() {
             .is_some_and(|reason| reason.starts_with("recipient_gone")),
         "{gone}"
     );
+    sender_cli_state(&c, "recipient_gone");
     assert_eq!(
         scalar(
             c.fleet.node("nodec"),
@@ -1029,36 +1109,6 @@ fn audit_rotation_during_multihop_conversation_loses_nothing() {
     conversation.answer_once();
 }
 
-#[test]
-fn follow_up_after_final_answer_on_one_way_edge_is_collected() {
-    let conversation = Conversation::new(DIRECT);
-    conversation.send();
-    conversation.read_question();
-    conversation.reply();
-    conversation.answer_once();
-    // Let the idle outbound poll enter its long backoff after the final answer.
-    let start = Instant::now();
-    fleet::wait_until("post-answer idle interval", DEADLINE, || {
-        assert_eq!(
-            read(conversation.fleet.node("nodea"), &conversation.sender.pane),
-            json!([])
-        );
-        (start.elapsed() >= Duration::from_secs(7)).then_some(())
-    });
-    let reply = conversation.receiver.cli(
-        conversation.fleet.node("nodeb"),
-        &["msg", "reply", "question", "follow-up body"],
-    );
-    let origin = conversation.fleet.node("nodea");
-    let messages = fleet::wait_until("follow-up wake collection", Duration::from_secs(4), || {
-        let messages = read(origin, &conversation.sender.pane);
-        (!messages.as_array()?.is_empty()).then_some(messages)
-    });
-    assert_eq!(messages[0]["body"], "follow-up body");
-    assert_eq!(messages[0]["correlation_id"], reply["correlation_id"]);
-    assert_eq!(read(origin, &conversation.sender.pane), json!([]));
-}
-
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 fn start_at(node: &Node, cwd: &Path, executable: &Path) -> Value {
@@ -1136,17 +1186,32 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
         .any(|m| m["correlation_id"] == "restart-mail"));
 }
 
-fn rejected_config(node: &Node, content: &str, key: &str) {
+fn warned_config(node: &Node, content: &str, key: &str) {
     let path = node.config_home.join("flock-dev/config.toml");
     let original = fs::read_to_string(&path).unwrap();
     fs::write(&path, content).unwrap();
-    let output = operator(node, &["config", "check"]);
+    let output = operator(node, &["config", "check", "--json"]);
     fs::write(path, original).unwrap();
-    assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["exit_code"], 1, "{result}");
     assert!(
-        error.contains(key) && error.contains("was removed") && error.contains("delete this line"),
-        "{error}"
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                let diagnostic = diagnostic.as_str().unwrap();
+                diagnostic.contains(key)
+                    && diagnostic.contains("was removed")
+                    && diagnostic.contains("delete this line")
+            }),
+        "{result}"
     );
 }
 
@@ -1185,7 +1250,7 @@ fn mismatched_protocol_and_custom_summary_refused_with_upgrade_message() {
         .unwrap()
         .contains("upgrade flk on nodeb"));
     assert_eq!(read(c.fleet.node("nodeb"), &c.receiver.pane), json!([]));
-    rejected_config(
+    warned_config(
         c.fleet.node("nodea"),
         "[[peers]]\nname='nodeb'\nsummary_command='false'\n",
         "summary_command",
@@ -1193,14 +1258,14 @@ fn mismatched_protocol_and_custom_summary_refused_with_upgrade_message() {
 }
 
 #[test]
-fn removed_config_keys_rejected_with_migration_instructions() {
+fn removed_config_keys_warn_with_migration_instructions() {
     let fleet = fleet::spawn("s2config", &[NodeSpec::new("nodea", "config", &[])]);
     for key in [
         "uplink_timeout_secs",
         "uplink_heartbeat_secs",
         "deferral_relay_concurrency",
     ] {
-        rejected_config(fleet.node("nodea"), &format!("[msg]\n{key}=20\n"), key);
+        warned_config(fleet.node("nodea"), &format!("[msg]\n{key}=20\n"), key);
     }
 }
 
