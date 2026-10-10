@@ -27,7 +27,7 @@ slow-timeout = { period = "30s" }
 
 [[profile.default.overrides]]
 # Acceptance must expose flakes even without a command-line retry override.
-filter = 'binary(mesh_step1) | binary(mesh_forwarding)'
+filter = 'binary(mesh_step1) | binary(mesh_step2) | binary(mesh_forwarding)'
 test-group = 'serial-pty'
 retries = 0
 

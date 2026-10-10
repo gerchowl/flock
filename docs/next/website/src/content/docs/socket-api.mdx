@@ -22,7 +22,9 @@ bound to an SSH-descended process and its start time.
 `source` (`configured` or `inbound`), `state`, and `reason`. Its `routes` array
 contains `{node, name, next_hop, hops}` for live shortest paths (at most eight
 hops). Names use locally pinned names when available; other names include an
-eight-character node ID suffix and `(advertised)`. The response also includes
+eight-character node ID suffix and `(advertised)`. `route_generation` is the
+local route-table change counter for this server process; unchanged adverts
+keep it stable. The response also includes
 `mesh_quarantined` (the number of records isolated after decoding failures)
 and an optional `mesh_suspended_reason` while custody recovery is unavailable.
 The acceptor lists live inbound edges; the dialer retains handshake refusal
