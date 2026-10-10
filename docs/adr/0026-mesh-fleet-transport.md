@@ -427,8 +427,13 @@ publish a release.
 At each held-edge handshake require identical mesh protocol versions. Refuse
 a mismatch with a clear error naming both local and remote versions and
 `upgrade flk on <peer>` using the configured peer name. v1.0.0 speaks mesh
-protocol 5; protocol 4 nodes deny the new acknowledgement fields and would
-reject whole batches, so they are refused at hello. Nothing queues for
+protocol 5. Protocol 4 existed only in development builds, whose nodes deny
+the new acknowledgement fields and would reject whole batches, so they are
+refused at hello. The previous release, v0.11.0, has no mesh at all: its
+server rejects `mesh.hello` as an unknown method, and an older relay prints
+CLI usage instead of answering. Both are refused as
+`upgrade flk on <peer> (peer runs a pre-mesh flk)` with the long refusal
+backoff, never the transient retry schedule. Nothing queues for
 that incompatible peer and nothing is downgraded. Refuse new acceptance
 addressed through a known incompatible edge, including collection jobs for
 it. Existing custody remains stored rather than being sent to an
@@ -436,21 +441,31 @@ incompatible peer. Ordinary offline queuing for enrolled matching-protocol
 destinations remains, subject to custody TTL, and is not a compatibility
 mechanism.
 
-A peer that cannot hold an edge, including one using a custom
-`summary_command`, old `flk`, or a failing stream, is refused until fixed.
+A peer that cannot hold an edge, such as an old `flk` or a failing stream,
+is refused until fixed (see Amendment #844 for `summary_command`).
 `flk status` and `flk peers` name the configured peer and concrete reason
-(custom summary transport unsupported, protocol/version unsupported or
+(pre-mesh flk, protocol/version unsupported or
 stream failure). No one-shot or alternate-message transport is attempted.
 
 Delete the old message uplink, one-shot message relay, separate deferral SSH
 hop and their related configuration keys in the mesh series, without a
 deprecation window. This includes `[msg] uplink_timeout_secs`,
 `uplink_heartbeat_secs`, `deferral_relay_concurrency` and custom peer
-`summary_command` compatibility behavior. Reject removed keys with migration
-instructions rather than accepting inert compatibility settings. There are
+`summary_command` compatibility behavior. There are
 no legacy acknowledgements, legacy gates or opt-in legacy sends. Review
 `src/protocol/wire.rs` under the repository's release-relative version rule
 while implementing the breaking wire, rather than bumping it in this doc PR.
+
+**Amendment #844 (owner accepted 2026-10-09):** removed keys warn and are
+ignored rather than refused. Startup, live handoff and reload strip
+`[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`,
+`deferral_relay_concurrency` and `[[peers]] summary_command`, apply every
+other setting, and keep the peer, which then holds an ordinary mesh edge.
+Warnings name the file, line and key in `flk status` and on CLI stderr;
+`flk config check [--json]` lists removed and unknown keys before a rollout
+and exits 1 when there are warnings. Startup, handoff and reload are never
+refused for a removed key. This supersedes the earlier "reject removed keys"
+rule and the refusal of peers with a custom `summary_command`.
 
 **Amendment Q2 (owner accepted 2026-10-09):** dev-build stores at schema
 v1–v11 upgrade in place, idempotently, to the v1.0.0 schema baseline (v12).

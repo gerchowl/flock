@@ -103,7 +103,10 @@ impl NodeSpec {
 #[serde(rename_all = "snake_case")]
 pub enum MeshMode {
     Native,
+    /// A v0.11.0 server behind a working relay: mesh methods are unknown.
     Disabled,
+    /// A flk without `peers relay`: the relay command prints usage and exits.
+    PreRelay,
     ForgedSignature,
     ForgedChallenge,
     RelayReset,

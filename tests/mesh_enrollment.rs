@@ -203,9 +203,41 @@ fn previous_mesh_version_peer_is_refused_with_upgrade_instruction() {
     );
 }
 
+const PRE_MESH: &str = "upgrade flk on acceptor.test (peer runs a pre-mesh flk)";
+
+/// A v0.11.0 peer is refused permanently: the upgrade instruction reaches
+/// status and `flk peers`, and the edge waits out the long refusal backoff
+/// instead of redialling on the 1-30 s transient schedule.
+fn pre_mesh_peer_is_refused_without_hot_retry(tag: &str, mode: MeshMode) {
+    let mut specs = PAIR.to_vec();
+    specs[1].mesh = mode;
+    let fleet = fleet::spawn(tag, &specs);
+    let status = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
+    assert_eq!(
+        status["reason"],
+        format!("mesh handshake refused: {PRE_MESH}")
+    );
+    assert!(status["node_id"].is_null(), "{status}");
+    let peers = cli_text(fleet.node("dialer.test"), &["peers", "status", "--json"]);
+    assert!(peers.contains(PRE_MESH), "{peers}");
+    let attempts = fleet
+        .base
+        .join("enrollment-attempts-dialer.test-acceptor.test");
+    let count = || std::fs::read_to_string(&attempts).unwrap().lines().count();
+    let before = count();
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(count(), before, "a pre-mesh peer must not be hot-retried");
+    enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
+}
+
 #[test]
-fn mesh_disabled_peer_is_refused_in_status() {
-    refused_mode("mesh-disabled", MeshMode::Disabled, "unknown variant");
+fn pre_mesh_server_peer_is_refused_with_upgrade_instruction() {
+    pre_mesh_peer_is_refused_without_hot_retry("mesh-pre-server", MeshMode::Disabled);
+}
+
+#[test]
+fn pre_relay_flk_peer_is_refused_with_upgrade_instruction() {
+    pre_mesh_peer_is_refused_without_hot_retry("mesh-pre-relay", MeshMode::PreRelay);
 }
 
 #[test]

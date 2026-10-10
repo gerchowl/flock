@@ -1081,8 +1081,8 @@ impl App {
             return encode_error(id, "msg_target_not_found", "recipient owner is unknown");
         };
         let next = self.request_next_hop(owner);
-        if let Some(peer) = self.incompatible_request_peer(owner, &next.node) {
-            return encode_error(id, "peer_incompatible", format!("upgrade flk on {peer}"));
+        if let Some(upgrade) = self.incompatible_request_peer(owner, &next.node) {
+            return encode_error(id, "peer_incompatible", upgrade);
         }
         // The sender is whoever asked, attested locally where possible.
         let attested = self.attested_sender_agent();

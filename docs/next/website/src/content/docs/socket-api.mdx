@@ -189,12 +189,16 @@ inbox delivery.
 | `loop_detected` | Refuse this route attempt, retain upstream custody and wait for a route change. |
 | `hop_budget_exhausted` | Refuse further forwarding, retain upstream custody and seek another route. |
 | `invalid_signature` | Permanently refuse an envelope whose origin signature fails verification. |
-| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh versions. |
+| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh versions, or that the peer runs a pre-mesh flk. |
 
 Delivery refusals use `error.code: "mesh_delivery_refused"` with the specific
 reason above in `error.message`; `origin_mismatch` has its own error code.
 New-send compatibility refusals use `error.code: "peer_incompatible"`. No
-legacy transport or downgrade is attempted.
+legacy transport or downgrade is attempted. A peer still running a pre-mesh
+release such as v0.11.0 rejects `mesh.hello` as an unknown method; Flock
+reports it as `upgrade flk on <peer> (peer runs a pre-mesh flk)` in
+`peers.enrollment`, `flk peers`, and send errors, and retries it only on the
+long refusal backoff.
 
 Cross-host sends use `mesh.deliver` over authenticated held edges. The receiver commits inbox import and deduplication in one transaction before returning a receipt. `state: "delivered"` confirms recipient inbox import, not reading or agent execution. `state: "queued"` means the origin retains custody for retry. A new send through a known incompatible peer is refused with `peer_incompatible` and an upgrade instruction. There is no one-shot SSH fallback for these sends. Replies and automatic mute deferrals use the durable return binding. Custodians route answers and delivery/read receipts toward the origin over live mesh paths, or retain them for next-hop collection while offline. The recipient needs no outbound peer entry for collection. Delivered requests, FYI messages included, are polled until a terminal read/expiry receipt arrives: at most one commit per message per poll, and for unread mail no longer than the custody window (seven days). Requests expecting an answer remain eligible until a final answer arrives; a deferral keeps the conversation open. The first poll follows delivery by about five seconds, then polling backs off through 60 seconds to five minutes with jitter. An active `msg.wait_reply` or a re-enrolled edge restores fast polling. Collection survives restart, imports each message key once, and acknowledges only after import. Lost acknowledgements are retried even after a final answer. Invalid reply bindings fail permanently; other import failures become `collect_failed` in `msg.status` after three attempts. Mailbox-full remains retryable. Fleet pause freezes retries and TTL. Replies to messages without a valid return binding return `reply_unavailable`. Collection uses a separate bounded worker lane, with at most one request per peer in flight, so an unavailable collector cannot delay user sends. Same-host replies remain available during mesh-store recovery. Unbound muted questions are still queued for the recipient; the sender receives a `reply_unavailable` warning because the automatic deferral cannot route back.
 
