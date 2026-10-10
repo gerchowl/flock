@@ -45,6 +45,10 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         response: String,
     ) {
+        if let Some((request, peer_pid)) = self.pending_recovery_park.take() {
+            self.park_until_mesh_recovered(request, peer_pid, respond_to);
+            return;
+        }
         if let Some(mut relay) = self.message_relays.pending.take() {
             relay.respond_to = Some(respond_to);
             self.enqueue_message_relay(relay.into_work());
