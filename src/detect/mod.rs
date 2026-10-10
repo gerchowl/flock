@@ -347,11 +347,15 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
 /// sentence appended to it would be submitted along with it.
 pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool> {
     match agent {
-        Agent::Claude => {
-            agents::claude_code::prompt_input(screen_content).map(|typed| typed.is_empty())
-        }
+        Agent::Claude => agents::claude_code::prompt_input(screen_content)
+            .map(|typed| typed.is_empty() || agents::claude_code::is_prompt_suggestion(&typed)),
         _ => None,
     }
+}
+
+/// Whether a Claude composer row is only Claude's ghost-text suggestion.
+pub(crate) fn claude_prompt_suggestion(row: &str) -> bool {
+    agents::claude_code::is_prompt_suggestion(row)
 }
 
 /// Read the recognized Claude composer from the unscrolled detection snapshot.
@@ -1340,6 +1344,9 @@ mod tests {
 
         let wrapped = "─────────────\n❯ \n  continued draft\n─────────────";
         assert_eq!(agent_prompt_is_empty(Agent::Claude, wrapped), Some(false));
+
+        let suggestion = "─────────────\n❯ Try \"refactor check-ssot.sh\"\n─────────────";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, suggestion), Some(true));
 
         assert_eq!(agent_prompt_is_empty(Agent::Claude, "no box at all"), None);
         assert_eq!(agent_prompt_is_empty(Agent::Codex, empty), None);

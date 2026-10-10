@@ -1900,3 +1900,50 @@ async fn restore_prefers_store_when_both_attempts_are_unfinished() {
     assert!(restored[0].retried);
     assert_eq!(restored[0].state, "unconfirmed");
 }
+
+/// Claude v2.1.295's ghost-text suggestion in an otherwise empty box (#864).
+const SUGGESTION: &str = "Try \"refactor check-ssot.sh\"";
+
+#[tokio::test]
+async fn guarded_submit_types_into_a_box_showing_only_claudes_suggestion() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTION));
+    app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
+        .expect("a suggestion is not a draft");
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+
+    // The same words without the quoted suggestion shape are somebody's draft.
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    runtime(&app).test_process_pty_bytes(&claude_screen("Try refactor check-ssot.sh"));
+    assert_eq!(
+        app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
+            .unwrap_err(),
+        "input_not_empty"
+    );
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn an_idle_claude_showing_its_suggestion_is_still_woken() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, settled());
+    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTION));
+    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+    assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
+    tick_past_gap(&mut app);
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+}
