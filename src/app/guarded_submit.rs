@@ -128,8 +128,8 @@ fn composer_rows<'a>(
 }
 
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
-pub(crate) fn composer_contents(agent: Agent, screen: &str) -> Option<String> {
-    composer_rows(agent, screen, screen).map(|(rows, _, _)| rows.join("\n"))
+pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
+    composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
 }
 
 /// Classify a live pane's editor from one styled read of its detection text.
@@ -142,6 +142,7 @@ pub(crate) fn runtime_composer(
     composer_unfaint(agent, &screen, &unfaint, text)
 }
 
+#[cfg(test)]
 pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
     composer_unfaint(agent, screen, screen, text)
 }

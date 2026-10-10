@@ -1269,6 +1269,7 @@ mod tests {
                                     source: crate::api::schema::ReadSource::RecentUnwrapped,
                                     format: crate::api::schema::ReadFormat::Text,
                                     text: String::new(),
+                                    unfaint: None,
                                     revision: 0,
                                     truncated: false,
                                 },

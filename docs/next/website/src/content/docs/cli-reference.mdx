@@ -544,7 +544,7 @@ Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BL
 
 `reap --force` clears the dirty-checkout refusal and proceeds through a busy lock. The teardown is idempotent: each step re-confirms the identity, treats `workspace_not_found` and `not_git_worktree` as "nothing to do", and derives the `removed` output from what actually happened — so two concurrent `reap --force` of the same delegate each exit 0 with the same end state, and the loser simply reports `removed: false` for the fields the winner removed. If the recorded checkout was removed outside flock, `reap` closes the workspace only when it still belongs to that checkout, prunes stale Git worktree metadata, then clears the entry. A reap that cannot get an answer from the server (a timeout or a dead socket) never counts that as removal: it exits 1 and keeps the entry, so it can be retried.
 
-`pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats.
+`pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats. Socket clients can ask `pane.read` for `source: "detection_unfaint"` to get the same screen plus `unfaint`, the same rows with faint cells blanked, from one read; that is how `delegate wait` tells an agent's own dimmed suggestion from a typed draft.
 
 ### Delegate stall verdicts
 

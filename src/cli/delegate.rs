@@ -3972,12 +3972,20 @@ impl Await<'_> {
                         start_watch.interrupted();
                         return false;
                     };
-                    let Some(screen) = detection_screen(pane_id, self.deadline) else {
+                    let Some((screen, unfaint)) =
+                        detection_screens_with(pane_id, self.deadline, bounded)
+                    else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
                         return false;
                     };
-                    if start_watch.observe(cursor, *status, &screen, Instant::now()) {
+                    if start_watch.observe_unfaint(
+                        cursor,
+                        *status,
+                        &screen,
+                        &unfaint,
+                        Instant::now(),
+                    ) {
                         not_started = true;
                         return true;
                     }
@@ -4331,6 +4339,42 @@ fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> 
         .pointer("/result/read/text")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The detection screen and its faint-blanked copy from one server read
+/// (#892). A server without `detection_unfaint` refuses it, and the plain read
+/// then stands in for both, which reads a suggestion as typed.
+fn detection_screens_with(
+    pane_id: &str,
+    deadline: Option<Instant>,
+    mut read: impl FnMut(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> Option<(String, String)> {
+    let params = |source| {
+        Method::PaneRead(PaneReadParams {
+            pane_id: pane_id.into(),
+            source,
+            lines: None,
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        })
+    };
+    let response = read(params(ReadSource::DetectionUnfaint), deadline).ok()?;
+    if let Some(text) = response
+        .pointer("/result/read/text")
+        .and_then(|v| v.as_str())
+    {
+        let unfaint = response
+            .pointer("/result/read/unfaint")
+            .and_then(|v| v.as_str())
+            .unwrap_or(text);
+        return Some((text.to_string(), unfaint.to_string()));
+    }
+    let text = read(params(ReadSource::Detection), deadline)
+        .ok()?
+        .pointer("/result/read/text")?
+        .as_str()?
+        .to_string();
+    Some((text.clone(), text))
 }
 
 fn event_observation(

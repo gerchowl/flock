@@ -8,8 +8,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::api::schema::{
-    MessageTarget, Method, MsgIntent, MsgMuteParams, MsgReadParams, MsgSendParams,
-    PaneSendTextParams, Request,
+    MessageTarget, Method, MsgIntent, MsgMuteParams, MsgReadParams, MsgSendParams, PaneReadParams,
+    PaneSendTextParams, ReadFormat, ReadSource, Request,
 };
 use crate::app::App;
 use crate::detect::{Agent, AgentState};
@@ -1904,7 +1904,7 @@ async fn restore_prefers_store_when_both_attempts_are_unfinished() {
 }
 
 /// Claude v2.1.295's suggestions in an otherwise empty box, painted faint
-/// (SGR 2) as a live capture shows: the `Try "…"` placeholder (#864) and the
+/// (SGR 2) as a live capture shows: the `Try "…"` hint (#864) and the
 /// bare post-turn suggestion (#892).
 const SUGGESTIONS: [&str; 2] = [
     "\x1b[2mTry \"refactor check-ssot.sh\"\x1b[0m",
@@ -1980,4 +1980,35 @@ async fn an_idle_claude_with_a_typed_draft_is_not_woken() {
     runtime(&app).test_process_pty_bytes(&claude_screen("watch CI on #891 and merge when green"));
     send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
     assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
+    let Rig { mut app, pane, .. } = rig();
+    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTIONS[1]));
+    let read = |app: &mut App, source| {
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::PaneRead(PaneReadParams {
+                pane_id: pane.clone(),
+                source,
+                lines: None,
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        }))
+        .unwrap();
+        response["result"]["read"].clone()
+    };
+    let both = read(&mut app, ReadSource::DetectionUnfaint);
+    let text = both["text"].as_str().unwrap();
+    assert!(text.contains("❯ watch CI on #891 and merge when green"));
+    assert_eq!(text, read(&mut app, ReadSource::Detection)["text"]);
+    let unfaint = both["unfaint"].as_str().unwrap();
+    assert!(unfaint.contains("Task complete.\n"));
+    assert!(!unfaint.contains("watch CI"));
+    // A plain read carries no copy, so its payload is unchanged.
+    assert!(read(&mut app, ReadSource::Detection)
+        .get("unfaint")
+        .is_none());
 }
