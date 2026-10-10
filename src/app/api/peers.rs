@@ -26,10 +26,10 @@ impl App {
                             .filter(|edge| edge.state == "pinned")
                             .and_then(|edge| edge.node_id.as_deref()),
                     )
-                    .is_some_and(|(node, hub)| {
+                    .is_some_and(|(_, hub)| {
                         crate::mesh::hello::with_store(|store| {
                             store
-                                .has_outbound(node, hub, super::messages::now_ms() as i64)
+                                .has_outbound(hub, super::messages::now_ms() as i64)
                                 .map_err(|e| e.to_string())
                         })
                         .unwrap_or(false)
