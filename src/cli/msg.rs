@@ -295,7 +295,11 @@ const EXIT_TIMEOUT: i32 = 124;
 fn exit_for(outcome: &str) -> i32 {
     match outcome {
         "replied" => EXIT_REPLIED,
-        "deferred" | "expired" | "recipient_gone" | "outcome_retention_elapsed" => EXIT_NO_ANSWER,
+        "deferred"
+        | "expired"
+        | "recipient_gone"
+        | "outcome_retention_elapsed"
+        | "undeliverable" => EXIT_NO_ANSWER,
         "refused" => EXIT_REFUSED,
         "timeout" => EXIT_TIMEOUT,
         _ => 1,
@@ -416,6 +420,10 @@ fn await_reply_for(
             result["detail"].as_str().unwrap_or("no reason given")
         ),
         "expired" => eprintln!("{correlation_id} was dropped unread; no answer is coming"),
+        "undeliverable" => eprintln!(
+            "{correlation_id} could not be delivered by a forwarding hub: {}",
+            result["detail"].as_str().unwrap_or("no reason given")
+        ),
         "timeout" => eprintln!(
             "no answer to {correlation_id} yet (last state: {})",
             result["state"].as_str().unwrap_or("unknown")
@@ -629,9 +637,13 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
 fn status_exit(state: Option<&str>) -> i32 {
     match state {
         Some("refused") => EXIT_REFUSED,
-        Some("expired" | "recipient_gone" | "outcome_retention_elapsed" | "collect_failed") => {
-            EXIT_NO_ANSWER
-        }
+        Some(
+            "expired"
+            | "recipient_gone"
+            | "outcome_retention_elapsed"
+            | "collect_failed"
+            | "undeliverable",
+        ) => EXIT_NO_ANSWER,
         _ => 0,
     }
 }
@@ -834,6 +846,7 @@ mod tests {
         assert_eq!(super::exit_for("anything else"), 1);
         assert_eq!(super::exit_for("recipient_gone"), 3);
         assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
+        assert_eq!(super::exit_for("undeliverable"), 3);
         assert_eq!(super::exit_for("refused"), 4);
     }
 
@@ -855,6 +868,7 @@ mod tests {
             "outcome_retention_elapsed",
             "recipient_gone",
             "collect_failed",
+            "undeliverable",
         ] {
             assert_eq!(super::status_exit(Some(state)), 3, "{state}");
         }

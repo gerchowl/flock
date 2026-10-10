@@ -2450,12 +2450,13 @@ pub enum ResponseResult {
         correlation_id: String,
         /// `replied`, `deferred` (a muted recipient's automatic answer),
         /// `expired` (dropped unread), `refused` (the receiver declined
-        /// custody, reason in `detail`), `recipient_gone`,
+        /// custody, reason in `detail`), `undeliverable` (a forwarding hub
+        /// could not deliver it, reason in `detail`), `recipient_gone`,
         /// `outcome_retention_elapsed`, or `timeout`.
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
-        /// On `refused`: the receiver's reason.
+        /// On `refused`: the receiver's reason. On `undeliverable`: the hub's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
         /// On `timeout`: the message's last known delivery state (`queued`,

@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 
 /// Version 5 adds the optional `OutboundAck::receipt` and the `refused`
 /// receipt state. Version 4 nodes deny unknown ack fields and would reject
-/// whole batches, so hello refuses the mismatch instead.
-pub const VERSION: u32 = 5;
+/// whole batches, so hello refuses the mismatch instead. Version 6 adds the
+/// hub-signed `undeliverable` receipt state (#876), which a version 5 origin
+/// would refuse as an invalid reply binding.
+pub const VERSION: u32 = 6;
 
 pub(crate) fn version() -> u32 {
     if cfg!(debug_assertions) {
@@ -256,12 +258,12 @@ mod tests {
         remote.mesh = 99;
         assert_eq!(
             remote.validate("configured.test").unwrap_err(),
-            "mesh version mismatch: local 5, remote 99; upgrade flk on this node"
+            "mesh version mismatch: local 6, remote 99; upgrade flk on this node"
         );
-        remote.mesh = 4;
+        remote.mesh = 5;
         assert_eq!(
             remote.validate("configured.test").unwrap_err(),
-            "mesh version mismatch: local 5, remote 4; upgrade flk on configured.test"
+            "mesh version mismatch: local 6, remote 5; upgrade flk on configured.test"
         );
         assert_eq!(
             version_mismatch(99, 1, "configured.test"),
