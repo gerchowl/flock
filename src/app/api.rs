@@ -12,6 +12,7 @@ mod lineage;
 mod mesh;
 mod mesh_forward;
 pub(super) mod mesh_mail;
+mod mesh_receipts;
 mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
@@ -448,10 +449,13 @@ impl App {
                     payload.node_id =
                         crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
                     summary.node_id = payload.node_id.clone();
-                    self.mesh_outbound_polls
-                        .entry(fetch.peer.clone())
-                        .or_default()
-                        .pending = payload.outbound_pending;
+                    if payload.outbound_pending {
+                        self.mesh_outbound_polls
+                            .entry(fetch.peer.clone())
+                            .or_default()
+                            .note_wake();
+                        self.mesh_collect_at = None;
+                    }
                     // Gossip v3 (#101): merge the polled peer's relayed_fleet
                     // into our cache BEFORE we mutate `summary`. Loop
                     // prevention rides on the origin field: we drop entries

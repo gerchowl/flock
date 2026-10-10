@@ -1107,14 +1107,46 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
         db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
             .unwrap()
     };
-    let before = version();
+    // A lost ack now leaves receipt debt pending until the origin explicitly
+    // acknowledges it. Permit that one bookkeeping update, but audit every
+    // other write so duplicate import must still be read-only.
+    db.execute_batch("CREATE TABLE replay_writes (table_name TEXT)")
+        .unwrap();
+    let tables: Vec<String> = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='replay_writes'"
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    for table in tables {
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let condition = if table == "envelopes" && operation == "UPDATE" {
+                let columns: Vec<String> = db.prepare(
+                    "SELECT name FROM pragma_table_info('envelopes') WHERE name!='receipt_sent'"
+                ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+                format!("WHEN NOT (OLD.receipt_sent IS NULL AND NEW.receipt_sent IS 'delivered' AND {})",
+                    columns.iter().map(|column| format!("OLD.\"{column}\" IS NEW.\"{column}\"")).collect::<Vec<_>>().join(" AND "))
+            } else {
+                String::new()
+            };
+            db.execute_batch(&format!(
+                "CREATE TRIGGER replay_{table}_{operation} AFTER {operation} ON {quoted} {condition}
+                 BEGIN INSERT INTO replay_writes VALUES ('{table}'); END"
+            ))
+            .unwrap();
+        }
+    }
+    let replay_writes = || {
+        db.query_row("SELECT COUNT(*) FROM replay_writes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
     let offers = fleet.base.join("outbound-offers-nodeb-nodea");
     wait_for(
         "duplicate offered to muted recipient",
         GOSSIP_TIMEOUT,
         || (std::fs::read_to_string(&offers).ok()?.lines().count() >= 2).then_some(()),
     );
-    assert_eq!(version(), before, "duplicate import must not commit on hub");
+    assert_eq!(replay_writes(), 0, "duplicate import must not write on hub");
     wait_for("next ack settles custody", GOSSIP_TIMEOUT, || {
         let state: String = spoke_db(fleet.node("nodea"))
             .query_row(
@@ -1125,9 +1157,11 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
             .ok()?;
         (state == "delivered").then_some(())
     });
-    assert_eq!(version(), before);
+    assert_eq!(replay_writes(), 0);
+    let before = version();
     let count = std::fs::read_to_string(&offers).unwrap().lines().count();
     thread::sleep(Duration::from_secs(6));
+    assert_eq!(version(), before);
     assert_eq!(
         std::fs::read_to_string(&offers).unwrap().lines().count(),
         count
