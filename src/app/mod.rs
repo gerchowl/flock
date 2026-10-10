@@ -182,6 +182,9 @@ pub struct App {
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_forward_generation: Option<u64>,
     pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
+    /// Forwarded custody whose only onward route crosses a node the mail
+    /// already visited, with when this hub first saw it so (#928).
+    pub(crate) mesh_looped: std::collections::HashMap<crate::mesh::key::MessageKey, Instant>,
     pub(crate) mesh_pause_seen: Option<bool>,
     pub(crate) mesh_maintenance_at: Option<Instant>,
     pub(crate) clone_detection_warning: Option<String>,
@@ -981,6 +984,7 @@ impl App {
             mesh_enrollment_generation: 0,
             mesh_forward_generation: None,
             mesh_forward_cursor: None,
+            mesh_looped: Default::default(),
             mesh_pause_seen: None,
             mesh_maintenance_at: None,
             clone_detection_warning: None,

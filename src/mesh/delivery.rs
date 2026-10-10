@@ -137,6 +137,22 @@ pub(crate) fn hop_limit() -> u8 {
     8
 }
 
+/// How long a hub keeps custody whose only onward route crosses a node the
+/// mail already visited, before it reports the mail undeliverable (#928).
+/// Long enough for a flapping edge to come back and for withdrawals to
+/// settle, far short of the custody deadline the sender would wait out.
+pub(crate) fn loop_grace() -> std::time::Duration {
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("FLOCK_TEST_MESH_LOOP_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_secs(30)
+}
+
 /// Hydrate a metadata notification without opening another custody writer.
 /// MCP bridges run in a separate process from the server that owns the store.
 pub(crate) fn body(key: Option<&super::key::MessageKey>, legacy: &str) -> Option<String> {

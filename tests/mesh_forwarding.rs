@@ -1359,3 +1359,151 @@ fn receipt_that_dies_twice_at_a_hub_is_surfaced_without_bouncing() {
     assert_eq!(outcomes, 2);
     std::fs::remove_file(capture).unwrap();
 }
+
+/// The sender reaches the recipient only through the hub at first. The
+/// direct edge comes back while the hub holds custody, then the hub's own
+/// edge to the recipient drops, so its only route runs back through the
+/// sender (#928).
+fn strand_at_hub(tag: &str, loop_grace_ms: u64) -> (Fleet, Value, Value) {
+    let (fleet, sender, recipient) = setup(
+        tag,
+        &[
+            NodeSpec::new("nodea", "strand-a", &["nodeb", "nodec"]),
+            NodeSpec::new("nodeb", "strand-b", &["nodec"]).with_loop_grace_ms(loop_grace_ms),
+            NodeSpec::new("nodec", "strand-c", &[]),
+        ],
+    );
+    fleet.refuse_edge("nodea", "nodec");
+    fleet.kill_edge("nodea", "nodec", WAIT);
+    route_via(&fleet, "nodea", "nodec", "nodeb");
+    let capture = fleet.base.join("capture-delivery-nodeb-nodec");
+    std::fs::write(&capture, "").unwrap();
+    let response = send(&fleet, &sender, &recipient, "strand");
+    assert_eq!(response["result"]["path"], "via nodeb", "{response}");
+    fleet::wait_until("hub delivery captured", WAIT, || {
+        (!std::fs::read(&capture).ok()?.is_empty()).then_some(())
+    });
+    row_state(fleet.node("nodea"), "strand", "transferred");
+    fleet.allow_edge("nodea", "nodec");
+    route_via(&fleet, "nodea", "nodec", "nodec");
+    fleet.refuse_edge("nodeb", "nodec");
+    fleet.kill_edge("nodeb", "nodec", WAIT);
+    route_via(&fleet, "nodeb", "nodec", "nodea");
+    (fleet, sender, recipient)
+}
+
+/// Wait until `node` routes to `target` through the adjacent `via`.
+fn route_via(fleet: &Fleet, node: &str, target: &str, via: &str) {
+    let target = fleet.node_id(target);
+    let via = fleet.node_id(via);
+    fleet::wait_until("route through the expected hop", WAIT, || {
+        let response = api(fleet.node(node), "peers.enrollment", json!({}));
+        response["result"]["routes"]
+            .as_array()?
+            .iter()
+            .any(|route| route["node"] == target && route["next_hop"] == via)
+            .then_some(())
+    });
+}
+
+#[test]
+fn hub_whose_only_route_loops_reports_undeliverable_before_custody_expiry() {
+    let (fleet, _sender, _recipient) = strand_at_hub("hub-strand", 1_000);
+    hub_outcome(&fleet, "strand", "loop_detected at nodeb");
+    // Custody had days left: the hub reported it, nothing expired.
+    let (state, deadline): (String, i64) = db(fleet.node("nodeb"))
+        .query_row(
+            "SELECT e.state,e.custody_deadline-c.elapsed FROM envelopes e, clock c
+             WHERE e.correlation='strand' AND e.kind='message'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "refused");
+    assert!(deadline > 3_600_000, "{deadline}ms of custody left");
+    std::fs::remove_file(fleet.base.join("capture-delivery-nodeb-nodec")).unwrap();
+}
+
+#[test]
+fn hub_route_that_loops_only_briefly_still_delivers() {
+    // A grace far beyond every wait here, so a slow edge reconnect can
+    // never be mistaken for a settled loop.
+    let (fleet, _sender, recipient) = strand_at_hub("hub-flap", 3_600_000);
+    fleet::wait_until("hub custody waits unrouted", WAIT, || {
+        let hop: String = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT next_hop FROM envelopes WHERE correlation='strand' AND kind='message'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        hop.is_empty().then_some(())
+    });
+    std::fs::remove_file(fleet.base.join("capture-delivery-nodeb-nodec")).unwrap();
+    fleet.allow_edge("nodeb", "nodec");
+    read_once(&fleet, &recipient, "strand");
+    remote_state(&fleet, "strand", "read");
+    for node in ["nodea", "nodeb"] {
+        let outcomes: i64 = db(fleet.node(node))
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE correlation LIKE '%:undeliverable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcomes, 0, "no undeliverable outcome at {node}");
+    }
+}
+
+/// The same strand for an answer: the replier reaches the sender only
+/// through the hub, then the hub's own edge to the sender drops while it
+/// holds the answer, so its only route runs back through the replier.
+#[test]
+fn answer_whose_only_route_loops_at_a_hub_is_undeliverable_at_the_replier() {
+    let (fleet, sender, recipient) = setup(
+        "hub-strand-answer",
+        &[
+            NodeSpec::new("nodeb", "strand-answer-b", &["nodea", "nodec"])
+                .with_loop_grace_ms(1_000),
+            NodeSpec::new("nodec", "strand-answer-c", &["nodea"]),
+            NodeSpec::new("nodea", "strand-answer-a", &[]),
+        ],
+    );
+    send(&fleet, &sender, &recipient, "strand-answer");
+    read_once(&fleet, &recipient, "strand-answer");
+    fleet.refuse_edge("nodec", "nodea");
+    fleet.kill_edge("nodec", "nodea", WAIT);
+    route_via(&fleet, "nodec", "nodea", "nodeb");
+    let capture = fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, "").unwrap();
+    let response = api(
+        fleet.node("nodec"),
+        "msg.reply",
+        json!({"correlation_id":"strand-answer", "reply_correlation_id":"strand-answer-reply",
+               "body":"stranded at the hub"}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    fleet::wait_until("hub holds the answer", WAIT, || {
+        let delivery: Value = serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()?;
+        (delivery["envelope"]["key"]["origin_node"] == fleet.node_id("nodec").as_str())
+            .then_some(())
+    });
+    fleet.allow_edge("nodec", "nodea");
+    route_via(&fleet, "nodec", "nodea", "nodea");
+    fleet.refuse_edge("nodeb", "nodea");
+    fleet.kill_edge("nodeb", "nodea", WAIT);
+    route_via(&fleet, "nodeb", "nodea", "nodec");
+    let status = fleet::wait_until("hub-signed outcome at the replier", WAIT, || {
+        let response = api(
+            fleet.node("nodec"),
+            "msg.status",
+            json!({"correlation_id":"strand-answer-reply"}),
+        );
+        (response["result"]["state"] == "undeliverable").then_some(response)
+    });
+    assert_eq!(
+        status["result"]["detail"], "loop_detected at nodeb",
+        "{status}"
+    );
+    std::fs::remove_file(capture).unwrap();
+}
