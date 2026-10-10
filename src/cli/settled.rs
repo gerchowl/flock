@@ -25,7 +25,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{AgentStatus, Method, Request};
 use crate::api::schema::{AgentTarget, PaneTarget};
 
@@ -908,6 +908,14 @@ fn settled_core_observed(
             // set no `--timeout`: without one, a server that has stopped
             // answering entirely would keep a supervisor waiting indefinitely
             // (#614). With one, the deadline is the bound and it keeps that.
+            // A poll that timed out on a server that took the connection is a
+            // server too busy to answer in time, not one that is gone: it ends
+            // a run of failures rather than extending it, so an unbounded wait
+            // on a live delegate under load keeps waiting (#910).
+            Err(PinnedFailure::Slow) => {
+                observer(None);
+                interrupted.reached();
+            }
             Err(PinnedFailure::Retry) => {
                 observer(None);
                 interrupted.note(verb);
@@ -1071,7 +1079,13 @@ fn resolve_initial(
             InitialTarget::Pane(pane_id) => requests.pane_get(pane_id, timeout),
         };
         let value = match reply {
-            Err(()) => {
+            // Busy, not gone: see the same arm in the poll loop (#910).
+            Err(Unanswered::Slow) => {
+                interrupted.reached();
+                sleep_bounded(deadline);
+                continue;
+            }
+            Err(Unanswered::Unreachable) => {
                 // Retried rather than reported: the same live handoff that
                 // interrupts a wait can land between this process starting and
                 // its first request. Bounded by the same window when the caller
@@ -1117,6 +1131,10 @@ enum PinnedFailure {
     /// socket mid-wait, and a transport error is not an answer — the next tick
     /// finds the new server, or the deadline takes the wait.
     Retry,
+    /// The request timed out on a server that took the connection: it is
+    /// there, only slow. Retried like `Retry`, but it is not evidence that
+    /// the server is unreachable (#910).
+    Slow,
     /// A reply arrived after the deadline. Reported as 124 rather than as the
     /// error or the settle it happened to carry: a wait that ran out of clock
     /// does not get to reinterpret what it read on the way past.
@@ -1133,9 +1151,43 @@ enum PinnedFailure {
 /// deadline — are reachable from a test without a server or a live socket.
 trait PinnedRequests {
     /// `Err` is a transport failure: not an answer.
-    fn agent_get(&mut self, terminal_id: &str, timeout: Duration) -> Result<serde_json::Value, ()>;
+    fn agent_get(
+        &mut self,
+        terminal_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered>;
 
-    fn pane_get(&mut self, pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()>;
+    fn pane_get(
+        &mut self,
+        pane_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered>;
+}
+
+/// Why a request came back without an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unanswered {
+    /// No server to talk to: refused, missing, or the connection dropped.
+    Unreachable,
+    /// The request timed out (`EAGAIN` under load): the server is there but
+    /// did not answer within the request's timeout (#910).
+    Slow,
+}
+
+impl Unanswered {
+    fn of(err: &ApiClientError) -> Self {
+        match err {
+            ApiClientError::Io(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Self::Slow
+            }
+            _ => Self::Unreachable,
+        }
+    }
 }
 
 struct SocketRequests<'a> {
@@ -1143,7 +1195,11 @@ struct SocketRequests<'a> {
 }
 
 impl PinnedRequests for SocketRequests<'_> {
-    fn agent_get(&mut self, terminal_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+    fn agent_get(
+        &mut self,
+        terminal_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered> {
         self.client
             .request_value_with_timeout(
                 &Request {
@@ -1154,10 +1210,14 @@ impl PinnedRequests for SocketRequests<'_> {
                 },
                 timeout,
             )
-            .map_err(|_| ())
+            .map_err(|err| Unanswered::of(&err))
     }
 
-    fn pane_get(&mut self, pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+    fn pane_get(
+        &mut self,
+        pane_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered> {
         self.client
             .request_value_with_timeout(
                 &Request {
@@ -1168,7 +1228,7 @@ impl PinnedRequests for SocketRequests<'_> {
                 },
                 timeout,
             )
-            .map_err(|_| ())
+            .map_err(|err| Unanswered::of(&err))
     }
 }
 
@@ -1250,7 +1310,10 @@ fn sample_pinned(
     let agent_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
     let agent_value = requests
         .agent_get(&terminal_id, agent_timeout)
-        .map_err(|()| PinnedFailure::Retry)?;
+        .map_err(|unanswered| match unanswered {
+            Unanswered::Unreachable => PinnedFailure::Retry,
+            Unanswered::Slow => PinnedFailure::Slow,
+        })?;
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(PinnedFailure::TimedOut);
     }
@@ -1261,9 +1324,12 @@ fn sample_pinned(
         return classify_pinned(&terminal_id, &agent_value, None);
     }
     let pane_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
-    let pane_value = requests
-        .pane_get(wait.last_pane_id().unwrap_or_default(), pane_timeout)
-        .ok();
+    let pane_value = match requests.pane_get(wait.last_pane_id().unwrap_or_default(), pane_timeout)
+    {
+        Ok(value) => Some(value),
+        Err(Unanswered::Slow) => return Err(PinnedFailure::Slow),
+        Err(Unanswered::Unreachable) => None,
+    };
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(PinnedFailure::TimedOut);
     }
@@ -2346,7 +2412,7 @@ mod tests {
     /// regression that keeps polling fails the test rather than hanging it, and
     /// the bound catches the case where the wait is slow rather than endless.
     fn wait_over_script(
-        replies: Vec<Result<serde_json::Value, ()>>,
+        replies: Vec<Result<serde_json::Value, Unanswered>>,
         settle_ms: u64,
         timeout_ms: Option<u64>,
         unreachable: Duration,
@@ -2381,7 +2447,7 @@ mod tests {
         // budget is more than the window can spend, so a regression that keeps
         // polling runs out of replies and fails rather than hanging.
         let mut replies = vec![Ok(working_agent())];
-        replies.extend(vec![Err(()); 8]);
+        replies.extend(vec![Err(Unanswered::Unreachable); 8]);
 
         let (outcome, elapsed, asked) = wait_over_script(replies, 0, None, TEST_UNREACHABLE);
         match outcome {
@@ -2398,6 +2464,58 @@ mod tests {
         assert!(elapsed < TEST_CEILING, "{elapsed:?}");
     }
 
+    /// #910: a server that takes the connection but answers too slowly is not
+    /// unreachable. Under load every 2 s poll timed out as `EAGAIN`, the window
+    /// ran out, and `delegate wait` gave up on a live delegate. Slow requests
+    /// for longer than the window, in both the resolve and the polls, must
+    /// leave the wait running until the agent settles.
+    #[test]
+    fn a_slow_server_outlasting_the_window_is_still_waited_on() {
+        let mut replies = vec![Err(Unanswered::Slow); 7];
+        replies.push(Ok(working_agent()));
+        replies.extend(vec![Err(Unanswered::Slow); 7]);
+        replies.extend([Ok(idle_agent()), Ok(idle_agent())]);
+
+        let (outcome, elapsed, asked) = wait_over_script(replies, 0, None, TEST_UNREACHABLE);
+        assert!(
+            matches!(outcome, SettledOutcome::Settled { .. }),
+            "a busy server is waited on, not given up on: {outcome:?}"
+        );
+        assert!(
+            elapsed > TEST_UNREACHABLE * 2,
+            "each run of slow polls outlasted the window: {elapsed:?}"
+        );
+        assert_eq!(asked, 17, "the wait read every scripted reply");
+        assert!(elapsed < TEST_CEILING, "{elapsed:?}");
+    }
+
+    /// A timeout is classified as slow and anything else as unreachable: a
+    /// refused connection or a missing socket still ends an unbounded wait.
+    #[test]
+    fn only_a_timeout_counts_as_a_slow_server() {
+        let io = |kind: std::io::ErrorKind| ApiClientError::Io(kind.into());
+        assert_eq!(
+            Unanswered::of(&io(std::io::ErrorKind::WouldBlock)),
+            Unanswered::Slow
+        );
+        assert_eq!(
+            Unanswered::of(&io(std::io::ErrorKind::TimedOut)),
+            Unanswered::Slow
+        );
+        assert_eq!(
+            Unanswered::of(&io(std::io::ErrorKind::ConnectionRefused)),
+            Unanswered::Unreachable
+        );
+        assert_eq!(
+            Unanswered::of(&io(std::io::ErrorKind::NotFound)),
+            Unanswered::Unreachable
+        );
+        assert_eq!(
+            Unanswered::of(&ApiClientError::EmptyResponse),
+            Unanswered::Unreachable
+        );
+    }
+
     /// The same bound in the phase before it. A server that is not there at all
     /// never answers the resolve, and a caller who passed no `--timeout` used to
     /// sit in that loop forever having learned nothing about the agent — the
@@ -2405,8 +2523,12 @@ mod tests {
     /// answers once could miss entirely.
     #[test]
     fn a_resolve_that_never_answers_ends_on_the_window_too() {
-        let (outcome, elapsed, asked) =
-            wait_over_script(vec![Err(()); 8], 0, None, TEST_UNREACHABLE);
+        let (outcome, elapsed, asked) = wait_over_script(
+            vec![Err(Unanswered::Unreachable); 8],
+            0,
+            None,
+            TEST_UNREACHABLE,
+        );
         match outcome {
             SettledOutcome::Error(reason) => assert_eq!(
                 reason, "server unreachable for 1s; giving up",
@@ -2432,8 +2554,8 @@ mod tests {
         let (outcome, elapsed, _) = wait_over_script(
             vec![
                 Ok(working_agent()),
-                Err(()),
-                Err(()),
+                Err(Unanswered::Unreachable),
+                Err(Unanswered::Unreachable),
                 Ok(idle_agent()),
                 Ok(idle_agent()),
             ],
@@ -2460,7 +2582,7 @@ mod tests {
     #[test]
     fn a_timeout_longer_than_the_window_is_still_a_timeout() {
         let mut replies = vec![Ok(working_agent())];
-        replies.extend(vec![Err(()); 4]);
+        replies.extend(vec![Err(Unanswered::Unreachable); 4]);
 
         // 60 ms of window under a 250 ms deadline: under the old rule the run is
         // spent at the first poll (200 ms in), and this would report the
@@ -2478,7 +2600,7 @@ mod tests {
     #[test]
     fn a_timeout_shorter_than_the_window_is_still_a_timeout() {
         let mut replies = vec![Ok(working_agent())];
-        replies.extend(vec![Err(()); 3]);
+        replies.extend(vec![Err(Unanswered::Unreachable); 3]);
 
         let (outcome, elapsed, _) = wait_over_script(replies, 0, Some(40), UNREACHABLE_LIMIT);
         assert_eq!(outcome, SettledOutcome::TimedOut);
@@ -2546,14 +2668,14 @@ mod tests {
     /// server. `cost` is slept per reply, which is what makes the deadline tests
     /// real rather than simulated.
     struct Scripted {
-        replies: std::collections::VecDeque<Result<serde_json::Value, ()>>,
+        replies: std::collections::VecDeque<Result<serde_json::Value, Unanswered>>,
         cost: Duration,
         /// The timeout each request was actually granted, in order.
         granted: Vec<Duration>,
     }
 
     impl Scripted {
-        fn new(replies: Vec<Result<serde_json::Value, ()>>, cost: Duration) -> Self {
+        fn new(replies: Vec<Result<serde_json::Value, Unanswered>>, cost: Duration) -> Self {
             Self {
                 replies: replies.into(),
                 cost,
@@ -2561,7 +2683,7 @@ mod tests {
             }
         }
 
-        fn next(&mut self, timeout: Duration) -> Result<serde_json::Value, ()> {
+        fn next(&mut self, timeout: Duration) -> Result<serde_json::Value, Unanswered> {
             self.granted.push(timeout);
             std::thread::sleep(self.cost);
             self.replies
@@ -2575,11 +2697,15 @@ mod tests {
             &mut self,
             _terminal_id: &str,
             timeout: Duration,
-        ) -> Result<serde_json::Value, ()> {
+        ) -> Result<serde_json::Value, Unanswered> {
             self.next(timeout)
         }
 
-        fn pane_get(&mut self, _pane_id: &str, timeout: Duration) -> Result<serde_json::Value, ()> {
+        fn pane_get(
+            &mut self,
+            _pane_id: &str,
+            timeout: Duration,
+        ) -> Result<serde_json::Value, Unanswered> {
             self.next(timeout)
         }
     }

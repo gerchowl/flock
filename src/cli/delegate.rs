@@ -285,15 +285,21 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
         }
     };
 
-    let response = ApiClient::local()
-        .request_value_with_timeout(
-            &Request {
-                id: "cli:delegate".into(),
-                method,
-            },
-            timeout,
-        )
-        .map_err(|e| BoundedError::Transport(super::api_client_error_to_io(e)))?;
+    let request = Request {
+        id: "cli:delegate".into(),
+        method,
+    };
+    // Retried with backoff on a transient socket error, reads only, and never
+    // past the deadline (#910): under load a 2 s poll times out as EAGAIN while
+    // the server is alive, and one of those used to fail the whole verb.
+    let client = ApiClient::local();
+    let response = if RETRIES.get() {
+        client.request_value_retrying(&request, timeout, deadline)
+    } else {
+        client.request_value_with_timeout(&request, timeout)
+    };
+    let response =
+        response.map_err(|e| BoundedError::Transport(super::api_client_error_to_io(e)))?;
 
     // Check if deadline passed after the response.
     if let Some(deadline) = deadline {
@@ -312,6 +318,25 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
 
     // Return raw response; caller handles server errors.
     Ok(response)
+}
+
+thread_local! {
+    /// Whether `bounded` may retry a transient error. Off only inside
+    /// [`without_retries`].
+    static RETRIES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Run `work` with `bounded` sending each request once (#910).
+///
+/// For the wind-down after an outcome is already decided: the screen read a
+/// timeout reports, and the rollback of a start that failed. Those requests
+/// carry no deadline, but the verb's own clock has run out, so each of them
+/// costs at most one cap against a frozen server, as it did before retries.
+fn without_retries<T>(work: impl FnOnce() -> T) -> T {
+    let before = RETRIES.replace(false);
+    let result = work();
+    RETRIES.set(before);
+    result
 }
 
 /// `delegate`'s own exit codes.
@@ -2709,7 +2734,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
 /// failed is still a failed start, and the reason it could not finish is on
 /// stderr beside the cause.
 fn rollback(cleanup: &Cleanup) {
-    if let Err(err) = tear_down(cleanup, true, true) {
+    if let Err(err) = without_retries(|| tear_down(cleanup, true, true)) {
         eprintln!(
             "delegate {}: rollback also failed: {}",
             cleanup.name, err.message
@@ -4164,7 +4189,7 @@ impl Await<'_> {
             match decision {
                 SettledDecision::Report { outcome, info } => {
                     let code = outcome.exit_code();
-                    let screen = detection_screen(&self.entry.pane_id, None)
+                    let screen = without_retries(|| detection_screen(&self.entry.pane_id, None))
                         .unwrap_or_else(|| monitor.screen.clone());
                     let verdict = matches!(outcome, Outcome::Stalled)
                         .then(|| monitor.latest.clone())
@@ -4574,8 +4599,13 @@ fn emit_ready_timeout(
     json: bool,
     reason: &str,
 ) {
-    let screen = detection_screen(pane_id, None).unwrap_or_default();
-    let status = Some(agent_record(terminal_id, None));
+    let (screen, status) = without_retries(|| {
+        (
+            detection_screen(pane_id, None).unwrap_or_default(),
+            agent_record(terminal_id, None),
+        )
+    });
+    let status = Some(status);
     let status = match &status {
         Some(AgentFetch::Found(record)) => field(record, "agent_status").unwrap_or("unknown"),
         _ => "unknown",

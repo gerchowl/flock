@@ -2,7 +2,7 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
@@ -12,6 +12,13 @@ use crate::api::schema::{
 };
 
 const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
+
+/// How many times `request_value_retrying` sends a request again after a
+/// transient transport error, on top of the first attempt.
+const TRANSIENT_RETRIES: u32 = 3;
+
+/// The pause before the first retry, doubled before each one after it.
+const TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// API connection target resolved by clients at the process edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,13 +82,87 @@ impl ApiClient {
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
-        let mut stream = self.connect()?;
-        stream.set_write_timeout(Some(timeout))?;
-        stream.set_read_timeout(Some(timeout))?;
-        write_request(&mut stream, request)?;
+        self.exchange_with_timeout(request, timeout)
+            .map_err(Attempt::into_error)
+    }
+
+    /// `request_value_with_timeout`, sent again with backoff when the socket
+    /// answers with a transient error (#910).
+    ///
+    /// Under load a read timeout surfaces as `EAGAIN` ("Resource temporarily
+    /// unavailable", os error 11 on Linux): the server is there, just slow.
+    /// One such error used to fail a whole CLI command. Now the request is
+    /// retried up to [`TRANSIENT_RETRIES`] times, but only where that is safe:
+    /// a failure before the request was written (the connect) retries for any
+    /// method, one after it only for a [`Method::is_retry_safe`] read, since
+    /// the server may already have applied a write it never answered.
+    ///
+    /// `timeout` bounds each attempt and `deadline`, when given, bounds all of
+    /// them: no attempt is granted more than the time left, and no retry
+    /// starts that its backoff would carry past the deadline.
+    pub fn request_value_retrying(
+        &self,
+        request: &Request,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<serde_json::Value, ApiClientError> {
+        self.check_allocation_preview_protocol(request, Some(timeout))?;
+        let mut backoff = TRANSIENT_BACKOFF;
+        let mut retries = 0;
+        loop {
+            let attempt_timeout = match deadline {
+                None => timeout,
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
+                    }
+                    left.min(timeout)
+                }
+            };
+            let failure = match self.exchange_with_timeout(request, attempt_timeout) {
+                Ok(response) => return Ok(response),
+                Err(failure) => failure,
+            };
+            let retry = retries < TRANSIENT_RETRIES
+                && failure.is_transient()
+                && (failure.before_send() || request.method.is_retry_safe())
+                && deadline.is_none_or(|deadline| Instant::now() + backoff < deadline);
+            if !retry {
+                return Err(failure.into_error());
+            }
+            tracing::debug!(
+                request = request.id.as_str(),
+                retry = retries + 1,
+                error = failure.error().to_string().as_str(),
+                "api request hit a transient error; retrying",
+            );
+            std::thread::sleep(backoff);
+            backoff *= 2;
+            retries += 1;
+        }
+    }
+
+    /// One bounded round trip, saying whether it failed before the request
+    /// reached the socket.
+    fn exchange_with_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Attempt> {
+        let mut stream = self
+            .connect()
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
 
         let mut reader = BufReader::new(stream);
-        let mut response = read_json_line(&mut reader)?;
+        let mut response = read_json_line(&mut reader).map_err(Attempt::AfterSend)?;
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
         } else {
@@ -173,6 +254,46 @@ impl ApiClient {
 
     fn connect(&self) -> io::Result<UnixStream> {
         UnixStream::connect(self.socket_path())
+    }
+}
+
+/// How one round trip failed, split at the point where the server could
+/// first have seen the request.
+#[derive(Debug)]
+enum Attempt {
+    /// Nothing was written: sending again cannot apply anything twice.
+    BeforeSend(ApiClientError),
+    /// The request may have reached the server, whatever came back.
+    AfterSend(ApiClientError),
+}
+
+impl Attempt {
+    fn error(&self) -> &ApiClientError {
+        match self {
+            Self::BeforeSend(err) | Self::AfterSend(err) => err,
+        }
+    }
+
+    fn into_error(self) -> ApiClientError {
+        match self {
+            Self::BeforeSend(err) | Self::AfterSend(err) => err,
+        }
+    }
+
+    fn before_send(&self) -> bool {
+        matches!(self, Self::BeforeSend(_))
+    }
+
+    /// `EAGAIN`/`EWOULDBLOCK` is how a socket timeout surfaces, and `TimedOut`
+    /// is the same event on a platform that names it. Anything else (a refused
+    /// connection, a missing socket, a reply that does not parse) is not going
+    /// to change by asking again a moment later.
+    fn is_transient(&self) -> bool {
+        matches!(
+            self.error(),
+            ApiClientError::Io(err)
+                if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        )
     }
 }
 
@@ -380,6 +501,161 @@ mod tests {
         assert_eq!(response["result"]["type"], "allocation_plan");
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A fake server for #910 that takes exactly `connections` connections,
+    /// reads each request, and leaves the first `stalls` of them unanswered so
+    /// the client's read times out with `EAGAIN`, the way a server under load
+    /// does. Every later one gets a `pong`. The thread hands back the listener,
+    /// switched to non-blocking, so a test can prove nothing else connected.
+    fn stalling_server(
+        name: &str,
+        stalls: usize,
+        connections: usize,
+    ) -> (PathBuf, std::thread::JoinHandle<StallingServer>) {
+        let path = std::env::temp_dir().join(format!("f910-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut seen = Vec::new();
+            for index in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: Request = read_json_line(&mut reader).unwrap();
+                if index >= stalls {
+                    let response = serde_json::json!({"id": request.id, "result": {
+                        "type": "pong", "version": "test", "protocol": 27,
+                    }});
+                    writeln!(reader.get_mut(), "{response}").unwrap();
+                } else {
+                    held.push(reader);
+                }
+                seen.push(request);
+            }
+            listener.set_nonblocking(true).unwrap();
+            // The stalled connections are handed back rather than dropped: a
+            // close here would reach the client as EOF instead of a timeout.
+            (listener, seen, held)
+        });
+        (path, server)
+    }
+
+    type StallingServer = (
+        std::os::unix::net::UnixListener,
+        Vec<Request>,
+        Vec<BufReader<UnixStream>>,
+    );
+
+    fn assert_no_further_connection(listener: &std::os::unix::net::UnixListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the client connected more often than the test allowed"
+        );
+    }
+
+    fn agent_get() -> Request {
+        Request {
+            id: "f910".into(),
+            method: Method::AgentGet(crate::api::schema::AgentTarget {
+                target: "worker".into(),
+            }),
+        }
+    }
+
+    const ATTEMPT: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn a_read_is_retried_through_eagain_until_it_is_answered() {
+        let (path, server) = stalling_server("read", 2, 3);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let response = client
+            .request_value_retrying(&agent_get(), ATTEMPT, None)
+            .expect("the third attempt is answered");
+        assert_eq!(response["result"]["type"], "pong");
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|request| request == &agent_get()));
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_timed_out_is_not_sent_again() {
+        let (path, server) = stalling_server("write", 1, 1);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let close = Request {
+            id: "f910".into(),
+            method: Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: "w1:p1".into(),
+            }),
+        };
+        let error = client
+            .request_value_retrying(&close, ATTEMPT, None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "the timeout is reported as it happened: {error:?}"
+        );
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen, vec![close]);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_read_that_never_answers_gives_up_after_the_retries() {
+        let attempts = TRANSIENT_RETRIES as usize + 1;
+        let (path, server) = stalling_server("never", attempts, attempts);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let error = client
+            .request_value_retrying(&agent_get(), ATTEMPT, None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), attempts);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_retry_starts_that_the_deadline_cannot_hold() {
+        let (path, server) = stalling_server("deadline", 1, 1);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        // One 50 ms attempt fits; the 100 ms backoff after it does not.
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let error = client
+            .request_value_retrying(&agent_get(), ATTEMPT, Some(deadline))
+            .unwrap_err();
+        assert!(matches!(&error, ApiClientError::Io(_)), "{error:?}");
+        assert!(Instant::now() < deadline + ATTEMPT);
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn only_reads_and_previews_are_retry_safe() {
+        assert!(agent_get().method.is_retry_safe());
+        assert!(Method::Ping(PingParams::default()).is_retry_safe());
+        assert!(
+            Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                dry_run: true,
+                ..Default::default()
+            })
+            .is_retry_safe()
+        );
+        assert!(!Method::WorktreeCreate(Default::default()).is_retry_safe());
+        assert!(!Method::PaneClose(crate::api::schema::PaneTarget {
+            pane_id: "w1:p1".into(),
+        })
+        .is_retry_safe());
+        assert!(!Method::MsgRead(crate::api::schema::MsgReadParams { pane: None }).is_retry_safe());
     }
 
     #[test]

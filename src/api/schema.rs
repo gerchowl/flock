@@ -258,6 +258,44 @@ impl Method {
             _ => false,
         }
     }
+
+    /// Can this request be sent again after a transport error that left its
+    /// fate unknown (#910)?
+    ///
+    /// Only reads qualify: a read timeout on a write says nothing about
+    /// whether the server applied it, and sending a `pane.close` twice turns
+    /// "closed" into `pane_not_found`. `msg.read` is left out on purpose, it
+    /// consumes the inbox it reads. An allocation preview writes nothing, so
+    /// it reads like a list.
+    pub(crate) fn is_retry_safe(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping(_)
+                | Self::NotificationList(_)
+                | Self::HandoffList(_)
+                | Self::HandoffRead(_)
+                | Self::WorkspaceList(_)
+                | Self::WorkspaceGet(_)
+                | Self::WorktreeList(_)
+                | Self::TabList(_)
+                | Self::TabGet(_)
+                | Self::PeersSummary(_)
+                | Self::AgentList(_)
+                | Self::AgentGet(_)
+                | Self::AgentRead(_)
+                | Self::AgentHistory(_)
+                | Self::AgentResult(_)
+                | Self::AgentLineage(_)
+                | Self::MsgList(_)
+                | Self::MsgStatus(_)
+                | Self::PeersEnrollment(_)
+                | Self::PaneList(_)
+                | Self::PaneGet(_)
+                | Self::PaneRead(_)
+                | Self::ChecksList(_)
+                | Self::FleetStatus(_)
+        ) || self.is_allocation_preview()
+    }
 }
 
 /// `revert.run` params.
