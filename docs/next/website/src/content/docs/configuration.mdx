@@ -217,7 +217,7 @@ If you have old custom keybindings and want the new defaults, run `flk config re
 
 ## Checking a config
 
-Flock shows config problems as a yellow warning banner in the session, which only helps once you are looking at it. Removed mesh keys also warn once per CLI invocation and appear in `flk status`; they do not prevent startup, live handoff, or reload, and other settings remain intact. `flk config check --json` reports source locations in JSON and exits `1` for removed or unknown keys (`0` for clean config, `2` for parse failure). To check interactively, run `flk config check`:
+Flock shows config problems as a yellow warning banner in the session, which only helps once you are looking at it. Removed mesh keys also warn on stderr once per CLI invocation (except `flk hook` and `flk mcp`, which run on every agent turn) and appear once in `flk status`; they do not prevent startup, live handoff, or reload, and other settings remain intact. `flk config check --json` reports source locations in JSON and exits `1` for removed or unknown keys (`0` for clean config, `2` for parse failure). To check interactively, run `flk config check`:
 
 ```bash
 $ flk config check

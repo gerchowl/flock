@@ -101,6 +101,18 @@ mod web;
 mod workspace;
 mod worktree;
 
+/// Whether this invocation warns about removed config keys on stderr before it
+/// runs. `config check` and `status` report them in their own output, and
+/// hooks and the MCP server run on every agent turn and tool call, where the
+/// warning is noise and the config scan is wasted work (#860).
+fn prints_removed_config_warnings(args: &[String]) -> bool {
+    match args.get(1).map(String::as_str) {
+        Some("status" | "hook" | "mcp") => false,
+        Some("config") => args.get(2).map(String::as_str) != Some("check"),
+        _ => true,
+    }
+}
+
 fn init_logging() {
     crate::logging::init_file_logging("flock.log");
 }
@@ -454,9 +466,7 @@ fn run() -> io::Result<()> {
         std::process::exit(2);
     }
 
-    if !(args.get(1).is_some_and(|arg| arg == "config")
-        && args.get(2).is_some_and(|arg| arg == "check"))
-    {
+    if prints_removed_config_warnings(&args) {
         for warning in config::removed_config_warnings() {
             eprintln!("warning: {warning}");
         }
@@ -846,6 +856,23 @@ fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_config_warnings_skip_commands_that_report_or_run_per_turn() {
+        let args = |line: &str| -> Vec<String> { line.split(' ').map(String::from).collect() };
+        for quiet in [
+            "flk status",
+            "flk status --json",
+            "flk hook stop",
+            "flk mcp",
+            "flk config check",
+        ] {
+            assert!(!prints_removed_config_warnings(&args(quiet)), "{quiet}");
+        }
+        for loud in ["flk", "flk --version", "flk config edit", "flk pane list"] {
+            assert!(prints_removed_config_warnings(&args(loud)), "{loud}");
+        }
+    }
 
     #[test]
     fn default_config_output_parses_back_to_default_config() {

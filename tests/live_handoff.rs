@@ -1458,7 +1458,20 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
         String::from_utf8_lossy(&status.stderr)
             .matches("delete this line")
             .count(),
-        1
+        0,
+        "status carries the warning in its JSON, not again on stderr (#860)"
+    );
+    let plain = run(&["status"]);
+    assert!(plain.status.success());
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        shown.matches("delete this line").count(),
+        1,
+        "plain status prints each warning once (#860): {shown}"
     );
     let version = run(&["--version"]);
     assert!(version.status.success());
