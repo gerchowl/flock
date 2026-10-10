@@ -2,6 +2,72 @@
 
 ## Unreleased
 
+## [1.0.0] - 2026-10-10
+
+### Changed
+- Enable SSH compression for remote attach, peer connections, and remote installs to reduce bandwidth use on slow links (#474)
+- Authenticate held peer edges with mutual node-key proofs, bind inbound identities to their signed names while honoring configured aliases and atomically pinning both directions on first contact and refusing later configured-name impersonation, persist separate configured and inbound pins, expose enrollment and refusal reasons in peer status, and preserve status with older servers, and show the affected pin before an operator resets a replaced peer key (#623)
+- Read mesh `msg.status` and `msg.wait_reply` from the durable custody store, so `queued`, `custody`, `delivered`, `read`, `held`, `collected`, `expired` and `outcome_retention_elapsed` survive audit rotation, restart and handoff; return read receipts to the sender over authenticated collection; hand out a signed status `reference` that still answers after outcome cleanup; report refusals as their own `refused` outcome with the receiver's reason; `flk msg status` and `flk wait reply` exit 3 when no answer can follow and 4 on a refusal; `reply_contract` tells a durable return binding apart from best-effort routing, while `replyable` keeps meaning a reply can be routed, the same on `msg.read` and the MCP channel push (#623)
+- Persist spoke-originated messages for authenticated hub collection, deduplicate across lost acknowledgements and restarts, and hold replies for push-down after reconnect; refuse forwarding beyond the hub in mesh step 1; mesh wire version 4 replaces version 3, so connected nodes must upgrade together (#623)
+- Breaking: require a coordinated v1.0.0 fleet upgrade with matching mesh protocols and origin policy keyed to configured or inbound first-contact pin names; upgrade dev mail stores in place with backup and quarantine recovery guidance (#661)
+- Upgrade existing mesh mail stores in place to the v12 baseline, repair missing defaultable columns, archive full raw quarantined rows to mode-0600 `mesh-quarantine.jsonl` beside the mail store before clearing bodies (64 MiB per file, two files retained; base64-decode the body and envelope fields for recovery), retain the original row on backup failure, tighten store permissions on a best-effort basis, and prepare signed envelopes and durable next-hop custody for mesh routing. (#661)
+- Forward fleet requests through authenticated mesh routes with signed origins, bounded hops, durable custody, and offline queuing for known owners (#661)
+- `agent send` and `pane send-text` now confirm visible paste delivery, including folded paste chips, draft appends, busy or unsupported harnesses, and repeated terminal input, with explicit evidence levels; the weakest, `screen_changed`, waits the full observation window and can reflect unrelated activity such as a clock or `tail -f`, while an unchanged recognized composer remains unconfirmed; unconfirmed sends exit 8 and abandoned guarded submissions exit 9, with matching MCP errors and preserved outcome evidence. (#784)
+
+### Added
+- Persist a per-user Ed25519 node identity across restarts, refuse copied identities when machine binding is available, warn when clone detection is unavailable, and report the node ID in ping and peer summaries (#623)
+- Add custody writer transfer across live handoff with generation checks and durable delivery recovery; keep panes running if the store cannot reopen, report suspended mesh status and retry recovery, and quarantine undecodable mailbox records (#623)
+- Persist message custody before acknowledging sends, return server-minted message keys, authenticate each one-hop origin, deliver over held mesh edges with transactional inbox deduplication, retry queued mail after restart, and rebuild mailboxes from the custody store in headless and monolithic mode; incompatible peers retain queued mail with an upgrade warning (#623)
+- Retain bounded wake and submit attempt evidence, exposing unconfirmed or abandoned submissions with reasons in message status, lists, MCP responses and the digest without marking unread mail as read. (#640)
+- Support multiple authenticated inbound mesh edges per node, so independent hubs can connect and deliver mail concurrently without sharing enrollment identity. (#661)
+- Discover signed mesh routes across enrolled inbound and outbound edges, withdraw routes when edges close, and retain offline agent owner hints across restarts; inspect next hops with `flk peers status --json` (#661)
+- Retry failed route exchanges with bounded backoff, recover topology after fleet resume, and retire records omitted from a supplier’s full view (#661)
+- Prevent route records from echoing back to their sole supplier, and clear retry backoff on route wakes or topology changes (#661)
+- Document multi-hop custody for requests, answers and receipts, live routes in peer status, and reply-wait exit codes for refusal, recipient removal and elapsed outcome retention (#661)
+- Route answers, follow-up replies, and delivery/read/removal receipts back across mesh hops, including when a laptop reconnects through another hub. Pre-upgrade dev-store answers missing their copied collection token are refused as `invalid reply binding` after migration. (#661)
+- Peer enrollment status records and shows whether a pin came from dialing or inbound first contact, preserving its origin across reconnects and restarts (#751)
+
+### Maintenance
+- Add the standalone durable mesh custody store with transactional inbox deduplication, bounded storage, retained outcomes, and pause-aware expiry clocks as groundwork for cross-host replies (#623)
+- Add isolated multi-node fleet test controls for node restarts, directed connection failures, held-edge termination, and simulated legacy or incompatible mesh peers (#623)
+- Isolate every test flk launch, reap fleet node and SSH relay process groups, wait for discovery before partitioning idle-custody tests, and add mesh diamond and two-hub laptop topology helpers (#661)
+- Add isolated mesh acceptance coverage for multi-hop delivery, replies, custody recovery, routing, and refusal diagnostics, with route-generation diagnostics in `peers.enrollment`. (#661)
+- Record the accepted mesh fleet transport design, including durable message custody, sender-side reply collection and the coordinated v1.0.0 clean break in ADR-0026 (#661)
+- Add Codex startup regression coverage for confirmed brief submission beneath passive update and quota warnings, and refusal without typing into the interactive update dialog (#723)
+- Avoid racing pane cleanup in the Claude delegate trust-dialog test and report the agent list immediately when a status wait loses its agent (#761)
+- Isolate integration-test server homes and XDG directories so mesh mail and deferral state cannot leak between tests or into local runs. (#779)
+- Name failed assertions and capture committed writes in the failed-reply mesh regression test to diagnose intermittent failures (#781)
+- Stabilize hook socket reads, strict-umask mesh startup, and foreground-directory integration checks by waiting for readiness (#791)
+
+### Fixed
+- Hold direct-edge replies and mute deferrals durably for authenticated origin collection, so a recipient can answer an offline sender without its own peer entry; keep held answers out of outbound retry slots and push them when an outbound edge enrolls; resume collection after restart and fleet pause without duplicate inbox imports; mesh wire version 3 replaces version 2, so connected nodes must upgrade together (#623)
+- Stop retrying permanently refused mesh mail and return hub read receipts promptly, with one-hop acceptance coverage for disconnects, restarts, lost acknowledgements, audit rotation, pause, and live handoff (#623)
+- Keep the server responsive while cross-host message sends, replies and mute deferrals wait for SSH, using a shared bounded worker pool without changing delivery responses. (#623)
+- The stop-hook mail nudge now names `flk msg read --pane <pane_id>` as a fallback when the `flock_msg_read` MCP tool is unavailable, so agents can still read their inbox without a connected MCP bridge. (#629)
+- Guard automated agent submissions and inbox wakes against drafts, dialogs and operator edits, confirm new turns, and retry Enter at most once without retyping the prompt (#639).
+- Wake dialers when mesh answers or receipts are ready, collect follow-up replies over one-way edges, retry failed answer pushes without re-enrollment, and retain read or expiry receipts until the original is ready. (#661)
+- Send directly over a live authenticated peer edge while topology adverts are still catching up, so newly discovered direct recipients report delivery instead of premature queuing (#661)
+- Report a peer still running a pre-mesh flk, such as v0.11.0 during a rolling upgrade, as `upgrade flk on <peer> (peer runs a pre-mesh flk)` in peer status and send errors, and retry it only on the long refusal backoff instead of as a transient stream failure. (#661)
+- Retain mail through hibernation, same-session restart and resume failure; authoritative agent removal now reports `recipient_gone`, while replies to removed senders remain available in conversation status. Replacement agents in reused panes receive fresh identities without inheriting removed agents’ unread mail, and resumable agent exits return to the shell. (#661)
+- Keep mesh recovery off the app loop, isolate reply waiters from the custody writer, preserve finished delivery attempts, report read-time expiry and quarantined mail, and retry unknown handshake failures (#661)
+- Recognize Codex 0.160.1 composers for guarded `agent send --submit` in default and `--no-alt-screen` modes, including after a live server handoff (#721).
+- Recover mesh edges promptly after peer server restarts with short, jittered retries for transient enrollment failures, while retaining longer backoff and visible reasons for genuine refusals. (#754)
+- Keep Codex marked as working while its “Giving this request a little extra thought” menu waits for a response, so supervisors do not settle the turn early (#763)
+- Spoke outbox collection leases each offer atomically and acknowledges surviving messages even when another acknowledged row has expired. Transient hub storage failures preserve custody for retry. (#776)
+- Codex delegate submission waits for a partial composer repaint before sending Enter; awaits report `not_started` (exit 8) only after an unchanged empty composer stays idle with no new turn for 30 seconds plus settle time, and include that evidence in S1 advice. (#785)
+- Report transient mesh connection failures as retrying instead of refused, preserving the reason while a peer reconnects. (#806)
+- `agent start --workspace` and `--tab` replace an untouched lone root shell or open a new tab; splitting now requires `--split`, and delegates start at `p1` without an extra shell (#818)
+- Report client/server protocol skew when discovered by existing pings or failed commands, with a uniform recovery message and exit code 78 for unsupported commands, and a structured MCP error; reject delegation and submitted sends before side effects on older servers. (#831)
+- Verify agent restarts with the Claude Code, Codex, or OpenCode composer, preserving retry plans and queued mail when resume cannot be confirmed (#835)
+- Removed mesh config keys now warn instead of refusing startup: startup, live handoff, and reload ignore them while preserving other settings; warnings name the file, line, and key in `flk status` and CLI stderr. `flk config check [--json]` lists removed and unknown keys before a fleet upgrade and exits 1 on warnings. (#844)
+- Clear the custody lease when a loop or exhausted hop budget invalidates a mesh route; retain the message without retrying that route until the topology changes. (#853)
+- Report a forwarded message's terminal refusal to its sender: when the owning node behind a hub refuses with `msg_not_allowed` or `recipient_gone`, it returns a receipt it signs itself. The hub routes that receipt back, so the sender's `msg.status` shows `refused` with the reason, or `recipient_gone`, instead of staying in `custody` until expiry. Origins accept only the recipient's own signature, so a hub cannot mint a refusal. This raises the mesh protocol to 5; development builds on protocol 4 are refused at hello with `upgrade flk on <peer>`. (#872)
+- Raise the CI check job timeout from 25 to 40 minutes so the macos-15 leg is no longer cancelled after all tests pass (#873)
+
+### Removed
+- Remove the single-hub messaging contract and document migration from obsolete uplink methods, relay attachment, caller-asserted hosts and transport settings to enrolled mesh edges (#661)
+- Remove caller-asserted message hosts and legacy relay completion; obsolete mesh config keys are named with file-and-line migration instructions (#661)
+
 ## [0.11.0] - 2026-10-08
 
 ### Changed

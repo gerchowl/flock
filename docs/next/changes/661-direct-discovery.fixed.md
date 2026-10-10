@@ -1,1 +1,0 @@
-- Send directly over a live authenticated peer edge while topology adverts are still catching up, so newly discovered direct recipients report delivery instead of premature queuing (#661)

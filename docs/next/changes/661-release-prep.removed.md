@@ -1,1 +1,0 @@
-- Remove the single-hub messaging contract and document migration from obsolete uplink methods, relay attachment, caller-asserted hosts and transport settings to enrolled mesh edges (#661)
