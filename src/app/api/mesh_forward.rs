@@ -333,9 +333,12 @@ mod tests {
                 .map_err(|e| e.to_string())
         })
         .unwrap();
+        // The second pass runs after a route change, which is when an
+        // unrouted row is offered again.
         for _ in 0..2 {
             app.mesh_retry_at = None;
             app.retry_mesh_mail();
+            app.mesh_routes.table.invalidate();
         }
         let next_hop = with_store(|store| {
             Ok(store
