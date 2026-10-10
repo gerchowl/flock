@@ -595,7 +595,7 @@ impl App {
             .and_then(|session| crate::detect::parse_agent_label(&session.agent))
             .ok_or("unknown_composer")?;
         let runtime = self.terminal_runtimes.get(id).ok_or("runtime_missing")?;
-        match super::guarded_submit::composer(agent, &runtime.detection_text(), "") {
+        match super::guarded_submit::runtime_composer(agent, runtime, "") {
             super::guarded_submit::Composer::Empty => Ok(()),
             super::guarded_submit::Composer::Unknown => Err("unknown_composer"),
             _ => Err("composer_not_empty"),

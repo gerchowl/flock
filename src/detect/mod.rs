@@ -344,18 +344,16 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
 /// Whether the agent's input box is on screen and EMPTY — `None` when this
 /// agent's box cannot be read at all (ADR-0018 §2). The idle wake types only
 /// into an empty box: text already there is somebody's unsent draft, and a
-/// sentence appended to it would be submitted along with it.
+/// sentence appended to it would be submitted along with it. Callers pass a
+/// read whose faint cells are blanked, which is what keeps Claude's dimmed
+/// prompt suggestion from reading as a draft (#892).
 pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool> {
     match agent {
-        Agent::Claude => agents::claude_code::prompt_input(screen_content)
-            .map(|typed| typed.is_empty() || agents::claude_code::is_prompt_suggestion(&typed)),
+        Agent::Claude => {
+            agents::claude_code::prompt_input(screen_content).map(|typed| typed.is_empty())
+        }
         _ => None,
     }
-}
-
-/// Whether a Claude composer row is only Claude's ghost-text suggestion.
-pub(crate) fn claude_prompt_suggestion(row: &str) -> bool {
-    agents::claude_code::is_prompt_suggestion(row)
 }
 
 /// Read the recognized Claude composer from the unscrolled detection snapshot.
@@ -1345,8 +1343,9 @@ mod tests {
         let wrapped = "─────────────\n❯ \n  continued draft\n─────────────";
         assert_eq!(agent_prompt_is_empty(Agent::Claude, wrapped), Some(false));
 
-        let suggestion = "─────────────\n❯ Try \"refactor check-ssot.sh\"\n─────────────";
-        assert_eq!(agent_prompt_is_empty(Agent::Claude, suggestion), Some(true));
+        // Text alone cannot tell a suggestion from a draft, so it reads as typed (#892).
+        let typed = "─────────────\n❯ Try \"refactor check-ssot.sh\"\n─────────────";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, typed), Some(false));
 
         assert_eq!(agent_prompt_is_empty(Agent::Claude, "no box at all"), None);
         assert_eq!(agent_prompt_is_empty(Agent::Codex, empty), None);

@@ -388,7 +388,7 @@ impl App {
         // the sentence. Read off the screen here, at the keystroke, never on
         // the tick.
         match agent.and_then(|agent| {
-            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text())
+            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text_and_unfaint().1)
         }) {
             Some(true) => {}
             Some(false) => return Decision::Suppressed("prompt_not_empty"),

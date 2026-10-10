@@ -354,9 +354,9 @@ impl App {
         // Quiet is not empty: a draft left in the box would be submitted with
         // this. Read the screen here, at the keystroke, never on an earlier tick.
         let agent = terminal.effective_known_agent();
-        match agent
-            .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
-        {
+        match agent.and_then(|agent| {
+            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text_and_unfaint().1)
+        }) {
             Some(true) => {}
             Some(false) => return SelfCompactDecision::Suppressed("prompt_not_empty"),
             None => return SelfCompactDecision::Suppressed("no_prompt_box"),
