@@ -169,7 +169,7 @@ fn refused_mode(tag: &str, mode: MeshMode, expected: &str) {
             status["reason"]
                 .as_str()
                 .unwrap()
-                .contains(&format!("local 4, remote {version}")),
+                .contains(&format!("local 5, remote {version}")),
             "{status}"
         );
     }
@@ -191,6 +191,15 @@ fn version_mismatch_is_refused_with_upgrade_instruction() {
         "mesh-version",
         MeshMode::VersionMismatch(99),
         "upgrade flk on this node",
+    );
+}
+
+#[test]
+fn previous_mesh_version_peer_is_refused_with_upgrade_instruction() {
+    refused_mode(
+        "mesh-version-4",
+        MeshMode::VersionMismatch(4),
+        "upgrade flk on acceptor.test",
     );
 }
 
