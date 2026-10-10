@@ -235,6 +235,120 @@ mod tests {
         let failure = crate::peers::PeerMessageFailure::Reroute("loop_detected".into());
         assert!(!failure.retryable());
     }
+    /// This hub's only route to the recipient runs back through the spoke
+    /// the mail came from, the topology of #866 after the laptop's direct
+    /// edge to this hub drops.
+    fn hub_reachable_only_through_spoke() -> (App, Deliver) {
+        let mut app = app();
+        app.node_id = Some(
+            crate::mesh::identity::NodeIdentity::load()
+                .unwrap()
+                .node_id(),
+        );
+        let spoke = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let laptop = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let peer = crate::config::PeerConfig {
+            name: "spoke".into(),
+            ssh: "loop-reroute-test-nonexistent-host.invalid".into(),
+            ..Default::default()
+        };
+        crate::peer_stream::test_enroll(&peer, &spoke.node_id());
+        app.state.peers = vec![peer];
+        app.refresh_mesh_routes();
+        let adjacency = |node: &crate::mesh::identity::NodeIdentity, name: &str| {
+            crate::mesh::routes::Adjacency {
+                node_id: node.node_id(),
+                name: name.into(),
+            }
+        };
+        let hub = crate::mesh::routes::Adjacency {
+            node_id: app.node_id.clone().unwrap(),
+            name: "hub".into(),
+        };
+        app.mesh_routes.table.learn(
+            &spoke.node_id(),
+            vec![
+                crate::mesh::routes::Advert::signed(
+                    &spoke,
+                    "spoke".into(),
+                    (1, 1),
+                    vec![hub, adjacency(&laptop, "laptop")],
+                ),
+                crate::mesh::routes::Advert::signed(
+                    &laptop,
+                    "laptop".into(),
+                    (1, 1),
+                    vec![adjacency(&spoke, "spoke")],
+                ),
+            ],
+        );
+        assert_eq!(
+            app.mesh_routes.table.next_hop(&laptop.node_id()),
+            Some(spoke.node_id())
+        );
+        let mut envelope = crate::mesh::sign::tests::signed();
+        envelope.return_binding.recipient_node = laptop.node_id();
+        crate::mesh::sign::seal(&mut envelope, &spoke);
+        let delivery = Deliver {
+            visited: vec![spoke.node_id()],
+            envelope,
+            remaining_ms: 60_000,
+            hops_left: 7,
+        };
+        (app, delivery)
+    }
+    #[tokio::test]
+    async fn hub_refuses_mail_whose_only_route_is_back_through_its_sender() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, delivery) = hub_reachable_only_through_spoke();
+        // The store refuses before taking custody, so the sender keeps it.
+        let refusal = app.accept_forwarded_request(&delivery).unwrap_err();
+        assert_eq!(
+            refusal.split(':').next(),
+            Some("loop_detected"),
+            "{refusal}"
+        );
+        let held = with_store(|store| store.get(&delivery.envelope.key).map_err(|e| e.to_string()))
+            .unwrap();
+        assert!(held.is_none(), "custody stays with the sender");
+    }
+    #[tokio::test]
+    async fn hub_never_routes_custody_to_a_node_it_already_crossed() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, delivery) = hub_reachable_only_through_spoke();
+        let hub = app.node_id.clone().unwrap();
+        // Custody taken while this hub had no route at all, then the only
+        // route that appears leads back through the spoke.
+        with_store(|store| {
+            store
+                .accept_forward(
+                    &delivery.envelope,
+                    delivery.remaining_ms,
+                    delivery.hops_left - 1,
+                    &[delivery.visited[0].clone(), hub],
+                    "",
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        // The second pass runs after a route change, which is when an
+        // unrouted row is offered again.
+        for _ in 0..2 {
+            app.mesh_retry_at = None;
+            app.retry_mesh_mail();
+            app.mesh_routes.table.invalidate();
+        }
+        let next_hop = with_store(|store| {
+            Ok(store
+                .collection_record(&delivery.envelope.key, now_ms() as i64)
+                .map_err(|e| e.to_string())?
+                .map(|record| record.next_hop))
+        })
+        .unwrap();
+        assert_eq!(next_hop.as_deref(), Some(""), "never offered to the spoke");
+    }
     #[tokio::test]
     async fn hop_budget_exhausted_refuses_only_forwarding() {
         let _store = crate::mesh::runtime_store::TestStore::new();
