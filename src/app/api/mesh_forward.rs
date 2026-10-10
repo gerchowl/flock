@@ -58,6 +58,7 @@ impl App {
         NextHop { node, name, peer }
     }
 
+    /// The upgrade instruction for a refused peer on this request's route.
     pub(super) fn incompatible_request_peer(&self, owner: &str, next: &str) -> Option<String> {
         self.state.peers.iter().find_map(|peer| {
             let status = crate::peer_stream::enrollment(peer);
@@ -67,7 +68,21 @@ impl App {
             let pin = with_store(|store| store.get_pin(&peer.name).map_err(|e| e.to_string()))
                 .ok()
                 .flatten()?;
-            (pin.node_id == owner || pin.node_id == next).then(|| peer.name.clone())
+            let pre_mesh = status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with(crate::peer_stream::PRE_MESH));
+            (pin.node_id == owner || pin.node_id == next).then(|| {
+                if pre_mesh {
+                    format!(
+                        "upgrade flk on {} {}",
+                        peer.name,
+                        crate::peer_stream::PRE_MESH
+                    )
+                } else {
+                    format!("upgrade flk on {}", peer.name)
+                }
+            })
         })
     }
 

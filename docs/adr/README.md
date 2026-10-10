@@ -35,7 +35,11 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0023](0023-decisions-and-agent-filing.md) | A decision is a record with an answer, and an agent may raise one | Accepted |
 | [0024](0024-accept-the-implemented-proposed-adrs.md) | The eleven implemented `Proposed` ADRs are decided; what each acceptance does and does not assert | Accepted |
 | [0025](0025-version-identity-and-release-automation.md) | Version identity: this project restarts its version line, and the deterministic `just release` path stays | Accepted |
-| [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody | Accepted |
+| [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody (implemented: v1.0.0, #623 / #661) | Accepted |
+
+ADR-0026 supersedes the affected transport, reply, deferral and deduplication
+contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
+decisions remain accepted; each carries a mesh amendment cross-reference.
 
 ## Conventions
 

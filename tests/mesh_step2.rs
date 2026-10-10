@@ -1266,7 +1266,7 @@ fn mismatched_protocol_and_custom_summary_refused_with_upgrade_message() {
     assert_eq!(c.send()["state"], "queued");
     c.fleet
         .node_mut("nodeb")
-        .restart_with_mesh(fleet::MeshMode::VersionMismatch(0));
+        .restart_with_mesh(fleet::MeshMode::VersionMismatch(4));
     c.fleet.allow_edge("nodea", "nodeb");
     fleet::wait_until("protocol upgrade diagnostic", DEADLINE, || {
         api(c.fleet.node("nodea"), "peers.enrollment", json!({}))["peers"]

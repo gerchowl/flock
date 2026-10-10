@@ -121,4 +121,12 @@ a merged commit message before being caught. `/usr/bin/time -p ssh … | grep
 real` times a failure just as happily as a success. Check exit status when
 timing network calls.
 
-See [ADR-0026](0026-mesh-fleet-transport.md) (accepted 2026-10-08) for mesh mode.
+## Mesh amendment (v1.0.0)
+
+See [ADR-0026](0026-mesh-fleet-transport.md), implemented by #623 and #661.
+
+The held SSH edge, liveness and coalesced summaries remain. ADR-0026
+supersedes the hub/spoke guard, one-hop ceiling, single uplink attachment and
+one-shot message fallback with per-edge enrollment and durable multi-hop
+custody. Sender status now receives durable delivery/read outcomes rather than
+an unknown remote fate.

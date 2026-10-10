@@ -121,4 +121,11 @@ be revisited if the guarantee firms up.
 federation already exists for cross-host traffic. If it cannot carry a message
 record, that is the thing to fix.
 
-See [ADR-0026](0026-mesh-fleet-transport.md) (accepted 2026-10-08) for mesh mode.
+## Mesh amendment (v1.0.0)
+
+See [ADR-0026](0026-mesh-fleet-transport.md), implemented by #623 and #661.
+
+The tool inbox and sender-authority boundary remain. ADR-0026 separates
+AgentId identity from reachability: replies use a durable return binding and
+custody routing, even when the sender is offline. An authenticated origin pin
+supplies policy identity; a host label is never dialing authority.

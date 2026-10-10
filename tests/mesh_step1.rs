@@ -54,7 +54,29 @@ impl Agent {
 
     // Execute inside the real agent ancestry, including on an edge-less spoke.
     fn cli(&self, node: &Node, args: &[&str]) -> Value {
-        cli_result(&self.start_cli(node, args))
+        self.result(node, &self.start_cli(node, args))
+    }
+
+    /// Wait for a command run in this pane; on timeout, name what the pane,
+    /// the node's edges and its logs showed, so a CI flake is diagnosable.
+    fn result(&self, node: &Node, output: &std::path::Path) -> Value {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let response = std::fs::read(output)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            if let Some(response) = response {
+                assert!(response.get("error").is_none(), "{response}");
+                return response["result"].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for agent CLI result on {}\n{}",
+                node.name,
+                diagnose_pane(node, &self.pane, output)
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn start_cli(&self, node: &Node, args: &[&str]) -> std::path::PathBuf {
@@ -87,8 +109,43 @@ impl Agent {
                 "text":format!("printf '{{\"result\":{{\"pid\":%s}}}}\\n' \"$$\" >{}\n", quote(output.to_str().unwrap()))
             }),
         );
-        cli_result(&output)["pid"].clone()
+        self.result(node, &output)["pid"].clone()
     }
+}
+
+fn diagnose_pane(node: &Node, pane: &str, output: &std::path::Path) -> String {
+    let raw = |method: &str, params: Value| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.api(&json!({"id":"diagnose","method":method,"params":params}).to_string())
+        }))
+        .unwrap_or_else(|_| format!("{method}: no response"))
+    };
+    let mut report = format!(
+        "output file: {:?}\npane: {}\nenrollment: {}\n",
+        std::fs::read_to_string(output).ok(),
+        raw(
+            "pane.read",
+            json!({"pane_id":pane, "source":"recent", "lines":40})
+        ),
+        raw("peers.enrollment", json!({})),
+    );
+    for dir in [node.config_home.join("flock-dev"), node.home.join("data")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.extension().is_some_and(|ext| ext == "log") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let tail: Vec<_> = text.lines().rev().take(30).collect();
+                report.push_str(&format!("--- {}\n", path.display()));
+                for line in tail.into_iter().rev() {
+                    report.push_str(line);
+                    report.push('\n');
+                }
+            }
+        }
+    }
+    report
 }
 
 fn cli_result(output: &std::path::Path) -> Value {
@@ -654,7 +711,7 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
     conversation
         .fleet
         .node_mut("nodeb")
-        .restart_with_mesh(fleet::MeshMode::VersionMismatch(0));
+        .restart_with_mesh(fleet::MeshMode::VersionMismatch(4));
     conversation.fleet.allow_edge("nodea", "nodeb");
     fleet::wait_until("old protocol refused", DEADLINE, || {
         api(
