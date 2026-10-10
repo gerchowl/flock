@@ -224,10 +224,55 @@ fn read(node: &Node, pane: &str) -> Value {
 }
 
 fn mail(node: &Node, pane: &str) -> Value {
+    let started = Instant::now();
     fleet::wait_until("inbox delivery", DEADLINE, || {
         let messages = read(node, pane);
+        assert!(
+            started.elapsed() < DEADLINE - Duration::from_secs(1),
+            "no inbox delivery to {} {pane}; custody: {}",
+            node.name,
+            custody(node)
+        );
         (!messages.as_array()?.is_empty()).then_some(messages)
     })
+}
+
+// Every node's rows, so a stalled leg names its sender and its backoff.
+fn custody(node: &Node) -> String {
+    let Some(Ok(entries)) = node.home.parent().map(fs::read_dir) else {
+        return String::new();
+    };
+    let mut nodes: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("home-"))
+        .collect();
+    nodes.sort_by_key(|entry| entry.file_name());
+    nodes
+        .iter()
+        .map(|entry| {
+            let rows = rusqlite::Connection::open(entry.path().join("state/flock-dev/mesh-mail.sqlite"))
+                .and_then(|db| {
+                    db.prepare(
+                        "SELECT correlation,kind,state,next_hop,retry_at,collect_attempts,collect_error FROM envelopes ORDER BY rowid",
+                    )?
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "{}/{}/{} next_hop={} retry_at={} attempts={} error={:?}",
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Option<String>>(6)?
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                });
+            format!("{}: {rows:?}", entry.file_name().to_string_lossy())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn db(node: &Node) -> rusqlite::Connection {
