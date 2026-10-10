@@ -53,7 +53,13 @@ impl Agent {
 
     fn start_cli(&self, node: &Node, args: &[&str]) -> std::path::PathBuf {
         let output = node.home.join("acceptance-cli.json");
-        let _ = std::fs::remove_file(&output);
+        for path in [
+            &output,
+            &output.with_extension("stderr"),
+            &output.with_extension("status"),
+        ] {
+            let _ = fs::remove_file(path);
+        }
         let command = std::iter::once(env!("CARGO_BIN_EXE_flk"))
             .chain(args.iter().copied())
             .map(quote)
@@ -64,7 +70,7 @@ impl Agent {
             "pane.send_text",
             json!({
                 "pane_id":self.pane,
-                "text":format!("{command} >{}\n", quote(output.to_str().unwrap()))
+                "text":format!("{command} >{} 2>{}\nprintf '%s' \"$?\" >{}\n", quote(output.to_str().unwrap()), quote(output.with_extension("stderr").to_str().unwrap()), quote(output.with_extension("status").to_str().unwrap()))
             }),
         );
         output
@@ -73,6 +79,16 @@ impl Agent {
 
 fn cli_result(output: &std::path::Path) -> Value {
     let response: Value = fleet::wait_until("agent CLI result", DEADLINE, || {
+        if let Ok(code) = fs::read_to_string(output.with_extension("status")) {
+            if let Ok(code) = code.parse::<i32>() {
+                assert_eq!(
+                    code,
+                    0,
+                    "CLI failed: {}",
+                    fs::read_to_string(output.with_extension("stderr")).unwrap_or_default()
+                );
+            }
+        }
         serde_json::from_slice(&std::fs::read(output).ok()?).ok()
     });
     assert!(response.get("error").is_none(), "{response}");
@@ -343,7 +359,6 @@ fn cli_answer(c: &Conversation) {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn chain_request_reply_and_receipts_across_two_hops() {
     let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     assert_eq!(
@@ -355,7 +370,6 @@ fn chain_request_reply_and_receipts_across_two_hops() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn spoke_without_outbound_edges_sends_and_receives_through_hub() {
     let c = Conversation::to(fleet::HUB_SPOKES, "nodec");
     round_trip(&c);
@@ -397,15 +411,27 @@ fn one_way_edge_carries_both_directions() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn laptop_collects_answer_through_a_different_hub() {
     let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");
     cut(&c.fleet, "nodea", "nodec");
+    fleet::wait_until("request route uses first hub", DEADLINE, || {
+        routes(c.fleet.node("nodea"))
+            .iter()
+            .any(|candidate| {
+                candidate["node"] == fleet::node_id(c.fleet.node("noded.example"))
+                    && candidate["next_hop"] == fleet::node_id(c.fleet.node("nodeb"))
+            })
+            .then_some(())
+    });
     c.send();
     c.read_question();
     cut(&c.fleet, "nodea", "nodeb");
+    // Wait for withdrawal at the reply origin, so the offer cannot follow
+    // a stale return path into a loop before the second hub reconnects.
+    c.fleet.wait_route("noded.example", "nodea", false);
     c.reply();
     reconnect(&c.fleet, "nodea", "nodec");
+    c.fleet.wait_route("noded.example", "nodea", true);
     for node in &c.fleet.nodes {
         due(node);
     }
@@ -463,7 +489,6 @@ fn shim(fleet: &Fleet, marker: &str, source: &str) {
 }
 
 #[test]
-#[ignore = "#853"]
 fn route_cycle_and_exhausted_hop_budget_retain_custody() {
     for (field, value) in [("visited", json!(["receiver"])), ("hops_left", json!(0))] {
         let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
@@ -777,7 +802,6 @@ fn offline_laptop_reconnects_and_queued_mail_flows_once() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn forwarder_and_receiver_restart_mid_conversation() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     c.send();
@@ -796,7 +820,6 @@ fn forwarder_and_receiver_restart_mid_conversation() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn lost_ack_at_each_hop_imports_once() {
     for (from, to) in [("nodea", "nodeb"), ("nodeb", "nodec")] {
         let c = Conversation::to(fleet::CHAIN_ABC, "nodec");
@@ -934,7 +957,6 @@ fn expiry_and_outbox_limits_report_honest_outcomes() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn durable_channel_original_settles_on_reply_custody() {
     let specs = [
         fleet::CHAIN_ABC[0].clone(),
@@ -970,7 +992,6 @@ fn durable_channel_original_settles_on_reply_custody() {
 }
 
 #[test]
-#[ignore = "needs 661-2h"]
 fn audit_rotation_during_multihop_conversation_loses_nothing() {
     use std::io::Write;
     let mut conversation = Conversation::to(fleet::CHAIN_ABC, "nodec");
@@ -1119,7 +1140,7 @@ fn rejected_config(node: &Node, content: &str, key: &str) {
     let path = node.config_home.join("flock-dev/config.toml");
     let original = fs::read_to_string(&path).unwrap();
     fs::write(&path, content).unwrap();
-    let output = operator(node, &["server"]);
+    let output = operator(node, &["config", "check"]);
     fs::write(path, original).unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
@@ -1224,8 +1245,10 @@ fn mailbox_full_retry_vs_24h_inbox_expiry() {
         )
         .unwrap();
     assert_eq!(read(owner, &c.receiver.pane), json!([]));
-    state(c.fleet.node("nodea"), "fill-0", "expired");
+    // The fixture advanced inbox expiry, so advance the origin's collection
+    // schedule too instead of waiting for its normal 60-second idle backoff.
     due(c.fleet.node("nodea"));
+    state(c.fleet.node("nodea"), "fill-0", "expired");
     c.read_question();
     once(owner, "question");
     assert_eq!(

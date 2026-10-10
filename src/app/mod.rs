@@ -155,6 +155,7 @@ pub struct App {
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
     pub(crate) mesh_retry_at: Option<Instant>,
+    pub(crate) mesh_receipt_log_at: Option<Instant>,
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
@@ -951,6 +952,7 @@ impl App {
             collection_peers: Default::default(),
             collection_generation: 0,
             mesh_retry_at: None,
+            mesh_receipt_log_at: None,
             pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
@@ -3283,13 +3285,12 @@ sidebar_pane_gap = 99
     }
 
     #[test]
-    fn removed_key_on_live_reload_keeps_previous_config() {
+    fn removed_key_on_live_reload_applies_other_settings() {
         let _guard = config_env_guard();
         let path = temp_config_path("reload-removed-mesh-key");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         let mut app = test_app();
-        let previous = toml::to_string(&app.state.config).unwrap();
         let workspace_count = app.state.workspaces.len();
         for removed in [
             "[msg]\nuplink_timeout_secs=20",
@@ -3299,15 +3300,15 @@ sidebar_pane_gap = 99
         ] {
             std::fs::write(&path, format!("name='changed'\n{removed}\n")).unwrap();
             let report = app.reload_config();
-            assert_eq!(report.status, crate::config::ConfigReloadStatus::Failed);
-            assert_eq!(toml::to_string(&app.state.config).unwrap(), previous);
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            assert_eq!(app.state.config.name, "changed");
             assert_eq!(app.state.workspaces.len(), workspace_count);
             assert!(app
                 .state
                 .config_diagnostic
                 .as_deref()
                 .unwrap()
-                .contains("was removed in flk 1.0.0 (mesh); delete this line"));
+                .contains("was removed (mesh); delete this line"));
         }
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

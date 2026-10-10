@@ -64,38 +64,6 @@ impl App {
         });
     }
 
-    pub(super) fn import_mesh_receipt(
-        &mut self,
-        mail: &Envelope,
-    ) -> Result<(Accepted, bool), String> {
-        let receipt: crate::mesh::collect::Receipt =
-            serde_json::from_slice(&mail.body).map_err(|_| "invalid_envelope".to_string())?;
-        with_store(|store| {
-            if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str()) {
-                return Err("invalid reply binding".into());
-            }
-            let original = store
-                .get(&receipt.key)
-                .map_err(|e| e.to_string())?
-                .ok_or("receipt_original_not_ready")?;
-            if original.envelope.return_binding.recipient_node != mail.key.origin_node
-                || original.envelope.return_binding.collection_token != receipt.token
-            {
-                return Err("invalid reply binding".into());
-            }
-            match store
-                .import_receipt(&receipt.key, &receipt.state)
-                .map_err(|e| e.to_string())?
-            {
-                crate::mesh::store::ReceiptImport::Applied => Ok((Accepted::New, true)),
-                crate::mesh::store::ReceiptImport::Duplicate => Ok((Accepted::Duplicate, true)),
-                crate::mesh::store::ReceiptImport::OriginalNotReady => {
-                    Err("receipt_original_not_ready".into())
-                }
-            }
-        })
-    }
-
     pub(super) fn persist_mesh_send(
         &mut self,
         owner: &str,
@@ -241,6 +209,11 @@ impl App {
     ) -> Result<(Accepted, bool), String> {
         let sender_host = self.check_mesh_import(delivery, upstream)?;
         let envelope = &delivery.envelope;
+        if (envelope.request_key.is_some() || envelope.kind == crate::mesh::store::Kind::Receipt)
+            && self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str())
+        {
+            return self.accept_forwarded_request(delivery);
+        }
         if envelope.kind == crate::mesh::store::Kind::Receipt {
             return self.import_mesh_receipt(envelope);
         }
@@ -316,15 +289,10 @@ impl App {
                 return Err("mailbox_full".into());
             }
             store
-                .accept_local(
-                    envelope,
-                    delivery.remaining_ms,
-                    &agent,
-                    &session,
-                    now_ms() as i64,
-                )
+                .accept_local_delivery(delivery, &agent, &session, now_ms() as i64)
                 .map_err(|e| e.to_string())
         })?;
+        self.route_mesh_receipts();
         if accepted == Accepted::New {
             self.emit_mesh_wake(&envelope.key.origin_node);
             self.queue_message_tiered(String::new(), data.message, Vec::new(), "unattested");
@@ -535,6 +503,7 @@ impl App {
                 .map_err(|e| e.to_string())?;
             Ok((rejected, changed))
         })?;
+        self.route_mesh_receipts();
         for node in changed {
             self.emit_mesh_wake(&node);
         }
@@ -744,11 +713,6 @@ impl App {
                     let Ok(Some(record)) = record else {
                         continue;
                     };
-                    if record.envelope.request_key.is_some()
-                        || record.envelope.kind != crate::mesh::store::Kind::Message
-                    {
-                        continue;
-                    }
                     let next =
                         self.request_next_hop(&record.envelope.return_binding.recipient_node);
                     if next.node != record.next_hop {
@@ -817,7 +781,7 @@ impl App {
                 continue;
             };
             let decoded = if record.envelope.kind == crate::mesh::store::Kind::Receipt {
-                serde_json::from_slice::<crate::mesh::collect::Receipt>(&record.envelope.body)
+                super::mesh_receipts::decode_receipt(&record.envelope)
                     .map(|_| {
                         (
                             peer.name.clone(),

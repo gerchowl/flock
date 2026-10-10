@@ -94,6 +94,7 @@ lock = threading.Lock()
 deliveries = set()
 collections = set()
 outbound_collections = set()
+summary_probes = set()
 
 
 def emit(line):
@@ -120,6 +121,13 @@ def forward_input():
             if method == "mesh.hello":
                 with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
                     log.write(str(time.monotonic()) + "\n")
+            if method == "peers.summary" and (base / f"observe-summary-{source}-{target}").exists():
+                summary_probes.add(request.get("id"))
+            if method == "mesh.routes" and (base / "withhold-route-adverts").exists():
+                emit(json.dumps({"id": request["id"], "error": {
+                    "code": "routes_unavailable", "message": "route exchange withheld by fixture",
+                }}) + "\n")
+                continue
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"
@@ -263,6 +271,14 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        summary_probe = base / f"observed-summary-{source}-{target}"
+        if response.get("event") == "mesh_outbound_pending":
+            summary_probe.unlink(missing_ok=True)
+        if response.get("id") in summary_probes:
+            summary_probes.discard(response.get("id"))
+            summary_probe.write_text(json.dumps({
+                "outbound_pending": response.get("result", {}).get("outbound_pending", True),
+            }))
         if response.get("id") in outbound_collections:
             outbound_collections.discard(response.get("id"))
             answers = response.get("result", {}).get("answers", [])

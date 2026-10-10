@@ -69,7 +69,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("status", "client", "flk status client [--json]"),
     ("config", "edit", "flk config edit"),
     ("config", "reset-keys", "flk config reset-keys"),
-    ("config", "check", "flk config check [--path PATH]"),
+    ("config", "check", "flk config check [--path PATH] [--json]"),
     ("channel", "set", "flk channel set <stable|preview>"),
     ("channel", "show", "flk channel show"),
     ("workspace", "list", "flk workspace list"),

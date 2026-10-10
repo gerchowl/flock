@@ -326,7 +326,6 @@ fn fleet_row<'a>(listing: &'a Value, agent_id: &str) -> Option<&'a Value> {
 /// put in the field, and an agent that can list the fleet but not target it
 /// has nothing to do with the answer.
 #[test]
-#[ignore = "needs 661-2h"]
 fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     let fleet = fleet::spawn("mcp-fleet", fleet::CHAIN_ABC);
     let node_a = fleet.node("nodea");
@@ -419,8 +418,9 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         "the sender must survive the hop as an identity, not a pane: {delivered}"
     );
     assert_eq!(
-        delivered["from_host"], "nodea",
-        "and must name the host it actually came from: {delivered}"
+        delivered["from_host"],
+        Value::Null,
+        "a gossip-only origin has no locally pinned host label: {delivered}"
     );
     assert_eq!(
         delivered["replyable"], true,
@@ -448,7 +448,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     });
     assert_eq!(answer["body"], "pong from nodec");
     assert_eq!(answer["from_agent"], bob.agent_id.as_str());
-    assert_eq!(answer["from_host"], "nodec");
+    assert_eq!(answer["from_host"], Value::Null);
     assert_eq!(
         answer["in_reply_to"], "c-320-e2e",
         "the answer has to thread back to the question: {answer}"
@@ -534,7 +534,6 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 ///   moment inside its own ssh hop to us. A deferral sent back synchronously
 ///   would wait on a server that is waiting on it.
 #[test]
-#[ignore = "needs 661-2h"]
 fn a_mute_answers_a_sender_on_another_host() {
     let fleet = fleet::spawn("mcp-fleet-mute", fleet::CHAIN_ABC);
     let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
@@ -583,7 +582,7 @@ fn a_mute_answers_a_sender_on_another_host() {
         "never a question back: {deferral}"
     );
     assert_eq!(deferral["from_agent"], bob.agent_id.as_str(), "{deferral}");
-    assert_eq!(deferral["from_host"], "nodec", "{deferral}");
+    assert_eq!(deferral["from_host"], Value::Null, "{deferral}");
     let body = deferral["body"].as_str().expect("body");
     assert!(body.contains("mid-rebase"), "the reason travels: {body}");
     assert!(
@@ -1002,6 +1001,54 @@ fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
 }
 
 #[test]
+fn direct_message_delivers_before_topology_adverts_arrive() {
+    let fleet = fleet::spawn_with_startup_probe("direct-before-routes", PAIR_AB, |fleet, _| {
+        std::fs::write(fleet.base.join("withhold-route-adverts"), "").unwrap();
+    });
+    let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+    wait_for(
+        "direct recipient discovery before topology exchange",
+        GOSSIP_TIMEOUT,
+        || {
+            let listing = alice.call_tool("flock_agent_list", json!({}));
+            fleet_row(&listing, &bob.agent_id).map(|_| ())
+        },
+    );
+    let enrollment = spoke_api(fleet.node("nodea"), "peers.enrollment", json!({}));
+    assert_eq!(enrollment["result"]["routes"], json!([]));
+    assert!(
+        enrollment["result"]["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["source"] == "configured" && peer["state"] == "pinned"),
+        "{enrollment}"
+    );
+    let sent = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type":"agent", "agent":bob.agent_id},
+            "body":"direct before adverts", "intent":"needs_reply",
+            "correlation_id":"direct-before-routes"
+        }),
+    );
+    assert_eq!(sent["state"], "delivered", "{sent}");
+    assert_eq!(sent["path"], "direct", "{sent}");
+    let read = bob.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["correlation_id"] == "direct-before-routes")
+            .count(),
+        1,
+        "{read}"
+    );
+}
+
+#[test]
 fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
     let (fleet, mut alice, bob) = spoke_pair("h2bad", SPOKE_PAIR);
     let hold = fleet.base.join("hold-outbound-nodeb-nodea");
@@ -1111,14 +1158,46 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
         db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
             .unwrap()
     };
-    let before = version();
+    // A lost ack now leaves receipt debt pending until the origin explicitly
+    // acknowledges it. Permit that one bookkeeping update, but audit every
+    // other write so duplicate import must still be read-only.
+    db.execute_batch("CREATE TABLE replay_writes (table_name TEXT)")
+        .unwrap();
+    let tables: Vec<String> = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='replay_writes'"
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    for table in tables {
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let condition = if table == "envelopes" && operation == "UPDATE" {
+                let columns: Vec<String> = db.prepare(
+                    "SELECT name FROM pragma_table_info('envelopes') WHERE name!='receipt_sent'"
+                ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+                format!("WHEN NOT (OLD.receipt_sent IS NULL AND NEW.receipt_sent IS 'delivered' AND {})",
+                    columns.iter().map(|column| format!("OLD.\"{column}\" IS NEW.\"{column}\"")).collect::<Vec<_>>().join(" AND "))
+            } else {
+                String::new()
+            };
+            db.execute_batch(&format!(
+                "CREATE TRIGGER replay_{table}_{operation} AFTER {operation} ON {quoted} {condition}
+                 BEGIN INSERT INTO replay_writes VALUES ('{table}'); END"
+            ))
+            .unwrap();
+        }
+    }
+    let replay_writes = || {
+        db.query_row("SELECT COUNT(*) FROM replay_writes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
     let offers = fleet.base.join("outbound-offers-nodeb-nodea");
     wait_for(
         "duplicate offered to muted recipient",
         GOSSIP_TIMEOUT,
         || (std::fs::read_to_string(&offers).ok()?.lines().count() >= 2).then_some(()),
     );
-    assert_eq!(version(), before, "duplicate import must not commit on hub");
+    assert_eq!(replay_writes(), 0, "duplicate import must not write on hub");
     wait_for("next ack settles custody", GOSSIP_TIMEOUT, || {
         let state: String = spoke_db(fleet.node("nodea"))
             .query_row(
@@ -1129,9 +1208,11 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
             .ok()?;
         (state == "delivered").then_some(())
     });
-    assert_eq!(version(), before);
+    assert_eq!(replay_writes(), 0);
+    let before = version();
     let count = std::fs::read_to_string(&offers).unwrap().lines().count();
     thread::sleep(Duration::from_secs(6));
+    assert_eq!(version(), before);
     assert_eq!(
         std::fs::read_to_string(&offers).unwrap().lines().count(),
         count
