@@ -2,7 +2,7 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::AgentStatus;
-use crate::app::guarded_submit::{composer, composer_contents, Composer};
+use crate::app::guarded_submit::{composer_contents, composer_unfaint, Composer};
 use crate::detect::Agent;
 
 use super::super::settled::Cursor;
@@ -44,11 +44,25 @@ impl StartWatch {
         self.state_seq = None;
     }
 
+    #[cfg(test)]
     pub(super) fn observe(
         &mut self,
         cursor: &Cursor,
         status: AgentStatus,
         screen: &str,
+        now: Instant,
+    ) -> bool {
+        self.observe_unfaint(cursor, status, screen, screen, now)
+    }
+
+    /// `unfaint` is `screen` with faint cells blanked, so a Claude box showing
+    /// only its own suggestion reads as empty (#892).
+    pub(super) fn observe_unfaint(
+        &mut self,
+        cursor: &Cursor,
+        status: AgentStatus,
+        screen: &str,
+        unfaint: &str,
         now: Instant,
     ) -> bool {
         let Some(before) = &self.baseline else {
@@ -67,7 +81,7 @@ impl StartWatch {
         }
         let empty = self
             .agent
-            .is_some_and(|agent| composer(agent, screen, "") == Composer::Empty);
+            .is_some_and(|agent| composer_unfaint(agent, screen, unfaint, "") == Composer::Empty);
         let pending = screen.lines().any(|line| {
             let line = line.trim().to_ascii_lowercase();
             line.contains("waiting for startup")
@@ -82,7 +96,7 @@ impl StartWatch {
         }
         let contents = self
             .agent
-            .and_then(|agent| composer_contents(agent, screen));
+            .and_then(|agent| composer_contents(agent, screen, unfaint));
         if contents != self.contents || self.state_seq != Some(cursor.seq) {
             self.empty_since = None;
             self.contents = contents;
@@ -301,5 +315,104 @@ mod tests {
             EMPTY,
             now + Duration::from_secs(70)
         ));
+    }
+
+    /// A real Claude 2.1.295 box after a lost paste: its `Try "…"` suggestion
+    /// painted faint (SGR 2), and the same words typed (#892).
+    fn claude_box(typed: &str) -> crate::terminal::TerminalRuntime {
+        let rule = "─".repeat(40);
+        let bytes = format!("\x1b[2J\x1b[H{rule}\r\n❯ {typed}\r\n{rule}\r\n? for shortcuts");
+        crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            80,
+            24,
+            65_536,
+            bytes.as_bytes(),
+        )
+    }
+
+    /// Answer reads the way the server does, from one styled read.
+    fn serve(
+        pane: &crate::terminal::TerminalRuntime,
+    ) -> impl FnMut(
+        crate::api::schema::Method,
+        Option<Instant>,
+    ) -> Result<serde_json::Value, super::super::BoundedError>
+           + '_ {
+        |method, _| {
+            let crate::api::schema::Method::PaneRead(params) = method else {
+                panic!("expected pane read")
+            };
+            assert_eq!(
+                params.source,
+                crate::api::schema::ReadSource::DetectionUnfaint
+            );
+            let (text, unfaint) = pane.detection_text_and_unfaint();
+            Ok(serde_json::json!({"result": {"read": {"text": text, "unfaint": unfaint}}}))
+        }
+    }
+
+    /// Whether two samples a full window apart report NOT_STARTED.
+    fn not_started(
+        read: &mut dyn FnMut(
+            crate::api::schema::Method,
+            Option<Instant>,
+        ) -> Result<serde_json::Value, super::super::BoundedError>,
+    ) -> bool {
+        let now = Instant::now();
+        let mut watch = StartWatch::new(
+            Some(cursor()),
+            Some(Agent::Claude),
+            now,
+            Duration::from_secs(5),
+        );
+        [now, now + Duration::from_secs(35)].into_iter().any(|at| {
+            let (screen, unfaint) =
+                super::super::detection_screens_with("fixture:p1", None, &mut *read).expect("read");
+            watch.observe_unfaint(&cursor(), AgentStatus::Idle, &screen, &unfaint, at)
+        })
+    }
+
+    #[tokio::test]
+    async fn a_claude_box_showing_only_its_faint_suggestion_is_not_started() {
+        let pane = claude_box("\x1b[2mTry \"refactor check-ssot.sh\"\x1b[0m");
+        assert!(not_started(&mut serve(&pane)));
+        let pane = claude_box("\x1b[2mwatch CI on #891 and merge when green\x1b[0m");
+        assert!(not_started(&mut serve(&pane)));
+    }
+
+    #[tokio::test]
+    async fn a_claude_box_holding_typed_text_is_never_not_started() {
+        let pane = claude_box("Try \"refactor check-ssot.sh\"");
+        assert!(!not_started(&mut serve(&pane)));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_unfaint_read_falls_back_to_the_plain_screen() {
+        let pane = claude_box("\x1b[2mTry \"refactor check-ssot.sh\"\x1b[0m");
+        let mut sources = Vec::new();
+        let mut old_server = |method, _| {
+            let crate::api::schema::Method::PaneRead(params) = method else {
+                panic!("expected pane read")
+            };
+            sources.push(params.source);
+            Ok(match params.source {
+                crate::api::schema::ReadSource::Detection => {
+                    serde_json::json!({"result": {"read": {"text": pane.detection_text()}}})
+                }
+                _ => serde_json::json!({"error": {"code": "invalid_params"}}),
+            })
+        };
+        let (screen, unfaint) =
+            super::super::detection_screens_with("fixture:p1", None, &mut old_server)
+                .expect("read");
+        assert_eq!(screen, pane.detection_text());
+        assert_eq!(unfaint, screen);
+        assert_eq!(
+            sources,
+            [
+                crate::api::schema::ReadSource::DetectionUnfaint,
+                crate::api::schema::ReadSource::Detection
+            ]
+        );
     }
 }

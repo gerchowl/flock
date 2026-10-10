@@ -597,18 +597,28 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
+        let mut unfaint = None;
         let text = match params.format {
             ReadFormat::Text => match params.source {
                 ReadSource::Visible => pane.visible_text(),
                 ReadSource::Recent => pane.recent_text(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
                 ReadSource::Detection => pane.detection_text(),
+                ReadSource::DetectionUnfaint => {
+                    let (text, blanked) = pane.detection_text_and_unfaint();
+                    unfaint = Some(blanked);
+                    text
+                }
             },
             ReadFormat::Ansi => match params.source {
                 ReadSource::Visible => pane.visible_ansi(),
                 ReadSource::Recent => pane.recent_ansi(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
                 ReadSource::Detection => pane.detection_ansi(),
+                ReadSource::DetectionUnfaint => {
+                    unfaint = Some(pane.detection_text_and_unfaint().1);
+                    pane.detection_ansi()
+                }
             },
         };
 
@@ -622,6 +632,7 @@ impl App {
                     source: params.source,
                     format: params.format,
                     text,
+                    unfaint,
                     revision: 0,
                     truncated: false,
                 },

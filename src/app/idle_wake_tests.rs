@@ -8,8 +8,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::api::schema::{
-    MessageTarget, Method, MsgIntent, MsgMuteParams, MsgReadParams, MsgSendParams,
-    PaneSendTextParams, Request,
+    MessageTarget, Method, MsgIntent, MsgMuteParams, MsgReadParams, MsgSendParams, PaneReadParams,
+    PaneSendTextParams, ReadFormat, ReadSource, Request,
 };
 use crate::app::App;
 use crate::detect::{Agent, AgentState};
@@ -127,8 +127,10 @@ fn tick_past_gap(app: &mut App) {
         .find_map(|entry| entry.in_flight.as_ref())
     {
         if let Some(attempt) = &flight.attempt {
-            if crate::detect::agent_prompt_is_empty(Agent::Claude, &runtime(app).detection_text())
-                == Some(true)
+            if crate::detect::agent_prompt_is_empty(
+                Agent::Claude,
+                &runtime(app).detection_text_and_unfaint().1,
+            ) == Some(true)
             {
                 runtime(app).test_process_pty_bytes(&claude_screen(&attempt.text));
             }
@@ -1901,49 +1903,112 @@ async fn restore_prefers_store_when_both_attempts_are_unfinished() {
     assert_eq!(restored[0].state, "unconfirmed");
 }
 
-/// Claude v2.1.295's ghost-text suggestion in an otherwise empty box (#864).
-const SUGGESTION: &str = "Try \"refactor check-ssot.sh\"";
+/// Claude v2.1.295's suggestions in an otherwise empty box, painted faint
+/// (SGR 2) as a live capture shows: the `Try "…"` hint (#864) and the
+/// bare post-turn suggestion (#892).
+const SUGGESTIONS: [&str; 2] = [
+    "\x1b[2mTry \"refactor check-ssot.sh\"\x1b[0m",
+    "\x1b[2mwatch CI on #891 and merge when green\x1b[0m",
+];
 
 #[tokio::test]
 async fn guarded_submit_types_into_a_box_showing_only_claudes_suggestion() {
-    let Rig {
-        mut app,
-        pane,
-        mut pty,
-    } = rig();
-    claude_idle_for(&mut app, settled());
-    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTION));
-    app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
-        .expect("a suggestion is not a draft");
-    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
-
-    // The same words without the quoted suggestion shape are somebody's draft.
-    let Rig {
-        mut app,
-        pane,
-        mut pty,
-    } = rig();
-    claude_idle_for(&mut app, settled());
-    runtime(&app).test_process_pty_bytes(&claude_screen("Try refactor check-ssot.sh"));
-    assert_eq!(
+    for suggestion in SUGGESTIONS {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        runtime(&app).test_process_pty_bytes(&claude_screen(suggestion));
         app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
-            .unwrap_err(),
-        "input_not_empty"
-    );
-    assert!(drain(&mut pty).is_empty());
+            .expect("a suggestion is not a draft");
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()], "{suggestion:?}");
+    }
+}
+
+#[tokio::test]
+async fn guarded_submit_refuses_a_typed_draft_shaped_like_a_suggestion() {
+    for draft in [
+        "Try \"refactor check-ssot.sh\"",
+        "watch CI on #891 and merge when green",
+        // Faint text after a typed character is still part of a draft.
+        "w\x1b[2match CI\x1b[0m",
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        runtime(&app).test_process_pty_bytes(&claude_screen(draft));
+        assert_eq!(
+            app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, Instant::now(), false)
+                .unwrap_err(),
+            "input_not_empty",
+            "{draft:?}"
+        );
+        assert!(drain(&mut pty).is_empty());
+    }
 }
 
 #[tokio::test]
 async fn an_idle_claude_showing_its_suggestion_is_still_woken() {
+    for suggestion in SUGGESTIONS {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        runtime(&app).test_process_pty_bytes(&claude_screen(suggestion));
+        send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+        assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
+        tick_past_gap(&mut app);
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    }
+}
+
+#[tokio::test]
+async fn an_idle_claude_with_a_typed_draft_is_not_woken() {
     let Rig {
         mut app,
         pane,
         mut pty,
     } = rig();
     claude_idle_for(&mut app, settled());
-    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTION));
+    runtime(&app).test_process_pty_bytes(&claude_screen("watch CI on #891 and merge when green"));
     send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
-    assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
-    tick_past_gap(&mut app);
-    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    assert!(drain(&mut pty).is_empty());
+}
+
+#[tokio::test]
+async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
+    let Rig { mut app, pane, .. } = rig();
+    runtime(&app).test_process_pty_bytes(&claude_screen(SUGGESTIONS[1]));
+    let read = |app: &mut App, source| {
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::PaneRead(PaneReadParams {
+                pane_id: pane.clone(),
+                source,
+                lines: None,
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        }))
+        .unwrap();
+        response["result"]["read"].clone()
+    };
+    let both = read(&mut app, ReadSource::DetectionUnfaint);
+    let text = both["text"].as_str().unwrap();
+    assert!(text.contains("❯ watch CI on #891 and merge when green"));
+    assert_eq!(text, read(&mut app, ReadSource::Detection)["text"]);
+    let unfaint = both["unfaint"].as_str().unwrap();
+    assert!(unfaint.contains("Task complete.\n"));
+    assert!(!unfaint.contains("watch CI"));
+    // A plain read carries no copy, so its payload is unchanged.
+    assert!(read(&mut app, ReadSource::Detection)
+        .get("unfaint")
+        .is_none());
 }

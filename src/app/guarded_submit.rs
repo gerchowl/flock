@@ -58,7 +58,15 @@ fn matches_rows(rows: &[&str], text: &str) -> bool {
         && rest.is_empty()
 }
 
-fn composer_rows(agent: Agent, screen: &str) -> Option<(Vec<&str>, usize, usize)> {
+/// `unfaint` is `screen` with its faint cells blanked, row for row. Claude's
+/// editor text is read from it, so the suggestion Claude paints faint into an
+/// empty box reads as nothing while anything typed still reads (#892). Without
+/// styling, pass `screen` for both.
+fn composer_rows<'a>(
+    agent: Agent,
+    screen: &'a str,
+    unfaint: &'a str,
+) -> Option<(Vec<&'a str>, usize, usize)> {
     let lines: Vec<_> = screen.lines().collect();
     let (rows, body_start, body_end): (Vec<&str>, usize, usize) = match agent {
         Agent::Claude => {
@@ -72,11 +80,16 @@ fn composer_rows(agent: Agent, screen: &str) -> Option<(Vec<&str>, usize, usize)
             };
             let end = lines.iter().rposition(|line| rule(line))?;
             let start = lines[..end].iter().rposition(|line| rule(line))?;
-            let body = &lines[start + 1..end];
-            let prompt = body
+            let prompt = lines[start + 1..end]
                 .iter()
                 .position(|line| line.trim_start().starts_with('❯'))?;
-            let mut rows = vec![body[prompt].trim_start().trim_start_matches('❯').trim()];
+            let typed: Vec<_> = unfaint.lines().collect();
+            if typed.len() != lines.len() {
+                return None;
+            }
+            let body = &typed[start + 1..end];
+            let row = body[prompt].trim_start().strip_prefix('❯')?;
+            let mut rows = vec![row.trim_start_matches('❯').trim()];
             rows.extend(body[prompt + 1..].iter().map(|line| line.trim()));
             (rows, start + 1, end)
         }
@@ -115,12 +128,28 @@ fn composer_rows(agent: Agent, screen: &str) -> Option<(Vec<&str>, usize, usize)
 }
 
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
-pub(crate) fn composer_contents(agent: Agent, screen: &str) -> Option<String> {
-    composer_rows(agent, screen).map(|(rows, _, _)| rows.join("\n"))
+pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
+    composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
 }
 
+/// Classify a live pane's editor from one styled read of its detection text.
+pub(crate) fn runtime_composer(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> Composer {
+    let (screen, unfaint) = runtime.detection_text_and_unfaint();
+    composer_unfaint(agent, &screen, &unfaint, text)
+}
+
+#[cfg(test)]
 pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
-    let Some((rows, body_start, body_end)) = composer_rows(agent, screen) else {
+    composer_unfaint(agent, screen, screen, text)
+}
+
+/// `composer` with Claude's editor read from `unfaint` (see `composer_rows`).
+pub(crate) fn composer_unfaint(agent: Agent, screen: &str, unfaint: &str, text: &str) -> Composer {
+    let Some((rows, body_start, body_end)) = composer_rows(agent, screen, unfaint) else {
         return Composer::Unknown;
     };
     let lines: Vec<_> = screen.lines().collect();
@@ -159,7 +188,6 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
     let empty = nonempty.is_empty()
         || (nonempty.len() == 1
             && match agent {
-                Agent::Claude => crate::detect::claude_prompt_suggestion(nonempty[0]),
                 Agent::Codex => nonempty[0] == "Ask Codex to do anything",
                 Agent::OpenCode => {
                     nonempty[0] == "Ask anything…"
@@ -282,7 +310,7 @@ impl App {
         }) {
             return Err("operator_active");
         }
-        match composer(agent, &runtime.detection_text(), text) {
+        match runtime_composer(agent, runtime, text) {
             Composer::Empty => (),
             Composer::Other | Composer::Owned => return Err("input_not_empty"),
             Composer::Unknown => return Err("unknown_composer"),
@@ -408,7 +436,7 @@ impl App {
         let Some(agent) = terminal.effective_known_agent() else {
             return Some(Outcome::Abandoned("unknown_composer"));
         };
-        let editor = composer(agent, &runtime.detection_text(), &attempt.text);
+        let editor = runtime_composer(agent, runtime, &attempt.text);
         // The first Enter may precede the child's paste repaint. An unchanged
         // empty editor remains safe, but only exact owned text permits a retry.
         if editor != Composer::Owned && (attempt.sent || editor != Composer::Empty) {
@@ -703,27 +731,31 @@ mod tests {
             composer(Agent::Claude, "❯ hello world", "hello world"),
             Composer::Unknown
         );
-        assert_eq!(
-            composer(
-                Agent::Claude,
-                &screen.replace("hello world", "Try \"refactor check-ssot.sh\""),
-                "hello world"
-            ),
-            Composer::Empty
-        );
-        for draft in [
-            "Try \"",
-            "Try \"\"",
-            "Try refactor",
-            "Try \"a\" and \"b\"",
-            "Try \"a\" and \"b\" later\n  please",
+        // Claude paints its suggestion faint, so the unfaint read is blank
+        // where it sits, whatever its shape (#892).
+        for suggestion in [
+            "Try \"refactor check-ssot.sh\"",
+            "watch CI on #891 and merge when green",
         ] {
+            let shown = screen.replace("hello world", suggestion);
+            let unfaint = screen.replace("hello world", "");
             assert_eq!(
-                composer(Agent::Claude, &screen.replace("hello world", draft), "x"),
+                composer_unfaint(Agent::Claude, &shown, &unfaint, "x"),
+                Composer::Empty,
+                "{suggestion:?}"
+            );
+            // The same words typed are not faint, so they are a draft.
+            assert_eq!(
+                composer_unfaint(Agent::Claude, &shown, &shown, "x"),
                 Composer::Other,
-                "{draft:?}"
+                "{suggestion:?}"
             );
         }
+        // Rows that do not line up with the screen prove nothing about it.
+        assert_eq!(
+            composer_unfaint(Agent::Claude, screen, "❯", "hello world"),
+            Composer::Unknown
+        );
         assert_eq!(
             composer(
                 Agent::Claude,

@@ -1721,6 +1721,10 @@ pub enum ReadSource {
     RecentUnwrapped,
     /// The unscrolled screen used by agent detection, excluding scrollback.
     Detection,
+    /// `Detection`, plus the same rows with faint cells blanked in the
+    /// result's `unfaint`, from one read. A composer whose text is all faint
+    /// shows only the agent's own suggestion (#892).
+    DetectionUnfaint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2995,6 +2999,9 @@ pub struct PaneReadResult {
     pub source: ReadSource,
     pub format: ReadFormat,
     pub text: String,
+    /// `text` with faint cells blanked, row for row. Only for `detection_unfaint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfaint: Option<String>,
     pub revision: u64,
     pub truncated: bool,
 }
@@ -4253,6 +4260,7 @@ mod tests {
                     source: ReadSource::Recent,
                     format: ReadFormat::Text,
                     text: "auth: received\n".into(),
+                    unfaint: None,
                     revision: 0,
                     truncated: false,
                 },

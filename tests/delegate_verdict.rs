@@ -112,7 +112,9 @@ impl Pane {
                         record
                     }
                     "pane.read" => {
-                        assert_eq!(request["params"]["source"], "detection");
+                        // `delegate wait` asks for the faint-blanked copy too (#892).
+                        assert!(["detection", "detection_unfaint"]
+                            .contains(&request["params"]["source"].as_str().unwrap_or_default()));
                         json!({"read": {"text": frames[frame].1}})
                     }
                     "agent.result" => {
