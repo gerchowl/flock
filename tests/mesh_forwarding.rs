@@ -274,23 +274,119 @@ fn one_undecodable_record_does_not_stall_the_retry_pass() {
     row_state(fleet.node("nodeb"), "broken", "quarantined");
 }
 
+fn audit_store_writes(connection: &rusqlite::Connection) {
+    connection.execute_batch(
+        "CREATE TABLE idle_write_audit (table_name TEXT, column_name TEXT, row_key TEXT, old_value TEXT, new_value TEXT)"
+    ).unwrap();
+    let tables: Vec<String> = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='idle_write_audit'"
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    for table in tables {
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap()
+            .query_map([&table], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for column in columns {
+            let key = if table == "envelopes" {
+                "NEW.correlation"
+            } else {
+                "''"
+            };
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER audit_{table}_{column} AFTER UPDATE OF \"{column}\" ON \"{table}\"
+                 WHEN OLD.\"{column}\" IS NOT NEW.\"{column}\"
+                 BEGIN INSERT INTO idle_write_audit VALUES ('{table}','{column}',{key},quote(OLD.\"{column}\"),quote(NEW.\"{column}\")); END"
+            )).unwrap();
+        }
+        for operation in ["INSERT", "DELETE"] {
+            let row = if operation == "INSERT" { "NEW" } else { "OLD" };
+            let key = if table == "envelopes" {
+                format!("{row}.correlation")
+            } else {
+                "''".into()
+            };
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER audit_{table}_{operation} AFTER {operation} ON \"{table}\"
+                 BEGIN INSERT INTO idle_write_audit VALUES ('{table}','{operation}',{key},NULL,NULL); END"
+            )).unwrap();
+        }
+    }
+}
+
+fn audited_writes(connection: &rusqlite::Connection, after: i64) -> Vec<String> {
+    connection.prepare(
+        "SELECT table_name || '.' || column_name || ' [' || row_key || '] ' || COALESCE(old_value,'') || ' -> ' || COALESCE(new_value,'') FROM idle_write_audit WHERE rowid>?1 ORDER BY rowid"
+    ).unwrap().query_map([after], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+}
+
 #[test]
 fn idle_forwarder_makes_no_commits() {
     let (fleet, sender, recipient) = setup("forward-idle", CHAIN);
+    let connection = db(fleet.node("nodeb"));
+    audit_store_writes(&connection);
     send(&fleet, &sender, &recipient, "idle");
     read_once(&fleet, &recipient, "idle");
     row_state(fleet.node("nodeb"), "idle", "delivered");
-    let connection = db(fleet.node("nodeb"));
-    // Let startup topology exchange finish before measuring custody's idle ticks.
-    std::thread::sleep(Duration::from_secs(3));
+    // Reading the recipient inbox does not settle the return receipts.
+    remote_state(&fleet, "idle", "read");
+    fleet::wait_until("both receipt custody legs acknowledged", WAIT, || {
+        let forwarded: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE kind='receipt' AND correlation LIKE '%:read' AND state='delivered' AND delivered=1 AND length(body)=0)
+             AND NOT EXISTS(SELECT 1 FROM envelopes WHERE state IN ('custody','held'))",
+            [], |row| row.get(0),
+        ).unwrap();
+        // The inbox and its receipt_sent mark belong to C, not forwarding B.
+        let returned: bool = db(fleet.node("nodec")).query_row(
+            "SELECT EXISTS(SELECT 1 FROM envelopes WHERE correlation='idle' AND state='read' AND receipt_sent='read')
+             AND NOT EXISTS(SELECT 1 FROM envelopes WHERE kind='receipt' AND state IN ('custody','held'))",
+            [], |row| row.get(0),
+        ).unwrap();
+        (forwarded && returned).then_some(())
+    });
+    // Observe fresh summaries over the enrolled edges after the acknowledgements.
+    // No node should still be advertising custody that wakes its collector.
+    for edge in ["nodea-nodeb", "nodeb-nodec"] {
+        std::fs::write(fleet.base.join(format!("observe-summary-{edge}")), "").unwrap();
+    }
+    fleet::wait_until(
+        "no pending outbound wake on either return edge",
+        WAIT,
+        || {
+            for edge in ["nodea-nodeb", "nodeb-nodec"] {
+                let summary: Value = serde_json::from_slice(
+                    &std::fs::read(fleet.base.join(format!("observed-summary-{edge}"))).ok()?,
+                )
+                .ok()?;
+                if summary["outbound_pending"] != false {
+                    return None;
+                }
+            }
+            Some(())
+        },
+    );
+    let audit_start: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM idle_write_audit",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     let version: i64 = connection
         .query_row("PRAGMA data_version", [], |r| r.get(0))
         .unwrap();
-    std::thread::sleep(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(6));
     let after: i64 = connection
         .query_row("PRAGMA data_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(after, version, "idle app passes committed store changes");
+    assert_eq!(
+        after,
+        version,
+        "idle app passes committed store changes: {:?}",
+        audited_writes(&connection, audit_start)
+    );
 }
 
 #[test]
