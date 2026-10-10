@@ -268,6 +268,7 @@ impl App {
                     .map_err(|e| e.to_string())?
                 {
                     if record.envelope.kind == crate::mesh::store::Kind::Receipt
+                        && record.state != crate::mesh::store::UNDELIVERABLE
                         && record.envelope.correlation_id
                             == format!("receipt:{}:{}", receipt.key.message_id, receipt.state)
                         && key.origin_node == origin
@@ -377,11 +378,17 @@ impl App {
 }
 
 impl App {
-    /// A forwarding hub's signed `undeliverable` outcome (#876). The signature
-    /// authenticates the hub, and the collection token proves it held this
-    /// message: only the custody path carries it before the recipient has an
-    /// outcome, and any recipient outcome outranks this one. A hub can never
-    /// assert a recipient state, and the recipient never asserts this one.
+    /// A forwarding hub's signed `undeliverable` outcome (#876) for a request,
+    /// an answer or a routed receipt this node sent (#902). The signature
+    /// authenticates the hub, and the collection token proves it held the
+    /// request's conversation: only the custody path carries it before the
+    /// recipient has an outcome, and any recipient outcome outranks this one.
+    /// Answers and receipts carry the request's token, so for a receipt it
+    /// proves only that the hub held the request, not the receipt. A hub that
+    /// did can cost one extra resend and lose the receipt, nothing more. A hub
+    /// can never assert a recipient state, and the recipient never asserts
+    /// this one. An outcome for mail this node never stored, such as a
+    /// refusal receipt, is refused permanently so the hub stops resending it.
     fn import_hub_outcome(
         &mut self,
         mail: &Envelope,
@@ -397,10 +404,12 @@ impl App {
             {
                 return Err("invalid reply binding".into());
             }
+            // This node commits what it sends before sending it, so a
+            // missing row is never late: it was never kept, or is gone.
             let original = store
                 .get(&receipt.key)
                 .map_err(|e| e.to_string())?
-                .ok_or("receipt_original_not_ready")?;
+                .ok_or("invalid reply binding")?;
             if original.envelope.return_binding.recipient_node == hub
                 || original.envelope.return_binding.collection_token != receipt.token
                 || mail.target_agent != original.envelope.sender
@@ -428,6 +437,19 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?
             {
+                crate::mesh::store::ReceiptImport::Applied
+                    if original.envelope.kind == crate::mesh::store::Kind::Receipt =>
+                {
+                    // A dead receipt is routed once more, then surfaced. Its
+                    // outcome is never answered with another (#902).
+                    let owed = decode_receipt(&original.envelope)?;
+                    if owed.state == crate::mesh::store::UNDELIVERABLE
+                        || !store.retry_receipt(&owed).map_err(|e| e.to_string())?
+                    {
+                        crate::logging::mesh_custody_failed("receipt", "undeliverable");
+                    }
+                    Ok((accepted, true))
+                }
                 crate::mesh::store::ReceiptImport::Applied
                 | crate::mesh::store::ReceiptImport::Duplicate => Ok((accepted, true)),
                 crate::mesh::store::ReceiptImport::OriginalNotReady => {
@@ -1173,6 +1195,50 @@ mod tests {
                 .unwrap()
                 .is_empty());
             assert!(store.hub_outcomes(now_ms() as i64).unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A recipient never stores the refusal receipt it returns with its
+    /// refusal, so a hub's outcome for that receipt can never apply there.
+    /// It is refused permanently, once, rather than resent until the hub's
+    /// custody deadline (#902).
+    #[tokio::test]
+    async fn hub_outcome_for_an_unstored_refusal_receipt_is_refused_permanently() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let recipient = crate::mesh::identity::NodeIdentity::load().unwrap();
+        app.node_id = Some(recipient.node_id());
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let hub = crate::mesh::identity::NodeIdentity::fixture([10; 32]);
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut original, &sender);
+        let refusal = mint_receipt(
+            &original,
+            &recipient.node_id(),
+            &recipient,
+            serde_json::json!({"state":"refused","detail":"msg_not_allowed"}),
+            "refused",
+            original.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        let state = crate::mesh::store::UNDELIVERABLE;
+        let outcome = mint_receipt(
+            &refusal,
+            &hub.node_id(),
+            &hub,
+            serde_json::json!({"state":state,"detail":"no_route"}),
+            state,
+            refusal.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        let reason = app.import_mesh_receipt(&outcome).unwrap_err();
+        assert_eq!(reason, "invalid reply binding");
+        assert!(crate::mesh::delivery::permanent_refusal(&reason));
+        with_store(|store| {
+            assert!(store.get(&outcome.key).unwrap().is_none());
             Ok(())
         })
         .unwrap();
