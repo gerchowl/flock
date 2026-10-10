@@ -735,14 +735,25 @@ fn print_worktree_help() {
     eprintln!("  flk worktree unquarantine <quarantined-path> <destination>");
 }
 
-fn normalize_path_arg(value: &str) -> std::io::Result<String> {
+/// A path flag, absolute against the caller's directory before it reaches the
+/// server, which would otherwise read it against its own (#898).
+pub(super) fn normalize_path_arg(value: &str) -> std::io::Result<String> {
     let path = crate::worktree::expand_tilde_path(value);
-    let absolute = if path.is_absolute() {
-        path
+    if path.is_absolute() {
+        return Ok(path.display().to_string());
+    }
+    Ok(resolve_path_arg(value, &std::env::current_dir()?))
+}
+
+/// `value` with a leading `~` expanded, joined onto `base` when relative.
+/// Symlinks are not followed: the path stays the one the caller wrote.
+pub(super) fn resolve_path_arg(value: &str, base: &std::path::Path) -> String {
+    let path = crate::worktree::expand_tilde_path(value);
+    if path.is_absolute() {
+        path.display().to_string()
     } else {
-        std::env::current_dir()?.join(path)
-    };
-    Ok(absolute.display().to_string())
+        base.join(path).display().to_string()
+    }
 }
 
 #[cfg(test)]

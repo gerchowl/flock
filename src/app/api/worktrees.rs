@@ -37,14 +37,19 @@ fn process_infos(
         .collect()
 }
 
-fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
-    let path = crate::worktree::expand_tilde_path(path);
+/// `value`, which arrived in the request field `field`, as an absolute path.
+///
+/// The server's own directory is no anchor for a caller's relative path, so it
+/// is refused, and the refusal names the field it came from (#898): a relative
+/// `cwd` used to be reported as a bad worktree `path`.
+fn absolute_user_path(field: &str, value: &str) -> Result<PathBuf, ApiFailure> {
+    let path = crate::worktree::expand_tilde_path(value);
     if path.is_absolute() {
         Ok(path)
     } else {
         Err(ApiFailure::new(
             "invalid_request",
-            "worktree path must be absolute",
+            format!("{field} must be an absolute path, got {value:?}"),
         ))
     }
 }
@@ -126,7 +131,7 @@ impl App {
             Err(err) => return encode_error(id, err.code, err.message),
         };
         let checkout_path = match params.path {
-            Some(path) => match absolute_user_path(&path) {
+            Some(path) => match absolute_user_path("path", &path) {
                 Ok(path) => path,
                 Err(err) => return encode_error(id, err.code, err.message),
             },
@@ -371,7 +376,7 @@ impl App {
             ..
         } = source;
         let checkout_path = match params.path {
-            Some(path) => match absolute_user_path(&path) {
+            Some(path) => match absolute_user_path("path", &path) {
                 Ok(path) => path,
                 Err(err) => return encode_error(id, err.code, err.message),
             },
@@ -1041,7 +1046,7 @@ impl App {
                 })
             }
             (None, Some(path)) => {
-                let path = absolute_user_path(path)?;
+                let path = absolute_user_path("path", path)?;
                 let canonical = crate::worktree::canonical_or_original(&path);
                 if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&canonical) {
                     if let Some(space) = self
@@ -1107,7 +1112,7 @@ impl App {
         }
 
         if let Some(cwd) = cwd {
-            let path = absolute_user_path(&cwd)?;
+            let path = absolute_user_path("cwd", &cwd)?;
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
@@ -1167,7 +1172,7 @@ impl App {
         }
 
         if let Some(cwd) = cwd {
-            let path = absolute_user_path(&cwd)?;
+            let path = absolute_user_path("cwd", &cwd)?;
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
@@ -1371,7 +1376,7 @@ impl App {
         let entries = crate::worktree::list_existing_worktrees(&source.source_repo_root)
             .map_err(|err| ApiFailure::new("worktree_list_failed", err))?;
         if let Some(path) = path {
-            let expected = absolute_user_path(&path)?;
+            let expected = absolute_user_path("path", &path)?;
             let expected = crate::worktree::canonical_or_original(&expected);
             entries
                 .into_iter()
@@ -2012,10 +2017,16 @@ mod tests {
 
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            error.error.message,
+            r#"path must be an absolute path, got "relative-checkout""#
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         let _ = std::fs::remove_dir_all(repo);
     }
 
+    /// A relative `cwd` is refused as `cwd`, not as a worktree `path` the
+    /// caller never sent (#898). `flk delegate start --repo` travels as `cwd`.
     #[test]
     fn raw_api_worktree_create_rejects_relative_cwd() {
         let mut app = test_app();
@@ -2032,7 +2043,31 @@ mod tests {
 
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            error.error.message,
+            r#"cwd must be an absolute path, got "relative-repo""#
+        );
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn raw_api_worktree_list_rejects_relative_cwd_by_name() {
+        let mut app = test_app();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
+                cwd: Some("relative-repo".into()),
+                ..WorktreeListParams::default()
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            error.error.message,
+            r#"cwd must be an absolute path, got "relative-repo""#
+        );
     }
 
     #[test]

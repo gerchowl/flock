@@ -1168,10 +1168,7 @@ fn validate_worktree_flags(flags: &StartFlags) -> Result<(), String> {
 /// symlinks. A leading `~` is expanded the way the server would expand it.
 fn resolve_placement_paths(flags: &mut StartFlags, base: &Path) {
     for value in [&mut flags.cwd, &mut flags.repo].into_iter().flatten() {
-        let path = crate::worktree::expand_tilde_path(value);
-        if !path.is_absolute() {
-            *value = base.join(path).display().to_string();
-        }
+        *value = super::worktree::resolve_path_arg(value, base);
     }
 }
 
