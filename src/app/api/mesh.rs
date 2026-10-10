@@ -295,6 +295,7 @@ impl App {
                 .flatten()
                 .unwrap_or(0),
                 routes: self.mesh_route_status(),
+                route_generation: self.mesh_routes.table.generation(),
                 peers,
                 mesh_suspended_reason,
             },

@@ -2188,6 +2188,8 @@ pub enum ResponseResult {
     PeersEnrollment {
         #[serde(default)]
         mesh_quarantined: usize,
+        #[serde(default)]
+        route_generation: u64,
         routes: Vec<crate::mesh::routes::Route>,
         peers: Vec<crate::mesh::hello::Enrollment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
