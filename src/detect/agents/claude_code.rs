@@ -93,7 +93,7 @@ pub(in crate::detect) fn settled_with_background_shells(content: &str) -> bool {
     let above = content_above_prompt_box(content);
     has_prompt_box(content)
         && ends_on_done_turn(above)
-        && (last_non_empty_line(above).is_some_and(is_still_running_status_line)
+        && (last_non_empty_line(above).is_some_and(|line| still_running_task_count(line) > 0)
             || has_background_shell_footer(content))
 }
 
@@ -311,20 +311,64 @@ fn ends_on_done_turn(content_above_prompt: &str) -> bool {
 /// Claude's turn-completion line, `✻ Brewed for 34m 19s · done 10:59 AM · 1
 /// shell still running`, carries a `done <clock>` segment only once the turn
 /// is over. The shells it names outlive the turn, so the line is a finished
-/// turn rather than working chrome (#911). The clock is required, so prose
-/// that merely says "done" does not count.
+/// turn rather than working chrome (#911). The line must start with the
+/// completion glyph and the clock is required (`4:32 PM`, `8:05pm`, `17:59`),
+/// so prose that merely says "done" does not count.
 fn has_turn_done_marker(line: &str) -> bool {
+    let line = line.trim();
+    // The recap glyph `※` is in the spinner set but starts prose, not a
+    // completion line.
+    if !line.starts_with(|c: char| c != '\u{203b}' && SPINNER_CHARS.contains(c)) {
+        return false;
+    }
     line.split('\u{b7}').skip(1).any(|segment| {
         segment
             .trim()
             .strip_prefix("done ")
             .and_then(|clock| clock.split_whitespace().next())
             .is_some_and(|clock| {
+                let lower = clock.to_ascii_lowercase();
+                let clock = lower
+                    .strip_suffix("am")
+                    .or_else(|| lower.strip_suffix("pm"))
+                    .unwrap_or(&lower);
                 clock.starts_with(|c: char| c.is_ascii_digit())
                     && clock.contains(':')
                     && clock.chars().all(|c| c.is_ascii_digit() || c == ':')
             })
     })
+}
+
+/// Background tasks a completion line says are still running, counted the way
+/// Claude lists them: `1 shell still running`, `2 shells, 1 monitor still
+/// running`, `2 local agents still running`. Only the segment that ends in
+/// `still running` counts. Used for the done-marked line alone, where the
+/// count is a report about a finished turn rather than evidence of work.
+fn still_running_task_count(line: &str) -> u32 {
+    let lower = line.to_ascii_lowercase();
+    let Some(segment) = lower
+        .split('\u{b7}')
+        .map(str::trim)
+        .find(|segment| segment.ends_with("still running"))
+    else {
+        return 0;
+    };
+    let words: Vec<&str> = segment
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty() && *word != "local")
+        .collect();
+    words
+        .windows(2)
+        .filter_map(|pair| {
+            let count = pair[0].parse::<u32>().ok()?;
+            matches!(
+                pair[1],
+                "shell" | "shells" | "monitor" | "monitors" | "agent" | "agents"
+            )
+            .then_some(count)
+        })
+        .sum()
 }
 
 fn is_background_agent_wait_line(line: &str) -> bool {
@@ -435,6 +479,10 @@ fn has_claude_yes_no_choice(content: &str) -> bool {
     })
 }
 
+/// The glyphs Claude cycles through on its spinner line. The finished turn's
+/// completion line (`✻ Brewed for 3s`) keeps whichever one it stopped on.
+const SPINNER_CHARS: &str = "·✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋✢✣✤✥✦✧✨⊛⊕⊙◉◎◍⁂⁕※⍟☼★☆";
+
 /// Claude Code spinner characters + activity label.
 /// The verb changes frequently ("Processing…", "Pouncing…", etc.), so rely
 /// on the spinner glyph + trailing ellipsis rather than specific wording.
@@ -446,7 +494,6 @@ pub(in crate::detect) fn has_spinner_activity(content: &str) -> bool {
 /// The free-text activity label from Claude's spinner line, e.g.
 /// "✶ Implementing the parser… (esc to interrupt)" -> "Implementing the parser".
 pub(in crate::detect) fn spinner_activity_text(content: &str) -> Option<String> {
-    const SPINNER_CHARS: &str = "·✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋✢✣✤✥✦✧✨⊛⊕⊙◉◎◍⁂⁕※⍟☼★☆";
     for line in content.lines() {
         let trimmed = line.trim();
         let mut chars = trimmed.chars();
@@ -642,11 +689,22 @@ mod tests {
         assert!(has_turn_done_marker(
             "\u{273b} Brewed for 3s \u{b7} done 17:59"
         ));
+        assert!(has_turn_done_marker(
+            "\u{2736} Brewed for 3s \u{b7} done 8:05pm"
+        ));
+        assert!(has_turn_done_marker(
+            "  \u{273b} Brewed for 3s \u{b7} done 8:05 pm"
+        ));
         for line in [
             "\u{273b} Crunched for 7s \u{b7} 1 shell still running",
             "\u{273b} Crunched for 7s \u{b7} done \u{b7} 1 shell still running",
             "\u{273b} Crunched for 7s \u{b7} done soon \u{b7} 1 shell still running",
             "done 4:32 PM \u{b7} 1 shell still running",
+            // Prose, not the completion glyph, even with a clock in it.
+            "Deploy \u{b7} done 4:32 PM \u{b7} 1 shell still running",
+            "\u{25cf} Shipped \u{b7} done 4:32 PM \u{b7} 1 shell still running",
+            "\u{203b} recap: merged \u{b7} done 4:32 PM \u{b7} 1 shell still running",
+            "\u{273b} Brewed for 3s \u{b7} done 8:05xm",
         ] {
             assert!(!has_turn_done_marker(line), "{line}");
         }
@@ -655,6 +713,38 @@ mod tests {
             prompt_box_below("\u{273b} Crunched for 7s \u{b7} done \u{b7} 1 shell still running");
         assert!(has_working_chrome(&content));
         assert!(!settled_with_background_shells(&content));
+    }
+
+    /// The live footer shape from `background_shell_footer_matchers_miss_the_real_footer`
+    /// under a done-marked completion line: the comma and the monitor no longer
+    /// hide the count once the turn is known to be over.
+    #[test]
+    fn done_marked_turn_with_shells_and_a_monitor_is_settled() {
+        let content = done_turn_with_leftover_shell(
+            "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 2 shells, 1 monitor \u{b7} \u{2190} for agents",
+        )
+        .replace(
+            "Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running",
+            "Worked for 27s \u{b7} done 8:05 PM \u{b7} 2 shells, 1 monitor still running",
+        );
+        assert!(content.contains("2 shells, 1 monitor still running"));
+        assert!(!has_working_chrome(&content));
+        assert_eq!(detect_structural(&content), Some(AgentState::Idle));
+        assert!(settled_with_background_shells(&content));
+    }
+
+    #[test]
+    fn still_running_task_count_tolerates_claude_list_punctuation() {
+        for (line, count) in [
+            ("\u{273b} Brewed for 3s \u{b7} done 4:32 PM \u{b7} 1 shell still running", 1),
+            ("\u{273b} Worked for 27s \u{b7} done 8:05 PM \u{b7} 2 shells, 1 monitor still running", 3),
+            ("\u{273b} Worked for 4s \u{b7} done 9:01 AM \u{b7} 2 local agents still running", 2),
+            ("\u{273b} Worked for 4s \u{b7} done 9:01 AM \u{b7} 1 monitor still running", 1),
+            ("\u{273b} Baked for 16m 38s \u{b7} done 5:54 PM", 0),
+            ("\u{273b} Baked for 3s \u{b7} 2 files still running late", 0),
+        ] {
+            assert_eq!(still_running_task_count(line), count, "{line}");
+        }
     }
 
     #[test]

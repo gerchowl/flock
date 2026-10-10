@@ -577,7 +577,10 @@ fn delegate_short_provider_retry_recovers_and_settles_normally() {
 }
 
 /// #911: a turn that ended on its sentinel with a shell still running settles,
-/// and the outcome and `status` both say a shell outlived it.
+/// and the outcome and `status` both say a shell outlived it. The fixture
+/// server supplies `idle`, so this covers the reported field only; the state
+/// decision itself is covered in `terminal/state.rs`
+/// (`claude_hook_idle_holds_over_a_done_turn_with_a_leftover_shell`).
 #[test]
 fn delegate_done_turn_with_leftover_shell_settles_and_says_so() {
     let settled = concat!(
