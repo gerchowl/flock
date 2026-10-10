@@ -93,6 +93,9 @@ pub(super) const START_USAGE: &str = concat!(
     "                      git push and gh need explicit --sandbox danger-full-access\n",
     "  --ready-timeout MS  how long the agent may take to become ready and reach its prompt, default 60000\n",
     "  --max-chars N       characters of the reply to print, default 4000\n",
+    "  the brief must ask for a final line `DONE: ...`, `BLOCKED: ...` or `VERDICT: ...`; a reply\n",
+    "  ending on none of them is no_sentinel (exit 5); `flk delegate wait` lists every exit code\n",
+    "  an agent that exits before it takes the brief is gone (exit 4); its record stays for `reap`\n",
     "  the delegate runs in a workspace it created, never in the focused one, and never asks for focus",
 );
 
@@ -2662,6 +2665,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
     if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
+        if matches!(reason, SubmitFailure::Gone) {
+            return Ok(emit_submit_gone(&entry, flags.json));
+        }
         if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
             return Ok(fail(format!(
                 "delegate {name}: brief submission could not be confirmed: {reason}. \
@@ -2761,14 +2767,41 @@ fn composer_state(screen: &str, sentence: &str) -> Composer {
 enum SubmitFailure {
     Refused(String),
     Unconfirmed(String),
+    /// The pane exited before the harness took the brief: the harness died at
+    /// launch or on the brief, so no round is running (#817).
+    Gone,
 }
 
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(reason) | Self::Unconfirmed(reason) => f.write_str(reason),
+            Self::Gone => f.write_str("the agent exited before it accepted the brief"),
         }
     }
+}
+
+/// Report a round whose agent exited before it took the brief, as `gone`.
+///
+/// The entry is kept: it is the record `status` and `result` answer from, and
+/// what `reap` removes. The workspace may already have closed with its last
+/// pane, and a worktree checkout is still on disk.
+fn emit_submit_gone(entry: &Entry, json: bool) -> i32 {
+    let info = serde_json::json!({ "reason": "pane_gone" });
+    emit_outcome(
+        entry,
+        Outcome::Gone.as_str(),
+        Some(&info),
+        json,
+        &entry.cursor,
+    );
+    eprintln!(
+        "delegate {}: {}; `flk delegate reap {}` removes what is left",
+        entry.name,
+        SubmitFailure::Gone,
+        entry.name
+    );
+    Outcome::Gone.exit_code()
 }
 
 fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
@@ -2783,6 +2816,11 @@ fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), Submi
     };
     if let Some(error) = response.get("error") {
         return Err(SubmitFailure::Refused(server_error(error)));
+    }
+    if response.pointer("/result/outcome") == Some(&serde_json::json!("abandoned"))
+        && response.pointer("/result/reason") == Some(&serde_json::json!("pane_gone"))
+    {
+        return Err(SubmitFailure::Gone);
     }
     if !matches!(
         response
@@ -3249,6 +3287,9 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     }
 
     if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
+        if matches!(reason, SubmitFailure::Gone) {
+            return Ok(emit_submit_gone(&entry, flags.json));
+        }
         if matches!(reason, SubmitFailure::Unconfirmed(_)) {
             return Ok(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
         }
@@ -3441,8 +3482,19 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate_no_deadline(name) {
-        Ok(entry) => entry,
+    let entry = match require_recorded_delegate(name) {
+        Ok(Recorded::Live(entry)) => entry,
+        // No agent to ask for a reply: the same answer `delegate wait` gives.
+        Ok(Recorded::Gone(entry)) => {
+            emit_outcome(
+                &entry,
+                Outcome::Gone.as_str(),
+                None,
+                flags.json,
+                &entry.cursor,
+            );
+            return Ok(Outcome::Gone.exit_code());
+        }
         Err(code) => return Ok(code),
     };
 
@@ -3524,18 +3576,23 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate_no_deadline(name) {
-        Ok(entry) => entry,
+    let (entry, gone) = match require_recorded_delegate(name) {
+        Ok(Recorded::Live(entry)) => (entry, false),
+        Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
     };
     // `agent_record`, not `_opt`: an unreachable server is a FAILURE, never
     // a cheerful "unknown" at exit 0 (W13 / G5).
-    let record = match agent_record(&entry.terminal_id, None) {
-        AgentFetch::Found(record) => record,
-        AgentFetch::Missing => serde_json::json!({}),
-        AgentFetch::TimedOut => return Ok(fail(format!("delegate {}: timed out", entry.name))),
-        AgentFetch::Failed(reason) => {
-            return Ok(fail(format!("delegate {}: {reason}", entry.name)))
+    let record = if gone {
+        serde_json::json!({ "agent_status": Outcome::Gone.as_str() })
+    } else {
+        match agent_record(&entry.terminal_id, None) {
+            AgentFetch::Found(record) => record,
+            AgentFetch::Missing => serde_json::json!({}),
+            AgentFetch::TimedOut => return Ok(fail(format!("delegate {}: timed out", entry.name))),
+            AgentFetch::Failed(reason) => {
+                return Ok(fail(format!("delegate {}: {reason}", entry.name)))
+            }
         }
     };
     let status = field(&record, "agent_status").unwrap_or("unknown");
@@ -3664,6 +3721,59 @@ fn require_delegate_no_deadline(name: &str) -> Result<Entry, i32> {
             "delegate {name}: timed out resolving the agent"
         ))),
         Err(RequireFailure::Failed(reason)) => Err(fail(format!("delegate {name}: {reason}"))),
+    }
+}
+
+/// A delegate the read-only verbs answer for: live, or recorded but gone.
+#[derive(Debug)]
+enum Recorded {
+    Live(Entry),
+    /// The registry entry exists and no agent holds the name or the recorded
+    /// terminal any more: the harness exited, or its pane or workspace closed.
+    Gone(Entry),
+}
+
+/// Resolve a delegate for `status` and `result`, which read without acting.
+///
+/// A harness that dies at launch leaves its entry behind, and "not a delegate"
+/// for a name with a record is a lie the operator cannot act on (#817): the
+/// read verbs answer `gone` from the record instead. A name reused by another
+/// agent, or an agent renamed away from it, is still not this delegate.
+fn require_recorded_delegate(name: &str) -> Result<Recorded, i32> {
+    if let Err(reason) = validate_name(name) {
+        return Err(usage(reason));
+    }
+    let Some(entry) = read_entry(name) else {
+        return Err(usage(format!("not a delegate: {name}")));
+    };
+    let by_name = agent_record(name, None);
+    let terminal_id = entry.terminal_id.clone();
+    match recorded_decide(entry, by_name, || agent_record(&terminal_id, None)) {
+        Ok(recorded) => Ok(recorded),
+        Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
+        Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
+            "delegate {name}: timed out resolving the agent"
+        ))),
+        Err(RequireFailure::Failed(reason)) => Err(fail(format!("delegate {name}: {reason}"))),
+    }
+}
+
+/// The pure decision half of `require_recorded_delegate`. The terminal is asked
+/// only when the name is missing, which is what tells a renamed agent (still
+/// on its terminal) from a gone one.
+fn recorded_decide(
+    entry: Entry,
+    by_name: AgentFetch,
+    by_terminal: impl FnOnce() -> AgentFetch,
+) -> Result<Recorded, RequireFailure> {
+    if !matches!(by_name, AgentFetch::Missing) {
+        return require_decide(entry, by_name).map(Recorded::Live);
+    }
+    match by_terminal() {
+        AgentFetch::Missing => Ok(Recorded::Gone(entry)),
+        AgentFetch::Found(_) => Err(RequireFailure::NotDelegate),
+        AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
+        AgentFetch::Failed(reason) => Err(RequireFailure::Failed(reason)),
     }
 }
 
