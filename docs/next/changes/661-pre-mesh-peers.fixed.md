@@ -1,0 +1,1 @@
+- Report a peer still running a pre-mesh flk, such as v0.11.0 during a rolling upgrade, as `upgrade flk on <peer> (peer runs a pre-mesh flk)` in peer status and send errors, and retry it only on the long refusal backoff instead of as a transient stream failure. (#661)

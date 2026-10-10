@@ -151,10 +151,10 @@ fn refused_old_peer_rejects_new_acceptance_and_names_the_upgrade() {
     });
     let sent = send(&fleet, &recipient, "upgrade-refused");
     assert_eq!(sent["error"]["code"], "peer_incompatible", "{sent}");
-    assert!(sent["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("upgrade flk on nodeb"));
+    assert_eq!(
+        sent["error"]["message"],
+        "upgrade flk on nodeb (peer runs a pre-mesh flk)"
+    );
     assert_eq!(read(fleet.node("nodeb"), &recipient["pane_id"]), json!([]));
 }
 

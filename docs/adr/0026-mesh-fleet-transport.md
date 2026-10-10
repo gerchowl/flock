@@ -8,8 +8,8 @@
 - Decision owner: operator, accepted 2026-10-08 with the defaults and further
   rulings recorded in the Decisions section below.
   Extends ADR-0009 and clarifies ADR-0008, superseding their affected transport
-  contracts. Acceptance records the design, not its implementation.
-- Implemented: none. No mesh implementation ships with this document.
+  contracts. The amendments below record the final implementation decisions.
+- Implemented: v1.0.0 (#623 step 1, #661 step 2)
 
 ## Evidence and scope
 
@@ -18,7 +18,7 @@ roaming or NATed sender must be able to send and receive answers using the
 connections it can initiate. Connectivity determines when mail moves, not
 whether an accepted conversation has a return address.
 
-The #623 analysis remains applicable to this checkout:
+The pre-mesh #623 analysis established the original failure:
 `src/peers.rs::send_peer_message` performs a one-shot SSH command and discards
 its successful response body. `src/app/api/messages.rs::route_msg_reply`
 resolves the sender afresh and falls back to `hand_up_or_refuse`, not to a
@@ -36,8 +36,8 @@ compatibility fallback: mesh requires a held edge with matching protocol. Do
 not replicate logs or tune polling intervals to repair message transport.
 Directory and route knowledge remain bounded summaries pulled over existing
 SSH channels under ADR-0001. Discrete messages, acknowledgements and
-collection responses can travel both ways on those channels, as existing
-uplink traffic already does.
+collection responses travel both ways on those channels. The acceptor signals
+pending work with a wake push; the dialer pulls it over the held edge.
 
 ## Topology and routing
 
@@ -194,8 +194,10 @@ queued/expired outcomes without doing synchronous remote polling.
 ## Origin policy and fleet pause
 
 `[msg] allow_from` matches the ORIGIN node, authenticated by its persisted
-node key and mapped to its configured peer name. Display node ids through
-that peer name in status, routing and policy diagnostics. Never match the
+node key and mapped to its locally stored pin name: a configured peer name
+or the name pinned at inbound first contact. An advertised name alone is not
+a policy binding. Display node ids through that pin name in status, routing
+and policy diagnostics. Never match the
 caller-controlled host label or a forwarding hub's identity. Hubs traversed
 by a message are not checked against `allow_from`, so an allowed hop cannot
 launder a disallowed origin. Forwarding preserves the authenticated origin
@@ -234,30 +236,29 @@ longer means an accepted request's known sender is temporarily unreachable.
 
 A bounded asynchronous collection worker at the origin resumes from its
 outstanding request records without an active CLI waiter. It asks the
-original receiver or forwarding custodian for scoped answers and receipts.
-Persist those custodian node ids at send time, so collection can address
-them without requiring the original SSH alias to be reachable. Collection
-uses an authenticated held mesh edge, whether locally initiated or already
-open. There is no one-shot message or collection fallback.
+directly connected receiver or custodian for scoped answers and receipts.
+Custodian node ids survive loss of an SSH alias. Collection runs on a held
+authenticated edge; beyond that neighbor, routed custody supplies the
+return path described below. There is no one-shot message or collection
+fallback.
 
-**Mesh collection uses relayed collection, not proactive reply replication.**
-If (a) a laptop wakes where the original holder is not directly reachable,
-it addresses collection to that holder's node id through another connected
-hub. The hub relays the authenticated, conversation-scoped query along a
-loop-free live route and returns results along the request path, taking
-durable custody before acknowledging any returned answer. The original
-holder does not spray replies at hubs that might later be reachable. This
-keeps body copies and authority bounded to participating paths. If there is
-no path from the new hub to any recorded custodian or receiver, collection
-remains queued until one appears or TTL expires. A mesh cannot retrieve a
-physically partitioned holder, and no replication guarantee is implied.
+**Amendment Q1 (owner accepted 2026-10-09): route-driven custody forwarding
+replaces the relayed collection query.** If a laptop reconnects through a
+different hub, the holder forwards its single custody copy toward the
+origin node once a live route appears, or offers it for the next-hop
+neighbor to pull. Requests, answers and delivery/read receipts use the same
+bounded routing and durable import mechanism. No synchronous collection
+query is relayed through a chain of hubs, and replies are not replicated to
+speculative future hubs. Without a route to a surviving custodian, mail
+remains held until a path appears or its TTL expires.
 
-If (b) a spoke has no outbound edges, its hub collects on its behalf and
-pushes answers and receipts down the inbound-capable held edge the hub opened.
-The spoke can also request collection in the reverse direction on that edge.
-Push and relayed collection converge on the same durable import/dedupe
-transaction. When the edge is absent, the hub retains custody until reconnect
-or expiry. This applies equally to requests addressed to that spoke.
+A spoke with no outbound edges signals pending work with `mesh.wake` on the
+hub-opened edge. The hub pulls neighbor-addressed custody with
+`mesh.collect` and pushes mail toward the spoke with `mesh.deliver`.
+Follow-up answers remain eligible after an earlier final answer; a wake
+can prompt another pull without a permanent conversation poll. Import
+commits before acknowledgement. When the edge disappears, its custodian
+retains mail until reconnect or expiry.
 
 Import collected replies through `src/app/api/messages.rs`'s local event and
 mailbox/store path exactly once, then acknowledge collection. Both
@@ -281,10 +282,13 @@ id. `src/app/directory.rs` remains the single resolution surface. Extend its
 peer summaries with owning node identity, incarnation/generation and
 edge-bound route provenance. Local authoritative identity wins over cached
 entries. A closed advertising edge withdraws its routes, not the agent's
-existence: known identity plus stale location is queued/offline. A
-never-known fresh target may still be refused as unknown, while a reply uses
-its retained return binding even when directory discovery fails. Movement
-requires authenticated owner updates, not reinterpretation of the host
+existence: known identity plus stale location is queued/offline.
+
+**Amendment Q3 (owner accepted 2026-10-09):** a new send whose owner is
+outside the direct/one-hop gossip horizon and has no stored owner hint is
+refused as unknown. A known-but-offline owner is queued. Replies use the
+stored return binding at any depth, even when directory discovery fails.
+Movement requires authenticated owner updates, not reinterpretation of the host
 substring in an AgentId.
 
 The owning server's agent lifecycle handler emits and persists an explicit
@@ -333,21 +337,41 @@ identity, permanent removal and expiry differ from temporary routing loss.
 Transport attestation and collection tokens never make agent traffic an
 operator instruction.
 
+Terminal refusals by the owning node are recipient-signed receipts
+([#872](https://github.com/gerchowl/flock/issues/872)). When the owner behind
+a forwarding hub refuses a message with a policy reason (`refused` plus the
+reason) or because the target was removed (`recipient_gone`), it signs a
+receipt bound to the message's return binding. The hub takes custody of that
+receipt before recording the refusal and routes it back like delivery and
+read receipts. The origin accepts it only under the recipient node's
+signature, so a hub cannot mint a refusal for another node. Refusals a hub
+decides on its own are not signed by the owner. The receipt travels in an
+optional `receipt` field of the outbound acknowledgement, with a new
+`refused` receipt state, so it requires mesh protocol 5.
+
+Known limitations, fixed in v1.1.0: failures decided at an intermediate node
+(hop budget, loop, no route) are not routed back to the sender
+([#876](https://github.com/gerchowl/flock/issues/876)), and routed receipts do
+not carry expiry or elapsed outcome retention to multi-hop origins
+([#858](https://github.com/gerchowl/flock/issues/858)). In both cases the
+origin keeps the message in custody until its own deadline.
+
 ## Components and implementation steps
 
-These are implementation responsibilities, not claims of existing APIs:
+Implementation responsibilities:
 
-- `src/peer_stream.rs` and `src/cli/peers.rs`: require matching mesh protocol, frame
-  symmetric message/receipt/collection requests and recover authenticated
-  edges. Keep summary coalescing separate from discrete durable mail.
+- `src/peer_stream.rs` and `src/cli/peers.rs`: require matching mesh protocol, carry
+  messages and receipts in both directions using delivery, wake pushes and
+  dialer collection, and recover authenticated edges. Keep summary coalescing
+  separate from discrete durable mail.
 - `src/peers.rs`: replace one-shot message sends with held-edge custody and
   structured acknowledgements, exposing edge refusal reasons in peer status.
 - `src/app/api/messages.rs`, `src/app/mailboxes.rs` and event/schema modules:
   dedicated custody store, atomic dedupe/import, return bindings and outcomes.
   Audit schemas carry metadata only, while wait/status query durable records.
-- `src/app/api/uplink.rs` and `src/app/uplink.rs`: remove the old message
-  uplink paths. Runtime workers handle mesh custody, deferral production and
-  origin collection off the app/render loop.
+- `src/app/api/edges.rs` and `src/app/edges.rs`: authenticate per-edge relay
+  attachments, replacing the single message uplink. Runtime workers handle
+  mesh custody, deferral production and collection off the app/render loop.
 - `src/app/directory.rs`: edge-bound routes and lifecycle-backed owner tombstones.
 - `src/remote.rs`: keep thin-client bootstrap and protocol compatibility gates
   separate from fleet routing. A client attachment is not a durable mailbox
@@ -375,8 +399,9 @@ collection authorization depend on it.
 **Step 1 (#623):** dedicated store, minted message ids, durable reply outbox
 and authenticated sender-side collection on existing direct or one-hub logical
 paths, with restart recovery, idempotent
-import, delivery receipts and honest pending-collection status. Preserve the
-current hub/spoke guard. Ship holding and collection together: holding alone
+import, delivery receipts and honest pending-collection status. This milestone
+preserved the hub/spoke guard until step 2 replaced it. Holding and collection
+were implemented together: holding alone
 strands the answer. Choose records and keys that step 2 can reuse.
 
 **Step 2 (#661):** generalise custody to requests and replies, advertise
@@ -401,7 +426,14 @@ publish a release.
 
 At each held-edge handshake require identical mesh protocol versions. Refuse
 a mismatch with a clear error naming both local and remote versions and
-`upgrade flk on <peer>` using the configured peer name. Nothing queues for
+`upgrade flk on <peer>` using the configured peer name. v1.0.0 speaks mesh
+protocol 5. Protocol 4 existed only in development builds, whose nodes deny
+the new acknowledgement fields and would reject whole batches, so they are
+refused at hello. The previous release, v0.11.0, has no mesh at all: its
+server rejects `mesh.hello` as an unknown method, and an older relay prints
+CLI usage instead of answering. Both are refused as
+`upgrade flk on <peer> (peer runs a pre-mesh flk)` with the long refusal
+backoff, never the transient retry schedule. Nothing queues for
 that incompatible peer and nothing is downgraded. Refuse new acceptance
 addressed through a known incompatible edge, including collection jobs for
 it. Existing custody remains stored rather than being sent to an
@@ -409,21 +441,42 @@ incompatible peer. Ordinary offline queuing for enrolled matching-protocol
 destinations remains, subject to custody TTL, and is not a compatibility
 mechanism.
 
-A peer that cannot hold an edge, including one using a custom
-`summary_command`, old `flk`, or a failing stream, is refused until fixed.
+A peer that cannot hold an edge, such as an old `flk` or a failing stream,
+is refused until fixed (see Amendment #844 for `summary_command`).
 `flk status` and `flk peers` name the configured peer and concrete reason
-(custom summary transport unsupported, protocol/version unsupported or
+(pre-mesh flk, protocol/version unsupported or
 stream failure). No one-shot or alternate-message transport is attempted.
 
 Delete the old message uplink, one-shot message relay, separate deferral SSH
 hop and their related configuration keys in the mesh series, without a
 deprecation window. This includes `[msg] uplink_timeout_secs`,
 `uplink_heartbeat_secs`, `deferral_relay_concurrency` and custom peer
-`summary_command` compatibility behavior. Reject removed keys with migration
-instructions rather than accepting inert compatibility settings. There are
+`summary_command` compatibility behavior. There are
 no legacy acknowledgements, legacy gates or opt-in legacy sends. Review
 `src/protocol/wire.rs` under the repository's release-relative version rule
 while implementing the breaking wire, rather than bumping it in this doc PR.
+
+**Amendment #844 (owner accepted 2026-10-09):** removed keys warn and are
+ignored rather than refused. Startup, live handoff and reload strip
+`[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`,
+`deferral_relay_concurrency` and `[[peers]] summary_command`, apply every
+other setting, and keep the peer, which then holds an ordinary mesh edge.
+Warnings name the file, line and key in `flk status` and on CLI stderr;
+`flk config check [--json]` lists removed and unknown keys before a rollout
+and exits 1 when there are warnings. Startup, handoff and reload are never
+refused for a removed key. This supersedes the earlier "reject removed keys"
+rule and the refusal of peers with a custom `summary_command`.
+
+**Amendment Q2 (owner accepted 2026-10-09):** dev-build stores at schema
+v1–v11 upgrade in place, idempotently, to the v1.0.0 schema baseline (v12).
+Do not discard live custody to upgrade. Before rollout, make a consistent
+SQLite backup of `mesh-mail.sqlite` and preserve the identity and both
+`mesh-quarantine.jsonl` sidecar files. Copying only the main database while
+its WAL writer is active is not a consistent backup. Quarantined rows are
+archived with their original typed columns before bodies are cleared; a
+failed archive write leaves the row intact. Migration failures name the
+store path and recovery hint; moving it aside starts empty and loses its
+custody, so preserve a backup before any such recovery.
 
 ## Alternatives rejected
 
@@ -448,7 +501,8 @@ posture. A dedicated store provides atomic import and independent quota/GC.
 
 **Proactively replicate replies toward potentially reachable hubs.** Rejected:
 adds body copies and retention obligations without guaranteeing the laptop's
-next network. Relayed collection uses the available path to an actual holder.
+next network. Route-driven custody forwarding transfers one copy along an
+actual route, retaining it until downstream durable acceptance.
 
 **Replicated logs, a broker, faster polls or ControlMaster alone.** Retain
 ADR-0009's rejections and measurements. Conversation-scoped custody transfers only
@@ -472,8 +526,8 @@ mismatched protocols. Also cover a laptop collecting through a different
 hub, a spoke with no outbound edges, quiet healthy edges retaining routes,
 closed edges withdrawing routes, and #582 restart/resume retaining identity
 without a removal tombstone. Existing `tests/support/fleet.rs` and
-`tests/mcp_fleet_messaging.rs` supply the harness. This docs-only PR adds no
-runtime tests or behavior. Also require end-to-end coverage of origin
+`tests/mcp_fleet_messaging.rs` supply the harness. Also require end-to-end
+coverage of origin
 allowlists across an allowed forwarding hub, pause/resume and restart while
 paused with no TTL consumption, mailbox-full retry versus 24-hour inbox
 expiry, durable channel-original settlement, cloned identity refusal,
@@ -517,8 +571,9 @@ before advertising mesh capability:
    rules. Hubs can read bodies as trusted same-user custodians, and do not
    replicate them to speculative future hubs.
 8. **Origin policy and display:** `[msg] allow_from` matches the node-key-
-   authenticated origin under its configured peer name, never intermediate
-   hubs. Display node ids through configured peer names.
+   authenticated origin under its local pin name (configured or inbound
+   first-contact), never intermediate hubs. Advertised names alone confer no
+   policy authority.
 9. **Fleet pause:** freeze all custody activity, including sends, retries,
    delivery and expiry. Stop TTL/retention clocks while paused, including
    across restart, and resume without charging paused time.

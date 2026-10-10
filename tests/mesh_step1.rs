@@ -654,7 +654,7 @@ fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
     conversation
         .fleet
         .node_mut("nodeb")
-        .restart_with_mesh(fleet::MeshMode::VersionMismatch(0));
+        .restart_with_mesh(fleet::MeshMode::VersionMismatch(4));
     conversation.fleet.allow_edge("nodea", "nodeb");
     fleet::wait_until("old protocol refused", DEADLINE, || {
         api(

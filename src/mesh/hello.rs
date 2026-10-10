@@ -7,7 +7,10 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const VERSION: u32 = 4;
+/// Version 5 adds the optional `OutboundAck::receipt` and the `refused`
+/// receipt state. Version 4 nodes deny unknown ack fields and would reject
+/// whole batches, so hello refuses the mismatch instead.
+pub const VERSION: u32 = 5;
 
 pub(crate) fn version() -> u32 {
     if cfg!(debug_assertions) {
@@ -253,7 +256,12 @@ mod tests {
         remote.mesh = 99;
         assert_eq!(
             remote.validate("configured.test").unwrap_err(),
-            "mesh version mismatch: local 4, remote 99; upgrade flk on this node"
+            "mesh version mismatch: local 5, remote 99; upgrade flk on this node"
+        );
+        remote.mesh = 4;
+        assert_eq!(
+            remote.validate("configured.test").unwrap_err(),
+            "mesh version mismatch: local 5, remote 4; upgrade flk on configured.test"
         );
         assert_eq!(
             version_mismatch(99, 1, "configured.test"),

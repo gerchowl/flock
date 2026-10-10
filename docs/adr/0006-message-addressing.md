@@ -71,3 +71,12 @@ database, and the epic's §9 rules that out.
 - Scripts get deterministic addressing; humans get the shorthand.
 - The `repo` tier gives US-3 ("ask a peer in another repo") its natural
   spelling while same-repo asks keep the short form.
+
+## Mesh amendment (v1.0.0)
+
+See [ADR-0026](0026-mesh-fleet-transport.md), implemented by #623 and #661.
+
+Pane and repo-scoped addressing remain. ADR-0026 adds owner-node routing for
+remote AgentIds and supersedes correlation-id deduplication: the immutable
+(origin_node_id, message_id) key controls exactly-once import, while
+correlation IDs remain conversation labels.

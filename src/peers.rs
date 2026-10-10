@@ -1005,7 +1005,7 @@ pub struct PeerCheckoutOutcome {
 /// from the workspace id and acts on its own git; with `push` it pushes to
 /// origin so the hub can `git fetch origin <branch>` afterwards. `push == false`
 /// is a read-only probe feeding the hub's pre-action confirmation. Runs over the
-/// SAME SSH-invoked verb surface as `run_summary_command` — the hub never
+/// same peer SSH surface as the other `flk peers` verbs — the hub never
 /// touches the peer's `.git`, keeping the model hub-spoke. Blocking; run off the
 /// UI thread.
 pub fn run_checkout_prepare_command(
@@ -1024,7 +1024,7 @@ pub fn run_checkout_prepare_command(
     }
     let push_flag = if push { " --push" } else { "" };
     // The `flk` invocation is wrapped in a login shell so profile-managed PATHs
-    // (nix, brew) apply — same shape as the default summary_command and the
+    // (nix, brew) apply — same shape as the
     // prepare_peer_switch pre-focus call.
     let remote =
         format!("sh -lc 'flk peers checkout-prepare --workspace {workspace_id}{push_flag} --json'");
