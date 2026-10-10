@@ -37,6 +37,9 @@ const IMPORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// protocol and [`HANDOFF_VERSION`] stays 1 (#471).
 #[cfg(unix)]
 pub(crate) const MAX_FDS_PER_BATCH: usize = 64;
+/// The one data byte every fd batch rides on.
+#[cfg(unix)]
+const FD_BATCH_TAG: u8 = b'F';
 /// Room the receiver leaves for one SCM_RIGHTS message. Linux caps a message
 /// at 253 descriptors (`SCM_MAX_FD`), so no Linux sender can overflow this,
 /// and anything above [`MAX_FDS_PER_BATCH`] is refused after it arrives.
@@ -581,7 +584,12 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
 
 #[cfg(unix)]
 fn send_fd_batch(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
-    let byte = b"F";
+    send_tagged_fd_batch(stream, fds, FD_BATCH_TAG)
+}
+
+#[cfg(unix)]
+fn send_tagged_fd_batch(stream: &UnixStream, fds: &[RawFd], tag: u8) -> io::Result<()> {
+    let byte = [tag];
     let iov = [libc::iovec {
         iov_base: byte.as_ptr() as *mut libc::c_void,
         iov_len: byte.len(),
@@ -688,6 +696,12 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        if byte[0] != FD_BATCH_TAG {
+            return Err(io::Error::other(format!(
+                "handoff fd batch carried data byte {:#04x}, expected {:#04x}",
+                byte[0], FD_BATCH_TAG
+            )));
+        }
         let batch = out.len() - before;
         if batch == 0 {
             return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
@@ -717,7 +731,9 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
 #[cfg(unix)]
 unsafe fn collect_scm_rights(msg: &libc::msghdr, out: &mut Vec<RawFd>) -> io::Result<()> {
     let control = msg.msg_control as *const u8;
-    let control_end = control.wrapping_add(msg.msg_controllen as usize);
+    // `as _`: msg_controllen is usize on Linux and u32 on macOS.
+    let controllen: usize = msg.msg_controllen as _;
+    let control_end = control.wrapping_add(controllen);
     let mut result = Ok(());
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
     while !cmsg.is_null() {
@@ -1160,6 +1176,19 @@ mod tests {
         close_fds(&writes);
         let err = recv_fds(&receiver, 200).expect_err("65 fds in one batch");
         assert!(err.to_string().contains("batch limit"), "{err}");
+        drop(sender);
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn batch_on_a_byte_other_than_f_is_refused_and_its_fds_closed() {
+        let (reads, writes) = pipes(2);
+        let (sender, receiver) = pair_with_timeout();
+        send_tagged_fd_batch(&sender, &writes, b'X').expect("send");
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 2).expect_err("wrong data byte");
+        assert!(err.to_string().contains("data byte 0x58"), "{err}");
         drop(sender);
         drop(receiver);
         assert_all_write_ends_closed(&reads);
