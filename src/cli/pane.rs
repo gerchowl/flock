@@ -229,7 +229,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --cwd");
                     return Ok(2);
                 };
-                cwd = Some(value.clone());
+                cwd = Some(super::worktree::normalize_path_arg(value)?);
                 index += 2;
             }
             "--dry-run" => {
