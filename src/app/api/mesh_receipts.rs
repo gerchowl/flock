@@ -30,7 +30,10 @@ pub(super) fn decode_receipt(mail: &Envelope) -> Result<crate::mesh::collect::Re
 
 /// The recipient's reason for a terminal refusal, carried beside its state.
 fn receipt_detail(mail: &Envelope, state: &str) -> Option<String> {
-    if !matches!(state, "refused" | "recipient_gone") {
+    if !matches!(
+        state,
+        "refused" | "recipient_gone" | crate::mesh::store::UNDELIVERABLE
+    ) {
         return None;
     }
     #[derive(serde::Deserialize)]
@@ -171,18 +174,77 @@ impl App {
         }) else {
             return;
         };
-        for receipt in receipts {
-            if let Err(reason) = self.persist_routed_receipt(&receipt) {
-                let now = std::time::Instant::now();
-                if self
-                    .mesh_receipt_log_at
-                    .is_none_or(|deadline| now >= deadline)
-                {
-                    crate::logging::mesh_custody_failed("receipt", error_code(&reason));
-                    self.mesh_receipt_log_at = Some(now + std::time::Duration::from_secs(60));
-                }
+        let mut failures: Vec<String> = receipts
+            .iter()
+            .filter_map(|receipt| self.persist_routed_receipt(receipt).err())
+            .collect();
+        let outcomes = with_store(|store| {
+            store
+                .hub_outcomes(now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap_or_default();
+        for outcome in &outcomes {
+            failures.extend(self.persist_hub_outcome(outcome).err());
+        }
+        for reason in failures {
+            let now = std::time::Instant::now();
+            if self
+                .mesh_receipt_log_at
+                .is_none_or(|deadline| now >= deadline)
+            {
+                crate::logging::mesh_custody_failed("receipt", error_code(&reason));
+                self.mesh_receipt_log_at = Some(now + std::time::Duration::from_secs(60));
             }
         }
+    }
+
+    /// Sign this hub's own outcome for a forwarded message whose custody
+    /// ended here, and route it to the origin like any receipt (#876).
+    fn persist_hub_outcome(
+        &mut self,
+        outcome: &crate::mesh::store::HubOutcome,
+    ) -> Result<(), String> {
+        let hub = self
+            .node_id
+            .clone()
+            .ok_or("mesh node identity unavailable")?;
+        let next = self.request_next_hop(&outcome.key.origin_node);
+        let identity = crate::mesh::identity::NodeIdentity::load().map_err(|e| e.to_string())?;
+        with_store(|store| {
+            let original = store
+                .get(&outcome.key)
+                .map_err(|e| e.to_string())?
+                .ok_or("message_not_found")?;
+            let state = crate::mesh::store::UNDELIVERABLE;
+            let mail = mint_receipt(
+                &original.envelope,
+                &hub,
+                &identity,
+                serde_json::json!({"state":state,"detail":outcome.detail}),
+                state,
+                original.envelope.return_binding.collection_token.clone(),
+            )?;
+            store
+                .accept_origin(
+                    &mail,
+                    &next.node,
+                    if next.peer.is_some() {
+                        Admission::Custody
+                    } else {
+                        Admission::Held
+                    },
+                    crate::mesh::delivery::hop_limit(),
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?;
+            store
+                .hub_outcome_sent(&outcome.key)
+                .map_err(|e| e.to_string())
+        })?;
+        self.mesh_retry_at = None;
+        self.emit_mesh_wake(&next.node);
+        Ok(())
     }
 
     fn persist_routed_receipt(
@@ -256,6 +318,20 @@ impl App {
     ) -> Result<(Accepted, bool), String> {
         crate::mesh::sign::verify(mail).map_err(|_| "invalid_signature")?;
         let receipt = decode_receipt(mail)?;
+        if receipt.state == crate::mesh::store::UNDELIVERABLE {
+            return self.import_hub_outcome(mail, &receipt);
+        }
+        self.import_recipient_receipt(mail, &receipt)
+    }
+
+    /// The recipient-signed receipt path, unchanged since v1.0.0. A v1.0.0
+    /// origin sends a hub's `undeliverable` here and refuses it permanently
+    /// as `invalid reply binding`, so mixed fleets need no protocol bump.
+    fn import_recipient_receipt(
+        &mut self,
+        mail: &Envelope,
+        receipt: &crate::mesh::collect::Receipt,
+    ) -> Result<(Accepted, bool), String> {
         with_store(|store| {
             if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str())
                 || mail.return_binding.request != mail.key
@@ -287,6 +363,68 @@ impl App {
                     &receipt.key,
                     &receipt.state,
                     receipt_detail(mail, &receipt.state).as_deref(),
+                )
+                .map_err(|e| e.to_string())?
+            {
+                crate::mesh::store::ReceiptImport::Applied
+                | crate::mesh::store::ReceiptImport::Duplicate => Ok((accepted, true)),
+                crate::mesh::store::ReceiptImport::OriginalNotReady => {
+                    Err("receipt_original_not_ready".into())
+                }
+            }
+        })
+    }
+}
+
+impl App {
+    /// A forwarding hub's signed `undeliverable` outcome (#876). The signature
+    /// authenticates the hub, and the collection token proves it held this
+    /// message: only the custody path carries it before the recipient has an
+    /// outcome, and any recipient outcome outranks this one. A hub can never
+    /// assert a recipient state, and the recipient never asserts this one.
+    fn import_hub_outcome(
+        &mut self,
+        mail: &Envelope,
+        receipt: &crate::mesh::collect::Receipt,
+    ) -> Result<(Accepted, bool), String> {
+        let hub = mail.key.origin_node.as_str();
+        with_store(|store| {
+            if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str())
+                || hub == receipt.key.origin_node
+                || mail.return_binding.request != mail.key
+                || mail.return_binding.recipient_node != receipt.key.origin_node
+                || mail.request_key.as_ref() != Some(&receipt.key)
+            {
+                return Err("invalid reply binding".into());
+            }
+            let original = store
+                .get(&receipt.key)
+                .map_err(|e| e.to_string())?
+                .ok_or("receipt_original_not_ready")?;
+            if original.envelope.return_binding.recipient_node == hub
+                || original.envelope.return_binding.collection_token != receipt.token
+                || mail.target_agent != original.envelope.sender
+            {
+                return Err("invalid reply binding".into());
+            }
+            let reason: String = receipt_detail(mail, crate::mesh::store::UNDELIVERABLE)
+                .unwrap_or_else(|| "undeliverable".into())
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(128)
+                .collect();
+            let name = store
+                .origin_name(hub)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| hub.chars().take(12).collect());
+            let accepted = store
+                .accept(mail, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
+                .map_err(|e| e.to_string())?;
+            match store
+                .import_hub_outcome(
+                    &receipt.key,
+                    &format!("{reason} at {name}"),
+                    now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())?
             {
@@ -739,6 +877,302 @@ mod tests {
         assert_eq!(outbound.ack.len(), 1, "the refusal ack proceeds");
         with_store(|store| {
             assert_eq!(store.get(&receipt.key).unwrap().unwrap().state, "custody");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_owes_its_own_outcome_only_when_custody_ends_without_a_receipt() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let hub = crate::mesh::identity::NodeIdentity::load().unwrap();
+        app.node_id = Some(hub.node_id());
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let forward = |thread: &str, ttl: i64| {
+            let mut mail = crate::mesh::sign::tests::signed();
+            mail.correlation_id = thread.into();
+            mail.return_binding.recipient_node = recipient.node_id();
+            crate::mesh::sign::seal(&mut mail, &sender);
+            with_store(|store| {
+                store
+                    .accept_forward(
+                        &mail,
+                        ttl,
+                        7,
+                        &[mail.key.origin_node.clone(), hub.node_id()],
+                        &recipient.node_id(),
+                        Admission::Custody,
+                        now_ms() as i64,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+            mail
+        };
+        let owed = || {
+            with_store(|store| {
+                let mut owed: Vec<_> = store
+                    .hub_outcomes(now_ms() as i64)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|outcome| (outcome.key, outcome.detail))
+                    .collect();
+                owed.sort_by(|a: &(MessageKey, String), b| a.1.cmp(&b.1));
+                Ok(owed)
+            })
+            .unwrap()
+        };
+        let looped = forward("looped", 300);
+        let refused = forward("refused-by-hub", CUSTODY_TTL_MS);
+        let owner_refused = forward("refused-by-owner", CUSTODY_TTL_MS);
+        let live = forward("live", CUSTODY_TTL_MS);
+        with_store(|store| {
+            store
+                .refuse_route(&looped.key, "loop_detected")
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(owed().is_empty(), "rerouting custody owes nothing yet");
+        let receipt = mint_receipt(
+            &owner_refused,
+            &recipient.node_id(),
+            &recipient,
+            serde_json::json!({"state":"refused","detail":"msg_not_allowed"}),
+            "refused",
+            owner_refused.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        app.settle_refusal(
+            &owner_refused,
+            "msg_not_allowed",
+            Some(&receipt),
+            Some(&recipient.node_id()),
+        )
+        .unwrap();
+        app.settle_refusal(&refused, "invalid_envelope", None, None)
+            .unwrap();
+        // The looped row reaches its deadline still unrouted.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let expected = vec![
+            (refused.key.clone(), "invalid_envelope".to_string()),
+            (looped.key.clone(), "loop_detected".to_string()),
+        ];
+        assert_eq!(owed(), expected, "{:?}", live.key);
+
+        app.route_mesh_receipts();
+        assert!(owed().is_empty(), "each outcome is minted once");
+        with_store(|store| {
+            for (key, detail) in &expected {
+                let receipts: Vec<_> = store
+                    .by_request_key(key)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|receipt| store.get(&receipt).unwrap().unwrap())
+                    .collect();
+                assert_eq!(receipts.len(), 1);
+                let mail = &receipts[0].envelope;
+                assert_eq!(mail.key.origin_node, hub.node_id());
+                assert_eq!(mail.return_binding.recipient_node, sender.node_id());
+                crate::mesh::sign::verify(mail).unwrap();
+                assert_eq!(
+                    decode_receipt(mail).unwrap().state,
+                    crate::mesh::store::UNDELIVERABLE
+                );
+                assert_eq!(
+                    receipt_detail(mail, crate::mesh::store::UNDELIVERABLE).as_deref(),
+                    Some(detail.as_str())
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hub_signed_undeliverable_reaches_the_origin_and_never_poses_as_the_recipient() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let hub = crate::mesh::identity::NodeIdentity::fixture([10; 32]);
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut original, &sender);
+        app.node_id = Some(sender.node_id());
+        with_store(|store| {
+            store
+                .accept(
+                    &original,
+                    CUSTODY_TTL_MS,
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?;
+            store
+                .finish(
+                    &original.key,
+                    crate::mesh::store::Outcome::Transferred,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let status = || {
+            with_store(|store| {
+                let status = store
+                    .status(&sender.node_id(), &original.correlation_id, now_ms() as i64)
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+                Ok((status.state, status.detail))
+            })
+            .unwrap()
+        };
+        let sign = |signer: &crate::mesh::identity::NodeIdentity, state: &str, token: Vec<u8>| {
+            mint_receipt(
+                &original,
+                &signer.node_id(),
+                signer,
+                serde_json::json!({"state":state,"detail":"hop_budget_exhausted"}),
+                state,
+                token,
+            )
+            .unwrap()
+        };
+        let token = original.return_binding.collection_token.clone();
+        // A hub cannot assert a recipient state, the recipient cannot assert
+        // a hub outcome, and a node without the message's token cannot either.
+        for forged in [
+            sign(&hub, "read", token.clone()),
+            sign(&hub, "refused", token.clone()),
+            sign(&recipient, crate::mesh::store::UNDELIVERABLE, token.clone()),
+            sign(&hub, crate::mesh::store::UNDELIVERABLE, vec![1; 32]),
+        ] {
+            assert_eq!(
+                app.import_mesh_receipt(&forged).unwrap_err(),
+                "invalid reply binding"
+            );
+        }
+        assert_eq!(status(), ("custody".into(), None));
+
+        let outcome = sign(&hub, crate::mesh::store::UNDELIVERABLE, token.clone());
+        assert_eq!(app.import_mesh_receipt(&outcome), Ok((Accepted::New, true)));
+        let at = format!("hop_budget_exhausted at {}", &hub.node_id()[..12]);
+        assert_eq!(status(), ("undeliverable".into(), Some(at.clone())));
+        assert_eq!(
+            app.import_mesh_receipt(&outcome),
+            Ok((Accepted::Duplicate, true))
+        );
+        let again = sign(&hub, crate::mesh::store::UNDELIVERABLE, token.clone());
+        assert_eq!(app.import_mesh_receipt(&again), Ok((Accepted::New, true)));
+        assert_eq!(status(), ("undeliverable".into(), Some(at)));
+
+        // The recipient's own outcome outranks the hub's, and stays final.
+        let read = mint_receipt(
+            &original,
+            &recipient.node_id(),
+            &recipient,
+            serde_json::json!({"state":"read"}),
+            "read",
+            token.clone(),
+        )
+        .unwrap();
+        assert_eq!(app.import_mesh_receipt(&read), Ok((Accepted::New, true)));
+        assert_eq!(status(), ("read".into(), None));
+        let late = sign(&hub, crate::mesh::store::UNDELIVERABLE, token);
+        assert_eq!(app.import_mesh_receipt(&late), Ok((Accepted::New, true)));
+        assert_eq!(status(), ("read".into(), None));
+    }
+
+    /// Without a protocol bump a v1.0.0 origin receives the hub's outcome
+    /// on its recipient-receipt path. It must refuse it once, permanently,
+    /// with nothing stored, and the hub must settle that refusal without
+    /// owing another outcome, so mixed fleets cannot loop.
+    #[tokio::test]
+    async fn v1_0_origin_refuses_a_hub_outcome_once_and_the_hub_settles_it() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let hub = crate::mesh::identity::NodeIdentity::load().unwrap();
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut original, &sender);
+        app.node_id = Some(sender.node_id());
+        with_store(|store| {
+            store
+                .accept(
+                    &original,
+                    CUSTODY_TTL_MS,
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?;
+            store
+                .finish(
+                    &original.key,
+                    crate::mesh::store::Outcome::Transferred,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let outcome = mint_receipt(
+            &original,
+            &hub.node_id(),
+            &hub,
+            serde_json::json!({"state":"undeliverable","detail":"no_route"}),
+            "undeliverable",
+            original.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        let receipt = decode_receipt(&outcome).unwrap();
+        let reason = app
+            .import_recipient_receipt(&outcome, &receipt)
+            .unwrap_err();
+        assert_eq!(reason, "invalid reply binding");
+        assert!(crate::mesh::delivery::permanent_refusal(&reason));
+        let delivery = forwarded(&outcome);
+        assert!(app.refusal_receipt(&delivery, &reason).is_none());
+        with_store(|store| {
+            assert!(store.get(&outcome.key).unwrap().is_none());
+            assert_eq!(
+                store
+                    .status(&sender.node_id(), &original.correlation_id, now_ms() as i64)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "custody"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // The hub holds that receipt in custody and records the refusal as
+        // final. Receipt rows never owe a hub outcome of their own.
+        app.node_id = Some(hub.node_id());
+        with_store(|store| {
+            store
+                .accept_origin(
+                    &outcome,
+                    &sender.node_id(),
+                    Admission::Custody,
+                    8,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        app.settle_refusal(&outcome, &reason, None, Some(&sender.node_id()))
+            .unwrap();
+        with_store(|store| {
+            assert_eq!(store.get(&outcome.key).unwrap().unwrap().state, "refused");
+            assert!(store
+                .push_ready(now_ms() as i64 + CUSTODY_TTL_MS, 16, &[sender.node_id()])
+                .unwrap()
+                .is_empty());
+            assert!(store.hub_outcomes(now_ms() as i64).unwrap().is_empty());
             Ok(())
         })
         .unwrap();

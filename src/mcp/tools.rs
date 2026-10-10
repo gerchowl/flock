@@ -186,7 +186,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_status",
-            description: "Inspect durable message state: queued, custody, delivered, read, held, collected, refused, expired or outcome_retention_elapsed. Includes replies and submission attempts. Retain the returned reference for queries after retention; old local messages remain supported.",
+            description: "Inspect durable message state: queued, custody, delivered, read, held, collected, refused, undeliverable, expired or outcome_retention_elapsed. Includes replies and submission attempts. Retain the returned reference for queries after retention; old local messages remain supported.",
             input_schema: schema_msg_status,
             build: build_msg_status,
         },
@@ -239,7 +239,9 @@ pub(super) fn table() -> &'static [Tool] {
                           `reply`), `deferred` (the recipient is muted; its \
                           automatic answer is in `reply`), `expired` (dropped \
                           unread), `refused` (the receiver declined it; reason in \
-                          `detail`), `recipient_gone`, `outcome_retention_elapsed`, or `timeout` (with \
+                          `detail`), `undeliverable` (a forwarding hub could \
+                          not deliver it; reason in `detail`), \
+                          `recipient_gone`, `outcome_retention_elapsed`, or `timeout` (with \
                           the message's last `state`, e.g. `read`). BLOCKS \
                           this MCP session for up to `timeout_ms` (default \
                           60 s, at most 10 min): to wait longer without \
