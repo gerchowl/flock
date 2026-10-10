@@ -629,6 +629,13 @@ impl App {
         let enrollment_changed = self.mesh_enrollment_generation != generation;
         let resumed = self.mesh_pause_seen != Some(false) && !paused;
         self.mesh_pause_seen = Some(paused);
+        if resumed {
+            // A pause halts custody clocks, so a loop's grace starts over
+            // and routes get time to settle after resume (#928).
+            for since in self.mesh_looped.values_mut() {
+                *since = now;
+            }
+        }
         if let Err(reason) = with_store(|store| {
             store
                 .set_paused(self.fleet_pause.paused, now_ms() as i64)
@@ -750,7 +757,7 @@ impl App {
                 }
             }
         }
-        self.settle_looped_custody();
+        self.settle_looped_custody(crate::mesh::delivery::loop_grace());
         // Leave a worker available for new user sends when a retry edge stalls.
         let cap = crate::mesh::delivery::push_concurrency();
         let limit = self
@@ -859,11 +866,10 @@ impl App {
     /// path rather than at the custody deadline (#928). A route that turned
     /// loop-free meanwhile is taken instead, and a recipient with no route
     /// at all keeps waiting for one, as before.
-    fn settle_looped_custody(&mut self) {
+    pub(super) fn settle_looped_custody(&mut self, grace: std::time::Duration) {
         if self.mesh_looped.is_empty() {
             return;
         }
-        let grace = crate::mesh::delivery::loop_grace();
         let due: Vec<MessageKey> = self
             .mesh_looped
             .iter()

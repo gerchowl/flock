@@ -349,21 +349,19 @@ mod tests {
         .unwrap();
         assert_eq!(next_hop.as_deref(), Some(""), "never offered to the spoke");
     }
-    #[tokio::test]
-    async fn hub_reports_custody_whose_only_route_stays_looped_past_the_grace() {
-        let _store = crate::mesh::runtime_store::TestStore::new();
-        std::env::set_var("FLOCK_TEST_MESH_LOOP_GRACE_MS", "0");
+    /// Custody taken over an edge that has since gone, so the only route
+    /// left leads back through the spoke (#928). One retry pass under the
+    /// default grace notes the loop without acting on it.
+    fn looped_custody() -> (App, Deliver) {
         let (mut app, delivery) = hub_reachable_only_through_spoke();
         let hub = app.node_id.clone().unwrap();
-        // Custody taken over an edge that has since gone, so the only route
-        // left leads back through the spoke (#928).
         with_store(|store| {
             store
                 .accept_forward(
                     &delivery.envelope,
                     delivery.remaining_ms,
                     delivery.hops_left - 1,
-                    &[delivery.visited[0].clone(), hub.clone()],
+                    &[delivery.visited[0].clone(), hub],
                     "",
                     Admission::Custody,
                     now_ms() as i64,
@@ -373,7 +371,19 @@ mod tests {
         .unwrap();
         app.mesh_retry_at = None;
         app.retry_mesh_mail();
-        std::env::remove_var("FLOCK_TEST_MESH_LOOP_GRACE_MS");
+        assert!(app.mesh_looped.contains_key(&delivery.envelope.key));
+        (app, delivery)
+    }
+    fn row_state(key: &crate::mesh::key::MessageKey) -> String {
+        with_store(|store| Ok(store.get(key).unwrap().unwrap().state)).unwrap()
+    }
+    #[tokio::test]
+    async fn hub_reports_custody_whose_only_route_stays_looped_past_the_grace() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, delivery) = looped_custody();
+        let hub = app.node_id.clone().unwrap();
+        assert_eq!(row_state(&delivery.envelope.key), "custody");
+        app.settle_looped_custody(std::time::Duration::ZERO);
         assert!(app.mesh_looped.is_empty());
         with_store(|store| {
             let row = store.get(&delivery.envelope.key).unwrap().unwrap();
@@ -391,6 +401,32 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+    #[tokio::test]
+    async fn fleet_resume_restarts_the_loop_grace() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, delivery) = looped_custody();
+        let key = delivery.envelope.key.clone();
+        let backdate = |app: &mut App| {
+            *app.mesh_looped.get_mut(&key).unwrap() = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(120))
+                .unwrap();
+        };
+        // The grace ran out while the fleet was paused.
+        app.fleet_pause.paused = true;
+        app.mesh_retry_at = None;
+        app.retry_mesh_mail();
+        backdate(&mut app);
+        app.fleet_pause.paused = false;
+        app.mesh_retry_at = None;
+        app.retry_mesh_mail();
+        assert_eq!(row_state(&key), "custody", "resume starts the grace over");
+        assert!(app.mesh_looped[&key].elapsed() < std::time::Duration::from_secs(60));
+        // Without a pause the same lapsed grace is reported.
+        backdate(&mut app);
+        app.mesh_retry_at = None;
+        app.retry_mesh_mail();
+        assert_eq!(row_state(&key), "refused");
     }
     #[tokio::test]
     async fn hop_budget_exhausted_refuses_only_forwarding() {
