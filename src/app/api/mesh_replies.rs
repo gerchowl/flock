@@ -178,10 +178,12 @@ impl App {
                 )
                 .map(|edge| &edge.enrollment)
                 .filter(|edge| edge.state == "pinned")
-                .and_then(|edge| edge.node_id.as_deref())
+                .and_then(|edge| edge.node_id.clone())
                 .ok_or("mesh edge is not enrolled")?;
+            let origin = origin.as_str();
             with_store(|store| {
                 let mut refusals = Vec::new();
+                let mut refusal_receipts = Vec::new();
                 if let Collect::Outbound { outbound } = &query {
                     for ack in &outbound.ack {
                         if let Some(reason) = &ack.refusal {
@@ -193,6 +195,12 @@ impl App {
                                 .map_err(|e| e.to_string())?
                             {
                                 if record.state == "held" && record.remaining_ms > 0 {
+                                    if let Some(receipt) = ack.receipt.as_deref().filter(|_| {
+                                        self.node_id.as_deref()
+                                            != Some(record.envelope.key.origin_node.as_str())
+                                    }) {
+                                        refusal_receipts.push((receipt.clone(), origin.to_owned()));
+                                    }
                                     refusals.push((record.envelope.correlation_id, reason.clone()));
                                 }
                             }
@@ -243,11 +251,14 @@ impl App {
                         }
                     }
                 }
-                Ok((answers, refusals, receipt, receipts_acked))
+                Ok((answers, refusals, refusal_receipts, receipt, receipts_acked))
             })
         })();
         match result {
-            Ok((answers, refusals, receipt, receipts_acked)) => {
+            Ok((answers, refusals, refusal_receipts, receipt, receipts_acked)) => {
+                for (refusal_receipt, downstream) in refusal_receipts {
+                    self.forward_refusal_receipt(&refusal_receipt, &downstream);
+                }
                 for (correlation_id, reason) in refusals {
                     self.emit_event(EventEnvelope {
                         event: EventKind::MessageDelivered,

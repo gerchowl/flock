@@ -1174,8 +1174,12 @@ impl App {
         &mut self,
         completion: crate::app::message_relay::RelayCompletion,
     ) {
-        let crate::app::message_relay::RelayCompletion { send, result } = completion;
-        self.complete_mesh_send(send, result);
+        let crate::app::message_relay::RelayCompletion {
+            send,
+            result,
+            receipt,
+        } = completion;
+        self.complete_mesh_send(send, result, receipt);
     }
 
     /// The `blocking` tier's own budget (ADR-0018 §1): the intent the message
@@ -2861,6 +2865,7 @@ mod tests {
                 result: Err(crate::peers::PeerMessageFailure::Unreachable(
                     "timeout".into(),
                 )),
+                receipt: None,
             });
             assert_eq!(
                 app.mailboxes.wake_count(&asker),
@@ -2876,6 +2881,7 @@ mod tests {
                         "timeout".into(),
                     ))
                 },
+                receipt: None,
             });
             assert_eq!(
                 app.mailboxes.wake_count(&asker),

@@ -3,6 +3,7 @@ use super::{mesh_mail::error_code, messages::now_ms};
 use crate::{
     app::App,
     mesh::{
+        delivery::Deliver,
         hello::with_store,
         key::MessageKey,
         store::{Accepted, Admission, Envelope, ReturnBinding, CUSTODY_TTL_MS},
@@ -27,7 +28,102 @@ pub(super) fn decode_receipt(mail: &Envelope) -> Result<crate::mesh::collect::Re
     }
 }
 
+/// The recipient's reason for a terminal refusal, carried beside its state.
+fn receipt_detail(mail: &Envelope, state: &str) -> Option<String> {
+    if !matches!(state, "refused" | "recipient_gone") {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        detail: Option<String>,
+    }
+    serde_json::from_slice::<Body>(&mail.body)
+        .ok()?
+        .detail
+        .map(|detail| detail.chars().take(512).collect())
+}
+
+/// Seal `state` as a receipt for `original`, signed by this node. Only the
+/// recipient's own signature is accepted at the origin.
+fn mint_receipt(
+    original: &Envelope,
+    origin: &str,
+    identity: &crate::mesh::identity::NodeIdentity,
+    body: serde_json::Value,
+    state: &str,
+    token: Vec<u8>,
+) -> Result<Envelope, String> {
+    let mut mail = original.clone();
+    mail.key = MessageKey::mint(origin.into(), now_ms()).map_err(|e| e.to_string())?;
+    mail.kind = crate::mesh::store::Kind::Receipt;
+    mail.request_key = Some(original.key.clone());
+    mail.target_agent = mail.sender.clone();
+    mail.correlation_id = format!("receipt:{}:{}", original.key.message_id, state);
+    mail.in_reply_to = None;
+    mail.intent = "\"fyi\"".into();
+    mail.return_binding =
+        ReturnBinding::mint(mail.key.clone(), original.key.origin_node.clone(), vec![])
+            .map_err(|e| e.to_string())?;
+    mail.return_binding.collection_token = token;
+    mail.body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    crate::mesh::sign::seal(&mut mail, identity);
+    Ok(mail)
+}
+
 impl App {
+    /// The recipient's signed terminal outcome for a forwarded message it
+    /// refuses (#872). The upstream hub returns it toward the origin, which
+    /// accepts only this node's signature for it, so no hub can mint one.
+    pub(super) fn refusal_receipt(&self, delivery: &Deliver, reason: &str) -> Option<Envelope> {
+        let envelope = &delivery.envelope;
+        let state = match reason.split(':').next() {
+            Some("recipient_gone") => "recipient_gone",
+            Some("msg_not_allowed") => "refused",
+            _ => return None,
+        };
+        let local = self.node_id.as_deref()?;
+        if delivery.visited.len() < 2
+            || envelope.kind != crate::mesh::store::Kind::Message
+            || envelope.request_key.is_some()
+            || envelope.return_binding.recipient_node != local
+            || envelope.return_binding.request != envelope.key
+            || delivery.visited.first() != Some(&envelope.key.origin_node)
+            || crate::mesh::sign::verify(envelope).is_err()
+        {
+            return None;
+        }
+        let identity = crate::mesh::identity::NodeIdentity::load().ok()?;
+        let detail: String = reason.chars().take(512).collect();
+        mint_receipt(
+            envelope,
+            local,
+            &identity,
+            serde_json::json!({"state":state,"detail":detail}),
+            state,
+            envelope.return_binding.collection_token.clone(),
+        )
+        .ok()
+    }
+
+    /// Take custody of the downstream recipient's refusal receipt and route
+    /// it like any forwarded receipt. The origin authenticates its signer.
+    pub(super) fn forward_refusal_receipt(&mut self, receipt: &Envelope, downstream: &str) {
+        let delivery = Deliver {
+            envelope: receipt.clone(),
+            remaining_ms: CUSTODY_TTL_MS,
+            hops_left: crate::mesh::delivery::hop_limit(),
+            visited: vec![downstream.to_owned()],
+        };
+        if receipt.kind != crate::mesh::store::Kind::Receipt
+            || self.node_id.as_deref() == Some(receipt.return_binding.recipient_node.as_str())
+        {
+            return;
+        }
+        if let Err(reason) = self.import_attested_mesh_mail(&delivery, downstream) {
+            crate::logging::mesh_custody_failed("refusal_receipt", error_code(&reason));
+        }
+    }
+
     /// Retry durable receipt debt without writing on idle passes.
     pub(super) fn route_mesh_receipts(&mut self) {
         let Ok(receipts) = with_store(|store| {
@@ -86,21 +182,14 @@ impl App {
                 .get(&receipt.key)
                 .map_err(|e| e.to_string())?
                 .ok_or("message_not_found")?;
-            let mut mail = original.envelope;
-            mail.key = MessageKey::mint(origin.clone(), now_ms()).map_err(|e| e.to_string())?;
-            mail.kind = crate::mesh::store::Kind::Receipt;
-            mail.request_key = Some(receipt.key.clone());
-            mail.target_agent = mail.sender.clone();
-            mail.correlation_id = format!("receipt:{}:{}", receipt.key.message_id, receipt.state);
-            mail.in_reply_to = None;
-            mail.intent = "\"fyi\"".into();
-            mail.return_binding =
-                ReturnBinding::mint(mail.key.clone(), receipt.key.origin_node.clone(), vec![])
-                    .map_err(|e| e.to_string())?;
-            mail.return_binding.collection_token = receipt.token.clone();
-            mail.body = serde_json::to_vec(&serde_json::json!({"state":receipt.state}))
-                .map_err(|e| e.to_string())?;
-            crate::mesh::sign::seal(&mut mail, &identity);
+            let mail = mint_receipt(
+                &original.envelope,
+                &origin,
+                &identity,
+                serde_json::json!({"state":receipt.state}),
+                &receipt.state,
+                receipt.token.clone(),
+            )?;
             store
                 .accept_origin(
                     &mail,
@@ -156,7 +245,11 @@ impl App {
                 .accept(mail, CUSTODY_TTL_MS, Admission::Inbox, now_ms() as i64)
                 .map_err(|e| e.to_string())?;
             match store
-                .import_receipt(&receipt.key, &receipt.state)
+                .import_receipt_with_detail(
+                    &receipt.key,
+                    &receipt.state,
+                    receipt_detail(mail, &receipt.state).as_deref(),
+                )
                 .map_err(|e| e.to_string())?
             {
                 crate::mesh::store::ReceiptImport::Applied
@@ -312,6 +405,150 @@ mod tests {
                 .unwrap();
             assert_eq!(due.len(), 1, "a receipt must not close answer collection");
             assert_eq!(due[0].envelope.key, original.key);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn test_app() -> App {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn forwarded(envelope: &Envelope) -> Deliver {
+        Deliver {
+            visited: vec![envelope.key.origin_node.clone(), "hub.example".into()],
+            envelope: envelope.clone(),
+            remaining_ms: CUSTODY_TTL_MS,
+            hops_left: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn recipient_signed_refusal_reaches_the_origin_and_a_hub_cannot_mint_one() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let recipient = crate::mesh::identity::NodeIdentity::load().unwrap();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut original, &sender);
+        app.node_id = Some(recipient.node_id());
+        let mut direct = forwarded(&original);
+        direct.visited.truncate(1);
+        // A direct sender records its own refusal, and transient failures stay retryable.
+        assert!(app.refusal_receipt(&direct, "msg_not_allowed").is_none());
+        assert!(app
+            .refusal_receipt(&forwarded(&original), "mailbox_full")
+            .is_none());
+        let receipt = app
+            .refusal_receipt(&forwarded(&original), "msg_not_allowed")
+            .expect("recipient signs its refusal");
+        let gone = app
+            .refusal_receipt(&forwarded(&original), "recipient_gone: RecipientGone")
+            .unwrap();
+        assert_eq!(
+            gone.body,
+            br#"{"detail":"recipient_gone: RecipientGone","state":"recipient_gone"}"#
+        );
+
+        app.node_id = Some(sender.node_id());
+        with_store(|store| {
+            store
+                .accept(
+                    &original,
+                    CUSTODY_TTL_MS,
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?;
+            store
+                .finish(
+                    &original.key,
+                    crate::mesh::store::Outcome::Transferred,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let status = || {
+            with_store(|store| {
+                let status = store
+                    .status(&sender.node_id(), &original.correlation_id, now_ms() as i64)
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+                Ok((status.state, status.detail))
+            })
+            .unwrap()
+        };
+        // The forwarding hub re-signs the same refusal under its own key.
+        let hub = crate::mesh::identity::NodeIdentity::fixture([10; 32]);
+        let mut forged = receipt.clone();
+        forged.key = MessageKey::mint(hub.node_id(), now_ms()).unwrap();
+        forged.return_binding.request = forged.key.clone();
+        crate::mesh::sign::seal(&mut forged, &hub);
+        assert_eq!(
+            app.import_mesh_receipt(&forged).unwrap_err(),
+            "invalid reply binding"
+        );
+        with_store(|store| {
+            assert!(store.get(&forged.key).unwrap().is_none());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(status(), ("custody".into(), None));
+
+        assert_eq!(app.import_mesh_receipt(&receipt), Ok((Accepted::New, true)));
+        assert_eq!(status(), ("refused".into(), Some("msg_not_allowed".into())));
+        assert_eq!(
+            app.import_mesh_receipt(&receipt),
+            Ok((Accepted::Duplicate, true))
+        );
+        assert_eq!(app.import_mesh_receipt(&gone), Ok((Accepted::New, true)));
+        assert_eq!(status(), ("refused".into(), Some("msg_not_allowed".into())));
+    }
+
+    #[tokio::test]
+    async fn hub_takes_custody_of_the_downstream_refusal_receipt() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let hub = crate::mesh::identity::NodeIdentity::load().unwrap();
+        app.node_id = Some(hub.node_id());
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(
+            &mut original,
+            &crate::mesh::identity::NodeIdentity::fixture([7; 32]),
+        );
+        let receipt = mint_receipt(
+            &original,
+            &recipient.node_id(),
+            &recipient,
+            serde_json::json!({"state":"refused","detail":"msg_not_allowed"}),
+            "refused",
+            original.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        // Only the adjacent node that signed it can hand the receipt over.
+        app.forward_refusal_receipt(&receipt, "other.example");
+        with_store(|store| {
+            assert!(store.get(&receipt.key).unwrap().is_none());
+            Ok(())
+        })
+        .unwrap();
+        app.forward_refusal_receipt(&receipt, &recipient.node_id());
+        with_store(|store| {
+            let record = store.get(&receipt.key).unwrap().expect("hub custody");
+            assert_eq!(record.state, "custody");
+            assert_eq!(record.visited, vec![recipient.node_id(), hub.node_id()]);
+            assert_eq!(record.envelope, receipt);
             Ok(())
         })
         .unwrap();

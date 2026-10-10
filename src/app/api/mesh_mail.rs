@@ -171,17 +171,24 @@ impl App {
                     path: None,
                 },
             ),
-            Err(reason) => encode_error(
-                id,
-                if reason == "origin_mismatch" {
+            Err(reason) => {
+                let code = if reason == "origin_mismatch" {
                     "origin_mismatch"
                 } else if reason == super::mesh_replies::UNAVAILABLE {
                     "reply_unavailable"
                 } else {
                     "mesh_delivery_refused"
-                },
-                reason,
-            ),
+                };
+                match self.refusal_receipt(&delivery, &reason) {
+                    Some(receipt) => super::responses::encode_error_with_data(
+                        id,
+                        code,
+                        reason,
+                        serde_json::json!({ "receipt": receipt }),
+                    ),
+                    None => encode_error(id, code, reason),
+                }
+            }
         }
     }
 
@@ -307,6 +314,7 @@ impl App {
         &mut self,
         send: RelaySend,
         mut result: Result<bool, crate::peers::PeerMessageFailure>,
+        receipt: Option<Envelope>,
     ) {
         let delivery = &send.mesh;
         let mut warnings = Vec::new();
@@ -371,6 +379,16 @@ impl App {
                         } else {
                             "refused"
                         };
+                        // A hub returns the recipient's signed outcome to the origin.
+                        if let (Some(receipt), Some(downstream)) = (
+                            receipt.as_ref().filter(|_| {
+                                self.node_id.as_deref()
+                                    != Some(delivery.envelope.key.origin_node.as_str())
+                            }),
+                            crate::peer_stream::enrollment(&send.peer).node_id,
+                        ) {
+                            self.forward_refusal_receipt(receipt, &downstream);
+                        }
                         warnings.push(format!("refused by {}: {reason}", send.peer.name));
                         self.emit_event(EventEnvelope {
                             event: EventKind::MessageDelivered,
