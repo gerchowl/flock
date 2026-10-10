@@ -192,6 +192,7 @@ pub(super) fn migrate(
         tx.execute("UPDATE envelopes SET next_hop=recipient_node WHERE next_hop='' AND state IN ('held','custody')", [])?;
     }
     repair_columns(&tx, false)?;
+    tx.execute_batch(ROUTED_RECEIPTS)?;
     let rowids = {
         let mut statement =
             tx.prepare("SELECT rowid FROM envelopes WHERE state='quarantined' AND length(body)>0")?;
@@ -404,6 +405,13 @@ CREATE TABLE IF NOT EXISTS agent_tombstones (agent_id TEXT NOT NULL, session TEX
 CREATE TABLE IF NOT EXISTS agent_owners (agent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, name TEXT NOT NULL, seen INTEGER NOT NULL);
 "#;
 
+/// Receivers scan only rows that can still owe a routed receipt. Created in
+/// place rather than by a version bump, so an older binary still opens the
+/// store. The terms must match `routed_receipts_sql` word for word, or
+/// SQLite cannot prove the partial index applies.
+pub(super) const ROUTED_RECEIPTS: &str = "CREATE INDEX IF NOT EXISTS routed_receipts ON envelopes(recipient_node,origin,id)
+    WHERE receipt_sent IS NOT 'outcome_retention_elapsed' AND receipt_sent IS NOT 'recipient_gone';";
+
 const LOCAL_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS local_recipients (
     origin TEXT NOT NULL, id TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL,
     PRIMARY KEY(origin,id),
@@ -454,6 +462,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS inbound_node_name ON identity_pins(node_id) WH
 CREATE INDEX IF NOT EXISTS open_collections ON envelopes(origin,delivered,reply_expected,collect_at);
 CREATE INDEX IF NOT EXISTS push_ready ON envelopes(state,next_hop,retry_at);
 CREATE INDEX IF NOT EXISTS request_answers ON envelopes(request_origin,request_id,origin,id);
+CREATE INDEX IF NOT EXISTS routed_receipts ON envelopes(recipient_node,origin,id)
+    WHERE receipt_sent IS NOT 'outcome_retention_elapsed' AND receipt_sent IS NOT 'recipient_gone';
 CREATE INDEX IF NOT EXISTS status_correlation ON envelopes(correlation,origin,id);
 CREATE INDEX IF NOT EXISTS terminal_gc ON envelopes(outcome_until,dedupe_until);
 CREATE INDEX IF NOT EXISTS unrouted ON envelopes(state,next_hop) WHERE next_hop='';
