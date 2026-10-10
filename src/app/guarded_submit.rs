@@ -159,6 +159,7 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
     let empty = nonempty.is_empty()
         || (nonempty.len() == 1
             && match agent {
+                Agent::Claude => crate::detect::claude_prompt_suggestion(nonempty[0]),
                 Agent::Codex => nonempty[0] == "Ask Codex to do anything",
                 Agent::OpenCode => {
                     nonempty[0] == "Ask anything…"
@@ -702,6 +703,27 @@ mod tests {
             composer(Agent::Claude, "❯ hello world", "hello world"),
             Composer::Unknown
         );
+        assert_eq!(
+            composer(
+                Agent::Claude,
+                &screen.replace("hello world", "Try \"refactor check-ssot.sh\""),
+                "hello world"
+            ),
+            Composer::Empty
+        );
+        for draft in [
+            "Try \"",
+            "Try \"\"",
+            "Try refactor",
+            "Try \"a\" and \"b\"",
+            "Try \"a\" and \"b\" later\n  please",
+        ] {
+            assert_eq!(
+                composer(Agent::Claude, &screen.replace("hello world", draft), "x"),
+                Composer::Other,
+                "{draft:?}"
+            );
+        }
         assert_eq!(
             composer(
                 Agent::Claude,
