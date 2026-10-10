@@ -321,6 +321,17 @@ impl App {
         if receipt.state == crate::mesh::store::UNDELIVERABLE {
             return self.import_hub_outcome(mail, &receipt);
         }
+        self.import_recipient_receipt(mail, &receipt)
+    }
+
+    /// The recipient-signed receipt path, unchanged since v1.0.0. A v1.0.0
+    /// origin sends a hub's `undeliverable` here and refuses it permanently
+    /// as `invalid reply binding`, so mixed fleets need no protocol bump.
+    fn import_recipient_receipt(
+        &mut self,
+        mail: &Envelope,
+        receipt: &crate::mesh::collect::Receipt,
+    ) -> Result<(Accepted, bool), String> {
         with_store(|store| {
             if self.node_id.as_deref() != Some(receipt.key.origin_node.as_str())
                 || mail.return_binding.request != mail.key
@@ -1072,5 +1083,98 @@ mod tests {
         let late = sign(&hub, crate::mesh::store::UNDELIVERABLE, token);
         assert_eq!(app.import_mesh_receipt(&late), Ok((Accepted::New, true)));
         assert_eq!(status(), ("read".into(), None));
+    }
+
+    /// Without a protocol bump a v1.0.0 origin receives the hub's outcome
+    /// on its recipient-receipt path. It must refuse it once, permanently,
+    /// with nothing stored, and the hub must settle that refusal without
+    /// owing another outcome, so mixed fleets cannot loop.
+    #[tokio::test]
+    async fn v1_0_origin_refuses_a_hub_outcome_once_and_the_hub_settles_it() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let hub = crate::mesh::identity::NodeIdentity::load().unwrap();
+        let mut original = crate::mesh::sign::tests::signed();
+        original.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut original, &sender);
+        app.node_id = Some(sender.node_id());
+        with_store(|store| {
+            store
+                .accept(
+                    &original,
+                    CUSTODY_TTL_MS,
+                    Admission::Custody,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?;
+            store
+                .finish(
+                    &original.key,
+                    crate::mesh::store::Outcome::Transferred,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let outcome = mint_receipt(
+            &original,
+            &hub.node_id(),
+            &hub,
+            serde_json::json!({"state":"undeliverable","detail":"no_route"}),
+            "undeliverable",
+            original.return_binding.collection_token.clone(),
+        )
+        .unwrap();
+        let receipt = decode_receipt(&outcome).unwrap();
+        let reason = app
+            .import_recipient_receipt(&outcome, &receipt)
+            .unwrap_err();
+        assert_eq!(reason, "invalid reply binding");
+        assert!(crate::mesh::delivery::permanent_refusal(&reason));
+        let delivery = forwarded(&outcome);
+        assert!(app.refusal_receipt(&delivery, &reason).is_none());
+        with_store(|store| {
+            assert!(store.get(&outcome.key).unwrap().is_none());
+            assert_eq!(
+                store
+                    .status(&sender.node_id(), &original.correlation_id, now_ms() as i64)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "custody"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // The hub holds that receipt in custody and records the refusal as
+        // final. Receipt rows never owe a hub outcome of their own.
+        app.node_id = Some(hub.node_id());
+        with_store(|store| {
+            store
+                .accept_origin(
+                    &outcome,
+                    &sender.node_id(),
+                    Admission::Custody,
+                    8,
+                    now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        app.settle_refusal(&outcome, &reason, None, Some(&sender.node_id()))
+            .unwrap();
+        with_store(|store| {
+            assert_eq!(store.get(&outcome.key).unwrap().unwrap().state, "refused");
+            assert!(store
+                .push_ready(now_ms() as i64 + CUSTODY_TTL_MS, 16, &[sender.node_id()])
+                .unwrap()
+                .is_empty());
+            assert!(store.hub_outcomes(now_ms() as i64).unwrap().is_empty());
+            Ok(())
+        })
+        .unwrap();
     }
 }

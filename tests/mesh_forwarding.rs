@@ -412,7 +412,7 @@ fn incompatible_next_hop_refuses_new_acceptance_existing_custody_kept() {
     );
     fleet
         .node_mut("nodeb")
-        .restart_with_mesh(fleet::MeshMode::VersionMismatch(5));
+        .restart_with_mesh(fleet::MeshMode::VersionMismatch(4));
     fleet::wait_until("incompatible next hop", WAIT, || {
         api(fleet.node("nodea"), "peers.enrollment", json!({}))["result"]["peers"]
             .as_array()?
