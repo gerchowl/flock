@@ -654,6 +654,47 @@ pub struct LoadedConfig {
     pub config: Config,
     pub diagnostics: Vec<String>,
     pub invalid_sections: Vec<String>,
+    /// The entries of `diagnostics` that are about one removed or unknown key,
+    /// so a caller that reports the same key with a source location can
+    /// replace them without matching message text (#860).
+    pub key_diagnostics: Vec<KeyDiagnostic>,
+}
+
+impl LoadedConfig {
+    /// Drop the key diagnostics `select` picks, from `diagnostics` as well.
+    pub fn remove_key_diagnostics(&mut self, mut select: impl FnMut(&KeyDiagnostic) -> bool) {
+        let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.key_diagnostics)
+            .into_iter()
+            .partition(|diagnostic| select(diagnostic));
+        self.key_diagnostics = kept;
+        for diagnostic in removed {
+            if let Some(index) = self
+                .diagnostics
+                .iter()
+                .position(|message| *message == diagnostic.message)
+            {
+                self.diagnostics.remove(index);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDiagnosticKind {
+    /// A key flock no longer reads, e.g. `msg.uplink_timeout_secs`.
+    Removed,
+    /// A key or top-level section flock never knew.
+    Unknown,
+}
+
+/// A config diagnostic about one key. `key` is dotted and canonical
+/// (`msg.future`, `peers.summary_command`, `toast`), so the same key reported
+/// by the loader and by the source scan compares equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDiagnostic {
+    pub kind: KeyDiagnosticKind,
+    pub key: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

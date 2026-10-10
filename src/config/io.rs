@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use super::{env, model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
+use super::{
+    env,
+    model::{KeyDiagnostic, KeyDiagnosticKind, LoadedConfig},
+    Config, CONFIG_PATH_ENV_VAR,
+};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
@@ -87,6 +91,7 @@ impl Config {
                     config: Self::default(),
                     diagnostics,
                     invalid_sections: Vec::new(),
+                    key_diagnostics: Vec::new(),
                 }
             }
         }
@@ -148,7 +153,7 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
 /// Inspect source keys before merging, retaining file/line information even
 /// when an overlay would replace the removed setting. Malformed TOML still
 /// follows the existing parse-error policy in the normal loader.
-pub(super) fn removed_key_diagnostics(content: &str, path: &Path) -> Vec<String> {
+pub(super) fn removed_key_diagnostics(content: &str, path: &Path) -> Vec<KeyDiagnostic> {
     let Ok(document) = toml_edit::Document::parse(content) else {
         return Vec::new();
     };
@@ -165,11 +170,15 @@ pub(super) fn removed_key_diagnostics(content: &str, path: &Path) -> Vec<String>
                         + 1
                 })
                 .unwrap_or(1);
-            diagnostics.push(format!(
-                "{}:{line}: {}",
-                path.display(),
-                removed_key_message(section, key)
-            ));
+            diagnostics.push(KeyDiagnostic {
+                kind: KeyDiagnosticKind::Removed,
+                key: format!("{section}.{key}"),
+                message: format!(
+                    "{}:{line}: {}",
+                    path.display(),
+                    removed_key_message(section, key)
+                ),
+            });
         }
     };
     if let Some(msg) = document.get("msg").and_then(toml_edit::Item::as_table_like) {
@@ -254,14 +263,22 @@ fn load_config() -> Result<LoadedConfig, Vec<String>> {
     Ok(loaded)
 }
 
-fn attach_source_diagnostics(loaded: &mut LoadedConfig, diagnostics: Vec<String>) {
-    loaded
-        .diagnostics
-        .retain(|message| !message.contains("was removed (mesh)"));
+/// Replace the loader's location-less removed-key warnings with the ones that
+/// name the file and line, which also cover keys an overlay shadowed.
+fn attach_source_diagnostics(loaded: &mut LoadedConfig, diagnostics: Vec<KeyDiagnostic>) {
+    loaded.remove_key_diagnostics(|loader| {
+        loader.kind == KeyDiagnosticKind::Removed
+            && diagnostics.iter().any(|source| source.key == loader.key)
+    });
     for diagnostic in &diagnostics {
-        crate::logging::config_removed_key(diagnostic);
+        crate::logging::config_removed_key(&diagnostic.message);
     }
-    loaded.diagnostics.extend(diagnostics);
+    loaded.diagnostics.extend(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone()),
+    );
+    loaded.key_diagnostics.extend(diagnostics);
 }
 
 /// Load the base config with the user overlay (`config.local.toml`)
@@ -403,32 +420,45 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
 fn load_live_config_from_table(
     mut table: toml::map::Map<String, toml::Value>,
 ) -> Result<LoadedConfig, Vec<String>> {
+    let removed_key = |section: &str, key: &str| KeyDiagnostic {
+        kind: KeyDiagnosticKind::Removed,
+        key: format!("{section}.{key}"),
+        message: removed_key_message(section, key),
+    };
     let mut removed = Vec::new();
     if let Some(msg) = table.get_mut("msg").and_then(toml::Value::as_table_mut) {
         for key in REMOVED_MSG_KEYS {
             if msg.remove(key).is_some() {
-                removed.push(removed_key_message("msg", key));
+                removed.push(removed_key("msg", key));
             }
         }
     }
     if let Some(peers) = table.get_mut("peers").and_then(toml::Value::as_array_mut) {
         for peer in peers.iter_mut().filter_map(toml::Value::as_table_mut) {
             if peer.remove("summary_command").is_some() {
-                removed.push(removed_key_message("peers", "summary_command"));
+                removed.push(removed_key("peers", "summary_command"));
             }
         }
     }
 
     let mut config = Config::default();
-    let mut diagnostics = unknown_top_level_section_diagnostics(&table);
-    diagnostics.extend(removed);
+    let mut key_diagnostics = unknown_top_level_section_diagnostics(&table);
+    key_diagnostics.extend(removed);
     if let Some(msg) = table.get("msg").and_then(toml::Value::as_table) {
         let known = toml::Value::try_from(super::model::MsgConfig::default())
             .map_err(|err| vec![err.to_string()])?;
         for key in msg.keys().filter(|key| known.get(key.as_str()).is_none()) {
-            diagnostics.push(format!("unknown msg.{key} setting ignored"));
+            key_diagnostics.push(KeyDiagnostic {
+                kind: KeyDiagnosticKind::Unknown,
+                key: format!("msg.{key}"),
+                message: format!("unknown msg.{key} setting ignored"),
+            });
         }
     }
+    let mut diagnostics: Vec<String> = key_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect();
 
     let mut invalid_sections = Vec::new();
 
@@ -660,6 +690,7 @@ fn load_live_config_from_table(
         config,
         diagnostics,
         invalid_sections,
+        key_diagnostics,
     })
 }
 
@@ -700,14 +731,23 @@ fn validate_peers(
 
 fn unknown_top_level_section_diagnostics(
     table: &toml::map::Map<String, toml::Value>,
-) -> Vec<String> {
+) -> Vec<KeyDiagnostic> {
     table
         .iter()
-        .filter_map(|(key, value)| unknown_top_level_section_diagnostic(key, value))
+        .filter_map(|(key, value)| {
+            Some(KeyDiagnostic {
+                kind: KeyDiagnosticKind::Unknown,
+                key: key.clone(),
+                message: unknown_top_level_section_diagnostic(key, value)?,
+            })
+        })
         .collect()
 }
 
-fn unknown_top_level_section_diagnostic(key: &str, value: &toml::Value) -> Option<String> {
+pub(super) fn unknown_top_level_section_diagnostic(
+    key: &str,
+    value: &toml::Value,
+) -> Option<String> {
     if KNOWN_TOP_LEVEL_CONFIG_KEYS.contains(&key) {
         return None;
     }
@@ -1687,7 +1727,11 @@ mod spoke_config_tests {
     #[test]
     fn removed_key_locations_follow_toml_keys_not_comments_or_values() {
         let source = "# summary_command is only a comment\npeers = [{ name='nodea', 'summary_command' = 'false' }]\nmsg = { enabled=false, uplink_timeout_secs=1 }\n";
-        let errors = super::removed_key_diagnostics(source, std::path::Path::new("fixture.toml"));
+        let errors: Vec<_> =
+            super::removed_key_diagnostics(source, std::path::Path::new("fixture.toml"))
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect();
         assert_eq!(errors, vec![
             "fixture.toml:3: msg.uplink_timeout_secs was removed (mesh); delete this line",
             "fixture.toml:2: peers.summary_command was removed (mesh); delete this line; peers now always hold a mesh edge",
