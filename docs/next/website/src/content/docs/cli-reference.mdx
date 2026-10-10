@@ -530,7 +530,7 @@ Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspac
 
 The brief is a file, and exactly one sentence is ever typed into the agent: `Read <absolute path> and execute it exactly.` The path is made absolute without resolving symlinks, and is refused if it contains whitespace, a control character, or any of `` ! $ ` " ' \ `` — the path crosses the agent's shell, and a quote that survives that hop names a different file by the time the agent reads it. Put the instructions in the file; the typed text carries nothing else.
 
-The delegate runs in a workspace it created and **never requests focus**, so your focus is unchanged by any of these verbs and a delegate never lands in the workspace you are looking at. With `--worktree` it makes a linked checkout (`--repo`, `--branch`, `--base`; those three mean nothing with `--cwd` and are refused there) and the agent's cwd is that checkout.
+The delegate runs in a workspace it created and **never requests focus**, so your focus is unchanged by any of these verbs and a delegate never lands in the workspace you are looking at. With `--worktree` it makes a linked checkout (`--repo`, `--branch`, `--base`; those three mean nothing with `--cwd` and are refused there) and the agent's cwd is that checkout. A relative `--repo` or `--cwd` is resolved against your current directory, like the brief, before anything reaches the server.
 
 `--harness` is `opencode` (the default) or `claude`, and `--model M` is handed to it as `--model M`. The two differ in where the session comes from, which is what `no_result` reports: opencode's plugin names it mid-turn, Claude's `SessionStart` hook names it from inside the harness.
 
