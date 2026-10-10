@@ -471,9 +471,13 @@ fn laptop_collects_answer_through_a_different_hub() {
     c.send();
     c.read_question();
     cut(&c.fleet, "nodea", "nodeb");
-    // Wait for withdrawal at the reply origin, so the offer cannot follow
-    // a stale return path into a loop before the second hub reconnects.
+    // Wait for withdrawal at the reply origin and at the first hub, so the
+    // offer cannot follow a stale return path into a loop before the second
+    // hub reconnects. A first hub that still believed its edge to nodea live
+    // could take custody of the reply, then find its only route runs back
+    // through the spoke, which refuses it as loop_detected (#866).
     c.fleet.wait_route("noded.example", "nodea", false);
+    c.fleet.wait_route("nodeb", "nodea", false);
     c.reply();
     reconnect(&c.fleet, "nodea", "nodec");
     c.fleet.wait_route("noded.example", "nodea", true);

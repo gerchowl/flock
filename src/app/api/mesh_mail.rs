@@ -725,6 +725,11 @@ impl App {
                     };
                     let next =
                         self.request_next_hop(&record.envelope.return_binding.recipient_node);
+                    // A node this mail already crossed refuses it as a loop.
+                    // Leave it unrouted until the routes offer another hop (#866).
+                    if record.visited.contains(&next.node) {
+                        continue;
+                    }
                     if next.node != record.next_hop {
                         let _ = with_store(|store| {
                             store
