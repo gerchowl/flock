@@ -1160,6 +1160,21 @@ fn validate_worktree_flags(flags: &StartFlags) -> Result<(), String> {
     Ok(())
 }
 
+/// `--cwd` and `--repo`, resolved against the caller's directory (#865).
+///
+/// The server runs in its own directory, so a relative path it receives is
+/// refused (`worktree.create`) or quietly resolved against the wrong place
+/// (`workspace.create`). Resolved here, like the brief, without following
+/// symlinks. A leading `~` is expanded the way the server would expand it.
+fn resolve_placement_paths(flags: &mut StartFlags, base: &Path) {
+    for value in [&mut flags.cwd, &mut flags.repo].into_iter().flatten() {
+        let path = crate::worktree::expand_tilde_path(value);
+        if !path.is_absolute() {
+            *value = base.join(path).display().to_string();
+        }
+    }
+}
+
 /// The brief path, made absolute, checked, readable, and returned as the one
 /// sentence to type.
 ///
@@ -2458,7 +2473,15 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let flags = as_start(&flags);
+    let mut flags = as_start(&flags);
+    match std::env::current_dir() {
+        Ok(cwd) => resolve_placement_paths(&mut flags, &cwd),
+        Err(err) => {
+            return Ok(usage(format!(
+                "could not read the current directory: {err}"
+            )))
+        }
+    }
 
     // Every refusal below this line happens before a single request that could
     // create anything — including before the registry directory exists, so a
@@ -3972,12 +3995,20 @@ impl Await<'_> {
                         start_watch.interrupted();
                         return false;
                     };
-                    let Some(screen) = detection_screen(pane_id, self.deadline) else {
+                    let Some((screen, unfaint)) =
+                        detection_screens_with(pane_id, self.deadline, bounded)
+                    else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
                         return false;
                     };
-                    if start_watch.observe(cursor, *status, &screen, Instant::now()) {
+                    if start_watch.observe_unfaint(
+                        cursor,
+                        *status,
+                        &screen,
+                        &unfaint,
+                        Instant::now(),
+                    ) {
                         not_started = true;
                         return true;
                     }
@@ -4333,6 +4364,42 @@ fn detection_screen(pane_id: &str, deadline: Option<Instant>) -> Option<String> 
         .map(str::to_string)
 }
 
+/// The detection screen and its faint-blanked copy from one server read
+/// (#892). A server without `detection_unfaint` refuses it, and the plain read
+/// then stands in for both, which reads a suggestion as typed.
+fn detection_screens_with(
+    pane_id: &str,
+    deadline: Option<Instant>,
+    mut read: impl FnMut(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> Option<(String, String)> {
+    let params = |source| {
+        Method::PaneRead(PaneReadParams {
+            pane_id: pane_id.into(),
+            source,
+            lines: None,
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        })
+    };
+    let response = read(params(ReadSource::DetectionUnfaint), deadline).ok()?;
+    if let Some(text) = response
+        .pointer("/result/read/text")
+        .and_then(|v| v.as_str())
+    {
+        let unfaint = response
+            .pointer("/result/read/unfaint")
+            .and_then(|v| v.as_str())
+            .unwrap_or(text);
+        return Some((text.to_string(), unfaint.to_string()));
+    }
+    let text = read(params(ReadSource::Detection), deadline)
+        .ok()?
+        .pointer("/result/read/text")?
+        .as_str()?
+        .to_string();
+    Some((text.clone(), text))
+}
+
 fn event_observation(
     name: &str,
     screen: &str,
@@ -4677,6 +4744,36 @@ mod tests {
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relative `--repo` or `--cwd` names a directory under the CALLER's cwd,
+    /// not the server's, so it reaches the server absolute (#865).
+    #[test]
+    fn relative_placement_paths_resolve_against_the_caller() {
+        let base = std::env::temp_dir().join("flk-865-caller");
+        let args: Vec<String> = ["d1", "--worktree", "--branch", "b", "--repo", "."]
+            .map(String::from)
+            .to_vec();
+        let mut flags = as_start(&parse_flags(Verb::Start, &args).unwrap());
+        resolve_placement_paths(&mut flags, &base);
+        assert_eq!(flags.repo, Some(base.join(".").display().to_string()));
+        assert!(Path::new(flags.repo.as_deref().unwrap()).is_absolute());
+
+        let mut flags = StartFlags {
+            cwd: Some("sub/dir".into()),
+            ..StartFlags::default()
+        };
+        resolve_placement_paths(&mut flags, &base);
+        assert_eq!(flags.cwd, Some(base.join("sub/dir").display().to_string()));
+
+        let mut flags = StartFlags {
+            cwd: Some("/already/absolute".into()),
+            repo: None,
+            ..StartFlags::default()
+        };
+        resolve_placement_paths(&mut flags, &base);
+        assert_eq!(flags.cwd.as_deref(), Some("/already/absolute"));
+        assert_eq!(flags.repo, None);
     }
 
     /// The reason `--repo` is refused with `--cwd`: there is no checkout to

@@ -110,18 +110,6 @@ pub(super) fn has_prompt_box(content: &str) -> bool {
         .any(|line| line.trim_start().starts_with('❯'))
 }
 
-/// Claude Code (v2.1.295) paints a ghost-text suggestion such as
-/// `Try "refactor check-ssot.sh"` into an empty input box. The plain-text
-/// snapshot carries no styling, so the quoted `Try "…"` shape on its own is
-/// what marks the box as empty (#864). A quote inside the suggestion reads as a
-/// draft, so an ambiguous box still refuses the submit.
-pub(in crate::detect) fn is_prompt_suggestion(typed: &str) -> bool {
-    typed
-        .strip_prefix("Try \"")
-        .and_then(|rest| rest.strip_suffix('"'))
-        .is_some_and(|inner| !inner.trim().is_empty() && !inner.contains('"'))
-}
-
 /// What is typed into Claude's input box: the `❯` line's text plus any
 /// continuation lines up to the bottom border, whitespace-trimmed. `None`
 /// when no prompt box is on screen.
