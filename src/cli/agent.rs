@@ -240,6 +240,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         wait_ready,
         ready_timeout_ms,
     } = flags;
+    // Resolved here rather than in the parser, which stays a pure function of
+    // `args`: the server would read a relative `--cwd` against its own
+    // directory (#898).
+    let cwd = cwd
+        .map(|cwd| super::worktree::normalize_path_arg(&cwd))
+        .transpose()?;
 
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),

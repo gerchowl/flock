@@ -3996,3 +3996,64 @@ fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
     assert!(opencode.join("plugins/flock-agent-state.js").is_file());
     cleanup_test_base(&base);
 }
+
+/// A relative `--cwd` names a directory under the CALLER's cwd, so every verb
+/// that places a pane sends it absolute; the server would otherwise read it
+/// against its own directory (#898).
+#[test]
+fn relative_cwd_flags_reach_the_server_absolute() {
+    for (verb, method) in [
+        (
+            vec!["agent", "start", "a1", "--cwd", "sub", "--", "true"],
+            "agent.start",
+        ),
+        (
+            vec![
+                "pane",
+                "split",
+                "1-1",
+                "--direction",
+                "right",
+                "--cwd",
+                "sub",
+            ],
+            "pane.split",
+        ),
+        (vec!["tab", "create", "--cwd", "sub"], "tab.create"),
+        (
+            vec!["workspace", "create", "--cwd", "sub"],
+            "workspace.create",
+        ),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(base.join("sub")).unwrap();
+        let socket_path = base.join("flock.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let line = read_request_line(&stream);
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            line
+        });
+
+        let run = run_cli_in_dir(&socket_path, &verb, &base);
+        let line = server.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method, "stderr: {:?}", run.stderr);
+        // The caller's cwd as the process sees it: on macOS `/tmp` resolves to
+        // `/private/tmp`.
+        let caller = fs::canonicalize(&base).unwrap();
+        assert_eq!(
+            request["params"]["cwd"],
+            caller.join("sub").display().to_string(),
+            "{method} must send --cwd resolved against the caller"
+        );
+
+        cleanup_test_base(&base);
+    }
+}
