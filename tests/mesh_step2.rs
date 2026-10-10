@@ -65,13 +65,14 @@ impl Agent {
             .map(quote)
             .collect::<Vec<_>>()
             .join(" ");
-        api(
-            node,
-            "pane.send_text",
-            json!({
-                "pane_id":self.pane,
-                "text":format!("{command} >{} 2>{}\nprintf '%s' \"$?\" >{}\n", quote(output.to_str().unwrap()), quote(output.with_extension("stderr").to_str().unwrap()), quote(output.with_extension("status").to_str().unwrap()))
-            }),
+        node.run_in_pane(
+            &self.pane,
+            &format!(
+                "{command} >{} 2>{}; printf '%s' \"$?\" >{}",
+                quote(output.to_str().unwrap()),
+                quote(output.with_extension("stderr").to_str().unwrap()),
+                quote(output.with_extension("status").to_str().unwrap())
+            ),
         );
         output
     }
@@ -425,6 +426,14 @@ fn one_way_edge_carries_both_directions() {
     let c = Conversation::new(DIRECT);
     round_trip(&c);
     cli_answer(&c);
+    // The reverse send needs nodeb to have discovered the sender first.
+    fleet::wait_until("sender discovery", DEADLINE, || {
+        api(c.fleet.node("nodeb"), "agent.list", json!({}))["fleet"]
+            .as_array()?
+            .iter()
+            .any(|entry| entry["agent_id"] == c.sender.id)
+            .then_some(())
+    });
     let sent = c.receiver.cli(
         c.fleet.node("nodeb"),
         &[

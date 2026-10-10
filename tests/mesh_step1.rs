@@ -69,6 +69,19 @@ impl Agent {
                 assert!(response.get("error").is_none(), "{response}");
                 return response["result"].clone();
             }
+            // A refused CLI writes its error to stderr and nothing to stdout.
+            if let Some(code) = std::fs::read_to_string(output.with_extension("status"))
+                .ok()
+                .and_then(|code| code.parse::<i32>().ok())
+            {
+                assert_eq!(
+                    code,
+                    0,
+                    "agent CLI failed on {}: {}",
+                    node.name,
+                    std::fs::read_to_string(output.with_extension("stderr")).unwrap_or_default()
+                );
+            }
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for agent CLI result on {}\n{}",
@@ -81,19 +94,26 @@ impl Agent {
 
     fn start_cli(&self, node: &Node, args: &[&str]) -> std::path::PathBuf {
         let output = node.home.join("acceptance-cli.json");
-        let _ = std::fs::remove_file(&output);
+        for path in [
+            &output,
+            &output.with_extension("stderr"),
+            &output.with_extension("status"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
         let command = std::iter::once(env!("CARGO_BIN_EXE_flk"))
             .chain(args.iter().copied())
             .map(quote)
             .collect::<Vec<_>>()
             .join(" ");
-        api(
-            node,
-            "pane.send_text",
-            json!({
-                "pane_id":self.pane,
-                "text":format!("{command} >{}\n", quote(output.to_str().unwrap()))
-            }),
+        node.run_in_pane(
+            &self.pane,
+            &format!(
+                "{command} >{} 2>{}; printf '%s' \"$?\" >{}",
+                quote(output.to_str().unwrap()),
+                quote(output.with_extension("stderr").to_str().unwrap()),
+                quote(output.with_extension("status").to_str().unwrap())
+            ),
         );
         output
     }
@@ -101,13 +121,12 @@ impl Agent {
     fn shell_pid(&self, node: &Node) -> Value {
         let output = node.home.join("acceptance-pid.json");
         let _ = std::fs::remove_file(&output);
-        api(
-            node,
-            "pane.send_text",
-            json!({
-                "pane_id":self.pane,
-                "text":format!("printf '{{\"result\":{{\"pid\":%s}}}}\\n' \"$$\" >{}\n", quote(output.to_str().unwrap()))
-            }),
+        node.run_in_pane(
+            &self.pane,
+            &format!(
+                "printf '{{\"result\":{{\"pid\":%s}}}}\\n' \"$$\" >{}",
+                quote(output.to_str().unwrap())
+            ),
         );
         self.result(node, &output)["pid"].clone()
     }
@@ -1188,14 +1207,10 @@ fn hundred_held_answers_cause_bounded_polls() {
     for (index, receiver) in receivers.iter().enumerate() {
         let output = spoke.home.join(format!("burst-{index}.json"));
         let command = format!(
-            "i=0; while [ $i -lt 20 ]; do {} msg reply burst-{index} answer-$i >/dev/null || break; i=$((i+1)); done; printf '{{\"result\":{{\"count\":%s}}}}\\n' \"$i\" >{}\n",
+            "i=0; while [ $i -lt 20 ]; do {} msg reply burst-{index} answer-$i >/dev/null || break; i=$((i+1)); done; printf '{{\"result\":{{\"count\":%s}}}}\\n' \"$i\" >{}",
             quote(env!("CARGO_BIN_EXE_flk")), quote(output.to_str().unwrap())
         );
-        api(
-            spoke,
-            "pane.send_text",
-            json!({"pane_id":receiver.pane,"text":command}),
-        );
+        spoke.run_in_pane(&receiver.pane, &command);
         assert_eq!(cli_result(&output)["count"], 20);
     }
     let polls = conversation.fleet.base.join("outbound-polls-nodea-nodeb");

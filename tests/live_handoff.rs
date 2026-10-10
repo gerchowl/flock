@@ -1931,6 +1931,24 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 );
             }
         }
+        if failure_point == "slow_store" {
+            // #887: mail waits for recovery only up to its bound, then is
+            // refused and dropped, so a caller's retry cannot duplicate it.
+            let started = Instant::now();
+            let refused = request(
+                &api_socket,
+                serde_json::json!({"id":"send-during-recovery", "method":"msg.send", "params":{
+                    "to":{"type":"pane", "pane":pane_id}, "body":"ghost",
+                    "correlation_id":"ghost-during-recovery", "intent":"fyi"
+                }}),
+            );
+            assert_eq!(
+                refused["error"]["code"], "mail_store_unavailable",
+                "{refused}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(10), "{refused}");
+            assert!(fail_file.exists(), "recovery must still be blocked");
+        }
         fs::remove_file(&fail_file).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1950,6 +1968,19 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 "to":{"type":"pane", "pane":pane_id}, "body":"recovered", "intent":"fyi"
             }}),
         ));
+        if failure_point == "slow_store" {
+            let read = request(
+                &api_socket,
+                serde_json::json!({"id":"read-after-recovery", "method":"msg.read", "params":{"pane":pane_id}}),
+            );
+            let bodies: Vec<_> = read["result"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["body"].clone())
+                .collect();
+            assert_eq!(bodies, [serde_json::json!("recovered")], "{read}");
+        }
     }
     let _ = request(
         &api_socket,
