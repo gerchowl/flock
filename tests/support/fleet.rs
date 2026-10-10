@@ -328,7 +328,7 @@ impl Node {
     }
 }
 
-/// Hold legacy message SSH commands on one edge while other traffic proceeds.
+/// Hold mesh message deliveries on one edge while other traffic proceeds.
 /// Dropping the gate also releases it, including when a test assertion fails.
 pub struct MessageGate {
     path: PathBuf,
@@ -691,7 +691,7 @@ pub const CHAIN_ABC: &[NodeSpec] = &[
 ];
 
 /// Laptop and edge-less spoke reached by one hub. The wide laptop sidebar
-/// keeps legacy `via nodeb` routing evidence visible in the MCP regression.
+/// keeps `via nodeb` routing evidence visible in the MCP regression.
 pub const HUB_SPOKES: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &[]).with_config("\n[ui]\nsidebar_width = 44\n"),
     NodeSpec::new("nodeb", "beta", &["nodea", "nodec"]),

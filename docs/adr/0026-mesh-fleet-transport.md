@@ -337,6 +337,25 @@ identity, permanent removal and expiry differ from temporary routing loss.
 Transport attestation and collection tokens never make agent traffic an
 operator instruction.
 
+Terminal refusals by the owning node are recipient-signed receipts
+([#872](https://github.com/gerchowl/flock/issues/872)). When the owner behind
+a forwarding hub refuses a message with a policy reason (`refused` plus the
+reason) or because the target was removed (`recipient_gone`), it signs a
+receipt bound to the message's return binding. The hub takes custody of that
+receipt before recording the refusal and routes it back like delivery and
+read receipts. The origin accepts it only under the recipient node's
+signature, so a hub cannot mint a refusal for another node. Refusals a hub
+decides on its own are not signed by the owner. The receipt travels in an
+optional `receipt` field of the outbound acknowledgement, with a new
+`refused` receipt state, so it requires mesh protocol 5.
+
+Known limitations, fixed in v1.1.0: failures decided at an intermediate node
+(hop budget, loop, no route) are not routed back to the sender
+([#876](https://github.com/gerchowl/flock/issues/876)), and routed receipts do
+not carry expiry or elapsed outcome retention to multi-hop origins
+([#858](https://github.com/gerchowl/flock/issues/858)). In both cases the
+origin keeps the message in custody until its own deadline.
+
 ## Components and implementation steps
 
 Implementation responsibilities:
@@ -407,7 +426,9 @@ publish a release.
 
 At each held-edge handshake require identical mesh protocol versions. Refuse
 a mismatch with a clear error naming both local and remote versions and
-`upgrade flk on <peer>` using the configured peer name. Nothing queues for
+`upgrade flk on <peer>` using the configured peer name. v1.0.0 speaks mesh
+protocol 5; protocol 4 nodes deny the new acknowledgement fields and would
+reject whole batches, so they are refused at hello. Nothing queues for
 that incompatible peer and nothing is downgraded. Refuse new acceptance
 addressed through a known incompatible edge, including collection jobs for
 it. Existing custody remains stored rather than being sent to an

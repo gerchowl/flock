@@ -128,7 +128,7 @@ flk server reload-config
 ## Config
 
 ```bash
-flk config check [--path PATH]
+flk config check [--path PATH] [--json]
 flk config edit
 flk config reset-keys
 ```
@@ -138,8 +138,10 @@ flk config reset-keys
 | Exit | Meaning |
 | --- | --- |
 | `0` | clean |
-| `1` | loaded, with advisory warnings (deprecated keys, keybinding conflicts) |
+| `1` | loaded, with advisory warnings (removed or unknown keys, deprecated keys, keybinding conflicts) |
 | `2` | did not load — a session would fall back to built-in defaults |
+
+`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown keys include file and line locations. Removed keys always produce exit `1`, even though the configuration loads successfully.
 
 Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
 
@@ -742,9 +744,11 @@ Flock never files the report itself (ADR-0010 decision 6). The one write path it
 | `FLOCK_<UPPER_SNAKE_PATH>` | Generic override for any scalar config field (ADR-0002); sits BELOW the config file. |
 | `FLOCK_DISABLE_SOUND` | Deprecated alias for `FLOCK_UI_SOUND_ENABLED=false`. Sits below the file (removal after one release). |
 
-## Removed in 1.0.0
+## Removed mesh settings and methods
 
-Upgrade the fleet together for mesh transport. Remove these settings and callers:
+Upgrade the fleet together for mesh transport. Removed config keys are ignored with a warning naming the file, line, and key; all other settings still apply on startup, live handoff, and reload. Delete the named lines. Warnings appear in `flk status` and once per CLI invocation on stderr.
+
+Remove these settings and callers:
 
 - `[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`, and `deferral_relay_concurrency`: delete these lines. Custody pushes use a fixed concurrency of four.
 - `[[peers]] summary_command`: delete this line; peers now always hold a mesh edge. Use `relay_command` if the remote executable needs a custom path.
@@ -755,7 +759,7 @@ Upgrade the fleet together for mesh transport. Remove these settings and callers
   route through the mesh or queue while offline. New sends outside the gossip
   horizon with no stored owner hint are refused as unknown.
 
-Removed config keys are errors with migration instructions. The server refuses to start and names the file, line, and key to delete. A replacement server reports the refusal to the old server so live handoff rolls back safely. A live reload fails, surfaces the diagnostic, and keeps the previous configuration and running panes. Unknown future keys still only warn.
+Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
 
 Existing peer lists become a mesh with fewer edges; reciprocal SSH access is
 not required. `[msg] allow_from` names are the authenticated origin's local

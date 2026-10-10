@@ -454,6 +454,14 @@ fn run() -> io::Result<()> {
         std::process::exit(2);
     }
 
+    if !(args.get(1).is_some_and(|arg| arg == "config")
+        && args.get(2).is_some_and(|arg| arg == "check"))
+    {
+        for warning in config::removed_config_warnings() {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     if let cli::CommandOutcome::Handled(code) = cli::maybe_run(&args)? {
         std::process::exit(code);
     }
@@ -688,11 +696,7 @@ fn run() -> io::Result<()> {
     }
 
     let no_session = args.iter().any(|a| a == "--no-session");
-    let loaded_config = if no_session {
-        config::Config::load_for_server()?
-    } else {
-        config::Config::load()
-    };
+    let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.

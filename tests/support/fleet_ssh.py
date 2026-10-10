@@ -94,6 +94,7 @@ lock = threading.Lock()
 deliveries = set()
 collections = set()
 outbound_collections = set()
+summary_probes = set()
 
 
 def emit(line):
@@ -120,6 +121,13 @@ def forward_input():
             if method == "mesh.hello":
                 with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
                     log.write(str(time.monotonic()) + "\n")
+            if method == "peers.summary" and (base / f"observe-summary-{source}-{target}").exists():
+                summary_probes.add(request.get("id"))
+            if method == "mesh.routes" and (base / "withhold-route-adverts").exists():
+                emit(json.dumps({"id": request["id"], "error": {
+                    "code": "routes_unavailable", "message": "route exchange withheld by fixture",
+                }}) + "\n")
+                continue
             if method == "mesh.collect":
                 outbound = "outbound" in request.get("params", {})
                 kind = "outbound" if outbound else "collect"
@@ -167,6 +175,27 @@ def forward_input():
                     }}) + "\n")
                     continue
                 deliveries.add(request.get("id"))
+                tamper = base / f"tamper-delivery-{source}-{target}"
+                if tamper.exists():
+                    field = tamper.read_text().strip()
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    if field == "origin":
+                        envelope["key"]["origin_node"] = "0" * 64
+                    elif field == "visited":
+                        params["visited"][-1] = envelope["key"]["origin_node"]
+                    elif field == "body":
+                        payload = json.loads(bytes(envelope["body"]))
+                        payload["message"]["body"] = "wire forgery"
+                        envelope["body"] = list(json.dumps(payload).encode())
+                    elif field == "signature":
+                        envelope["signature"] = [0] * 64
+                    elif field == "token":
+                        envelope["return_binding"]["collection_token"][0] ^= 1
+                    else:
+                        raise ValueError(f"unknown delivery tamper: {field}")
+                    line = json.dumps(request) + "\n"
+                    (base / f"tampered-delivery-{source}-{target}").write_text(line)
                 if (base / f"spoof-host-{source}-{target}").exists():
                     envelope = request["params"]["envelope"]
                     payload = json.loads(bytes(envelope["body"]))
@@ -242,6 +271,14 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        summary_probe = base / f"observed-summary-{source}-{target}"
+        if response.get("event") == "mesh_outbound_pending":
+            summary_probe.unlink(missing_ok=True)
+        if response.get("id") in summary_probes:
+            summary_probes.discard(response.get("id"))
+            summary_probe.write_text(json.dumps({
+                "outbound_pending": response.get("result", {}).get("outbound_pending", True),
+            }))
         if response.get("id") in outbound_collections:
             outbound_collections.discard(response.get("id"))
             answers = response.get("result", {}).get("answers", [])
@@ -262,6 +299,10 @@ try:
             if response.get("error"):
                 (base / f"collect-refused-{source}-{target}").write_text(line)
         if response.get("id") in deliveries:
+            if (base / f"observe-delivery-{source}-{target}").exists():
+                (base / f"observed-result-{source}-{target}").write_text(line)
+            if (base / f"tamper-delivery-{source}-{target}").exists():
+                (base / f"tampered-result-{source}-{target}").write_text(line)
             deliveries.discard(response.get("id"))
             gate = base / f"gate-delivery-ack-{source}-{target}"
             if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:

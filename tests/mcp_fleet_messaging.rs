@@ -327,20 +327,20 @@ fn fleet_row<'a>(listing: &'a Value, agent_id: &str) -> Option<&'a Value> {
 /// has nothing to do with the answer.
 #[test]
 fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
-    let fleet = fleet::spawn("mcp-fleet", PAIR_AB);
+    let fleet = fleet::spawn("mcp-fleet", fleet::CHAIN_ABC);
     let node_a = fleet.node("nodea");
-    let node_b = fleet.node("nodeb");
+    let node_c = fleet.node("nodec");
 
     // Both agents ARE their MCP servers, each in a pane on its own node.
     // Nothing in this test reaches a flock API except through a tool call, so
     // a gap in the MCP surface cannot be papered over by the harness.
     let mut alice = PanedMcp::start(node_a, &fleet.base);
-    let mut bob = PanedMcp::start(node_b, &fleet.base);
+    let mut bob = PanedMcp::start(node_c, &fleet.base);
 
     // 1. Discovery. The listing is A's own panes PLUS the directory, and only
     //    the directory can name an agent that is not here.
     let listing = wait_for(
-        "nodeb's agent to reach nodea's directory",
+        "nodec's agent to reach nodea's directory",
         GOSSIP_TIMEOUT,
         || {
             let listing = alice.call_tool("flock_agent_list", json!({}));
@@ -353,7 +353,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         remote["local"], false,
         "an agent on another machine must not look addressable by pane id: {remote}"
     );
-    assert_eq!(remote["host"], "nodeb", "the row names where it lives");
+    assert_eq!(remote["host"], "nodec", "the row names where it lives");
     assert_eq!(
         remote["route"], "nodeb",
         "and how this server reaches it: {remote}"
@@ -380,13 +380,13 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     // A name is a label; the id is the address. Renaming B's agent between
     // discovery and delivery must change nothing — if the route were carrying
     // the name, this is where it would break.
-    let renamed = node_b.api(&format!(
+    let renamed = node_c.api(&format!(
         r#"{{"id":"t:rename","method":"agent.rename","params":{{"target":"{}","name":"renamed-mid-flight"}}}}"#,
         bob.pane_id
     ));
     assert!(
         renamed.contains("\"result\""),
-        "agent.rename on nodeb: {renamed}"
+        "agent.rename on nodec: {renamed}"
     );
 
     // 2. Addressing. The id from the listing goes straight into the target.
@@ -407,7 +407,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 
     // 3. It arrives, and B reads it as its OWN inbox — no addressing, the
     //    same call a real agent makes when its stop hook wakes it.
-    let delivered = wait_for("the message to land in nodeb's inbox", RPC_TIMEOUT, || {
+    let delivered = wait_for("the message to land in nodec's inbox", RPC_TIMEOUT, || {
         let inbox = bob.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
@@ -418,8 +418,9 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         "the sender must survive the hop as an identity, not a pane: {delivered}"
     );
     assert_eq!(
-        delivered["from_host"], "nodea",
-        "and must name the host it actually came from: {delivered}"
+        delivered["from_host"],
+        Value::Null,
+        "a gossip-only origin has no locally pinned host label: {delivered}"
     );
     assert_eq!(
         delivered["replyable"], true,
@@ -437,7 +438,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         .expect("correlation id");
     bob.call_tool(
         "flock_msg_reply",
-        json!({"correlation_id": correlation_id, "body": "pong from nodeb"}),
+        json!({"correlation_id": correlation_id, "body": "pong from nodec"}),
     );
 
     collect_now(fleet.node("nodea"));
@@ -445,9 +446,9 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         let inbox = alice.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
-    assert_eq!(answer["body"], "pong from nodeb");
+    assert_eq!(answer["body"], "pong from nodec");
     assert_eq!(answer["from_agent"], bob.agent_id.as_str());
-    assert_eq!(answer["from_host"], "nodeb");
+    assert_eq!(answer["from_host"], Value::Null);
     assert_eq!(
         answer["in_reply_to"], "c-320-e2e",
         "the answer has to thread back to the question: {answer}"
@@ -460,7 +461,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 
     let status = alice.call_tool("flock_msg_status", json!({"correlation_id":correlation_id}));
     assert!(status["reference"].is_object(), "{status}");
-    assert_eq!(status["reply"]["body"], "pong from nodeb", "{status}");
+    assert_eq!(status["reply"]["body"], "pong from nodec", "{status}");
     let waited = alice.call_tool(
         "flock_msg_wait_reply",
         json!({
@@ -480,7 +481,7 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
             "intent": "blocking",
         }),
     );
-    let escalated = wait_for("the blocking message to reach nodeb", RPC_TIMEOUT, || {
+    let escalated = wait_for("the blocking message to reach nodec", RPC_TIMEOUT, || {
         let inbox = bob.call_tool("flock_msg_read", json!({}));
         inbox["messages"].as_array()?.first().cloned()
     });
@@ -534,19 +535,14 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 ///   would wait on a server that is waiting on it.
 #[test]
 fn a_mute_answers_a_sender_on_another_host() {
-    let fleet = fleet::spawn("mcp-fleet-mute", PAIR_AB);
+    let fleet = fleet::spawn("mcp-fleet-mute", fleet::CHAIN_ABC);
     let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
-    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodec"), &fleet.base);
 
-    // Each side has to be able to name the other: the question goes a→b,
-    // the deferral b→a.
-    wait_for("nodeb's agent in nodea's directory", GOSSIP_TIMEOUT, || {
+    // Discovery addresses A → B → C. The durable binding routes the deferral home.
+    wait_for("nodec's agent in nodea's directory", GOSSIP_TIMEOUT, || {
         let listing = alice.call_tool("flock_agent_list", json!({}));
         fleet_row(&listing, &bob.agent_id).map(|_| ())
-    });
-    wait_for("nodea's agent in nodeb's directory", GOSSIP_TIMEOUT, || {
-        let listing = bob.call_tool("flock_agent_list", json!({}));
-        fleet_row(&listing, &alice.agent_id).map(|_| ())
     });
 
     // 1. Waiting before the mute.
@@ -559,7 +555,7 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "needs_reply",
         }),
     );
-    wait_for("the question to land on nodeb", RPC_TIMEOUT, || {
+    wait_for("the question to land on nodec", RPC_TIMEOUT, || {
         let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
         (!queued["messages"].as_array()?.is_empty()).then_some(())
     });
@@ -586,7 +582,7 @@ fn a_mute_answers_a_sender_on_another_host() {
         "never a question back: {deferral}"
     );
     assert_eq!(deferral["from_agent"], bob.agent_id.as_str(), "{deferral}");
-    assert_eq!(deferral["from_host"], "nodeb", "{deferral}");
+    assert_eq!(deferral["from_host"], Value::Null, "{deferral}");
     let body = deferral["body"].as_str().expect("body");
     assert!(body.contains("mid-rebase"), "the reason travels: {body}");
     assert!(
@@ -630,12 +626,19 @@ fn a_mute_answers_a_sender_on_another_host() {
             "intent": "fyi",
         }),
     );
-    wait_for("the notice to land on nodeb", RPC_TIMEOUT, || {
+    wait_for("the notice to land on nodec", RPC_TIMEOUT, || {
         let queued = bob.call_tool("flock_msg_list", json!({"pane": bob.pane_id}));
         (queued["messages"].as_array()?.len() == 3).then_some(())
     });
     // Give a stray deferral the same window a real one got to arrive.
-    thread::sleep(Duration::from_secs(2));
+    let observed = Instant::now();
+    wait_for("no duplicate deferral", RPC_TIMEOUT, || {
+        assert_eq!(
+            alice.call_tool("flock_msg_read", json!({}))["messages"],
+            json!([])
+        );
+        (observed.elapsed() >= Duration::from_secs(2)).then_some(())
+    });
     let inbox = alice.call_tool("flock_msg_read", json!({}));
     assert_eq!(
         inbox["messages"].as_array().map(Vec::len),
@@ -922,7 +925,7 @@ fn spoke_custody_hub_live_handoff_mid_conversation() {
     assert_eq!(answer[0]["body"], "answer after handoff");
 }
 
-/// Hold the actual legacy SSH command until another app-loop API responds.
+/// Hold the mesh delivery on the relay edge until another app-loop API responds.
 /// Ping is served by the socket thread, so workspace.list is the probe.
 fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, relay: &str) {
     let fleet = fleet::spawn_with_startup_probe("slow-message-hop", specs, |fleet, name| {
@@ -995,6 +998,54 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
 #[test]
 fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
     slow_message_hop_keeps_api_responsive(PAIR_AB, "nodeb", "nodea");
+}
+
+#[test]
+fn direct_message_delivers_before_topology_adverts_arrive() {
+    let fleet = fleet::spawn_with_startup_probe("direct-before-routes", PAIR_AB, |fleet, _| {
+        std::fs::write(fleet.base.join("withhold-route-adverts"), "").unwrap();
+    });
+    let mut alice = PanedMcp::start(fleet.node("nodea"), &fleet.base);
+    let mut bob = PanedMcp::start(fleet.node("nodeb"), &fleet.base);
+    wait_for(
+        "direct recipient discovery before topology exchange",
+        GOSSIP_TIMEOUT,
+        || {
+            let listing = alice.call_tool("flock_agent_list", json!({}));
+            fleet_row(&listing, &bob.agent_id).map(|_| ())
+        },
+    );
+    let enrollment = spoke_api(fleet.node("nodea"), "peers.enrollment", json!({}));
+    assert_eq!(enrollment["result"]["routes"], json!([]));
+    assert!(
+        enrollment["result"]["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["source"] == "configured" && peer["state"] == "pinned"),
+        "{enrollment}"
+    );
+    let sent = alice.call_tool(
+        "flock_msg_send",
+        json!({
+            "to": {"type":"agent", "agent":bob.agent_id},
+            "body":"direct before adverts", "intent":"needs_reply",
+            "correlation_id":"direct-before-routes"
+        }),
+    );
+    assert_eq!(sent["state"], "delivered", "{sent}");
+    assert_eq!(sent["path"], "direct", "{sent}");
+    let read = bob.call_tool("flock_msg_read", json!({}));
+    assert_eq!(
+        read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["correlation_id"] == "direct-before-routes")
+            .count(),
+        1,
+        "{read}"
+    );
 }
 
 #[test]
@@ -1107,14 +1158,46 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
         db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
             .unwrap()
     };
-    let before = version();
+    // A lost ack now leaves receipt debt pending until the origin explicitly
+    // acknowledges it. Permit that one bookkeeping update, but audit every
+    // other write so duplicate import must still be read-only.
+    db.execute_batch("CREATE TABLE replay_writes (table_name TEXT)")
+        .unwrap();
+    let tables: Vec<String> = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='replay_writes'"
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    for table in tables {
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let condition = if table == "envelopes" && operation == "UPDATE" {
+                let columns: Vec<String> = db.prepare(
+                    "SELECT name FROM pragma_table_info('envelopes') WHERE name!='receipt_sent'"
+                ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+                format!("WHEN NOT (OLD.receipt_sent IS NULL AND NEW.receipt_sent IS 'delivered' AND {})",
+                    columns.iter().map(|column| format!("OLD.\"{column}\" IS NEW.\"{column}\"")).collect::<Vec<_>>().join(" AND "))
+            } else {
+                String::new()
+            };
+            db.execute_batch(&format!(
+                "CREATE TRIGGER replay_{table}_{operation} AFTER {operation} ON {quoted} {condition}
+                 BEGIN INSERT INTO replay_writes VALUES ('{table}'); END"
+            ))
+            .unwrap();
+        }
+    }
+    let replay_writes = || {
+        db.query_row("SELECT COUNT(*) FROM replay_writes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
     let offers = fleet.base.join("outbound-offers-nodeb-nodea");
     wait_for(
         "duplicate offered to muted recipient",
         GOSSIP_TIMEOUT,
         || (std::fs::read_to_string(&offers).ok()?.lines().count() >= 2).then_some(()),
     );
-    assert_eq!(version(), before, "duplicate import must not commit on hub");
+    assert_eq!(replay_writes(), 0, "duplicate import must not write on hub");
     wait_for("next ack settles custody", GOSSIP_TIMEOUT, || {
         let state: String = spoke_db(fleet.node("nodea"))
             .query_row(
@@ -1125,9 +1208,11 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
             .ok()?;
         (state == "delivered").then_some(())
     });
-    assert_eq!(version(), before);
+    assert_eq!(replay_writes(), 0);
+    let before = version();
     let count = std::fs::read_to_string(&offers).unwrap().lines().count();
     thread::sleep(Duration::from_secs(6));
+    assert_eq!(version(), before);
     assert_eq!(
         std::fs::read_to_string(&offers).unwrap().lines().count(),
         count

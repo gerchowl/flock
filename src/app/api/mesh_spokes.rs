@@ -10,11 +10,23 @@ use crate::{
 impl App {
     pub(super) fn finish_outbound_collection(&mut self, completion: Completion) {
         let mut failed = completion.result.is_err();
+        let mut unacked_receipts = false;
         if let Collect::Outbound { outbound } = &completion.query {
-            if completion.result.is_ok() && !outbound.receipts.is_empty() {
+            if let Ok(batch) = &completion.result {
+                unacked_receipts = outbound
+                    .receipts
+                    .iter()
+                    .any(|receipt| !batch.receipts_acked.contains(receipt));
                 if let Err(reason) = with_store(|store| {
                     store
-                        .receipts_sent(&outbound.receipts)
+                        .receipts_sent(
+                            &batch
+                                .receipts_acked
+                                .iter()
+                                .filter(|r| outbound.receipts.contains(r))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
                         .map_err(|e| e.to_string())
                 }) {
                     failed = true;
@@ -28,7 +40,7 @@ impl App {
         self.mesh_outbound_polls
             .entry(completion.peer.name.clone())
             .or_default()
-            .finished(std::time::Instant::now(), failed);
+            .finished_receipts(std::time::Instant::now(), failed, unacked_receipts);
         let Ok(batch) = completion.result else {
             return;
         };
@@ -48,6 +60,11 @@ impl App {
             };
             let result = self.import_attested_mesh_mail(&delivery, upstream);
             let delivered = result.as_ref().is_ok_and(|(_, delivered)| *delivered);
+            let receipt = result
+                .as_ref()
+                .err()
+                .and_then(|reason| self.refusal_receipt(&delivery, reason))
+                .map(Box::new);
             let refusal = match result {
                 Ok(_) => None,
                 Err(reason) => {
@@ -67,6 +84,7 @@ impl App {
                 key: mail.key.clone(),
                 token: mail.return_binding.collection_token.clone(),
                 refusal,
+                receipt,
             });
         }
         if !ack.is_empty() {

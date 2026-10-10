@@ -27,9 +27,21 @@ pub struct Deliver {
     pub visited: Vec<String>,
 }
 
+/// Push one delivery. A terminal refusal may carry the recipient's signed
+/// receipt for the origin (#872).
 pub(crate) fn send(
     peer: &crate::config::PeerConfig,
     delivery: &Deliver,
+) -> (Result<bool, PeerMessageFailure>, Option<Envelope>) {
+    let mut receipt = None;
+    let result = push(peer, delivery, &mut receipt);
+    (result, receipt)
+}
+
+fn push(
+    peer: &crate::config::PeerConfig,
+    delivery: &Deliver,
+    receipt: &mut Option<Envelope>,
 ) -> Result<bool, PeerMessageFailure> {
     let mut delivery = delivery.clone();
     super::hello::with_store(|store| {
@@ -54,7 +66,11 @@ pub(crate) fn send(
     let response: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| PeerMessageFailure::Unreachable(e.to_string()))?;
     if let Some(error) = response.get("error") {
-        return Err(delivery_failure(error));
+        let failure = delivery_failure(error);
+        if matches!(failure, PeerMessageFailure::Refused(_)) {
+            *receipt = serde_json::from_value(error["data"]["receipt"].clone()).ok();
+        }
+        return Err(failure);
     }
     let result = &response["result"];
     if result["message_key"]
@@ -102,6 +118,7 @@ pub(crate) fn permanent_refusal(reason: &str) -> bool {
             | "msg_not_allowed"
             | "origin_mismatch"
             | "invalid_signature"
+            | "invalid reply binding"
             | "invalid_envelope"
             | "message_key_conflict"
     )
@@ -166,6 +183,7 @@ mod tests {
             "msg_not_allowed",
             "origin_mismatch",
             "invalid_signature",
+            "invalid reply binding",
             "invalid_envelope",
         ] {
             let failure = super::delivery_failure(

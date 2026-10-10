@@ -11,9 +11,10 @@ pub struct StatusReference {
 }
 
 /// The receiver-side states a read receipt may carry back to the origin.
-pub(super) const RECEIPT_STATES: [&str; 5] = [
+pub(super) const RECEIPT_STATES: [&str; 6] = [
     "delivered",
     "recipient_gone",
+    "refused",
     "read",
     "expired",
     "outcome_retention_elapsed",
@@ -150,6 +151,9 @@ impl<D: DiskSpace> Store<D> {
                     continue;
                 }
                 let envelope = answer.envelope;
+                if envelope.kind == Kind::Receipt {
+                    continue;
+                }
                 let deferred = crate::app::mailboxes::is_deferral(&envelope.correlation_id);
                 if reply
                     .as_ref()
@@ -192,6 +196,17 @@ impl<D: DiskSpace> Store<D> {
     }
 
     pub fn import_receipt(&mut self, key: &MessageKey, state: &str) -> Result<ReceiptImport> {
+        self.import_receipt_with_detail(key, state, None)
+    }
+
+    /// A terminal refusal carries the recipient's reason, shown as the
+    /// sender's status `detail`.
+    pub fn import_receipt_with_detail(
+        &mut self,
+        key: &MessageKey,
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<ReceiptImport> {
         let incoming = RECEIPT_STATES
             .iter()
             .position(|candidate| *candidate == state)
@@ -217,7 +232,15 @@ impl<D: DiskSpace> Store<D> {
                     .position(|candidate| *candidate == state)
             })
             .max();
-        if current.is_some_and(|current| current >= incoming) {
+        if remote
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(original_state.as_str()))
+            .any(|state| matches!(state, "read" | "recipient_gone" | "refused" | "expired"))
+            || (state == "outcome_retention_elapsed"
+                && remote.as_deref().unwrap_or(&original_state) != "delivered")
+            || current.is_some_and(|current| current >= incoming)
+        {
             return Ok(ReceiptImport::Duplicate);
         }
         if !matches!(
@@ -226,9 +249,17 @@ impl<D: DiskSpace> Store<D> {
         ) {
             return Ok(ReceiptImport::OriginalNotReady);
         }
+        // Delivery evidence does not acknowledge a held offer. Keep its body
+        // for retransmission until the custody ack arrives. Final outcomes can
+        // settle it immediately, including a read that outran its own ack.
+        let settle = original_state != "held" || state != "delivered";
         let changed = self.connection.execute(
-            "UPDATE envelopes SET remote_state=?3,body=CASE WHEN state='transferred' THEN X'' ELSE body END,state=CASE WHEN state='transferred' THEN 'delivered' ELSE state END WHERE origin=?1 AND id=?2",
-            params![key.origin_node, key.message_id, state],
+            "UPDATE envelopes SET remote_state=?3,delivered=1,
+             body=CASE WHEN ?4 AND state IN ('held','transferred') THEN X'' ELSE body END,
+             state=CASE WHEN ?4 AND state IN ('held','transferred') THEN 'delivered' ELSE state END,
+             collect_error=COALESCE(?5,collect_error)
+             WHERE origin=?1 AND id=?2",
+            params![key.origin_node, key.message_id, state, settle, detail],
         )?;
         Ok(if changed == 1 {
             ReceiptImport::Applied
@@ -335,7 +366,7 @@ impl<D: DiskSpace> Store<D> {
         let now = self.clock()?.advance(wall_ms);
         let mut stmt = self.connection.prepare(&format!(
             "WITH due AS MATERIALIZED (
-                SELECT rowid AS record_rowid,* FROM envelopes WHERE origin=?1 AND state IN ('inbox','read','inbox_expired')
+                SELECT rowid AS record_rowid,* FROM envelopes WHERE origin=?1 AND kind='message' AND state IN ('inbox','read','inbox_expired')
                 AND ((outcome_until<=?2 AND receipt_sent IS NOT 'outcome_retention_elapsed')
                   OR ((outcome_until IS NULL OR outcome_until>?2) AND (
                     (state='read' AND receipt_sent IS NOT 'read')
@@ -404,5 +435,37 @@ impl<D: DiskSpace> Store<D> {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+impl<D: DiskSpace> Store<D> {
+    /// Read only changed, multihop inbox outcomes. Custody is created before marking sent.
+    pub fn routed_receipts(&mut self, wall_ms: i64) -> Result<Vec<crate::mesh::collect::Receipt>> {
+        let now = self.clock()?.advance(wall_ms);
+        let keys = self.routing_keys(
+            "SELECT origin,id,rowid FROM envelopes WHERE json_valid(visited) AND json_array_length(visited)>1
+             AND recipient_node=?1 AND custody_deadline>?2
+             AND (state NOT IN ('inbox','read') OR COALESCE(inbox_deadline,custody_deadline)>?2)
+             AND request_origin IS NULL AND kind='message'
+             AND state IN ('inbox','read','recipient_gone')
+             AND receipt_sent IS NOT CASE WHEN state='inbox' THEN 'delivered' ELSE state END
+             ORDER BY origin,id LIMIT 16",
+            params![self.local_node, now],
+        )?;
+        let mut receipts = Vec::new();
+        for key in keys {
+            if let Some(record) = self.collection_record(&key, wall_ms)? {
+                receipts.push(crate::mesh::collect::Receipt {
+                    key,
+                    token: record.envelope.return_binding.collection_token,
+                    state: if record.state == "inbox" {
+                        "delivered".into()
+                    } else {
+                        record.state
+                    },
+                });
+            }
+        }
+        Ok(receipts)
     }
 }

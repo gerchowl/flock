@@ -7,6 +7,7 @@ pub(crate) const POLL_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Default)]
 pub(crate) struct Batch {
+    pub receipts_acked: Vec<Receipt>,
     pub receipt: Option<String>,
     pub deliveries: Vec<Deliver>,
     pub quarantined: Vec<OutboundAck>,
@@ -21,6 +22,8 @@ pub(crate) struct Poll {
     attempts: usize,
     generation: u64,
     failed: bool,
+    receipts_pending: bool,
+    receipts_deferred: bool,
 }
 impl Poll {
     pub fn note_wake(&mut self) {
@@ -28,7 +31,7 @@ impl Poll {
     }
 
     pub fn note_receipts(&mut self, pending: bool) {
-        self.pending |= pending;
+        self.receipts_pending |= pending;
     }
 
     pub fn ready(&mut self, now: std::time::Instant, pinned: bool, generation: u64) -> bool {
@@ -36,13 +39,25 @@ impl Poll {
             self.deadline = None;
             self.attempts = 0;
             self.failed = false;
+            self.receipts_deferred = false;
         }
         self.pinned = pinned;
         self.generation = generation;
-        pinned && (self.deadline.is_none_or(|at| at <= now) || (self.pending && !self.failed))
+        pinned
+            && (self.deadline.is_none_or(|at| at <= now)
+                || (!self.failed
+                    && (self.pending || (self.receipts_pending && !self.receipts_deferred))))
     }
+    /// Unaccepted receipts wait for the bounded poll deadline, but a healthy
+    /// edge can still wake for new mail or retry a lost custody acknowledgement.
+    pub fn finished_receipts(&mut self, now: std::time::Instant, failed: bool, unacked: bool) {
+        self.finished(now, failed);
+        self.receipts_deferred = unacked;
+    }
+
     pub fn finished(&mut self, now: std::time::Instant, failed: bool) {
         self.pending = false;
+        self.receipts_pending = false;
         self.failed = failed;
         let seconds = [5, 60, 299][self.attempts.min(2)];
         self.attempts = self.attempts.saturating_add(1);
@@ -85,6 +100,9 @@ pub struct OutboundAck {
     pub refusal: Option<String>,
     #[serde(default = "delivered_by_default")]
     pub delivered: bool,
+    /// The recipient's signed terminal receipt for a refused forward (#872).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Box<crate::mesh::store::Envelope>>,
 }
 
 fn delivered_by_default() -> bool {
@@ -161,9 +179,14 @@ fn decode(raw: &str) -> Result<Batch, String> {
         return Err("mesh collection batch too large".into());
     }
     let mut batch = Batch {
+        receipts_acked: serde_json::from_value(response["result"]["receipts_acked"].clone())
+            .unwrap_or_default(),
         receipt: response["result"]["receipt"].as_str().map(str::to_owned),
         ..Batch::default()
     };
+    if batch.receipts_acked.len() > BATCH_CAP {
+        return Err("mesh receipt acknowledgement batch too large".into());
+    }
     for value in answers {
         match serde_json::from_value::<Deliver>(value.clone()) {
             Ok(delivery) => batch.deliveries.push(delivery),
@@ -181,6 +204,7 @@ fn decode(raw: &str) -> Result<Batch, String> {
                         key,
                         token,
                         refusal: Some("invalid_envelope".into()),
+                        receipt: None,
                     });
                 }
             }
@@ -191,6 +215,22 @@ fn decode(raw: &str) -> Result<Batch, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unacked_receipts_back_off_without_blocking_custody_wakes() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+    }
+
     #[test]
     fn wake_does_not_bypass_failed_backoff() {
         let now = std::time::Instant::now();

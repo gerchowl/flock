@@ -2168,6 +2168,8 @@ pub enum ResponseResult {
         content: String,
     },
     MeshCollected {
+        #[serde(default)]
+        receipts_acked: Vec<crate::mesh::collect::Receipt>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         receipt: Option<String>,
         answers: Vec<crate::mesh::delivery::Deliver>,
@@ -2186,6 +2188,8 @@ pub enum ResponseResult {
     PeersEnrollment {
         #[serde(default)]
         mesh_quarantined: usize,
+        #[serde(default)]
+        route_generation: u64,
         routes: Vec<crate::mesh::routes::Route>,
         peers: Vec<crate::mesh::hello::Enrollment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

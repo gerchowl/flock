@@ -11,7 +11,7 @@ pub(super) fn record_answer(
     let Some(request) = &answer.request_key else {
         return Ok(());
     };
-    if admission != Admission::Inbox {
+    if admission != Admission::Inbox || answer.kind == Kind::Receipt {
         return Ok(());
     }
     if !crate::app::mailboxes::is_deferral(&answer.correlation_id) {
@@ -106,6 +106,7 @@ impl<D: DiskSpace> Store<D> {
         wall_ms: i64,
         limit: usize,
         busy: &[String],
+        pinned: &[String],
     ) -> Result<Vec<Record>> {
         let mut clock = self.clock()?;
         if clock.paused || limit == 0 {
@@ -118,8 +119,10 @@ impl<D: DiskSpace> Store<D> {
                   SELECT id,collect_attempts,collect_at,
                     row_number() OVER (PARTITION BY recipient_node ORDER BY collect_at,id) AS rank
                   FROM envelopes e WHERE origin=?1 AND collect_at<=?2
+                  AND request_origin IS NULL AND kind='message'
                   AND custody_deadline>?2 AND delivered=1 AND state='delivered'
                   AND recipient_node NOT IN ('',?1)
+                  AND recipient_node IN (SELECT value FROM json_each(?5))
                   AND recipient_node NOT IN (SELECT value FROM json_each(?4))
                   AND collect_error IS NULL AND (
                     (reply_expected=1 AND collect_done=0) OR remote_state IS NULL OR remote_state='delivered' OR EXISTS (
@@ -132,7 +135,8 @@ impl<D: DiskSpace> Store<D> {
                         origin,
                         now,
                         limit.min(BATCH_CAP) as i64,
-                        serde_json::to_string(busy)?
+                        serde_json::to_string(busy)?,
+                        serde_json::to_string(pinned)?
                     ],
                     |r| {
                         Ok((
@@ -310,7 +314,7 @@ impl<D: DiskSpace> Store<D> {
         }
         let keys = {
             let mut stmt = self.connection.prepare(
-                "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 AND state IN ('custody','held')
+                "SELECT origin,id FROM envelopes WHERE request_origin=?1 AND request_id=?2 AND kind='message' AND state IN ('custody','held')
                  ORDER BY origin,id LIMIT ?3")?;
             let rows = stmt
                 .query_map(
@@ -349,13 +353,13 @@ impl<D: DiskSpace> Store<D> {
 
 impl<D: DiskSpace> Store<D> {
     /// The existing summary carries only ready work, so a backed-off row cannot cause hot polling.
-    pub fn has_outbound(&self, local: &str, hub: &str, wall_ms: i64) -> Result<bool> {
+    pub fn has_outbound(&self, hub: &str, wall_ms: i64) -> Result<bool> {
         let mut clock = self.clock()?;
         if clock.paused {
             return Ok(false);
         }
         let now = clock.advance(wall_ms);
-        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE origin=?1 AND request_origin IS NULL AND state='held' AND recipient_node=?3 AND retry_at<=?2 AND custody_deadline>?2)", params![local, now, hub], |r| r.get(0))?)
+        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2)", params![hub, now], |r| r.get(0))?)
     }
 
     /// Step-1 importers accept only local requests addressed to their neighbor.
@@ -460,10 +464,7 @@ impl<D: DiskSpace> Store<D> {
         // takes the receipt too, rather than the hub marking it sent for
         // nothing.
         for receipt in receipts {
-            if self.import_receipt(&receipt.key, &receipt.state)? == ReceiptImport::OriginalNotReady
-            {
-                return Err(Error::InvalidState);
-            }
+            let _ = self.import_receipt(&receipt.key, &receipt.state)?;
         }
         if offer == Offer::All {
             // Materialize only changed inbox receipts. The sent mark follows

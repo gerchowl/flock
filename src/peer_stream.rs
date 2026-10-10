@@ -939,8 +939,8 @@ pub fn establish_failure(peer: &PeerConfig) -> Option<String> {
         Arc::clone(registry.get(&peer.name)?)
     };
     // A blocking lock, not `try_lock`: this runs on the poll's own worker
-    // thread, never the main loop, and a request in flight (an uplink answer,
-    // say) would otherwise read as "no failure" and blank the peer's row for
+    // thread, never the main loop, and a request in flight (a mesh
+    // collection, say) would otherwise read as "no failure" and blank the peer's row for
     // a poll. Poison is recovered like `request_over` does.
     let slot = match slot.lock() {
         Ok(slot) => slot,
