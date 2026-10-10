@@ -4342,7 +4342,7 @@ fn clearing_a_route_releases_custody_and_held_leases_idempotently() {
 }
 
 #[test]
-fn expired_read_receipts_do_not_starve_fresh_routed_receipts() {
+fn late_read_receipts_route_without_starving_fresh_routed_receipts() {
     let f = Fixture::new();
     let mut store = f.open(0);
     store.set_local_node("receiver.example");
@@ -4359,7 +4359,8 @@ fn expired_read_receipts_do_not_starve_fresh_routed_receipts() {
     store
         .accept(&fresh, CUSTODY_TTL_MS, Admission::Inbox, DAY_MS + 1)
         .unwrap();
-    // All rows arrived through two hops. Expired read rows sort before the fresh row.
+    // All rows arrived through two hops. Read rows past their inbox deadline
+    // sort before the fresh row, and each still owes its read receipt.
     store
         .connection
         .execute(
@@ -4367,12 +4368,58 @@ fn expired_read_receipts_do_not_starve_fresh_routed_receipts() {
             [],
         )
         .unwrap();
-    let receipts = store.routed_receipts(DAY_MS + 1).unwrap();
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].key, fresh.key);
-    assert_eq!(receipts[0].state, "delivered");
-    store.receipts_sent(&receipts).unwrap();
+    let mut routed = Vec::new();
+    for _ in 0..3 {
+        let receipts = store.routed_receipts(DAY_MS + 1).unwrap();
+        store.receipts_sent(&receipts).unwrap();
+        routed.extend(receipts);
+    }
+    assert_eq!(routed.len(), 21);
+    assert_eq!(routed.iter().filter(|r| r.state == "read").count(), 20);
+    let last = routed.iter().find(|r| r.key == fresh.key).unwrap();
+    assert_eq!(last.state, "delivered");
     assert!(store.routed_receipts(DAY_MS + 1).unwrap().is_empty());
+}
+
+#[test]
+fn routed_receipts_carry_expiry_and_retention_to_multihop_origins() {
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    store.set_local_node("receiver.example");
+    let mail = envelope();
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    store
+        .connection
+        .execute(
+            r#"UPDATE envelopes SET visited='["origin.example","hub.example"]'"#,
+            [],
+        )
+        .unwrap();
+    let route = |store: &mut Store<Disk>, at: i64| {
+        let receipts = store.routed_receipts(at).unwrap();
+        store.receipts_sent(&receipts).unwrap();
+        receipts
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.key, mail.key);
+                r.state
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(route(&mut store, 1), ["delivered"]);
+    // The inbox deadline passes before maintenance records it.
+    assert_eq!(route(&mut store, DAY_MS + 1), ["expired"]);
+    store.maintain(DAY_MS + 1).unwrap();
+    assert_eq!(
+        store.get(&mail.key).unwrap().unwrap().state,
+        "inbox_expired"
+    );
+    assert!(route(&mut store, DAY_MS + 2).is_empty());
+    let retained = DAY_MS + 1 + CUSTODY_TTL_MS;
+    assert_eq!(route(&mut store, retained), ["outcome_retention_elapsed"]);
+    assert!(route(&mut store, retained + 1).is_empty());
 }
 
 #[test]

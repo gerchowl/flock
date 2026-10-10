@@ -747,6 +747,23 @@ fn recipient_gone_receipt_reaches_multihop_origin() {
 }
 
 #[test]
+fn expired_receipt_reaches_multihop_origin() {
+    let (fleet, sender, recipient) = setup("routed-expired", CHAIN);
+    send(&fleet, &sender, &recipient, "expiring");
+    remote_state(&fleet, "expiring", "delivered");
+    // Lapse the unread inbox row on the owner instead of waiting a day.
+    let lapsed = db(fleet.node("nodec"))
+        .execute(
+            "UPDATE envelopes SET inbox_deadline=0
+             WHERE correlation='expiring' AND kind='message' AND state='inbox'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(lapsed, 1);
+    remote_state(&fleet, "expiring", "expired");
+}
+
+#[test]
 fn channel_original_settles_on_reply_custody_multihop() {
     let (fleet, sender, recipient) = setup(
         "routed-channel",
