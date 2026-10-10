@@ -1019,7 +1019,7 @@ fn hub_outcome(fleet: &Fleet, correlation: &str, detail: &str) {
 }
 
 /// Replay the hub's captured push to `next` with one field changed, so
-/// `next` refuses the route and the hub keeps custody with no next hop.
+/// `next` refuses the route and the hub keeps custody for a reroute.
 fn refuse_at_hub(fleet: &Fleet, next: &str, correlation: &str, field: &str, value: Value) {
     let capture = fleet.base.join(format!("capture-delivery-nodeb-{next}"));
     let mut delivery: Value = fleet::wait_until("hub delivery captured", WAIT, || {
@@ -1033,15 +1033,22 @@ fn refuse_at_hub(fleet: &Fleet, next: &str, correlation: &str, field: &str, valu
     .unwrap();
     std::fs::remove_file(capture).unwrap();
     due(fleet.node("nodeb"));
-    fleet::wait_until("hub retains unrouted custody", WAIT, || {
-        let row: (String, String) = db(fleet.node("nodeb"))
+    // The refusal clears the next hop, but a route generation that is still
+    // converging can reassign it. The recorded reason stays either way.
+    let reason = if field == "visited" {
+        "loop_detected"
+    } else {
+        "hop_budget_exhausted"
+    };
+    fleet::wait_until("hub records the route refusal in custody", WAIT, || {
+        let row: (String, Option<String>) = db(fleet.node("nodeb"))
             .query_row(
-                "SELECT state,next_hop FROM envelopes WHERE correlation=?1",
+                "SELECT state,collect_error FROM envelopes WHERE correlation=?1",
                 [correlation],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok()?;
-        (row == ("custody".into(), String::new())).then_some(())
+        (row.0 == "custody" && row.1.as_deref() == Some(reason)).then_some(())
     });
     remote_state(fleet, correlation, "custody");
 }
