@@ -1004,3 +1004,139 @@ fn route_cycle_and_exhausted_hop_budget_retain_custody() {
         assert_eq!(count, 1);
     }
 }
+
+/// The origin's view once a hub signs its own outcome (#876).
+fn hub_outcome(fleet: &Fleet, correlation: &str, detail: &str) {
+    fleet::wait_until("hub-signed outcome at the origin", WAIT, || {
+        let response = api(
+            fleet.node("nodea"),
+            "msg.status",
+            json!({"correlation_id":correlation}),
+        );
+        (response["result"]["state"] == "undeliverable" && response["result"]["detail"] == detail)
+            .then_some(())
+    });
+}
+
+/// Replay the hub's captured push to `next` with one field changed, so
+/// `next` refuses the route and the hub keeps custody for a reroute.
+fn refuse_at_hub(fleet: &Fleet, next: &str, correlation: &str, field: &str, value: Value) {
+    let capture = fleet.base.join(format!("capture-delivery-nodeb-{next}"));
+    let mut delivery: Value = fleet::wait_until("hub delivery captured", WAIT, || {
+        serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()
+    });
+    delivery[field] = value;
+    std::fs::write(
+        fleet.base.join(format!("replay-delivery-nodeb-{next}")),
+        serde_json::to_vec(&delivery).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(capture).unwrap();
+    due(fleet.node("nodeb"));
+    // The refusal clears the next hop, but a route generation that is still
+    // converging can reassign it. The recorded reason stays either way.
+    let reason = if field == "visited" {
+        "loop_detected"
+    } else {
+        "hop_budget_exhausted"
+    };
+    fleet::wait_until("hub records the route refusal in custody", WAIT, || {
+        let row: (String, Option<String>) = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT state,collect_error FROM envelopes WHERE correlation=?1",
+                [correlation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()?;
+        (row.0 == "custody" && row.1.as_deref() == Some(reason)).then_some(())
+    });
+    remote_state(fleet, correlation, "custody");
+}
+
+/// Lapse the hub's custody of `correlation` instead of waiting seven days.
+fn lapse_hub_custody(fleet: &Fleet, correlation: &str) {
+    let lapsed = db(fleet.node("nodeb"))
+        .execute(
+            "UPDATE envelopes SET custody_deadline=0 WHERE correlation=?1 AND kind='message'",
+            [correlation],
+        )
+        .unwrap();
+    assert_eq!(lapsed, 1);
+}
+
+#[test]
+fn loop_at_a_hub_reaches_the_origin_as_a_hub_signed_outcome() {
+    let (fleet, sender, recipient) = setup("hub-loop", CHAIN);
+    let capture = fleet.base.join("capture-delivery-nodeb-nodec");
+    std::fs::write(&capture, "").unwrap();
+    send(&fleet, &sender, &recipient, "hub-loop");
+    refuse_at_hub(
+        &fleet,
+        "nodec",
+        "hub-loop",
+        "visited",
+        json!([
+            fleet.node_id("nodea"),
+            fleet.node_id("nodec"),
+            fleet.node_id("nodeb")
+        ]),
+    );
+    lapse_hub_custody(&fleet, "hub-loop");
+    hub_outcome(&fleet, "hub-loop", "loop_detected at nodeb");
+}
+
+#[test]
+fn exhausted_hop_budget_at_a_hub_reaches_the_origin() {
+    let (fleet, sender, recipient) = prepare(
+        "hub-hops",
+        &[
+            NodeSpec::new("nodea", "hops-a", &["nodeb"]),
+            NodeSpec::new("nodeb", "hops-b", &["noded"]),
+            NodeSpec::new("noded", "hops-d", &["nodec"]),
+            NodeSpec::new("nodec", "hops-c", &[]),
+        ],
+        true,
+    );
+    let capture = fleet.base.join("capture-delivery-nodeb-noded");
+    std::fs::write(&capture, "").unwrap();
+    send(&fleet, &sender, &recipient, "hub-hops");
+    refuse_at_hub(&fleet, "noded", "hub-hops", "hops_left", json!(0));
+    lapse_hub_custody(&fleet, "hub-hops");
+    hub_outcome(&fleet, "hub-hops", "hop_budget_exhausted at nodeb");
+}
+
+#[test]
+fn no_route_at_a_hub_reaches_the_origin_after_its_own_expiry() {
+    let (fleet, sender, recipient) = setup("hub-no-route", CHAIN);
+    let capture = fleet.base.join("capture-delivery-nodeb-nodec");
+    std::fs::write(&capture, "").unwrap();
+    send(&fleet, &sender, &recipient, "hub-no-route");
+    fleet::wait_until("hub delivery captured", WAIT, || {
+        (!std::fs::read(&capture).ok()?.is_empty()).then_some(())
+    });
+    fleet.refuse_edge("nodeb", "nodec");
+    fleet.kill_edge("nodeb", "nodec", WAIT);
+    fleet.wait_route("nodeb", "nodec", false);
+    fleet::wait_until("hub custody loses its next hop", WAIT, || {
+        let hop: String = db(fleet.node("nodeb"))
+            .query_row(
+                "SELECT next_hop FROM envelopes WHERE correlation='hub-no-route'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        hop.is_empty().then_some(())
+    });
+    // Both deadlines pass. The origin reports its own expiry first, and the
+    // hub's reason replaces it when it arrives.
+    db(fleet.node("nodea"))
+        .execute(
+            "UPDATE envelopes SET custody_deadline=0 WHERE correlation='hub-no-route'",
+            [],
+        )
+        .unwrap();
+    remote_state(&fleet, "hub-no-route", "expired");
+    lapse_hub_custody(&fleet, "hub-no-route");
+    hub_outcome(&fleet, "hub-no-route", "no_route at nodeb");
+    std::fs::remove_file(capture).unwrap();
+}
