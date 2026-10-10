@@ -368,27 +368,19 @@ impl App {
             }
             Err(failure) if !failure.retryable() => {
                 let reason = failure.detail();
-                match with_store(|store| {
-                    store
-                        .refuse(&delivery.envelope.key, reason, now_ms() as i64)
-                        .map_err(|e| e.to_string())
-                }) {
+                let downstream = crate::peer_stream::enrollment(&send.peer).node_id;
+                match self.settle_refusal(
+                    &delivery.envelope,
+                    reason,
+                    receipt.as_ref(),
+                    downstream.as_deref(),
+                ) {
                     Ok(()) => {
                         state = if reason.split(':').next() == Some("recipient_gone") {
                             "recipient_gone"
                         } else {
                             "refused"
                         };
-                        // A hub returns the recipient's signed outcome to the origin.
-                        if let (Some(receipt), Some(downstream)) = (
-                            receipt.as_ref().filter(|_| {
-                                self.node_id.as_deref()
-                                    != Some(delivery.envelope.key.origin_node.as_str())
-                            }),
-                            crate::peer_stream::enrollment(&send.peer).node_id,
-                        ) {
-                            self.forward_refusal_receipt(receipt, &downstream);
-                        }
                         warnings.push(format!("refused by {}: {reason}", send.peer.name));
                         self.emit_event(EventEnvelope {
                             event: EventKind::MessageDelivered,
