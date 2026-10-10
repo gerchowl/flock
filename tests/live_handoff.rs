@@ -1473,6 +1473,19 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
         1,
         "plain status prints each warning once (#860): {shown}"
     );
+    for scope in ["server", "client"] {
+        let scoped = run(&["status", scope]);
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&scoped.stdout),
+            String::from_utf8_lossy(&scoped.stderr)
+        );
+        assert_eq!(
+            shown.matches("delete this line").count(),
+            1,
+            "status {scope} does not print config warnings itself, so the CLI must (#860): {shown}"
+        );
+    }
     let version = run(&["--version"]);
     assert!(version.status.success());
     assert_eq!(

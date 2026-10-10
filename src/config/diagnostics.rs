@@ -49,7 +49,7 @@ fn key_diagnostics(text: &str, path: &Path) -> Vec<KeyDiagnostic> {
         }
         // Deserialize sections independently so one invalid section cannot hide
         // unknown keys in another. Serde owns the schema, including aliases.
-        unknown_keys(std::slice::from_ref(key), value, &mut unknown);
+        unknown_keys(&[Segment::Key(key.clone())], value, &mut unknown);
     }
     for key in unknown {
         let Some(line) = locations.get(&key) else {
@@ -74,33 +74,58 @@ fn key_diagnostics(text: &str, path: &Path) -> Vec<KeyDiagnostic> {
     diagnostics
 }
 
+/// One step from the config root down to the value being checked.
+#[derive(Clone)]
+enum Segment {
+    Key(String),
+    /// An entry of an array of tables such as `[[peers]]`, checked alone.
+    Index(usize),
+}
+
 /// Collect the dotted paths serde ignores under `value`, which sits at `path`.
 /// Serde stops at the first type error, so a table that fails is retried one
-/// key at a time: a bad value then hides nothing but itself (#860).
-fn unknown_keys(path: &[String], value: &toml::Value, found: &mut Vec<String>) {
+/// key at a time, and an array of tables one entry at a time: a bad value then
+/// hides nothing but itself (#860).
+fn unknown_keys(path: &[Segment], value: &toml::Value, found: &mut Vec<String>) {
     let mut section = value.clone();
-    for part in path.iter().rev() {
-        section = toml::Value::Table([(part.clone(), section)].into_iter().collect());
+    for segment in path.iter().rev() {
+        section = match segment {
+            Segment::Key(key) => toml::Value::Table([(key.clone(), section)].into_iter().collect()),
+            Segment::Index(_) => toml::Value::Array(vec![section]),
+        };
     }
     let result: Result<Config, _> = serde_ignored::deserialize(section, |ignored| {
-        let key = ignored
+        let mut parts: Vec<String> = ignored
             .to_string()
             .split('.')
             .filter(|part| *part != "?")
-            .collect::<Vec<_>>()
-            .join(".");
+            .map(String::from)
+            .collect();
+        // An entry checked alone sits at index 0, so put its real index back.
+        for (part, segment) in parts.iter_mut().zip(path) {
+            if let Segment::Index(index) = segment {
+                *part = index.to_string();
+            }
+        }
+        let key = parts.join(".");
         if !found.contains(&key) {
             found.push(key);
         }
     });
     if result.is_err() {
-        let Some(table) = value.as_table() else {
-            return;
-        };
-        for (key, child) in table {
+        let mut descend = |segment: Segment, child: &toml::Value| {
             let mut child_path = path.to_vec();
-            child_path.push(key.clone());
+            child_path.push(segment);
             unknown_keys(&child_path, child, found);
+        };
+        if let Some(table) = value.as_table() {
+            for (key, child) in table {
+                descend(Segment::Key(key.clone()), child);
+            }
+        } else if let Some(entries) = value.as_array() {
+            for (index, child) in entries.iter().enumerate().filter(|(_, v)| v.is_table()) {
+                descend(Segment::Index(index), child);
+            }
         }
     }
 }
@@ -193,6 +218,18 @@ mod tests {
                 "fixture.toml:3: unknown msg.future_setting setting ignored".to_string(),
                 "fixture.toml:6: unknown ui.toast.future_toast setting ignored".to_string(),
             ]
+        );
+    }
+
+    /// The same holds inside one `[[peers]]` entry, and the reported index is
+    /// the entry's own, not the 0 it had while checked alone.
+    #[test]
+    fn a_type_error_does_not_hide_unknown_keys_in_a_peer_entry() {
+        assert_eq!(
+            messages(
+                "[[peers]]\nname = \"nodea\"\n[[peers]]\nname = \"nodeb\"\nssh = 5\nfuture_peer = 1\n",
+            ),
+            vec!["fixture.toml:6: unknown peers.1.future_peer setting ignored".to_string()]
         );
     }
 

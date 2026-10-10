@@ -102,12 +102,18 @@ mod workspace;
 mod worktree;
 
 /// Whether this invocation warns about removed config keys on stderr before it
-/// runs. `config check` and `status` report them in their own output, and
-/// hooks and the MCP server run on every agent turn and tool call, where the
-/// warning is noise and the config scan is wasted work (#860).
+/// runs. `config check` and the full `status` report them in their own output
+/// (`status server` and `status client` do not), and hooks and the MCP server
+/// run on every agent turn and tool call, where the warning is noise and the
+/// config scan is wasted work (#860).
 fn prints_removed_config_warnings(args: &[String]) -> bool {
     match args.get(1).map(String::as_str) {
-        Some("status" | "hook" | "mcp") => false,
+        Some("hook" | "mcp") => false,
+        Some("status") => match &args[2..] {
+            [] => false,
+            [flag] => flag != "--json",
+            _ => true,
+        },
         Some("config") => args.get(2).map(String::as_str) != Some("check"),
         _ => true,
     }
@@ -869,7 +875,14 @@ mod tests {
         ] {
             assert!(!prints_removed_config_warnings(&args(quiet)), "{quiet}");
         }
-        for loud in ["flk", "flk --version", "flk config edit", "flk pane list"] {
+        for loud in [
+            "flk",
+            "flk --version",
+            "flk config edit",
+            "flk pane list",
+            "flk status server",
+            "flk status client --json",
+        ] {
             assert!(prints_removed_config_warnings(&args(loud)), "{loud}");
         }
     }
