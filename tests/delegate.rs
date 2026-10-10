@@ -1371,6 +1371,48 @@ fn a21_harness_that_dies_at_the_brief_fails_the_start_and_reports_gone() {
     );
 }
 
+/// #817: once a delegate's agent is gone, `send` and `wait` answer `gone`
+/// (exit 4) from its record like `status` and `result`, and `send` types nothing
+/// and leaves the round where it was.
+#[test]
+fn a22_send_and_wait_on_a_gone_delegate_report_gone() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    finish(child);
+    wait_typed(&server, 1);
+    let closed = request(
+        &server,
+        &format!(r#"{{"id":"pc","method":"pane.close","params":{{"pane_id":"{pane}"}}}}"#),
+    );
+    assert!(closed.get("error").is_none(), "{closed}");
+
+    let b2 = brief(&server, "fix.md", "y\n");
+    let sent = cli(
+        &server,
+        &["delegate", "send", "d1", "--brief", &b2, "--json"],
+    );
+    assert_eq!(sent.status.code(), Some(4), "{}", stderr(&sent));
+    let json = stdout_json(&sent);
+    assert_eq!(json["outcome"], "gone", "{json}");
+    assert_eq!(json["round"], 1, "{json}");
+    assert_eq!(typed(&server).len(), 1, "send typed nothing");
+
+    let waited = cli(&server, &["delegate", "wait", "d1", "--json"]);
+    assert_eq!(waited.status.code(), Some(4), "{}", stderr(&waited));
+    assert_eq!(stdout_json(&waited)["outcome"], "gone");
+
+    let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["round"], 1);
+}
+
 /// E12: `status` shows the delegate with a null goal; `result` maps an
 /// unfinished turn to `running`.
 #[test]

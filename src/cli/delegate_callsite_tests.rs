@@ -411,6 +411,39 @@ fn recorded_decide_an_unreachable_terminal_lookup_is_a_failure_not_gone() {
     assert!(matches!(out, Err(RequireFailure::Failed(_))), "{out:?}");
 }
 
+// ---------- submit_outcome: one answer for a pane that died (#817) ----------
+
+#[test]
+fn submit_outcome_a_pane_gone_before_typing_is_gone() {
+    let refused = json!({"error": {"code": "pane_gone", "message": "pane_gone"}});
+    assert!(matches!(submit_outcome(&refused), Err(SubmitFailure::Gone)));
+}
+
+#[test]
+fn submit_outcome_a_pane_gone_during_confirmation_is_gone() {
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "pane_gone"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Gone)
+    ));
+}
+
+#[test]
+fn submit_outcome_other_failures_keep_their_kind() {
+    let refused = json!({"error": {"code": "input_not_empty", "message": "x"}});
+    assert!(matches!(
+        submit_outcome(&refused),
+        Err(SubmitFailure::Refused(_))
+    ));
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "operator_active"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Unconfirmed(_))
+    ));
+    let accepted = json!({"result": {"outcome": "accepted"}});
+    assert!(submit_outcome(&accepted).is_ok());
+}
+
 // ---------- W10: "already gone" is reachable ---------------------------------
 
 #[test]

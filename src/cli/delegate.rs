@@ -2805,20 +2805,28 @@ fn emit_submit_gone(entry: &Entry, json: bool) -> i32 {
 }
 
 fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
-    let response = match bounded(method, deadline) {
-        Ok(response) => response,
-        Err(BoundedError::TimedOut) => {
-            return Err(SubmitFailure::Unconfirmed("timed out".to_string()))
-        }
-        Err(BoundedError::Transport(err)) => {
-            return Err(SubmitFailure::Unconfirmed(err.to_string()))
-        }
-    };
+    match bounded(method, deadline) {
+        Ok(response) => submit_outcome(&response),
+        Err(BoundedError::TimedOut) => Err(SubmitFailure::Unconfirmed("timed out".to_string())),
+        Err(BoundedError::Transport(err)) => Err(SubmitFailure::Unconfirmed(err.to_string())),
+    }
+}
+
+/// What a `pane.submit` answer means for the round.
+///
+/// A pane that is gone is one answer whichever moment it died at: refused up
+/// front (`pane_gone` before anything was typed) or abandoned during the
+/// confirmation, the round has no agent and is reported `gone` (#817).
+fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
+    let pane_gone = serde_json::json!("pane_gone");
     if let Some(error) = response.get("error") {
+        if error.get("code") == Some(&pane_gone) {
+            return Err(SubmitFailure::Gone);
+        }
         return Err(SubmitFailure::Refused(server_error(error)));
     }
     if response.pointer("/result/outcome") == Some(&serde_json::json!("abandoned"))
-        && response.pointer("/result/reason") == Some(&serde_json::json!("pane_gone"))
+        && response.pointer("/result/reason") == Some(&pane_gone)
     {
         return Err(SubmitFailure::Gone);
     }
@@ -3241,7 +3249,18 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
     let mut entry = match require_delegate_no_deadline(name) {
-        Ok(entry) => entry,
+        Ok(Recorded::Live(entry)) => entry,
+        // Nothing to type into: the round is not started, and the record stays.
+        Ok(Recorded::Gone(entry)) => {
+            emit_outcome(
+                &entry,
+                Outcome::Gone.as_str(),
+                None,
+                flags.json,
+                &entry.cursor,
+            );
+            return Ok(Outcome::Gone.exit_code());
+        }
         Err(code) => return Ok(code),
     };
     // The whole entry, kept. A round that fails to submit has to put the file
@@ -3288,7 +3307,12 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
 
     if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
         if matches!(reason, SubmitFailure::Gone) {
-            return Ok(emit_submit_gone(&entry, flags.json));
+            // The round never started, so the record goes back to the last one
+            // that did, which is what `status` and `reap` then answer from.
+            if let Err(err) = write_entry(&original) {
+                eprintln!("delegate {name}: the registry could not be restored: {err}");
+            }
+            return Ok(emit_submit_gone(&original, flags.json));
         }
         if matches!(reason, SubmitFailure::Unconfirmed(_)) {
             return Ok(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
@@ -3406,7 +3430,19 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
         .map(|ms| Instant::now() + Duration::from_millis(ms));
 
     let entry = match require_delegate(name, deadline) {
-        Ok(entry) => entry,
+        Ok(Recorded::Live(entry)) => entry,
+        // The same answer the await gives when the pane closes under it.
+        Ok(Recorded::Gone(entry)) => {
+            let reported_cursor = flags.after.clone().unwrap_or_else(|| entry.cursor.clone());
+            emit_outcome(
+                &entry,
+                Outcome::Gone.as_str(),
+                None,
+                flags.json,
+                &reported_cursor,
+            );
+            return Ok(Outcome::Gone.exit_code());
+        }
         Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::Failed(reason)) => {
             // The server was unreachable. Never "not a delegate" (W4): a
@@ -3482,7 +3518,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_recorded_delegate(name) {
+    let entry = match require_delegate_no_deadline(name) {
         Ok(Recorded::Live(entry)) => entry,
         // No agent to ask for a reply: the same answer `delegate wait` gives.
         Ok(Recorded::Gone(entry)) => {
@@ -3576,7 +3612,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let (entry, gone) = match require_recorded_delegate(name) {
+    let (entry, gone) = match require_delegate_no_deadline(name) {
         Ok(Recorded::Live(entry)) => (entry, false),
         Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
@@ -3682,7 +3718,14 @@ enum RequireFailure {
     Failed(String),
 }
 
-fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, RequireFailure> {
+/// Resolve a name to its delegate: the registry entry, live or gone.
+///
+/// A harness that dies at launch leaves its entry behind, and "not a delegate"
+/// for a name with a record is a lie the operator cannot act on (#817): a
+/// recorded delegate whose agent no longer exists is handed back as `Gone`, and
+/// every verb answers `gone` from the record. A name reused by another agent, or
+/// an agent renamed away from it, is still not this delegate.
+fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, RequireFailure> {
     if let Err(reason) = validate_name(name) {
         eprintln!("{reason}");
         return Err(RequireFailure::NotDelegate);
@@ -3690,7 +3733,9 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Entry, Requ
     let Some(entry) = read_entry(name) else {
         return Err(RequireFailure::NotDelegate);
     };
-    require_decide(entry, agent_record(name, deadline))
+    let by_name = agent_record(name, deadline);
+    let terminal_id = entry.terminal_id.clone();
+    recorded_decide(entry, by_name, || agent_record(&terminal_id, deadline))
 }
 
 /// The pure decision half of `require_delegate`, given the entry already read
@@ -3713,42 +3758,8 @@ fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailu
 /// Map a `RequireFailure` into an exit code for callers that do not want to
 /// emit a `timeout` outcome object: `NotDelegate` is a usage error (exit 2),
 /// `TimedOut`/`Failed` print on stderr and exit 1.
-fn require_delegate_no_deadline(name: &str) -> Result<Entry, i32> {
+fn require_delegate_no_deadline(name: &str) -> Result<Recorded, i32> {
     match require_delegate(name, None) {
-        Ok(entry) => Ok(entry),
-        Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
-        Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
-            "delegate {name}: timed out resolving the agent"
-        ))),
-        Err(RequireFailure::Failed(reason)) => Err(fail(format!("delegate {name}: {reason}"))),
-    }
-}
-
-/// A delegate the read-only verbs answer for: live, or recorded but gone.
-#[derive(Debug)]
-enum Recorded {
-    Live(Entry),
-    /// The registry entry exists and no agent holds the name or the recorded
-    /// terminal any more: the harness exited, or its pane or workspace closed.
-    Gone(Entry),
-}
-
-/// Resolve a delegate for `status` and `result`, which read without acting.
-///
-/// A harness that dies at launch leaves its entry behind, and "not a delegate"
-/// for a name with a record is a lie the operator cannot act on (#817): the
-/// read verbs answer `gone` from the record instead. A name reused by another
-/// agent, or an agent renamed away from it, is still not this delegate.
-fn require_recorded_delegate(name: &str) -> Result<Recorded, i32> {
-    if let Err(reason) = validate_name(name) {
-        return Err(usage(reason));
-    }
-    let Some(entry) = read_entry(name) else {
-        return Err(usage(format!("not a delegate: {name}")));
-    };
-    let by_name = agent_record(name, None);
-    let terminal_id = entry.terminal_id.clone();
-    match recorded_decide(entry, by_name, || agent_record(&terminal_id, None)) {
         Ok(recorded) => Ok(recorded),
         Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
@@ -3758,7 +3769,16 @@ fn require_recorded_delegate(name: &str) -> Result<Recorded, i32> {
     }
 }
 
-/// The pure decision half of `require_recorded_delegate`. The terminal is asked
+/// A delegate a verb answers for: live, or recorded but gone.
+#[derive(Debug)]
+enum Recorded {
+    Live(Entry),
+    /// The registry entry exists and no agent holds the name or the recorded
+    /// terminal any more: the harness exited, or its pane or workspace closed.
+    Gone(Entry),
+}
+
+/// The pure decision half of `require_delegate`. The terminal is asked
 /// only when the name is missing, which is what tells a renamed agent (still
 /// on its terminal) from a gone one.
 fn recorded_decide(
@@ -3788,8 +3808,9 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
     // Reap reads only the registry, so it still works for a delegate whose agent
-    // is gone, whose pane was closed by hand, or which was renamed — all of
-    // which `require_delegate` would refuse.
+    // was renamed, which `require_delegate` refuses, and acts on one whose agent
+    // is gone or whose pane was closed by hand, which the other verbs only
+    // report as `gone`.
     if let Err(reason) = validate_name(name) {
         return Ok(usage(reason));
     }
