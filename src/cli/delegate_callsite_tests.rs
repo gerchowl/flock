@@ -374,6 +374,76 @@ fn w7_require_decide_a_timeout_hands_the_entry_back() {
     }
 }
 
+// ---------- recorded_decide: status/result answer for a gone delegate (#817) --
+
+#[test]
+fn recorded_decide_a_record_with_no_agent_left_is_gone() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || AgentFetch::Missing);
+    assert!(
+        matches!(out, Ok(Recorded::Gone(ref e)) if e.name == "d1"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn recorded_decide_a_renamed_agent_is_still_not_a_delegate() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || {
+        AgentFetch::Found(json!({"terminal_id": "t", "name": "renamed"}))
+    });
+    assert!(matches!(out, Err(RequireFailure::NotDelegate)), "{out:?}");
+}
+
+#[test]
+fn recorded_decide_a_live_agent_skips_the_terminal_lookup() {
+    let out = recorded_decide(
+        entry_for("d1"),
+        AgentFetch::Found(json!({"terminal_id": "t"})),
+        || panic!("a name that resolves needs no second lookup"),
+    );
+    assert!(matches!(out, Ok(Recorded::Live(_))), "{out:?}");
+}
+
+#[test]
+fn recorded_decide_an_unreachable_terminal_lookup_is_a_failure_not_gone() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || {
+        AgentFetch::Failed("socket closed".to_string())
+    });
+    assert!(matches!(out, Err(RequireFailure::Failed(_))), "{out:?}");
+}
+
+// ---------- submit_outcome: one answer for a pane that died (#817) ----------
+
+#[test]
+fn submit_outcome_a_pane_gone_before_typing_is_gone() {
+    let refused = json!({"error": {"code": "pane_gone", "message": "pane_gone"}});
+    assert!(matches!(submit_outcome(&refused), Err(SubmitFailure::Gone)));
+}
+
+#[test]
+fn submit_outcome_a_pane_gone_during_confirmation_is_gone() {
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "pane_gone"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Gone)
+    ));
+}
+
+#[test]
+fn submit_outcome_other_failures_keep_their_kind() {
+    let refused = json!({"error": {"code": "input_not_empty", "message": "x"}});
+    assert!(matches!(
+        submit_outcome(&refused),
+        Err(SubmitFailure::Refused(_))
+    ));
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "operator_active"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Unconfirmed(_))
+    ));
+    let accepted = json!({"result": {"outcome": "accepted"}});
+    assert!(submit_outcome(&accepted).is_ok());
+}
+
 // ---------- W10: "already gone" is reachable ---------------------------------
 
 #[test]
