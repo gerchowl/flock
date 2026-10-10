@@ -925,7 +925,7 @@ fn spoke_custody_hub_live_handoff_mid_conversation() {
     assert_eq!(answer[0]["body"], "answer after handoff");
 }
 
-/// Hold the actual legacy SSH command until another app-loop API responds.
+/// Hold the mesh delivery on the relay edge until another app-loop API responds.
 /// Ping is served by the socket thread, so workspace.list is the probe.
 fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, relay: &str) {
     let fleet = fleet::spawn_with_startup_probe("slow-message-hop", specs, |fleet, name| {

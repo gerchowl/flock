@@ -68,6 +68,13 @@ env.update(
     FLOCK_FLEET_SOURCE=target,
     PATH=manifest["bin"] + os.pathsep + os.environ["PATH"],
 )
+# A flk older than `peers relay` prints its peers usage and exits before any
+# request is read, as v0.11.0 does for an unknown peers subcommand.
+if "peers relay" in command and node["mesh"] == "pre_relay":
+    with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
+        log.write(str(time.monotonic()) + "\n")
+    sys.stdout.write("usage: flk peers [status] [--json]\n       flk peers summary [--json]\n")
+    sys.exit(0)
 if "peers relay" not in command:
     if "msg send" in command:
         (base / f"legacy-message-{source}-{target}").touch()
@@ -232,8 +239,10 @@ def forward_input():
                             break
                         time.sleep(0.01)
             if isinstance(method, str) and method.startswith("mesh.") and mode == "disabled":
-                emit(json.dumps({"id": request.get("id"), "error": {
-                    "code": "invalid_request", "message": f"unknown variant `{method}`",
+                # v0.11.0's exact reply: its server cannot parse the request, so the id is lost.
+                emit(json.dumps({"id": "", "error": {
+                    "code": "invalid_request",
+                    "message": f"invalid request: unknown variant `{method}`, expected one of `ping`, `server.stop`",
                 }}) + "\n")
             else:
                 if mode == "forged_signature" and method == "mesh.hello" and request.get("params", {}).get("phase") == "finish":

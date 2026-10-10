@@ -1,0 +1,1 @@
+- Breaking: require a coordinated v1.0.0 fleet upgrade with matching mesh protocols and origin policy keyed to configured or inbound first-contact pin names; upgrade dev mail stores in place with backup and quarantine recovery guidance (#661)

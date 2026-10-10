@@ -50,6 +50,38 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// refusal reason while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Names a peer whose flk predates mesh transport, e.g. v0.11.0.
+pub(crate) const PRE_MESH: &str = "(peer runs a pre-mesh flk)";
+
+fn pre_mesh_refusal(peer: &str) -> String {
+    format!("mesh handshake refused: upgrade flk on {peer} {PRE_MESH}")
+}
+
+/// A pre-mesh server rejects the hello method itself. v0.11.0 answers
+/// ``invalid request: unknown variant `mesh.hello`, expected one of ...``.
+fn pre_mesh_error(error: &serde_json::Value) -> bool {
+    matches!(
+        error["code"].as_str(),
+        Some("method_not_found" | "unknown_method")
+    ) || error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unknown variant `mesh.hello`"))
+}
+
+/// A flk without `peers relay` prints usage or an unknown-command error
+/// instead of a JSON response.
+fn pre_mesh_output(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("usage: flk")
+        || [
+            "unrecognized subcommand",
+            "unknown command",
+            "unknown subcommand",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 /// Only known identity and compatibility failures use the long refusal delay.
 struct EnrollmentError {
     detail: String,
@@ -65,6 +97,7 @@ impl From<String> for EnrollmentError {
             "identity changed for ",
             "impersonation of configured peer ",
             "mesh handshake refused (local ",
+            "mesh handshake refused: ",
         ]
         .iter()
         .any(|prefix| detail.starts_with(prefix))
@@ -96,7 +129,6 @@ impl EnrollmentError {
                     | "invalid_mesh_signature"
                     | "identity_pin_conflict"
                     | "impersonation"
-                    | "custom_summary_unsupported"
             )
         ) || (error["code"] == "mesh_refused"
             && error["message"]
@@ -352,8 +384,15 @@ impl PeerStream {
         let raw = self
             .request("mesh.hello", request)
             .map_err(EnrollmentError::transport)?;
-        let response: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let response: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(response) => response,
+            Err(_) if pre_mesh_output(&raw) => return Err(pre_mesh_refusal(&peer.name).into()),
+            Err(err) => return Err(err.to_string().into()),
+        };
         if let Some(error) = response.get("error") {
+            if pre_mesh_error(error) {
+                return Err(pre_mesh_refusal(&peer.name).into());
+            }
             if error["code"] == "mesh_version_mismatch" {
                 if let Some(remote) = error["data"]["mesh"]
                     .as_u64()
@@ -812,17 +851,23 @@ fn request_over(
                     slot.stream = Some(stream);
                 }
                 Err(err) => {
-                    let backoff = if err.transient {
-                        slot.transient_backoff()
-                    } else {
-                        RECONNECT_BACKOFF
-                    };
-                    let transient = err.transient;
+                    let mut transient = err.transient;
                     let err = err.detail;
-                    let (detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED) {
+                    let (mut detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED)
+                    {
                         stream.explain(&err)
                     } else {
                         (err, None)
+                    };
+                    // A relay that exits with a CLI error never answered hello.
+                    if transient && pre_mesh_output(&detail) {
+                        detail = pre_mesh_refusal(&peer.name);
+                        transient = false;
+                    }
+                    let backoff = if transient {
+                        slot.transient_backoff()
+                    } else {
+                        RECONNECT_BACKOFF
                     };
                     set_enrollment(
                         peer,
@@ -939,9 +984,9 @@ pub fn establish_failure(peer: &PeerConfig) -> Option<String> {
         Arc::clone(registry.get(&peer.name)?)
     };
     // A blocking lock, not `try_lock`: this runs on the poll's own worker
-    // thread, never the main loop, and a request in flight (an uplink answer,
-    // say) would otherwise read as "no failure" and blank the peer's row for
-    // a poll. Poison is recovered like `request_over` does.
+    // thread, never the main loop, and a request in flight (a mesh
+    // collection, say) would otherwise read as "no failure" and blank the
+    // peer's row for a poll. Poison is recovered like `request_over` does.
     let slot = match slot.lock() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
@@ -1052,6 +1097,29 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pre_mesh_replies_are_permanent_upgrade_refusals() {
+        // Verbatim v0.11.0 answer to `mesh.hello` through its relay.
+        let v011 = serde_json::json!({"code":"invalid_request","message":"invalid request: unknown variant `mesh.hello`, expected one of `ping`, `server.stop`"});
+        assert!(pre_mesh_error(&v011));
+        assert!(!pre_mesh_error(&serde_json::json!({
+            "code":"invalid_request","message":"invalid request: missing field `offer`"
+        })));
+        assert!(pre_mesh_output(
+            "usage: flk peers [status] [--json]\n       flk peers summary [--json]"
+        ));
+        assert!(pre_mesh_output("error: unrecognized subcommand 'relay'"));
+        assert!(!pre_mesh_output(
+            "ssh: connect to host node port 22: Connection refused"
+        ));
+        let refusal = EnrollmentError::from(pre_mesh_refusal("nodeb"));
+        assert!(!refusal.transient);
+        assert_eq!(
+            refusal.detail,
+            "mesh handshake refused: upgrade flk on nodeb (peer runs a pre-mesh flk)"
+        );
     }
 
     #[test]
