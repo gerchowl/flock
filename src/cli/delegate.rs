@@ -3633,6 +3633,12 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     };
     let status = field(&record, "agent_status").unwrap_or("unknown");
     let latest = load_observation(&entry);
+    // A turn that ended with shells still running is settled (#911), and says
+    // so, rather than leaving the caller to wonder what the footer counts.
+    let background_shells = !gone
+        && matches!(status, "idle" | "done")
+        && detection_screen(&entry.pane_id, None)
+            .is_some_and(|screen| crate::detect::settled_with_background_shells(&screen));
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
         // that appears with its first value is not a field a caller can test for.
@@ -3641,6 +3647,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
             serde_json::json!({
                 "name": entry.name,
                 "agent_status": status,
+                "settled_with_background_shells": background_shells,
                 "blocked_reason": record.get("blocked_reason"),
                 "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
@@ -3660,6 +3667,9 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         );
     } else {
         println!("delegate {name}: {status}");
+        if background_shells {
+            println!("  settled with background shells still running");
+        }
         if let Some(reason) = field(&record, "blocked_reason") {
             if let Some(eta) = record
                 .get("retry_after_ms")
@@ -4186,6 +4196,8 @@ impl Await<'_> {
                     for (key, value) in observation.as_object().into_iter().flatten() {
                         info[key] = value.clone();
                     }
+                    info["settled_with_background_shells"] =
+                        serde_json::json!(crate::detect::settled_with_background_shells(&screen));
                     emit_outcome(
                         self.entry,
                         outcome.as_str(),
@@ -4637,6 +4649,7 @@ fn emit_outcome(
                 "verdict": text("verdict"), "reason": text("reason"),
                 "retry_after_ms": text("retry_after_ms"), "last_line": text("last_line"),
                 "s1": text("s1"),
+                "settled_with_background_shells": text("settled_with_background_shells"),
             })
         );
     } else {

@@ -576,6 +576,64 @@ fn delegate_short_provider_retry_recovers_and_settles_normally() {
     assert_eq!(Pane::json(&out)["outcome"], "done");
 }
 
+/// #911: a turn that ended on its sentinel with a shell still running settles,
+/// and the outcome and `status` both say a shell outlived it.
+#[test]
+fn delegate_done_turn_with_leftover_shell_settles_and_says_so() {
+    let settled = concat!(
+        "\u{25cf} DONE: recovered\n\n",
+        "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
+        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        "\u{276f} \n",
+        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 1 shell \u{b7} \u{2190} for agents\n",
+    );
+    let pane = Pane::frames(vec![
+        (
+            "working".into(),
+            "\u{2736} Crunching\u{2026} (esc to interrupt)".into(),
+        ),
+        ("idle".into(), settled.into()),
+    ]);
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "0",
+        "--settle",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value = Pane::json(&out);
+    assert_eq!(value["outcome"], "done");
+    assert_eq!(value["settled_with_background_shells"], true);
+
+    let status = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    let status = Pane::json(&status);
+    assert_eq!(status["agent_status"], "idle");
+    assert_eq!(status["settled_with_background_shells"], true);
+}
+
+#[test]
+fn delegate_status_without_leftover_shells_says_false() {
+    let pane = Pane::new("idle", "DONE: recovered");
+    let status = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    assert_eq!(Pane::json(&status)["settled_with_background_shells"], false);
+}
+
 #[test]
 fn delegate_short_provider_retry_persisting_outlasts_silence() {
     let pane = Pane::new(

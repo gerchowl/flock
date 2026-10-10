@@ -2812,6 +2812,47 @@ mod tests {
         );
     }
 
+    /// #911 from the screen to the reported state: Claude's Stop hook says the
+    /// turn ended, and the completion line naming the shell it left running is
+    /// no longer working chrome that overrules it.
+    #[test]
+    fn claude_hook_idle_holds_over_a_done_turn_with_a_leftover_shell() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_hook_authority_with_custom_status_at(
+            "flock:claude".into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+            now,
+        );
+        let screen = concat!(
+            "\u{25cf} DONE: https://github.com/example/repo/pull/1\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} auto mode on \u{b7} 1 shell \u{b7} \u{2193} to manage\n",
+        );
+        let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            detection.state,
+            detection.visible_blocker,
+            detection.visible_idle,
+            detection.visible_working,
+            false,
+            now + Duration::from_millis(1),
+        );
+
+        assert!(!detection.visible_working);
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
     #[test]
     fn recent_visible_working_holds_against_newer_claude_hook_idle() {
         let now = Instant::now();

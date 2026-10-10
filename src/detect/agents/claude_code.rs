@@ -81,7 +81,20 @@ pub(super) fn has_working_chrome(content: &str) -> bool {
         || above_lower.contains("ctrl+c to interrupt")
         || has_running_status_line(above)
         || has_spinner_activity(above)
-        || has_background_shell_footer(content)
+        || (has_background_shell_footer(content) && !ends_on_done_turn(above))
+}
+
+/// Whether a turn ended (Claude's `done <clock>` marker) with background
+/// shells or agents still running, as the "N shell still running" suffix on
+/// that line or the footer counter below the prompt box (#911). Neither keeps
+/// the pane working, so a supervisor reading `idle` can tell this settle from
+/// one with nothing left running.
+pub(in crate::detect) fn settled_with_background_shells(content: &str) -> bool {
+    let above = content_above_prompt_box(content);
+    has_prompt_box(content)
+        && ends_on_done_turn(above)
+        && (last_non_empty_line(above).is_some_and(is_still_running_status_line)
+            || has_background_shell_footer(content))
 }
 
 pub(super) fn is_transcript_viewer(content: &str) -> bool {
@@ -276,16 +289,42 @@ fn has_live_blocked_form(content: &str) -> bool {
     })
 }
 
+fn last_non_empty_line(content: &str) -> Option<&str> {
+    content.lines().rev().find(|line| !line.trim().is_empty())
+}
+
 fn has_running_status_line(content_above_prompt: &str) -> bool {
-    let Some(line) = content_above_prompt
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-    else {
+    let Some(line) = last_non_empty_line(content_above_prompt) else {
         return false;
     };
 
-    is_background_agent_wait_line(line) || is_still_running_status_line(line)
+    is_background_agent_wait_line(line)
+        || (is_still_running_status_line(line) && !has_turn_done_marker(line))
+}
+
+/// Does the newest line above the prompt box end a turn with Claude's
+/// `done <clock>` marker?
+fn ends_on_done_turn(content_above_prompt: &str) -> bool {
+    last_non_empty_line(content_above_prompt).is_some_and(has_turn_done_marker)
+}
+
+/// Claude's turn-completion line, `✻ Brewed for 34m 19s · done 10:59 AM · 1
+/// shell still running`, carries a `done <clock>` segment only once the turn
+/// is over. The shells it names outlive the turn, so the line is a finished
+/// turn rather than working chrome (#911). The clock is required, so prose
+/// that merely says "done" does not count.
+fn has_turn_done_marker(line: &str) -> bool {
+    line.split('\u{b7}').skip(1).any(|segment| {
+        segment
+            .trim()
+            .strip_prefix("done ")
+            .and_then(|clock| clock.split_whitespace().next())
+            .is_some_and(|clock| {
+                clock.starts_with(|c: char| c.is_ascii_digit())
+                    && clock.contains(':')
+                    && clock.chars().all(|c| c.is_ascii_digit() || c == ':')
+            })
+    })
 }
 
 fn is_background_agent_wait_line(line: &str) -> bool {
@@ -547,6 +586,75 @@ mod tests {
 
         assert_eq!(detect(&content), AgentState::Working);
         assert!(has_working_chrome(&content));
+    }
+
+    /// The #911 screen, shaped after a live capture: a turn that ended on its
+    /// `DONE:` line, Claude's completion line with its `done <clock>` marker and
+    /// the shell it left running, and the footer counting that shell.
+    fn done_turn_with_leftover_shell(footer: &str) -> String {
+        format!(
+            "● DONE: https://github.com/example/repo/pull/1\n\n\
+             \u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n\
+             \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \u{276f} \n\
+             \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+             {footer}\n"
+        )
+    }
+
+    #[test]
+    fn done_marked_turn_with_leftover_shell_is_settled_not_working() {
+        for footer in [
+            "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 1 shell \u{b7} \u{2190} for agents",
+            "  \u{23f5}\u{23f5} auto mode on \u{b7} 1 shell \u{b7} \u{2190} for agents \u{b7} \u{2193} to manage",
+        ] {
+            let content = done_turn_with_leftover_shell(footer);
+            assert!(!has_working_chrome(&content), "{footer}");
+            assert_eq!(detect_structural(&content), Some(AgentState::Idle));
+            assert!(settled_with_background_shells(&content), "{footer}");
+        }
+    }
+
+    #[test]
+    fn done_marked_turn_with_only_the_footer_counter_is_settled() {
+        let content = format!(
+            "{}\u{23f5}\u{23f5} auto mode on \u{b7} 1 shell \u{b7} \u{2193} to manage\n",
+            prompt_box_below("● DONE: shipped\n\n\u{273b} Brewed for 34m 19s \u{b7} done 17:59")
+        );
+        assert!(!has_working_chrome(&content));
+        assert_eq!(detect_structural(&content), Some(AgentState::Idle));
+        assert!(settled_with_background_shells(&content));
+    }
+
+    #[test]
+    fn done_marked_turn_with_nothing_left_running_is_plainly_idle() {
+        let content =
+            prompt_box_below("● DONE: shipped\n\n\u{273b} Baked for 16m 38s \u{b7} done 5:54 PM");
+        assert_eq!(detect_structural(&content), Some(AgentState::Idle));
+        assert!(!settled_with_background_shells(&content));
+    }
+
+    #[test]
+    fn turn_done_marker_needs_a_clock_segment() {
+        assert!(has_turn_done_marker(
+            "\u{273b} Brewed for 34m 19s \u{b7} done 10:59 AM \u{b7} 1 shell still running"
+        ));
+        assert!(has_turn_done_marker(
+            "\u{273b} Brewed for 3s \u{b7} done 17:59"
+        ));
+        for line in [
+            "\u{273b} Crunched for 7s \u{b7} 1 shell still running",
+            "\u{273b} Crunched for 7s \u{b7} done \u{b7} 1 shell still running",
+            "\u{273b} Crunched for 7s \u{b7} done soon \u{b7} 1 shell still running",
+            "done 4:32 PM \u{b7} 1 shell still running",
+        ] {
+            assert!(!has_turn_done_marker(line), "{line}");
+        }
+        // Without the marker the line is still working chrome, as before.
+        let content =
+            prompt_box_below("\u{273b} Crunched for 7s \u{b7} done \u{b7} 1 shell still running");
+        assert!(has_working_chrome(&content));
+        assert!(!settled_with_background_shells(&content));
     }
 
     #[test]

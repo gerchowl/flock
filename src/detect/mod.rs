@@ -356,6 +356,12 @@ pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool>
     }
 }
 
+/// Whether a Claude turn ended with background shells or agents still running
+/// (#911): settled, not working, but not empty-handed either.
+pub(crate) fn settled_with_background_shells(screen: &str) -> bool {
+    agents::claude_code::settled_with_background_shells(screen)
+}
+
 /// Read the recognized Claude composer from the unscrolled detection snapshot.
 pub(crate) fn claude_composer(screen: &str) -> Option<String> {
     agents::claude_code::prompt_input(screen)
