@@ -1465,6 +1465,7 @@ mod tests {
         assert_eq!(ephemeral["error"]["code"], "invalid_params");
         let ahead = events_read(&event_hub, r#"{"after":9}"#);
         assert_eq!(ahead["error"]["code"], "cursor_ahead");
+        assert_eq!(ahead["error"]["data"]["head"], 3, "{ahead}");
     }
 
     /// #438: the inbox feed reports only its own pane's mail, only mail that

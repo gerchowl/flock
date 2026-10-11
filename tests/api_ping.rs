@@ -486,6 +486,57 @@ fn events_wait_returns_the_matching_event_or_times_out() {
     cleanup_spawned_flock(child, base);
 }
 
+/// #1029: a wait with no `--after` starts at the log's head and is woken by an
+/// event that lands after it. The creates repeat until the waiter returns,
+/// because a create racing the waiter's head read is history, not news.
+#[test]
+fn events_wait_without_a_cursor_receives_a_live_event() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let child = spawn_flock(&base.join("config"), &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let head = run_flk(&socket_path, &["events", "read", "--json"]);
+    let head: serde_json::Value = serde_json::from_slice(&head.stdout).unwrap();
+    let head = head["next_after"].as_u64().unwrap();
+    let waiter = {
+        let socket_path = socket_path.clone();
+        thread::spawn(move || {
+            run_flk(
+                &socket_path,
+                &[
+                    "events",
+                    "wait",
+                    "--kinds",
+                    "workspace_created",
+                    "--timeout",
+                    "20s",
+                ],
+            )
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !waiter.is_finished() && Instant::now() < deadline {
+        send_request(
+            &socket_path,
+            &format!(
+                r#"{{"id":"ev","method":"workspace.create","params":{{"cwd":"{}","focus":false}}}}"#,
+                base.display()
+            ),
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+    let woke = waiter.join().unwrap();
+    assert_eq!(woke.status.code(), Some(0), "{woke:?}");
+    let event: serde_json::Value = serde_json::from_slice(&woke.stdout).unwrap();
+    assert_eq!(event["event"], "workspace_created");
+    assert!(event["seq"].as_u64().unwrap() > head, "{event}");
+
+    cleanup_spawned_flock(child, base);
+}
+
 #[test]
 fn workspace_list_and_create_round_trip() {
     let _lock = test_lock();

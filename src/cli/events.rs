@@ -152,7 +152,9 @@ fn read(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// The newest durable sequence, so a wait without `--after` sees only what
-/// happens from now on. The server names it when refusing a cursor past it.
+/// happens from now on. The server returns it as `data.head` when it refuses
+/// a cursor past it. A server from before that field names it only at the
+/// end of the message.
 fn head_cursor() -> std::io::Result<Result<u64, Value>> {
     let response = events_read(
         EventsReadParams {
@@ -161,12 +163,17 @@ fn head_cursor() -> std::io::Result<Result<u64, Value>> {
         },
         READ_GRACE,
     )?;
-    let head = (response["error"]["code"] == "cursor_ahead")
-        .then(|| response["error"]["message"].as_str())
-        .flatten()
-        .and_then(|message| message.rsplit(' ').next())
-        .and_then(|head| head.parse().ok());
-    Ok(head.ok_or(response))
+    Ok(cursor_ahead_head(&response).ok_or(response))
+}
+
+fn cursor_ahead_head(response: &Value) -> Option<u64> {
+    let error = &response["error"];
+    if error["code"] != "cursor_ahead" {
+        return None;
+    }
+    error["data"]["head"]
+        .as_u64()
+        .or_else(|| error["message"].as_str()?.rsplit(' ').next()?.parse().ok())
 }
 
 fn wait(args: &[String]) -> std::io::Result<i32> {
@@ -258,6 +265,23 @@ mod tests {
         assert_eq!(flags.params.subjects, ["a", "b"]);
         assert_eq!((flags.params.after, flags.has_after), (7, true));
         assert_eq!(flags.timeout_ms, Some(5_000));
+    }
+
+    /// #1029: the head comes from `data.head`; the message is read only
+    /// when an older server sent no such field.
+    #[test]
+    fn the_head_prefers_the_structured_field() {
+        let refusal = |data: Value| {
+            serde_json::json!({"error": {"code": "cursor_ahead", "data": data,
+                "message": "cursor 9 is past this server's newest event 3; read from 0 or 3"}})
+        };
+        assert_eq!(
+            cursor_ahead_head(&refusal(serde_json::json!({"head": 7}))),
+            Some(7)
+        );
+        assert_eq!(cursor_ahead_head(&refusal(Value::Null)), Some(3));
+        let other = serde_json::json!({"error": {"code": "invalid_params", "message": "x 3"}});
+        assert_eq!(cursor_ahead_head(&other), None);
     }
 
     #[test]
