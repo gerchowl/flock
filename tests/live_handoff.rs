@@ -2332,26 +2332,118 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
 /// A Nix-shaped install: every version lives at its own store path forever,
 /// and the profile's `bin/flk` is a symlink that a switch repoints.
 fn nix_style_install(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
-    let built = Path::new(env!("CARGO_BIN_EXE_flk"));
-    let install = |name: &str| {
-        let bin = base.join("store").join(name).join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let exe = bin.join("flk");
-        // A hard link is a second path to the same build, the way two store
-        // paths of one derivation would be; copy when the temp dir is on
-        // another filesystem.
-        if fs::hard_link(built, &exe).is_err() {
-            fs::copy(built, &exe).unwrap();
-        }
-        fs::canonicalize(&exe).unwrap()
+    let old = install_store_build(base, "aaaa-flock-old");
+    let new = install_store_build(base, "bbbb-flock-new");
+    let profile_flk = link_profile(base, &new);
+    (old, new, profile_flk)
+}
+
+fn store_bin(base: &Path, name: &str) -> PathBuf {
+    let bin = base.join("store").join(name).join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    bin.join("flk")
+}
+
+fn install_store_build(base: &Path, name: &str) -> PathBuf {
+    let exe = store_bin(base, name);
+    // A hard link is a second path to the same build, the way two store
+    // paths of one derivation would be; copy when the temp dir is on
+    // another filesystem.
+    if fs::hard_link(env!("CARGO_BIN_EXE_flk"), &exe).is_err() {
+        fs::copy(env!("CARGO_BIN_EXE_flk"), &exe).unwrap();
+    }
+    fs::canonicalize(&exe).unwrap()
+}
+
+/// A store path holding an older flk: the test build with its reported
+/// version overridden, so one build plays two versions. With
+/// `answers_version = false` its `--version` fails, as an unprobeable binary.
+fn install_store_stub(base: &Path, name: &str, version: &str, answers_version: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = store_bin(base, name);
+    let version_reply = if answers_version {
+        format!("echo 'flk {version}'; exit 0")
+    } else {
+        "exit 1".to_string()
     };
-    let old = install("aaaa-flock-old");
-    let new = install("bbbb-flock-new");
+    fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then {version_reply}; fi\nFLOCK_TEST_BUILD_VERSION={version} exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_flk")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::canonicalize(&exe).unwrap()
+}
+
+fn link_profile(base: &Path, target: &Path) -> PathBuf {
     let profile_bin = base.join("profile/bin");
     fs::create_dir_all(&profile_bin).unwrap();
     let profile_flk = profile_bin.join("flk");
-    std::os::unix::fs::symlink(&new, &profile_flk).unwrap();
-    (old, new, profile_flk)
+    std::os::unix::fs::symlink(target, &profile_flk).unwrap();
+    profile_flk
+}
+
+fn run_handoff_cli(
+    exe: &Path,
+    extra_args: &[&str],
+    cwd: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+) -> (bool, String) {
+    let output = std::process::Command::new(exe)
+        .args(["server", "live-handoff"])
+        .args(extra_args)
+        .current_dir(cwd)
+        .envs(support::environment::isolated_env(config_home, runtime_dir))
+        .env("XDG_STATE_HOME", runtime_dir.join("state"))
+        .env("FLOCK_SOCKET_PATH", api_socket)
+        .env(
+            "FLOCK_CLIENT_SOCKET_PATH",
+            runtime_dir.join("flock-client.sock"),
+        )
+        .env_remove("FLOCK_ENV")
+        .env_remove("FLOCK_TEST_BUILD_VERSION")
+        .output()
+        .expect("client runs");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn server_version(api_socket: &Path) -> String {
+    request(
+        api_socket,
+        serde_json::json!({"id":"version","method":"ping","params":{}}),
+    )["result"]["version"]
+        .as_str()
+        .expect("server reports a version")
+        .to_string()
+}
+
+fn client_version() -> String {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+        .arg("--version")
+        .env_remove("FLOCK_TEST_BUILD_VERSION")
+        .output()
+        .expect("flk --version runs");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("flk ")
+        .expect("flk --version banner")
+        .to_string()
+}
+
+fn stop_and_clean(api_socket: &Path, base: &Path) {
+    let _ = try_request(
+        api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(base);
 }
 
 fn process_argv0(pid: u32) -> String {
@@ -2433,4 +2525,166 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     cleanup_test_base(&base);
+}
+
+/// #958 end to end: an older server on its own store path upgrades to the
+/// client the profile points at, and the report names both versions.
+#[test]
+fn live_handoff_upgrades_an_older_server_to_the_client_version() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let old_exe = install_store_stub(&base, "aaaa-flock-old", "0.0.1", true);
+    let new_exe = install_store_build(&base, "bbbb-flock-new");
+    let profile_flk = link_profile(&base, &new_exe);
+    let client = client_version();
+
+    let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned.child.process_id().expect("server pid");
+    assert_eq!(server_version(&api_socket), "0.0.1");
+
+    let (ok, stderr) = run_handoff_cli(
+        &profile_flk,
+        &[],
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+    );
+    assert!(ok, "handoff failed:\n{stderr}");
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    drop(spawned);
+    assert_eq!(
+        process_argv0(replacement_pid),
+        new_exe.display().to_string()
+    );
+    assert_eq!(server_version(&api_socket), client);
+    assert!(
+        stderr.contains(&format!(
+            "live handoff complete: server flk 0.0.1 -> flk {client}"
+        )),
+        "stderr was:\n{stderr}"
+    );
+
+    stop_and_clean(&api_socket, &base);
+}
+
+/// An explicit `--import-exe` of the old version is refused before anything
+/// moves, and a relative path is resolved against the client's cwd.
+#[test]
+fn live_handoff_refuses_a_relative_import_exe_of_the_old_version() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let old_exe = install_store_stub(&base, "aaaa-flock-old", "0.0.1", true);
+    let client = client_version();
+
+    let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let (ok, stderr) = run_handoff_cli(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        &["--import-exe", "store/aaaa-flock-old/bin/flk"],
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+    );
+    assert!(
+        !ok,
+        "a handoff to the old version must not succeed:\n{stderr}"
+    );
+    assert!(stderr.contains("refusing live handoff"), "{stderr}");
+    assert!(stderr.contains("flk 0.0.1"), "{stderr}");
+    assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
+    assert_eq!(server_version(&api_socket), "0.0.1");
+
+    stop_and_clean(&api_socket, &base);
+    drop(spawned);
+}
+
+/// The verification path: a binary whose version cannot be probed is handed
+/// off to, comes back as the old version, and the CLI exits 1 instead of
+/// reporting success.
+#[test]
+fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let old_exe = install_store_stub(&base, "aaaa-flock-old", "0.0.1", false);
+    let client = client_version();
+
+    let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned.child.process_id().expect("server pid");
+
+    let old_path = old_exe.display().to_string();
+    let (ok, stderr) = run_handoff_cli(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        &["--import-exe", &old_path],
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+    );
+    assert!(
+        !ok,
+        "a same-version re-exec must not report success:\n{stderr}"
+    );
+    assert!(stderr.contains("same server version"), "{stderr}");
+    assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
+    wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    drop(spawned);
+    assert_eq!(server_version(&api_socket), "0.0.1");
+
+    stop_and_clean(&api_socket, &base);
+}
+
+/// A client older than the server (a stale `flk` earlier on PATH) refuses the
+/// default handoff instead of downgrading the server to itself.
+#[test]
+fn live_handoff_refuses_a_default_downgrade() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let client = client_version();
+
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("FLOCK_TEST_BUILD_VERSION", "99.0.0")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let (ok, stderr) = run_handoff_cli(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        &[],
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+    );
+    assert!(!ok, "a downgrade must not succeed:\n{stderr}");
+    assert!(stderr.contains("older than"), "{stderr}");
+    assert!(stderr.contains("flk 99.0.0"), "{stderr}");
+    assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
+    assert_eq!(server_version(&api_socket), "99.0.0");
+
+    stop_and_clean(&api_socket, &base);
+    drop(spawned);
 }

@@ -63,13 +63,31 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     // #958: with no --import-exe the server re-executes its own binary, which
     // on a versioned install (a Nix store path) is the old version forever.
     // The binary the operator just upgraded to is this one.
-    if params.import_exe.is_none() {
-        fill_import_target_from_client(&mut params, own_executable());
-    } else if params.expected_version.is_none() {
-        params.expected_version = params
-            .import_exe
-            .as_deref()
-            .and_then(|exe| probe_executable_version(std::path::Path::new(exe)));
+    if let Some(exe) = params.import_exe.as_deref() {
+        // The server resolves a relative path against its own cwd, not ours.
+        let resolved = match std::fs::canonicalize(exe) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("refusing live handoff: --import-exe {exe} cannot be resolved: {err}");
+                return Ok(1);
+            }
+        };
+        if params.expected_version.is_none() {
+            params.expected_version = probe_executable_version(&resolved);
+        }
+        params.import_exe = Some(resolved.display().to_string());
+    } else {
+        let own_exe = own_executable();
+        if let Some(refusal) = refuse_downgrade(
+            before.as_deref(),
+            &client_version,
+            own_exe.as_deref(),
+            &socket_path,
+        ) {
+            eprintln!("{refusal}");
+            return Ok(1);
+        }
+        fill_import_target_from_client(&mut params, own_exe);
     }
     if let Some(refusal) = refuse_stale_import_target(
         before.as_deref(),
@@ -189,6 +207,42 @@ fn refuse_stale_import_target(
     Some(format!(
         "refusing live handoff: the import binary is flk {target}, the version the server already runs, but this client is flk {client_version}.\n{}",
         upgrade_hint()
+    ))
+}
+
+/// The `major.minor.patch` a version string starts with, ignoring a channel
+/// suffix such as `-latest.abc`.
+fn base_version(version: &str) -> Option<(u32, u32, u32)> {
+    let base = version.strip_prefix('v').unwrap_or(version);
+    let base = base.split(['-', '+']).next()?;
+    let mut parts = base.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
+/// Refuse a default handoff from a client older than the running server: the
+/// default target is this client's binary, so a stale `flk` earlier on PATH
+/// would quietly downgrade every pane. `--import-exe` stays the explicit way.
+fn refuse_downgrade(
+    server_version: Option<&str>,
+    client_version: &str,
+    client_exe: Option<&std::path::Path>,
+    socket_path: &std::path::Path,
+) -> Option<String> {
+    let server = server_version?;
+    if base_version(client_version)? >= base_version(server)? {
+        return None;
+    }
+    let client_path = client_exe
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown path".to_string());
+    Some(format!(
+        "refusing live handoff: this client is flk {client_version} ({client_path}), older than the server's flk {server} (on {}).\nA handoff would downgrade the server to this client's binary. Run the newer flk, or pass --import-exe <path> to choose the binary explicitly.",
+        socket_path.display()
     ))
 }
 
@@ -444,5 +498,42 @@ mod tests {
     #[test]
     fn judge_fails_when_no_server_answers_afterwards() {
         assert!(judge_handoff(Some("1.0.0"), None, Some("1.0.0"), "1.0.0").is_err());
+    }
+
+    #[test]
+    fn base_version_ignores_channel_suffixes() {
+        assert_eq!(base_version("1.2.0"), Some((1, 2, 0)));
+        assert_eq!(base_version("v1.2.0-latest.abc"), Some((1, 2, 0)));
+        assert_eq!(base_version("1.2"), None);
+        assert_eq!(base_version("1.2.0.4"), None);
+        assert_eq!(base_version("unknown"), None);
+    }
+
+    #[test]
+    fn refuses_a_default_handoff_from_an_older_client() {
+        let refusal = refuse_downgrade(
+            Some("1.3.0"),
+            "1.2.0",
+            Some(std::path::Path::new("/home/me/.cargo/bin/flk")),
+            std::path::Path::new("/run/flock.sock"),
+        )
+        .expect("downgrade refused");
+
+        assert!(refusal.contains("flk 1.2.0"), "{refusal}");
+        assert!(refusal.contains("flk 1.3.0"), "{refusal}");
+        assert!(refusal.contains("/home/me/.cargo/bin/flk"), "{refusal}");
+        assert!(refusal.contains("--import-exe"), "{refusal}");
+    }
+
+    #[test]
+    fn allows_a_default_handoff_from_an_equal_or_newer_client() {
+        let socket = std::path::Path::new("/run/flock.sock");
+        assert_eq!(refuse_downgrade(Some("1.2.0"), "1.3.0", None, socket), None);
+        assert_eq!(
+            refuse_downgrade(Some("1.2.0"), "1.2.0-latest.abc", None, socket),
+            None
+        );
+        assert_eq!(refuse_downgrade(None, "1.2.0", None, socket), None);
+        assert_eq!(refuse_downgrade(Some("odd"), "1.2.0", None, socket), None);
     }
 }
