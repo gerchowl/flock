@@ -2087,3 +2087,46 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
 
 #[path = "injection_lock_tests.rs"]
 mod injection_lock_tests;
+
+/// #1019 from the socket: `agent.get` and `agent.list` carry the `state`
+/// a real detector report produces, and the local `fleet` row repeats it.
+#[tokio::test]
+async fn agent_records_carry_the_state_object_from_the_detector() {
+    let call = |app: &mut App, method| -> serde_json::Value {
+        let id = "state".to_string();
+        serde_json::from_str(&app.handle_api_request(Request { id, method })).unwrap()
+    };
+    let Rig { mut app, pane, .. } = rig();
+    claude_idle_for(&mut app, Duration::from_secs(3));
+    let target = crate::api::schema::AgentTarget { target: pane };
+    let state = &call(&mut app, Method::AgentGet(target))["result"]["agent"]["state"];
+    assert_eq!(state["turn"], "idle");
+    assert_eq!(state["phase"], "settling");
+    assert_eq!(
+        (&state["background"], &state["attention"]),
+        (&"unknown".into(), &"unknown".into())
+    );
+    assert_eq!(
+        (&state["lifecycle"], &state["source"]["turn"]),
+        (&"live".into(), &"screen".into())
+    );
+    assert!(state["held_ms"].as_u64().unwrap() >= 3_000);
+    // The idle start only moves on a change, so the settled case is a fresh pane.
+    let Rig { mut app, .. } = rig();
+    claude_idle_for(&mut app, settled());
+    let list = call(
+        &mut app,
+        Method::AgentList(crate::api::schema::EmptyParams {}),
+    );
+    let agent = &list["result"]["agents"][0];
+    assert_eq!(
+        (&agent["agent_status"], &agent["state"]["phase"]),
+        (&"idle".into(), &"unknown".into())
+    );
+    let held = agent["state"]["held_ms"].as_u64().unwrap();
+    assert!(
+        (10_000..settled().as_millis() as u64).contains(&held),
+        "{held}"
+    );
+    assert_eq!(list["result"]["fleet"][0]["state"], agent["state"]);
+}
