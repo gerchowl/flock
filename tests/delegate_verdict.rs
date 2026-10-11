@@ -251,8 +251,51 @@ struct S1 {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+// Kev answered with `answers` alone. Clef (since g-fleet#330) adds
+// `model`, `usage`, a cache count and per-answer `type`, `choice` and
+// `confidence`. Only `answers` may matter to the client.
+#[derive(Clone, Copy)]
+enum Shape {
+    Kev,
+    Clef,
+    Rejected(&'static str),
+}
+
+impl Shape {
+    fn respond(self, questions: &serde_json::Map<String, Value>) -> String {
+        let mut answers = serde_json::Map::new();
+        for (name, question) in questions {
+            let choice = question["type"] == "choice";
+            let probabilities =
+                json!({"failure": 0.9, "partial": 0.1, "success": 0.0, "info": 0.0});
+            answers.insert(
+                name.clone(),
+                match (self, choice) {
+                    (Self::Clef, true) => json!({"type": "choice", "choice": "failure",
+                        "probabilities": probabilities, "confidence": 0.8}),
+                    (Self::Clef, false) => json!({"type": "noul", "noul": 0.9}),
+                    (_, true) => json!({"probabilities": probabilities}),
+                    (_, false) => json!({"noul": 0.9}),
+                },
+            );
+        }
+        match self {
+            Self::Kev => json!({"answers": answers}).to_string(),
+            Self::Clef => json!({"model": "s1-fast", "answers": answers,
+                "usage": {"input_tokens": 2184, "output_tokens": 0},
+                "prompt_eval_cached_count": 36})
+            .to_string(),
+            Self::Rejected(body) => body.to_string(),
+        }
+    }
+}
+
 impl S1 {
     fn new(status: u16) -> Self {
+        Self::serve(status, Shape::Kev)
+    }
+
+    fn serve(status: u16, shape: Shape) -> Self {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
@@ -292,15 +335,9 @@ impl S1 {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let body: Value = serde_json::from_slice(&body).unwrap();
-                let mut answers = serde_json::Map::new();
-                for (name, question) in body["questions"].as_object().unwrap() {
-                    answers.insert(name.clone(), if question["type"] == "choice" {
-                        json!({"probabilities": {"failure": 0.9, "partial": 0.1, "success": 0.0, "info": 0.0}})
-                    } else { json!({"noul": 0.9}) });
-                }
+                let response = shape.respond(body["questions"].as_object().unwrap());
                 captured.lock().unwrap().push(body);
                 count.fetch_add(1, Ordering::SeqCst);
-                let response = json!({"answers": answers}).to_string();
                 let _ = write!(stream, "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
             }
         });
@@ -482,6 +519,67 @@ fn delegate_s1_is_called_once_at_round_end_and_never_on_polls() {
     let body = &s1.bodies.lock().unwrap()[0];
     assert_eq!(body["questions"].as_object().unwrap().len(), 10);
     assert!(body["state"].as_str().unwrap().ends_with("still running"));
+}
+
+#[test]
+fn delegate_s1_advice_is_the_same_from_kev_and_clef_shaped_answers() {
+    let pane = Pane::new("working", "same screen");
+    let args = [
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "100ms",
+        "--timeout",
+        "5000",
+        "--json",
+    ];
+    let mut advice = Vec::new();
+    for shape in [Shape::Kev, Shape::Clef] {
+        let s1 = S1::serve(200, shape);
+        let out = pane.command(&args, Some(&s1.url)).output().unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(s1.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        advice.push(Pane::json(&out)["s1"].clone());
+    }
+    assert!(advice[0]["fused"].as_f64().unwrap() >= 0.5);
+    assert_eq!(advice[0], advice[1]);
+}
+
+#[test]
+fn delegate_s1_rejection_is_named_on_stderr_and_leaves_the_outcome_alone() {
+    let pane = Pane::new("working", "same screen");
+    let args = [
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "100ms",
+        "--timeout",
+        "5000",
+        "--json",
+    ];
+    let baseline = pane.command(&args, None).output().unwrap();
+    let s1 = S1::serve(
+        400,
+        Shape::Rejected(r#"{"error":"Clef input has 17097 tokens; context limit is 16384"}"#),
+    );
+    let out = pane.command(&args, Some(&s1.url)).output().unwrap();
+    assert_eq!(out.status.code(), baseline.status.code());
+    assert_eq!(Pane::json(&out), Pane::json(&baseline));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "System One at {} rejected the request (HTTP 400): Clef input has 17097 tokens",
+            s1.url
+        )),
+        "{stderr}"
+    );
 }
 
 #[test]
