@@ -431,6 +431,9 @@ impl EventHub {
 }
 
 #[cfg(test)]
+mod goal_storage_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::schema::{EventData, EventKind};
