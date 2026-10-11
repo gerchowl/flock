@@ -63,6 +63,8 @@ pub struct NodeSpec {
     pub extra_config: &'static str,
     pub mesh: MeshMode,
     pub push_concurrency: Option<usize>,
+    /// How long a hub waits on a looping route before reporting it (#928).
+    pub loop_grace_ms: Option<u64>,
 }
 
 impl NodeSpec {
@@ -78,11 +80,17 @@ impl NodeSpec {
             extra_config: "",
             mesh: MeshMode::Native,
             push_concurrency: None,
+            loop_grace_ms: None,
         }
     }
 
     pub const fn with_push_concurrency(mut self, limit: usize) -> Self {
         self.push_concurrency = Some(limit);
+        self
+    }
+
+    pub const fn with_loop_grace_ms(mut self, ms: u64) -> Self {
+        self.loop_grace_ms = Some(ms);
         self
     }
 
@@ -126,6 +134,7 @@ pub struct Node {
     shim_dir: PathBuf,
     mesh: MeshMode,
     push_concurrency: Option<usize>,
+    loop_grace_ms: Option<u64>,
     _master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
 }
@@ -229,6 +238,9 @@ impl Node {
         cmd.env("FLOCK_FLEET_SOURCE", &self.name);
         if let Some(limit) = self.push_concurrency {
             cmd.env("FLOCK_TEST_MESH_PUSH_CONCURRENCY", limit.to_string());
+        }
+        if let Some(ms) = self.loop_grace_ms {
+            cmd.env("FLOCK_TEST_MESH_LOOP_GRACE_MS", ms.to_string());
         }
         if let MeshMode::VersionMismatch(version) = self.mesh {
             cmd.env("FLOCK_TEST_MESH_VERSION", version.to_string());
@@ -691,6 +703,7 @@ pub fn spawn_with_startup_probe(
                 shim_dir: shim_dir.clone(),
                 mesh: spec.mesh,
                 push_concurrency: spec.push_concurrency,
+                loop_grace_ms: spec.loop_grace_ms,
                 _master: None,
                 child: None,
             }

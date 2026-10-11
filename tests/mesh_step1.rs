@@ -356,11 +356,17 @@ fn incident_direct_held_collected_read_without_an_active_waiter() {
     conversation.read_question();
     let reply = conversation.reply();
     assert_eq!(reply["state"], "held", "{reply}");
-    state(
-        conversation.fleet.node("nodeb"),
-        reply["correlation_id"].as_str().unwrap(),
-        "held",
-    );
+    // The origin can collect the held answer before the first poll here, so
+    // a later state proves the held answer was stored as well.
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("nodeb answer held or collected", DEADLINE, || {
+        let status = api(
+            conversation.fleet.node("nodeb"),
+            "msg.status",
+            json!({"correlation_id":correlation}),
+        );
+        matches!(status["state"].as_str(), Some("held" | "collected")).then_some(())
+    });
     conversation.answer_once();
     state(
         conversation.fleet.node("nodeb"),
