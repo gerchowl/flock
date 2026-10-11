@@ -67,8 +67,12 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.0.pause_handoff_reader(timeout)
+    pub fn pause_handoff_reader(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
+        self.0.pause_handoff_reader(timeout, drop_undrained)
     }
 
     #[cfg(unix)]

@@ -815,11 +815,15 @@ impl PaneRuntimeIo {
     }
 
     #[cfg(unix)]
-    fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+    fn begin_handoff(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Actor(actor) => actor.begin_handoff_with(timeout, drop_undrained),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => Ok(()),
+            PaneRuntimeIo::TestChannel { .. } => Ok(crate::pty::actor::HandoffQuiesce::default()),
         }
     }
 
@@ -1244,8 +1248,12 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.io.begin_handoff(timeout)
+    pub fn pause_handoff_reader(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
+        self.io.begin_handoff(timeout, drop_undrained)
     }
 
     #[cfg(unix)]

@@ -3627,6 +3627,48 @@ pub(crate) fn pty_write_failed(pane: u32, err: &str) {
     );
 }
 
+/// One line per pane, ever: the writer kept accepting zero bytes of a
+/// non-empty buffer, so its queue was dropped rather than retried hot (#1011).
+/// This replaces the per-attempt "write returned zero bytes" warning that
+/// filled server logs (#997).
+pub(crate) fn pty_writer_broken(pane: u32, zero_writes: u32, dropped_bytes: usize) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "writer_broken",
+        pane,
+        zero_writes,
+        dropped_bytes,
+        "PTY writer accepts zero bytes; dropping its pending writes and later input"
+    );
+}
+
+/// The aggregate count of writes dropped after a pane's writer broke, logged
+/// once when the actor exits instead of once per dropped write.
+pub(crate) fn pty_writes_dropped_after_broken(pane: u32, dropped_writes: u64) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "dropped",
+        pane,
+        dropped_writes,
+        "PTY actor dropped writes after its writer broke"
+    );
+}
+
+/// `--skip-undrained`: what a pane still had queued when the handoff drain
+/// deadline passed, dropped so the handoff could proceed.
+pub(crate) fn pty_handoff_dropped_undrained(pane: u32, dropped_bytes: usize) {
+    tracing::warn!(
+        event = "session.handoff",
+        subsystem = "handoff",
+        outcome = "dropped_undrained",
+        pane,
+        dropped_bytes,
+        "dropped undrained PTY writes to proceed with handoff"
+    );
+}
+
 pub(crate) fn pty_resize_failed(pane: u32, err: &str) {
     tracing::debug!(
         event = "pty.resize",

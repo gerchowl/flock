@@ -343,7 +343,37 @@ fn apply_terminal_attach_input(
 #[derive(Debug)]
 enum HandoffError {
     SessionBroken,
+    /// One or more panes' queued input did not drain before the deadline
+    /// (#981, #1011). Named, so the operator can close those panes or rerun
+    /// with `--skip-undrained` rather than lose every pane to a restart.
+    Undrained(Vec<api::schema::UndrainedPane>),
     Failed(io::Error),
+}
+
+/// The operator-facing text of a [`HandoffError::Undrained`] refusal.
+fn undrained_handoff_message(panes: &[api::schema::UndrainedPane]) -> String {
+    let listed = panes
+        .iter()
+        .map(describe_undrained_pane)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "timed out draining PTY writes before handoff: {listed}. \
+         Close those panes and retry, or rerun with --skip-undrained to hand off \
+         anyway and drop their pending input."
+    )
+}
+
+fn describe_undrained_pane(pane: &api::schema::UndrainedPane) -> String {
+    let mut text = format!("{} ({} bytes pending", pane.pane_id, pane.pending_bytes);
+    if let Some(pid) = pane.pid {
+        text.push_str(&format!(", pid {pid}"));
+    }
+    if let Some(title) = pane.title.as_deref().filter(|title| !title.is_empty()) {
+        text.push_str(&format!(", \"{title}\""));
+    }
+    text.push(')');
+    text
 }
 
 impl From<io::Error> for HandoffError {
@@ -935,7 +965,7 @@ impl HeadlessServer {
     fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
-    ) -> Result<(), HandoffError> {
+    ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
         // #426: refuse before anything is spawned or any client is
         // disconnected. This check is first on purpose — the failure it catches
         // is silent until the very end, and every step after this point tears
@@ -976,10 +1006,14 @@ impl HeadlessServer {
         };
 
         let mut pane_by_terminal = HashMap::new();
-        for ws in &self.app.state.workspaces {
+        let mut public_pane_by_terminal = HashMap::new();
+        for (ws_idx, ws) in self.app.state.workspaces.iter().enumerate() {
             for tab in &ws.tabs {
                 for (pane_id, pane) in &tab.panes {
                     pane_by_terminal.insert(pane.attached_terminal_id.clone(), pane_id.raw());
+                    if let Some(public) = self.app.state.public_pane_id(ws_idx, *pane_id) {
+                        public_pane_by_terminal.insert(pane.attached_terminal_id.clone(), public);
+                    }
                 }
             }
         }
@@ -995,16 +1029,54 @@ impl HeadlessServer {
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
 
+        // #981: every pane is tried before giving up, so the refusal names all
+        // the stuck panes at once rather than the first one per attempt.
         let mut paused_terminal_ids = Vec::new();
-        for terminal_id in pane_by_terminal.keys() {
-            if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
-                if let Err(err) = runtime.pause_handoff_reader(Duration::from_secs(2)) {
+        let mut undrained = Vec::new();
+        let mut skipped_undrained = Vec::new();
+        for (terminal_id, raw_pane_id) in &pane_by_terminal {
+            let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
+                continue;
+            };
+            let describe = |pending_bytes: usize| api::schema::UndrainedPane {
+                pane_id: public_pane_by_terminal
+                    .get(terminal_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("pane {raw_pane_id}")),
+                title: self
+                    .app
+                    .state
+                    .terminals
+                    .get(terminal_id)
+                    .and_then(|terminal| terminal.effective_title()),
+                pid: runtime.child_pid(),
+                pending_bytes,
+            };
+            match runtime.pause_handoff_reader(Duration::from_secs(2), params.skip_undrained) {
+                Ok(quiesce) => {
+                    if quiesce.dropped_bytes > 0 {
+                        skipped_undrained.push(describe(quiesce.dropped_bytes));
+                    }
+                    paused_terminal_ids.push(terminal_id.clone());
+                }
+                Err(err) => {
+                    if let Some(timeout) =
+                        crate::pty::actor::HandoffDrainTimeout::from_io_error(&err)
+                    {
+                        undrained.push(describe(timeout.pending_bytes));
+                        continue;
+                    }
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
                     return Err(err.into());
                 }
-                paused_terminal_ids.push(terminal_id.clone());
             }
         }
+        if !undrained.is_empty() {
+            undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(HandoffError::Undrained(undrained));
+        }
+        skipped_undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
@@ -1194,15 +1266,15 @@ impl HeadlessServer {
         self.app.state.should_quit = true;
         self.app.no_session = true;
         info!("live handoff completed; old server exiting");
-        Ok(())
+        Ok(skipped_undrained)
     }
 
     #[cfg(not(unix))]
     fn perform_live_handoff(
         &mut self,
         _params: crate::api::schema::ServerLiveHandoffParams,
-    ) -> io::Result<()> {
-        Err(io::Error::other("live handoff is only supported on Unix"))
+    ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
+        Err(io::Error::other("live handoff is only supported on Unix").into())
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -2609,10 +2681,25 @@ impl HeadlessServer {
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             let response = match self.perform_live_handoff(params.clone()) {
-                Ok(()) => serde_json::to_string(&api::schema::SuccessResponse {
+                Ok(skipped_undrained) if skipped_undrained.is_empty() => {
+                    serde_json::to_string(&api::schema::SuccessResponse {
+                        id: msg.request.id,
+                        result: api::schema::ResponseResult::Ok {},
+                    })
+                }
+                Ok(skipped_undrained) => serde_json::to_string(&api::schema::SuccessResponse {
                     id: msg.request.id,
-                    result: api::schema::ResponseResult::Ok {},
+                    result: api::schema::ResponseResult::LiveHandoff { skipped_undrained },
                 }),
+                Err(HandoffError::Undrained(panes)) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            code: "handoff_undrained".into(),
+                            message: undrained_handoff_message(&panes),
+                        },
+                    })
+                }
                 // #426: its own error code, not `handoff_failed`. The refusal is
                 // the one handoff outcome an operator can act on differently —
                 // retrying is pointless and the recovery destroys their sessions
@@ -4044,6 +4131,35 @@ mod tests {
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+
+    #[test]
+    fn undrained_handoff_message_names_each_stuck_pane_and_its_bytes() {
+        let message = undrained_handoff_message(&[
+            api::schema::UndrainedPane {
+                pane_id: "w2:p6".into(),
+                title: Some("zsh".into()),
+                pid: Some(4242),
+                pending_bytes: 17,
+            },
+            api::schema::UndrainedPane {
+                pane_id: "w1:p2".into(),
+                title: None,
+                pid: None,
+                pending_bytes: 3,
+            },
+        ]);
+
+        assert!(
+            message.starts_with("timed out draining PTY writes before handoff: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("w2:p6 (17 bytes pending, pid 4242, \"zsh\")"),
+            "{message}"
+        );
+        assert!(message.contains("w1:p2 (3 bytes pending)"), "{message}");
+        assert!(message.contains("--skip-undrained"), "{message}");
+    }
 
     #[test]
     fn first_frame_sent_attach_trace_fires_once() {

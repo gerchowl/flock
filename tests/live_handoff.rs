@@ -2454,3 +2454,119 @@ fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff
     );
     cleanup_test_base(&base);
 }
+
+/// #981, #1011: a pane whose child never reads its input must not wedge every
+/// handoff anonymously. The refusal names the pane and its pending bytes, the
+/// old server keeps running, and `skip_undrained` hands off past it, reporting
+/// what it dropped.
+#[test]
+fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let marker = base.join("stuck.pid");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Non-canonical with no reader: the tty input queue fills and the PTY
+    // master stops accepting writes, as a pane that never reads does.
+    let command = format!(
+        "stty -icanon -echo; echo STUCK $$ > {}; exec sleep 60",
+        marker.display()
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:run",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&marker, Duration::from_secs(5));
+    let pid_text = fs::read_to_string(&marker).unwrap();
+    let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:flood",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": "x".repeat(256 * 1024)}
+        }),
+    ));
+
+    let failed = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    );
+    assert_eq!(
+        failed["error"]["code"].as_str(),
+        Some("handoff_undrained"),
+        "an undrained pane must fail the handoff by name: {failed}"
+    );
+    let message = failed["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("{pane_id} (")) && message.contains("bytes pending"),
+        "refusal must name {pane_id} and its pending bytes: {message}"
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+
+    let skipped = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff:skip",
+            "method": "server.live_handoff",
+            "params": {"skip_undrained": true}
+        }),
+    );
+    assert_eq!(
+        skipped["result"]["type"].as_str(),
+        Some("live_handoff"),
+        "skip_undrained handoff should succeed and report: {skipped}"
+    );
+    let dropped = skipped["result"]["skipped_undrained"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        dropped
+            .iter()
+            .any(|pane| pane["pane_id"].as_str() == Some(&pane_id)
+                && pane["pending_bytes"].as_u64().unwrap_or(0) > 0),
+        "skipped_undrained must list {pane_id} with its dropped bytes: {skipped}"
+    );
+    drop(spawned);
+    thread::sleep(Duration::from_millis(300));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(
+        unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+        0,
+        "the stuck pane's process survives the handoff"
+    );
+
+    unsafe {
+        libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}

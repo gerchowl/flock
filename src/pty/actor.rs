@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::pty::fd;
 
@@ -18,6 +18,48 @@ const ACTOR_POLL_MS: i32 = 50;
 const ACTOR_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the handle waits past the actor's own drain deadline, so the actor's
+/// named drain error (#981) reaches the caller before the handle's generic
+/// "timed out waiting" one does.
+const HANDOFF_REPLY_MARGIN: Duration = Duration::from_millis(250);
+/// Consecutive `write` calls that may return 0 for a non-empty buffer before the
+/// pane's writer is declared broken (#1011). A PTY master never legitimately
+/// accepts zero bytes of a non-empty write, so this only bounds the retry.
+const ZERO_WRITE_LIMIT: u32 = 8;
+
+/// The pending writes a pane still held when its handoff drain deadline passed
+/// (#981, #1011). Carried as the payload of the `TimedOut` error so the server
+/// can name the pane and its byte count instead of an anonymous timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffDrainTimeout {
+    pub pending_bytes: usize,
+}
+
+impl std::fmt::Display for HandoffDrainTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timed out draining PTY writes before handoff ({} bytes pending)",
+            self.pending_bytes
+        )
+    }
+}
+
+impl std::error::Error for HandoffDrainTimeout {}
+
+impl HandoffDrainTimeout {
+    /// The drain timeout carried by `err`, if that is what it is.
+    pub(crate) fn from_io_error(err: &std::io::Error) -> Option<Self> {
+        err.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
+
+/// What a successful handoff quiesce left behind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HandoffQuiesce {
+    /// Pending bytes dropped because the caller opted into `--skip-undrained`.
+    pub dropped_bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -68,8 +110,14 @@ enum PtyIoDataCommand {
     WriteUserInput(Bytes),
 }
 
+struct BeginHandoffRequest {
+    drain_timeout: Duration,
+    drop_undrained: bool,
+    reply: std_mpsc::Sender<std::io::Result<HandoffQuiesce>>,
+}
+
 enum PtyIoControlCommand {
-    BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
+    BeginHandoff(BeginHandoffRequest),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
@@ -96,6 +144,11 @@ impl PtyIoActorHandle {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::SendError<Bytes>> {
+        // #1011: an empty payload can never be written, and queued it wedged
+        // the flush loop and every later handoff drain behind it.
+        if bytes.is_empty() {
+            return Ok(());
+        }
         {
             let user_writes = self
                 .user_writes
@@ -127,6 +180,9 @@ impl PtyIoActorHandle {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let user_writes = self
             .user_writes
             .lock()
@@ -190,7 +246,21 @@ impl PtyIoActorHandle {
     }
 
     pub(crate) fn begin_handoff(&self, timeout: Duration) -> std::io::Result<()> {
+        self.begin_handoff_with(timeout, false).map(|_| ())
+    }
+
+    /// Quiesces the actor for handoff. With `drop_undrained`, writes still
+    /// pending at the drain deadline are dropped and counted instead of failing
+    /// the handoff (`flk server live-handoff --skip-undrained`).
+    pub(crate) fn begin_handoff_with(
+        &self,
+        timeout: Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<HandoffQuiesce> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
+        let drain_timeout = timeout
+            .saturating_sub(HANDOFF_REPLY_MARGIN)
+            .min(HANDOFF_DRAIN_TIMEOUT);
         {
             let mut user_writes = self
                 .user_writes
@@ -199,7 +269,11 @@ impl PtyIoActorHandle {
             user_writes.accepting = false;
             if self
                 .control_tx
-                .send(PtyIoControlCommand::BeginHandoff(reply_tx))
+                .send(PtyIoControlCommand::BeginHandoff(BeginHandoffRequest {
+                    drain_timeout,
+                    drop_undrained,
+                    reply: reply_tx,
+                }))
                 .is_err()
             {
                 user_writes.accepting = true;
@@ -211,7 +285,7 @@ impl PtyIoActorHandle {
             self.wake_actor();
         }
         match reply_rx.recv_timeout(timeout) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(quiesce)) => Ok(quiesce),
             Ok(Err(err)) => {
                 let _ = self.rollback_handoff();
                 Err(err)
@@ -353,6 +427,9 @@ impl PtyIoActor {
             },
             pending_writes: VecDeque::new(),
             current_write_offset: 0,
+            zero_write_streak: 0,
+            writer_broken: false,
+            dropped_after_broken: 0,
             wake_read_fd: wake_pipe.read_fd,
             controls,
             on_read: config.on_read,
@@ -384,6 +461,12 @@ struct PtyIoActorRunner {
     state: ActorState,
     pending_writes: VecDeque<Bytes>,
     current_write_offset: usize,
+    /// Consecutive zero-byte writes of a non-empty buffer (#1011).
+    zero_write_streak: u32,
+    /// Set once `ZERO_WRITE_LIMIT` is hit; later writes are dropped and counted
+    /// rather than retried, so a wedged writer costs one log line, not a flood.
+    writer_broken: bool,
+    dropped_after_broken: u64,
     wake_read_fd: OwnedFd,
     controls: Arc<Mutex<SharedPtyControls>>,
     on_read: ReadCallback,
@@ -442,6 +525,12 @@ impl PtyIoActorRunner {
             }
         }
 
+        if self.dropped_after_broken > 0 {
+            crate::logging::pty_writes_dropped_after_broken(
+                self.pane_id,
+                self.dropped_after_broken,
+            );
+        }
         if let Some(on_reader_exit) = self.on_reader_exit.take() {
             on_reader_exit();
         }
@@ -499,7 +588,7 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.pending_writes.push_back(bytes);
+                    self.push_pending(bytes);
                 }
             }
         }
@@ -508,9 +597,9 @@ impl PtyIoActorRunner {
 
     fn handle_control_command(&mut self, command: PtyIoControlCommand) -> bool {
         match command {
-            PtyIoControlCommand::BeginHandoff(reply) => {
-                let result = self.begin_handoff();
-                let _ = reply.send(result);
+            PtyIoControlCommand::BeginHandoff(request) => {
+                let result = self.begin_handoff(request.drain_timeout, request.drop_undrained);
+                let _ = request.reply.send(result);
             }
             PtyIoControlCommand::DuplicateForHandoff(reply) => {
                 let result = if self.state == ActorState::Quiesced {
@@ -550,7 +639,11 @@ impl PtyIoActorRunner {
         false
     }
 
-    fn begin_handoff(&mut self) -> std::io::Result<()> {
+    fn begin_handoff(
+        &mut self,
+        drain_timeout: Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<HandoffQuiesce> {
         self.drain_pre_quiesce_commands();
         self.apply_pending_controls();
         if self.state == ActorState::Released {
@@ -559,26 +652,57 @@ impl PtyIoActorRunner {
                 "PTY actor was released before handoff quiesce",
             ));
         }
-        let deadline = Instant::now() + HANDOFF_DRAIN_TIMEOUT;
+        let deadline = Instant::now() + drain_timeout;
+        let mut quiesce = HandoffQuiesce::default();
         while !self.pending_writes.is_empty() {
             if Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timed out draining PTY writes before handoff",
-                ));
+                let pending_bytes = self.pending_bytes();
+                if !drop_undrained {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        HandoffDrainTimeout { pending_bytes },
+                    ));
+                }
+                crate::logging::pty_handoff_dropped_undrained(self.pane_id, pending_bytes);
+                self.pending_writes.clear();
+                self.current_write_offset = 0;
+                quiesce.dropped_bytes = pending_bytes;
+                break;
             }
             self.flush_pending_writes_once();
         }
         self.state = ActorState::Quiesced;
-        Ok(())
+        Ok(quiesce)
     }
 
     fn drain_pre_quiesce_commands(&mut self) {
         while let Ok(PtyIoDataCommand::WriteUserInput(bytes)) = self.data_rx.try_recv() {
             if self.state != ActorState::Released {
-                self.pending_writes.push_back(bytes);
+                self.push_pending(bytes);
             }
         }
+    }
+
+    /// The single place bytes join the write queue. Empty payloads are dropped
+    /// here (#1011), and a broken writer drops everything so the queue cannot
+    /// grow behind a pane that will never accept it.
+    fn push_pending(&mut self, bytes: Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.writer_broken {
+            self.dropped_after_broken = self.dropped_after_broken.saturating_add(1);
+            return;
+        }
+        self.pending_writes.push_back(bytes);
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending_writes
+            .iter()
+            .map(Bytes::len)
+            .sum::<usize>()
+            .saturating_sub(self.current_write_offset)
     }
 
     fn apply_pending_controls(&mut self) {
@@ -614,7 +738,7 @@ impl PtyIoActorRunner {
                 let result = (self.on_read)(&buf[..n]);
                 for response in result.terminal_responses {
                     if self.state != ActorState::Released {
-                        self.pending_writes.push_back(response);
+                        self.push_pending(response);
                     }
                 }
                 true
@@ -624,13 +748,22 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) {
         while let Some(bytes) = self.pending_writes.front() {
+            if self.current_write_offset >= bytes.len() {
+                // An empty entry (or a fully written one) has nothing left to
+                // write. `write(&[])` returns 0, which is how one empty payload
+                // used to pin the queue forever (#1011).
+                self.pending_writes.pop_front();
+                self.current_write_offset = 0;
+                continue;
+            }
             let chunk = &bytes[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
-                    warn!(pane = self.pane_id, "PTY actor write returned zero bytes");
+                    self.note_zero_write();
                     return;
                 }
                 Ok(written) => {
+                    self.zero_write_streak = 0;
                     self.current_write_offset += written;
                     if self.current_write_offset >= bytes.len() {
                         self.pending_writes.pop_front();
@@ -651,6 +784,27 @@ impl PtyIoActorRunner {
             }
         }
         let _ = self.file.flush();
+    }
+
+    /// A `write` of a non-empty buffer returned 0. Retried a bounded number of
+    /// times, then the writer is given up on.
+    fn note_zero_write(&mut self) {
+        self.zero_write_streak = self.zero_write_streak.saturating_add(1);
+        if self.zero_write_streak >= ZERO_WRITE_LIMIT {
+            self.mark_writer_broken();
+        }
+    }
+
+    /// Gives up on a writer that keeps accepting zero bytes of a non-empty
+    /// buffer: one warning, the queue dropped, and later writes dropped and
+    /// counted, never retried hot (#1011, #997).
+    fn mark_writer_broken(&mut self) {
+        let pending_bytes = self.pending_bytes();
+        crate::logging::pty_writer_broken(self.pane_id, self.zero_write_streak, pending_bytes);
+        self.writer_broken = true;
+        self.zero_write_streak = 0;
+        self.pending_writes.clear();
+        self.current_write_offset = 0;
     }
 
     fn resize(&self, resize: PtyResize) {
@@ -1022,8 +1176,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("handoff control command")
         {
-            PtyIoControlCommand::BeginHandoff(reply) => {
-                reply.send(Ok(())).expect("handoff waiter alive");
+            PtyIoControlCommand::BeginHandoff(request) => {
+                request
+                    .reply
+                    .send(Ok(HandoffQuiesce::default()))
+                    .expect("handoff waiter alive");
             }
             _ => panic!("expected begin handoff command"),
         }
@@ -1069,8 +1226,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("handoff control command")
         {
-            PtyIoControlCommand::BeginHandoff(reply) => {
-                reply.send(Ok(())).expect("handoff waiter alive");
+            PtyIoControlCommand::BeginHandoff(request) => {
+                request
+                    .reply
+                    .send(Ok(HandoffQuiesce::default()))
+                    .expect("handoff waiter alive");
             }
             _ => panic!("expected begin handoff command"),
         }
@@ -1083,20 +1243,30 @@ mod tests {
 
     #[test]
     fn begin_handoff_drains_user_writes_already_in_command_queue() {
-        let (actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
-        actor_socket
-            .set_nonblocking(true)
-            .expect("actor socket nonblocking");
-        peer.set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("peer timeout");
-        let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
-        let (_control_tx, control_rx) = std_mpsc::channel();
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
         data_tx
             .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
                 b"queued-before-ack",
             )))
             .expect("queued write");
-        let mut runner = PtyIoActorRunner {
+
+        runner
+            .begin_handoff(HANDOFF_DRAIN_TIMEOUT, false)
+            .expect("handoff drains queued write");
+
+        let mut buf = [0u8; 17];
+        peer.read_exact(&mut buf)
+            .expect("queued write reaches peer before quiesce ack");
+        assert_eq!(&buf, b"queued-before-ack");
+        assert_eq!(runner.state, ActorState::Quiesced);
+    }
+
+    fn runner_on(
+        actor_socket: UnixStream,
+        data_rx: mpsc::Receiver<PtyIoDataCommand>,
+    ) -> PtyIoActorRunner {
+        let (_control_tx, control_rx) = std_mpsc::channel();
+        PtyIoActorRunner {
             pane_id: 1,
             file: std::fs::File::from(unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) }),
             data_rx,
@@ -1104,19 +1274,147 @@ mod tests {
             state: ActorState::Running,
             pending_writes: VecDeque::new(),
             current_write_offset: 0,
+            zero_write_streak: 0,
+            writer_broken: false,
+            dropped_after_broken: 0,
             wake_read_fd: fd::create_wake_pipe().expect("wake pipe").read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+        }
+    }
+
+    fn socket_pair_runner() -> (PtyIoActorRunner, UnixStream, mpsc::Sender<PtyIoDataCommand>) {
+        let (actor_socket, peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+        (runner_on(actor_socket, data_rx), peer, data_tx)
+    }
+
+    #[test]
+    fn empty_user_input_is_never_enqueued() {
+        let (data_tx, mut data_rx) = mpsc::channel(4);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read_fd) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
         };
 
-        runner.begin_handoff().expect("handoff drains queued write");
+        handle
+            .try_write_user_input(Bytes::new())
+            .expect("empty input is accepted as a no-op");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(handle.write_user_input(Bytes::new()))
+            .expect("empty async input is accepted as a no-op");
 
-        let mut buf = [0u8; 17];
-        peer.read_exact(&mut buf)
-            .expect("queued write reaches peer before quiesce ack");
-        assert_eq!(&buf, b"queued-before-ack");
+        assert!(
+            data_rx.try_recv().is_err(),
+            "an empty payload must not reach the actor's queue (#1011)"
+        );
+    }
+
+    #[test]
+    fn handoff_drains_past_an_empty_write_that_reached_the_actor() {
+        // #1011: the live failure. An empty payload at the head of the queue
+        // made `write(&[])` return 0 forever and the drain hit its deadline.
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::new()))
+            .expect("queued empty write");
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                b"after-empty",
+            )))
+            .expect("queued write");
+        runner.pending_writes.push_back(Bytes::new());
+
+        let started = Instant::now();
+        runner
+            .begin_handoff(HANDOFF_DRAIN_TIMEOUT, false)
+            .expect("handoff drains past the empty write");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "drain must not spin to its deadline on an empty write"
+        );
+        let mut buf = [0u8; 11];
+        peer.read_exact(&mut buf).expect("later write reaches peer");
+        assert_eq!(&buf, b"after-empty");
+        assert_eq!(runner.state, ActorState::Quiesced);
+    }
+
+    #[test]
+    fn zero_byte_writes_of_a_non_empty_buffer_mark_the_writer_broken() {
+        let (mut runner, _peer, _data_tx) = socket_pair_runner();
+        runner.push_pending(Bytes::from_static(b"never-accepted"));
+
+        // A PTY that accepts zero bytes of a non-empty write cannot be built
+        // from a real fd, so call what the `Ok(0)` arm calls.
+        for _ in 1..ZERO_WRITE_LIMIT {
+            runner.note_zero_write();
+        }
+        assert!(!runner.writer_broken, "retries are bounded, not immediate");
+        assert_eq!(runner.pending_writes.len(), 1);
+        runner.note_zero_write();
+
+        assert!(runner.writer_broken);
+        assert!(
+            runner.pending_writes.is_empty(),
+            "queue is dropped, not retried"
+        );
+        runner.push_pending(Bytes::from_static(b"later"));
+        assert!(runner.pending_writes.is_empty());
+        assert_eq!(runner.dropped_after_broken, 1);
+        runner
+            .begin_handoff(Duration::from_millis(50), false)
+            .expect("a broken writer has nothing left to drain");
+    }
+
+    fn runner_with_undrainable_write() -> (PtyIoActorRunner, UnixStream) {
+        let (mut runner, peer, _data_tx) = socket_pair_runner();
+        // Larger than any socket buffer, and the peer never reads.
+        runner.push_pending(Bytes::from(vec![b'x'; 8 * 1024 * 1024]));
+        (runner, peer)
+    }
+
+    #[test]
+    fn handoff_drain_timeout_reports_pending_bytes() {
+        let (mut runner, _peer) = runner_with_undrainable_write();
+
+        let err = runner
+            .begin_handoff(Duration::from_millis(50), false)
+            .expect_err("an unread peer cannot drain");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let timeout = HandoffDrainTimeout::from_io_error(&err).expect("typed drain timeout");
+        assert!(timeout.pending_bytes > 0);
+        assert_eq!(timeout.pending_bytes, runner.pending_bytes());
+        assert!(err
+            .to_string()
+            .contains(&format!("({} bytes pending)", timeout.pending_bytes)));
+        assert_eq!(runner.state, ActorState::Running);
+    }
+
+    #[test]
+    fn handoff_drop_undrained_quiesces_and_counts_what_it_dropped() {
+        let (mut runner, _peer) = runner_with_undrainable_write();
+
+        let quiesce = runner
+            .begin_handoff(Duration::from_millis(50), true)
+            .expect("--skip-undrained hands off anyway");
+
+        assert!(quiesce.dropped_bytes > 0);
+        assert!(runner.pending_writes.is_empty());
         assert_eq!(runner.state, ActorState::Quiesced);
     }
 

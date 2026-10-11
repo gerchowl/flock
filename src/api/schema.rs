@@ -1750,6 +1750,24 @@ pub struct ServerLiveHandoffParams {
     pub expected_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Hand off even when a pane's queued input will not drain, dropping and
+    /// reporting what was pending per pane (#981, #1011). Opt-in: without it a
+    /// stuck pane fails the handoff and the error names it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_undrained: bool,
+}
+
+/// A pane whose queued PTY input did not drain before a live handoff (#981).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndrainedPane {
+    /// The public pane id (`wX:pN`), or the internal number when the pane has
+    /// no public id.
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2790,6 +2808,11 @@ pub enum ResponseResult {
         run_id: String,
         dry_run: bool,
         results: Vec<RevertRepoResult>,
+    },
+    /// A live handoff that went ahead under `--skip-undrained` and dropped the
+    /// listed panes' pending input. A handoff that dropped nothing answers `Ok`.
+    LiveHandoff {
+        skipped_undrained: Vec<UndrainedPane>,
     },
     Ok {},
 }
