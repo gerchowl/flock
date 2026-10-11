@@ -326,8 +326,12 @@ impl App {
         mut params: PaneSubmitParams,
         stash: bool,
     ) -> String {
-        let Some((ws, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return encode_error(id, "pane_gone", "pane_gone");
+        let (ws, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) if error.code == "pane_not_found" => {
+                return encode_error(id, "pane_gone", "pane_gone")
+            }
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
             return encode_error(id, "pane_gone", "pane_gone");

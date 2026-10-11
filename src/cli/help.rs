@@ -192,8 +192,8 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("mcp", "serve", "flk mcp serve"),
     ("terminal", "attach", "flk terminal attach <terminal_id> [--takeover]"),
     ("pane", "list", "flk pane list [--workspace <workspace_id>]"),
-    ("pane", "get", "flk pane get <pane_id>"),
-    ("pane", "rename", "flk pane rename <pane_id> <label>|--clear"),
+    ("pane", "get", "flk pane get <target>"),
+    ("pane", "rename", "flk pane rename <target> <label>|--clear"),
     (
         "pane",
         "read",
@@ -202,12 +202,12 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "split",
-        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
+        "flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
     ),
     (
         "pane",
         "move",
-        "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
+        "flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
     ("pane", "close", super::pane::PANE_CLOSE_USAGE),
     ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),

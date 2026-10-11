@@ -35,9 +35,18 @@ pub(crate) enum TerminalTargetError {
     },
 }
 
+/// The target shapes every pane or agent verb accepts, named in a refusal's
+/// `data.expected` so the caller's next call can be right (ADR-0029 §5).
+pub(crate) const PANE_TARGET_EXPECTED: &[&str] = &[
+    "pane id (w1:p2)",
+    "terminal id",
+    "unique agent name or label",
+    "fleet agent id (agent_<host>_<suffix>) of an agent on this server",
+];
+
 impl App {
-    // Staged for #00f: current pane APIs stay pane-targeted while agent APIs will call this.
-    #[allow(dead_code)]
+    /// The one target resolver (ADR-0029 §5): terminal id, pane id, unique
+    /// agent name or label, then a local fleet agent id.
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
@@ -73,6 +82,19 @@ impl App {
             .collect();
         if let Some(resolved) = self.single_terminal_match(target, name_matches)? {
             return Ok(resolved);
+        }
+
+        // A fleet agent id last (ADR-0029 §5): it names this server's pane
+        // only while the agent lives here.
+        if crate::terminal::AgentId::is_well_formed(target) {
+            let local = self.locate_agent(target).filter(|location| location.local);
+            if let Some((ws_idx, pane_id)) =
+                local.and_then(|location| self.parse_pane_id(&location.pane_id))
+            {
+                if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
+                    return Ok(resolved);
+                }
+            }
         }
 
         Err(TerminalTargetError::NotFound {
@@ -166,5 +188,26 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
         })
+    }
+
+    /// [`Self::resolve_terminal_target`] for verbs that act on a placement:
+    /// an unknown target is `pane_not_found`, an ambiguous one keeps the
+    /// agent refusal with its candidate list.
+    pub(crate) fn resolve_pane_target(
+        &self,
+        target: &str,
+    ) -> Result<(usize, crate::layout::PaneId), crate::api::schema::ErrorBody> {
+        self.resolve_terminal_target(target)
+            .map(|resolved| (resolved.ws_idx, resolved.pane_id))
+            .map_err(|error| match error {
+                TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: format!(
+                        "pane {target} not found; expected a {}",
+                        PANE_TARGET_EXPECTED.join(", a ")
+                    ),
+                },
+                error => self.agent_target_error_body(error),
+            })
     }
 }

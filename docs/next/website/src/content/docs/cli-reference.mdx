@@ -262,9 +262,9 @@ flk tab close <tab_id>
 
 ```bash
 flk pane list [--workspace <workspace_id>]
-flk pane get <pane_id>
-flk pane rename <pane_id> <label>|--clear
-flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]
+flk pane get <target>
+flk pane rename <target> <label>|--clear
+flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]
 flk pane close <pane_id>
 flk pane stash show|restore <pane_id> [--json]
 ```
@@ -286,7 +286,7 @@ Send input:
 ```bash
 flk pane send-text <pane_id> <text>
 flk pane send-keys <pane_id> <key> [key ...]
-flk pane run <pane_id> <command>
+flk pane run <target> <command>
 ```
 
 `pane send-text` reports the same observed delivery result and exit codes as plain `agent send` (see below).
