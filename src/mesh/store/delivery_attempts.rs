@@ -88,6 +88,7 @@ mod tests {
             finished_at_ms: (state != "typed").then_some(id),
             retried: false,
             draft: None,
+            held_input_not_written: false,
         }
     }
 

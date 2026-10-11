@@ -774,6 +774,36 @@ impl OperatorInputClock {
     }
 }
 
+/// What one retry of a pane's held-input backlog did (#850, #1011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct HeldInputDrain {
+    /// Some held input still waits on a full channel.
+    pub still_waiting: bool,
+    /// Held bytes a closed pane or a broken writer refused. They are lost.
+    pub refused_bytes: usize,
+}
+
+/// A pane's handoff quiesce, started and not yet collected, so a handoff can
+/// drain every pane at once instead of one after another.
+#[cfg(unix)]
+pub(crate) enum PendingPaneHandoff {
+    Actor(crate::pty::actor::PendingHandoff),
+    #[cfg(test)]
+    Ready,
+}
+
+#[cfg(unix)]
+impl PendingPaneHandoff {
+    pub(crate) fn wait(self) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
+        match self {
+            PendingPaneHandoff::Actor(pending) => pending.wait(),
+            #[cfg(test)]
+            PendingPaneHandoff::Ready => Ok(crate::pty::actor::HandoffQuiesce::default()),
+        }
+    }
+}
+
 enum PaneRuntimeIo {
     #[cfg(unix)]
     Actor(PtyIoActorHandle),
@@ -815,11 +845,26 @@ impl PaneRuntimeIo {
     }
 
     #[cfg(unix)]
-    fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+    fn start_handoff(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<PendingPaneHandoff> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Actor(actor) => actor
+                .start_handoff(timeout, drop_undrained)
+                .map(PendingPaneHandoff::Actor),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => Ok(()),
+            PaneRuntimeIo::TestChannel { .. } => Ok(PendingPaneHandoff::Ready),
+        }
+    }
+
+    fn writer_broken(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => actor.writer_broken(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => false,
         }
     }
 
@@ -1244,8 +1289,12 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.io.begin_handoff(timeout)
+    pub fn start_handoff_pause(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<PendingPaneHandoff> {
+        self.io.start_handoff(timeout, drop_undrained)
     }
 
     #[cfg(unix)]
@@ -2187,8 +2236,7 @@ impl PaneRuntime {
         };
         self.operator_input.stamp();
         if self.injection_lease.has_backlog() {
-            self.write_in_order(bytes);
-            return Ok(());
+            return self.write_in_order(bytes).map_err(mpsc::error::SendError);
         }
         self.io.send_bytes(bytes).await
     }
@@ -2205,8 +2253,12 @@ impl PaneRuntime {
         };
         self.operator_input.stamp();
         if self.injection_lease.has_backlog() {
-            self.write_in_order(bytes);
-            return Ok(());
+            // #1011 review: behind a backlog the write can still be refused
+            // (closed pane, broken writer), and then the backlog AND these
+            // bytes are gone, so the caller is told.
+            return self
+                .write_in_order(bytes)
+                .map_err(mpsc::error::TrySendError::Closed);
         }
         self.io.try_send_bytes(bytes)
     }
@@ -2221,17 +2273,19 @@ impl PaneRuntime {
     ) -> bool {
         match self.injection_lease.acquire(token, until, now) {
             Ok(flush) => {
-                self.write_held_input(flush);
+                let _ = self.write_held_input(flush);
                 true
             }
             Err(()) => false,
         }
     }
 
-    /// End `token`'s lease and write what it held, in order.
-    pub(crate) fn end_injection_lease(&self, token: &str) {
+    /// End `token`'s lease and write what it held, in order. False when held
+    /// input could not be written (a closed pane or a broken writer), which
+    /// is also logged.
+    pub(crate) fn end_injection_lease(&self, token: &str) -> bool {
         let held = self.injection_lease.release(token);
-        self.write_held_input(held);
+        self.write_held_input(held)
     }
 
     /// End a lease past its bound. True when one ended.
@@ -2239,14 +2293,14 @@ impl PaneRuntime {
         let Some(held) = self.injection_lease.expire(now) else {
             return false;
         };
-        self.write_held_input(Some(held));
+        let _ = self.write_held_input(Some(held));
         true
     }
 
     /// End any lease, for a server that is stopping or handing off.
     pub(crate) fn end_all_injection_leases(&self) {
         let held = self.injection_lease.release_all();
-        self.write_held_input(held);
+        let _ = self.write_held_input(held);
     }
 
     pub(crate) fn injection_lease_until(&self) -> Option<std::time::Instant> {
@@ -2257,21 +2311,22 @@ impl PaneRuntime {
         self.injection_lease.holds(token, now)
     }
 
-    fn write_held_input(&self, held: Option<Bytes>) {
+    fn write_held_input(&self, held: Option<Bytes>) -> bool {
         let Some(bytes) = held.filter(|bytes| !bytes.is_empty()) else {
-            return;
+            return true;
         };
         self.operator_input.stamp();
-        self.write_in_order(bytes);
+        self.write_in_order(bytes).is_ok()
     }
 
     /// Write behind any backlog. A full channel keeps the bytes for the loop
-    /// to drain rather than dropping them; only a closed pane loses them, and
-    /// that is logged.
-    fn write_in_order(&self, bytes: Bytes) {
+    /// to drain rather than dropping them; only a closed pane or a broken
+    /// writer refuses them, and then the refused bytes (the old backlog with
+    /// these appended) are logged and returned as the error.
+    fn write_in_order(&self, bytes: Bytes) -> Result<(), Bytes> {
         let bytes = self.injection_lease.behind_backlog(bytes);
         match self.io.try_send_bytes(bytes) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(bytes)) => {
                 let len = bytes.len();
                 if self.injection_lease.defer(bytes) {
@@ -2279,8 +2334,20 @@ impl PaneRuntime {
                         "pane input channel full; {len} held bytes still waiting"
                     ));
                 }
+                Ok(())
             }
-            Err(err) => crate::logging::pane_held_input_write_failed(&err.to_string()),
+            Err(mpsc::error::TrySendError::Closed(bytes)) => {
+                let reason = if self.io.writer_broken() {
+                    "pane writer accepts zero bytes"
+                } else {
+                    "pane input channel closed"
+                };
+                crate::logging::pane_held_input_write_failed(&format!(
+                    "{reason}; {} held bytes not written",
+                    bytes.len()
+                ));
+                Err(bytes)
+            }
         }
     }
 
@@ -2288,12 +2355,17 @@ impl PaneRuntime {
         self.injection_lease.has_backlog()
     }
 
-    /// Retry held input a full channel refused. True while some still waits.
-    pub(crate) fn drain_held_input(&self) -> bool {
-        if let Some(bytes) = self.injection_lease.take_backlog() {
-            self.write_in_order(bytes);
+    /// Retry held input a full channel refused.
+    pub(crate) fn drain_held_input(&self) -> HeldInputDrain {
+        let refused_bytes = self
+            .injection_lease
+            .take_backlog()
+            .and_then(|bytes| self.write_in_order(bytes).err())
+            .map_or(0, |bytes| bytes.len());
+        HeldInputDrain {
+            still_waiting: self.injection_lease.has_backlog(),
+            refused_bytes,
         }
-        self.injection_lease.has_backlog()
     }
 
     /// Write bytes flock authored on its own initiative, WITHOUT counting them
@@ -2457,6 +2529,14 @@ impl PaneRuntime {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], 4)
     }
 
+    /// A test runtime whose input goes to a real PTY actor.
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: PtyIoActorHandle) -> Self {
+        let (mut runtime, _receiver) = Self::test_with_channel(80, 24);
+        runtime.io = PaneRuntimeIo::Actor(actor);
+        runtime
+    }
+
     pub(crate) fn test_with_channel_capacity(
         cols: u16,
         rows: u16,
@@ -2527,6 +2607,120 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_input_replay_lands_on_a_healthy_writer() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"held"))
+            .expect("held while leased");
+
+        assert!(runtime.end_injection_lease("t"));
+
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("peer timeout");
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut peer, &mut buf).expect("held input replayed");
+        assert_eq!(&buf, b"held");
+        handle.shutdown();
+    }
+
+    /// Held keys `ab` wait in the backlog behind a full one-slot channel, and
+    /// only then does the writer break (#1011 review, round 2).
+    #[cfg(unix)]
+    fn runtime_with_backlog_then_broken_writer(
+    ) -> (PaneRuntime, PtyIoActorHandle, Box<dyn std::any::Any>) {
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"ab"))
+            .expect("held while leased");
+        runtime
+            .try_send_flock_authored(Bytes::from_static(b"fill"))
+            .expect("the one slot");
+        assert!(
+            runtime.end_injection_lease("t"),
+            "a full channel keeps the replay for later"
+        );
+        assert!(runtime.has_held_backlog());
+        handle.test_mark_writer_broken();
+        (runtime, handle, guard)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_behind_a_backlog_a_broken_writer_refuses_is_an_error() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        match runtime.try_send_bytes(Bytes::from_static(b"c")) {
+            Err(mpsc::error::TrySendError::Closed(refused)) => {
+                assert_eq!(refused, Bytes::from_static(b"abc"), "backlog and new bytes");
+            }
+            other => panic!("refused input must be an error, got {other:?}"),
+        }
+        assert!(!runtime.has_held_backlog());
+
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+        let err = runtime
+            .send_bytes(Bytes::from_static(b"c"))
+            .await
+            .expect_err("the async path reports it too");
+        assert_eq!(err.0, Bytes::from_static(b"abc"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn draining_a_backlog_a_broken_writer_refuses_reports_the_loss() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        let drain = runtime.drain_held_input();
+
+        assert_eq!(
+            drain,
+            HeldInputDrain {
+                still_waiting: false,
+                refused_bytes: 2,
+            }
+        );
+    }
+
+    /// #1011 review: held keystrokes replayed into a broken writer (#850) are
+    /// reported as not written, never queued and silently dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_input_replay_reports_a_broken_writer() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"held"))
+            .expect("held while leased");
+        handle.test_mark_writer_broken();
+
+        assert!(
+            !runtime.end_injection_lease("t"),
+            "a replay into a broken writer reports failure"
+        );
+        assert!(
+            runtime.try_send_bytes(Bytes::from_static(b"x")).is_err(),
+            "direct input to a broken writer is an error too"
+        );
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .expect("peer timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            std::io::Read::read(&mut peer, &mut buf).is_err(),
+            "nothing reached the pane"
+        );
+        handle.shutdown();
+    }
 
     #[tokio::test]
     async fn every_input_write_marks_root_shell_touched() {
