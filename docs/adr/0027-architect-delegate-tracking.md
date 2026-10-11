@@ -9,6 +9,7 @@
 - Decision owner: operator.
 - Implemented: none. Slice issues are listed in §9.
 - Revised: 2026-10-11 after the PR #966 review (architect succession, hook-output re-inject, #697 and #850 delivery, worktree provenance for reap).
+- Amended: 2026-10-11 by ADR-0028 §5 (owner decision 1, PR #1006): the `fyi` digest wakes an idle architect only when it opens a wait the architect registered. See the amendment note in §3.
 
 ## Context
 
@@ -207,6 +208,18 @@ unchanged:
   injection. That injection already moves a composer draft aside and restores
   it, and it holds the operator's input while it types. The digest adds no
   second injector, so it cannot race #850's lock.
+
+**Amendment (ADR-0028 §5, owner decision 1, 2026-10-11): wake follows the
+wait.** As written, the second path never fires for a digest: ADR-0018 lets
+only `needs_reply`, `blocking` and answers to a question idle-wake an agent,
+and the digest is `fyi` (measured in ADR-0028: an `fyi` to an idle Claude
+produced no wake in 60 s). The digest stays `fyi`. It wakes an idle architect
+when it opens a wait that architect registered (ADR-0028 §5: a `park` on its
+delegates, or a `flk events wait` on them), and only then; an architect that
+did not park is not interrupted and reads the digest at its next turn
+boundary. ADR-0018's rule for peer mail is unchanged. #961's "parked architect
+is woken" acceptance therefore depends on ADR-0028 slices E5 and E6, in
+addition to #697.
 
 **Precondition: #697.** An architect almost always has a background shell
 running, and while it does flk reports it `working`. Idle wake then never
