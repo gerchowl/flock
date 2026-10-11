@@ -325,6 +325,8 @@ fn entry_for(name: &str) -> Entry {
         cursor: String::new(),
         created_at_ms: 0,
         root_pane_terminal_id: "rt".to_string(),
+        base: None,
+        base_sha: None,
     }
 }
 
@@ -547,7 +549,7 @@ async fn delegate_startup_dialog_ignores_scrollback() {
     let dialog = HARNESSES
         .iter()
         .find(|harness| harness.name == "codex")
-        .and_then(|harness| harness.startup_dialog.as_ref())
+        .and_then(|harness| harness.startup_dialogs.first())
         .expect("Codex dialog");
     let screen = "Hooks need review\r\n1 hook is new or changed.\r\nHooks can run outside the sandbox after you trust them.\r\n› 1. Review hooks\r\n2. Trust all and continue\r\n3. Continue without trusting (hooks won't run)\r\nenter confirm · esc skip";
     let mut bytes = screen.as_bytes().to_vec();
@@ -576,4 +578,138 @@ async fn delegate_startup_dialog_ignores_scrollback() {
         !shown,
         "a dialog outside the live screen cannot block startup"
     );
+}
+
+// ---------- recover_lost_brief_with: the #828 resubmit decision ---------------
+
+const LOST_SENTENCE: &str = "Read /fixture/briefs/task.md and execute it exactly.";
+const EMPTY_CODEX: &str = "OpenAI Codex\n› Ask Codex to do anything\n  ? for shortcuts\n";
+
+struct LostBriefRun {
+    outcome: Result<bool, SubmitFailure>,
+    resubmits: u32,
+    elapsed: Duration,
+}
+
+/// Drive the decision with one probe per fake second until it answers.
+fn run_lost_brief(mut probe: impl FnMut(u64) -> Probe) -> LostBriefRun {
+    let mut entry = entry_for("lost");
+    entry.harness = "codex".to_string();
+    entry.cursor = "term_fixture:0:3:8:i".to_string();
+    let start = Instant::now();
+    let settle = Duration::from_millis(300);
+    let deadline = start + start_watch::StartWatch::window(settle) + LOST_BRIEF_MARGIN;
+    let clock = std::cell::Cell::new(start);
+    let mut second = 0;
+    let resubmits = std::cell::Cell::new(0);
+    let outcome = recover_lost_brief_with(
+        &entry,
+        LOST_SENTENCE,
+        settle,
+        start,
+        deadline,
+        SubmitFailure::Unconfirmed("owned_composer_not_visible".into()),
+        || {
+            second += 1;
+            probe(second)
+        },
+        || {
+            resubmits.set(resubmits.get() + 1);
+            Ok(())
+        },
+        || clock.get(),
+        || clock.set(clock.get() + Duration::from_secs(1)),
+    );
+    LostBriefRun {
+        outcome,
+        resubmits: resubmits.get(),
+        elapsed: clock.get() - start,
+    }
+}
+
+fn idle_probe(cursor: &str, screen: &str) -> Probe {
+    Probe::Record {
+        status: crate::api::schema::AgentStatus::Idle,
+        cursor: Cursor::parse(cursor).unwrap(),
+        screen: screen.to_string(),
+        unfaint: screen.to_string(),
+    }
+}
+
+#[test]
+fn a_brief_swallowed_at_startup_is_resubmitted_once_after_the_window() {
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", EMPTY_CODEX));
+    assert!(matches!(run.outcome, Ok(true)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 1);
+    assert!(
+        run.elapsed >= start_watch::StartWatch::window(Duration::from_millis(300)),
+        "never before the not_started window: {:?}",
+        run.elapsed
+    );
+}
+
+#[test]
+fn a_brief_that_shows_on_screen_is_never_resubmitted() {
+    // vigil-5: the brief was queued, then the composer emptied again.
+    let shown =
+        format!("› Read /fixture/briefs/task.md and\n  execute it exactly.\n\n{EMPTY_CODEX}");
+    let run = run_lost_brief(|second| {
+        idle_probe(
+            "term_fixture:0:3:8:i",
+            if second == 3 { &shown } else { EMPTY_CODEX },
+        )
+    });
+    assert!(
+        matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(run.resubmits, 0);
+    assert_eq!(
+        run.elapsed,
+        Duration::from_secs(2),
+        "it stops at the sighting"
+    );
+}
+
+#[test]
+fn a_turn_that_starts_late_confirms_the_brief_without_a_resubmit() {
+    let run = run_lost_brief(|second| {
+        if second < 20 {
+            idle_probe("term_fixture:0:3:8:i", EMPTY_CODEX)
+        } else {
+            idle_probe("term_fixture:0:4:9:i", EMPTY_CODEX)
+        }
+    });
+    assert!(matches!(run.outcome, Ok(false)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 0);
+}
+
+#[test]
+fn queued_startup_evidence_or_a_restart_never_resubmits() {
+    let queued =
+        "Waiting for startup · esc cancel\n› Ask Codex to do anything\n  ? for shortcuts\n";
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", queued));
+    assert!(matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))));
+    assert_eq!(run.resubmits, 0);
+
+    let run = run_lost_brief(|_| idle_probe("term_fixture:1:3:8:i", EMPTY_CODEX));
+    assert!(matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))));
+    assert_eq!(run.resubmits, 0);
+
+    let run = run_lost_brief(|_| Probe::Gone);
+    assert!(matches!(run.outcome, Err(SubmitFailure::Gone)));
+    assert_eq!(run.resubmits, 0);
+}
+
+#[test]
+fn only_codex_retypes_a_lost_brief() {
+    for harness in &HARNESSES {
+        assert_eq!(
+            harness.resubmit_lost_brief,
+            harness.name == "codex",
+            "{} (opencode keeps #636's never-retype rule)",
+            harness.name
+        );
+    }
 }

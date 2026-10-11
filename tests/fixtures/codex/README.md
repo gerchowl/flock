@@ -33,3 +33,14 @@ content. The 50-column pane wraps the explanatory text and bottom notice.
 This is a replay of the issue's screen, not a fresh live Codex capture.
 The title, three choices and final no-action notice identify the active menu.
 The selection marker may move between choices; none requires action.
+
+# Codex folder-trust dialog (#828)
+
+`folder-trust.txt` is a live Codex 0.160.1 capture (`tmux capture-pane`, 100
+columns) of the first start in a subdirectory of a git repository Codex had
+never trusted, run with a throwaway `CODEX_HOME` and no flk server. Only the
+two scratch paths were replaced by `/fixture/codex-828/…`; the wording, the
+selection marker, the blank rows and the `enter continue · esc quit` footer are
+unchanged. A start at the repository root itself shows the same dialog without
+the `Note:` paragraph. The dialog has no composer, so a brief typed at it
+answers the dialog.
