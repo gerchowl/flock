@@ -62,6 +62,17 @@ retries = 2
 filter = 'kind(test)'
 retries = 2
 
+[profile.ci]
+# CI's profile (#991). It inherits every `profile.default` override above —
+# the serial-pty group, the retries and the slow-timeouts — and only adds a
+# JUnit report, which `scripts/ci_shards.py summary` turns into the job
+# summary (slowest tests, per-binary totals, per-shard wall clock).
+# Written to target/nextest/ci/junit.xml.
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
+
 # NOTE: nextest IGNORES a top-level `[env]` table — it warns "ignoring unknown
 # configuration keys: env" and carries on, so pinning the test environment here
 # looks like it works and does nothing. Verified against cargo-nextest 0.9.133.
