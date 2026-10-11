@@ -464,6 +464,69 @@ fn one_way_edge_carries_both_directions() {
     once(c.fleet.node("nodea"), "reverse");
 }
 
+// The hub leases an offered row for its backoff. When the offer never lands,
+// the row must come back on its own once that backoff ends: no new mail, no
+// test-side `due`, and nowhere near the 299 s idle poll (#879). A silent loss
+// leaves the collector healthy, so the hub's wake carries it. A failed poll
+// holds wakes off, so the collector's own failure retry carries it.
+fn lost_offer_on_one_way_edge_is_reoffered_after_backoff(how: &str) {
+    let c = Conversation::new(DIRECT);
+    round_trip(&c);
+    fleet::wait_until("sender discovery", DEADLINE, || {
+        api(c.fleet.node("nodeb"), "agent.list", json!({}))["fleet"]
+            .as_array()?
+            .iter()
+            .any(|entry| entry["agent_id"] == c.sender.id)
+            .then_some(())
+    });
+    // Without the summary's pending flag, the collector would next look on
+    // its idle poll, 299 s out. Only the hub's own wake can bring it sooner.
+    fs::write(c.fleet.base.join("hide-pending-nodea-nodeb"), "").unwrap();
+    fs::write(c.fleet.base.join("lose-outbound-offer-nodea-nodeb"), how).unwrap();
+    c.receiver.cli(
+        c.fleet.node("nodeb"),
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &c.sender.id,
+            "--correlation-id",
+            "reverse",
+            "--intent",
+            "fyi",
+            "reverse body",
+        ],
+    );
+    fleet::wait_until("first offer lost", DEADLINE, || {
+        c.fleet
+            .base
+            .join("lost-outbound-offer-nodea-nodeb")
+            .exists()
+            .then_some(())
+    });
+    let lost = Instant::now();
+    let messages = mail(c.fleet.node("nodea"), &c.sender.pane);
+    assert_eq!(messages[0]["correlation_id"], "reverse");
+    // A 5 s lease plus up to 1 s of jitter, with room for a loaded runner.
+    assert!(
+        lost.elapsed() < Duration::from_secs(15),
+        "re-offer took {:?}",
+        lost.elapsed()
+    );
+    state(c.fleet.node("nodeb"), "reverse", "delivered");
+    once(c.fleet.node("nodea"), "reverse");
+}
+
+#[test]
+fn silently_lost_offer_on_one_way_edge_is_reoffered_after_backoff() {
+    lost_offer_on_one_way_edge_is_reoffered_after_backoff("silent");
+}
+
+#[test]
+fn failed_offer_on_one_way_edge_is_reoffered_after_backoff() {
+    lost_offer_on_one_way_edge_is_reoffered_after_backoff("error");
+}
+
 #[test]
 fn laptop_collects_answer_through_a_different_hub() {
     let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");

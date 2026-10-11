@@ -678,6 +678,19 @@ impl App {
         if paused {
             return;
         }
+        // A held edge is collected, never pushed, so an offer whose lease ran
+        // out waits for a wake. Without one the collector finds it only on
+        // its next summary or idle poll (#879).
+        if let Ok((checked, hops)) = with_store(|store| {
+            store
+                .offers_due(self.mesh_offers_checked_ms, now_ms() as i64)
+                .map_err(|e| e.to_string())
+        }) {
+            self.mesh_offers_checked_ms = checked;
+            for hop in hops {
+                self.emit_mesh_wake(&hop);
+            }
+        }
         let route_generation = self.mesh_routes.table.generation();
         if self.mesh_forward_generation != Some(route_generation) {
             let adjacent: Vec<_> = self
