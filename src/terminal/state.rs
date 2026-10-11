@@ -253,6 +253,11 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub launch_env: Vec<(String, String)>,
+    /// The agent session whose profile selector was last read into
+    /// `launch_env` (#1010), so a hook that reports on every state change
+    /// reads the process environment once per session, not once per report.
+    /// Ephemeral: `launch_env` is what persists.
+    pub(crate) profile_env_session: Option<String>,
     pub restart_in_progress: bool,
     pub restart_stopped: bool,
     pub(crate) restart_confirmation_pid: Option<u32>,
@@ -364,6 +369,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             launch_env: Vec::new(),
+            profile_env_session: None,
             restart_in_progress: false,
             restart_stopped: false,
             restart_confirmation_pid: None,

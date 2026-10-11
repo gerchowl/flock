@@ -1228,6 +1228,9 @@ impl App {
             status_age_secs: pane.status_age_secs,
             run_id: terminal.run_id.clone(),
             turn_cursor: pane.turn_cursor,
+            resumable: terminal.hibernated_resume_plan.is_some()
+                || (terminal.pending_agent_resume_plan.is_some()
+                    && self.terminal_runtimes.get(&terminal.id).is_none()),
             revision: pane.revision,
         })
     }

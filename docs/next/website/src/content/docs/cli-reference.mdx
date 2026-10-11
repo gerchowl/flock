@@ -361,7 +361,7 @@ The pane defaults to the calling pane. Use `--pane <pane_id>` or a legacy leadin
 ## Agents
 
 ```bash
-flk agent list
+flk agent list [--resumable]
 flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]
@@ -373,8 +373,8 @@ flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|s
 flk agent attach <target> [--takeover]
 flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]
-flk agent hibernate <target>
-flk agent resume <target>
+flk agent hibernate <target>|--all
+flk agent resume <target>|--all
 flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]
 flk lineage <target> [--json]
 flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking] [--correlation-id ID] [--reply-to ID] [--await [--timeout MS]] [-- <text starting with dashes>]
@@ -433,6 +433,10 @@ A status result includes a signed `reference`. Retain it and pass it as `referen
 `msg send` queues a message for another pane's agent; it is typed and submitted as a chat turn at that pane's next settled turn boundary, tagged with the sender pane and a correlation id the recipient can `msg reply` to. `<repo>:<pane>` splits only when the left side names a known repo; use `--repo` to be explicit. `--intent` says how much you need from the recipient, and it rides the envelope, so the recipient sees it before reading the body and `msg list` shows it on the queued row: `fyi` never wakes the recipient (it is read whenever the inbox next is), `needs-reply` marks the message as one you are owed an answer to and nudges the recipient at its next turn boundary, and `blocking` says you cannot proceed without one — it also puts the recipient in the operator's attention list and, if the recipient has muted itself, files an operator notification naming sender, recipient and count. `blocking` has its own per-sender budget, `[msg] blocking_per_hour`; past it the message is still delivered, as `needs-reply`, and the send result's `warnings` say it was downgraded. It defaults to `fyi` on the CLI — the MCP tool requires the choice instead, since an agent that never has to look at the field will not. Both verbs **refuse an option they do not recognise** rather than treating it as body text, and `--` ends flag parsing so a message may legitimately begin with dashes. Cross-host sends now persist custody before delivery and return a server-minted message key. A held authenticated mesh edge imports the message exactly once per key. A `delivered` result confirms inbox import; `queued` retains the message for retry after a disconnection or restart. An incompatible peer is named with `upgrade flk on <peer>`; sends do not fall back to a one-shot SSH command. `lineage` prints the fork ancestry chain of a pane, worktree, or branch — reconstructed from the durable event log, so it survives server restarts. `agent fork` branches the target's conversation into a new linked worktree: it creates the worktree, then starts a pane that resumes a fork of the agent's session, optionally seeded with a pivot prompt (`--pivot`; `<branch>` resolves to the final branch name, `--no-pivot` opts out of the configured template). Only Claude sessions can fork; other agents are refused with `unsupported_for_agent` because a plain resume would attach two processes to one session id.
 
 `agent hibernate` parks a pane cleanly: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. The next focus (or an explicit `agent resume`) respawns it. Panes without a resumable session refuse with `hibernate_unsupported` (data-loss guard).
+
+Hibernation survives a server restart, not only a live handoff: the stashed plan is saved in the session snapshot together with the agent's profile selector (the keys `[spawn.env]` declares, such as `CLAUDE_CONFIG_DIR`), so a cold-started server restores the pane hibernated and `agent resume` brings the agent back logged in to the same account. The selector is recorded when `agent start` carries it, when the agent's hook first reports its session, and again at hibernate. Every `agent` verb also takes the agent's `agent_id`, which is the address that survives a restart (terminal ids are re-minted and pane ids are placements).
+
+When a live handoff is not possible, restart instead: `flk agent hibernate --all` before stopping the server, then after the start `flk agent list --resumable` and `flk agent resume --all`. Both `--all` forms print `{"results":[…]}` with an `outcome` per agent (`hibernated`/`resumed`, `skipped` with a `code`, or `failed` with the server's `code` and `message`) and exit 1 if any agent failed. `agent list` marks such agents `"resumable": true`; that also covers an agent a restart restored whose deferred resume has not run yet, which on a server with no client attached it never does on its own, so after an unplanned restart `resume --all` brings those back too.
 
 `checks list` enumerates the runner's script checks together with the built-in state (blocked-alert / hibernation / issue-guard). `checks ack <name>` silences the next fire — for script checks the debounce window; for the built-in blocked-alert, the current in-flight episodes. `checks run <name>` forces a script check due right now.
 

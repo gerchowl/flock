@@ -119,6 +119,10 @@ impl App {
             .ok_or(HibernationError::NotFound)?;
         let workspace_id = self.public_workspace_id(ws_idx);
 
+        // Read the profile selector while the agent process still exists to
+        // read it from (#1010): after the shutdown below nothing on the
+        // machine says which account the session belongs to.
+        self.record_agent_profile_env(&terminal_id, None);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.set_hibernated_resume_plan(Some(plan.clone()));
             terminal.respawn_shell_on_exit = false;
@@ -175,9 +179,18 @@ impl App {
             if terminal.restart_in_progress {
                 return Err(HibernationError::RestartPending);
             }
+            // A restored agent still waiting for its deferred resume (#1010)
+            // is as parked as a hibernated one: it has a plan and no process.
+            // Answering `not_hibernated` there told an operator after a cold
+            // start that their agent could not come back when it could.
+            let deferred = terminal
+                .pending_agent_resume_plan
+                .clone()
+                .filter(|_| self.terminal_runtimes.get(&terminal_id).is_none());
             let plan = terminal
                 .hibernated_resume_plan
                 .clone()
+                .or(deferred)
                 .ok_or(HibernationError::NotHibernated)?;
             (terminal_id, plan)
         };
