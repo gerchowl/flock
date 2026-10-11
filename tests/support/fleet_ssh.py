@@ -280,6 +280,12 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        # Leaves the hub's own wake as the only prompt to collect (#879).
+        result = response.get("result")
+        if (base / f"hide-pending-{source}-{target}").exists() and isinstance(result, dict) \
+                and result.get("outbound_pending"):
+            result["outbound_pending"] = False
+            line = json.dumps(response) + "\n"
         summary_probe = base / f"observed-summary-{source}-{target}"
         if response.get("event") == "mesh_outbound_pending":
             summary_probe.unlink(missing_ok=True)
@@ -294,8 +300,22 @@ try:
             if answers:
                 with (base / f"outbound-offers-{source}-{target}").open("a") as log:
                     log.write(json.dumps(answers) + "\n")
+                # The hub has already leased these rows, so dropping the reply
+                # leaves them unacked until their backoff expires (#879).
+                lose = base / f"lose-outbound-offer-{source}-{target}"
+                if lose.exists():
+                    how = lose.read_text().strip()
+                    lose.rename(base / f"lost-outbound-offer-{source}-{target}")
+                    if how == "error":
+                        response = {"id": response["id"], "error": {
+                            "code": "lost_offer", "message": "offer lost in transit",
+                        }}
+                    else:
+                        response = {"id": response["id"], "result": {"answers": []}}
+                    line = json.dumps(response) + "\n"
+                    answers = []
                 corrupt = base / f"corrupt-outbound-{source}-{target}"
-                if corrupt.exists():
+                if answers and corrupt.exists():
                     answers[0]["remaining_ms"] = "undecodable"
                     corrupt.unlink()
                     line = json.dumps(response) + "\n"

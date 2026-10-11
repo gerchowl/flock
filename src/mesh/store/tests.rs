@@ -4578,6 +4578,38 @@ fn forwarded_returns_are_advertised_by_next_hop_without_committing() {
 }
 
 #[test]
+fn expired_offer_lease_reports_its_hop_once_without_committing() {
+    use crate::mesh::collect::OutboundCollect;
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    store.set_local_node("hub.example");
+    let mut mail = envelope();
+    mail.request_key = Some(MessageKey::mint("request.example".into(), 0).unwrap());
+    store
+        .accept_origin(&mail, "next.example", Admission::Held, 7, 0)
+        .unwrap();
+    // Announced on arrival, so a never-offered row is no re-wake.
+    assert_eq!(store.offers_due(0, 10_000).unwrap().1, Vec::<String>::new());
+    let offered = store
+        .collect_outbound(
+            Offer::All,
+            "hub.example",
+            "next.example",
+            &OutboundCollect::default(),
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(offered.len(), 1);
+    let before = store.connection.total_changes();
+    let (checked, hops) = store.offers_due(1_000, 5_999).unwrap();
+    assert!(hops.is_empty());
+    let (checked, hops) = store.offers_due(checked, 6_000).unwrap();
+    assert_eq!(hops, vec!["next.example".to_owned()]);
+    assert!(store.offers_due(checked, 60_000).unwrap().1.is_empty());
+    assert_eq!(store.connection.total_changes(), before);
+}
+
+#[test]
 fn routed_receipt_and_forwarded_answer_replays_do_not_commit() {
     for (kind, admission) in [
         (Kind::Receipt, Admission::Inbox),

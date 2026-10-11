@@ -2024,6 +2024,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopened_store_rechecks_offer_leases_from_its_own_clock() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        app.mesh_offers_checked_ms = i64::MAX;
+        app.resume_mesh_store(0);
+        let result = recovered(&mut app).await;
+        app.finish_mesh_recovery(result);
+        assert_eq!(app.mesh_offers_checked_ms, 0);
+    }
+
+    #[tokio::test]
     async fn mail_parked_through_a_failed_recovery_gets_the_store_error() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         let _store = crate::mesh::runtime_store::TestStore::new();

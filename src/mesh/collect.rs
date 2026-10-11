@@ -20,6 +20,10 @@ pub(crate) struct Poll {
     pub pinned: bool,
     deadline: Option<std::time::Instant>,
     attempts: usize,
+    /// Consecutive failed polls. A failure backs off on its own ladder, so a
+    /// first failure after a long idle history waits 5 s, not the idle 299 s
+    /// (#879). The hub's offer lease expires on the same 5 s step.
+    failures: usize,
     generation: u64,
     failed: bool,
     receipts_pending: bool,
@@ -38,6 +42,7 @@ impl Poll {
         if pinned && (!self.pinned || self.generation != generation) {
             self.deadline = None;
             self.attempts = 0;
+            self.failures = 0;
             self.failed = false;
             self.receipts_deferred = false;
         }
@@ -59,8 +64,14 @@ impl Poll {
         self.pending = false;
         self.receipts_pending = false;
         self.failed = failed;
-        let seconds = [5, 60, 299][self.attempts.min(2)];
+        let step = if failed { self.failures } else { self.attempts };
+        let seconds = [5, 60, 299][step.min(2)];
         self.attempts = self.attempts.saturating_add(1);
+        self.failures = if failed {
+            self.failures.saturating_add(1)
+        } else {
+            0
+        };
         let mut random = [0; 2];
         let _ = getrandom::fill(&mut random);
         let jitter = u64::from(u16::from_le_bytes(random) % 1001);
@@ -240,11 +251,36 @@ mod tests {
         poll.note_wake();
         assert!(poll.ready(now, true, 1));
         poll.finished(now, true);
-        for second in 0..60 {
+        for second in 0..5 {
             poll.note_wake();
             assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
         }
-        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+        let retry = now + std::time::Duration::from_secs(6);
+        assert!(poll.ready(retry, true, 1));
+        // A second consecutive failure holds wakes off for the next step.
+        poll.finished(retry, true);
+        for second in 0..60 {
+            poll.note_wake();
+            assert!(!poll.ready(retry + std::time::Duration::from_secs(second), true, 1));
+        }
+        assert!(poll.ready(retry + std::time::Duration::from_secs(61), true, 1));
+    }
+
+    #[test]
+    fn first_failure_after_idle_history_retries_on_the_offer_lease_not_idle_cadence() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        for _ in 0..4 {
+            poll.finished(now, false);
+        }
+        assert!(!poll.ready(now + std::time::Duration::from_secs(298), true, 1));
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, true);
+        poll.note_wake();
+        assert!(!poll.ready(now + std::time::Duration::from_secs(4), true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(7), true, 1));
     }
 
     #[test]
@@ -258,13 +294,13 @@ mod tests {
         assert!(poll.ready(now, true, 1));
         // Transport succeeded but persisting receipts_sent failed.
         poll.finished(now, true);
-        for second in 0..60 {
+        for second in 0..5 {
             poll.note_receipts(true);
             assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
         }
-        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
-        poll.finished(now + std::time::Duration::from_secs(61), false);
-        assert!(!poll.ready(now + std::time::Duration::from_secs(62), true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(6), true, 1));
+        poll.finished(now + std::time::Duration::from_secs(6), false);
+        assert!(!poll.ready(now + std::time::Duration::from_secs(7), true, 1));
     }
 
     #[test]
@@ -281,10 +317,18 @@ mod tests {
         assert!(!poll.ready(now + std::time::Duration::from_secs(59), true, 1));
         poll.pending = true;
         assert!(poll.ready(now, true, 1));
+        // Consecutive failures climb their own 5/60/299 s ladder.
+        for (failure, wait) in [5, 60, 299].into_iter().enumerate() {
+            poll.finished(now, true);
+            poll.pending = true;
+            assert!(
+                !poll.ready(now + std::time::Duration::from_secs(wait - 1), true, 1),
+                "failure {failure}"
+            );
+            assert!(poll.ready(now + std::time::Duration::from_secs(wait + 1), true, 1));
+        }
         poll.finished(now, true);
-        poll.pending = true;
         assert!(!poll.ready(now + std::time::Duration::from_secs(298), true, 1));
-        assert!(poll.ready(now + std::time::Duration::from_secs(300), true, 1));
         assert!(poll.ready(now, true, 2));
         assert!(!poll.ready(now, false, 2));
         assert!(poll.ready(now, true, 1));

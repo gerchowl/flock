@@ -169,6 +169,9 @@ pub struct App {
     pub(crate) collection_peers: std::collections::HashMap<String, String>,
     pub(crate) collection_generation: u64,
     pub(crate) mesh_retry_at: Option<Instant>,
+    /// Store-clock ms up to which expired offer leases have woken their
+    /// collectors (#879).
+    pub(crate) mesh_offers_checked_ms: i64,
     pub(crate) mesh_receipt_log_at: Option<Instant>,
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     mesh_store_retry_at: Option<Instant>,
@@ -972,6 +975,7 @@ impl App {
             collection_peers: Default::default(),
             collection_generation: 0,
             mesh_retry_at: None,
+            mesh_offers_checked_ms: 0,
             mesh_receipt_log_at: None,
             pending_agent_removals: Default::default(),
             mesh_store_retry_at: None,
@@ -1094,6 +1098,9 @@ impl App {
                     self.apply_mesh_mail(records);
                 }
                 crate::mesh::runtime_store::recovered();
+                // The reopened store's clock may restart below the old mark,
+                // which would hide every lease until it caught up (#879).
+                self.mesh_offers_checked_ms = 0;
                 self.mesh_retry_at = None;
                 self.mesh_maintenance_at = None;
                 self.mesh_store_retry_at = None;
