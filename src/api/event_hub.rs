@@ -1,7 +1,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::api::schema::EventEnvelope;
+use crate::api::schema::{EventEnvelope, EventKind};
 
 /// One durable log line (#175 O1). Newline-delimited JSON so a torn tail
 /// from a crash mid-write is detectable: the last line either parses whole
@@ -168,14 +168,31 @@ fn highest_seq_best_effort(path: &Path) -> u64 {
     highest
 }
 
-fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
+/// The sequence of a line that is a well-formed log entry this binary cannot
+/// type: a kind added by a newer release (#1020, ADR-0028 §3a). Such a line is
+/// skipped, never treated as corruption, so a downgrade or the old side of a
+/// live handoff keeps the log instead of quarantining it. A KNOWN kind that
+/// fails to parse is real corruption and is not skipped.
+fn unknown_kind_seq(line: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let kind = value.pointer("/envelope/event")?;
+    if !kind.is_string() || serde_json::from_value::<EventKind>(kind.clone()).is_ok() {
+        return None;
+    }
+    value.get("seq")?.as_u64()
+}
+
+/// Events in one file, plus the highest sequence among skipped unknown-kind
+/// lines: those numbers are spent too, and must not be handed out again.
+fn read_log_file(path: &Path) -> Result<(Vec<PersistedEvent>, u64), String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     let mut reader = std::io::BufReader::new(file);
     let mut events = Vec::new();
+    let mut skipped_seq = 0;
     let mut line = String::new();
     loop {
         line.clear();
@@ -194,13 +211,16 @@ fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
                 let _ = err;
                 break;
             }
-            Err(err) => return Err(format!("{}: corrupt line: {err}", path.display())),
+            Err(err) => match unknown_kind_seq(line.trim_end()) {
+                Some(seq) => skipped_seq = skipped_seq.max(seq),
+                None => return Err(format!("{}: corrupt line: {err}", path.display())),
+            },
         }
         if !complete {
             break;
         }
     }
-    Ok(events)
+    Ok((events, skipped_seq))
 }
 
 pub(crate) struct ReplyWaitGuard {
@@ -255,6 +275,7 @@ impl EventHub {
             let Ok(mut state) = hub.inner.lock() else {
                 return hub;
             };
+            let mut highest_skipped_seq = 0;
             for index in (1..=MAX_ROTATED).rev() {
                 let mut name = path
                     .file_stem()
@@ -263,13 +284,19 @@ impl EventHub {
                     .to_string();
                 name.push_str(&format!(".{index}.jsonl"));
                 match read_log_file(&path.with_file_name(name)) {
-                    Ok(events) => restored.extend(events),
+                    Ok((events, skipped)) => {
+                        restored.extend(events);
+                        highest_skipped_seq = highest_skipped_seq.max(skipped);
+                    }
                     Err(err) => crate::logging::event_log_corrupt(&err),
                 }
             }
             let mut highest_quarantined_seq = 0;
             match read_log_file(&path) {
-                Ok(events) => restored.extend(events),
+                Ok((events, skipped)) => {
+                    restored.extend(events);
+                    highest_skipped_seq = highest_skipped_seq.max(skipped);
+                }
                 Err(err) => {
                     // The active file is append-target: a corrupt one would
                     // swallow every future event on the next load. Quarantine
@@ -299,7 +326,8 @@ impl EventHub {
                 .last()
                 .map(|event| event.seq)
                 .unwrap_or(0)
-                .max(highest_quarantined_seq);
+                .max(highest_quarantined_seq)
+                .max(highest_skipped_seq);
             state.events = restored
                 .iter()
                 .rev()
@@ -413,12 +441,12 @@ impl EventHub {
         let mut restored: Vec<PersistedEvent> = Vec::new();
         for index in (1..=MAX_ROTATED).rev() {
             match read_log_file(&log.rotated_path(index)) {
-                Ok(events) => restored.extend(events),
+                Ok((events, _)) => restored.extend(events),
                 Err(err) => crate::logging::event_log_corrupt(&err),
             }
         }
         match read_log_file(&log.path) {
-            Ok(events) => restored.extend(events),
+            Ok((events, _)) => restored.extend(events),
             Err(err) => crate::logging::event_log_corrupt(&err),
         }
         restored.sort_by_key(|event| event.seq);
@@ -433,7 +461,7 @@ impl EventHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::{EventData, EventKind};
+    use crate::api::schema::EventData;
 
     fn temp_log(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -534,6 +562,62 @@ mod tests {
             assert_eq!(last.len(), 1, "exactly the new event after the max");
             cleanup(&path);
         }
+    }
+
+    /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
+    /// corruption, and its sequence stays spent.
+    #[test]
+    fn an_unknown_kind_is_skipped_without_quarantining_the_log() {
+        let path = temp_log("unknown-kind");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        drop(hub);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+            file.write_all(
+                b"{\"seq\":2,\"ts_ms\":1,\"envelope\":{\"event\":\"pr.from_the_future\",\"data\":{\"type\":\"pr.from_the_future\"}}}\n",
+            )
+            .unwrap();
+        }
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "an unknown kind must not quarantine the log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        restarted.push(workspace_event("w2"));
+        let seqs: Vec<u64> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(seq, _, _)| seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 3], "seq 2 stays spent");
+        cleanup(&path);
+    }
+
+    /// Skipping is for kinds this binary does not know. A known kind with
+    /// malformed data is corruption, and must still be caught.
+    #[test]
+    fn a_known_kind_with_malformed_data_is_still_corrupt() {
+        let path = temp_log("known-kind-malformed");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        drop(hub);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+            file.write_all(
+                b"{\"seq\":2,\"ts_ms\":1,\"envelope\":{\"event\":\"workspace_closed\",\"data\":{\"type\":\"workspace_closed\"}}}\n",
+            )
+            .unwrap();
+        }
+        let _restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "a known kind that fails to parse must be quarantined, not skipped"
+        );
+        cleanup(&path);
     }
 
     #[test]
