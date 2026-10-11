@@ -577,6 +577,16 @@ fn lost_collect_ack_reimports_once_after_edge_is_killed() {
     conversation.read_question();
     let gate = conversation.fleet.base.join("gate-collect-ack-nodea-nodeb");
     std::fs::create_dir(&gate).unwrap();
+    // The outbound poll offers the held answer too. Keep it on the gated
+    // collect lane, or a poll that wins the race skips the gate (#948).
+    std::fs::write(
+        conversation
+            .fleet
+            .base
+            .join("withhold-outbound-answers-nodea-nodeb"),
+        "",
+    )
+    .unwrap();
     conversation.reply();
     due(conversation.fleet.node("nodea"));
     fleet::wait_until("collection ack after import", DEADLINE, || {
@@ -1121,6 +1131,34 @@ fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
     conversation.answer_once();
     assert_eq!(api(hub, "peers.enrollment", json!({})), enrollment);
     assert!(delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2);
+}
+
+#[test]
+fn reply_push_in_flight_is_not_pushed_again_by_the_retry_scheduler() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let gate = conversation
+        .fleet
+        .base
+        .join("gate-delivery-ack-nodeb-nodea");
+    std::fs::create_dir(&gate).unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("reply push in flight", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
+    // Hold the relay's push across several one-second scheduler ticks. A
+    // second push for the same row queues behind it on the held edge (#948).
+    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(gate.join("release"), "").unwrap();
+    conversation.answer_once();
+    // A queued second push goes out as soon as the first one's reply lands.
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation),
+        1
+    );
 }
 
 #[test]
