@@ -386,6 +386,9 @@ impl App {
             );
         };
         let (status, status_text) = crate::agent_transcript::sentinel(&reply.text).unzip();
+        let settled_with_background_shells = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .is_some_and(|agent| agent.settled_with_background_shells);
         let max_chars = params
             .max_chars
             .unwrap_or(AGENT_RESULT_DEFAULT_CHARS)
@@ -405,6 +408,7 @@ impl App {
                     agent: store.agent().to_string(),
                     session_id: store.session_id().to_string(),
                     finished,
+                    settled_with_background_shells,
                     status,
                     status_text,
                     text,
@@ -1101,6 +1105,101 @@ mod tests {
         assert!(!info.finished);
         assert_eq!(info.text, "DONE: first shipped");
         assert_eq!(info.status.as_deref(), Some("done"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #922: the server's own detector sees a Claude turn that ended with a
+    /// shell still running, and `agent.get` and `agent.result` both say so. It
+    /// starts from a real screen through the shared detector and the
+    /// `StateChanged` event the detection task publishes, so the field is
+    /// produced the way a live pane produces it, not set by hand.
+    #[test]
+    fn settled_with_background_shells_reaches_agent_get_and_agent_result() {
+        use crate::detect::{Agent, AgentState};
+        use crate::events::AppEvent;
+
+        let settled = concat!(
+            "\u{25cf} DONE: recovered\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 1 shell \u{b7} \u{2190} for agents\n",
+        );
+        let body = user_line("recover it") + &assistant_line("DONE: recovered");
+        let home = claude_home_with("settled-shells", "sess-shells", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-shells");
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused pane");
+        let publish = |app: &mut App, screen: &str| {
+            let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+            app.state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Claude),
+                state: detection.state,
+                activity: detection.activity,
+                provider_limit: detection.provider_limit,
+                visible_blocker: detection.visible_blocker,
+                visible_idle: detection.visible_idle,
+                visible_working: detection.visible_working,
+                settled_with_background_shells: detection.settled_with_background_shells,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+            detection.state
+        };
+        let get = |app: &mut App| -> serde_json::Value {
+            let response = app.handle_api_request_after_internal_events_drained(Request {
+                id: "req".into(),
+                method: Method::AgentGet(crate::api::schema::AgentTarget {
+                    target: target.clone(),
+                }),
+            });
+            serde_json::from_str(&response).expect("agent.get json")
+        };
+        let read_result = |app: &mut App| -> serde_json::Value {
+            serde_json::from_str(&result(app, &target, None, None)).expect("agent.result json")
+        };
+
+        assert_eq!(publish(&mut app, settled), AgentState::Idle);
+        let agent = get(&mut app);
+        assert_eq!(
+            agent["result"]["agent"]["settled_with_background_shells"], true,
+            "{agent}"
+        );
+        let reply = read_result(&mut app);
+        assert_eq!(
+            reply["result"]["result"]["settled_with_background_shells"], true,
+            "{reply}"
+        );
+
+        // A plain settle with nothing left running omits the field, as does
+        // an older server, so a client reads absent as false.
+        let plain = concat!(
+            "\u{25cf} DONE: recovered\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} bypass permissions on\n",
+        );
+        assert_eq!(publish(&mut app, plain), AgentState::Idle);
+        let agent = get(&mut app);
+        assert!(
+            agent["result"]["agent"]
+                .get("settled_with_background_shells")
+                .is_none(),
+            "{agent}"
+        );
+        let reply = read_result(&mut app);
+        assert!(
+            reply["result"]["result"]
+                .get("settled_with_background_shells")
+                .is_none(),
+            "{reply}"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 

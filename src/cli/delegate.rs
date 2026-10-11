@@ -4110,10 +4110,18 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     let latest = load_observation(&entry);
     // A turn that ended with shells still running is settled (#911), and says
     // so, rather than leaving the caller to wonder what the footer counts.
+    // The server carries the detector's answer on the record (#922). It omits
+    // the field when false, and an older server never sends it, so an absent
+    // field falls back to reading the screen here. Telling the two apart would
+    // take a capability ping, which a successful delegate command never sends.
     let background_shells = !gone
         && matches!(status, "idle" | "done")
-        && detection_screen(&entry.pane_id, None)
-            .is_some_and(|screen| crate::detect::settled_with_background_shells(&screen));
+        && (record
+            .get("settled_with_background_shells")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || detection_screen(&entry.pane_id, None)
+                .is_some_and(|screen| crate::detect::settled_with_background_shells(&screen)));
     // A bare `blocked` gives the operator nothing to act on when the harness is
     // sitting on a dialog it shows before any input (#828).
     let startup_dialog = (!gone && status == "blocked")

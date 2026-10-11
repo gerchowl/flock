@@ -5918,6 +5918,7 @@ sidebar_pane_gap = 99
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -5945,6 +5946,7 @@ sidebar_pane_gap = 99
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
