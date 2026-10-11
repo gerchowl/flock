@@ -296,6 +296,18 @@ what happens, in order:
 4. when your harness reports the compaction back, flock types your handoff
    prompt in and submits it — and that is your next turn.
 
+to steer what the compaction's summary keeps, pass instructions too. flock
+types them after the command, as `/compact <instructions>`:
+
+```bash
+flk pane arm-self-compact \
+  --instructions "keep GOAL.md, the STATUS.md next step, open PRs, standing rules" \
+  "pick up at the STATUS.md next step"
+```
+
+`--instructions-file <path>` reads them from a file instead. one line, plain
+text. claude code only, like the rest of this.
+
 write the prompt as instructions to your own next self. assume nothing
 survives but the compaction: name what to check first, what not to redo, and
 where you left off. if the detail is long, put it in a file and name the file.

@@ -97,11 +97,17 @@ fn claude_idle_at(app: &mut App, idle_for: Duration, observed_at: Instant) {
 }
 
 fn arm(app: &mut App, pane: &str, continuation: &str) -> String {
+    arm_with(app, pane, continuation, None)
+}
+
+/// Arm with instructions for what the compaction keeps (#854).
+fn arm_with(app: &mut App, pane: &str, continuation: &str, instructions: Option<&str>) -> String {
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::PaneArmSelfCompact(PaneArmSelfCompactParams {
             pane: Some(pane.to_string()),
             continuation: Some(continuation.to_string()),
+            instructions: instructions.map(str::to_string),
             abort: false,
         }),
     })
@@ -394,6 +400,7 @@ async fn aborting_reports_whether_there_was_anything_to_drop() {
         method: Method::PaneArmSelfCompact(PaneArmSelfCompactParams {
             pane: Some(pane.clone()),
             continuation: None,
+            instructions: None,
             abort: true,
         }),
     });
@@ -405,6 +412,7 @@ async fn aborting_reports_whether_there_was_anything_to_drop() {
         method: Method::PaneArmSelfCompact(PaneArmSelfCompactParams {
             pane: Some(pane),
             continuation: None,
+            instructions: None,
             abort: true,
         }),
     });
@@ -828,4 +836,159 @@ fn a_continuation_cannot_break_out_of_the_paste_or_run_as_a_command() {
         check_continuation("run just check, then a/b and c!"),
         Ok(())
     );
+}
+
+/// #854: the instructions go out in the SAME paste as `/compact`, so the one
+/// Enter a gap later submits the command with its argument, and the rest of
+/// the sequence is unchanged.
+#[tokio::test]
+async fn instructions_are_typed_after_the_compact_command_in_one_write() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    let keep = "keep GOAL.md, the STATUS.md next step, open PRs and the standing rules";
+    let reply = arm_with(&mut app, &pane, "carry on from STATUS.md", Some(keep));
+    assert!(reply.contains("\"state\":\"armed\""), "{reply}");
+    assert!(
+        reply.contains("\"instructions\":true"),
+        "the answer must say the instructions were stored, or a client cannot \
+         tell this server from one that ignored them: {reply}"
+    );
+
+    let now = Instant::now();
+    app.tick_self_compacts(now);
+    let writes = drain(&mut pty);
+    assert_eq!(writes.len(), 1, "command and instructions are one paste");
+    let typed = String::from_utf8_lossy(&writes[0]).into_owned();
+    assert!(
+        typed.contains(&format!("/compact {keep}")),
+        "expected `/compact <instructions>`, got {typed:?}"
+    );
+    assert!(!typed.contains('\r'), "the Enter is not in the paste");
+    app.tick_self_compacts(now + GAP);
+    assert!(!written(&mut pty).is_empty(), "the Enter is its own write");
+
+    session_started_with(&mut app, &pane, "compact");
+    deliver_continuation(&mut app, &mut pty);
+    let continuation = written(&mut pty);
+    assert!(
+        continuation.contains("carry on from STATUS.md") && !continuation.contains(keep),
+        "the continuation is delivered alone, got {continuation:?}"
+    );
+    assert_eq!(armed_continuation(&app), None, "the sequence completed");
+}
+
+/// Back-compat: an arming without instructions types the bare command and
+/// answers without the flag, exactly as before #854.
+#[tokio::test]
+async fn an_arming_without_instructions_types_the_bare_command() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    let reply = arm(&mut app, &pane, "carry on");
+    assert!(!reply.contains("\"instructions\""), "{reply}");
+
+    app.tick_self_compacts(Instant::now());
+    let typed = written(&mut pty);
+    assert!(typed.contains("/compact"), "{typed:?}");
+    assert!(
+        !typed.contains("/compact "),
+        "nothing follows the bare command: {typed:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_abort_drops_the_instructions_with_the_continuation() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Claude),
+        AgentState::Working,
+        false,
+        false,
+        false,
+        false,
+        Instant::now(),
+    );
+    arm_with(&mut app, &pane, "carry on", Some("keep GOAL.md"));
+    app.handle_api_request(Request {
+        id: "req".into(),
+        method: Method::PaneArmSelfCompact(PaneArmSelfCompactParams {
+            pane: Some(pane.clone()),
+            continuation: None,
+            instructions: None,
+            abort: true,
+        }),
+    });
+    assert!(terminal_const(&app).armed_self_compact.is_none());
+
+    // A later bare arming must not inherit the dropped instructions.
+    arm(&mut app, &pane, "carry on");
+    claude_idle_for(&mut app, SETTLED);
+    app.tick_self_compacts(Instant::now());
+    let typed = written(&mut pty);
+    assert!(!typed.contains("GOAL.md"), "{typed:?}");
+}
+
+#[tokio::test]
+async fn instructions_that_could_escape_the_paste_are_refused_and_nothing_is_armed() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    for (instructions, expect) in [
+        ("keep this\nand that", "must be one line"),
+        ("keep\x1b[201~ this", "must be plain text"),
+        ("   ", "must not be empty"),
+    ] {
+        let reply = arm_with(&mut app, &pane, "carry on", Some(instructions));
+        assert!(
+            reply.contains("invalid_params") && reply.contains(expect),
+            "{instructions:?}: {reply}"
+        );
+        assert_eq!(armed_continuation(&app), None);
+    }
+    let long = "k".repeat(crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES + 1);
+    let reply = arm_with(&mut app, &pane, "carry on", Some(&long));
+    assert!(reply.contains("byte cap"), "{reply}");
+    assert_eq!(armed_continuation(&app), None);
+    app.tick_self_compacts(Instant::now());
+    assert!(drain(&mut pty).is_empty());
+}
+
+/// A harness whose compact command takes no argument never gets the arming:
+/// the instructions would be lost, and the agent would believe the summary
+/// kept what it asked.
+#[tokio::test]
+async fn instructions_for_a_harness_without_compact_arguments_are_refused() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    terminal(&mut app).set_detected_state_with_screen_signals_at(
+        Some(Agent::Codex),
+        AgentState::Idle,
+        false,
+        true,
+        false,
+        false,
+        Instant::now(),
+    );
+    let reply = arm_with(&mut app, &pane, "carry on", Some("keep GOAL.md"));
+    assert!(reply.contains("\"error\""), "{reply}");
+    assert_eq!(armed_continuation(&app), None);
+    assert!(!app.self_compact_takes_instructions(&pane));
+    assert!(drain(&mut pty).is_empty());
 }

@@ -498,7 +498,9 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 /// its own id first, which is one more step between "context is full" and
 /// acting on it.
 fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_arm_self_compact(args) {
+    let params = match parse_arm_self_compact(args, |path| {
+        std::fs::read_to_string(path).map_err(|err| format!("--instructions-file {path}: {err}"))
+    }) {
         Ok(params) => params,
         Err(usage) => {
             eprintln!("{usage}");
@@ -506,21 +508,41 @@ fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    super::print_response(&super::send_request(&Request {
+    let steered = params.instructions.is_some();
+    let pane = params.pane.clone();
+    let response = super::send_request(&Request {
         id: "cli:pane:arm-self-compact".into(),
         method: Method::PaneArmSelfCompact(params),
-    })?)
+    })?;
+    // #854: an older server ignores `instructions` and arms a plain `/compact`.
+    // Undo that arming rather than print a success that lost them.
+    if crate::agent_self_compact::instructions_dropped(steered, &response["result"]) {
+        super::send_request(&Request {
+            id: "cli:pane:arm-self-compact".into(),
+            method: crate::agent_self_compact::abort_dropped_arming(pane),
+        })?;
+        eprintln!("{}", crate::agent_self_compact::INSTRUCTIONS_DROPPED);
+        return Ok(crate::api::compatibility::EXIT_CODE);
+    }
+    super::print_response(&response)
 }
 
 /// Pure: the flags and the trailing text of `arm-self-compact` to the params
 /// the verb takes, or the usage line to print. Split out from the command so
 /// the parsing — which is where the interesting refusals live — is testable
 /// without a socket.
-fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, String> {
-    const USAGE: &str =
-        "usage: flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>";
+///
+/// `read_file` resolves `--instructions-file`, injected so the parse stays
+/// testable without touching the filesystem.
+fn parse_arm_self_compact(
+    args: &[String],
+    read_file: impl Fn(&str) -> Result<String, String>,
+) -> Result<PaneArmSelfCompactParams, String> {
+    const USAGE: &str = "usage: flk pane arm-self-compact [--pane <pane_id>] [--abort] \
+         [--instructions <text> | --instructions-file <path>] <handoff prompt>";
     let mut pane = None;
     let mut continuation: Option<String> = None;
+    let mut instructions: Option<String> = None;
     let mut abort = false;
     let mut index = 0;
     while index < args.len() {
@@ -530,6 +552,29 @@ fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, S
                     return Err("--pane needs a pane id".to_string());
                 };
                 pane = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
+            flag @ ("--instructions" | "--instructions-file") => {
+                if instructions.is_some() {
+                    return Err(
+                        "give --instructions or --instructions-file once, not both".to_string()
+                    );
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("{flag} needs a value"));
+                };
+                instructions = Some(if flag == "--instructions" {
+                    value.clone()
+                } else {
+                    // A file almost always ends in a newline nobody meant as
+                    // content. Only that one is dropped: a newline inside is
+                    // still refused by the server, never folded into a space.
+                    let text = read_file(value)?;
+                    text.strip_suffix('\n')
+                        .map(|text| text.strip_suffix('\r').unwrap_or(text))
+                        .unwrap_or(&text)
+                        .to_string()
+                });
                 index += 2;
             }
             "--abort" => {
@@ -558,10 +603,14 @@ fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, S
     if !abort && continuation.is_none() {
         return Err(USAGE.to_string());
     }
+    if abort && instructions.is_some() {
+        return Err("--abort drops the armed compaction; it takes no instructions".to_string());
+    }
 
     Ok(PaneArmSelfCompactParams {
         pane,
         continuation,
+        instructions,
         abort,
     })
 }
@@ -1452,7 +1501,7 @@ fn pane_help_text() -> String {
     );
     let _ = writeln!(
         out,
-        "  flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>"
+        "  flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>"
     );
     let _ = writeln!(out, "  flk pane report-agent [<pane_id>] --source ID --agent LABEL --state idle|working|blocked|unknown [--pane <pane_id>] [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     let _ = writeln!(out, "  flk pane report-metadata [<pane_id>] [--pane <pane_id>] --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
@@ -1531,6 +1580,13 @@ mod tests {
     };
     use crate::api::schema::PaneAgentState;
 
+    /// The parse with no file to read: a test that reaches for one fails.
+    fn parse_arm_self_compact_no_files(
+        args: &[String],
+    ) -> Result<super::PaneArmSelfCompactParams, String> {
+        super::parse_arm_self_compact(args, |path| panic!("unexpected file read: {path}"))
+    }
+
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
     }
@@ -1564,8 +1620,9 @@ mod tests {
     /// still compact its own context instead of waiting for a human.
     #[test]
     fn arm_self_compact_defaults_to_my_own_pane_and_keeps_the_whole_prompt() {
-        let params = super::parse_arm_self_compact(&argv(&["open", "the", "PR,", "--watch", "CI"]))
-            .expect("arms");
+        let params =
+            parse_arm_self_compact_no_files(&argv(&["open", "the", "PR,", "--watch", "CI"]))
+                .expect("arms");
         assert_eq!(
             params.pane, None,
             "an agent compacting itself should not have to look up its own id"
@@ -1585,19 +1642,69 @@ mod tests {
     #[test]
     fn arm_self_compact_refuses_a_missing_or_empty_prompt() {
         for words in [vec![], vec!["", "  "]] {
-            let err = super::parse_arm_self_compact(&argv(&words))
+            let err = parse_arm_self_compact_no_files(&argv(&words))
                 .expect_err("an arming with no prompt is refused");
             assert!(!err.is_empty(), "a refusal must say something");
         }
     }
 
     #[test]
+    fn arm_self_compact_carries_instructions_from_a_flag_or_a_file() {
+        let params = parse_arm_self_compact_no_files(&argv(&[
+            "--instructions",
+            "keep GOAL.md and open PRs",
+            "carry",
+            "on",
+        ]))
+        .expect("arms");
+        assert_eq!(
+            params.instructions.as_deref(),
+            Some("keep GOAL.md and open PRs")
+        );
+        assert_eq!(params.continuation.as_deref(), Some("carry on"));
+
+        let from_file = super::parse_arm_self_compact(
+            &argv(&["--instructions-file", "keep.txt", "carry on"]),
+            |path| {
+                assert_eq!(path, "keep.txt");
+                Ok("keep STATUS.md\r\n".to_string())
+            },
+        )
+        .expect("arms");
+        assert_eq!(
+            from_file.instructions.as_deref(),
+            Some("keep STATUS.md"),
+            "only the file's trailing line ending is dropped"
+        );
+
+        let bare = parse_arm_self_compact_no_files(&argv(&["carry on"])).expect("arms");
+        assert_eq!(bare.instructions, None, "omitted stays omitted");
+    }
+
+    #[test]
+    fn arm_self_compact_refuses_conflicting_or_unreadable_instructions() {
+        for words in [
+            vec!["--instructions", "a", "--instructions-file", "b", "go"],
+            vec!["--instructions"],
+            vec!["--abort", "--instructions", "a"],
+        ] {
+            parse_arm_self_compact_no_files(&argv(&words)).expect_err("refused before the socket");
+        }
+        let err = super::parse_arm_self_compact(
+            &argv(&["--instructions-file", "missing.txt", "go"]),
+            |path| Err(format!("--instructions-file {path}: not found")),
+        )
+        .expect_err("an unreadable file is refused");
+        assert!(err.contains("missing.txt"), "{err}");
+    }
+
+    #[test]
     fn arm_self_compact_abort_needs_no_prompt() {
-        let params = super::parse_arm_self_compact(&argv(&["--abort"])).expect("aborts");
+        let params = parse_arm_self_compact_no_files(&argv(&["--abort"])).expect("aborts");
         assert!(params.abort);
         assert_eq!(params.continuation, None);
 
-        let named = super::parse_arm_self_compact(&argv(&["--pane", "w2:p1", "--abort"]))
+        let named = parse_arm_self_compact_no_files(&argv(&["--pane", "w2:p1", "--abort"]))
             .expect("aborts a named pane");
         assert!(named.abort);
         assert_eq!(named.pane.as_deref(), Some("w2:p1"));

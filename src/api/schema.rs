@@ -1677,6 +1677,18 @@ pub struct PaneArmSelfCompactParams {
     /// and non-empty unless `abort` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,
+    /// What the compaction's summary should keep, typed after the compact
+    /// command as `/compact <instructions>` (#854). Omitted means a bare
+    /// `/compact`, exactly as before this field existed. One line, checked by
+    /// [`crate::agent_self_compact::check_instructions`], and refused for a
+    /// harness whose compact command takes no argument.
+    ///
+    /// Additive and optional, so it needed no protocol bump: an older client
+    /// never sends it, and an older server that ignores it is caught by the
+    /// `instructions` flag on the answer instead (see
+    /// [`crate::agent_self_compact::instructions_dropped`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Drop an armed self-compaction instead of arming one, for an agent that
     /// armed by mistake. Answers what it dropped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2670,6 +2682,11 @@ pub enum ResponseResult {
         /// claims the compaction happened — it has not, at the moment the tool
         /// returns.
         detail: String,
+        /// The arming stored compaction instructions (#854). Absent from an
+        /// older server's answer, which is how a client that sent some tells
+        /// that they were silently dropped.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        instructions: bool,
     },
     PaneInfo {
         pane: PaneInfo,

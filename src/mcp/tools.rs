@@ -279,8 +279,12 @@ pub(super) fn table() -> &'static [Tool] {
                           yourself a keystroke, and you should not be able to. \
                           If a compaction is already armed, yours is refused \
                           rather than replacing it — abort first if you meant \
-                          to rewrite it. Claude Code only; other harnesses are \
-                          refused by name.",
+                          to rewrite it. Pass `instructions` to steer what \
+                          the compaction's summary keeps (goal, status file, \
+                          open PRs, standing rules): flock types them after \
+                          the compact command as `/compact <instructions>`. \
+                          Claude Code only; other harnesses are refused by \
+                          name.",
             input_schema: schema_self_compact,
             build: build_self_compact,
         },
@@ -1145,6 +1149,11 @@ fn schema_self_compact() -> Value {
                 "minLength": 1,
                 "description": "Your own handoff prompt, in your own words: what you want to be doing once you are on the other side of the compaction. This is the text a human would otherwise copy out of your transcript and paste back into you, so write it as instructions to your next self. Required, and it must not be empty — a compaction with no prompt leaves you with no thread to hold. Capped at 16 KiB; put anything longer in a file and name the file.",
             },
+            "instructions": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional. What the compaction's summary must keep — for example: keep GOAL.md, the STATUS.md next step, open PRs and the standing rules. Typed after the compact command as `/compact <instructions>`, so it steers the summary itself, where `continuation` only speaks after it. One line of plain text, capped at 16 KiB. Omit for a plain `/compact`. Refused for a harness whose compact command takes no argument.",
+            },
             "abort": {
                 "type": "boolean",
                 "description": "Drop an armed self-compaction instead of arming one, for a compaction you armed by mistake. Tells you whether there was anything to drop.",
@@ -1198,10 +1207,30 @@ fn build_self_compact(args: Value) -> Result<Method, McpError> {
             }));
         }
     }
+    let instructions = optional_string(&args, "instructions")?;
+    if let Some(text) = instructions.as_deref() {
+        if text.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "`instructions` must not be empty when given: omit it for a plain \
+                 `/compact`, or say what the summary must keep.",
+            ));
+        }
+        if crate::agent_self_compact::check_instructions(text).is_err()
+            || text.len() > crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES
+        {
+            return Err(McpError::invalid_params(
+                "`instructions` must be one line of plain text, at most 16 KiB: \
+                 they are typed after `/compact` in the same paste, and a newline \
+                 or escape would submit or end it early. Put the long version in \
+                 a file and name the file.",
+            ));
+        }
+    }
     Ok(Method::PaneArmSelfCompact(
         crate::api::schema::PaneArmSelfCompactParams {
             pane: optional_string(&args, "pane")?,
             continuation,
+            instructions,
             abort,
         },
     ))
@@ -1665,6 +1694,39 @@ mod tests {
     /// A compaction with no prompt behind it would shorten the context and
     /// then hand back no thread to hold, which is strictly worse than not
     /// compacting at all.
+    #[test]
+    fn flock_self_compact_carries_the_compaction_instructions() {
+        let method = build_self_compact(json!({
+            "continuation": "open the PR",
+            "instructions": "keep GOAL.md and /tmp/STATUS.md",
+        }))
+        .expect("arms");
+        let Method::PaneArmSelfCompact(params) = method else {
+            panic!("expected pane.arm_self_compact");
+        };
+        assert_eq!(
+            params.instructions.as_deref(),
+            Some("keep GOAL.md and /tmp/STATUS.md")
+        );
+        assert!(schema_self_compact()["properties"]["instructions"].is_object());
+
+        let bare = build_self_compact(json!({"continuation": "open the PR"})).expect("arms");
+        let Method::PaneArmSelfCompact(bare) = bare else {
+            panic!("expected pane.arm_self_compact");
+        };
+        assert_eq!(bare.instructions, None, "omitted stays omitted");
+
+        for bad in ["", "  ", "keep\nthis", "keep\x1b[201~"] {
+            let err = build_self_compact(json!({"continuation": "go", "instructions": bad}))
+                .expect_err("refused");
+            assert!(
+                err.message.contains("instructions"),
+                "{bad:?}: {}",
+                err.message
+            );
+        }
+    }
+
     #[test]
     fn flock_self_compact_refuses_an_empty_handoff_prompt() {
         for args in [

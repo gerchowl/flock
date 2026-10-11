@@ -1085,13 +1085,14 @@ impl App {
         let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &requested);
         };
-        let answer = |state: SelfCompactState, detail: String| {
+        let answer = |state: SelfCompactState, detail: String, instructions: bool| {
             encode_success(
                 id.clone(),
                 ResponseResult::PaneSelfCompact {
                     pane: pane.clone(),
                     state,
                     detail,
+                    instructions,
                 },
             )
         };
@@ -1107,6 +1108,7 @@ impl App {
                 } else {
                     "nothing was armed, so there was nothing to drop.".to_string()
                 },
+                false,
             );
         }
 
@@ -1164,6 +1166,54 @@ impl App {
                 ),
             );
         }
+        // The instructions ride in the same paste as `/compact`, so they get
+        // the same refusals as the continuation, minus the leading-`/` one:
+        // they are an argument, never the start of a line (#854).
+        let instructions = match params.instructions {
+            None => None,
+            Some(text) if text.trim().is_empty() => {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    "`instructions` must not be empty when given: omit it for a \
+                     plain `/compact`, or say what the summary must keep.",
+                );
+            }
+            Some(text) => Some(text),
+        };
+        if let Some(text) = instructions.as_deref() {
+            if let Err(problem) = crate::agent_self_compact::check_instructions(text) {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    match problem {
+                        crate::agent_self_compact::ContinuationProblem::LineBreak => {
+                            "`instructions` must be one line: they are typed after \
+                             `/compact` in the same paste, and a newline would submit \
+                             the command with half of them. Put the long version in a \
+                             file and name the file."
+                        }
+                        _ => {
+                            "`instructions` must be plain text: a control byte or \
+                             escape sequence would end the paste early and be read \
+                             as keystrokes."
+                        }
+                    },
+                );
+            }
+            if text.len() > crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    format!(
+                        "`instructions` is {} bytes, over the {} byte cap. Write the \
+                         long version to a file and name the file.",
+                        text.len(),
+                        crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES
+                    ),
+                );
+            }
+        }
         if let Some(reason) = self.self_compact_refusal(&pane) {
             return encode_error(
                 id,
@@ -1181,22 +1231,43 @@ impl App {
                 },
             );
         }
-        if !self.arm_self_compact(&pane, continuation, std::time::Instant::now()) {
+        if instructions.is_some() && !self.self_compact_takes_instructions(&pane) {
+            return encode_error(
+                id,
+                "self_compact_instructions_unsupported",
+                "this agent's harness has no way to take instructions with its \
+                 compact command, so they would be lost and the summary would not \
+                 keep what you asked. Arm without `instructions`, and put what must \
+                 survive in your continuation instead.",
+            );
+        }
+        let steered = instructions.is_some();
+        if !self.arm_self_compact(&pane, continuation, instructions, std::time::Instant::now()) {
             return answer(
                 SelfCompactState::Pending,
                 "a self-compaction is already armed for this pane, so yours was \
                  NOT stored — the handoff prompt already there is untouched. Abort \
                  it first if you meant to replace it."
                     .to_string(),
+                false,
             );
         }
         answer(
             SelfCompactState::Armed,
-            "armed. Nothing has been typed yet and nothing has been compacted: \
-             flock waits for your current turn to end, then asks the harness to \
-             compact, then sends your continuation prompt back as your next turn. \
-             Finish this turn normally."
-                .to_string(),
+            if steered {
+                "armed. Nothing has been typed yet and nothing has been compacted: \
+                 flock waits for your current turn to end, then types `/compact` \
+                 with your instructions for what the summary keeps, then sends your \
+                 continuation prompt back as your next turn. Finish this turn \
+                 normally."
+            } else {
+                "armed. Nothing has been typed yet and nothing has been compacted: \
+                 flock waits for your current turn to end, then asks the harness to \
+                 compact, then sends your continuation prompt back as your next turn. \
+                 Finish this turn normally."
+            }
+            .to_string(),
+            steered,
         )
     }
 

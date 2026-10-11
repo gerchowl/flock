@@ -87,12 +87,93 @@ pub fn check_continuation(text: &str) -> Result<(), ContinuationProblem> {
     Ok(())
 }
 
+/// Make compaction instructions safe to type after the compact command, or say
+/// why not (#854).
+///
+/// The same refusals as [`check_continuation`], minus one. A line break or a
+/// control byte is just as dangerous here: the instructions are typed into the
+/// same prompt box in the same paste as `/compact`, so a newline submits the
+/// command early with half its argument and an escape sequence ends the paste.
+/// A leading `/` or `!` is not: the instructions are an *argument* to a command
+/// flock already chose, never the start of a line, so the harness reads them as
+/// text whatever they open with.
+pub fn check_instructions(text: &str) -> Result<(), ContinuationProblem> {
+    if text.contains('\n') || text.contains('\r') {
+        return Err(ContinuationProblem::LineBreak);
+    }
+    if crate::control_bytes::strip(text) != text {
+        return Err(ContinuationProblem::Control);
+    }
+    Ok(())
+}
+
+/// Largest compaction instructions accepted, in bytes. The same cap as the
+/// continuation and for the same reason: anything longer belongs in a file the
+/// instructions name.
+pub const MAX_INSTRUCTIONS_BYTES: usize = MAX_CONTINUATION_BYTES;
+
 /// The slash command that asks the harness to compact. Claude Code's, and
 /// currently the only one: compaction is a harness affordance, so the text is a
 /// constant here rather than something an agent gets to choose. An agent that
 /// named its own command would be typing arbitrary bytes into its own prompt
 /// box, which is exactly what keeping `pane.send_*` off MCP prevents.
 pub const COMPACT_COMMAND: &str = "/compact";
+
+/// Whether this harness's compact command takes the summary's instructions as
+/// an argument (#854), so `/compact <what to keep>` steers what survives.
+///
+/// Claude Code's does. Codex's `/compact` and OpenCode's `/compact` take none,
+/// so text after them would be dropped or misread, and the agent would believe
+/// it had steered a summary it had not. There is deliberately no fallback of
+/// typing the instructions as a turn of their own first: that turn would be
+/// answered, and the answer, not the instructions, is what the summary sees.
+/// An unknown harness is refused too: flock cannot know what it would do with
+/// the text.
+pub fn compact_takes_instructions(agent: Option<crate::detect::Agent>) -> bool {
+    matches!(agent, Some(crate::detect::Agent::Claude))
+}
+
+/// The line flock types to start a compaction: the bare command, or the
+/// command followed by the agent's instructions for what the summary keeps.
+pub fn compact_line(instructions: Option<&str>) -> String {
+    match instructions {
+        Some(text) => format!("{COMPACT_COMMAND} {text}"),
+        None => COMPACT_COMMAND.to_string(),
+    }
+}
+
+/// Whether a server dropped the instructions a client sent it (#854).
+///
+/// `instructions` is an additive optional field, so a server from before it
+/// existed deserializes the arming without it and arms a bare `/compact` —
+/// a success that silently lost what the agent asked the summary to keep. A
+/// server that stored them says so in `instructions: true` on its answer, so
+/// a client that sent some and got back an `armed` without that flag is
+/// talking to an older server and must not report success.
+pub fn instructions_dropped(sent: bool, result: &serde_json::Value) -> bool {
+    sent && result.get("state").and_then(serde_json::Value::as_str) == Some("armed")
+        && result
+            .get("instructions")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+}
+
+/// What a client says after [`instructions_dropped`] caught an older server
+/// arming without the instructions, and after it aborted that arming.
+pub const INSTRUCTIONS_DROPPED: &str = "the flock server is older than this client \
+     and ignored `instructions`, so it armed a plain `/compact` that would not keep \
+     what you asked. That arming was aborted and nothing was typed. Hand the server \
+     off with `flk server live-handoff`, or arm without `instructions`.";
+
+/// The abort a client sends to undo an arming that lost its instructions.
+pub fn abort_dropped_arming(pane: Option<String>) -> crate::api::schema::Method {
+    crate::api::schema::Method::PaneArmSelfCompact(crate::api::schema::PaneArmSelfCompactParams {
+        pane,
+        continuation: None,
+        instructions: None,
+        abort: true,
+    })
+}
 
 /// Where an armed compaction has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +206,9 @@ pub struct ArmedSelfCompact {
     /// trimmed, or summarised — because the whole point is that this is the
     /// agent's words rather than a human's transcription of them.
     pub continuation: String,
+    /// What the agent asked the summary to keep, typed after the compact
+    /// command (#854). `None` types the bare command, exactly as before.
+    pub instructions: Option<String>,
     pub phase: SelfCompactPhase,
     /// When flock started waiting on something it cannot see or cannot force:
     /// set when a write is submitted, cleared while nothing is outstanding.
@@ -149,11 +233,23 @@ impl ArmedSelfCompact {
     pub fn new(continuation: String) -> Self {
         Self {
             continuation,
+            instructions: None,
             phase: SelfCompactPhase::Armed,
             waiting_since: None,
             typed_at: None,
             submit_at: None,
         }
+    }
+
+    /// Carry the agent's instructions for what the compaction keeps.
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
+    }
+
+    /// The line that starts this compaction.
+    pub fn compact_line(&self) -> String {
+        compact_line(self.instructions.as_deref())
     }
 
     /// Record that `/compact` went out. `submit_gap` is the same gap
@@ -403,6 +499,60 @@ mod tests {
             crate::detect::Agent::OpenCode
         )));
         assert!(!agent_can_self_compact(None));
+    }
+
+    #[test]
+    fn only_claude_takes_compaction_instructions() {
+        use crate::detect::Agent;
+        assert!(compact_takes_instructions(Some(Agent::Claude)));
+        for agent in [Agent::Codex, Agent::OpenCode] {
+            assert!(
+                !compact_takes_instructions(Some(agent)),
+                "{agent:?}'s /compact takes no argument, so instructions would be lost"
+            );
+        }
+        assert!(!compact_takes_instructions(None));
+    }
+
+    #[test]
+    fn the_compact_line_carries_the_instructions_after_the_command() {
+        assert_eq!(armed().compact_line(), "/compact");
+        let steered = armed().with_instructions(Some("keep GOAL.md and open PRs".to_string()));
+        assert_eq!(steered.compact_line(), "/compact keep GOAL.md and open PRs");
+    }
+
+    /// Instructions are an argument, not a line of their own, so a leading `/`
+    /// is text. Everything that could end the paste or submit early is still
+    /// refused.
+    #[test]
+    fn instructions_refuse_what_could_escape_the_paste_but_not_a_leading_slash() {
+        assert_eq!(check_instructions("keep /tmp/STATUS.md"), Ok(()));
+        assert_eq!(check_instructions("/tmp/STATUS.md first"), Ok(()));
+        assert_eq!(
+            check_instructions("keep this\nand that"),
+            Err(ContinuationProblem::LineBreak)
+        );
+        assert_eq!(
+            check_instructions("keep\x1b[201~ this"),
+            Err(ContinuationProblem::Control)
+        );
+    }
+
+    #[test]
+    fn a_server_that_did_not_store_the_instructions_is_caught() {
+        use serde_json::json;
+        let old = json!({"type": "pane_self_compact", "state": "armed"});
+        let new = json!({"type": "pane_self_compact", "state": "armed", "instructions": true});
+        assert!(instructions_dropped(true, &old));
+        assert!(!instructions_dropped(true, &new));
+        assert!(
+            !instructions_dropped(false, &old),
+            "nothing sent, nothing lost"
+        );
+        assert!(
+            !instructions_dropped(true, &json!({"state": "pending"})),
+            "a refused arming stored nothing either way"
+        );
     }
 
     #[test]
