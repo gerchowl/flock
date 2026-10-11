@@ -84,6 +84,27 @@ pub(super) fn has_working_chrome(content: &str) -> bool {
         || (has_background_shell_footer(content) && !ends_on_done_turn(above))
 }
 
+/// The spinner above the prompt box follows `text`, echoed as the last prompt
+/// in the transcript (#870).
+pub(in crate::detect) fn live_turn_follows_echo(content: &str, text: &str) -> bool {
+    if !has_prompt_box(content) || !has_working_chrome(content) {
+        return false;
+    }
+    let lines: Vec<&str> = content_above_prompt_box(content).lines().collect();
+    let Some(working) = lines.iter().rposition(|line| {
+        has_spinner_activity(line) || line.to_lowercase().contains("esc to interrupt")
+    }) else {
+        return false;
+    };
+    let Some(echo) = lines[..working]
+        .iter()
+        .rposition(|line| line.starts_with("> ") || line.starts_with("❯ "))
+    else {
+        return false;
+    };
+    super::super::echo_matches(&lines, echo, working, &['>', '❯'], text)
+}
+
 /// Whether a turn ended (Claude's `done <clock>` marker) with background
 /// shells or agents still running, as the "N shell still running" suffix on
 /// that line or the footer counter below the prompt box (#911). Neither keeps
@@ -618,6 +639,24 @@ fn transcript_control_tail(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spinner_follows_the_echoed_prompt_past_a_notice() {
+        let rule = "─".repeat(40);
+        let screen = format!(
+            "> Read /fixture/briefs/task.md and\n  execute it exactly.\n\n  ⎿  Heads up, an update is available.\n\n✶ Pondering… (3s · esc to interrupt)\n\n{rule}\n❯ \n{rule}\n"
+        );
+        let text = "Read /fixture/briefs/task.md and execute it exactly.";
+        assert!(live_turn_follows_echo(&screen, text));
+        assert!(live_turn_follows_echo(&screen.replace("> ", "❯ "), text));
+        assert!(!live_turn_follows_echo(
+            &screen,
+            "Read /fixture/briefs/other.md"
+        ));
+        // A finished turn under the echo is not a live one.
+        let done = screen.replace("✶ Pondering… (3s · esc to interrupt)", "✻ Brewed for 3s");
+        assert!(!live_turn_follows_echo(&done, text));
+    }
 
     fn prompt_box_below(content_above_prompt: &str) -> String {
         format!(

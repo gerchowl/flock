@@ -3010,12 +3010,8 @@ fn recover_lost_brief_with(
             .collect::<String>()
     };
     let brief = compact(sentence);
-    let mut watch = start_watch::StartWatch::new(
-        Some(baseline.clone()),
-        crate::detect::parse_agent_label(&entry.harness),
-        submitted,
-        settle,
-    );
+    let agent = crate::detect::parse_agent_label(&entry.harness);
+    let mut watch = start_watch::StartWatch::new(Some(baseline.clone()), agent, submitted, settle);
     loop {
         let at = now();
         if at >= deadline {
@@ -3037,6 +3033,13 @@ fn recover_lost_brief_with(
                     || cursor.working
                     || cursor.entries > baseline.entries
                 {
+                    return Ok(false);
+                }
+                // The brief echoed with its turn running under it is a taken
+                // brief whatever the record says yet (#870).
+                if agent.is_some_and(|agent| {
+                    crate::detect::live_turn_follows_submitted(agent, &screen, sentence)
+                }) {
                     return Ok(false);
                 }
                 // The brief is on screen, so it was not lost: queued, echoed,

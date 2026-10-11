@@ -44,3 +44,16 @@ selection marker, the blank rows and the `enter continue · esc quit` footer are
 unchanged. A start at the repository root itself shows the same dialog without
 the `Note:` paragraph. The dialog has no composer, so a brief typed at it
 answers the dialog.
+
+# Codex turn after the weekly-limit warning (#870)
+
+`working-after-weekly-notice.txt` is the owner-reported Codex 0.160.1 screen
+from #870, right after `flk delegate start` reported
+`owned_composer_not_visible`. The brief's path was replaced by
+`/fixture/codex-870/…`, and the blank row and
+`GPT-6.1-Sol default · /fixture/codex-870/…` footer from
+`../codex-submit-721/inline-working.txt` were added below the composer, which
+the issue's excerpt cut off. The echoed brief, the `⚠ Heads up` warning, the
+`• Working` row and the right-aligned weekly-limit status are unchanged. The
+running turn under the echoed brief confirms the submission. The warning
+between them is history, not a prompt.

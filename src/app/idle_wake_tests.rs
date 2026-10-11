@@ -1782,6 +1782,66 @@ async fn plain_paste_waits_for_late_chip_before_using_screen_only_evidence() {
 }
 
 #[tokio::test]
+async fn guarded_submit_confirms_a_codex_turn_running_past_the_weekly_notice() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    // #870: Enter was taken, Codex echoed the brief, printed its weekly-limit
+    // warning and shows the running turn, while the turn cursor has not moved.
+    let brief = "Read /fixture/codex-870/briefs/63.md and execute it exactly.";
+    let running = include_str!("../../tests/fixtures/codex/working-after-weekly-notice.txt");
+    let footer = "\r\n\r\n  GPT-6.1-Sol default · /fixture/codex-870/…\r\n";
+    for (echoed, expected) in [
+        (brief, Some(Outcome::ObservedAccepted)),
+        (
+            "Read /fixture/codex-870/briefs/64.md and execute it exactly.",
+            Some(Outcome::Unconfirmed("owned_composer_not_visible")),
+        ),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        let codex = |typed: &str| format!("\x1b[2J\x1b[H› {typed}{footer}").into_bytes();
+        runtime(&app).test_process_pty_bytes(&codex("Ask Codex to do anything"));
+        let now = Instant::now();
+        let terminal = terminal(&mut app);
+        for at in [now - settled(), now] {
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Codex),
+                AgentState::Idle,
+                false,
+                true,
+                false,
+                false,
+                at,
+            );
+        }
+        let mut attempt = app
+            .begin_guarded_submit(&pane, brief, None, Duration::ZERO, now, false)
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![brief.as_bytes().to_vec()]);
+        runtime(&app).test_process_pty_bytes(&codex(brief));
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        let screen = running.replace(brief, echoed).replace('\n', "\r\n");
+        runtime(&app).test_process_pty_bytes(format!("\x1b[2J\x1b[H{screen}").as_bytes());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+            expected,
+            "{echoed}"
+        );
+        assert!(drain(&mut pty).is_empty(), "no second Enter");
+        if expected == Some(Outcome::ObservedAccepted) {
+            assert_eq!(attempt.evidence.state, "observed_accepted");
+            assert!(!attempt.retried);
+        }
+    }
+}
+
+#[tokio::test]
 async fn guarded_submit_waits_for_unknown_or_other_until_original_deadline() {
     use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
     for screen in [b"\x1b[2J\x1b[H".to_vec(), claude_screen("hel")] {
