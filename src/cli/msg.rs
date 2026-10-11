@@ -283,14 +283,14 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// `flk wait reply` exit status (#576): an answer arrived.
-const EXIT_REPLIED: i32 = 0;
+const EXIT_REPLIED: i32 = super::exit::SUCCESS;
 /// No answer is coming: the recipient is muted (its deferral is printed), or
 /// the message was dropped unread.
-const EXIT_NO_ANSWER: i32 = 3;
+const EXIT_NO_ANSWER: i32 = super::exit::NO_ANSWER;
 /// The receiver refused custody of the message; the reason is printed.
-const EXIT_REFUSED: i32 = 4;
+const EXIT_REFUSED: i32 = super::exit::MSG_REFUSED;
 /// The wait ran out first. The coreutils `timeout` convention.
-const EXIT_TIMEOUT: i32 = 124;
+const EXIT_TIMEOUT: i32 = super::exit::TIMEOUT;
 
 fn exit_for(outcome: &str) -> i32 {
     match outcome {
@@ -302,7 +302,7 @@ fn exit_for(outcome: &str) -> i32 {
         | "undeliverable" => EXIT_NO_ANSWER,
         "refused" => EXIT_REFUSED,
         "timeout" => EXIT_TIMEOUT,
-        _ => 1,
+        _ => super::exit::FAILURE,
     }
 }
 
@@ -644,7 +644,7 @@ fn status_exit(state: Option<&str>) -> i32 {
             | "collect_failed"
             | "undeliverable",
         ) => EXIT_NO_ANSWER,
-        _ => 0,
+        _ => super::exit::SUCCESS,
     }
 }
 

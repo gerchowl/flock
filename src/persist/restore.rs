@@ -532,19 +532,43 @@ fn restore_tab(
         let old_pane_id = reverse_id_map.get(id).copied();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
+        // #1010: a pane the operator hibernated comes back hibernated, whatever
+        // `resume_agents_on_restore` says. Parking it was a request to keep the
+        // agent resumable, and a cold start is exactly when that request has
+        // to hold: the old server's memory, where hibernation used to live, is
+        // gone.
+        let saved_hibernation = if was_imported {
+            None
+        } else {
+            saved_pane
+                .and_then(|p| p.hibernated.as_ref())
+                .and_then(super::snapshot::HibernatedPlanSnapshot::to_plan)
+        };
         let pending_native_agent_restore = if was_imported {
             None
         } else {
             startup.restore_plan.clone()
         };
-        if let Some(plan) = pending_native_agent_restore {
+        let runtime_less_restore = saved_hibernation
+            .map(|plan| (plan, true))
+            .or_else(|| pending_native_agent_restore.map(|plan| (plan, false)));
+        if let Some((plan, hibernated)) = runtime_less_restore {
+            // From the plan rather than `startup`, which is empty for a
+            // hibernated pane when resume-on-restore is off. A shell-launched
+            // agent has no name and no argv, so without this it would not
+            // even list as an agent.
+            let initial_restore_agent = crate::detect::parse_agent_label(&plan.agent);
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::with_agent_id(
                 terminal_id.clone(),
                 restored_agent_id.clone(),
                 cwd.clone(),
-            )
-            .with_pending_agent_resume_plan(plan);
+            );
+            if hibernated {
+                terminal.set_hibernated_resume_plan(Some(plan));
+            } else {
+                terminal = terminal.with_pending_agent_resume_plan(plan);
+            }
             terminal.launch_argv = saved_launch_argv.clone();
             terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
             terminal.last_prompt = saved_last_prompt.clone();
@@ -1169,6 +1193,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             launch_env: Vec::new(),
+                            hibernated: None,
                         },
                     )]),
                     zoomed: false,
@@ -1261,6 +1286,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             launch_env: Vec::new(),
+                            hibernated: None,
                         },
                     )]),
                     zoomed: false,
@@ -1434,6 +1460,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
+                hibernated: None,
             },
         );
         let history = SessionHistorySnapshot {

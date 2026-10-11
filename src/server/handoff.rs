@@ -104,6 +104,9 @@ pub(crate) fn spawn_handoff_import(
         .arg("--handoff-import")
         .arg(socket_path)
         .arg(token)
+        // A test version override names the exporter's build, not the
+        // importer's, which reports its own (#958).
+        .env_remove("FLOCK_TEST_BUILD_VERSION")
         .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

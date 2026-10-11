@@ -79,6 +79,55 @@ impl Drop for Server {
     }
 }
 
+impl Server {
+    /// Stop this server process and start a new one on the same sandbox:
+    /// a cold restart, not a live handoff (#1010). The session snapshot is
+    /// what carries the panes across, so the caller waits for it first.
+    fn restart(mut self) -> Server {
+        let pid = self.child.process_id();
+        let _ = self.child.kill();
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let mut status = 0;
+                let result =
+                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if result == pid as libc::pid_t || result == -1 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        unregister_spawned_flock_pid(pid);
+        let _ = fs::remove_file(&self.socket);
+        let base = self.base.clone();
+        // The base outlives this process: Drop would delete it.
+        std::mem::forget(self);
+        spawn_server(base)
+    }
+
+    /// Wait until the debounced session snapshot mentions every `needle`.
+    fn wait_session_saved(&self, needles: &[&str]) {
+        let path = self
+            .base
+            .join("config")
+            .join(app_dir_name())
+            .join("session.json");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let saved = fs::read_to_string(&path).unwrap_or_default();
+            if needles.iter().all(|needle| saved.contains(needle)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session snapshot never recorded {needles:?}: {saved}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
         "flock-dev"
@@ -121,6 +170,7 @@ if [ -e '{base}/starting' ]; then
 fi
 printf '%s\n' "$*" >> '{base}/argv.log'
 printf '%s\n' "$PWD" >> '{base}/cwd.log'
+printf '%s\n' "${{FLEET_PROFILE:-}}" >> '{base}/profile.log'
 if [ -e '{base}/die' ]; then exit 1; fi
 ( last=; while :; do
   now=$(cat '{base}/screen' 2>/dev/null)
@@ -193,6 +243,10 @@ fn start_server() -> Server {
 }
 
 fn start_server_with_shell_startup(slow_startup: bool) -> Server {
+    start_server_with(slow_startup, "")
+}
+
+fn start_server_with(slow_startup: bool, extra_config: &str) -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -200,7 +254,6 @@ fn start_server_with_shell_startup(slow_startup: bool) -> Server {
     let base = PathBuf::from(format!("/tmp/hdel-{}-{nanos}", std::process::id()));
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let socket = runtime_dir.join("flock.sock");
     fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     fs::create_dir_all(base.join("work")).unwrap();
@@ -223,14 +276,22 @@ fn start_server_with_shell_startup(slow_startup: bool) -> Server {
     fs::write(
         config_home.join(app_dir_name()).join("config.toml"),
         format!(
-            "onboarding = false\n\n{terminal_config}\n[worktrees]\ndirectory = \"{}\"\n",
+            "onboarding = false\n\n{terminal_config}\n[worktrees]\ndirectory = \"{}\"\n{extra_config}",
             base.join("wt").display()
         ),
     )
     .unwrap();
     write_fake_opencode(&base);
     create_db(&base);
+    spawn_server(base)
+}
 
+/// Start a server on a sandbox `base` that is already laid out, so a test
+/// can stop one and start a fresh process on the same state (#1010).
+fn spawn_server(base: PathBuf) -> Server {
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket = runtime_dir.join("flock.sock");
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1467,6 +1528,236 @@ fn a12_status_and_result() {
     let result = cli(&server, &["delegate", "result", "d1", "--json"]);
     assert_eq!(result.status.code(), Some(0), "{}", stderr(&result));
     assert_eq!(stdout_json(&result)["outcome"], "running");
+}
+
+/// #1010 / #975: a hibernated delegate survives a cold server restart. The new
+/// server lists it as resumable under the same agent id, `delegate status`
+/// still knows it as a delegate although its terminal id was re-minted, and
+/// `agent resume --all` brings it back under the profile it was started with.
+#[test]
+fn a24_a_hibernated_delegate_survives_a_cold_restart_with_its_profile() {
+    // Resume-on-restore off, so nothing but the persisted hibernation can
+    // make the agent resumable after the restart.
+    let server = start_server_with(
+        false,
+        "\n[session]\nresume_agents_on_restore = false\n\n[spawn.env]\nopencode = [\"FLEET_PROFILE\"]\n",
+    );
+    operator_workspace(&server);
+    let profile = server.base.join("profiles").join("eth");
+    fs::create_dir_all(&profile).unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let work = work_dir(&server);
+    let mut child = command(
+        &server,
+        &[
+            "delegate", "start", "d1", "--brief", &b, "--cwd", &work, "--settle", SETTLE, "--json",
+        ],
+    )
+    .env("FLEET_PROFILE", &profile)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    let before = agent_get(&server, "d1").expect("delegate agent");
+    let agent_id = before["agent_id"].as_str().unwrap().to_string();
+
+    let parked = cli(&server, &["agent", "hibernate", "--all"]);
+    assert_eq!(parked.status.code(), Some(0), "{}", stderr(&parked));
+    let parked = stdout_json(&parked);
+    assert!(
+        parked["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["agent_id"] == agent_id.as_str() && row["outcome"] == "hibernated"),
+        "{parked}"
+    );
+    server.wait_session_saved(&["\"hibernated\"", &agent_id, "FLEET_PROFILE"]);
+
+    let server = server.restart();
+
+    let listed = stdout_json(&cli(&server, &["agent", "list", "--resumable"]));
+    let agents = listed["result"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{listed}");
+    assert_eq!(agents[0]["agent_id"], agent_id.as_str(), "{listed}");
+    assert_eq!(agents[0]["name"], "d1", "{listed}");
+    assert_eq!(agents[0]["resumable"], true, "{listed}");
+    assert_eq!(
+        agents[0]["workspace_id"], before["workspace_id"],
+        "{listed}"
+    );
+    assert_ne!(
+        agents[0]["terminal_id"], before["terminal_id"],
+        "a cold start re-mints terminal ids; this test needs it to"
+    );
+
+    let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["name"], "d1");
+
+    let profiles_before = read_lines(&server.base.join("profile.log")).len();
+    let resumed = cli(&server, &["agent", "resume", "--all"]);
+    assert_eq!(resumed.status.code(), Some(0), "{}", stderr(&resumed));
+    let resumed = stdout_json(&resumed);
+    assert!(
+        resumed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["agent_id"] == agent_id.as_str() && row["outcome"] == "resumed"),
+        "{resumed}"
+    );
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let argv = read_lines(&server.base.join("argv.log"));
+        let profiles = read_lines(&server.base.join("profile.log"));
+        if profiles.len() > profiles_before {
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some(format!("--session {SES}").as_str()),
+                "resumed with the session: {argv:?}"
+            );
+            assert_eq!(
+                profiles.last().map(PathBuf::from),
+                Some(profile.clone()),
+                "resumed under the profile it was started with: {profiles:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "the delegate never resumed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let after = agent_get(&server, &agent_id).expect("resolves by agent id");
+    assert_eq!(after["name"], "d1");
+}
+
+/// #1010: an unplanned restart, with nothing hibernated first. A headless
+/// server has no client to make its panes visible, so the deferred resume a
+/// restored agent waits for never fires on its own; `list --resumable` names
+/// it and `resume --all` (by agent id) brings it back.
+#[test]
+fn a25_an_unplanned_restart_leaves_the_delegate_resumable() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    let agent_id = agent_get(&server, "d1").expect("delegate agent")["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.wait_session_saved(&[SES, &agent_id]);
+
+    let server = server.restart();
+
+    let listed = stdout_json(&cli(&server, &["agent", "list", "--resumable"]));
+    let agents = listed["result"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "{listed}");
+    assert_eq!(agents[0]["agent_id"], agent_id.as_str(), "{listed}");
+
+    let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+
+    let runs_before = read_lines(&server.base.join("argv.log")).len();
+    let resumed = cli(&server, &["agent", "resume", &agent_id]);
+    assert_eq!(resumed.status.code(), Some(0), "{}", stdout(&resumed));
+    let deadline = Instant::now() + WITHIN;
+    while read_lines(&server.base.join("argv.log")).len() == runs_before {
+        assert!(Instant::now() < deadline, "the delegate never resumed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        read_lines(&server.base.join("argv.log")).last(),
+        Some(&format!("--session {SES}"))
+    );
+}
+
+/// #1010: an agent that runs `agent hibernate --all` from its own pane skips
+/// itself. Parking it would kill the loop halfway through, with the rest of
+/// the fleet still running and no summary or exit code.
+#[test]
+fn a26_hibernate_all_from_an_agent_pane_skips_the_caller() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+
+    // The caller: an agent pane that waits for a go file, then runs the loop.
+    let go = server.base.join("go");
+    let out = server.base.join("bulk.json");
+    let script = server.base.join("bin").join("architect");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile [ ! -e '{go}' ]; do sleep 0.05; done\nFLOCK_SOCKET_PATH='{socket}' '{flk}' agent hibernate --all > '{out}.tmp'\nprintf '%s\\n' \"$?\" > '{out}.rc'\nmv '{out}.tmp' '{out}'\nwhile :; do sleep 1; done\n",
+            go = go.display(),
+            socket = server.socket.display(),
+            flk = env!("CARGO_BIN_EXE_flk"),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = request(
+        &server,
+        &serde_json::json!({"id":"arch","method":"agent.start","params":{
+            "name":"architect","cwd":work_dir(&server),"argv":[script]}})
+        .to_string(),
+    );
+    let caller = started["result"]["agent"].clone();
+    assert!(caller.is_object(), "{started}");
+    let caller_pane = caller["pane_id"].as_str().unwrap();
+    // A resumable session, so nothing but being the caller can skip it.
+    let reported = request(
+        &server,
+        &format!(
+            r#"{{"id":"ses","method":"pane.report_agent_session","params":{{"pane_id":"{caller_pane}","source":"flock:opencode","agent":"opencode","agent_session_id":"ses_architect"}}}}"#
+        ),
+    );
+    assert!(reported.get("error").is_none(), "{reported}");
+
+    fs::write(&go, "").unwrap();
+    let deadline = Instant::now() + WITHIN;
+    while !out.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the bulk hibernate never finished"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    let rc = fs::read_to_string(format!("{}.rc", out.display())).unwrap();
+    assert_eq!(rc.trim(), "0", "{summary}");
+    let rows = summary["results"].as_array().unwrap();
+    let row = |id: &serde_json::Value| {
+        rows.iter()
+            .find(|row| row["agent_id"] == *id)
+            .unwrap_or_else(|| panic!("{id} missing from {summary}"))
+            .clone()
+    };
+    let me = row(&caller["agent_id"]);
+    assert_eq!(me["outcome"], "skipped", "{summary}");
+    assert_eq!(me["code"], "caller", "{summary}");
+    let d1 = agent_get(&server, "d1").unwrap();
+    assert_eq!(row(&d1["agent_id"])["outcome"], "hibernated", "{summary}");
+    assert_eq!(d1["agent_status"], "hibernated");
+    let after = agent_get(&server, "architect").unwrap();
+    assert_ne!(after["agent_status"], "hibernated", "{after}");
 }
 
 /// E13: the delegate's pane closes while the await blocks: exit 4 `gone`.

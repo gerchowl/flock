@@ -380,16 +380,16 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-/// `flk agent hibernate <target>` — park the agent pane (#175 C3).
+/// `flk agent hibernate <target>|--all` — park the agent pane (#175 C3).
 /// Mirrors the socket verb; refusals surface with the wire's code+message.
 fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent hibernate <target>");
+    let usage = "usage: flk agent hibernate <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent hibernate <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Hibernate);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:hibernate".into(),
@@ -399,16 +399,16 @@ fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-/// `flk agent resume <target>` — spawn the hibernated pane's argv back
+/// `flk agent resume <target>|--all` — spawn the hibernated pane's argv back
 /// into the same terminal (#175 C3).
 fn agent_resume(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent resume <target>");
+    let usage = "usage: flk agent resume <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent resume <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Resume);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:resume".into(),
@@ -416,6 +416,139 @@ fn agent_resume(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
         }),
     })?)
+}
+
+/// The two halves of the operator's restart path (#1010): park every agent
+/// before a server stop, bring every parked one back after the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkVerb {
+    Hibernate,
+    Resume,
+}
+
+impl BulkVerb {
+    fn done(self) -> &'static str {
+        match self {
+            Self::Hibernate => "hibernated",
+            Self::Resume => "resumed",
+        }
+    }
+
+    /// Whether this agent is one the verb applies to. Hibernate takes every
+    /// running agent with a resumable session; one without a session is
+    /// reported as skipped rather than refused one by one, because the
+    /// server would refuse to park it (it could never come back).
+    fn applies(self, agent: &serde_json::Value) -> Result<(), &'static str> {
+        let resumable = is_resumable(agent);
+        match self {
+            Self::Hibernate if resumable => Err("already_parked"),
+            Self::Hibernate if agent.get("agent_session").is_none() => Err("no_resumable_session"),
+            Self::Hibernate => Ok(()),
+            Self::Resume if resumable => Ok(()),
+            Self::Resume => Err("not_resumable"),
+        }
+    }
+
+    fn request(self, target: String) -> Request {
+        match self {
+            Self::Hibernate => Request {
+                id: "cli:agent:hibernate".into(),
+                method: Method::AgentHibernate(AgentTarget { target }),
+            },
+            Self::Resume => Request {
+                id: "cli:agent:resume".into(),
+                method: Method::AgentResume(AgentTarget { target }),
+            },
+        }
+    }
+}
+
+/// `resumable` from a current server; `hibernated` status from one that
+/// predates the field.
+fn is_resumable(agent: &serde_json::Value) -> bool {
+    agent
+        .get("resumable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || agent
+            .get("agent_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("hibernated")
+}
+
+fn local_agents(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response
+        .pointer("/result/agents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Apply `verb` to every local agent it fits, by agent id, and report each
+/// one: `{"results":[{agent_id,name,pane_id,outcome,code?,message?}]}`.
+/// Exit 1 when any agent the verb applied to failed, so a rollout script
+/// can tell "everything came back" from "something did not".
+fn agent_bulk(verb: BulkVerb) -> std::io::Result<i32> {
+    let listed = super::send_request(&Request {
+        id: "cli:agent:list".into(),
+        method: Method::AgentList(EmptyParams::default()),
+    })?;
+    if listed.get("error").is_some() {
+        return super::print_response(&listed);
+    }
+    // The caller's own agent, when it runs in a pane. Hibernating it would
+    // kill this very process mid-loop: the rest of the fleet stays running and
+    // no summary or exit code ever arrives. A server that predates `self`
+    // answers not-found, and then nothing is skipped.
+    let caller = super::send_request(&Request {
+        id: "cli:agent:self".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: "self".into(),
+        }),
+    })?
+    .pointer("/result/agent/agent_id")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_string);
+    let mut results = Vec::new();
+    let mut failed = false;
+    for agent in local_agents(&listed) {
+        let Some(agent_id) = agent.get("agent_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut row = serde_json::json!({
+            "agent_id": agent_id,
+            "name": agent.get("name"),
+            "pane_id": agent.get("pane_id"),
+        });
+        let applies = if caller.as_deref() == Some(agent_id) {
+            Err("caller")
+        } else {
+            verb.applies(&agent)
+        };
+        match applies {
+            Err(reason) => {
+                row["outcome"] = "skipped".into();
+                row["code"] = reason.into();
+            }
+            Ok(()) => {
+                let response = super::send_request(&verb.request(agent_id.to_string()))?;
+                if let Some(error) = response.get("error") {
+                    failed = true;
+                    row["outcome"] = "failed".into();
+                    row["code"] = error.get("code").cloned().unwrap_or_default();
+                    row["message"] = error.get("message").cloned().unwrap_or_default();
+                } else {
+                    row["outcome"] = verb.done().into();
+                    if let Some(pane) = response.pointer("/result/agent/pane_id") {
+                        row["pane_id"] = pane.clone();
+                    }
+                }
+            }
+        }
+        results.push(row);
+    }
+    println!("{}", serde_json::json!({ "results": results }));
+    Ok(i32::from(failed))
 }
 
 fn parse_agent_restart(args: &[String]) -> Result<crate::api::schema::AgentRestartParams, String> {
@@ -479,15 +612,36 @@ fn agent_restart(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: flk agent list");
-        return Ok(2);
-    }
+    let resumable = match args {
+        [] => false,
+        [flag] if flag == "--resumable" => true,
+        _ => {
+            eprintln!("usage: flk agent list [--resumable]");
+            return Ok(2);
+        }
+    };
 
-    super::print_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:agent:list".into(),
         method: Method::AgentList(EmptyParams::default()),
-    })?)
+    })?;
+    // #1010: after a restart, the agents `agent resume --all` would bring
+    // back. Local agents only: a fleet row is another server's to resume.
+    if resumable {
+        if let Some(agents) = response
+            .pointer_mut("/result/agents")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            agents.retain(is_resumable);
+        }
+        if let Some(result) = response
+            .get_mut("result")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            result.insert("fleet".into(), serde_json::Value::Array(Vec::new()));
+        }
+    }
+    super::print_response(&response)
 }
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
@@ -977,7 +1131,7 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
 
 fn print_agent_help() {
     eprintln!("flk agent commands:");
-    eprintln!("  flk agent list");
+    eprintln!("  flk agent list [--resumable]");
     eprintln!("  flk agent get <target>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  {AGENT_HISTORY_USAGE}");
@@ -995,8 +1149,14 @@ fn print_agent_help() {
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
-    eprintln!("  flk agent hibernate <target>");
-    eprintln!("  flk agent resume <target>");
+    eprintln!("  flk agent hibernate <target>|--all");
+    eprintln!("  flk agent resume <target>|--all");
+    eprintln!(
+        "    --all: every local agent; before a planned server stop hibernate --all, after the"
+    );
+    eprintln!(
+        "    start list --resumable and resume --all. Reports each agent; exit 1 if any failed"
+    );
     eprintln!("  {AGENT_RESTART_USAGE}");
     eprintln!("  --workspace/--tab replace an untouched lone root shell, otherwise open a new tab");
     eprintln!("    (a sibling space in workspace tab mode). Only --split splits a pane.");

@@ -1,3 +1,4 @@
+pub mod agent_state;
 pub mod client;
 pub(crate) mod compatibility;
 mod event_hub;
@@ -86,8 +87,8 @@ pub fn socket_path() -> PathBuf {
 /// Shared CLI and MCP effect-failure contract.
 pub(crate) fn effect_exit_code(result: &serde_json::Value) -> Option<i32> {
     match result.get("outcome").and_then(serde_json::Value::as_str) {
-        Some("unconfirmed") => Some(8),
-        Some("abandoned") => Some(9),
+        Some("unconfirmed") => Some(crate::cli::exit::UNCONFIRMED),
+        Some("abandoned") => Some(crate::cli::exit::ABANDONED),
         _ => None,
     }
 }

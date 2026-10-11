@@ -294,6 +294,7 @@ impl App {
                 agent: agent.agent,
                 name: agent.name,
                 status: agent.agent_status,
+                state: agent.state,
             });
         }
 
@@ -311,6 +312,7 @@ impl App {
                 // A gossiped summary carries no operator-assigned name.
                 name: None,
                 status: entry.status,
+                state: Some(crate::api::agent_state::AgentState::unknown()),
             });
         }
 

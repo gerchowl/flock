@@ -50,7 +50,7 @@ fn notification_show(args: &[String]) -> std::io::Result<i32> {
     })?;
     let exit = super::print_response(&response)?;
     if exit == 0 && response["result"]["shown"] == false {
-        return Ok(3);
+        return Ok(super::exit::NOT_SHOWN);
     }
     Ok(exit)
 }
