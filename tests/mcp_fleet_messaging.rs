@@ -302,6 +302,7 @@ impl PanedMcp {
 
 /// Poll `probe` until it returns a value, or fail with the last thing it saw.
 fn wait_for<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let _timing = support::timing::wait(what);
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(found) = probe() {

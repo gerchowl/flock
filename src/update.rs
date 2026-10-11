@@ -2710,6 +2710,7 @@ mod tests {
                     live_handoff: true,
                     node_id: None,
                     clone_detection_warning: None,
+                    agent_start_label: true,
                 }),
                 session_health: None,
                 api_listener: None,

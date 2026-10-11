@@ -436,6 +436,12 @@ impl HeadlessServer {
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
 
+        // #959: once per server start, cold or handed off. Here rather than in
+        // `App::new` because only now is the session restored (the live
+        // records openness is checked against) and, on a handoff, the
+        // exporting server done writing the log being folded.
+        self.app.reissue_open_delegations();
+
         let mut needs_render = true;
         let mut needs_full_render = true;
 
@@ -1225,6 +1231,7 @@ impl HeadlessServer {
                 live_handoff: true,
                 node_id: self.app.node_id.clone(),
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
+                agent_start_label: true,
             }),
         )?;
 

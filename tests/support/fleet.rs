@@ -141,6 +141,7 @@ pub struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        let _timing = super::timing::phase(super::timing::Phase::Teardown);
         self.stop();
     }
 }
@@ -186,6 +187,7 @@ impl Node {
 
     /// Restart only this sandbox server, preserving its config and state.
     pub fn restart(&mut self) {
+        let _timing = super::timing::phase(super::timing::Phase::Respawn);
         self.stop();
         // A hard stop can leave socket files behind. Readiness must observe
         // the replacement listener, never a stale filesystem entry.
@@ -294,6 +296,7 @@ impl Node {
     }
 
     pub fn attach_sized(&self, cols: u16, rows: u16) -> UnixStream {
+        let _timing = super::timing::phase(super::timing::Phase::Handshake);
         let mut stream = UnixStream::connect(&self.client_socket)
             .unwrap_or_else(|e| panic!("client socket for {} should connect: {e}", self.name));
         let (_, error) = super::client_handshake(&mut stream, super::PROTOCOL_VERSION, cols, rows)
@@ -404,6 +407,7 @@ pub struct Fleet {
 
 impl Drop for Fleet {
     fn drop(&mut self) {
+        let _timing = super::timing::phase(super::timing::Phase::Teardown);
         self.nodes.clear();
         self.kill_edges(None);
         super::cleanup_test_base(&self.base);
@@ -475,6 +479,7 @@ impl Fleet {
     }
 
     pub fn wait_route(&self, node: &str, target: &str, present: bool) {
+        let _timing = super::timing::phase(super::timing::Phase::Converge);
         let target_id = self.node_id(target);
         wait_until("mesh route status", Duration::from_secs(30), || {
             let response: serde_json::Value = serde_json::from_str(
@@ -590,6 +595,7 @@ pub fn spawn_with_startup_probe(
     specs: &[NodeSpec],
     mut before_start: impl FnMut(&Fleet, &str),
 ) -> Fleet {
+    let _timing = super::timing::phase(super::timing::Phase::Spawn);
     let base = unique_base(tag);
     fs::create_dir_all(&base).unwrap();
     let bin_dir = PathBuf::from(env!("CARGO_BIN_EXE_flk"))
@@ -773,6 +779,7 @@ pub const ONE_WAY_PAIR: &[NodeSpec] = &[
 /// Poll an observable condition up to a deadline. Each probe must itself be
 /// bounded (socket probes should set read/write timeouts).
 pub fn wait_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let _timing = super::timing::wait(what);
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(value) = probe() {

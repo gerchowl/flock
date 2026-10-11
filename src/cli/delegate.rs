@@ -79,7 +79,7 @@ pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
     "                     [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS]\n",
     "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N]\n",
-    "                     [--keep-on-failure] [--json]\n",
+    "                     [--keep-on-failure] [--label TEXT] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
@@ -101,6 +101,8 @@ pub(super) const START_USAGE: &str = concat!(
     "  --max-chars N       characters of the reply to print, default 4000\n",
     "  --keep-on-failure   a start that fails once its agent exists keeps the workspace for\n",
     "                      inspection instead of rolling back; `flk delegate reap` removes it\n",
+    "  --label TEXT        recorded on the architect -> delegate edge, default the delegate's name;\n",
+    "                      a start from outside an agent pane prints `edge: none (unattested)`\n",
     "  a failed start prints the agent pane's last lines\n",
     "  the brief must ask for a final line `DONE: ...`, `BLOCKED: ...` or `VERDICT: ...`; a reply\n",
     "  ending on none of them is no_sentinel (exit 5); `flk delegate wait` lists every exit code\n",
@@ -922,6 +924,7 @@ struct StartFlags {
     harness: Option<String>,
     model: Option<String>,
     sandbox: Option<String>,
+    label: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
@@ -995,7 +998,7 @@ impl Verb {
             | "--sandbox" => self == Self::Start,
             "--after" => self == Self::Wait,
             "--force" => self == Self::Reap,
-            "--keep-on-failure" => self == Self::Start,
+            "--keep-on-failure" | "--label" => self == Self::Start,
             _ => false,
         }
     }
@@ -1063,6 +1066,7 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             "--harness" => flags.harness = Some(value(&mut index)?),
             "--model" => flags.model = Some(value(&mut index)?),
             "--sandbox" => flags.sandbox = Some(value(&mut index)?),
+            "--label" => flags.label = Some(value(&mut index)?),
             "--after" => flags.after = Some(value(&mut index)?),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -1101,6 +1105,7 @@ struct Parsed {
     harness: Option<String>,
     model: Option<String>,
     sandbox: Option<String>,
+    label: Option<String>,
     after: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
@@ -1124,6 +1129,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
         harness: flags.harness.clone(),
         model: flags.model.clone(),
         sandbox: flags.sandbox.clone(),
+        label: flags.label.clone(),
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
@@ -2704,6 +2710,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(placement) => placement,
         Err(code) => return Ok(code),
     };
+    let label = edge_label(name, flags.label.as_deref(), server_takes_label());
     let started = start_the_agent(
         name,
         &placement,
@@ -2712,6 +2719,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             model: flags.model.as_deref(),
             sandbox: flags.sandbox.as_deref(),
         },
+        label,
     );
     let agent = match started {
         Ok(agent) => agent,
@@ -3297,11 +3305,56 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
     Ok(())
 }
 
+/// The label `agent.start` gets for the delegation edge (#959): the one asked
+/// for, else the delegate's name. A server that does not advertise the
+/// capability gets none, and is named rather than left to drop it silently
+/// (#868 skew rules).
+fn edge_label(name: &str, asked: Option<&str>, server_takes_label: bool) -> Option<String> {
+    let label = asked.unwrap_or(name).to_string();
+    if server_takes_label {
+        return Some(label);
+    }
+    eprintln!(
+        "delegate {name}: the server does not record edge labels; starting without label {label:?}"
+    );
+    None
+}
+
+/// Does the server advertise `agent_start_label`? A ping that fails reads as
+/// no, so the start goes ahead without the field rather than failing late.
+fn server_takes_label() -> bool {
+    bounded(
+        Method::Ping(crate::api::schema::PingParams::default()),
+        None,
+    )
+    .is_ok_and(|pong| advertises_label(&pong))
+}
+
+fn advertises_label(pong: &serde_json::Value) -> bool {
+    pong.pointer("/result/capabilities/agent_start_label")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Print what the start recorded as its edge when it recorded none (#959):
+/// a start whose ancestry places it in no agent pane is attested as the
+/// operator, and its delegate will not be listed as the caller's.
+fn report_unattested_edge(name: &str, response: &serde_json::Value) {
+    if let Some(edge) = response
+        .pointer("/result/edge")
+        .and_then(serde_json::Value::as_str)
+        .filter(|edge| edge.starts_with("none"))
+    {
+        eprintln!("delegate {name}: edge: {edge}");
+    }
+}
+
 fn start_the_agent(
     name: &str,
     placement: &Placement,
     harness: &HarnessSpec,
     options: HarnessOptions<'_>,
+    label: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let argv = (harness.argv)(options);
     let response = request(
@@ -3317,10 +3370,12 @@ fn start_the_agent(
             // The delegate's whole premise is that it lands BESIDE the operator.
             focus: false,
             argv,
+            label,
         }),
         None,
     )
     .map_err(|err| format!("delegate {name}: could not start the agent: {err}"))?;
+    report_unattested_edge(name, &response);
     // `request` returns Err on a server-level error already (see its impl),
     // so a response here is a success envelope: no second `error` check (F12).
     response
@@ -5196,6 +5251,40 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #959 / #868: the label defaults to the delegate's name, goes only to a
+    /// server that advertises it, and a server that does not (an older one,
+    /// whose pong has no such capability) gets a start without it.
+    #[test]
+    fn the_edge_label_is_sent_only_to_a_server_that_advertises_it() {
+        assert_eq!(edge_label("fixer", None, true).as_deref(), Some("fixer"));
+        assert_eq!(
+            edge_label("fixer", Some("#614"), true).as_deref(),
+            Some("#614")
+        );
+        assert_eq!(edge_label("fixer", Some("#614"), false), None);
+
+        let current = serde_json::json!({"result": {"type": "pong", "capabilities": {
+            "live_handoff": true, "agent_start_label": true
+        }}});
+        let older = serde_json::json!({"result": {"type": "pong", "capabilities": {
+            "live_handoff": true
+        }}});
+        let oldest = serde_json::json!({"result": {"type": "pong", "version": "0.9.0"}});
+        assert!(advertises_label(&current));
+        assert!(!advertises_label(&older));
+        assert!(!advertises_label(&oldest));
+    }
+
+    #[test]
+    fn the_label_flag_is_a_start_flag() {
+        let args: Vec<String> = ["d", "--label", "#614"].map(String::from).to_vec();
+        assert_eq!(
+            parse_flags(Verb::Start, &args).map(|flags| flags.label),
+            Ok(Some("#614".to_string()))
+        );
+        assert!(parse_flags(Verb::Send, &args).is_err());
+    }
 
     #[test]
     fn not_started_requires_idle_same_execution_and_no_new_turn() {

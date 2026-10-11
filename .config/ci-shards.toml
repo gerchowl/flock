@@ -1,0 +1,68 @@
+# How CI splits one platform's test run across parallel jobs (#991).
+#
+# The serial-pty group in `.config/nextest.toml` runs one test at a time, and
+# it used to be a single ~20-minute chain on the critical path of every PR,
+# while the rest of the runner's cores sat idle. Running those tests in
+# parallel on ONE runner is not the fix: that is the CPU contention the group
+# exists to prevent. So each shard below is its own runner, and inside it the
+# group still holds them to one at a time — the same contention profile as
+# before, with several lanes instead of one.
+#
+# A shard is either `serial` (only serial-pty binaries, which nextest then
+# runs one at a time) or not (only binaries outside the group, run in
+# parallel), never a mix. Every serial-pty binary must be in exactly one
+# serial shard. Exactly one shard says `rest = true` instead of listing
+# binaries: it runs everything the others do not name. `scripts/ci_shards.py
+# verify` fails the build unless the shards list exactly the tests the leg's
+# base filter selects, each once.
+#
+# Balance by measured time: the check job's summary prints per-shard wall
+# clock and per-binary totals from every shard's JUnit report. Five shards per
+# leg because five macOS jobs is the account's concurrency limit, and a sixth
+# would only queue behind the others.
+
+# One leg per required check, `check (<leg>)`. `filter` is what that leg's
+# single job used to run, and the shards partition exactly that set.
+[legs.ubuntu-latest]
+filter = "all()"
+
+[legs.macos-15]
+# live_handoff has been skipped on macOS since 3503209b ("ci: skip live
+# handoff tests on macos"), carried over unchanged here.
+filter = "not binary(live_handoff)"
+
+# Measured on CI run 38151232176 (cumulative test seconds, macOS / ubuntu).
+# The parallel shards each get about half of the rest, which runs ~3 tests at
+# a time on a hosted runner.
+
+[[shards]]
+name = "unit-1"
+serial = false
+# flk 274/146, delegate 191/80, delegate_codex 132/71, delegate_safety 126/73,
+# delegate_r4 86/42
+binaries = ["flk", "delegate", "delegate_codex", "delegate_safety", "delegate_r4"]
+
+[[shards]]
+name = "unit-2"
+serial = false
+# ~800/400: the other parallel integration binaries
+rest = true
+
+[[shards]]
+name = "serial-1"
+serial = true
+# mesh_forwarding 256/273, mesh_routes 72/62, peer_federation 30/11
+binaries = ["mesh_forwarding", "mesh_routes", "peer_federation"]
+
+[[shards]]
+name = "serial-2"
+serial = true
+# mesh_step1 217/189, mcp_fleet_messaging 97/103, mesh_enrollment 61/45
+binaries = ["mesh_step1", "mcp_fleet_messaging", "mesh_enrollment"]
+
+[[shards]]
+name = "serial-3"
+serial = true
+# mesh_step2 ~350/311, live_handoff (ubuntu only) 47, cross_area 15/7,
+# fleet_gossip 11/4
+binaries = ["mesh_step2", "live_handoff", "cross_area", "fleet_gossip"]

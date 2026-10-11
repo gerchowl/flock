@@ -32,6 +32,7 @@ struct RequestError {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         unregister_spawned_flock_pid(pid);
@@ -90,6 +91,7 @@ fn spawn_server_with_env(
     api_socket: &Path,
     extra_env: &[(&str, &str)],
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -139,6 +141,7 @@ fn spawn_named_session_server(
     runtime_dir: &Path,
     session_name: &str,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -176,6 +179,7 @@ fn spawn_named_session_server(
 }
 
 fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -272,6 +276,7 @@ fn assert_ok(response: serde_json::Value) {
 }
 
 fn wait_for_api(socket_path: &Path, timeout: Duration) {
+    let _timing = support::timing::wait("ready: api");
     let deadline = Instant::now() + timeout;
     let mut last_error = String::new();
     while Instant::now() < deadline {
@@ -2310,6 +2315,143 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// Every `agent_delegated` event in the isolated server's durable log, as
+/// (architect, delegate, via, reissued).
+fn delegation_edges(config_home: &Path) -> Vec<(String, String, String, bool)> {
+    let mut logs = Vec::new();
+    let mut dirs = vec![config_home.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|name| name == "event-log.jsonl")
+            {
+                logs.push(path);
+            }
+        }
+    }
+    assert_eq!(logs.len(), 1, "one event log in the sandbox: {logs:?}");
+    fs::read_to_string(&logs[0])
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["envelope"]["event"] == "agent_delegated")
+        .map(|event| {
+            let data = &event["envelope"]["data"];
+            (
+                data["architect"].as_str().unwrap().to_string(),
+                data["delegate"].as_str().unwrap().to_string(),
+                data["via"].as_str().unwrap().to_string(),
+                data["reissued"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+/// #959: the edge starts where the value starts. An agent pane runs the real
+/// `flk agent start`, so the server attests the caller by walking that
+/// process's ancestry to the pane, and the test ends at the event on the
+/// durable log. A live handoff then folds the log in the new server, which
+/// re-issues the still-open edge. A start from this test process, which no
+/// pane is an ancestor of, records nothing and says so.
+#[test]
+fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let child_out = base.join("child-start.json");
+    let started_marker = base.join("child-started");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let command = format!(
+        "FLOCK_SOCKET_PATH={socket} {flk} agent start child --cwd /tmp -- /bin/sh -c 'exec sleep 600' > {out} 2>&1; echo done > {marker}; exec sleep 600",
+        socket = api_socket.display(),
+        flk = env!("CARGO_BIN_EXE_flk"),
+        out = child_out.display(),
+        marker = started_marker.display(),
+    );
+    let architect = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:architect",
+            "method": "agent.start",
+            "params": {"name": "architect", "cwd": "/tmp", "argv": ["/bin/sh", "-c", command]}
+        }),
+    );
+    assert_ok(architect.clone());
+    let architect_id = architect["result"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        architect["result"]["edge"], "none (unattested)",
+        "the test process is not in any pane"
+    );
+    support::wait_for_file(&started_marker, Duration::from_secs(10));
+    let child: serde_json::Value = serde_json::from_str(&fs::read_to_string(&child_out).unwrap())
+        .unwrap_or_else(|err| panic!("child start output: {err}"));
+    let child_id = child["result"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("child start failed: {child}"))
+        .to_string();
+    assert_eq!(
+        child["result"]["edge"],
+        serde_json::json!(format!("architect {architect_id}"))
+    );
+    assert_eq!(
+        delegation_edges(&config_home),
+        [(
+            architect_id.clone(),
+            child_id.clone(),
+            "start".to_string(),
+            false
+        )],
+        "exactly one edge, with the calling pane's agent as architect"
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    // A request the app loop answers, so the replacement server is past the
+    // once-per-start fold rather than only listening.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:list","method":"agent.list","params":{}}),
+    ));
+
+    let edges = delegation_edges(&config_home);
+    assert!(
+        edges.contains(&(
+            architect_id.clone(),
+            child_id.clone(),
+            "start".to_string(),
+            true
+        )),
+        "the handed-off server re-issues the open edge: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|edge| edge.1 == architect_id),
+        "the operator-started architect has no architect of its own: {edges:?}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
     cleanup_test_base(&base);
 }
 
