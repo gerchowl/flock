@@ -517,3 +517,31 @@ fn an_existing_ping_warns_once_for_an_older_server() {
         1
     );
 }
+
+/// #1029: both events verbs answer an older server's unknown `events.read`
+/// with the version gap (exit 78), the wait included before it waits.
+#[test]
+fn events_verbs_report_the_version_gap_against_an_older_server() {
+    for args in [
+        &["events", "read"][..],
+        &[
+            "events",
+            "wait",
+            "--kinds",
+            "pane_exited",
+            "--timeout",
+            "5s",
+        ],
+    ] {
+        let (output, methods) = run(
+            args,
+            Some("1.2.0"),
+            Some(
+                serde_json::json!({"code":"invalid_request", "message":"unknown variant `events.read`"}),
+            ),
+            false,
+        );
+        assert_gap(output, "1.2.0");
+        assert_eq!(methods, ["events.read", "ping"], "{args:?}");
+    }
+}
