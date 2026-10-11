@@ -183,7 +183,7 @@ pub(crate) mod tests {
     /// missing from this list may hold none.
     const GRANDFATHERED_BARE_CLI_RETURNS: &[(&str, usize)] = &[
         ("src/cli.rs", 72),
-        ("src/cli/agent.rs", 63),
+        ("src/cli/agent.rs", 61),
         ("src/cli/checks.rs", 8),
         ("src/cli/delegate.rs", 5),
         ("src/cli/digest.rs", 6),
@@ -201,7 +201,6 @@ pub(crate) mod tests {
         ("src/cli/ready.rs", 1),
         ("src/cli/report.rs", 14),
         ("src/cli/revert.rs", 4),
-        ("src/cli/server.rs", 6),
         ("src/cli/status.rs", 7),
         ("src/cli/tab.rs", 16),
         ("src/cli/workspace.rs", 14),
