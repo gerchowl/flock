@@ -215,7 +215,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "arm-self-compact",
-        "flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>",
+        "flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>",
     ),
     (
         "pane",
