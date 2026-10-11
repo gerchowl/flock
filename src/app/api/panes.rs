@@ -660,6 +660,7 @@ impl App {
             params.agent_session_path,
         );
         let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref,
@@ -673,6 +674,9 @@ impl App {
 
         if native_identity {
             self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -782,6 +786,7 @@ impl App {
             params.agent_session_path,
         );
         let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref,
@@ -793,6 +798,9 @@ impl App {
 
         if native_identity {
             self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
         }
         encode_success(id, ResponseResult::Ok {})
     }

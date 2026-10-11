@@ -3103,6 +3103,14 @@ pub struct AgentInfo {
     /// summaries, and on servers predating #553.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_cursor: Option<String>,
+    /// The agent has a resume plan and no running process (#1010): it was
+    /// hibernated, or a restart restored it and its deferred resume has not
+    /// launched yet. `agent resume` brings it back either way.
+    ///
+    /// Additive and optional, so it needed no protocol bump: omitted when
+    /// false, and an older server never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumable: bool,
     pub revision: u64,
 }
 
@@ -4989,6 +4997,7 @@ mod tests {
             status_age_secs: None,
             run_id: None,
             turn_cursor: Some("term_1:0:3:9:w".into()),
+            resumable: false,
             revision: 4,
         }
     }
