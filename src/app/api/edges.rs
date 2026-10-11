@@ -3,35 +3,72 @@ use super::responses::{encode_error, encode_success};
 use crate::api::schema::ResponseResult;
 use crate::app::App;
 
-const SSHD_ANCESTRY_DEPTH: usize = 16;
+const SSH_ANCESTRY_DEPTH: usize = 16;
 
-/// The ancestor a relay must descend from: `sshd` (which also matches macOS's
-/// `sshd-session` and Linux's `sshd:` privsep child).
+/// The ancestors a relay may descend from, matched against the process name.
+///
+/// - `sshd`, as a prefix, which also matches macOS's `sshd-session` and
+///   Linux's `sshd:` privsep child.
+/// - `tailscaled`, exactly: Tailscale SSH has no sshd, and a session's shell
+///   descends from `tailscaled be-child ssh` under the `tailscaled` daemon
+///   (#976). Tailscale's SSH server runs on Linux, and on macOS only with the
+///   open-source `tailscaled` daemon. The App Store and standalone apps cannot
+///   accept Tailscale SSH sessions, so there is no other macOS process to match.
+///
+/// Both are matched the same way, by name: a renamed copy of a shell passes
+/// for either one equally, and neither is trusted more. The caller's
+/// `SSH_CONNECTION` is not consulted, since the caller sets its own
+/// environment and a variable proves nothing about its ancestry.
 ///
 /// Debug builds let the multi-node test harness name a different one: its
 /// fake ssh runs the relay under the polling node's own server, and macOS
 /// refuses to run a copied system shell renamed to stand in for sshd. A
 /// release build never reads the variable.
-fn relay_ancestor() -> String {
+fn relay_ancestor_override() -> Option<String> {
     #[cfg(debug_assertions)]
     if let Ok(name) = std::env::var("FLOCK_TEST_RELAY_ANCESTOR") {
-        return name;
+        return Some(name);
     }
-    "sshd".to_string()
+    None
 }
 
-/// Whether `pid` was started by an ssh session: some ancestor is sshd.
-fn descends_from_sshd(pid: u32) -> bool {
-    let ancestor = relay_ancestor();
+/// Whether a process named `name` is an ssh session's server process.
+fn is_ssh_server_process(name: &str, override_ancestor: Option<&str>) -> bool {
+    match override_ancestor {
+        Some(ancestor) => name.starts_with(ancestor),
+        None => name.starts_with("sshd") || name == "tailscaled",
+    }
+}
+
+/// Whether `pid` was started by an ssh session: some ancestor is an ssh
+/// server process (see [`is_ssh_server_process`]).
+fn descends_from_ssh(pid: u32) -> bool {
+    let override_ancestor = relay_ancestor_override();
+    ancestry_reaches_ssh_server(
+        pid,
+        override_ancestor.as_deref(),
+        crate::platform::process_parent_id,
+        crate::platform::process_name,
+    )
+}
+
+/// The ancestry walk behind [`descends_from_ssh`], over an injected process
+/// table so the tests can describe one.
+fn ancestry_reaches_ssh_server(
+    pid: u32,
+    override_ancestor: Option<&str>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    name_of: impl Fn(u32) -> Option<String>,
+) -> bool {
     let mut current = pid;
-    for _ in 0..SSHD_ANCESTRY_DEPTH {
-        let Some(parent) = crate::platform::process_parent_id(current) else {
+    for _ in 0..SSH_ANCESTRY_DEPTH {
+        let Some(parent) = parent_of(current) else {
             return false;
         };
         if parent <= 1 || parent == current {
             return false;
         }
-        if crate::platform::process_name(parent).is_some_and(|name| name.starts_with(&ancestor)) {
+        if name_of(parent).is_some_and(|name| is_ssh_server_process(&name, override_ancestor)) {
             return true;
         }
         current = parent;
@@ -90,11 +127,11 @@ impl App {
                 "the caller's start time could not be read, so it cannot be told from a pid reuser",
             );
         };
-        if !descends_from_sshd(pid) {
+        if !descends_from_ssh(pid) {
             return encode_error(
                 id,
                 "relay_not_from_ssh",
-                "a relay is started by the hub's ssh session; this caller has no sshd ancestor",
+                "a relay is started by the hub's ssh session; this caller has no sshd or tailscaled ancestor",
             );
         }
         match self
@@ -124,5 +161,138 @@ impl App {
                 format!("{method} is accepted only from an edge bound by mesh.hello"),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process table of `(pid, parent, name)` rows.
+    fn walk(pid: u32, table: &[(u32, u32, &str)]) -> bool {
+        ancestry_reaches_ssh_server(
+            pid,
+            None,
+            |pid| table.iter().find(|row| row.0 == pid).map(|row| row.1),
+            |pid| {
+                table
+                    .iter()
+                    .find(|row| row.0 == pid)
+                    .map(|row| row.2.to_string())
+            },
+        )
+    }
+
+    #[test]
+    fn ssh_server_names_are_accepted() {
+        for name in ["sshd", "sshd-session", "sshd: alice@pts/0", "tailscaled"] {
+            assert!(is_ssh_server_process(name, None), "{name}");
+        }
+    }
+
+    #[test]
+    fn other_names_are_refused() {
+        for name in [
+            "bash",
+            "zsh",
+            "flk",
+            "flock",
+            "ssh",
+            "tailscale",
+            "tailscaled-impostor",
+            "my-tailscaled",
+            "launchd",
+            "",
+        ] {
+            assert!(!is_ssh_server_process(name, None), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_test_override_replaces_the_real_ancestors() {
+        assert!(is_ssh_server_process("flk", Some("flk")));
+        assert!(!is_ssh_server_process("sshd", Some("flk")));
+        assert!(!is_ssh_server_process("tailscaled", Some("flk")));
+    }
+
+    #[test]
+    fn an_openssh_session_is_accepted() {
+        let table = [
+            (40, 30, "flk"),
+            (30, 20, "bash"),
+            (20, 10, "sshd-session"),
+            (10, 1, "sshd"),
+        ];
+        assert!(walk(40, &table));
+    }
+
+    #[test]
+    fn a_linux_privsep_session_is_accepted() {
+        let table = [
+            (40, 30, "flk"),
+            (30, 20, "bash"),
+            (20, 10, "sshd: alice@notty"),
+            (10, 1, "sshd"),
+        ];
+        assert!(walk(40, &table));
+    }
+
+    #[test]
+    fn a_tailscale_ssh_session_is_accepted() {
+        // The ancestry reported in #976: bash -> tailscaled -> tailscaled -> init.
+        let table = [
+            (40, 30, "flk"),
+            (30, 20, "bash"),
+            (20, 10, "tailscaled"),
+            (10, 1, "tailscaled"),
+        ];
+        assert!(walk(40, &table));
+    }
+
+    #[test]
+    fn a_shell_renamed_to_resemble_tailscaled_is_refused() {
+        let table = [
+            (40, 30, "flk"),
+            (30, 20, "tailscaled-sh"),
+            (20, 1, "launchd"),
+        ];
+        assert!(!walk(40, &table));
+    }
+
+    #[test]
+    fn a_pane_process_is_refused() {
+        // A pane's shell descends from the flock server, which descends from
+        // the user's terminal and login session, never from an ssh server.
+        let table = [
+            (50, 40, "flk"),
+            (40, 30, "zsh"),
+            (30, 20, "flk"),
+            (20, 10, "alacritty"),
+            (10, 1, "launchd"),
+        ];
+        assert!(!walk(50, &table));
+    }
+
+    #[test]
+    fn the_caller_itself_is_not_its_own_ancestor() {
+        let table = [(40, 30, "sshd"), (30, 1, "launchd")];
+        assert!(!walk(40, &table));
+    }
+
+    #[test]
+    fn a_vanished_parent_or_cycle_ends_the_walk() {
+        assert!(!walk(40, &[(40, 30, "flk")]));
+        assert!(!walk(40, &[(40, 40, "flk")]));
+    }
+
+    #[test]
+    fn an_ancestor_beyond_the_depth_limit_is_not_reached() {
+        let depth = SSH_ANCESTRY_DEPTH as u32;
+        let mut table: Vec<(u32, u32, &str)> = (0..depth + 1)
+            .map(|step| (100 + step, 101 + step, "bash"))
+            .collect();
+        table.push((101 + depth, 1, "sshd"));
+        assert!(!walk(100, &table));
+        assert!(walk(100 + 1, &table));
     }
 }
