@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod fleet;
 pub mod process_table;
+pub mod timing;
 
 pub mod environment;
 
@@ -90,6 +91,7 @@ pub fn flock_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<
 }
 
 pub fn cleanup_test_base(base: &Path) {
+    let _timing = timing::phase(timing::Phase::Teardown);
     let runtime_dir = base.join("runtime");
     let runtime_dirs = HashSet::from([runtime_dir.clone()]);
 
@@ -141,6 +143,7 @@ fn terminate_servers_under_base(base: &Path) {
 }
 
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
+    let _timing = timing::wait("ready: socket");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
@@ -152,6 +155,7 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
 }
 
 pub fn wait_for_file(path: &Path, timeout: Duration) {
+    let _timing = timing::wait("ready: file");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {
@@ -362,6 +366,7 @@ pub fn client_handshake_with_fleet_and_theme(
     fleet_option_bytes: &[u8],
     theme_option_bytes: &[u8],
 ) -> Result<(u32, Option<String>), String> {
+    let _timing = timing::phase(timing::Phase::Handshake);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -859,6 +864,8 @@ pub fn cleanup_registered_flock_pids() {
 
 fn ensure_cleanup_hooks() {
     INIT.call_once(|| {
+        // Before the cleanup `atexit` below, so the timing report runs after it.
+        timing::init();
         let _ = cleanup_servers_with_missing_runtime_dir();
         start_global_watchdog();
 
@@ -1119,6 +1126,7 @@ fn is_test_flock_binary(path: &Path) -> bool {
 }
 
 extern "C" fn run_atexit_cleanup() {
+    let _timing = timing::phase(timing::Phase::Teardown);
     cleanup_registered_flock_pids();
 }
 
