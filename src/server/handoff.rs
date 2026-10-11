@@ -62,6 +62,10 @@ pub(crate) struct HandoffManifest {
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// Operator drafts kept in panes' stashes (#850), so a handoff does not
+    /// drop them. Absent from an older server's manifest.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kept_drafts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[cfg(unix)]
@@ -510,6 +514,7 @@ pub(crate) fn manifest_for(
         expected_protocol,
         snapshot,
         panes,
+        kept_drafts: Default::default(),
     }
 }
 
@@ -896,6 +901,16 @@ mod tests {
         assert_eq!(manifest.source_protocol, 25);
         assert_eq!(manifest.panes.len(), 1);
         assert_eq!(manifest.snapshot.workspaces.len(), 1);
+        assert!(manifest.kept_drafts.is_empty());
+    }
+
+    #[test]
+    fn kept_drafts_cross_a_handoff_manifest() {
+        let mut manifest: HandoffManifest = serde_json::from_str(OLD_SHAPE_MANIFEST).unwrap();
+        manifest.kept_drafts = [("w1:p1".to_string(), vec!["half a thought".to_string()])].into();
+        let wire = serde_json::to_string(&manifest).unwrap();
+        let received: HandoffManifest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(received.kept_drafts, manifest.kept_drafts);
     }
 
     #[test]

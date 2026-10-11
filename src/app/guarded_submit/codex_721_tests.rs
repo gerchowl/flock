@@ -105,3 +105,30 @@ fn codex_721_multiline_draft_keeps_bullets_as_input() {
         );
     }
 }
+
+/// The draft restore runs right after the submit, while Codex is working:
+/// its composer must still read, empty and then with the draft (#850).
+#[test]
+fn codex_721_working_composer_still_reads_for_a_draft_restore() {
+    for screen in [
+        include_str!("../../../tests/fixtures/codex-submit-721/inline-working.txt"),
+        include_str!("../../../tests/fixtures/codex-submit-721/alt-working.txt"),
+    ] {
+        fn rows(screen: &str) -> Vec<String> {
+            composer_rows(Agent::Codex, screen, screen)
+                .expect("working composer reads")
+                .0
+                .into_iter()
+                .filter(|row| !row.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }
+        assert_eq!(rows(screen), ["Ask Codex to do anything"]);
+        assert!(editor_rows_empty(
+            Agent::Codex,
+            &["Ask Codex to do anything"]
+        ));
+        let typed = screen.replace("Ask Codex to do anything", "half a thought");
+        assert_eq!(rows(&typed), ["half a thought"]);
+    }
+}

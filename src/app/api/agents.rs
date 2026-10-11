@@ -615,7 +615,9 @@ impl App {
             let Some(pane) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
                 return agent_not_found(id, &params.target);
             };
-            return self.handle_pane_submit(
+            // An operator's draft in the pane moves aside for the sentence
+            // and comes back after it (#850).
+            return self.handle_guarded_submit(
                 id,
                 crate::api::schema::PaneSubmitParams {
                     self_submit_confirmed: None,
@@ -624,6 +626,7 @@ impl App {
                     if_session: None,
                     min_age_secs: 0,
                 },
+                true,
             );
         }
         self.begin_paste(

@@ -981,6 +981,10 @@ impl HeadlessServer {
             self.rollback_handoff_before_commit(&socket_path, &[]);
             return Err(err.into());
         }
+        // #850: a draft an injection holds goes to the stash, which the
+        // manifest carries, and held keystrokes reach the PTY before it moves
+        // to the new server, which knows nothing of the lease.
+        self.app.settle_injections_for_exit();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
@@ -1050,6 +1054,7 @@ impl HeadlessServer {
             params.expected_version,
         );
         manifest.store_generation = store_generation;
+        manifest.kept_drafts = self.app.kept_drafts.borrow().export();
         if cfg!(debug_assertions)
             && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("stale_generation")
         {
@@ -3541,6 +3546,8 @@ impl HeadlessServer {
         self.app.tick_idle_wakes(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
+        // #850: mirrored in the TUI runtime loop (#25).
+        changed |= self.app.tick_injection_leases(now);
         changed |= self.app.tick_agent_restarts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
@@ -3655,6 +3662,9 @@ impl HeadlessServer {
         }
         info!("server shutdown initiated");
         self.shutting_down = true;
+        // #850: keep any draft an injection holds, and write any keystrokes
+        // an injection lease still holds.
+        self.app.settle_injections_for_exit();
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();
@@ -3677,6 +3687,7 @@ impl HeadlessServer {
     /// close client connections, remove socket files, and clean up.
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+        self.app.settle_injections_for_exit();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -3908,6 +3919,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         };
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
+        app.kept_drafts
+            .borrow_mut()
+            .import(std::mem::take(&mut received.manifest.kept_drafts));
         crate::server::handoff::report_restored(&mut received.stream)?;
         if cfg!(debug_assertions)
             && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored")
