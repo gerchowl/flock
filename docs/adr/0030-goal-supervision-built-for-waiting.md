@@ -1,7 +1,9 @@
 # ADR 0030 — Goal supervision decides most stops without a judge: parked on a registered wait is silent, the judge is a bounded last step, and the goal survives compaction as hook output
 
-- Status: Proposed
-- Date: 2026-10-11
+- Status: Accepted
+- Date: 2026-10-11 (accepted 2026-10-11)
+- Scope of acceptance: the decisions in this record, as the operator answered
+  them on 2026-10-11 (PR #1006, "Owner decisions"). Acceptance claims no code.
 - Issues: #1001 (area 3), #573 (goal mode in flk), #882–#886 (judge question
   set, owner-reserved clauses, handoff sentinel, breaker and fallback,
   decisions labels), #962 / #965 (delegate table and goal re-inject), #714
@@ -9,7 +11,7 @@
 - Builds on: ADR-0027 (delegate edges), ADR-0028 (state vocabulary, events,
   registered waits, wake), ADR-0029 (exit and error contract).
 - Decision owner: operator.
-- Implemented: none. Slices are listed in §7; the cross-ADR order is §8.
+- Implemented: none. Slices (§7) filed 2026-10-11: G0 #1033, G1 #1034, G2 #1035, G3a #885, G3b #1036, G3c #886, G4 #882 + #883, G5 #884, G6 #965. The cross-ADR order is §8.
 
 ## Context
 
@@ -102,7 +104,7 @@ decides in this order and stops at the first rung that applies:
 | 4 | the agent has an open **registered wait** (ADR-0028 §5): parked on a delegate, a PR's CI, a reply, or a `flk events wait` running under the harness's background mechanism | **parked**: allow silently, no push, no check-in timer | no |
 | 5 | every open subtask is owned by a live delegate edge (ADR-0027) whose `phase` is `working`, `settling`, `finished_with_background` or `waiting_on_event` | parked (as 4, derived from edges) | no |
 | 6 | frozen checks are green | enter the done gate: independent review, then `GoalMet` | no |
-| 7 | background work flk cannot attribute (`finished_with_background`) | allow, start a check-in deadline (`[goal] background_checkin_s`, default 30 min) instead of a push | no |
+| 7 | background work flk cannot attribute (`finished_with_background`) | allow, and schedule check-ins instead of a per-stop push: one check-in after 30 min (`[goal] background_checkin_s`), then the interval doubles (60 min, 120 min, …) while the background work flk cannot attribute is still running | no |
 | 8 | otherwise: classify the final message | judge (§3): `asks` / `routine` / `legit` / `deferred` → block with a continue nudge, or allow | yes |
 
 Consequences of the order:
@@ -240,7 +242,7 @@ each line shippable on its own:
 4. **E2** turn-keyed wake and self-compact; **E3** derived events; **E4a** → **E4b**, **E4c** event reads; ADR-0027 slice 2 (#960; slice 1, #959, has landed).
 5. **E5** wait registry; **E6** wake-follows-wait; ADR-0027 slice 3 (#961, now woken by E6).
 6. **G0** → **G1** → **G2**, **G3a** → **G3b**, **G3c** → **G4**, **G5**; ADR-0027 slice 4 (#962).
-7. **G6** with ADR-0027 slice 8 (#965); **E8** channel contract (#1005).
+7. **G6** with ADR-0027 slice 8 (#965); **E8** channel contract, then **E9a** → **E9b** → **E9c** questions with options (#1005).
 
 Retirement checkpoints for the flock fleet's own scaffolding: after step 5,
 `supervisor.py`'s status loop, CI watcher and typed `[fleet]` lines; after
@@ -298,25 +300,26 @@ the dialog scraping in `spawn-claude.sh` (with #605 already landed).
 
 ## Owner decisions
 
-Recommendation first; each is open until the operator answers it. The
-decisions for ADR-0028 and ADR-0029 are listed at the end of each.
+Decided by the operator on 2026-10-11 (PR #1006): every item below was
+accepted as recommended. The rejected alternative is kept for the record.
+The decisions for ADR-0028 and ADR-0029 are listed at the end of each.
 
-1. **Judge failure default.** Recommended: allow the stop and mark the goal
-   `degraded` (visible, reported to the supervisor, never `met`). Alternative:
+1. **Judge failure default.** Decided: allow the stop and mark the goal
+   `degraded` (visible, reported to the supervisor, never `met`). Rejected:
    hold the stop until the judge returns, which turns a System One outage into
    a fleet that cannot stop (the opencode twin's bug, claude-config#12).
-2. **Compaction vs operator.** Recommended: the operator first, compaction
+2. **Compaction vs operator.** Decided: the operator first, compaction
    second (§4). Compaction beats goal continuation in the stop ladder (rung 2)
    either way.
 3. **Background check-in deadline** for work flk cannot attribute (rung 7).
-   Recommended: 30 minutes, then one check-in, then doubling. The survey's
+   Decided: 30 minutes, then one check-in, then doubling. The survey's
    median allowed wait was 2.4 h to 19 h, so a shorter default would bring back
    the `bg-checkin` pushes this ADR removes.
 4. **G0: goal state as an event fold in the log vs a SQLite store.**
-   Recommended: the event fold, unless G0 measures the Stop-hook read path over
+   Decided: the event fold, unless G0 measures the Stop-hook read path over
    budget; it is the pattern lineage and ADR-0027 already use, and it gives the
    versioned, auditable state the field report asked for.
 5. **Parking on delegates that are `settling` or `finished_with_background`**
-   (rung 5). Recommended: yes, because each produces a waking event; `finished`
+   (rung 5). Decided: yes, because each produces a waking event; `finished`
    and `needs_human` delegates do not park the architect.
 

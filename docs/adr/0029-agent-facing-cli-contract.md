@@ -1,13 +1,15 @@
 # ADR 0029 — The agent-facing CLI keeps one contract: a send submits and says whether it did, an exit code means one thing on every verb, output is selectable, and errors are stable JSON
 
-- Status: Proposed
-- Date: 2026-10-11
+- Status: Accepted
+- Date: 2026-10-11 (accepted 2026-10-11)
+- Scope of acceptance: the decisions in this record, as the operator answered
+  them on 2026-10-11 (PR #1006, "Owner decisions"). Acceptance claims no code.
 - Issues: #1001 (areas 2 and 4), #995 (submit by default), #996 (field
   selectors and stable errors). Builds on #639 / #640 / #783–#786 (guarded
   submit and confirmed outcomes), #850 (injection lock), #868 (client/server
   skew). Consumed by ADR-0028 §8 (external channels).
 - Decision owner: operator.
-- Implemented: none. Slices are listed in §8 and are not filed yet.
+- Implemented: none. Slices (§8) filed 2026-10-11: C1 #1017, C4a #1018, C5 #1021, C2 #1024, C3 #996, C4b #995, C4c #1025, C4d #1026.
 
 ## Context
 
@@ -117,7 +119,7 @@ their meaning where they do not collide; collisions are resolved once:
 | 10 | refused before acting, nothing changed | yes, later | send-like verbs, guarded verbs |
 | 11 | delegate not started (was 8) | after inspecting | `delegate start/wait` |
 | 12 | `--field` path missing in the result | never | all (§3) |
-| 13 | refused by policy or scope (`msg` refused, channel scope, ADR-0014 boundary; was 4 for `msg`) | never without a change | `msg`, channel adapters |
+| 13 | refused by policy or scope (`msg` refused, channel scope, ADR-0014 boundary; was 4 for `msg`) | never without a change | `msg`, channel adapters, `question answer` (`question_closed`) |
 | 75 | the client gave up reconnecting to its server (`RECONNECT_GAVE_UP_EXIT_CODE`, #436; EX_TEMPFAIL) | yes, once the server is back | the attached client and launcher |
 | 78 | client/server protocol gap (#868) | after a handoff | all |
 | 124 | timeout | yes | waits |
@@ -226,7 +228,7 @@ client-side or additive on the wire:
 | # | Slice | Depends on | Replaces / amends | Skew (§7) | Acceptance |
 | --- | --- | --- | --- | --- | --- |
 | C1 | Exit-code registry and error-code enum with retry class; `--help` exit sections generated; drift-lock tests. No code changes value yet | — | — | Client-side | Every existing code path returns the same code as before; a test lists every code and fails on an unregistered literal |
-| C2 | Error envelope on stdout under `--json` / `--format json` / `--field`, human line on stderr; global `--format`; MCP `data.retry` / `data.exit` | C1 | #996 (errors half) | Client-side | `flk agent get nosuch --json | python3 -c 'import json,sys; json.load(sys.stdin)'` succeeds and exits 4; plain `flk agent get nosuch` prints one human line |
+| C2 | Error envelope on stdout under `--json` / `--format json` / `--field`, human line on stderr; global `--format`; MCP `data.retry` / `data.exit` | C1 | #996 (errors half) | Client-side | `flk agent get nosuch --json \| python3 -c 'import json,sys; json.load(sys.stdin)'` succeeds and exits 4; plain `flk agent get nosuch` prints one human line |
 | C3 | Global `--field <path>` with `[]` / `[n]`, exit 12 on a missing path | C2 | #996 (selector half) | Client-side | `flk agent list --field 'agents[].name'` prints one name per line; a missing path exits 12 with the envelope |
 | C4a | `typed_not_submitted` detection in the guarded submit, as a `reason` under `unconfirmed` | — | #995 (outcome half) | Additive; old clients exit 8 | Sandbox probe with a composer that swallows Enter: `unconfirmed` / `typed_not_submitted`, exit 8, on both the new client and the last released client |
 | C4b | `agent send` submits by default; `--no-submit`; `--submit` becomes a deprecated no-op | C1 | #995 (default half) | Client-side | A send into a settled empty composer is `accepted`, exit 0; `--no-submit` types only |
@@ -239,8 +241,9 @@ client-side or additive on the wire:
 - An agent can branch on an exit code without knowing the verb, and every
   non-zero code says whether retrying is safe.
 - The composer-left-full failure is reported as itself.
-- Scripts that parse today's JSON keep working; scripts that branch on the two
-  moved codes need a one-line change, announced for a release.
+- Scripts that parse today's JSON keep working; scripts that branch on any of
+  the four moved codes (§2: 1 → 10, 3 → 6, 8 → 11, 4 → 13) need a one-line
+  change, announced for a release with stderr notices.
 - The CLI reference gains generated exit and error tables, which the docs
   currently lack.
 
@@ -280,18 +283,19 @@ client-side or additive on the wire:
 
 ## Owner decisions
 
-Recommendation first; each is open until the operator answers it.
+Decided by the operator on 2026-10-11 (PR #1006): every item below was
+accepted as recommended. The rejected alternative is kept for the record.
 
 1. **`agent send` submits by default** (C4b), with `--no-submit` and a
-   one-release deprecation of `--submit` as a no-op. Recommended: yes; the
+   one-release deprecation of `--submit` as a no-op. Decided: yes; the
    survey shows teaching `--submit` failed (32 of 951 sends).
 2. **The four exit-code moves in one release** (§2: 1 → 10, 3 → 6, 8 → 11,
-   4 → 13), each with a one-release stderr notice. Recommended: yes, together,
-   so scripts are updated once. Alternative: keep 3 for the plain waits and
+   4 → 13), each with a one-release stderr notice. Decided: yes, together,
+   so scripts are updated once. Rejected: keep 3 for the plain waits and
    accept that one signal has two codes depending on the verb.
 3. **Errors on stdout with `--json` / `--field`**, a human line on stderr.
-   Recommended: yes; without machine output nothing changes.
+   Decided: yes; without machine output nothing changes.
 4. **Refuse multi-row text without bracketed paste** (`unsafe_text`) instead
-   of typing it line by line. Recommended: yes; line-by-line typing submits the
+   of typing it line by line. Decided: yes; line-by-line typing submits the
    first line early in every harness.
 

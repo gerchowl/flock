@@ -1,7 +1,9 @@
 # ADR 0028 — An agent's state has one cross-harness vocabulary, supervisors read it as a resumable event stream, and waiting is a registered wait that the server wakes, never a poll
 
-- Status: Proposed
-- Date: 2026-10-11
+- Status: Accepted
+- Date: 2026-10-11 (accepted 2026-10-11)
+- Scope of acceptance: the decisions in this record, as the operator answered
+  them on 2026-10-11 (PR #1006, "Owner decisions"). Acceptance claims no code.
 - Issues: #1001 (the spike this records, area 1 "push events, stop polling").
   Amends the slice plans of #663, #697, #961 and #922's follow-ups. Composes
   with ADR-0027 (delegate tracking), ADR-0029 (agent-facing CLI contract),
@@ -9,7 +11,7 @@
 - Builds on: ADR-0005 (durable event log), ADR-0008 / ADR-0018 / ADR-0019 (mail,
   wake, channel push), ADR-0026 (mesh custody), #850 (injection lock).
 - Decision owner: operator.
-- Implemented: none. Slices are listed in §10 and are not filed yet.
+- Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
 
@@ -430,6 +432,89 @@ other client. It gets no private path.
   and whether flk embeds the adapter later. The contract above is what any
   embedding must keep.
 
+### 8a. Open questions are first-class: structured options, a reply path, and one answer
+
+Added by the owner on 2026-10-11 (#1005, two additions: options, then a reply
+path). The main reason to reach an agent from a phone is to answer the question
+it is stuck on, and most such questions have choices. A question, and its
+choices, must therefore travel as data, not as screen text.
+
+- **What counts as an open question.** Every `needs_human{question}` (a harness
+  question or choice dialog on screen) and every unanswered `needs_reply`
+  message addressed to the operator or a channel. Each has a stable
+  `question_id`, with or without options.
+
+- **Payload.** `needs_human{question}` gains an optional `question` object, and
+  so does a `needs_reply` message whose sender attached options:
+
+  ```text
+  question {
+    question_id,                 // stable for one dialog instance or one message
+    source:       screen | message,
+    prompt,                      // the question text
+    options:      [{ id, label, description? }],
+    multi_select: bool,
+    allow_other:  bool,          // free text accepted ("Other")
+    default?:     option id,
+    timeout_ms?,
+    state:        open | answered { by, option_ids | text, at } | expired | withdrawn
+  }
+  ```
+
+- **Sources.** On screen: the harness's choice dialog, detected per the
+  AGENTS.md evidence rule (Claude Code's AskUserQuestion dialog with its
+  numbered options and descriptions, Codex and opencode choice prompts). The
+  `question_id` is derived from the agent, the turn cursor and a fingerprint of
+  the prompt and options, so a redraw is the same question and a new dialog is
+  a new one. From a message: `msg.send` gains an optional `options` block, and
+  the `question_id` is the message's correlation id.
+- **Events.** `agent.question_opened`, `agent.question_answered` (with who
+  answered and through which binding) and `agent.question_closed` (`expired`,
+  or `withdrawn` when the dialog leaves the screen unanswered) are durable
+  kinds, so the answer is part of the agent's event stream and a channel can
+  update its rendering.
+- **One answer verb.** `question.answer { question_id, option_ids | text }` is
+  the only way in, from the CLI, MCP or a channel adapter (which needs the
+  `reply` scope). The first valid answer wins. A second tap, a late poll answer
+  or an answer to a question that has closed is refused with
+  `question_closed` (ADR-0029 exit 13), so retries and duplicate deliveries are
+  harmless.
+- **Delivery into the agent.** For an on-screen dialog the server selects the
+  option itself through the guarded injection under the #850 lock: before each
+  key it re-checks that the same `question_id` is still on screen, it uses the
+  harness's own selection keys (number or arrows, space to toggle for
+  multi-select, Enter to confirm, the Other field for free text), and it
+  confirms that the dialog closed. The result is an ADR-0029 outcome:
+  `accepted`, `abandoned` (the dialog changed or the operator typed, nothing
+  selected) or `unconfirmed`. For a message the answer becomes a `msg.reply`
+  with `in_reply_to` set and the chosen option ids in a structured field beside
+  the label text.
+- **Answering locally.** `flk question list` shows open questions across
+  agents with age, source and options; `flk question answer <id> <text>` or
+  `--option <ID>` (repeatable for multi-select) calls `question.answer`. MCP
+  has `flock_question_list` and `flock_question_answer`. The same idempotency
+  applies, and a refusal says who answered first and when.
+- **Every answer is recorded with its source** (`cli`, `mcp`, or
+  `channel:<binding>/<external user>`) in `agent.question_answered`, so the
+  event stream shows who decided what.
+- **Defaults and timeouts are never applied to an on-screen dialog by flk.**
+  For a message, the server picks `default` on timeout only when the sender
+  asked for it (`auto_default: true`); otherwise the question expires.
+- **Channel rendering** (the adapter's job, not specified in depth): a single
+  choice renders as inline buttons, multi-select or several questions as a poll
+  (`tg-poll` in `gerchowl/telegram-bot`), and `allow_other` as a free-text
+  reply. The adapter maps Telegram's short callback data to `question_id` and
+  option id itself, and edits the message to show the outcome once
+  `agent.question_answered` or `agent.question_closed` arrives.
+- **Reply path.** Every channel post of an open question carries its
+  `question_id` (the adapter keeps the mapping from the chat's message id). A
+  native reply-to-message on that post (text, an option button, or a poll
+  answer) answers exactly that agent and question, with no target or id to
+  type. A plain message in an agent's channel answers that agent's **oldest**
+  open question, or becomes an ordinary inbound message (§8) when none is open.
+  Either way it goes through `question.answer`, so a reply to a question that
+  someone already answered locally is refused and the chat is told by whom.
+
 ### 9. Migration: what each hand-rolled piece becomes
 
 | Today | Becomes | Slice |
@@ -461,11 +546,14 @@ in ADR-0030 §8.
 | E3 | Derived durable kinds `agent.phase_changed`, `agent.needs_human`, `agent.limit_reached`, `agent.gone` after the server settle window | E1a (E1b, E1c enrich it) | #663 A (event half) | New persisted kinds: first verify the last released server skips unknown kinds in the log, fix the reader if not | A status that flips back inside the window emits nothing; a real `PaneAgentStatusChanged` sequence produces exactly one `agent.phase_changed` |
 | E4a | `events.read { after, kinds, subjects, limit, wait_ms }` on the socket: ring-then-disk replay, `gap`, server-side long-poll on the hub condvar | — | `EventsWait` schema stub | New method, protocol bump. Old server: exit 78 via `normalize` | Property test: random rotations and restarts, a reader resuming from any retained cursor sees every event once or more, never a silent gap; a reader past retention gets `gap` |
 | E4b | `flk events read` / `flk events wait` and MCP `flock_events_read`; watch-nudge text and the `watch-job` skill point at them | E4a | — | Client side only; against an old server the verbs exit 78 | `flk events wait --kinds agent.phase_changed --subject <agent> --timeout 5s` returns the event, or exits 124 |
-| E4c | `events.subscribe` takes `after`, starts at now when omitted, reports `lagged`; `delegate wait` and `agent wait --status settled` re-based on `events.read` | E4a | — | Changes `events.subscribe` defaults (changelog line); new clients use `events.read` only when the server advertises the protocol, else keep today's polling | `delegate wait` makes one request per state change instead of 5 per second; existing wait exit codes unchanged |
+| E4c | `events.subscribe` takes `after`, starts at now when omitted, reports `lagged`; `delegate wait` and `agent wait --status settled` re-based on `events.read` | E4a | — | Changes `events.subscribe` defaults (changelog line); a new client detects support from the `protocol` number in the server's `ping` reply (the probe #868's `begin_cli` already makes and caches per invocation; MCP probes once per process): at or above the protocol E4a bumps to it uses `events.read`, below it keeps today's 200 ms polling | `delegate wait` makes one request per state change instead of 5 per second; existing wait exit codes unchanged |
 | E5 | Wait registry: blocking and `park` waits recorded against the attested caller, `state.waiting`, `phase: waiting_on_event`, deadline expiry event | E1a, E4a | — | `wait.park` is state-changing: gated, exit 78 against an old server | A parked agent reads `waiting_on_event`; a `flk events wait` started under Claude `run_in_background` makes the pane `waiting_on_event`, not `finished_with_background` |
 | E6 | Wake-follows-wait: a message or event that opens a registered wait wakes regardless of intent; idle wake for Codex and opencode where the inbox tool is configured | E2, E5 | ADR-0027 §3 wake gap (#961) | Server-internal. Mail relayed from an older peer is woken by the local rule, since the rule runs at the recipient | An architect parked on its delegates is woken by an `fyi` digest within one injection; an unparked one is not; a Codex agent with the flock MCP server is woken |
 | E7 | PR poller adds check-run conclusions; `pr.ci_completed`, `pr.merged`, `pr.closed` kinds | — | #663 B | New persisted kinds (same reader check as E3) | One `pr.ci_completed` per head SHA with failed check names; no added per-worktree `gh` exec |
 | E8 | Channel adapter contract: binding config, capability token, per-binding coalescing buffer, inbound `msg.send` / `msg.reply` attribution and scope checks; a reference adapter test double | E4a, ADR-0029 C1 | #1005 (contract half) | New state-changing methods, gated; an adapter refuses to start against a server without them | #1005's first-slice acceptance against a fake adapter; an unauthorised sender is refused and logged |
+| E9a | Structured `question` payload on `needs_human{question}` from the Claude AskUserQuestion dialog (then Codex / opencode choice prompts); `options` on `msg.send`; `agent.question_opened` / `agent.question_closed` | E1c | #1005 (questions) | Fields and new kinds only; old clients print them; an old server ignores no new request because there is none yet | Captured AskUserQuestion screens (single, multi-select, with Other) yield the documented payload; a redraw keeps the `question_id`, a new dialog changes it |
+| E9b | `question.answer`: first answer wins, `question_closed` afterwards (naming who answered); on-screen selection through the guarded injection with a per-key re-check; message answers as `msg.reply` with option ids; `agent.question_answered` with source; `flk question list` / `flk question answer`, MCP `flock_question_list` / `flock_question_answer` | E9a, ADR-0029 C1 | #1005 (questions) | New state-changing method, gated (exit 78 against an older server) | Fake Claude dialog: `flk question answer <id> --option 2` selects option 2 and the dialog closes (`accepted`); a second answer is refused and names the first answerer; a dialog that changed mid-selection is `abandoned` with nothing selected; `flk question list` shows open dialogs and unanswered `needs_reply` messages |
+| E9c | Channel side of questions: binding receives `agent.question_*`; adapter test double renders buttons, poll and Other; reply-to-message routing by `question_id`, plain message to the oldest open question (or ordinary inbound mail when none); outcome edits back to the chat | E8, E9b | #1005 (questions) | Adapter refuses to enable questions against a server without `question.answer` | Fake adapter: a button answer reaches the agent once and a duplicate callback is refused; a reply-to-message on a question post answers that question even when the agent has two open; a plain message answers the oldest; a multi-select poll selects every chosen option |
 
 ## Consequences
 
@@ -538,25 +626,31 @@ in ADR-0030 §8.
 
 ## Owner decisions
 
-Each of these is open until the operator answers it. The recommendation comes
-first.
+Decided by the operator on 2026-10-11 (PR #1006): every item below was
+accepted as recommended. The rejected alternative is kept for the record.
 
-1. **Wake follows the wait (§5).** Recommended: amend ADR-0027 §3 through this
+1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
-   Alternative: give the digest a waking intent, which would interrupt
+   Rejected: give the digest a waking intent, which would interrupt
    architects that did not ask to be woken.
-2. **Injection priority (§5).** Recommended: operator input first, then
+2. **Injection priority (§5).** Decided: operator input first, then
    compaction, then a wake, then a goal continuation, which keeps #850 and
-   ADR-0027 §3 intact. Alternative: compaction above the operator, which would
+   ADR-0027 §3 intact. Rejected: compaction above the operator, which would
    be the only write allowed to override a human and is not proposed.
-3. **Defaults (§6).** Recommended: 20 s settle (5 s already removes 48 % of raw
+3. **Defaults (§6).** Decided: 20 s settle (5 s already removes 48 % of raw
    transitions, 20 s removes 54 % and also covers compaction and quota
    screens), a 12-line digest, and 540 s maximum read wait.
-4. **Channels (§8).** Recommended: inbound text defaults to `needs_reply` (it
+4. **Channels (§8).** Decided: inbound text defaults to `needs_reply` (it
    wakes, since a person sent it on purpose); adapters authenticate with a
    per-binding capability token issued by the server; one statically named
    node per binding, no failover.
-5. **Channel adapter placement.** Recommended: out of process (the
+5. **Channel adapter placement.** Decided: out of process (the
    telegram-bot daemon over the socket) now; embedding later must keep §8's
    contract.
-
+6. **Open questions from channels (§8a), added by the owner.** Decided: a
+   structured `question` payload with options sourced from the harness's choice
+   dialog or a message's `options`; channel rendering as buttons, poll and
+   free-text Other; a reply path (reply-to-message answers that question, a
+   plain message answers the oldest open one); `flk question list` / `answer`
+   and MCP equivalents; first answer wins, every answer recorded with its
+   source. Slices E9a–E9c.
