@@ -79,10 +79,10 @@ pub(super) mod exit {
     // `blocked` with a code of its own would send a supervisor to a different
     // remedy for the same signal. The codes themselves are unchanged, and 5 and
     // 6 (the delegate's own) deliberately live in `cli::delegate` instead.
-    pub(crate) const SETTLED: i32 = 0;
-    pub(crate) const BLOCKED: i32 = 3;
-    pub(crate) const GONE: i32 = 4;
-    pub(crate) const TIMEOUT: i32 = 124;
+    pub(crate) const SETTLED: i32 = crate::cli::exit::SUCCESS;
+    pub(crate) const BLOCKED: i32 = crate::cli::exit::WAIT_BLOCKED;
+    pub(crate) const GONE: i32 = crate::cli::exit::GONE;
+    pub(crate) const TIMEOUT: i32 = crate::cli::exit::TIMEOUT;
 }
 
 /// What a `--status` value means. CLI-only: `Settled` has no server-side
@@ -247,13 +247,13 @@ impl SettledOutcome {
     /// below is the mapping those verbs had before the split.
     fn exit_code(&self) -> i32 {
         match self {
-            Self::Stalled { .. } => 7,
+            Self::Stalled { .. } => crate::cli::exit::STALLED,
             Self::Settled { .. } => exit::SETTLED,
             Self::Blocked { .. } => exit::BLOCKED,
             Self::Gone { .. } => exit::GONE,
-            Self::Refused(_) => 2,
+            Self::Refused(_) => crate::cli::exit::USAGE,
             Self::TimedOut => exit::TIMEOUT,
-            Self::ServerRefused(_) | Self::Error(_) => 1,
+            Self::ServerRefused(_) | Self::Error(_) => crate::cli::exit::FAILURE,
         }
     }
 }
