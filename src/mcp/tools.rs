@@ -73,7 +73,11 @@ pub(super) fn table() -> &'static [Tool] {
         Tool {
             name: "flock_agent_get",
             description: "Get one agent's details. `target` accepts a public \
-                          pane id, a terminal id, or a unique agent name.",
+                          pane id, a terminal id, or a unique agent name. \
+                          `settled_with_background_shells: true` on an \
+                          `idle`/`done` agent means its turn ended while \
+                          shells or agents it started are still running; \
+                          the field is absent otherwise.",
             input_schema: schema_target_only,
             build: build_agent_get,
         },

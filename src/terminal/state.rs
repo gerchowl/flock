@@ -198,6 +198,11 @@ pub struct TerminalState {
     /// (e.g. Claude's "Implementing the parser"). Cleared by the detector
     /// when the agent stops working.
     pub live_activity: Option<String>,
+    /// The detector last saw a Claude turn that ended (`done <time>`) with
+    /// background shells still running (#911, #922). Carried to `agent.get`
+    /// and `agent.result` so a supervisor on the socket can tell that settle
+    /// from one with nothing left running without reading the screen.
+    pub settled_with_background_shells: bool,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -339,6 +344,7 @@ impl TerminalState {
             header_reserved: false,
             state_changed_at: None,
             live_activity: None,
+            settled_with_background_shells: false,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -1034,6 +1040,7 @@ impl TerminalState {
         self.fallback_visible_idle = false;
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
+        self.settled_with_background_shells = false;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
@@ -1295,6 +1302,7 @@ impl TerminalState {
         self.fallback_visible_idle = false;
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
+        self.settled_with_background_shells = false;
         self.stale_hook_idle_since = None;
         self.state = AgentState::Unknown;
         self.state_changed_at = None;
@@ -1332,6 +1340,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.stale_hook_idle_since = None;
         self.live_activity = None;
+        self.settled_with_background_shells = false;
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
@@ -2462,6 +2471,7 @@ mod tests {
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2487,6 +2497,7 @@ mod tests {
                 visible_blocker: false,
                 visible_idle: true,
                 visible_working: false,
+                settled_with_background_shells: false,
             },
             false,
             now + std::time::Duration::from_millis(100),

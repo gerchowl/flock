@@ -507,6 +507,8 @@ Both verbs are read-only: neither marks a pane seen, so an agent may poll them. 
 
 Pane and agent records also carry `seen` (whether the operator has viewed the agent's latest completed turn — `agent_status` folds this bit into `done`) and `status_age_secs` (seconds since the semantic agent state last changed; omitted when no transition has been observed). Records from older servers parse as seen with no age.
 
+`agent.get`, `agent.list` and `agent.result` also carry `settled_with_background_shells: true` when the agent is `idle` or `done` because its Claude turn ended (the completion line shows `done <time>`) while background shells or agents it started are still running. The server reads this from the same screen detector that decides the agent's state, so a supervisor on the socket or MCP (`flock_agent_get`) can tell that settle apart from one with nothing left running without reading the pane. The field is omitted when false, and older servers never send it.
+
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Flock integration.
 
 ```json
