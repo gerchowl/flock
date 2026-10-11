@@ -327,6 +327,7 @@ fn entry_for(name: &str) -> Entry {
         root_pane_terminal_id: "rt".to_string(),
         base: None,
         base_sha: None,
+        agent_id: None,
     }
 }
 
@@ -343,6 +344,56 @@ fn w7_require_decide_a_mismatched_terminal_is_not_a_delegate() {
     let record = json!({"terminal_id": "someone_else"});
     assert!(matches!(
         require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn require_decide_a_restarted_delegate_is_found_by_its_agent_id() {
+    // #975: a server restart re-mints the terminal id. The agent id survives,
+    // and the entry is re-pointed at the new terminal and pane.
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".to_string());
+    let record = json!({"terminal_id": "t2", "pane_id": "p2", "agent_id": "agent_a"});
+    let live = require_decide(entry, AgentFetch::Found(record)).expect("same agent");
+    assert_eq!(live.terminal_id, "t2");
+    assert_eq!(live.pane_id, "p2");
+}
+
+#[test]
+fn require_decide_another_agent_on_a_new_terminal_is_not_a_delegate() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".to_string());
+    let record = json!({"terminal_id": "t2", "agent_id": "agent_b"});
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn require_decide_backfills_the_agent_id_on_a_terminal_match() {
+    let entry = entry_for("d1");
+    let record = json!({"terminal_id": "t", "agent_id": "agent_a"});
+    let live = require_decide(entry, AgentFetch::Found(record)).expect("same terminal");
+    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
+}
+
+#[test]
+fn require_decide_a_legacy_worktree_entry_survives_a_restart_in_its_worktree() {
+    // An entry written before agent ids were recorded (the #975 report): the
+    // agent still runs in the delegate's own worktree under its name.
+    let mut entry = entry_for("d1");
+    entry.worktree = Some("/wt/d1".to_string());
+    let record =
+        json!({"terminal_id": "t2", "pane_id": "p2", "agent_id": "agent_a", "cwd": "/wt/d1"});
+    let live = require_decide(entry.clone(), AgentFetch::Found(record)).expect("same worktree");
+    assert_eq!(live.terminal_id, "t2");
+    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
+
+    let elsewhere = json!({"terminal_id": "t2", "agent_id": "agent_a", "cwd": "/elsewhere"});
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(elsewhere)),
         Err(RequireFailure::NotDelegate)
     ));
 }

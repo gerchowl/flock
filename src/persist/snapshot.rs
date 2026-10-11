@@ -168,6 +168,52 @@ pub struct PaneSnapshot {
     pub launch_argv: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_env: Vec<(String, String)>,
+    /// The resume plan of a hibernated agent (#1010).
+    ///
+    /// Hibernation used to live only in the server's memory, so a server that
+    /// started cold (a restart rather than a live handoff) brought the pane
+    /// back as a plain shell and `agent resume` answered `not_hibernated` for
+    /// an agent the operator had parked precisely so it could come back.
+    /// Additive and `#[serde(default)]`: an older file restores as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hibernated: Option<HibernatedPlanSnapshot>,
+}
+
+/// The stashed argv a hibernated agent resumes with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HibernatedPlanSnapshot {
+    pub agent: String,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub dedupe_key: String,
+}
+
+impl From<&crate::agent_resume::AgentResumePlan> for HibernatedPlanSnapshot {
+    fn from(plan: &crate::agent_resume::AgentResumePlan) -> Self {
+        Self {
+            agent: plan.agent.clone(),
+            argv: plan.argv.clone(),
+            dedupe_key: plan.dedupe_key.clone(),
+        }
+    }
+}
+
+impl HibernatedPlanSnapshot {
+    /// The plan to stash again, or `None` for a record with no argv to run.
+    pub fn to_plan(&self) -> Option<crate::agent_resume::AgentResumePlan> {
+        if self.argv.is_empty() {
+            return None;
+        }
+        Some(crate::agent_resume::AgentResumePlan {
+            agent: self.agent.clone(),
+            argv: self.argv.clone(),
+            dedupe_key: if self.dedupe_key.is_empty() {
+                self.argv.join(" ")
+            } else {
+                self.dedupe_key.clone()
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +524,12 @@ fn capture_tab(
                     .and_then(|pane| terminals.get(&pane.attached_terminal_id))
                     .map(|terminal| terminal.launch_env.clone())
                     .unwrap_or_default(),
+                hibernated: tab
+                    .panes
+                    .get(id)
+                    .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                    .and_then(|terminal| terminal.hibernated_resume_plan.as_ref())
+                    .map(HibernatedPlanSnapshot::from),
             },
         );
     }
@@ -724,6 +776,48 @@ mod tests {
         assert_ne!(other, minted);
     }
 
+    #[test]
+    fn a_hibernated_plan_survives_a_capture_and_a_parse() {
+        let mut state = state_with_workspaces(&["main"]);
+        let terminal_id = state.workspaces[0]
+            .terminal_id(state.workspaces[0].tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        let plan = crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "sid-1".into()],
+            dedupe_key: "claude:sid-1".into(),
+        };
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_hibernated_resume_plan(Some(plan.clone()));
+
+        let snapshot = capture_from_state(&state);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let parsed = parse_snapshot(&json).unwrap();
+        let pane = parsed.workspaces[0].tabs[0].panes.values().next().unwrap();
+        assert_eq!(
+            pane.hibernated
+                .as_ref()
+                .and_then(HibernatedPlanSnapshot::to_plan),
+            Some(plan)
+        );
+    }
+
+    #[test]
+    fn a_pane_snapshot_without_hibernation_parses_and_omits_the_field() {
+        let state = state_with_workspaces(&["main"]);
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        assert!(!json.contains("\"hibernated\""), "{json}");
+        let parsed = parse_snapshot(&json).unwrap();
+        assert!(parsed.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| pane.hibernated.is_none()));
+    }
+
     fn capture_from_state(state: &AppState) -> SessionSnapshot {
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         capture_from_state_with_runtimes(state, &terminal_runtimes)
@@ -825,6 +919,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
+                hibernated: None,
             },
         );
         panes.insert(
@@ -842,6 +937,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
+                hibernated: None,
             },
         );
 
@@ -1525,6 +1621,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
+                hibernated: None,
             },
         );
         panes.insert(
@@ -1544,6 +1641,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
+                hibernated: None,
             },
         );
 

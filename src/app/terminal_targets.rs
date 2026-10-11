@@ -66,6 +66,25 @@ impl App {
             }
         }
 
+        // The agent id is the one address that survives a restart (#1010):
+        // terminal ids are re-minted and pane ids are placements, so an
+        // operator holding only `agent list` output from before a restart
+        // can still reach the agent by it.
+        let agent_id_matches: Vec<_> = self
+            .terminal_targets()
+            .into_iter()
+            .filter(|candidate| {
+                self.state
+                    .terminals
+                    .values()
+                    .find(|terminal| terminal.id.to_string() == candidate.terminal_id)
+                    .is_some_and(|terminal| terminal.agent_id.to_string() == target)
+            })
+            .collect();
+        if let Some(resolved) = self.single_terminal_match(target, agent_id_matches)? {
+            return Ok(resolved);
+        }
+
         let name_matches: Vec<_> = self
             .terminal_targets()
             .into_iter()
@@ -209,5 +228,43 @@ impl App {
                 },
                 error => self.agent_target_error_body(error),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_one_pane() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("main"));
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    #[test]
+    fn an_agent_id_resolves_to_its_pane() {
+        // #1010: the agent id is the address that survives a restart.
+        let app = app_with_one_pane();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.workspaces[0].terminal_id(pane_id).unwrap();
+        let agent_id = app.state.terminals[terminal].agent_id.to_string();
+
+        let resolved = app.resolve_terminal_target(&agent_id).unwrap();
+        assert_eq!(resolved.pane_id, pane_id);
+        assert_eq!(resolved.terminal_id, terminal.to_string());
+        assert!(matches!(
+            app.resolve_terminal_target("agent_nowhere_0000"),
+            Err(TerminalTargetError::NotFound { .. })
+        ));
     }
 }
