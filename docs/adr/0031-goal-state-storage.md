@@ -46,7 +46,7 @@ included.
 | Cold start: one more full-log read + fold | p50 345 ms | p50 550 ms | open + first status: p50 0.35 ms, p99 0.57 ms |
 | Cold start: the fold alone, in a pass that already read the log | p50 29 ms | p50 47 ms | — |
 
-Across repeated runs (three at 97 MiB, two at 159 MiB) the shape held and the
+Across repeated runs (four at 97 MiB, two at 159 MiB) the shape held and the
 absolute values moved by up to 1.8× (hub open 281–818 ms, fold write p99 6–12
 ms); the table shows the last run of each. The operator's live log holds 131k
 events (19.4 MiB) over 71 days, so the 97 MiB case is a log that has rotated
