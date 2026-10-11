@@ -248,7 +248,8 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
-    /// Imported panes get one app-safe resize nudge after the first client attaches.
+    /// Imported panes get a resize nudge at import and another after the
+    /// first client attaches.
     pending_handoff_repaint_nudge: bool,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
@@ -1030,12 +1031,11 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            let has_agent_session =
+                terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            handoff_runtime.agent_session_hook_confirmed =
+                terminal.is_some_and(crate::terminal::TerminalState::agent_session_hook_confirmed);
             if !has_agent_session {
                 handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             }
@@ -3972,6 +3972,16 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             .resume_mesh_store(received.manifest.store_generation);
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
+        // The importer starts with an empty screen for every pane that does
+        // not replay history, and agent panes never do. An idle TUI has no
+        // reason to redraw, so without a nudge the pane stays blank until a
+        // client attaches, and every screen-gated decision (idle-wake mail
+        // delivery among them) sees nothing (#977). Nudge now, headless or not,
+        // and again on the first attach, when the client size settles.
+        server
+            .app
+            .terminal_runtimes
+            .nudge_child_redraw_after_handoff();
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             crate::logging::handoff_report_ownership_failed(&err.to_string());

@@ -580,6 +580,9 @@ fn restore_tab(
             continue;
         }
 
+        let imported_session_confirmed = imported_runtime
+            .as_ref()
+            .is_some_and(|imported| imported.state.agent_session_hook_confirmed);
         let runtime_result = if let Some(imported) = imported_runtime {
             TerminalRuntime::from_handoff_fd(
                 crate::handoff_runtime::ImportedHandoffRuntime {
@@ -649,6 +652,9 @@ fn restore_tab(
                     startup.duplicate_agent_session,
                 ) {
                     terminal.set_persisted_agent_session(session);
+                    if imported_session_confirmed {
+                        terminal.confirm_persisted_agent_session_after_handoff();
+                    }
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
