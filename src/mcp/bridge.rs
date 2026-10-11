@@ -145,10 +145,21 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     // Undo that arming rather than report a success that lost them.
     if let Some(pane) = pane {
         if crate::agent_self_compact::instructions_dropped(true, &flock_result) {
-            call_flock(crate::agent_self_compact::abort_dropped_arming(pane), flock)?;
+            // A failed abort must not replace the explanation with a bare
+            // transport error: the agent still needs to know why, and that
+            // the plain arming is still there to drop.
+            let message =
+                match call_flock(crate::agent_self_compact::abort_dropped_arming(pane), flock) {
+                    Ok(_) => crate::agent_self_compact::INSTRUCTIONS_DROPPED.to_string(),
+                    Err(err) => format!(
+                        "{} ({})",
+                        crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED,
+                        err.message
+                    ),
+                };
             return Err(McpError::from_flock_error(
                 crate::api::compatibility::ERROR_CODE,
-                crate::agent_self_compact::INSTRUCTIONS_DROPPED,
+                &message,
             ));
         }
     }
@@ -306,6 +317,43 @@ mod tests {
         )
         .expect("a server that stored them is a success");
         assert_eq!(current.calls.borrow().len(), 1);
+    }
+
+    /// An older server whose abort then fails: the explanation survives, and
+    /// says the plain arming is still there to drop.
+    #[test]
+    fn a_failed_abort_keeps_the_dropped_instructions_explanation() {
+        struct AbortFails;
+        impl FlockCall for AbortFails {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                match method {
+                    Method::PaneArmSelfCompact(params) if params.abort => Ok(json!({
+                        "error": {"code": "internal", "message": "socket closed"}
+                    })),
+                    _ => Ok(json!({"result": {
+                        "type": "pane_self_compact", "pane": "1-1",
+                        "state": "armed", "detail": "armed."
+                    }})),
+                }
+            }
+        }
+        let err = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &AbortFails,
+            &ChannelOptions::off(),
+        )
+        .expect_err("a dropped arming is not a success");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE}))
+        );
+        assert!(
+            err.message.contains("still armed") && err.message.contains("socket closed"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

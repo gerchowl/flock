@@ -517,11 +517,25 @@ fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
     // #854: an older server ignores `instructions` and arms a plain `/compact`.
     // Undo that arming rather than print a success that lost them.
     if crate::agent_self_compact::instructions_dropped(steered, &response["result"]) {
-        super::send_request(&Request {
+        let aborted = super::send_request(&Request {
             id: "cli:pane:arm-self-compact".into(),
             method: crate::agent_self_compact::abort_dropped_arming(pane),
-        })?;
-        eprintln!("{}", crate::agent_self_compact::INSTRUCTIONS_DROPPED);
+        });
+        // A failed abort keeps the explanation rather than losing it to `?`.
+        match aborted {
+            Ok(reply) if reply.get("error").is_none() => {
+                eprintln!("{}", crate::agent_self_compact::INSTRUCTIONS_DROPPED);
+            }
+            Ok(reply) => eprintln!(
+                "{} ({})",
+                crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED,
+                reply["error"]
+            ),
+            Err(err) => eprintln!(
+                "{} ({err})",
+                crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED
+            ),
+        }
         return Ok(crate::api::compatibility::EXIT_CODE);
     }
     super::print_response(&response)

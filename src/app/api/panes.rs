@@ -1231,6 +1231,10 @@ impl App {
                 },
             );
         }
+        // Unreachable today: every harness that passes `self_compact_refusal`
+        // (Claude Code) also takes instructions. Kept as defence in depth so
+        // widening self-compaction to a harness whose compact command takes
+        // no argument refuses instructions instead of silently dropping them.
         if instructions.is_some() && !self.self_compact_takes_instructions(&pane) {
             return encode_error(
                 id,

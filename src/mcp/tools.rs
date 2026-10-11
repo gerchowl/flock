@@ -1152,7 +1152,7 @@ fn schema_self_compact() -> Value {
             "instructions": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Optional. What the compaction's summary must keep — for example: keep GOAL.md, the STATUS.md next step, open PRs and the standing rules. Typed after the compact command as `/compact <instructions>`, so it steers the summary itself, where `continuation` only speaks after it. One line of plain text, capped at 16 KiB. Omit for a plain `/compact`. Refused for a harness whose compact command takes no argument.",
+                "description": "Optional. What the compaction's summary must keep — for example: keep GOAL.md, the STATUS.md next step, open PRs and the standing rules. Typed after the compact command as `/compact <instructions>`, so it steers the summary itself, where `continuation` only speaks after it. One line of plain text, at most 500 bytes: Claude Code collapses a longer paste and may then not run it as `/compact`. Omit for a plain `/compact`. Refused for a harness whose compact command takes no argument.",
             },
             "abort": {
                 "type": "boolean",
@@ -1219,7 +1219,7 @@ fn build_self_compact(args: Value) -> Result<Method, McpError> {
             || text.len() > crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES
         {
             return Err(McpError::invalid_params(
-                "`instructions` must be one line of plain text, at most 16 KiB: \
+                "`instructions` must be one line of plain text, at most 500 bytes: \
                  they are typed after `/compact` in the same paste, and a newline \
                  or escape would submit or end it early. Put the long version in \
                  a file and name the file.",
@@ -1691,9 +1691,6 @@ mod tests {
         assert!(!params.abort);
     }
 
-    /// A compaction with no prompt behind it would shorten the context and
-    /// then hand back no thread to hold, which is strictly worse than not
-    /// compacting at all.
     #[test]
     fn flock_self_compact_carries_the_compaction_instructions() {
         let method = build_self_compact(json!({
@@ -1716,7 +1713,11 @@ mod tests {
         };
         assert_eq!(bare.instructions, None, "omitted stays omitted");
 
-        for bad in ["", "  ", "keep\nthis", "keep\x1b[201~"] {
+        let cap = crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES;
+        build_self_compact(json!({"continuation": "go", "instructions": "k".repeat(cap)}))
+            .expect("exactly at the cap is accepted");
+        let over = "k".repeat(cap + 1);
+        for bad in ["", "  ", "keep\nthis", "keep\x1b[201~", over.as_str()] {
             let err = build_self_compact(json!({"continuation": "go", "instructions": bad}))
                 .expect_err("refused");
             assert!(
@@ -1727,6 +1728,9 @@ mod tests {
         }
     }
 
+    /// A compaction with no prompt behind it would shorten the context and
+    /// then hand back no thread to hold, which is strictly worse than not
+    /// compacting at all.
     #[test]
     fn flock_self_compact_refuses_an_empty_handoff_prompt() {
         for args in [

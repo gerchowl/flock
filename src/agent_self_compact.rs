@@ -107,10 +107,16 @@ pub fn check_instructions(text: &str) -> Result<(), ContinuationProblem> {
     Ok(())
 }
 
-/// Largest compaction instructions accepted, in bytes. The same cap as the
-/// continuation and for the same reason: anything longer belongs in a file the
-/// instructions name.
-pub const MAX_INSTRUCTIONS_BYTES: usize = MAX_CONTINUATION_BYTES;
+/// Largest compaction instructions accepted, in bytes — far below the
+/// continuation's cap, and for a reason the continuation does not have.
+/// Claude Code collapses a long paste into a `[Pasted text #N]` chip, and a
+/// collapsed `/compact <instructions>` is no longer a line that starts with
+/// the command: it can go in as an ordinary message instead of compacting.
+/// The collapse begins at around 800 characters, so 500 bytes (never more
+/// characters than bytes) keeps the whole `/compact ` line clear of it with
+/// margin. Instructions are a short list of what to keep; anything longer
+/// belongs in a file they name.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 500;
 
 /// The slash command that asks the harness to compact. Claude Code's, and
 /// currently the only one: compaction is a harness affordance, so the text is a
@@ -164,6 +170,16 @@ pub const INSTRUCTIONS_DROPPED: &str = "the flock server is older than this clie
      and ignored `instructions`, so it armed a plain `/compact` that would not keep \
      what you asked. That arming was aborted and nothing was typed. Hand the server \
      off with `flk server live-handoff`, or arm without `instructions`.";
+
+/// What a client says when it caught a dropped arming but could not abort it.
+/// The arming is still stored and will type a plain `/compact` at the end of
+/// the turn, so the agent is told how to drop it itself.
+pub const INSTRUCTIONS_DROPPED_ABORT_FAILED: &str = "the flock server is older than \
+     this client and ignored `instructions`, so it armed a plain `/compact` that \
+     would not keep what you asked — and aborting that arming failed, so it is \
+     still armed. Drop it with `flk pane arm-self-compact --abort` (or \
+     `flock_self_compact` with `abort: true`), then hand the server off with \
+     `flk server live-handoff`.";
 
 /// The abort a client sends to undo an arming that lost its instructions.
 pub fn abort_dropped_arming(pane: Option<String>) -> crate::api::schema::Method {

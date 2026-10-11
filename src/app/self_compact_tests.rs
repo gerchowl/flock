@@ -967,6 +967,29 @@ async fn instructions_that_could_escape_the_paste_are_refused_and_nothing_is_arm
     assert!(drain(&mut pty).is_empty());
 }
 
+/// The cap sits below Claude Code's paste collapse, so the longest accepted
+/// instructions still go out as one `/compact <instructions>` line.
+#[tokio::test]
+async fn instructions_exactly_at_the_cap_are_typed_whole() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = rig();
+    claude_idle_for(&mut app, SETTLED);
+    let cap = crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES;
+    assert!(
+        cap + "/compact ".len() < 800,
+        "the whole line must stay under Claude Code's ~800 character paste collapse"
+    );
+    let at_cap = "k".repeat(cap);
+    let reply = arm_with(&mut app, &pane, "carry on", Some(&at_cap));
+    assert!(reply.contains("\"state\":\"armed\""), "{reply}");
+    app.tick_self_compacts(Instant::now());
+    let typed = written(&mut pty);
+    assert!(typed.contains(&format!("/compact {at_cap}")), "{typed:?}");
+}
+
 /// A harness whose compact command takes no argument never gets the arming:
 /// the instructions would be lost, and the agent would believe the summary
 /// kept what it asked.

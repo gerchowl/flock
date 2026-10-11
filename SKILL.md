@@ -306,7 +306,9 @@ flk pane arm-self-compact \
 ```
 
 `--instructions-file <path>` reads them from a file instead. one line, plain
-text. claude code only, like the rest of this.
+text, at most 500 bytes: claude code collapses a longer paste, and a collapsed
+`/compact` may not run. name a file if there is more. claude code only, like
+the rest of this.
 
 write the prompt as instructions to your own next self. assume nothing
 survives but the compaction: name what to check first, what not to redo, and
