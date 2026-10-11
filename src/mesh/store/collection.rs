@@ -362,6 +362,26 @@ impl<D: DiskSpace> Store<D> {
         Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2)", params![hub, now], |r| r.get(0))?)
     }
 
+    /// Next hops whose offered rows came off their lease in `(after, now]`.
+    /// A collector learns of a re-offer only from a wake, and the summary
+    /// that advertises it is polled far less often than the lease (#879).
+    /// Read-only, and each row reports once per 5/60/299 s offer step.
+    pub fn offers_due(&self, after: i64, wall_ms: i64) -> Result<(i64, Vec<String>)> {
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Ok((after, Vec::new()));
+        }
+        let now = clock.advance(wall_ms);
+        let mut stmt = self.connection.prepare(
+            "SELECT DISTINCT next_hop FROM envelopes WHERE state='held' AND next_hop!=''
+             AND collect_attempts>0 AND retry_at>?1 AND retry_at<=?2 AND custody_deadline>?2",
+        )?;
+        let hops = stmt
+            .query_map(params![after, now], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((now, hops))
+    }
+
     /// Step-1 importers accept only local requests addressed to their neighbor.
     /// All-custody importers opt into offers and acks bound to the next hop.
     /// A lost ack reoffers the same immutable envelope for idempotent import.
