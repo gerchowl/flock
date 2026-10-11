@@ -280,6 +280,12 @@ try:
                 line = json.dumps(response) + "\n"
         if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
             (base / f"reset-refused-{target}").write_text(line)
+        # Leaves the summary as the only prompt to collect, as on an edge
+        # whose held stream is down and polls one-shot (#780).
+        if response.get("push") == "mesh.wake" and (base / f"drop-wakes-{source}-{target}").exists():
+            with (base / f"dropped-wakes-{source}-{target}").open("a") as log:
+                log.write(str(time.monotonic()) + "\n")
+            continue
         # Leaves the hub's own wake as the only prompt to collect (#879).
         result = response.get("result")
         if (base / f"hide-pending-{source}-{target}").exists() and isinstance(result, dict) \

@@ -363,7 +363,31 @@ const RECEIPT_STATE_SQL: &str = "CASE
     WHEN state='read' THEN 'read'
     ELSE 'expired' END";
 
+/// Inbox rows from `?1` whose receipt state at `?2` changed since the last
+/// one that origin accepted. Shared by selection and the summary's check, so
+/// the summary never advertises a receipt the poll would not mint.
+const OWED_RECEIPT_SQL: &str = "origin=?1 AND kind='message' AND state IN ('inbox','read','inbox_expired')
+    AND ((outcome_until<=?2 AND receipt_sent IS NOT 'outcome_retention_elapsed')
+      OR ((outcome_until IS NULL OR outcome_until>?2) AND (
+        (state='read' AND receipt_sent IS NOT 'read')
+        OR (state='inbox_expired' AND receipt_sent IS NOT 'expired')
+        OR (state='inbox' AND inbox_deadline<=?2 AND receipt_sent IS NOT 'expired')
+        OR (state='inbox' AND (inbox_deadline IS NULL OR inbox_deadline>?2) AND receipt_sent IS NOT 'delivered'))))";
+
 impl<D: DiskSpace> Store<D> {
+    /// Whether any receipt is owed to `origin` at `now`, without the writes
+    /// [`pending_receipts`] may make. Its poll mints and marks them, so this
+    /// turns false after one successful exchange.
+    ///
+    /// [`pending_receipts`]: Store::pending_receipts
+    pub(super) fn owes_receipts(&self, origin: &str, now: i64) -> Result<bool> {
+        Ok(self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {OWED_RECEIPT_SQL})"),
+            params![origin, now],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Receipts owed to `origin`: rows whose receipt state changed since the
     /// last one it accepted. Every state is markable, so a row leaves this
     /// window after one successful exchange and id order cannot starve the
@@ -376,13 +400,7 @@ impl<D: DiskSpace> Store<D> {
         let now = self.clock()?.advance(wall_ms);
         let mut stmt = self.connection.prepare(&format!(
             "WITH due AS MATERIALIZED (
-                SELECT rowid AS record_rowid,* FROM envelopes WHERE origin=?1 AND kind='message' AND state IN ('inbox','read','inbox_expired')
-                AND ((outcome_until<=?2 AND receipt_sent IS NOT 'outcome_retention_elapsed')
-                  OR ((outcome_until IS NULL OR outcome_until>?2) AND (
-                    (state='read' AND receipt_sent IS NOT 'read')
-                    OR (state='inbox_expired' AND receipt_sent IS NOT 'expired')
-                    OR (state='inbox' AND inbox_deadline<=?2 AND receipt_sent IS NOT 'expired')
-                    OR (state='inbox' AND (inbox_deadline IS NULL OR inbox_deadline>?2) AND receipt_sent IS NOT 'delivered'))))
+                SELECT rowid AS record_rowid,* FROM envelopes WHERE {OWED_RECEIPT_SQL}
                 ORDER BY id LIMIT ?3)
              SELECT record_rowid,id,{RECEIPT_STATE_SQL} FROM due"
         ))?;
