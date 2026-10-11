@@ -468,6 +468,10 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(
+            message.contains("Run `flk --session work server live-handoff`"),
+            "unexpected error: {message}"
+        );
+        assert!(
             message.contains("Run `flk session stop work`"),
             "unexpected error: {message}"
         );

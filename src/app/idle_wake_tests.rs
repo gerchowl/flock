@@ -756,35 +756,41 @@ async fn under_channel_push_a_turn_the_push_started_is_never_typed_over() {
 #[tokio::test]
 async fn guarded_submit_retries_only_enter_once_and_reports_unconfirmed() {
     use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
-    let Rig {
-        mut app,
-        pane,
-        mut pty,
-    } = rig();
-    claude_idle_for(&mut app, settled());
-    let now = Instant::now();
-    let mut attempt = app
-        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
-        .unwrap();
-    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
-    runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
-    assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
-    assert!(drain(&mut pty).is_empty());
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-        None
-    );
-    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
-        None
-    );
-    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
-        Some(Outcome::Unconfirmed("confirm_timeout"))
-    );
-    assert!(drain(&mut pty).is_empty());
+    // (composer after the retried Enter, reason): text still there means
+    // the composer swallowed Enter (#1018), an emptied one proves nothing.
+    for (after, reason) in [("hello", "typed_not_submitted"), ("", "confirm_timeout")] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+        assert!(drain(&mut pty).is_empty());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen(after));
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
+            Some(Outcome::Unconfirmed(reason))
+        );
+        assert_eq!(attempt.evidence.reason.as_deref(), Some(reason));
+        assert!(drain(&mut pty).is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1226,7 +1232,7 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
     let attempts = app.delivery_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].state, "unconfirmed");
-    assert_eq!(attempts[0].reason.as_deref(), Some("confirm_timeout"));
+    assert_eq!(attempts[0].reason.as_deref(), Some("typed_not_submitted"));
     assert!(attempts[0].retried);
     assert_eq!(app.mailboxes.queued_len(&pane), 1);
     let status = |app: &mut App| -> serde_json::Value {
@@ -1306,7 +1312,7 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
     assert!(digest
         .yellow
         .iter()
-        .any(|row| row.summary.contains("confirm_timeout")
+        .any(|row| row.summary.contains("typed_not_submitted")
             && row.context.contains(&("pane".into(), pane.clone()))));
     assert_eq!(app.mailboxes.queued_len(&pane), 0);
     std::fs::remove_file(log).unwrap();
@@ -2087,3 +2093,46 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
 
 #[path = "injection_lock_tests.rs"]
 mod injection_lock_tests;
+
+/// #1019 from the socket: `agent.get` and `agent.list` carry the `state`
+/// a real detector report produces, and the local `fleet` row repeats it.
+#[tokio::test]
+async fn agent_records_carry_the_state_object_from_the_detector() {
+    let call = |app: &mut App, method| -> serde_json::Value {
+        let id = "state".to_string();
+        serde_json::from_str(&app.handle_api_request(Request { id, method })).unwrap()
+    };
+    let Rig { mut app, pane, .. } = rig();
+    claude_idle_for(&mut app, Duration::from_secs(3));
+    let target = crate::api::schema::AgentTarget { target: pane };
+    let state = &call(&mut app, Method::AgentGet(target))["result"]["agent"]["state"];
+    assert_eq!(state["turn"], "idle");
+    assert_eq!(state["phase"], "settling");
+    assert_eq!(
+        (&state["background"], &state["attention"]),
+        (&"unknown".into(), &"unknown".into())
+    );
+    assert_eq!(
+        (&state["lifecycle"], &state["source"]["turn"]),
+        (&"live".into(), &"screen".into())
+    );
+    assert!(state["held_ms"].as_u64().unwrap() >= 3_000);
+    // The idle start only moves on a change, so the settled case is a fresh pane.
+    let Rig { mut app, .. } = rig();
+    claude_idle_for(&mut app, settled());
+    let list = call(
+        &mut app,
+        Method::AgentList(crate::api::schema::EmptyParams {}),
+    );
+    let agent = &list["result"]["agents"][0];
+    assert_eq!(
+        (&agent["agent_status"], &agent["state"]["phase"]),
+        (&"idle".into(), &"unknown".into())
+    );
+    let held = agent["state"]["held_ms"].as_u64().unwrap();
+    assert!(
+        (10_000..settled().as_millis() as u64).contains(&held),
+        "{held}"
+    );
+    assert_eq!(list["result"]["fleet"][0]["state"], agent["state"]);
+}

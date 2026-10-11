@@ -617,7 +617,17 @@ impl App {
             return None;
         }
         if attempt.sent && attempt.retried {
-            return Some(Outcome::Unconfirmed("confirm_timeout"));
+            // Both Enters went out and no turn started. If the composer still
+            // holds the sent text, it swallowed the key and the caller must
+            // clear it before retrying (ADR-0029 §1).
+            let typed = terminal
+                .effective_known_agent()
+                .is_some_and(|agent| editor_shows(agent, runtime, &reported_text));
+            return Some(Outcome::Unconfirmed(if typed {
+                "typed_not_submitted"
+            } else {
+                "confirm_timeout"
+            }));
         }
         if let Some(reason) = terminal.guarded_submit_blocker(
             now,

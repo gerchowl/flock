@@ -310,7 +310,10 @@ fn server_lifecycle_verbs_are_never_refused_for_skew() {
         let (output, methods) = run(args, Some("0.9.0"), None, false);
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(!stderr.contains("is incompatible with client"), "{stderr}");
-        assert_eq!(methods, [method], "{args:?}");
+        // live-handoff reads the server's version before and after (#958), so
+        // its status pings are not a skew gate.
+        let verbs: Vec<_> = methods.iter().filter(|sent| *sent != "ping").collect();
+        assert_eq!(verbs, [method], "{args:?} sent {methods:?}");
     }
 }
 

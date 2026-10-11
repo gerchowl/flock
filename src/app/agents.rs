@@ -1208,6 +1208,14 @@ impl App {
                     pane.agent_status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
+            state: Some(super::api_helpers::agent_state(
+                pane.agent_status,
+                terminal.last_state_authority(),
+                terminal.effective_known_agent(),
+                terminal
+                    .state_changed_at
+                    .map(|changed| changed.elapsed().as_millis() as u64),
+            )),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {
                 Some("resume_failed".into())
@@ -1228,6 +1236,9 @@ impl App {
             status_age_secs: pane.status_age_secs,
             run_id: terminal.run_id.clone(),
             turn_cursor: pane.turn_cursor,
+            resumable: terminal.hibernated_resume_plan.is_some()
+                || (terminal.pending_agent_resume_plan.is_some()
+                    && self.terminal_runtimes.get(&terminal.id).is_none()),
             revision: pane.revision,
         })
     }

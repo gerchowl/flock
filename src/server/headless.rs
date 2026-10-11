@@ -3964,7 +3964,7 @@ pub fn run_server() -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk server is already running");
             eprintln!("api socket: {}", api::socket_path().display());
-            std::process::exit(1);
+            std::process::exit(crate::cli::exit::FAILURE);
         }
         Err(err) => return Err(err),
     };
@@ -4003,7 +4003,7 @@ pub fn run_server() -> io::Result<()> {
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
                 eprintln!("error: flk server is already running");
                 eprintln!("client socket: {}", client_socket_path().display());
-                std::process::exit(1);
+                std::process::exit(crate::cli::exit::FAILURE);
             }
             Err(err) => return Err(err),
         };
