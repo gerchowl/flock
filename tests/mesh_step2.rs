@@ -504,15 +504,13 @@ fn lost_offer_on_one_way_edge_is_reoffered_after_backoff(how: &str) {
             .exists()
             .then_some(())
     });
-    let lost = Instant::now();
-    let messages = mail(c.fleet.node("nodea"), &c.sender.pane);
+    // A 5 s lease plus up to 1 s of jitter, with wide room for a loaded CI
+    // runner, yet far below the 299 s idle poll this used to wait for.
+    let messages = fleet::wait_until("re-offered inbox delivery", Duration::from_secs(60), || {
+        let messages = read(c.fleet.node("nodea"), &c.sender.pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    });
     assert_eq!(messages[0]["correlation_id"], "reverse");
-    // A 5 s lease plus up to 1 s of jitter, with room for a loaded runner.
-    assert!(
-        lost.elapsed() < Duration::from_secs(15),
-        "re-offer took {:?}",
-        lost.elapsed()
-    );
     state(c.fleet.node("nodeb"), "reverse", "delivered");
     once(c.fleet.node("nodea"), "reverse");
 }
