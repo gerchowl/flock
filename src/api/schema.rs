@@ -1497,6 +1497,11 @@ pub struct DeliveryAttempt {
     /// `kept` (left in the pane's stash for `flk pane stash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// Operator keystrokes held for this injection (#850) could not be
+    /// replayed because the pane refused them (a closed pane or a writer
+    /// accepting zero bytes, #1011). They are lost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_input_not_written: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

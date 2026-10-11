@@ -395,7 +395,7 @@ impl TerminalRuntime {
         self.0.end_all_injection_leases();
     }
 
-    pub(crate) fn drain_held_input(&self) -> bool {
+    pub(crate) fn drain_held_input(&self) -> crate::pane::HeldInputDrain {
         self.0.drain_held_input()
     }
 

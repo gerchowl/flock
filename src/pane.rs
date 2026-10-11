@@ -774,6 +774,16 @@ impl OperatorInputClock {
     }
 }
 
+/// What one retry of a pane's held-input backlog did (#850, #1011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct HeldInputDrain {
+    /// Some held input still waits on a full channel.
+    pub still_waiting: bool,
+    /// Held bytes a closed pane or a broken writer refused. They are lost.
+    pub refused_bytes: usize,
+}
+
 /// A pane's handoff quiesce, started and not yet collected, so a handoff can
 /// drain every pane at once instead of one after another.
 #[cfg(unix)]
@@ -2224,8 +2234,7 @@ impl PaneRuntime {
         };
         self.operator_input.stamp();
         if self.injection_lease.has_backlog() {
-            self.write_in_order(bytes);
-            return Ok(());
+            return self.write_in_order(bytes).map_err(mpsc::error::SendError);
         }
         self.io.send_bytes(bytes).await
     }
@@ -2242,8 +2251,12 @@ impl PaneRuntime {
         };
         self.operator_input.stamp();
         if self.injection_lease.has_backlog() {
-            self.write_in_order(bytes);
-            return Ok(());
+            // #1011 review: behind a backlog the write can still be refused
+            // (closed pane, broken writer), and then the backlog AND these
+            // bytes are gone, so the caller is told.
+            return self
+                .write_in_order(bytes)
+                .map_err(mpsc::error::TrySendError::Closed);
         }
         self.io.try_send_bytes(bytes)
     }
@@ -2301,16 +2314,17 @@ impl PaneRuntime {
             return true;
         };
         self.operator_input.stamp();
-        self.write_in_order(bytes)
+        self.write_in_order(bytes).is_ok()
     }
 
     /// Write behind any backlog. A full channel keeps the bytes for the loop
     /// to drain rather than dropping them; only a closed pane or a broken
-    /// writer refuses them, and that is logged and returned as false.
-    fn write_in_order(&self, bytes: Bytes) -> bool {
+    /// writer refuses them, and then the refused bytes (the old backlog with
+    /// these appended) are logged and returned as the error.
+    fn write_in_order(&self, bytes: Bytes) -> Result<(), Bytes> {
         let bytes = self.injection_lease.behind_backlog(bytes);
         match self.io.try_send_bytes(bytes) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(bytes)) => {
                 let len = bytes.len();
                 if self.injection_lease.defer(bytes) {
@@ -2318,18 +2332,19 @@ impl PaneRuntime {
                         "pane input channel full; {len} held bytes still waiting"
                     ));
                 }
-                true
+                Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(bytes)) if self.io.writer_broken() => {
+            Err(mpsc::error::TrySendError::Closed(bytes)) => {
+                let reason = if self.io.writer_broken() {
+                    "pane writer accepts zero bytes"
+                } else {
+                    "pane input channel closed"
+                };
                 crate::logging::pane_held_input_write_failed(&format!(
-                    "pane writer accepts zero bytes; {} held bytes not written",
+                    "{reason}; {} held bytes not written",
                     bytes.len()
                 ));
-                false
-            }
-            Err(err) => {
-                crate::logging::pane_held_input_write_failed(&err.to_string());
-                false
+                Err(bytes)
             }
         }
     }
@@ -2338,12 +2353,17 @@ impl PaneRuntime {
         self.injection_lease.has_backlog()
     }
 
-    /// Retry held input a full channel refused. True while some still waits.
-    pub(crate) fn drain_held_input(&self) -> bool {
-        if let Some(bytes) = self.injection_lease.take_backlog() {
-            let _ = self.write_in_order(bytes);
+    /// Retry held input a full channel refused.
+    pub(crate) fn drain_held_input(&self) -> HeldInputDrain {
+        let refused_bytes = self
+            .injection_lease
+            .take_backlog()
+            .and_then(|bytes| self.write_in_order(bytes).err())
+            .map_or(0, |bytes| bytes.len());
+        HeldInputDrain {
+            still_waiting: self.injection_lease.has_backlog(),
+            refused_bytes,
         }
-        self.injection_lease.has_backlog()
     }
 
     /// Write bytes flock authored on its own initiative, WITHOUT counting them
@@ -2605,6 +2625,67 @@ mod tests {
         std::io::Read::read_exact(&mut peer, &mut buf).expect("held input replayed");
         assert_eq!(&buf, b"held");
         handle.shutdown();
+    }
+
+    /// Held keys `ab` wait in the backlog behind a full one-slot channel, and
+    /// only then does the writer break (#1011 review, round 2).
+    #[cfg(unix)]
+    fn runtime_with_backlog_then_broken_writer(
+    ) -> (PaneRuntime, PtyIoActorHandle, Box<dyn std::any::Any>) {
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"ab"))
+            .expect("held while leased");
+        runtime
+            .try_send_flock_authored(Bytes::from_static(b"fill"))
+            .expect("the one slot");
+        assert!(
+            runtime.end_injection_lease("t"),
+            "a full channel keeps the replay for later"
+        );
+        assert!(runtime.has_held_backlog());
+        handle.test_mark_writer_broken();
+        (runtime, handle, guard)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_behind_a_backlog_a_broken_writer_refuses_is_an_error() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        match runtime.try_send_bytes(Bytes::from_static(b"c")) {
+            Err(mpsc::error::TrySendError::Closed(refused)) => {
+                assert_eq!(refused, Bytes::from_static(b"abc"), "backlog and new bytes");
+            }
+            other => panic!("refused input must be an error, got {other:?}"),
+        }
+        assert!(!runtime.has_held_backlog());
+
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+        let err = runtime
+            .send_bytes(Bytes::from_static(b"c"))
+            .await
+            .expect_err("the async path reports it too");
+        assert_eq!(err.0, Bytes::from_static(b"abc"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn draining_a_backlog_a_broken_writer_refuses_reports_the_loss() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        let drain = runtime.drain_held_input();
+
+        assert_eq!(
+            drain,
+            HeldInputDrain {
+                still_waiting: false,
+                refused_bytes: 2,
+            }
+        );
     }
 
     /// #1011 review: held keystrokes replayed into a broken writer (#850) are

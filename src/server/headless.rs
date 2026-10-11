@@ -367,6 +367,21 @@ fn undrained_handoff_message(panes: &[api::schema::UndrainedPane]) -> String {
     )
 }
 
+/// Orders `wX:pN` ids by their numbers (`w2` before `wA`, the tenth), not
+/// as strings. Ids that do not parse sort after, by text.
+fn public_pane_sort_key(pane_id: &str) -> (usize, usize, String) {
+    let (workspace, pane) = pane_id
+        .split_once(':')
+        .and_then(|(workspace, pane)| {
+            Some((
+                crate::workspace::public_workspace_number(workspace)?,
+                crate::workspace::decode_public_number(pane.strip_prefix('p')?)?,
+            ))
+        })
+        .unwrap_or((usize::MAX, usize::MAX));
+    (workspace, pane, pane_id.to_string())
+}
+
 /// A failed handoff's message, naming any pane whose input `--skip-undrained`
 /// had already dropped before the failure: that input is gone even though
 /// the old server keeps running.
@@ -1106,7 +1121,7 @@ impl HeadlessServer {
                 },
             }
         }
-        skipped_undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+        skipped_undrained.sort_by_cached_key(|pane| public_pane_sort_key(&pane.pane_id));
         // Recorded before any later step can fail, so a handoff that dropped
         // input and then failed still reports what it dropped.
         self.handoff_skipped_undrained = skipped_undrained.clone();
@@ -1115,7 +1130,7 @@ impl HeadlessServer {
             return Err(err.into());
         }
         if !undrained.is_empty() {
-            undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+            undrained.sort_by_cached_key(|pane| public_pane_sort_key(&pane.pane_id));
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(HandoffError::Undrained(undrained));
         }
@@ -4176,6 +4191,13 @@ mod tests {
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+
+    #[test]
+    fn undrained_panes_sort_by_number_not_text() {
+        let mut ids = vec!["pane 7", "wA:p1", "w2:p1", "w1:pA", "w1:p2"];
+        ids.sort_by_cached_key(|id| public_pane_sort_key(id));
+        assert_eq!(ids, vec!["w1:p2", "w1:pA", "w2:p1", "wA:p1", "pane 7"]);
+    }
 
     #[test]
     fn failed_handoff_message_reports_input_already_dropped() {

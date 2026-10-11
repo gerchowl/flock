@@ -788,7 +788,10 @@ impl PtyIoActorRunner {
                 let pending_bytes = self.pending_bytes();
                 if !drop_undrained {
                     // #1011 review: the queue stays as it is, so the old server
-                    // keeps every byte when the handoff is refused.
+                    // keeps every byte when the handoff is refused. The streak
+                    // restarts too, or the next zero write after the rollback
+                    // would declare the writer broken and drop that queue.
+                    self.zero_write_streak = 0;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         HandoffDrainTimeout {
@@ -1061,6 +1064,24 @@ impl PtyIoActorHandle {
         })
         .expect("actor spawn");
         (handle, peer)
+    }
+
+    /// A handle with no actor behind it: nothing drains its `capacity`-slot
+    /// queue, so a test can fill it. Keep the guard alive for the handle's
+    /// lifetime.
+    pub(crate) fn test_unserviced(capacity: usize) -> (Self, Box<dyn std::any::Any>) {
+        let (data_tx, data_rx) = mpsc::channel(capacity);
+        let (control_tx, control_rx) = std_mpsc::channel();
+        let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
+        let handle = Self {
+            data_tx,
+            control_tx,
+            wake: wake_pipe.writer,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+            writer_health: Arc::default(),
+        };
+        (handle, Box::new((data_rx, control_rx, wake_pipe.read_fd)))
     }
 
     /// Puts the writer in the state `ZERO_WRITE_LIMIT` zero-byte writes leave.
@@ -1676,6 +1697,12 @@ mod tests {
         assert_eq!(runner.pending_bytes(), 7, "the old server keeps every byte");
         assert!(!handle.writer_broken());
         assert_eq!(runner.state, ActorState::Running);
+        // The streak restarts, so the next zero write after the refused
+        // handoff does not break the writer and drop the queue just kept.
+        assert_eq!(runner.zero_write_streak, 0);
+        runner.flush_pending_writes_once();
+        assert!(!handle.writer_broken());
+        assert_eq!(runner.pending_bytes(), 7);
         assert!(
             started.elapsed() < HANDOFF_DRAIN_TIMEOUT,
             "a stuck writer fails fast, not at the deadline"
