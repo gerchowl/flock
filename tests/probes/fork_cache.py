@@ -98,7 +98,7 @@ def usage(session_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description="Token usage of a Claude session, for the ADR-0033 fork-cost runbook.")
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("usage", help="per-message token usage of one Claude session")
     one.add_argument("session_id")
