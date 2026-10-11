@@ -139,6 +139,7 @@ fn run_pr_poll_round(
     Ok(crate::events::PrPollRound {
         states: results,
         observed: found.into_values().collect(),
+        seed: None,
     })
 }
 
@@ -274,9 +275,13 @@ impl App {
             let targets = pr_poll_targets(&self.state);
             if !targets.is_empty() {
                 let event_tx = self.event_tx.clone();
+                let seed_from = (!self.pr_events.seeded).then(|| self.event_hub.clone());
                 self.pr_poll_health.mark_started(std::time::Instant::now());
                 std::thread::spawn(move || {
-                    let outcome = run_pr_poll_round(targets);
+                    let outcome = run_pr_poll_round(targets).map(|mut round| {
+                        round.seed = seed_from.map(|hub| crate::pr_poll::logged_pr_events(&hub));
+                        round
+                    });
                     let _ = event_tx.blocking_send(AppEvent::PrStatesUpdated(outcome));
                 });
             }
@@ -305,7 +310,7 @@ impl App {
                     return;
                 }
             };
-            self.emit_pr_events(&round.observed);
+            self.emit_pr_events(round.seed, &round.observed);
             let mut changed = false;
             for (workspace_id, pr_state) in round.states {
                 if let Some(ws) = self
@@ -1241,12 +1246,15 @@ impl App {
 
     /// Record the `pr.*` facts a round adds (#1020). The ledger is seeded from
     /// the durable log on the first round, so a restart re-announces nothing.
-    fn emit_pr_events(&mut self, observed: &[crate::pr_poll::PrObservation]) {
-        if !self.pr_events.restored {
-            let restored = self.event_hub.persisted_events_after(0);
-            self.pr_events
-                .fold(restored.iter().map(|(_, _, envelope)| envelope));
-            self.pr_events.restored = true;
+    /// Without a seed nothing is emitted: deduplication would be a guess.
+    fn emit_pr_events(
+        &mut self,
+        seed: Option<Vec<crate::api::schema::EventEnvelope>>,
+        observed: &[crate::pr_poll::PrObservation],
+    ) {
+        if !self.pr_events.seeded {
+            let Some(logged) = seed else { return };
+            self.pr_events.seed(&logged, observed);
         }
         for event in self.pr_events.derive(observed) {
             self.emit_event(event);
@@ -2873,6 +2881,7 @@ mod tests {
                     }),
                 )],
                 observed: Vec::new(),
+                seed: None,
             },
         )));
 
@@ -2886,47 +2895,70 @@ mod tests {
     }
 
     /// #1020 acceptance: one `pr.ci_completed` per head SHA and one
-    /// `pr.merged` per PR in the durable log, across repeated rounds AND a
-    /// server restart on the same log.
+    /// `pr.merged` per PR in the durable log, across repeated rounds AND
+    /// server restarts on the same log. A PR the first round after a start
+    /// already sees merged is history, and is seeded silently.
     #[tokio::test]
     async fn pr_events_persist_once_across_rounds_and_a_restart() {
-        use crate::api::schema::EventKind;
+        use crate::api::schema::{EventData, EventKind};
+        use crate::worktree::PrState;
         let dir = std::env::temp_dir().join(format!("flock-pr-events-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let log = dir.join("event-log.jsonl");
-        let observe = |state| crate::pr_poll::PrObservation {
+        let observe = |number, state| crate::pr_poll::PrObservation {
             repo: "o/n".into(),
-            branch: "feat".into(),
-            info: crate::worktree::PrStateInfo { state, number: 7 },
+            branch: format!("feat-{number}"),
+            info: crate::worktree::PrStateInfo { state, number },
             head_sha: Some("abc".into()),
             ci: Some(crate::pr_poll::CiConclusion {
                 conclusion: "failure".into(),
                 failed_checks: vec!["test".into()],
             }),
         };
-        let round = |state| {
-            crate::events::AppEvent::PrStatesUpdated(Ok(crate::events::PrPollRound {
-                states: Vec::new(),
-                observed: vec![observe(state)],
-            }))
-        };
-        for state in [
-            crate::worktree::PrState::Open,
-            crate::worktree::PrState::Merged,
-        ] {
+        // One server start per entry; each start runs its rounds in order.
+        let starts: [&[(u64, PrState)]; 3] = [
+            &[(7, PrState::Open), (7, PrState::Open)],
+            &[(7, PrState::Open), (7, PrState::Merged)],
+            &[(8, PrState::Merged), (8, PrState::Merged)],
+        ];
+        for rounds in starts {
             let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
             let hub = crate::api::EventHub::with_persistence(log.clone());
-            let mut app = App::new(&crate::config::Config::default(), true, None, api_rx, hub);
-            app.handle_internal_event(round(state));
-            app.handle_internal_event(round(state));
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                api_rx,
+                hub.clone(),
+            );
+            for &(number, state) in rounds {
+                app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(
+                    crate::events::PrPollRound {
+                        states: Vec::new(),
+                        observed: vec![observe(number, state)],
+                        seed: Some(crate::pr_poll::logged_pr_events(&hub)),
+                    },
+                )));
+            }
         }
-        let kinds: Vec<EventKind> = crate::api::EventHub::with_persistence(log)
+        let events: Vec<(EventKind, u64)> = crate::api::EventHub::with_persistence(log)
             .persisted_events_after(0)
             .into_iter()
-            .map(|(_, _, envelope)| envelope.event)
-            .filter(|kind| matches!(kind, EventKind::PrCiCompleted | EventKind::PrMerged))
+            .filter_map(|(_, _, envelope)| match envelope.data {
+                EventData::PrCiCompleted { pr, .. } | EventData::PrMerged { pr, .. } => {
+                    Some((envelope.event, pr))
+                }
+                _ => None,
+            })
             .collect();
-        assert_eq!(kinds, vec![EventKind::PrCiCompleted, EventKind::PrMerged]);
+        assert_eq!(
+            events,
+            vec![
+                (EventKind::PrCiCompleted, 7),
+                (EventKind::PrMerged, 7),
+                (EventKind::PrCiCompleted, 8),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

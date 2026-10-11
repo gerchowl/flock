@@ -109,7 +109,7 @@ pub(crate) fn build_query(queries: &[PrQuery]) -> String {
              orderBy: {{field: UPDATED_AT, direction: DESC}}) \
              {{ nodes {{ number state isDraft headRefOid \
              commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state \
-             contexts(first: 100) {{ nodes {{ __typename \
+             contexts(first: 100) {{ totalCount nodes {{ __typename \
              ... on CheckRun {{ name status conclusion }} \
              ... on StatusContext {{ context state }} }} }} }} }} }} }} }} }} }}"
         ));
@@ -177,7 +177,9 @@ pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery
 
 /// The conclusion of a head commit's checks, or `None` while any is still
 /// running. A commit with no checks at all has a null rollup and never
-/// concludes, which is the honest answer for a repo without CI.
+/// concludes, which is the honest answer for a repo without CI. Neither does
+/// one with more checks than a page holds: an unread check could still be
+/// running.
 fn parse_ci(rollup: &serde_json::Value) -> Option<CiConclusion> {
     let state = rollup.get("state")?.as_str()?;
     if !matches!(state, "SUCCESS" | "FAILURE" | "ERROR") {
@@ -186,8 +188,12 @@ fn parse_ci(rollup: &serde_json::Value) -> Option<CiConclusion> {
     let mut failed_checks = Vec::new();
     let contexts = rollup
         .pointer("/contexts/nodes")
-        .and_then(serde_json::Value::as_array);
-    for ctx in contexts.into_iter().flatten() {
+        .and_then(serde_json::Value::as_array)?;
+    let total = rollup.pointer("/contexts/totalCount")?.as_u64()?;
+    if total > contexts.len() as u64 {
+        return None;
+    }
+    for ctx in contexts {
         let field = |key: &str| ctx.get(key).and_then(serde_json::Value::as_str);
         let (name, failed) = match field("__typename") {
             Some("CheckRun") => {
@@ -225,11 +231,22 @@ fn parse_ci(rollup: &serde_json::Value) -> Option<CiConclusion> {
 /// Which PR facts the durable log already holds, so each is emitted once
 /// (#1020): one `pr.ci_completed` per head SHA, one `pr.merged` or
 /// `pr.closed` per PR. Seeded from the log on the first round after a start,
-/// which is what keeps a restart from re-announcing them.
+/// which is what keeps a restart from re-announcing them. A re-run of CI on
+/// the same SHA is never announced again: the first conclusion wins.
 #[derive(Debug, Default)]
 pub(crate) struct PrEventLedger {
-    pub restored: bool,
+    pub seeded: bool,
     seen: HashSet<String>,
+}
+
+/// The `pr.*` events already in the durable log. Read on the poll worker, not
+/// the App loop: it parses every retained log file.
+pub(crate) fn logged_pr_events(hub: &crate::api::EventHub) -> Vec<EventEnvelope> {
+    hub.persisted_events_after(0)
+        .into_iter()
+        .map(|(_, _, envelope)| envelope)
+        .filter(|envelope| PrEventLedger::key(envelope).is_some())
+        .collect()
 }
 
 impl PrEventLedger {
@@ -248,8 +265,27 @@ impl PrEventLedger {
         self.seen.extend(events.into_iter().filter_map(Self::key));
     }
 
+    /// Seed from the log, and mark PRs the first round already sees merged or
+    /// closed as known: they ended before this server started, and announcing
+    /// them would flood a supervisor with history on every upgrade.
+    pub(crate) fn seed(&mut self, logged: &[EventEnvelope], first_round: &[PrObservation]) {
+        self.fold(logged);
+        let ended = Self::candidates(first_round)
+            .into_iter()
+            .filter(|event| matches!(event.event, EventKind::PrMerged | EventKind::PrClosed));
+        self.seen
+            .extend(ended.filter_map(|event| Self::key(&event)));
+        self.seeded = true;
+    }
+
     /// The events this round adds, already folded into the ledger.
     pub(crate) fn derive(&mut self, observed: &[PrObservation]) -> Vec<EventEnvelope> {
+        let mut out = Self::candidates(observed);
+        out.retain(|event| Self::key(event).is_some_and(|key| self.seen.insert(key)));
+        out
+    }
+
+    fn candidates(observed: &[PrObservation]) -> Vec<EventEnvelope> {
         let mut out = Vec::new();
         for obs in observed {
             let (repo, branch, pr) = (obs.repo.clone(), obs.branch.clone(), obs.info.number);
@@ -289,7 +325,6 @@ impl PrEventLedger {
                 PrState::Open | PrState::Draft => {}
             }
         }
-        out.retain(|event| Self::key(event).is_some_and(|key| self.seen.insert(key)));
         out
     }
 }
@@ -437,7 +472,9 @@ mod tests {
         format!(
             r#"{{"pullRequests":{{"nodes":[{{"number":{number},"state":"{state}","isDraft":false,
             "headRefOid":"{sha}","commits":{{"nodes":[{{"commit":{{"oid":"{sha}",
-            "statusCheckRollup":{{"state":"{rollup}","contexts":{{"nodes":[{contexts}]}}}}}}}}]}}}}]}}}}"#
+            "statusCheckRollup":{{"state":"{rollup}","contexts":{{"totalCount":{total},
+            "nodes":[{contexts}]}}}}}}}}]}}}}]}}}}"#,
+            total = contexts.matches("__typename").count()
         )
     }
 
@@ -480,6 +517,16 @@ mod tests {
         )
         .replacen(r#""oid":"abc""#, r#""oid":"old""#, 1);
         assert_eq!(parse_response(&stale, &queries)[&queries[0]].ci, None);
+        let truncated = format!(
+            r#"{{"data":{{"a0":{}}}}}"#,
+            pr_node(7, "OPEN", "abc", "SUCCESS", FAILED_RUN)
+        )
+        .replacen(r#""totalCount":2"#, r#""totalCount":101"#, 1);
+        assert_eq!(
+            parse_response(&truncated, &queries)[&queries[0]].ci,
+            None,
+            "unread checks beyond the page could still be running"
+        );
     }
 
     /// #1020 acceptance: the checks ride the existing batched request (one

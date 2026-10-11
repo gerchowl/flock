@@ -80,6 +80,9 @@ pub struct WorktreeKillAllResult {
 pub struct PrPollRound {
     pub states: Vec<(String, Option<crate::worktree::PrStateInfo>)>,
     pub observed: Vec<crate::pr_poll::PrObservation>,
+    /// The `pr.*` events already logged, read by the worker while the ledger
+    /// is unseeded (the first round after a start).
+    pub seed: Option<Vec<crate::api::schema::EventEnvelope>>,
 }
 
 /// An event from a background task to the main loop.
