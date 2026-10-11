@@ -248,6 +248,9 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    /// Panes whose pending input the current `--skip-undrained` handoff has
+    /// dropped. Reported with the outcome even when a later step fails.
+    handoff_skipped_undrained: Vec<api::schema::UndrainedPane>,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     pending_handoff_repaint_nudge: bool,
     /// Flag set by Ctrl+C or `server stop` signal.
@@ -364,8 +367,26 @@ fn undrained_handoff_message(panes: &[api::schema::UndrainedPane]) -> String {
     )
 }
 
+/// A failed handoff's message, naming any pane whose input `--skip-undrained`
+/// had already dropped before the failure: that input is gone even though
+/// the old server keeps running.
+fn failed_handoff_message(err: &io::Error, dropped: &[api::schema::UndrainedPane]) -> String {
+    if dropped.is_empty() {
+        return err.to_string();
+    }
+    let listed = dropped
+        .iter()
+        .map(describe_undrained_pane)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{err}; --skip-undrained had already dropped pending input: {listed}")
+}
+
 fn describe_undrained_pane(pane: &api::schema::UndrainedPane) -> String {
     let mut text = format!("{} ({} bytes pending", pane.pane_id, pane.pending_bytes);
+    if pane.writer_stuck {
+        text.push_str(", writer accepts zero bytes");
+    }
     if let Some(pid) = pane.pid {
         text.push_str(&format!(", pid {pid}"));
     }
@@ -436,6 +457,7 @@ impl HeadlessServer {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit,
             server_event_rx,
@@ -1030,53 +1052,73 @@ impl HeadlessServer {
         let _ = reject_pending_client_connections(&self.client_listener);
 
         // #981: every pane is tried before giving up, so the refusal names all
-        // the stuck panes at once rather than the first one per attempt.
-        let mut paused_terminal_ids = Vec::new();
-        let mut undrained = Vec::new();
-        let mut skipped_undrained = Vec::new();
+        // the stuck panes at once. The drains run concurrently: every pane is
+        // asked to quiesce first and the answers are collected after, so 24
+        // stuck panes cost one drain deadline, not 24 of them.
+        let mut started = Vec::new();
         for (terminal_id, raw_pane_id) in &pane_by_terminal {
             let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
                 continue;
             };
-            let describe = |pending_bytes: usize| api::schema::UndrainedPane {
+            let pending =
+                runtime.start_handoff_pause(Duration::from_secs(2), params.skip_undrained);
+            started.push((terminal_id.clone(), *raw_pane_id, pending));
+        }
+        let mut paused_terminal_ids = Vec::new();
+        let mut undrained = Vec::new();
+        let mut skipped_undrained = Vec::new();
+        let mut hard_error = None;
+        for (terminal_id, raw_pane_id, pending) in started {
+            let describe = |pending_bytes: usize, writer_stuck: bool| api::schema::UndrainedPane {
                 pane_id: public_pane_by_terminal
-                    .get(terminal_id)
+                    .get(&terminal_id)
                     .cloned()
                     .unwrap_or_else(|| format!("pane {raw_pane_id}")),
                 title: self
                     .app
                     .state
                     .terminals
-                    .get(terminal_id)
+                    .get(&terminal_id)
                     .and_then(|terminal| terminal.effective_title()),
-                pid: runtime.child_pid(),
+                pid: self
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(|runtime| runtime.child_pid()),
                 pending_bytes,
+                writer_stuck,
             };
-            match runtime.pause_handoff_reader(Duration::from_secs(2), params.skip_undrained) {
+            match pending.and_then(|pending| pending.wait()) {
                 Ok(quiesce) => {
                     if quiesce.dropped_bytes > 0 {
-                        skipped_undrained.push(describe(quiesce.dropped_bytes));
+                        skipped_undrained
+                            .push(describe(quiesce.dropped_bytes, quiesce.writer_stuck));
                     }
-                    paused_terminal_ids.push(terminal_id.clone());
+                    paused_terminal_ids.push(terminal_id);
                 }
-                Err(err) => {
-                    if let Some(timeout) =
-                        crate::pty::actor::HandoffDrainTimeout::from_io_error(&err)
-                    {
-                        undrained.push(describe(timeout.pending_bytes));
-                        continue;
+                Err(err) => match crate::pty::actor::HandoffDrainTimeout::from_io_error(&err) {
+                    Some(timeout) => {
+                        undrained.push(describe(timeout.pending_bytes, timeout.writer_stuck));
                     }
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(err.into());
-                }
+                    None => {
+                        hard_error.get_or_insert(err);
+                    }
+                },
             }
+        }
+        skipped_undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+        // Recorded before any later step can fail, so a handoff that dropped
+        // input and then failed still reports what it dropped.
+        self.handoff_skipped_undrained = skipped_undrained.clone();
+        if let Some(err) = hard_error {
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(err.into());
         }
         if !undrained.is_empty() {
             undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(HandoffError::Undrained(undrained));
         }
-        skipped_undrained.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
@@ -2680,7 +2722,10 @@ impl HeadlessServer {
         }
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
-            let response = match self.perform_live_handoff(params.clone()) {
+            self.handoff_skipped_undrained.clear();
+            let outcome = self.perform_live_handoff(params.clone());
+            let dropped_before_failure = std::mem::take(&mut self.handoff_skipped_undrained);
+            let response = match outcome {
                 Ok(skipped_undrained) if skipped_undrained.is_empty() => {
                     serde_json::to_string(&api::schema::SuccessResponse {
                         id: msg.request.id,
@@ -2719,7 +2764,7 @@ impl HeadlessServer {
                         id: msg.request.id,
                         error: api::schema::ErrorBody {
                             code: "handoff_failed".into(),
-                            message: err.to_string(),
+                            message: failed_handoff_message(&err, &dropped_before_failure),
                         },
                     })
                 }
@@ -4133,6 +4178,31 @@ mod tests {
     use crate::protocol::CursorState;
 
     #[test]
+    fn failed_handoff_message_reports_input_already_dropped() {
+        let err = io::Error::other("handoff import refused: protocol");
+        assert_eq!(
+            failed_handoff_message(&err, &[]),
+            "handoff import refused: protocol"
+        );
+
+        let message = failed_handoff_message(
+            &err,
+            &[api::schema::UndrainedPane {
+                pane_id: "w1:p2".into(),
+                title: None,
+                pid: None,
+                pending_bytes: 3,
+                writer_stuck: false,
+            }],
+        );
+
+        assert_eq!(
+            message,
+            "handoff import refused: protocol; --skip-undrained had already dropped pending input: w1:p2 (3 bytes pending)"
+        );
+    }
+
+    #[test]
     fn undrained_handoff_message_names_each_stuck_pane_and_its_bytes() {
         let message = undrained_handoff_message(&[
             api::schema::UndrainedPane {
@@ -4140,12 +4210,14 @@ mod tests {
                 title: Some("zsh".into()),
                 pid: Some(4242),
                 pending_bytes: 17,
+                writer_stuck: true,
             },
             api::schema::UndrainedPane {
                 pane_id: "w1:p2".into(),
                 title: None,
                 pid: None,
                 pending_bytes: 3,
+                writer_stuck: false,
             },
         ]);
 
@@ -4154,7 +4226,8 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("w2:p6 (17 bytes pending, pid 4242, \"zsh\")"),
+            message
+                .contains("w2:p6 (17 bytes pending, writer accepts zero bytes, pid 4242, \"zsh\")"),
             "{message}"
         );
         assert!(message.contains("w1:p2 (3 bytes pending)"), "{message}");
@@ -4255,6 +4328,7 @@ mod tests {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit: Arc::new(AtomicBool::new(false)),
             server_event_rx,

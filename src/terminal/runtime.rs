@@ -67,12 +67,12 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn pause_handoff_reader(
+    pub fn start_handoff_pause(
         &self,
         timeout: std::time::Duration,
         drop_undrained: bool,
-    ) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
-        self.0.pause_handoff_reader(timeout, drop_undrained)
+    ) -> std::io::Result<crate::pane::PendingPaneHandoff> {
+        self.0.start_handoff_pause(timeout, drop_undrained)
     }
 
     #[cfg(unix)]
@@ -383,8 +383,8 @@ impl TerminalRuntime {
         self.0.begin_injection_lease(token, until, now)
     }
 
-    pub(crate) fn end_injection_lease(&self, token: &str) {
-        self.0.end_injection_lease(token);
+    pub(crate) fn end_injection_lease(&self, token: &str) -> bool {
+        self.0.end_injection_lease(token)
     }
 
     pub(crate) fn expire_injection_lease(&self, now: std::time::Instant) -> bool {

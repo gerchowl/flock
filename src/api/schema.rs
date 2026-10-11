@@ -1768,6 +1768,10 @@ pub struct UndrainedPane {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub pending_bytes: usize,
+    /// The pane's writer kept accepting zero bytes, rather than the drain
+    /// simply running out of time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
