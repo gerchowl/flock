@@ -902,6 +902,24 @@ mod tests {
         assert_eq!(manifest.panes.len(), 1);
         assert_eq!(manifest.snapshot.workspaces.len(), 1);
         assert!(manifest.kept_drafts.is_empty());
+        assert!(
+            !manifest.panes[0].agent_session_hook_confirmed,
+            "an older sender knows nothing of confirmation, so nothing is confirmed"
+        );
+    }
+
+    #[test]
+    fn agent_session_confirmation_crosses_a_handoff_manifest() {
+        // #977: the exporter's hook confirmation must reach the importer, and
+        // an unconfirmed pane must stay off the wire so an older importer
+        // reads exactly the manifest it always did.
+        let mut manifest: HandoffManifest = serde_json::from_str(OLD_SHAPE_MANIFEST).unwrap();
+        let unconfirmed = serde_json::to_string(&manifest).unwrap();
+        assert!(!unconfirmed.contains("agent_session_hook_confirmed"));
+        manifest.panes[0].agent_session_hook_confirmed = true;
+        let wire = serde_json::to_string(&manifest).unwrap();
+        let received: HandoffManifest = serde_json::from_str(&wire).unwrap();
+        assert!(received.panes[0].agent_session_hook_confirmed);
     }
 
     #[test]

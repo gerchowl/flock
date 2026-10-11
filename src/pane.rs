@@ -1318,6 +1318,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
             initial_history_ansi: None,
+            agent_session_hook_confirmed: false,
         }
     }
 
@@ -1509,6 +1510,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi,
             input_state,
             initial_history_ansi,
+            agent_session_hook_confirmed: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;

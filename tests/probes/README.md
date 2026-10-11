@@ -42,3 +42,11 @@ that describe the bug — is the point of the format.
 - **Kill the server the probe leaves behind.** Stopping the probe stops the
   client; flk's server daemonises and survives. Match on the sandbox binary
   path so you can never signal the user's real server.
+
+## Socket-driven measurement scripts
+
+`agent_wake.py` is not a TUI runbook: it drives an isolated flk over its socket
+to time wakes (idle, mid-turn, with a harness background task), and it reads an
+`event-log.jsonl` or a System One endpoint for the volume and judge-latency
+figures in ADR-0028 and ADR-0030. It refuses to run the pane probes without
+`--sandbox`. `python3 -I tests/probes/agent_wake.py --help` lists the setup.

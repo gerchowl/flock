@@ -1397,7 +1397,8 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
     assert_eq!(current["agent_id"], target["agent_id"]);
     assert_eq!(current["agent_session"]["value"], "retained-session");
     assert_eq!(removals(node), 0);
-    state(node, "restart-mail", "delivered");
+    // Unread in a local inbox, so queued until read (#977).
+    state(node, "restart-mail", "queued");
     let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
     assert!(messages["messages"]
         .as_array()

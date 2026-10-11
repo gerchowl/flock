@@ -517,6 +517,22 @@ impl App {
                     },
                 ));
             }
+            // A claude or opencode session flock restored but no hook from the
+            // running agent has named since. The transcript is readable once it
+            // is confirmed, so "flock cannot read this agent" is false (#977).
+            if info.source == crate::agent_resume::CLAUDE_HOOK_SOURCE
+                || info.source == crate::agent_resume::OPENCODE_HOOK_SOURCE
+            {
+                return Err(refuse(
+                    "session_unconfirmed",
+                    format!(
+                        "{} session {} was restored by flock and no hook from the running agent \
+                         has confirmed it since, so its conversation is not read yet: retry after \
+                         the agent's next turn",
+                        info.agent, info.value
+                    ),
+                ));
+            }
             return Err(refuse(
                 "unsupported_for_agent",
                 format!(
@@ -927,6 +943,39 @@ mod tests {
         assert_eq!(error.error.code, "unsupported_for_agent");
         assert!(
             error.error.message.contains("kimi"),
+            "{}",
+            error.error.message
+        );
+    }
+
+    #[test]
+    fn agent_history_says_a_restored_claude_session_is_unconfirmed_not_unreadable() {
+        // #977: a snapshot-restored claude session is deliberately not a
+        // licence to read (#328). The refusal used to claim flock cannot read
+        // claude at all, which sent operators chasing the wrong problem.
+        let mut app = test_app();
+        let terminal_id = focused_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal")
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-restored")
+                    .expect("session ref"),
+            });
+
+        let response = history(&mut app, params(&terminal_id.to_string()));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code, "session_unconfirmed",
+            "{}",
+            error.error.message
+        );
+        assert!(
+            error.error.message.contains("sess-restored"),
             "{}",
             error.error.message
         );
