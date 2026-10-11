@@ -824,6 +824,9 @@ fn laptop_collects_answer_through_a_different_hub() {
     });
     fleet.refuse_edge("nodea", "nodec");
     fleet.kill_edge("nodea", "nodec", WAIT);
+    // Until the cut reaches the recipient, its receipt can follow the stale
+    // route into nodec, whose every path back runs through the recipient.
+    route_via(&fleet, "noded.example", "nodea", "nodeb");
     send(&fleet, &sender, &recipient, "roaming");
     remote_state(&fleet, "roaming", "delivered");
     let response = api(
