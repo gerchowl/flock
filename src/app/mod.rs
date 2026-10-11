@@ -23,6 +23,7 @@ pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
 pub(crate) mod config_io;
 mod creation;
+pub(crate) mod delegation;
 use crate::mesh::store::delivery_attempts;
 pub(crate) mod directory;
 pub(crate) mod draft_stash;
@@ -175,6 +176,9 @@ pub struct App {
     pub(crate) mesh_offers_checked_ms: i64,
     pub(crate) mesh_receipt_log_at: Option<Instant>,
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
+    /// #959: open architect -> delegate edges, folded from the durable log
+    /// once per server start by `reissue_open_delegations`.
+    pub(crate) delegations: delegation::DelegationIndex,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
     /// Mail requests that arrived while the recovery worker was still
@@ -985,6 +989,7 @@ impl App {
             mesh_offers_checked_ms: 0,
             mesh_receipt_log_at: None,
             pending_agent_removals: Default::default(),
+            delegations: Default::default(),
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
             recovery_parked: Vec::new(),
@@ -4181,6 +4186,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd,
@@ -4354,6 +4360,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_390_explicit".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
@@ -4384,6 +4391,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390_split".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd,
@@ -4406,6 +4414,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_active".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: None,
@@ -4429,6 +4438,7 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_here".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: None,
@@ -4521,6 +4531,7 @@ sidebar_pane_gap = 99
                 id: format!("req_agent_start_398_{index}"),
                 method: crate::api::schema::Method::AgentStart(
                     crate::api::schema::AgentStartParams {
+                        label: None,
                         dry_run: false,
                         name: format!("worker-{index}"),
                         cwd: Some(checkout.display().to_string()),
@@ -4988,6 +4999,7 @@ sidebar_pane_gap = 99
         };
 
         let base = || crate::api::schema::AgentStartParams {
+            label: None,
             dry_run: false,
             name: "worker".into(),
             cwd: None,
@@ -5082,6 +5094,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_398_precedence".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
@@ -5319,6 +5332,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: None,
@@ -5375,6 +5389,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: None,

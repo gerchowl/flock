@@ -80,6 +80,7 @@ pub(crate) fn start_server_for_mode(
             live_handoff,
             node_id: Some(identity.node_id()),
             clone_detection_warning: identity.clone_detection_warning.clone(),
+            agent_start_label: true,
         }),
     )
 }
@@ -1207,6 +1208,7 @@ mod tests {
                 live_handoff: true,
                 node_id: None,
                 clone_detection_warning: None,
+                agent_start_label: true,
             }),
             None,
             &Mutex::default(),
