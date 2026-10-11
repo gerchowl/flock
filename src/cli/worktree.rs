@@ -752,7 +752,13 @@ pub(super) fn resolve_path_arg(value: &str, base: &std::path::Path) -> String {
     if path.is_absolute() {
         path.display().to_string()
     } else {
-        base.join(path).display().to_string()
+        // `components` drops the `.` segments, so `--repo .` names the
+        // directory itself rather than `<dir>/.`.
+        base.join(path)
+            .components()
+            .collect::<std::path::PathBuf>()
+            .display()
+            .to_string()
     }
 }
 

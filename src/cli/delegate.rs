@@ -78,13 +78,16 @@ use super::settled::{Cursor, PinnedTarget, SettleTarget};
 pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
     "                     [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS]\n",
-    "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N]\n",
+    "                     [--keep-on-failure] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
     "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review\n",
     "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
+    "  --repo PATH         a linked worktree is swapped for its main checkout, branching from its HEAD\n",
+    "                      unless --base is given\n",
     "  --base REF          fetched first; a branch resolves to its remote-tracking ref unless the local\n",
     "                      branch has commits of its own; the ref and commit used are printed\n",
     "  a brief codex swallowed at startup is typed once more after the not_started window\n",
@@ -96,6 +99,9 @@ pub(super) const START_USAGE: &str = concat!(
     "                      git push and gh need explicit --sandbox danger-full-access\n",
     "  --ready-timeout MS  how long the agent may take to become ready and reach its prompt, default 60000\n",
     "  --max-chars N       characters of the reply to print, default 4000\n",
+    "  --keep-on-failure   a start that fails once its agent exists keeps the workspace for\n",
+    "                      inspection instead of rolling back; `flk delegate reap` removes it\n",
+    "  a failed start prints the agent pane's last lines\n",
     "  the brief must ask for a final line `DONE: ...`, `BLOCKED: ...` or `VERDICT: ...`; a reply\n",
     "  ending on none of them is no_sentinel (exit 5); `flk delegate wait` lists every exit code\n",
     "  an agent that exits before it takes the brief is gone (exit 4); its record stays for `reap`\n",
@@ -922,6 +928,7 @@ struct StartFlags {
     silence_ms: Option<u64>,
     ready_timeout_ms: Option<u64>,
     max_chars: Option<u32>,
+    keep_on_failure: bool,
     json: bool,
 }
 
@@ -988,6 +995,7 @@ impl Verb {
             | "--sandbox" => self == Self::Start,
             "--after" => self == Self::Wait,
             "--force" => self == Self::Reap,
+            "--keep-on-failure" => self == Self::Start,
             _ => false,
         }
     }
@@ -1032,6 +1040,10 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             }
             "--force" => {
                 flags.force = true;
+                index += 1;
+            }
+            "--keep-on-failure" => {
+                flags.keep_on_failure = true;
                 index += 1;
             }
             "--timeout" => flags.timeout_ms = Some(number(flag, &value(&mut index)?)?),
@@ -1097,6 +1109,7 @@ struct Parsed {
     ready_timeout_ms: Option<u64>,
     max_chars: Option<u32>,
     force: bool,
+    keep_on_failure: bool,
     json: bool,
 }
 
@@ -1117,6 +1130,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
         silence_ms: flags.silence_ms,
         ready_timeout_ms: flags.ready_timeout_ms,
         max_chars: flags.max_chars,
+        keep_on_failure: flags.keep_on_failure,
         json: flags.json,
     }
 }
@@ -1236,6 +1250,48 @@ fn resolve_placement_paths(flags: &mut StartFlags, base: &Path) {
     for value in [&mut flags.cwd, &mut flags.repo].into_iter().flatten() {
         *value = super::worktree::resolve_path_arg(value, base);
     }
+}
+
+/// A `--repo` that is a linked worktree, swapped for its main checkout (#925).
+///
+/// `worktree.create` starts from a repository's main checkout and refuses a
+/// linked one with `linked_worktree_source`, a message that names neither the
+/// path nor the fix. A missing `--repo` is the caller's directory, which can
+/// be a linked worktree just the same. The caller pointed at that checkout, so
+/// without `--base` the new branch starts from its HEAD rather than from
+/// whatever the main checkout happens to have checked out.
+fn resolve_linked_repo(
+    name: &str,
+    flags: &mut StartFlags,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
+    let Some(repo) = flags
+        .repo
+        .clone()
+        .or_else(|| cwd.map(|cwd| cwd.display().to_string()))
+    else {
+        return Ok(());
+    };
+    let Some(linked) = crate::worktree::linked_worktree_source(Path::new(&repo))
+        .map_err(|reason| format!("delegate {name}: --repo: {reason}"))?
+    else {
+        return Ok(());
+    };
+    let main = linked.main_checkout.display().to_string();
+    let based = match (&flags.base, &linked.head) {
+        (Some(base), _) => format!("--base {base}"),
+        (None, Some(head)) => {
+            flags.base = Some(head.clone());
+            format!("its HEAD {}", &head[..head.len().min(12)])
+        }
+        (None, None) => "the main checkout's HEAD".to_string(),
+    };
+    eprintln!(
+        "delegate {name}: {repo} is a linked worktree; starting from its main checkout {main}, \
+         branching from {based}"
+    );
+    flags.repo = Some(main);
+    Ok(())
 }
 
 /// The brief path, made absolute, checked, readable, and returned as the one
@@ -2637,6 +2693,13 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         }
     }
 
+    // Last before the create, so a start refused above never prints the swap.
+    if mode == Mode::Worktree {
+        let cwd = std::env::current_dir().ok();
+        if let Err(reason) = resolve_linked_repo(name, &mut flags, cwd.as_deref()) {
+            return Ok(usage(reason));
+        }
+    }
     let placement = match place(name, &flags, mode) {
         Ok(placement) => placement,
         Err(code) => return Ok(code),
@@ -2660,43 +2723,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let terminal_id = field(&agent, "terminal_id").unwrap_or_default().to_string();
     let pane_id = field(&agent, "pane_id").unwrap_or_default().to_string();
     let cleanup = placement.cleanup(name, mode, &pane_id, &terminal_id);
-
-    let ready_timeout = flags
-        .ready_timeout_ms
-        .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
-    let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
-    // The gate returns the FINAL record it saw, and the cursor is taken from
-    // THAT. Captured earlier it would be a cursor from before the last idle, and
-    // a settle would then accept the quiet that preceded the brief instead of
-    // waiting for the turn the brief caused (D-D).
-    let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
-        Ok(record) => record,
-        Err(reason) => {
-            if reason.deadline_reached {
-                emit_ready_timeout(
-                    name,
-                    &pane_id,
-                    &terminal_id,
-                    None,
-                    flags.json,
-                    &reason.reason,
-                );
-                rollback(&cleanup);
-                return Ok(1);
-            }
-            rollback(&cleanup);
-            return Ok(fail(reason.reason));
-        }
-    };
-    let cursor = match cursor_of(&settled_record) {
-        Ok(cursor) => cursor,
-        Err(reason) => {
-            rollback(&cleanup);
-            return Ok(fail(reason));
-        }
-    };
-    let mut submitted_at_ms = now_ms();
-
+    // The record a kept start leaves for `reap` and `send` (#925). Round 0
+    // until the brief is typed: a start kept before that has run no round,
+    // and the next `send` is round 1.
     let mut entry = Entry {
         name: name.to_string(),
         terminal_id: terminal_id.clone(),
@@ -2717,25 +2746,79 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
                 .clone()
                 .unwrap_or_else(|| "workspace-write".into())
         }),
-        round: 1,
+        round: 0,
         brief: brief.clone(),
-        submitted_at_ms,
-        cursor: cursor.clone(),
+        submitted_at_ms: 0,
+        cursor: field(&agent, "turn_cursor").unwrap_or_default().to_string(),
         created_at_ms: now_ms(),
         root_pane_terminal_id: placement.root_pane_terminal_id.clone(),
         base: placement.base.as_ref().map(|fresh| fresh.base.clone()),
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
     };
+    let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
+        fail_started(
+            entry,
+            &cleanup,
+            written,
+            flags.keep_on_failure,
+            reason,
+            None,
+        )
+    };
+
+    let ready_timeout = flags
+        .ready_timeout_ms
+        .unwrap_or(super::ready::DEFAULT_READY_TIMEOUT_MS);
+    let ready_deadline = Instant::now() + Duration::from_millis(ready_timeout);
+    // The gate returns the FINAL record it saw, and the cursor is taken from
+    // THAT. Captured earlier it would be a cursor from before the last idle, and
+    // a settle would then accept the quiet that preceded the brief instead of
+    // waiting for the turn the brief caused (D-D).
+    let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
+        Ok(record) => record,
+        Err(reason) => {
+            if reason.deadline_reached {
+                // The verdict read the screen already: its tail is printed
+                // from that read rather than a second one, which a server
+                // that stopped answering would hold for its whole cap.
+                let screen = emit_ready_timeout(
+                    name,
+                    &pane_id,
+                    &terminal_id,
+                    None,
+                    flags.json,
+                    &reason.reason,
+                );
+                return Ok(fail_started(
+                    &entry,
+                    &cleanup,
+                    false,
+                    flags.keep_on_failure,
+                    None,
+                    Some(&screen),
+                ));
+            }
+            return Ok(failed(&entry, false, Some(&reason.reason)));
+        }
+    };
+    let cursor = match cursor_of(&settled_record) {
+        Ok(cursor) => cursor,
+        Err(reason) => return Ok(failed(&entry, false, Some(&reason))),
+    };
+    let mut submitted_at_ms = now_ms();
+    entry.round = 1;
+    entry.submitted_at_ms = submitted_at_ms;
+    entry.cursor = cursor.clone();
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
         // Removing `entry_path(name)` would delete a pre-existing (and
         // likely stale) entry the operator may still want to see or reap
         // (W11 / a30: forget nothing). `write_entry` already removes its
         // own temp file, so there is nothing of ours to clean up here.
+        // Nothing can be kept without a record, so this one always rolls back.
+        eprintln!("delegate {name}: could not write the delegate registry entry: {err}");
         rollback(&cleanup);
-        return Ok(fail(format!(
-            "could not write the delegate registry entry: {err}"
-        )));
+        return Ok(1);
     }
 
     // No request between persisting the cursor and typing the brief: the
@@ -2766,16 +2849,26 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             return Ok(emit_submit_gone(&entry, flags.json));
         }
         if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            return Ok(fail(format!(
+            eprintln!(
                 "delegate {name}: brief submission could not be confirmed: {reason}. \
                  Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
-            )));
+            );
+            print_pane_tail(name, &pane_id);
+            return Ok(1);
         }
-        let _ = std::fs::remove_file(entry_path(name));
-        rollback(&cleanup);
-        return Ok(fail(format!(
-            "delegate {name}: the brief was not submitted: {reason}"
-        )));
+        if matches!(reason, SubmitFailure::Refused(_)) {
+            // Refused before anything was typed: no round ran, so a kept
+            // delegate's next `send` is round 1.
+            entry.round = 0;
+            entry.submitted_at_ms = 0;
+        }
+        return Ok(failed(
+            &entry,
+            true,
+            Some(&format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )),
+        ));
     }
 
     if !flags.await_result {
@@ -2798,6 +2891,119 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         json: flags.json,
     }
     .run()
+}
+
+/// Lines of the agent's pane a failed start prints (#925).
+const FAILURE_TAIL_LINES: u32 = 20;
+
+/// Lines read to find them: a screen's unused bottom rows are blank, and a
+/// read of only twenty could be all blank below a short prompt.
+const FAILURE_TAIL_READ_LINES: u32 = 120;
+
+/// How long a failed start waits for the pane read it prints. Short: the
+/// start has already failed, and the tail only explains it.
+const FAILURE_TAIL_WAIT: Duration = Duration::from_secs(2);
+
+/// End a start that failed once its agent existed (#925).
+///
+/// The reason (`None` when the caller already printed one), then the agent's
+/// last pane lines (from `screen` when the caller already read it), read
+/// BEFORE anything is torn down, so a rolled-back start still leaves
+/// something to read. Then the rollback, or with
+/// `--keep-on-failure` a registry entry so `status`, `send` and `reap` can
+/// find what was kept. `written` says this start already wrote that entry,
+/// which a rollback then removes.
+fn fail_started(
+    entry: &Entry,
+    cleanup: &Cleanup,
+    written: bool,
+    keep: bool,
+    reason: Option<&str>,
+    screen: Option<&str>,
+) -> i32 {
+    let name = &entry.name;
+    if let Some(reason) = reason {
+        eprintln!("{reason}");
+    }
+    match screen {
+        Some(screen) => {
+            if let Some(block) = tail_block(name, screen) {
+                eprint!("{block}");
+            }
+        }
+        None => print_pane_tail(name, &entry.pane_id),
+    }
+    if keep {
+        match write_entry(entry) {
+            Ok(()) => {
+                eprintln!(
+                    "delegate {name}: kept for inspection (--keep-on-failure); \
+                     `flk delegate reap {name}` removes it"
+                );
+                return 1;
+            }
+            Err(err) => eprintln!(
+                "delegate {name}: could not record it for --keep-on-failure, rolling back: {err}"
+            ),
+        }
+    }
+    if written {
+        let _ = std::fs::remove_file(entry_path(name));
+    }
+    rollback(cleanup);
+    1
+}
+
+/// Print the agent pane's last lines on stderr, when the pane still answers.
+fn print_pane_tail(name: &str, pane_id: &str) {
+    let deadline = Instant::now() + FAILURE_TAIL_WAIT;
+    let tail = without_retries(|| pane_tail(pane_id, deadline, bounded));
+    if let Some(block) = tail.as_deref().and_then(|text| tail_block(name, text)) {
+        eprint!("{block}");
+    }
+}
+
+/// The pane's last [`FAILURE_TAIL_LINES`] lines, from one bounded read.
+fn pane_tail(
+    pane_id: &str,
+    deadline: Instant,
+    read: impl FnOnce(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> Option<String> {
+    if pane_id.is_empty() {
+        return None;
+    }
+    let response = read(
+        Method::PaneRead(PaneReadParams {
+            pane_id: pane_id.to_owned(),
+            source: ReadSource::Recent,
+            lines: Some(FAILURE_TAIL_READ_LINES),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+        }),
+        Some(deadline),
+    )
+    .ok()?;
+    response
+        .pointer("/result/read/text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// The tail as printed: a header naming the delegate, then each line indented
+/// behind a bar so it cannot be mistaken for flk's own output. Trailing blank
+/// rows (an idle screen's unused bottom) are dropped, and an all-blank pane
+/// prints nothing.
+fn tail_block(name: &str, text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let end = lines.iter().rposition(|line| !line.is_empty())? + 1;
+    let start = end.saturating_sub(FAILURE_TAIL_LINES as usize);
+    let mut block = format!("delegate {name}: last {} pane line(s):\n", end - start);
+    for line in &lines[start..end] {
+        block.push_str("  | ");
+        block.push_str(line);
+        block.push('\n');
+    }
+    Some(block)
 }
 
 /// Undo a start that failed after its workspace existed.
@@ -4878,7 +5084,7 @@ fn emit_ready_timeout(
     entry: Option<&Entry>,
     json: bool,
     reason: &str,
-) {
+) -> String {
     let (screen, status) = without_retries(|| {
         (
             detection_screen(pane_id, None).unwrap_or_default(),
@@ -4906,6 +5112,7 @@ fn emit_ready_timeout(
             verdict.verdict, verdict.last_line
         );
     }
+    screen
 }
 
 /// The one object every OUTCOME prints under `--json`.
@@ -5195,7 +5402,11 @@ mod tests {
             .to_vec();
         let mut flags = as_start(&parse_flags(Verb::Start, &args).unwrap());
         resolve_placement_paths(&mut flags, &base);
-        assert_eq!(flags.repo, Some(base.join(".").display().to_string()));
+        assert_eq!(
+            flags.repo,
+            Some(base.display().to_string()),
+            "`--repo .` is the caller's directory itself, without a trailing `/.` (#925)"
+        );
         assert!(Path::new(flags.repo.as_deref().unwrap()).is_absolute());
 
         let mut flags = StartFlags {

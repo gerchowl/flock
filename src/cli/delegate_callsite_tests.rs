@@ -725,3 +725,64 @@ fn only_codex_retypes_a_lost_brief() {
         );
     }
 }
+
+// ---------- the failed-start tail (#925) ------------------------------------
+
+/// A start that fails reads the pane's recent buffer, bounded by the caller's
+/// deadline, and asks for more rows than it prints so a screen's blank bottom
+/// cannot crowd the content out.
+#[test]
+fn pane_tail_reads_the_recent_buffer_within_the_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let tail = pane_tail("w2:p1", deadline, |method, bound| {
+        assert_eq!(bound, Some(deadline));
+        let Method::PaneRead(params) = method else {
+            panic!("expected pane read")
+        };
+        assert_eq!(params.pane_id, "w2:p1");
+        assert_eq!(params.source, ReadSource::Recent);
+        assert!(params.lines.unwrap() > FAILURE_TAIL_LINES);
+        assert!(params.strip_ansi);
+        Ok(json!({"result": {"read": {"text": "a\nb\n"}}}))
+    });
+    assert_eq!(tail.as_deref(), Some("a\nb\n"));
+
+    let failed = pane_tail("w2:p1", deadline, |_, _| Err(BoundedError::TimedOut));
+    assert_eq!(failed, None, "a read that fails prints nothing");
+    let no_pane = pane_tail("", deadline, |_, _| panic!("no pane, no read"));
+    assert_eq!(no_pane, None);
+}
+
+/// The printed block: the last twenty non-trailing-blank lines, each behind a
+/// bar, under a header naming the delegate. An all-blank pane prints nothing.
+#[test]
+fn tail_block_keeps_the_last_twenty_lines_and_drops_the_blank_bottom() {
+    let mut screen: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    screen.push("\u{276f} ghost suggestion   ".to_string());
+    screen.extend(std::iter::repeat_n(String::new(), 10));
+    let block = tail_block("d1", &screen.join("\n")).expect("a block");
+    let lines: Vec<&str> = block.lines().collect();
+    assert_eq!(lines[0], "delegate d1: last 20 pane line(s):");
+    assert_eq!(lines.len(), 21, "{block}");
+    assert_eq!(lines[1], "  | line 12");
+    assert_eq!(
+        lines[20], "  | \u{276f} ghost suggestion",
+        "the composer line, trailing spaces trimmed"
+    );
+
+    let short = tail_block("d1", "only\n\n").unwrap();
+    assert_eq!(short, "delegate d1: last 1 pane line(s):\n  | only\n");
+    assert_eq!(tail_block("d1", "\n   \n\n"), None);
+}
+
+/// `--keep-on-failure` is a start flag, and only that.
+#[test]
+fn keep_on_failure_is_a_start_flag() {
+    let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    let start = parse_flags(Verb::Start, &args(&["d1", "--keep-on-failure"])).unwrap();
+    assert!(as_start(&start).keep_on_failure);
+    assert!(!as_start(&parse_flags(Verb::Start, &args(&["d1"])).unwrap()).keep_on_failure);
+    for verb in [Verb::Send, Verb::Wait, Verb::Reap] {
+        assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
+    }
+}
