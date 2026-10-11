@@ -686,6 +686,18 @@ fn a_turn_that_starts_late_confirms_the_brief_without_a_resubmit() {
 }
 
 #[test]
+fn a_brief_running_past_the_weekly_notice_is_taken_and_never_resubmitted() {
+    // #870: the record has not caught up, but the screen shows the brief
+    // echoed with its turn running under it.
+    let screen = include_str!("../../tests/fixtures/codex/working-after-weekly-notice.txt")
+        .replace("/fixture/codex-870/briefs/63.md", "/fixture/briefs/task.md");
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", &screen));
+    assert!(matches!(run.outcome, Ok(false)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 0);
+    assert_eq!(run.elapsed, Duration::ZERO, "decided on the first look");
+}
+
+#[test]
 fn queued_startup_evidence_or_a_restart_never_resubmits() {
     let queued =
         "Waiting for startup · esc cancel\n› Ask Codex to do anything\n  ? for shortcuts\n";

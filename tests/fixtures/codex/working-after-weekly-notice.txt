@@ -1,0 +1,7 @@
+› Read /fixture/codex-870/briefs/63.md and execute it exactly.
+⚠ Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.
+• Working (6s • esc to interrupt)
+                                                    ⚠ weekly limit: 13% left · /status
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /fixture/codex-870/…
