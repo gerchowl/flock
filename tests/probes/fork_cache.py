@@ -41,6 +41,11 @@ the opposite (only the harness's shared system prefix hits).
 
 Gotchas seen while producing the ADR's figures:
 
+- Use a sandbox `CLAUDE_CONFIG_DIR` (log in to it once). The ADR's run used
+  the operator's own profile, so accepting the trust dialog wrote a pretrust
+  entry into that profile's `.claude.json` and the throwaway transcripts
+  landed in its `projects/` directory.
+
 - `gh` inside a sandbox pane reads its config from `$XDG_CONFIG_HOME/gh`, so
   the sandbox's XDG override hides the operator's gh login (exit 4).
 - `agent.fork` puts the worktree under the default worktree directory in the
