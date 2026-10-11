@@ -22,6 +22,10 @@ use crate::api::schema::{EventData, EventEnvelope, EventKind};
 
 const GOAL_AGENT: &str = "goal:agent_bench_long";
 const VERDICTS: usize = 400;
+/// The active file stops this many events short of a full one, so the
+/// measured verdict writes never cross the 32 MiB byte bound and no rotation
+/// lands inside the write samples.
+const ACTIVE_HEADROOM: usize = 2_000;
 
 fn envelope(payload: String) -> EventEnvelope {
     EventEnvelope {
@@ -74,11 +78,11 @@ fn rotated(path: &Path, index: usize) -> PathBuf {
     path.with_file_name(format!("event-log.{index}.jsonl"))
 }
 
-/// Write five full log files directly (no fsync per line): filler lines of
-/// about 200 bytes, a little above a live log's average, with the goal's
-/// verdicts spread evenly across all of them.
+/// Write four full rotated files and a nearly full active one directly (no
+/// fsync per line): filler lines of about 200 bytes, a little above a live
+/// log's average, with the goal's verdicts spread evenly across all of them.
 fn seed_log(path: &Path, per_file: usize) -> u64 {
-    let total = per_file * (MAX_ROTATED + 1);
+    let total = per_file * (MAX_ROTATED + 1) - ACTIVE_HEADROOM;
     let every = total / VERDICTS;
     let mut seq = 0u64;
     let mut verdict = 0usize;
@@ -89,7 +93,12 @@ fn seed_log(path: &Path, per_file: usize) -> u64 {
             rotated(path, file_index)
         };
         let mut out = std::io::BufWriter::new(std::fs::File::create(&target).unwrap());
-        for _ in 0..per_file {
+        let lines = if file_index == 0 {
+            per_file - ACTIVE_HEADROOM
+        } else {
+            per_file
+        };
+        for _ in 0..lines {
             seq += 1;
             let payload = if (seq as usize).is_multiple_of(every) && verdict < VERDICTS {
                 verdict += 1;
@@ -211,6 +220,7 @@ fn goal_storage_bench() {
     drop(restored);
     pcts("fold: cold start, fold in a shared pass", shared);
 
+    let newest_rotated = std::fs::metadata(rotated(&path, 1)).map(|meta| meta.len());
     let writes: Vec<Duration> = (0..VERDICTS)
         .map(|index| {
             let event = envelope(verdict_payload(GOAL_AGENT, VERDICTS + index));
@@ -224,6 +234,13 @@ fn goal_storage_bench() {
             .0
         })
         .collect();
+    assert_eq!(
+        std::fs::metadata(rotated(&path, 1))
+            .map(|meta| meta.len())
+            .ok(),
+        newest_rotated.ok(),
+        "a rotation landed inside the write samples"
+    );
     pcts("fold: verdict write (append + sync_data)", writes);
 
     // (b) SQLite, the mesh store's pragmas (src/mesh/store.rs).
