@@ -134,7 +134,35 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments.clone())?;
+    let pane = match &method {
+        Method::PaneArmSelfCompact(params) if params.instructions.is_some() => {
+            Some(params.pane.clone())
+        }
+        _ => None,
+    };
     let flock_result = tools::annotate(name, &arguments, call_flock(method, flock)?);
+    // #854: an older server ignores `instructions` and arms a plain `/compact`.
+    // Undo that arming rather than report a success that lost them.
+    if let Some(pane) = pane {
+        if crate::agent_self_compact::instructions_dropped(true, &flock_result) {
+            // A failed abort must not replace the explanation with a bare
+            // transport error: the agent still needs to know why, and that
+            // the plain arming is still there to drop.
+            let message =
+                match call_flock(crate::agent_self_compact::abort_dropped_arming(pane), flock) {
+                    Ok(_) => crate::agent_self_compact::INSTRUCTIONS_DROPPED.to_string(),
+                    Err(err) => format!(
+                        "{} ({})",
+                        crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED,
+                        err.message
+                    ),
+                };
+            return Err(McpError::from_flock_error(
+                crate::api::compatibility::ERROR_CODE,
+                &message,
+            ));
+        }
+    }
 
     // MCP's tool-call result shape: `content` is an array of blocks. We JSON-
     // encode the flock result and hand it back as a single text block so the
@@ -239,6 +267,93 @@ mod tests {
                 assert_eq!(error.data, Some(result));
             }
         }
+    }
+
+    /// #854: an older server ignores `instructions`, answers `armed` without
+    /// the flag, and would compact without them. The bridge aborts that
+    /// arming and says why instead of reporting success.
+    #[test]
+    fn self_compact_instructions_an_older_server_dropped_are_aborted() {
+        let old = MockApi::ok(json!({"result": {
+            "type": "pane_self_compact", "pane": "1-1", "state": "armed", "detail": "armed."
+        }}));
+        let err = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &old,
+            &ChannelOptions::off(),
+        )
+        .expect_err("a dropped arming is not a success");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE}))
+        );
+        let calls = old.calls.borrow();
+        assert_eq!(calls.len(), 2, "the arming, then its abort");
+        assert!(matches!(&calls[1], Method::PaneArmSelfCompact(p) if p.abort));
+        drop(calls);
+
+        // The same answer without instructions sent is just a plain arming.
+        let route_ok = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {"continuation": "carry on"}}),
+            &old,
+            &ChannelOptions::off(),
+        );
+        assert!(route_ok.is_ok());
+        assert_eq!(old.calls.borrow().len(), 3, "no abort for a bare arming");
+
+        let current = MockApi::ok(json!({"result": {
+            "type": "pane_self_compact", "pane": "1-1", "state": "armed",
+            "detail": "armed.", "instructions": true
+        }}));
+        route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &current,
+            &ChannelOptions::off(),
+        )
+        .expect("a server that stored them is a success");
+        assert_eq!(current.calls.borrow().len(), 1);
+    }
+
+    /// An older server whose abort then fails: the explanation survives, and
+    /// says the plain arming is still there to drop.
+    #[test]
+    fn a_failed_abort_keeps_the_dropped_instructions_explanation() {
+        struct AbortFails;
+        impl FlockCall for AbortFails {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                match method {
+                    Method::PaneArmSelfCompact(params) if params.abort => Ok(json!({
+                        "error": {"code": "internal", "message": "socket closed"}
+                    })),
+                    _ => Ok(json!({"result": {
+                        "type": "pane_self_compact", "pane": "1-1",
+                        "state": "armed", "detail": "armed."
+                    }})),
+                }
+            }
+        }
+        let err = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &AbortFails,
+            &ChannelOptions::off(),
+        )
+        .expect_err("a dropped arming is not a success");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE}))
+        );
+        assert!(
+            err.message.contains("still armed") && err.message.contains("socket closed"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
