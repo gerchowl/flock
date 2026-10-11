@@ -370,6 +370,43 @@ impl TerminalRuntime {
         self.0.last_operator_input_at()
     }
 
+    pub(crate) fn begin_injection_lease(
+        &self,
+        token: &str,
+        until: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        self.0.begin_injection_lease(token, until, now)
+    }
+
+    pub(crate) fn end_injection_lease(&self, token: &str) {
+        self.0.end_injection_lease(token);
+    }
+
+    pub(crate) fn expire_injection_lease(&self, now: std::time::Instant) -> bool {
+        self.0.expire_injection_lease(now)
+    }
+
+    pub(crate) fn end_all_injection_leases(&self) {
+        self.0.end_all_injection_leases();
+    }
+
+    pub(crate) fn drain_held_input(&self) -> bool {
+        self.0.drain_held_input()
+    }
+
+    pub(crate) fn has_held_backlog(&self) -> bool {
+        self.0.has_held_backlog()
+    }
+
+    pub(crate) fn injection_lease_until(&self) -> Option<std::time::Instant> {
+        self.0.injection_lease_until()
+    }
+
+    pub(crate) fn holds_injection_lease(&self, token: &str, now: std::time::Instant) -> bool {
+        self.0.holds_injection_lease(token, now)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_stamp_operator_input_at(&self, at: std::time::Instant) {
         self.0.test_stamp_operator_input_at(at);

@@ -531,6 +531,9 @@ async fn a_human_who_types_between_the_sentence_and_the_enter_gets_no_enter() {
         pane,
         mut pty,
     } = rig();
+    // The contract without the injection lock (#850); the lock's own is
+    // pinned in `injection_lock_tests`.
+    app.state.config.ui.injection_lock.enabled = false;
     claude_idle_for(&mut app, settled());
     send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
     assert_eq!(drain(&mut pty).len(), 1, "sentence typed");
@@ -612,6 +615,9 @@ async fn a_draft_left_in_the_prompt_is_never_typed_next_to() {
         pane,
         mut pty,
     } = rig();
+    // The contract without the injection lock (#850); the lock's own is
+    // pinned in `injection_lock_tests`.
+    app.state.config.ui.injection_lock.enabled = false;
     claude_idle_for(&mut app, settled());
     // Typed long ago — outside any quiet window — and never sent.
     runtime(&app).test_process_pty_bytes(&claude_screen("half a thought"));
@@ -832,6 +838,9 @@ async fn guarded_submit_refuses_drafts_and_concurrent_input() {
         pane,
         mut pty,
     } = rig();
+    // The contract without the injection lock (#850); the lock's own is
+    // pinned in `injection_lock_tests`.
+    app.state.config.ui.injection_lock.enabled = false;
     claude_idle_for(&mut app, settled());
     runtime(&app).test_process_pty_bytes(&claude_screen("human draft"));
     assert_eq!(
@@ -2036,6 +2045,9 @@ async fn an_idle_claude_with_a_typed_draft_is_not_woken() {
         pane,
         mut pty,
     } = rig();
+    // The contract without the injection lock (#850); the lock's own is
+    // pinned in `injection_lock_tests`.
+    app.state.config.ui.injection_lock.enabled = false;
     claude_idle_for(&mut app, settled());
     runtime(&app).test_process_pty_bytes(&claude_screen("watch CI on #891 and merge when green"));
     send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
@@ -2072,3 +2084,6 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
         .get("unfaint")
         .is_none());
 }
+
+#[path = "injection_lock_tests.rs"]
+mod injection_lock_tests;

@@ -9,6 +9,15 @@ use bytes::Bytes;
 
 pub(crate) const CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(50);
+/// The bound on one injection's hold on the operator's input (#850): five
+/// seconds of work plus the submit confirmation.
+pub(crate) const INJECTION_LEASE: Duration = Duration::from_secs(5 + CONFIRM_WINDOW.as_secs());
+/// How long clearing a draft, or reading it back, may take before flock stops
+/// and keeps the draft in the pane's stash.
+const DRAFT_STEP: Duration = Duration::from_secs(1);
+/// Backspaces past the draft's visible length, for whitespace the composer
+/// read trims. Extra ones on an empty composer do nothing.
+const CLEAR_SLACK: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Attempt {
@@ -25,9 +34,34 @@ pub(crate) struct Attempt {
     wake: bool,
     session: Option<String>,
     settle: Duration,
+    /// The operator's draft, moved aside for this injection (#850).
+    pub(crate) stash: Option<DraftStash>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DraftStash {
+    pub(crate) draft: String,
+    pub(crate) phase: StashPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StashPhase {
+    /// Clear keys sent; the injection waits for an empty composer.
+    Clearing,
+    /// The composer holds the injection; the draft waits for the submit.
+    Held,
+    /// The submit landed with `outcome`; the draft goes back once the
+    /// composer reads empty, then must read back exactly.
+    Restoring {
+        outcome: Outcome,
+        typed: bool,
+        until: Instant,
+    },
+    /// Read back exactly.
+    Restored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Accepted,
     ObservedAccepted,
@@ -185,24 +219,85 @@ pub(crate) fn composer_unfaint(agent: Agent, screen: &str, unfaint: &str, text: 
         return Composer::Unknown;
     }
     let nonempty: Vec<_> = rows.into_iter().filter(|row| !row.is_empty()).collect();
-    let empty = nonempty.is_empty()
-        || (nonempty.len() == 1
-            && match agent {
-                Agent::Codex => nonempty[0] == "Ask Codex to do anything",
-                Agent::OpenCode => {
-                    nonempty[0] == "Ask anything…"
-                        || (nonempty[0].starts_with("Ask anything… \"")
-                            && nonempty[0].ends_with('"'))
-                }
-                _ => false,
-            });
-    if empty {
+    if editor_rows_empty(agent, &nonempty) {
         Composer::Empty
     } else if matches_rows(&nonempty, text) && !text.trim().is_empty() {
         Composer::Owned
     } else {
         Composer::Other
     }
+}
+
+/// An editor showing nothing, or only its harness's own hint text.
+fn editor_rows_empty(agent: Agent, nonempty: &[&str]) -> bool {
+    match nonempty {
+        [] => true,
+        [row] => match agent {
+            Agent::Codex => *row == "Ask Codex to do anything",
+            Agent::OpenCode => {
+                *row == "Ask anything…"
+                    || (row.starts_with("Ask anything… \"") && row.ends_with('"'))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The editor's rows with blanks dropped, read without the idle gates: after
+/// a submit the agent is working, and its composer still takes input.
+fn editor_rows(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> Option<Vec<String>> {
+    let (screen, unfaint) = runtime.detection_text_and_unfaint();
+    let (rows, _, _) = composer_rows(agent, &screen, &unfaint)?;
+    Some(
+        rows.into_iter()
+            .filter(|row| !row.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn editor_is_empty(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> bool {
+    editor_rows(agent, runtime).is_some_and(|rows| {
+        editor_rows_empty(agent, &rows.iter().map(String::as_str).collect::<Vec<_>>())
+    })
+}
+
+fn editor_shows(agent: Agent, runtime: &crate::terminal::TerminalRuntime, text: &str) -> bool {
+    editor_rows(agent, runtime).is_some_and(|rows| {
+        matches_rows(&rows.iter().map(String::as_str).collect::<Vec<_>>(), text)
+    })
+}
+
+/// A draft flock can move aside and put back exactly: one editor row, with
+/// no paste or image chip whose contents the screen does not show. Several
+/// rows are refused because the screen cannot tell a typed newline from the
+/// harness's own wrap.
+pub(crate) fn stashable_draft(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+) -> Option<String> {
+    match editor_rows(agent, runtime)?.as_slice() {
+        [row] if !row.contains("[Pasted") && !row.contains("[Image") => Some(row.clone()),
+        _ => None,
+    }
+}
+
+fn key(runtime: &crate::terminal::TerminalRuntime, code: crossterm::event::KeyCode) -> Vec<u8> {
+    runtime.encode_terminal_key(
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty()).into(),
+    )
+}
+
+/// End, then a backspace per character and some slack: the same keys clear
+/// a one-row editor in Claude, Codex and OpenCode.
+fn clear_keys(runtime: &crate::terminal::TerminalRuntime, draft: &str) -> Vec<u8> {
+    let mut bytes = key(runtime, crossterm::event::KeyCode::End);
+    let backspace = key(runtime, crossterm::event::KeyCode::Backspace);
+    for _ in 0..draft.chars().count() + CLEAR_SLACK {
+        bytes.extend_from_slice(&backspace);
+    }
+    bytes
 }
 
 /// Same execution plus a new working entry also captures turns between polls.
@@ -218,10 +313,18 @@ fn progress(before: &str, after: &str) -> Result<bool, &'static str> {
 }
 
 impl App {
-    pub(crate) fn handle_pane_submit(
+    pub(crate) fn handle_pane_submit(&mut self, id: String, params: PaneSubmitParams) -> String {
+        self.handle_guarded_submit(id, params, false)
+    }
+
+    /// `pane.submit`, or `agent.send --submit` when `stash` lets an operator's
+    /// draft move aside for the injection (#850). `pane.submit` keeps refusing
+    /// a draft: a delegate's brief goes into a pane nobody should be typing in.
+    pub(crate) fn handle_guarded_submit(
         &mut self,
         id: String,
         mut params: PaneSubmitParams,
+        stash: bool,
     ) -> String {
         let Some((ws, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "pane_gone", "pane_gone");
@@ -237,13 +340,14 @@ impl App {
             );
         }
         params.pane_id = pane;
-        match self.begin_guarded_submit(
+        match self.begin_guarded_injection(
             &params.pane_id,
             &params.text,
             params.if_session.as_deref(),
             Duration::from_secs(params.min_age_secs),
             Instant::now(),
             false,
+            stash,
         ) {
             Ok(attempt) => {
                 self.active_submissions.insert(params.pane_id.clone());
@@ -254,6 +358,8 @@ impl App {
         }
     }
 
+    /// A guarded submit that refuses any draft, as `pane.submit` does.
+    #[cfg(test)]
     pub(crate) fn begin_guarded_submit(
         &self,
         pane: &str,
@@ -262,6 +368,26 @@ impl App {
         settle: Duration,
         now: Instant,
         wake: bool,
+    ) -> Result<Attempt, &'static str> {
+        self.begin_guarded_injection(pane, text, session, settle, now, wake, false)
+    }
+
+    pub(crate) fn injection_lock_enabled(&self) -> bool {
+        self.state.config.ui.injection_lock.enabled
+    }
+
+    /// Type `text` under an injection lease (#850). With `stash`, a one-row
+    /// operator draft is cleared first and typed back after the submit.
+    #[allow(clippy::too_many_arguments)] // The guarded submit's own inputs plus the stash opt-in.
+    pub(crate) fn begin_guarded_injection(
+        &self,
+        pane: &str,
+        text: &str,
+        session: Option<&str>,
+        settle: Duration,
+        now: Instant,
+        wake: bool,
+        stash: bool,
     ) -> Result<Attempt, &'static str> {
         if text.trim().is_empty()
             || text
@@ -310,27 +436,64 @@ impl App {
         }) {
             return Err("operator_active");
         }
-        match runtime_composer(agent, runtime, text) {
-            Composer::Empty => (),
+        let lock = self.injection_lock_enabled();
+        let draft = match runtime_composer(agent, runtime, text) {
+            Composer::Empty => None,
+            Composer::Other if stash && lock => {
+                Some(stashable_draft(agent, runtime).ok_or("input_not_empty")?)
+            }
             Composer::Other | Composer::Owned => return Err("input_not_empty"),
             Composer::Unknown => return Err("unknown_composer"),
-        }
+        };
         let bytes = super::api_helpers::encode_api_text(runtime, text);
         if text.contains(['\n', '\t']) && !bytes.starts_with(b"\x1b[200~") {
             return Err("unsafe_text");
         }
         let mut evidence = self.new_delivery_attempt(pane, wake)?;
+        if draft.is_some() {
+            evidence.draft = Some("stashed".into());
+        }
         self.record_delivery_attempt(&evidence);
-        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
+        let abandon = |mut evidence: crate::api::schema::DeliveryAttempt, reason: &str| {
             evidence.state = "abandoned".into();
-            evidence.reason = Some("write_failed".into());
+            evidence.reason = Some(reason.into());
             evidence.finished_at_ms = Some(super::api::messages::now_ms());
             self.record_delivery_attempt(&evidence);
+        };
+        if lock && !runtime.begin_injection_lease(&evidence.attempt_id, now + INJECTION_LEASE, now)
+        {
+            abandon(evidence, "injection_pending");
+            return Err("injection_pending");
+        }
+        let first = match &draft {
+            Some(draft) => clear_keys(runtime, draft),
+            None => bytes,
+        };
+        if runtime.try_send_flock_authored(Bytes::from(first)).is_err() {
+            // Nothing reached the pane, so a draft is still where it was.
+            runtime.end_injection_lease(&evidence.attempt_id);
+            abandon(evidence, "write_failed");
             return Err("write_failed");
         }
-        evidence.state = "typed".into();
-        evidence.typed_at_ms = Some(super::api::messages::now_ms());
-        self.record_delivery_attempt(&evidence);
+        if draft.is_none() {
+            evidence.state = "typed".into();
+            evidence.typed_at_ms = Some(super::api::messages::now_ms());
+            self.record_delivery_attempt(&evidence);
+        }
+        if let Some(draft) = &draft {
+            // From here until the attempt is released, the draft lives only in
+            // memory, so the server can find it whoever holds the attempt.
+            self.kept_drafts
+                .borrow_mut()
+                .track_in_flight(&evidence.attempt_id, pane, draft);
+        }
+        let (due, deadline) = match draft {
+            Some(_) => (now + POLL, now + DRAFT_STEP),
+            None => (
+                now + crate::cli::pane::PANE_RUN_SUBMIT_GAP,
+                now + CONFIRM_WINDOW,
+            ),
+        };
         Ok(Attempt {
             evidence,
             text: text.to_owned(),
@@ -338,13 +501,17 @@ impl App {
             child_pid: runtime.child_pid(),
             operator_input: runtime.last_operator_input_at(),
             prompt_generation: terminal.prompt_report_generation,
-            due: now + crate::cli::pane::PANE_RUN_SUBMIT_GAP,
-            deadline: now + CONFIRM_WINDOW,
+            due,
+            deadline,
             sent: false,
             retried: false,
             wake,
             session: session.map(str::to_owned),
             settle,
+            stash: draft.map(|draft| DraftStash {
+                draft,
+                phase: StashPhase::Clearing,
+            }),
         })
     }
 
@@ -354,9 +521,16 @@ impl App {
         attempt: &mut Attempt,
         now: Instant,
     ) -> Option<Outcome> {
-        let outcome = self.advance_guarded_submit_inner(pane, attempt, now);
+        let outcome = match attempt.stash.as_ref().map(|stash| stash.phase) {
+            Some(StashPhase::Restoring { outcome, .. }) => {
+                self.advance_draft_restore(pane, attempt, outcome, now)
+            }
+            _ => self
+                .advance_guarded_submit_inner(pane, attempt, now)
+                .and_then(|outcome| self.begin_draft_restore(pane, attempt, outcome, now)),
+        };
         if let Some(ref outcome) = outcome {
-            self.finish_delivery_attempt(attempt, outcome);
+            self.conclude_guarded_attempt(pane, attempt, outcome);
         } else if attempt.sent
             && (attempt.evidence.state != "submit_sent"
                 || attempt.evidence.retried != attempt.retried)
@@ -409,6 +583,13 @@ impl App {
             && terminal.last_prompt.as_deref() == Some(reported_text.trim());
         if !attempt.sent && (started || reported) {
             return Some(Outcome::Abandoned("turn_started_before_enter"));
+        }
+        if attempt
+            .stash
+            .as_ref()
+            .is_some_and(|stash| stash.phase == StashPhase::Clearing)
+        {
+            return self.advance_draft_clear(terminal, runtime, attempt, now);
         }
         if attempt.sent && reported {
             return Some(Outcome::Accepted);
@@ -478,6 +659,231 @@ impl App {
         None
     }
 
+    /// Type the injection once the cleared composer reads empty.
+    fn advance_draft_clear(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        runtime: &crate::terminal::TerminalRuntime,
+        attempt: &mut Attempt,
+        now: Instant,
+    ) -> Option<Outcome> {
+        if now < attempt.due {
+            return None;
+        }
+        let Some(agent) = terminal.effective_known_agent() else {
+            return Some(Outcome::Abandoned("unknown_composer"));
+        };
+        if !runtime.holds_injection_lease(&attempt.evidence.attempt_id, now) {
+            return Some(Outcome::Abandoned("injection_lease_expired"));
+        }
+        if runtime_composer(agent, runtime, &attempt.text) != Composer::Empty {
+            if now < attempt.deadline {
+                attempt.due = (now + POLL).min(attempt.deadline);
+                return None;
+            }
+            return Some(Outcome::Abandoned("draft_not_cleared"));
+        }
+        let bytes = super::api_helpers::encode_api_text(runtime, &attempt.text);
+        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
+            return Some(Outcome::Abandoned("write_failed"));
+        }
+        if let Some(stash) = attempt.stash.as_mut() {
+            stash.phase = StashPhase::Held;
+        }
+        attempt.evidence.state = "typed".into();
+        attempt.evidence.typed_at_ms = Some(super::api::messages::now_ms());
+        self.record_delivery_attempt(&attempt.evidence);
+        attempt.due = now + crate::cli::pane::PANE_RUN_SUBMIT_GAP;
+        attempt.deadline = now + CONFIRM_WINDOW;
+        None
+    }
+
+    /// A submit that landed puts a held draft back before it reports.
+    fn begin_draft_restore(
+        &self,
+        pane: &str,
+        attempt: &mut Attempt,
+        outcome: Outcome,
+        now: Instant,
+    ) -> Option<Outcome> {
+        let Some(stash) = attempt.stash.as_mut() else {
+            return Some(outcome);
+        };
+        if stash.phase != StashPhase::Held
+            || !matches!(outcome, Outcome::Accepted | Outcome::ObservedAccepted)
+        {
+            return Some(outcome);
+        }
+        stash.phase = StashPhase::Restoring {
+            outcome,
+            typed: false,
+            until: now + DRAFT_STEP,
+        };
+        self.advance_draft_restore(pane, attempt, outcome, now)
+    }
+
+    /// Type the draft into the emptied composer and read it back, all under
+    /// the lease. Whatever cannot be confirmed in time is left for the
+    /// pane's stash when the attempt concludes.
+    fn advance_draft_restore(
+        &self,
+        pane: &str,
+        attempt: &mut Attempt,
+        outcome: Outcome,
+        now: Instant,
+    ) -> Option<Outcome> {
+        let token = &attempt.evidence.attempt_id;
+        let Some(stash) = attempt.stash.as_mut() else {
+            return Some(outcome);
+        };
+        let StashPhase::Restoring { typed, until, .. } = stash.phase else {
+            return Some(outcome);
+        };
+        let Some((ws, pane_id)) = self.parse_pane_id(pane) else {
+            return Some(outcome);
+        };
+        let (Some(terminal), Some(runtime)) = (
+            self.terminal_for_pane(ws, pane_id),
+            self.lookup_runtime_sender(ws, pane_id),
+        ) else {
+            return Some(outcome);
+        };
+        let Some(agent) = terminal.effective_known_agent() else {
+            return Some(outcome);
+        };
+        if !runtime.holds_injection_lease(token, now) {
+            return Some(outcome);
+        }
+        if typed && editor_shows(agent, runtime, &stash.draft) {
+            stash.phase = StashPhase::Restored;
+            return Some(outcome);
+        }
+        if !typed && editor_is_empty(agent, runtime) {
+            let bytes = super::api_helpers::encode_api_text(runtime, &stash.draft);
+            if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
+                return Some(outcome);
+            }
+            stash.phase = StashPhase::Restoring {
+                outcome,
+                typed: true,
+                until: now + DRAFT_STEP,
+            };
+        } else if now >= until {
+            return Some(outcome);
+        }
+        attempt.due = now + POLL;
+        None
+    }
+
+    /// Every attempt ends here, whoever drops it: the pane is released, then
+    /// the evidence closes.
+    pub(crate) fn conclude_guarded_attempt(
+        &self,
+        pane: &str,
+        attempt: &mut Attempt,
+        outcome: &Outcome,
+    ) {
+        self.release_guarded_attempt(pane, attempt);
+        self.finish_delivery_attempt(attempt, outcome);
+    }
+
+    /// A draft that did not come back exactly goes to the pane's stash, then
+    /// the lease ends and its held keystrokes replay. Safe to repeat.
+    pub(crate) fn release_guarded_attempt(&self, pane: &str, attempt: &mut Attempt) {
+        let target = self.parse_pane_id(pane).and_then(|(ws, pane_id)| {
+            Some((
+                self.terminal_for_pane(ws, pane_id)?,
+                self.lookup_runtime_sender(ws, pane_id)?,
+            ))
+        });
+        if let Some(stash) = attempt.stash.take() {
+            // Settled already (a handoff or shutdown kept every draft in
+            // flight): the stash has it, so keeping it again would duplicate.
+            let owned = self
+                .kept_drafts
+                .borrow_mut()
+                .claim_in_flight(&attempt.evidence.attempt_id);
+            let untouched = || {
+                target.is_some_and(|(terminal, runtime)| {
+                    terminal
+                        .effective_known_agent()
+                        .is_some_and(|agent| editor_shows(agent, runtime, &stash.draft))
+                })
+            };
+            let verdict = match stash.phase {
+                _ if !owned => "kept",
+                StashPhase::Restored => "restored",
+                StashPhase::Clearing if untouched() => "untouched",
+                _ => {
+                    self.keep_draft(pane, stash.draft.clone());
+                    "kept"
+                }
+            };
+            attempt.evidence.draft = Some(verdict.into());
+        }
+        if let Some((_, runtime)) = target {
+            runtime.end_injection_lease(&attempt.evidence.attempt_id);
+        }
+    }
+
+    fn pane_runtimes(&self) -> Vec<&crate::terminal::TerminalRuntime> {
+        let runtimes: Vec<_> = self.terminal_runtimes.values().collect();
+        // Test fixtures attach runtimes to the workspace instead.
+        #[cfg(test)]
+        let runtimes = {
+            let mut runtimes = runtimes;
+            for ws in &self.state.workspaces {
+                runtimes.extend(ws.test_runtimes.values());
+                runtimes.extend(ws.tabs.iter().flat_map(|tab| tab.runtimes.values()));
+            }
+            runtimes
+        };
+        runtimes
+    }
+
+    /// End every lease past its bound and replay what it held (#850). The
+    /// bound holds even when the injection's owner never comes back.
+    pub(crate) fn tick_injection_leases(&mut self, now: Instant) -> bool {
+        let mut ended = 0;
+        for runtime in self.pane_runtimes() {
+            ended += usize::from(runtime.expire_injection_lease(now));
+            runtime.drain_held_input();
+        }
+        self.surface_kept_drafts();
+        ended > 0
+    }
+
+    /// The next lease bound, or a prompt retry while held input waits on a
+    /// full channel.
+    pub(crate) fn next_injection_lease_deadline(&self) -> Option<Instant> {
+        let runtimes = self.pane_runtimes();
+        let retry = runtimes
+            .iter()
+            .any(|runtime| runtime.has_held_backlog())
+            .then(|| Instant::now() + POLL);
+        runtimes
+            .iter()
+            .filter_map(|runtime| runtime.injection_lease_until())
+            .chain(retry)
+            .min()
+    }
+
+    /// Before the server stops or hands off: every draft an injection holds
+    /// goes to the stash (and is announced), then every held keystroke is
+    /// written. The attempts themselves die with this server, so nothing
+    /// else would ever put those drafts back.
+    pub(crate) fn settle_injections_for_exit(&mut self) {
+        let kept = self.kept_drafts.borrow_mut().keep_all_in_flight();
+        for pane in &kept {
+            crate::logging::pane_draft_kept(pane);
+        }
+        self.surface_kept_drafts();
+        for runtime in self.pane_runtimes() {
+            runtime.end_all_injection_leases();
+            runtime.drain_held_input();
+        }
+    }
+
     pub(crate) fn schedule_guarded_request(
         &self,
         request_id: String,
@@ -524,6 +930,7 @@ impl App {
                     retried: attempt.retried,
                 },
             ));
+            self.surface_kept_drafts();
         } else {
             self.schedule_guarded_request(id, pane, attempt, respond_to);
         }
@@ -548,6 +955,7 @@ fn new_evidence(
         submit_sent_at_ms: None,
         finished_at_ms: None,
         retried: false,
+        draft: None,
     }
 }
 
@@ -651,6 +1059,7 @@ impl Attempt {
             wake: false,
             session: None,
             settle: Duration::ZERO,
+            stash: None,
         }
     }
 }
