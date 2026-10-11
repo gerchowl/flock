@@ -665,6 +665,20 @@ fn read_request_line(stream: &UnixStream) -> String {
     line
 }
 
+/// Answers the protocol check a state-changing verb sends first (#868) with
+/// this build's protocol, and says whether `line` was that check.
+fn answer_protocol_check(stream: &mut UnixStream, line: &str) -> bool {
+    let request: serde_json::Value = serde_json::from_str(line).unwrap();
+    if request["method"] != "ping" {
+        return false;
+    }
+    let pong = serde_json::json!({"id":request["id"],"result":{
+        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION
+    }});
+    writeln!(stream, "{pong}").unwrap();
+    true
+}
+
 #[test]
 fn request_reader_waits_for_data_on_a_nonblocking_stream() {
     let (server, mut client) = UnixStream::pair().unwrap();
@@ -1000,6 +1014,9 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let line = read_request_line(&stream);
+                    if answer_protocol_check(&mut stream, &line) {
+                        continue;
+                    }
                     stream
                         .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                         .unwrap();
@@ -4030,15 +4047,18 @@ fn relative_cwd_flags_reach_the_server_absolute() {
         let socket_path = base.join("flock.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
 
-        let server = thread::spawn(move || {
+        let server = thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().unwrap();
             let line = read_request_line(&stream);
+            if answer_protocol_check(&mut stream, &line) {
+                continue;
+            }
             stream
                 .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                 .unwrap();
             stream.write_all(b"\n").unwrap();
             stream.flush().unwrap();
-            line
+            break line;
         });
 
         let run = run_cli_in_dir(&socket_path, &verb, &base);
