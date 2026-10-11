@@ -2594,6 +2594,39 @@ pub(crate) fn agent_spawn_env_allowlisted(agent: &str, allowed: &str, kept: &str
     );
 }
 
+/// A Claude Code pre-trust attempt before an agent spawn (#605). `outcome` is
+/// `wrote`, a skip reason, or `error`; only a write or an error is worth the
+/// default level, since a skip is the ordinary answer for most spawns.
+pub(crate) fn claude_pretrust(outcome: &str, config: &str, path: &str, detail: &str) {
+    match outcome {
+        "wrote" => tracing::info!(
+            event = "agent.spawn.claude_pretrust",
+            subsystem = "spawn",
+            outcome,
+            config,
+            path,
+            "pre-trusted linked worktree for Claude Code"
+        ),
+        "error" => tracing::warn!(
+            event = "agent.spawn.claude_pretrust",
+            subsystem = "spawn",
+            outcome,
+            config,
+            path,
+            detail,
+            "Claude Code pre-trust failed; the trust dialog is left to the operator"
+        ),
+        _ => tracing::debug!(
+            event = "agent.spawn.claude_pretrust",
+            subsystem = "spawn",
+            outcome,
+            config,
+            path,
+            "Claude Code pre-trust skipped"
+        ),
+    }
+}
+
 pub(crate) fn worktree_add_started(repo_root: &str, branch: &str, checkout_path: &str) {
     tracing::info!(
         event = "worktree.add",

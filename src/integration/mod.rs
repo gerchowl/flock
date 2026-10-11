@@ -1,4 +1,5 @@
 mod atomic_write;
+pub(crate) mod claude_trust;
 mod codex_hook_trust;
 mod jsonc;
 pub(crate) mod launch;
