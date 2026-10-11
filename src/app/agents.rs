@@ -1524,6 +1524,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", base.join("profile"));
 
         let mut app = test_app();
+        app.state.config.worktrees.pretrust_claude = true;
         let mut request = start_request(claude.to_str().unwrap());
         if let Method::AgentStart(params) = &mut request.method {
             params.cwd = Some(worktree.to_string_lossy().into_owned());

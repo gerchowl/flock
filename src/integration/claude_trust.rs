@@ -18,11 +18,13 @@
 //!
 //! The file belongs to Claude, which rewrites it while it runs, so the edit is
 //! a byte splice rather than a re-serialisation: every other key keeps its
-//! bytes. It is re-read just before the atomic replace and recomputed once if
-//! Claude changed it in between.
+//! bytes. It is made under the same lock Claude Code takes for its own config
+//! writes (see [`ConfigLock`]), and re-read just before the atomic replace in
+//! case a writer ignored the lock.
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -38,6 +40,8 @@ pub(crate) enum Outcome {
     NotLinkedWorktree,
     NoConfig,
     ExternallyOwned,
+    LockHeld,
+    LockLost,
 }
 
 impl Outcome {
@@ -49,6 +53,8 @@ impl Outcome {
             Self::NotLinkedWorktree => "not_linked_worktree",
             Self::NoConfig => "no_config",
             Self::ExternallyOwned => "externally_owned",
+            Self::LockHeld => "lock_held",
+            Self::LockLost => "lock_lost",
         }
     }
 }
@@ -66,11 +72,15 @@ pub(crate) fn pretrust_for_launch(
     if !enabled || crate::spawn::env::agent_for_argv(argv) != Some(crate::detect::Agent::Claude) {
         return;
     }
-    let Some(config) = config_path(spawn_env, |key| std::env::var(key).ok()) else {
+    let Some(config) = config_path(spawn_env, |key| std::env::var(key).ok(), Path::is_file) else {
         return;
     };
     let config_text = config.display().to_string();
-    let (outcome, path, detail) = match pretrust_at(&config, cwd, &mut || {}) {
+    let mut hooks = Hooks {
+        before_write: &mut || {},
+        sleep: &mut std::thread::sleep,
+    };
+    let (outcome, path, detail) = match pretrust_at(&config, cwd, &mut hooks) {
         Ok(Outcome::Wrote(target)) => ("wrote", target, String::new()),
         Ok(outcome) => (outcome.label(), cwd.to_path_buf(), String::new()),
         Err(err) => ("error", cwd.to_path_buf(), err.to_string()),
@@ -78,27 +88,47 @@ pub(crate) fn pretrust_for_launch(
     crate::logging::claude_pretrust(outcome, &config_text, &path.display().to_string(), &detail);
 }
 
-/// The `.claude.json` the child reads: `$CLAUDE_CONFIG_DIR/.claude.json`, else
-/// `~/.claude.json`. The carried spawn environment wins over the server's own,
-/// because that is what the child's environment is built from.
+/// The global config file the child reads, resolved the way Claude Code
+/// 2.1.295 does (`Tt()` in its bundle): `<claude home>/.config.json` when that
+/// legacy file exists, where the claude home is `$CLAUDE_CONFIG_DIR` or
+/// `~/.claude`; otherwise `.claude<suffix>.json` in `$CLAUDE_CONFIG_DIR`, or in
+/// `$HOME` when it is unset. The suffix is `-custom-oauth` under
+/// `CLAUDE_CODE_CUSTOM_OAUTH_URL` and empty for the production build; the
+/// staging and local suffixes come from build-internal state no environment
+/// shows, so those builds are not covered. A variable carried in the spawn
+/// environment wins over the server's own, because that is what the child's
+/// environment is built from.
 fn config_path(
     spawn_env: &[(String, String)],
     server_env: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    let carried = spawn_env
-        .iter()
-        .rev()
-        .find(|(key, _)| key == super::CLAUDE_CONFIG_DIR_ENV_VAR)
-        .map(|(_, value)| value.clone());
-    match carried
-        .or_else(|| server_env(super::CLAUDE_CONFIG_DIR_ENV_VAR))
-        .filter(|dir| !dir.is_empty())
-    {
-        Some(dir) => Some(PathBuf::from(dir).join(".claude.json")),
-        None => server_env("HOME")
-            .filter(|home| !home.is_empty())
-            .map(|home| PathBuf::from(home).join(".claude.json")),
+    let lookup = |key: &str| {
+        spawn_env
+            .iter()
+            .rev()
+            .find(|(carried, _)| carried == key)
+            .map(|(_, value)| value.clone())
+            .or_else(|| server_env(key))
+            .filter(|value| !value.is_empty())
+    };
+    let config_dir = lookup(super::CLAUDE_CONFIG_DIR_ENV_VAR).map(PathBuf::from);
+    let home = server_env("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let claude_home = config_dir
+        .clone()
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
+    let legacy = claude_home.join(".config.json");
+    if exists(&legacy) {
+        return Some(legacy);
     }
+    let suffix = if lookup("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some() {
+        "-custom-oauth"
+    } else {
+        ""
+    };
+    Some(config_dir.or(home)?.join(format!(".claude{suffix}.json")))
 }
 
 /// A linked worktree and the main checkout it shares a repository with, both
@@ -110,9 +140,12 @@ struct LinkedWorktree {
 }
 
 /// The linked worktree `dir` sits in, read from git's own files rather than a
-/// `git` subprocess: the nearest `.git` above `dir` must be a FILE pointing at
-/// a gitdir that carries a `commondir`. A `.git` directory is a main checkout,
-/// and a gitdir without `commondir` is a submodule; neither is a worktree.
+/// `git` subprocess. A `.git` FILE is only a claim, and anyone can write one,
+/// so it is believed only when git's own records agree from both ends: the
+/// gitdir it names sits at `<common dir>/worktrees/<name>`, and that gitdir's
+/// `gitdir` file points back at this very `.git`. A `.git` directory is a main
+/// checkout, and a submodule's gitdir lives under `modules/`, not `worktrees/`;
+/// neither is a worktree.
 fn linked_worktree(dir: &Path) -> Option<LinkedWorktree> {
     for root in dir.ancestors() {
         let dotgit = root.join(".git");
@@ -123,9 +156,17 @@ fn linked_worktree(dir: &Path) -> Option<LinkedWorktree> {
             return None;
         }
         let pointer = fs::read_to_string(&dotgit).ok()?;
-        let gitdir = root.join(pointer.trim().strip_prefix("gitdir:")?.trim());
+        let gitdir =
+            fs::canonicalize(root.join(pointer.trim().strip_prefix("gitdir:")?.trim())).ok()?;
         let commondir = fs::read_to_string(gitdir.join("commondir")).ok()?;
         let common = fs::canonicalize(gitdir.join(commondir.trim())).ok()?;
+        if gitdir.parent()? != common.join("worktrees") {
+            return None;
+        }
+        let back = fs::read_to_string(gitdir.join("gitdir")).ok()?;
+        if fs::canonicalize(gitdir.join(back.trim())).ok()? != fs::canonicalize(&dotgit).ok()? {
+            return None;
+        }
         let main_root = crate::worktree::main_root_from_common_dir(&common);
         if main_root == common {
             // A bare repository has no checkout anyone could have trusted.
@@ -139,10 +180,139 @@ fn linked_worktree(dir: &Path) -> Option<LinkedWorktree> {
     None
 }
 
-/// Pre-trust `cwd` in the `.claude.json` at `config`. `before_write` runs
-/// between the decision and the re-read, which is where a concurrent Claude
-/// rewrite lands.
-fn pretrust_at(config: &Path, cwd: &Path, before_write: &mut dyn FnMut()) -> io::Result<Outcome> {
+/// The lock Claude Code takes around every write of its global config.
+///
+/// Verified against the Claude Code 2.1.295 bundle: its config save
+/// (`saveConfigWithLock`) calls the vendored `proper-lockfile` with
+/// `lockfilePath` set to `<file>.lock` and no other options, so the library
+/// defaults apply: the lock is a DIRECTORY created with `mkdir`; an existing
+/// one is stale only when its mtime is older than `stale` (10 s), in which
+/// case it is removed and the `mkdir` tried once more; the holder refreshes the
+/// mtime every `stale / 2` and treats a changed mtime as "Config lock
+/// compromised". Claude retries a held lock with backoff
+/// (`[200,400,800,1600,3200,4000]` ms) and never writes without it.
+///
+/// flock follows the same protocol with a shorter wait, since it runs on the
+/// server's event loop, and gives up instead of writing unlocked: a skipped
+/// write leaves the trust dialog, which is safe. Its own hold lasts one read
+/// and one write, well inside `stale / 2`, so it does not refresh the mtime;
+/// it re-checks the mtime before the write instead, and backs off if another
+/// process took the lock over meanwhile.
+struct ConfigLock {
+    dir: PathBuf,
+    mtime: SystemTime,
+    acquired: std::time::Instant,
+}
+
+const LOCK_STALE: Duration = Duration::from_secs(10);
+const LOCK_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+];
+
+impl ConfigLock {
+    fn path(config: &Path) -> PathBuf {
+        let mut dir = config.as_os_str().to_owned();
+        dir.push(".lock");
+        PathBuf::from(dir)
+    }
+
+    /// Take the lock, waiting out a short hold. `None` means another process
+    /// still has it.
+    fn acquire(config: &Path, sleep: &mut dyn FnMut(Duration)) -> io::Result<Option<Self>> {
+        let dir = Self::path(config);
+        for delay in std::iter::once(Duration::ZERO).chain(LOCK_RETRY_DELAYS) {
+            if !delay.is_zero() {
+                sleep(delay);
+            }
+            if let Some(lock) = Self::try_acquire(&dir, SystemTime::now())? {
+                return Ok(Some(lock));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One `proper-lockfile` acquisition attempt, judged against `now`.
+    fn try_acquire(dir: &Path, now: SystemTime) -> io::Result<Option<Self>> {
+        if let Some(lock) = Self::create(dir)? {
+            return Ok(Some(lock));
+        }
+        let modified = match fs::metadata(dir).and_then(|metadata| metadata.modified()) {
+            // Released between the mkdir and the stat: one more try, as
+            // `proper-lockfile` does with `stale: 0`.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Self::create(dir),
+            Err(err) => return Err(err),
+            Ok(modified) => modified,
+        };
+        let stale = now
+            .checked_sub(LOCK_STALE)
+            .is_some_and(|cutoff| modified < cutoff);
+        if !stale {
+            return Ok(None);
+        }
+        match fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        Self::create(dir)
+    }
+
+    fn create(dir: &Path) -> io::Result<Option<Self>> {
+        match fs::create_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        match fs::metadata(dir).and_then(|metadata| metadata.modified()) {
+            Ok(mtime) => Ok(Some(Self {
+                dir: dir.to_path_buf(),
+                mtime,
+                acquired: std::time::Instant::now(),
+            })),
+            Err(err) => {
+                let _ = fs::remove_dir(dir);
+                Err(err)
+            }
+        }
+    }
+
+    /// Still ours: not past the point where a waiter may call it stale, and
+    /// not replaced by someone who did.
+    fn still_held(&self) -> bool {
+        self.acquired.elapsed() < LOCK_STALE / 2
+            && fs::metadata(&self.dir)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|mtime| mtime == self.mtime)
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir(&self.dir) {
+            if err.kind() != io::ErrorKind::NotFound {
+                crate::logging::claude_pretrust(
+                    "error",
+                    &self.dir.display().to_string(),
+                    &self.dir.display().to_string(),
+                    &format!("could not release the config lock: {err}"),
+                );
+            }
+        }
+    }
+}
+
+/// Seams for the moments a test needs to step into: `before_write` runs
+/// between the decision and the re-read, which is where a writer that ignores
+/// the lock lands, and `sleep` is the wait between lock attempts.
+struct Hooks<'a> {
+    before_write: &'a mut dyn FnMut(),
+    sleep: &'a mut dyn FnMut(Duration),
+}
+
+/// Pre-trust `cwd` in the config file at `config`.
+fn pretrust_at(config: &Path, cwd: &Path, hooks: &mut Hooks<'_>) -> io::Result<Outcome> {
     let cwd = fs::canonicalize(cwd)?;
     let Some(worktree) = linked_worktree(&cwd) else {
         return Ok(Outcome::NotLinkedWorktree);
@@ -150,6 +320,15 @@ fn pretrust_at(config: &Path, cwd: &Path, before_write: &mut dyn FnMut()) -> io:
     if super::mcp_config::externally_owned_at(config) {
         return Ok(Outcome::ExternallyOwned);
     }
+    if !config.is_file() {
+        return Ok(Outcome::NoConfig);
+    }
+    if let Some(dir) = config.parent() {
+        super::atomic_write::sweep_orphans(dir);
+    }
+    let Some(lock) = ConfigLock::acquire(config, hooks.sleep)? else {
+        return Ok(Outcome::LockHeld);
+    };
     for _ in 0..2 {
         let content = match fs::read_to_string(config) {
             Ok(content) => content,
@@ -160,7 +339,7 @@ fn pretrust_at(config: &Path, cwd: &Path, before_write: &mut dyn FnMut()) -> io:
             Plan::Done(outcome) => return Ok(outcome),
             Plan::Write { target, updated } => (target, updated),
         };
-        before_write();
+        (hooks.before_write)();
         let latest = match fs::read_to_string(config) {
             Ok(latest) => latest,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Outcome::NoConfig),
@@ -168,6 +347,9 @@ fn pretrust_at(config: &Path, cwd: &Path, before_write: &mut dyn FnMut()) -> io:
         };
         if latest != content {
             continue;
+        }
+        if !lock.still_held() {
+            return Ok(Outcome::LockLost);
         }
         super::atomic_write::replace(config, updated.as_bytes())?;
         return Ok(Outcome::Wrote(target));
@@ -310,6 +492,29 @@ mod tests {
     use super::*;
     use crate::test_support::{create_committed_repo, run_git, unique_temp_path};
 
+    fn run(config: &Path, cwd: &Path) -> io::Result<Outcome> {
+        run_with(config, cwd, &mut || {})
+    }
+
+    /// Lock waits are recorded, never slept, so a held lock costs no time.
+    fn run_with(config: &Path, cwd: &Path, before_write: &mut dyn FnMut()) -> io::Result<Outcome> {
+        pretrust_at(
+            config,
+            cwd,
+            &mut Hooks {
+                before_write,
+                sleep: &mut |_| {},
+            },
+        )
+    }
+
+    fn age(path: &Path, by: Duration) {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
     struct Fixture {
         base: PathBuf,
         repo: PathBuf,
@@ -373,7 +578,7 @@ mod tests {
         let fx = Fixture::new("pretrust-trusted");
         let original = fx.trust(&fx.repo);
         fs::write(&fx.config, &original).unwrap();
-        let outcome = pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap();
+        let outcome = run(&fx.config, &fx.worktree).unwrap();
         assert_eq!(outcome, Outcome::Wrote(fx.worktree.clone()));
         assert!(fx.trusted(&fx.worktree));
         let written = fs::read_to_string(&fx.config).unwrap();
@@ -385,7 +590,7 @@ mod tests {
         );
         assert_eq!(written.replacen(&inserted, "", 1), original);
         assert_eq!(
-            pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap(),
+            run(&fx.config, &fx.worktree).unwrap(),
             Outcome::AlreadyTrusted
         );
     }
@@ -400,18 +605,18 @@ mod tests {
         let original = fx.trust(&fx.base);
         fs::write(&fx.config, &original).unwrap();
         assert_eq!(
-            pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap(),
+            run(&fx.config, &fx.worktree).unwrap(),
             Outcome::SourceUntrusted
         );
         // #365: a plain directory, even one whose parent is trusted, is never
         // a target.
         assert_eq!(
-            pretrust_at(&fx.config, &elsewhere, &mut || {}).unwrap(),
+            run(&fx.config, &elsewhere).unwrap(),
             Outcome::NotLinkedWorktree
         );
         // The main checkout is not a linked worktree either.
         assert_eq!(
-            pretrust_at(&fx.config, &fx.repo, &mut || {}).unwrap(),
+            run(&fx.config, &fx.repo).unwrap(),
             Outcome::NotLinkedWorktree
         );
         assert_eq!(fs::read_to_string(&fx.config).unwrap(), original);
@@ -427,13 +632,13 @@ mod tests {
         // worktree: its root stays as untrusted as the repo root is.
         fs::write(&fx.config, fx.trust(&fx.repo.join("pkg"))).unwrap();
         assert_eq!(
-            pretrust_at(&fx.config, &fx.worktree.join(sub), &mut || {}).unwrap(),
+            run(&fx.config, &fx.worktree.join(sub)).unwrap(),
             Outcome::Wrote(fx.worktree.join("pkg"))
         );
         assert!(fx.trusted(&fx.worktree.join("pkg")));
         assert!(!fx.trusted(&fx.worktree));
         assert_eq!(
-            pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap(),
+            run(&fx.config, &fx.worktree).unwrap(),
             Outcome::SourceUntrusted
         );
     }
@@ -449,7 +654,7 @@ mod tests {
         // through one: the entry is still keyed on the real worktree path.
         fs::write(&fx.config, fx.trust(&repo_link)).unwrap();
         assert_eq!(
-            pretrust_at(&fx.config, &wt_link, &mut || {}).unwrap(),
+            run(&fx.config, &wt_link).unwrap(),
             Outcome::Wrote(fx.worktree.clone())
         );
         assert!(fx.trusted(&fx.worktree));
@@ -465,7 +670,7 @@ mod tests {
         fs::write(&real, fx.trust(&fx.repo)).unwrap();
         std::os::unix::fs::symlink(&real, &fx.config).unwrap();
         assert_eq!(
-            pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap(),
+            run(&fx.config, &fx.worktree).unwrap(),
             Outcome::ExternallyOwned
         );
         assert_eq!(fs::read_to_string(&real).unwrap(), fx.trust(&fx.repo));
@@ -477,7 +682,7 @@ mod tests {
         let fx = Fixture::new("pretrust-mode");
         fs::write(&fx.config, fx.trust(&fx.repo)).unwrap();
         fs::set_permissions(&fx.config, fs::Permissions::from_mode(0o600)).unwrap();
-        pretrust_at(&fx.config, &fx.worktree, &mut || {}).unwrap();
+        run(&fx.config, &fx.worktree).unwrap();
         let mode = fs::metadata(&fx.config).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
@@ -490,7 +695,7 @@ mod tests {
             fx.trust(&fx.repo)
                 .replace("\"numStartups\": 7", "\"numStartups\": 8"),
         );
-        let outcome = pretrust_at(&fx.config, &fx.worktree, &mut || {
+        let outcome = run_with(&fx.config, &fx.worktree, &mut || {
             if let Some(content) = claude_writes.take() {
                 fs::write(&fx.config, content).unwrap();
             }
@@ -505,7 +710,7 @@ mod tests {
         let fx = Fixture::new("pretrust-race-twice");
         fs::write(&fx.config, fx.trust(&fx.repo)).unwrap();
         let mut startups = 10;
-        let err = pretrust_at(&fx.config, &fx.worktree, &mut || {
+        let err = run_with(&fx.config, &fx.worktree, &mut || {
             startups += 1;
             let content = fx.trust(&fx.repo).replace(
                 "\"numStartups\": 7",
@@ -574,7 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn config_path_prefers_the_carried_profile() {
+    fn config_path_follows_claude_codes_lookup() {
+        let none = |_: &Path| false;
         let server = |key: &str| match key {
             "HOME" => Some("/fixture-home".to_string()),
             "CLAUDE_CONFIG_DIR" => Some("/fixture-server-profile".to_string()),
@@ -582,18 +788,173 @@ mod tests {
         };
         let carried = vec![("CLAUDE_CONFIG_DIR".to_string(), "/p/work".to_string())];
         assert_eq!(
-            config_path(&carried, server),
+            config_path(&carried, server, none),
             Some(PathBuf::from("/p/work/.claude.json"))
         );
         assert_eq!(
-            config_path(&[], server),
+            config_path(&[], server, none),
             Some(PathBuf::from("/fixture-server-profile/.claude.json"))
         );
         let home_only = |key: &str| (key == "HOME").then(|| "/fixture-home".to_string());
         assert_eq!(
-            config_path(&[], home_only),
+            config_path(&[], home_only, none),
             Some(PathBuf::from("/fixture-home/.claude.json"))
         );
-        assert_eq!(config_path(&[], |_| None), None);
+        assert_eq!(config_path(&[], |_| None, none), None);
+
+        // The legacy file wins wherever it exists: in the profile, or in
+        // `~/.claude` when no profile is selected.
+        let legacy = |path: &Path| path.ends_with(".config.json");
+        assert_eq!(
+            config_path(&carried, server, legacy),
+            Some(PathBuf::from("/p/work/.config.json"))
+        );
+        assert_eq!(
+            config_path(&[], home_only, legacy),
+            Some(PathBuf::from("/fixture-home/.claude/.config.json"))
+        );
+
+        let custom = |key: &str| match key {
+            "HOME" => Some("/fixture-home".to_string()),
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL" => Some("https://auth.example.invalid".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config_path(&[], custom, none),
+            Some(PathBuf::from("/fixture-home/.claude-custom-oauth.json"))
+        );
+    }
+
+    #[test]
+    fn a_forged_dotgit_file_is_not_a_worktree() {
+        let fx = Fixture::new("pretrust-forged");
+        fs::write(&fx.config, fx.trust(&fx.repo)).unwrap();
+        let gitdir = fs::read_to_string(fx.worktree.join(".git")).unwrap();
+        // A directory claiming the real worktree's gitdir: git's back-pointer
+        // names the real worktree, not this one.
+        let forged = fx.base.join("forged");
+        fs::create_dir_all(&forged).unwrap();
+        fs::write(forged.join(".git"), &gitdir).unwrap();
+        assert_eq!(
+            run(&fx.config, &forged).unwrap(),
+            Outcome::NotLinkedWorktree
+        );
+        // One claiming the main repository's own git dir, which has a
+        // `commondir`-less layout and is not under `worktrees/`.
+        let forged_main = fx.base.join("forged-main");
+        fs::create_dir_all(&forged_main).unwrap();
+        fs::write(
+            forged_main.join(".git"),
+            format!("gitdir: {}\n", fx.repo.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&fx.config, &forged_main).unwrap(),
+            Outcome::NotLinkedWorktree
+        );
+        // A hand-built gitdir that is not under `<common>/worktrees/`, with a
+        // matching back-pointer and a `commondir` aimed at the trusted repo.
+        let fake_gitdir = fx.base.join("fake-gitdir");
+        let forged_full = fx.base.join("forged-full");
+        fs::create_dir_all(&fake_gitdir).unwrap();
+        fs::create_dir_all(&forged_full).unwrap();
+        fs::write(
+            fake_gitdir.join("commondir"),
+            fx.repo.join(".git").display().to_string(),
+        )
+        .unwrap();
+        fs::write(
+            fake_gitdir.join("gitdir"),
+            forged_full.join(".git").display().to_string(),
+        )
+        .unwrap();
+        fs::write(
+            forged_full.join(".git"),
+            format!("gitdir: {}\n", fake_gitdir.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&fx.config, &forged_full).unwrap(),
+            Outcome::NotLinkedWorktree
+        );
+        assert_eq!(fs::read_to_string(&fx.config).unwrap(), fx.trust(&fx.repo));
+    }
+
+    #[test]
+    fn a_held_lock_is_waited_on_and_then_left_alone() {
+        let fx = Fixture::new("pretrust-held");
+        let original = fx.trust(&fx.repo);
+        fs::write(&fx.config, &original).unwrap();
+        let lock = ConfigLock::path(&fx.config);
+        fs::create_dir(&lock).unwrap();
+        let mut waits = Vec::new();
+        let outcome = pretrust_at(
+            &fx.config,
+            &fx.worktree,
+            &mut Hooks {
+                before_write: &mut || {},
+                sleep: &mut |delay| waits.push(delay),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::LockHeld);
+        assert_eq!(waits, LOCK_RETRY_DELAYS);
+        assert!(lock.is_dir(), "another holder's lock must not be removed");
+        assert_eq!(fs::read_to_string(&fx.config).unwrap(), original);
+    }
+
+    #[test]
+    fn a_stale_lock_is_taken_over_and_released_after_the_write() {
+        let fx = Fixture::new("pretrust-stale");
+        fs::write(&fx.config, fx.trust(&fx.repo)).unwrap();
+        let lock = ConfigLock::path(&fx.config);
+        fs::create_dir(&lock).unwrap();
+        age(&lock, LOCK_STALE + Duration::from_secs(5));
+        assert_eq!(
+            run(&fx.config, &fx.worktree).unwrap(),
+            Outcome::Wrote(fx.worktree.clone())
+        );
+        assert!(!lock.exists(), "the lock is released after the write");
+        // A lock just under the stale age is still a live holder's.
+        fs::create_dir(&lock).unwrap();
+        age(&lock, LOCK_STALE - Duration::from_secs(2));
+        assert!(ConfigLock::try_acquire(&lock, SystemTime::now())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_lock_taken_over_mid_write_is_not_written_through() {
+        let fx = Fixture::new("pretrust-lost");
+        let original = fx.trust(&fx.repo);
+        fs::write(&fx.config, &original).unwrap();
+        let lock = ConfigLock::path(&fx.config);
+        let outcome = run_with(&fx.config, &fx.worktree, &mut || {
+            age(&lock, Duration::from_secs(30));
+        })
+        .unwrap();
+        assert_eq!(outcome, Outcome::LockLost);
+        assert_eq!(fs::read_to_string(&fx.config).unwrap(), original);
+    }
+
+    #[test]
+    fn orphaned_temp_files_of_dead_writers_are_swept() {
+        let fx = Fixture::new("pretrust-orphans");
+        fs::write(&fx.config, fx.trust(&fx.repo)).unwrap();
+        // Above every platform's pid ceiling, so no process can hold it.
+        let dead = fx.base.join(".flock-write-4194305-0");
+        let young = fx.base.join(".flock-write-4194305-1");
+        let mine = fx
+            .base
+            .join(format!(".flock-write-{}-9", std::process::id()));
+        for path in [&dead, &young, &mine] {
+            fs::write(path, "partial").unwrap();
+        }
+        age(&dead, Duration::from_secs(120));
+        age(&mine, Duration::from_secs(120));
+        run(&fx.config, &fx.worktree).unwrap();
+        assert!(!dead.exists());
+        assert!(young.exists(), "a fresh temp may belong to a live write");
+        assert!(mine.exists());
     }
 }

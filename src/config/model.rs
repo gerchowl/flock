@@ -907,7 +907,7 @@ pub struct WorktreesConfig {
     /// flock launches `claude` in it, when the repository it was checked out
     /// from is already trusted there (#605). Never widens trust: an untrusted
     /// source, or a directory that is not a linked worktree, is left alone.
-    /// Default: true.
+    /// Default: true (false in test builds).
     pub pretrust_claude: bool,
 }
 
@@ -1736,7 +1736,9 @@ impl Default for WorktreesConfig {
             branch_pivot_message: default_branch_pivot_message().to_string(),
             protected_branches: Vec::new(),
             integration_branches: Vec::new(),
-            pretrust_claude: true,
+            // Off in test builds, so no test App can write to a real Claude
+            // config. A test that exercises it turns it on against a sandbox.
+            pretrust_claude: !cfg!(test),
         }
     }
 }
