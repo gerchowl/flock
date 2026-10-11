@@ -144,6 +144,9 @@ impl App {
             .remove(pane)
             .and_then(|entry| entry.in_flight);
         if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
+            // A draft still mid-restore goes to the stash (#850).
+            self.release_guarded_attempt(pane, &mut attempt);
+            self.surface_kept_drafts();
             if attempt.evidence.submit_sent_at_ms.is_some() {
                 attempt.evidence.state = "read".into();
                 attempt.evidence.reason = Some("inbox_read".into());
@@ -175,11 +178,13 @@ impl App {
             .and_then(|entry| entry.in_flight.take())
             .and_then(|flight| flight.attempt);
         if let Some(mut attempt) = attempt {
-            self.finish_delivery_attempt(
+            self.conclude_guarded_attempt(
+                pane,
                 &mut attempt,
                 &super::guarded_submit::Outcome::Abandoned(reason),
             );
             crate::logging::idle_wake_abandoned(pane, reason);
+            self.surface_kept_drafts();
         }
     }
 
@@ -307,8 +312,13 @@ impl App {
             }
             // It left Idle — the wake (or something else) took. Messages it
             // was told about stay announced; only new ones can wake it again.
-            if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
-                entry.in_flight = None;
+            let flight = self
+                .idle_wake
+                .panes
+                .get_mut(pane)
+                .and_then(|entry| entry.in_flight.take());
+            if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
+                self.release_guarded_attempt(pane, &mut attempt);
             }
         }
 
@@ -387,21 +397,27 @@ impl App {
         // is still in the box, and the Enter would submit it together with
         // the sentence. Read off the screen here, at the keystroke, never on
         // the tick.
+        // With the injection lock a one-row draft moves aside for the wake
+        // and comes back after it (#850); the guarded submit decides.
+        let stash = self.injection_lock_enabled();
         match agent.and_then(|agent| {
             crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text_and_unfaint().1)
         }) {
             Some(true) => {}
+            Some(false) if stash => {}
             Some(false) => return Decision::Suppressed("prompt_not_empty"),
             None => return Decision::Suppressed("no_prompt_box"),
         }
 
         let count = self.mailboxes.queued_len(pane);
         let text = idle_wake_text(count);
-        let attempt = match self.begin_guarded_submit(pane, &text, None, Duration::ZERO, now, true)
-        {
-            Ok(attempt) => attempt,
-            Err(reason) => return Decision::Suppressed(reason),
-        };
+        let attempt =
+            match self.begin_guarded_injection(pane, &text, None, Duration::ZERO, now, true, stash)
+            {
+                Ok(attempt) => attempt,
+                Err("input_not_empty") => return Decision::Suppressed("prompt_not_empty"),
+                Err(reason) => return Decision::Suppressed(reason),
+            };
 
         // The Enter is its own write, after the pane's reader has come back
         // round — the #362 lesson: text and a carriage return in one read are
@@ -451,7 +467,8 @@ impl App {
             self.advance_guarded_submit(pane, &mut attempt, now)
         };
         if let Some(ref outcome) = outcome {
-            self.finish_delivery_attempt(&mut attempt, outcome);
+            self.conclude_guarded_attempt(pane, &mut attempt, outcome);
+            self.surface_kept_drafts();
         }
         let enter_sent = before != (attempt.sent, attempt.retried);
         let next = now + Duration::from_millis(50);

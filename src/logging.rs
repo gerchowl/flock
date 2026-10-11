@@ -2464,6 +2464,30 @@ pub(crate) fn pane_focus_forward_failed(err: &str, event: &str) {
     );
 }
 
+/// An injection could not type an operator's draft back, so flock kept it
+/// in the pane's stash (#850). The draft itself is never logged.
+pub(crate) fn pane_draft_kept(pane: &str) {
+    tracing::warn!(
+        event = "pane.draft.kept",
+        subsystem = "pane",
+        outcome = "kept",
+        pane,
+        "kept an operator draft an injection could not restore"
+    );
+}
+
+/// Operator input held during an injection lease (#850) could not be written
+/// when the lease ended.
+pub(crate) fn pane_held_input_write_failed(err: &str) {
+    tracing::warn!(
+        event = "pane.injection_lease.flush",
+        subsystem = "pane",
+        outcome = "error",
+        err,
+        "failed to write operator input held during an injection"
+    );
+}
+
 // --- worktree family (logging redesign PR-6) -------------------------------
 // Every git-worktree lifecycle step the flock TUI drives — dialog open, add
 // start/complete/fail, remove start/complete/fail, merge-gate resolution,

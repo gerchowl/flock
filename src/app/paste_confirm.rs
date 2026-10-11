@@ -184,9 +184,28 @@ impl App {
             operator_input: runtime.last_operator_input_at(),
             deadline: Instant::now() + CONFIRM_WINDOW,
         };
+        // An injection holds the pane (#850): the paste waits behind it and
+        // the screen meanwhile shows flock's typing, so nothing observed now
+        // could be evidence about the paste.
+        let held = runtime.injection_lease_until().is_some();
         let encoded = super::api_helpers::encode_api_text(runtime, &text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(encoded)) {
             return encode_error(id, write_failed, err.to_string());
+        }
+        if held {
+            return encode_success(
+                id,
+                ResponseResult::Paste {
+                    outcome: "unconfirmed".into(),
+                    reason: "held_by_injection".into(),
+                    evidence: json!({
+                        "pane_id": paste.pane,
+                        "before_digest": digest(&paste.before),
+                        "after_digest": null,
+                        "level": null,
+                    }),
+                },
+            );
         }
         paste.operator_input = runtime.last_operator_input_at();
         self.pending_paste = Some(paste);

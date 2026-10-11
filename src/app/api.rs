@@ -1328,7 +1328,12 @@ impl App {
             self.pending_agent_submit.is_none(),
             "deferred agent submit must be consumed by respond_or_park before the next request"
         );
-        if let Some((_, pane, _)) = self.pending_agent_submit.take() {
+        if let Some((_, pane, mut attempt)) = self.pending_agent_submit.take() {
+            self.conclude_guarded_attempt(
+                &pane,
+                &mut attempt,
+                &super::guarded_submit::Outcome::Abandoned("request_dropped"),
+            );
             self.active_submissions.remove(&pane);
         }
         self.pending_recovery_park = None;
@@ -1509,6 +1514,12 @@ impl App {
                 return self.handle_pane_send_input(request.id, params)
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
+            Method::PaneStashShow(target) => {
+                return self.handle_pane_stash_show(request.id, target)
+            }
+            Method::PaneStashRestore(target) => {
+                return self.handle_pane_stash_restore(request.id, target)
+            }
             Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
             Method::PaneArmSelfCompact(params) => {
                 return self.handle_pane_arm_self_compact(request.id, params);
