@@ -1,7 +1,10 @@
 # ADR 0032 — An agent's starting context is compiled in five layers, most stable first, and the stable layers ride the harness's cached system prompt
 
-- Status: Proposed
-- Date: 2026-10-11
+- Status: Accepted
+- Date: 2026-10-11 (accepted 2026-10-12)
+- Scope of acceptance: the decisions in this record, with the four owner
+  decisions (§8) taken as recommended, as recorded by the operator on #1042.
+  Acceptance claims no code.
 - Issues: #1042 (the spike this records). Composes with #573 / ADR-0030 (goal
   supervision, G6 re-inject), ADR-0031 (goal state storage, PR #1068),
   ADR-0027 §4 (delegate table after compaction, #962), ADR-0028 (events,
@@ -126,7 +129,7 @@ order. A layer may be empty; it is never reordered.
 | # | Layer | Changes when | Authored or derived | Source of truth |
 | --- | --- | --- | --- | --- |
 | 1 | **Role**: the role skill (architect, builder, reviewer) and the working principles | a release, or an edit to the skill | authored | builder and reviewer packs ship in flk's release; the architect skill is read from its path and pinned by hash |
-| 2 | **Repo**: vision, ADR index, known traps; conventions the harness does not already load | a merge to `dev` | authored in the repo, compiled from `origin/dev` | `docs/adr/README.md`, a repo traps file (§8, owner question 3); `AGENTS.md` only when the harness does not load it itself |
+| 2 | **Repo**: vision, ADR index, known traps; conventions the harness does not already load | a merge to `dev` | authored in the repo, compiled from `origin/dev` | `docs/adr/README.md`, a repo traps file (§8, owner decision 3); `AGENTS.md` only when the harness does not load it itself |
 | 3 | **Goal and task**: the frozen goal, owner decisions and the wave structure (which work package holds what, not its progress) for an architect; the issue, the brief's task text and the issues and ADR sections it names for a builder | a decision, or a new task | authored | ADR-0030 goal record (G1, stored per ADR-0031), ADR-0023 decision records; `gh` for issue text |
 | 4 | **Snapshot**: wave progress (done counts, open tasks), in-flight delegates and their phase, open PRs and CI, landing queue, red/green, the last N events | any event, including a finished task | derived | the goal's subtask states, `delegate.list` (ADR-0027), `events.read` (ADR-0028), the PR poller's `pr.*` events |
 | 5 | **Next action**: one line | any event | derived (§6) | layers 3–4 |
@@ -300,16 +303,22 @@ The rule that fired is named in the manifest, so the line is checkable.
   issues). HANDOFF stops being a file the architect must rewrite before every
   compaction.
 
-### 8. Not decided here (owner questions)
+### 8. Owner decisions
 
-1. **Where layer 1 lives.** Recommended: flk bundles the builder and reviewer
-   packs, versioned with the release; the architect skill stays in the skills
-   repo and flk reads it by path and pins it by hash in the manifest.
-2. **`AGENTS.md` in layer 2.** Recommended: omit it for harnesses that load it
-   (Claude Code, Codex) and include it for those that do not.
-3. **Known traps.** Recommended: an authored repo file (for example
-   `docs/agents/traps.md`), reviewed through PRs like any doc, compiled into
-   layer 2. Today they live in briefs, the skill and private memory, and drift.
+Decided by the operator on 2026-10-12 (recorded on #1042): ADR-0032 is
+accepted, and each question below was decided as recommended.
+
+1. **Where layer 1 lives.** Decided: as recommended. Recommended: flk
+   bundles the builder and reviewer packs, versioned with the release; the
+   architect skill stays in the skills repo and flk reads it by path and pins
+   it by hash in the manifest.
+2. **`AGENTS.md` in layer 2.** Decided: as recommended. Recommended: omit it
+   for harnesses that load it (Claude Code, Codex) and include it for those
+   that do not.
+3. **Known traps.** Decided: as recommended. Recommended: an authored repo
+   file (for example `docs/agents/traps.md`), reviewed through PRs like any
+   doc, compiled into layer 2. Today they live in briefs, the skill and
+   private memory, and drift.
 
 ## Measurements: today vs compiled
 
@@ -469,8 +478,8 @@ What the numbers do and do not show:
 
 ## 9. Slices
 
-Each is sized at roughly 400 diff lines or less. Not filed; the architect
-files them after the owner accepts.
+Each is sized at roughly 400 diff lines or less. Not filed yet; the owner
+accepted on 2026-10-12, and the architect files them.
 
 | # | Slice | Depends on | Acceptance |
 | --- | --- | --- | --- |
