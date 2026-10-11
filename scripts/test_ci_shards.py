@@ -5,7 +5,6 @@ import unittest
 from pathlib import Path
 
 from scripts.ci_shards import (
-    UNIT,
     Config,
     Shard,
     check_assignment,
@@ -20,7 +19,12 @@ from scripts.ci_shards import (
 
 CONFIG = Config(
     legs={"linux": "all()", "mac": "not binary(c)"},
-    shards=(Shard("s1", ("a",)), Shard("s2", ("b", "c"))),
+    shards=(
+        Shard("u1", ("p",), serial=False),
+        Shard("u2", (), serial=False, rest=True),
+        Shard("s1", ("a",), serial=True),
+        Shard("s2", ("b", "c"), serial=True),
+    ),
 )
 
 
@@ -39,10 +43,10 @@ class Filters(unittest.TestCase):
     def test_a_shard_stays_inside_its_legs_base_filter(self):
         self.assertEqual(shard_filter(CONFIG, "mac", "s2"), "(not binary(c)) & (binary(b) | binary(c))")
 
-    def test_unit_is_the_complement_of_every_shard(self):
+    def test_the_rest_shard_is_the_complement_of_every_named_binary(self):
         self.assertEqual(
-            shard_filter(CONFIG, "linux", UNIT),
-            "(all()) & not (binary(a) | binary(b) | binary(c))",
+            shard_filter(CONFIG, "linux", "u2"),
+            "(all()) & not (binary(p) | binary(a) | binary(b) | binary(c))",
         )
 
     def test_an_unknown_leg_or_shard_fails_loudly(self):
@@ -58,14 +62,32 @@ class Assignment(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("d is in the serial-pty group", problems[0])
 
-    def test_a_sharded_binary_outside_the_group_is_reported(self):
+    def test_a_binary_outside_the_group_in_a_serial_shard_is_reported(self):
         problems = check_assignment(CONFIG, {"a", "b"})
         self.assertEqual(len(problems), 1)
-        self.assertIn("c is in shard s2", problems[0])
+        self.assertIn("c is in serial shard s2", problems[0])
+
+    def test_a_serial_binary_in_a_parallel_shard_is_reported(self):
+        problems = check_assignment(CONFIG, {"a", "b", "c", "p"})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("p is in the serial-pty group but in parallel shard u1", problems[0])
 
     def test_a_binary_in_two_shards_is_reported(self):
-        config = Config(CONFIG.legs, (Shard("s1", ("a",)), Shard("s2", ("a",))))
+        config = Config(
+            CONFIG.legs,
+            (Shard("s1", ("a",), serial=True), Shard("s2", ("a",), serial=True)),
+        )
         self.assertIn("a is in both s1 and s2", check_assignment(config, {"a"}))
+
+    def test_the_config_needs_exactly_one_rest_shard(self):
+        path = Path(tempfile.mkdtemp()) / "shards.toml"
+        path.write_text(
+            '[legs.l]\nfilter = "all()"\n'
+            '[[shards]]\nname = "s"\nserial = true\nbinaries = ["a"]\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            load_config(path)
 
 
 class Partition(unittest.TestCase):

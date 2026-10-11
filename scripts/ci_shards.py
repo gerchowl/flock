@@ -4,8 +4,8 @@
 The serial-pty group (`.config/nextest.toml`) runs one test at a time, so on a
 single runner it was a ~20-minute chain that every PR waited on. CI now builds
 the test binaries once per platform into a nextest archive and runs the group
-as several shard jobs, each still one-at-a-time on its own runner, plus one
-unit job for everything else. `.config/ci-shards.toml` says which binary goes
+as several shard jobs, each still one-at-a-time on its own runner, next to a
+few parallel shards for everything else. `.config/ci-shards.toml` says which binary goes
 where. This script is the only place that turns that file into filters.
 
 Subcommands:
@@ -40,9 +40,6 @@ ROOT = Path(__file__).resolve().parent.parent
 SHARDS_TOML = ROOT / ".config" / "ci-shards.toml"
 NEXTEST_TOML = ROOT / ".config" / "nextest.toml"
 
-# The job that runs everything no serial shard names. It is not listed in
-# ci-shards.toml because its filter is the complement of all the others.
-UNIT = "unit"
 SERIAL_GROUP = "serial-pty"
 
 
@@ -50,6 +47,8 @@ SERIAL_GROUP = "serial-pty"
 class Shard:
     name: str
     binaries: tuple[str, ...]
+    serial: bool
+    rest: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,14 +62,26 @@ class Config:
                 return shard
         return None
 
+    def named_binaries(self) -> list[str]:
+        return [b for s in self.shards for b in s.binaries]
+
 
 def load_config(path: Path = SHARDS_TOML) -> Config:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     legs = {name: leg["filter"] for name, leg in data["legs"].items()}
-    shards = tuple(Shard(s["name"], tuple(s["binaries"])) for s in data["shards"])
+    shards = tuple(
+        Shard(s["name"], tuple(s.get("binaries", ())), bool(s["serial"]), bool(s.get("rest", False)))
+        for s in data["shards"]
+    )
     names = [s.name for s in shards]
-    if UNIT in names or len(set(names)) != len(names):
-        raise SystemExit(f"ci-shards.toml: shard names must be unique and not {UNIT!r}: {names}")
+    if len(set(names)) != len(names):
+        raise SystemExit(f"ci-shards.toml: shard names must be unique: {names}")
+    rest = [s.name for s in shards if s.rest]
+    if len(rest) != 1:
+        raise SystemExit(f"ci-shards.toml: exactly one shard must say rest = true, found {rest}")
+    for shard in shards:
+        if shard.rest == bool(shard.binaries):
+            raise SystemExit(f"ci-shards.toml: {shard.name} needs either binaries or rest = true")
     return Config(legs, shards)
 
 
@@ -82,13 +93,12 @@ def shard_filter(config: Config, leg: str, shard_name: str) -> str:
     """The nextest filter for `shard_name` on `leg`, always within the leg's base set."""
     if leg not in config.legs:
         raise SystemExit(f"unknown leg {leg!r}; known: {sorted(config.legs)}")
-    base = config.legs[leg]
-    if shard_name == UNIT:
-        every = [b for s in config.shards for b in s.binaries]
-        return f"({base}) & not ({_binaries_expr(every)})"
     shard = config.shard(shard_name)
     if shard is None:
         raise SystemExit(f"unknown shard {shard_name!r}; known: {[s.name for s in config.shards]}")
+    base = config.legs[leg]
+    if shard.rest:
+        return f"({base}) & not ({_binaries_expr(config.named_binaries())})"
     return f"({base}) & ({_binaries_expr(shard.binaries)})"
 
 
@@ -103,7 +113,7 @@ def serial_group_binaries(nextest_toml: Path = NEXTEST_TOML) -> set[str]:
 
 
 def check_assignment(config: Config, serial: set[str]) -> list[str]:
-    """Problems with how ci-shards.toml covers the serial-pty group."""
+    """Problems with how ci-shards.toml places binaries relative to the serial-pty group."""
     problems = []
     seen: dict[str, str] = {}
     for shard in config.shards:
@@ -111,16 +121,24 @@ def check_assignment(config: Config, serial: set[str]) -> list[str]:
             if binary in seen:
                 problems.append(f"{binary} is in both {seen[binary]} and {shard.name}")
             seen[binary] = shard.name
+            if shard.serial and binary not in serial:
+                problems.append(
+                    f"{binary} is in serial shard {shard.name} but not in the {SERIAL_GROUP} "
+                    "group, so it would run in parallel there; keep the two files in step"
+                )
+            if not shard.serial and binary in serial:
+                problems.append(
+                    f"{binary} is in the {SERIAL_GROUP} group but in parallel shard {shard.name}; "
+                    "move it to a serial shard"
+                )
     for binary in sorted(serial - seen.keys()):
         problems.append(
-            f"{binary} is in the {SERIAL_GROUP} group but no shard runs it, so the unit job "
-            "would carry it serially; add it to a shard in .config/ci-shards.toml"
+            f"{binary} is in the {SERIAL_GROUP} group but no serial shard names it, so the rest "
+            "shard would carry it; add it to a serial shard in .config/ci-shards.toml"
         )
-    for binary in sorted(seen.keys() - serial):
-        problems.append(
-            f"{binary} is in shard {seen[binary]} but not in the {SERIAL_GROUP} group, "
-            "so its shard would run it in parallel; keep the two files in step"
-        )
+    for shard in config.shards:
+        if shard.rest and shard.serial:
+            problems.append(f"the rest shard {shard.name} cannot be serial")
     return problems
 
 
@@ -141,8 +159,8 @@ def check_partition(base: set[str], shards: dict[str, set[str]]) -> list[str]:
     return problems
 
 
-def nextest_list(archive: str, expr: str) -> set[str]:
-    """The tests nextest would run for `expr` from `archive`, as 'binary-id name'."""
+def nextest_list(archive: str, expr: str) -> dict:
+    """nextest's JSON listing of `expr` from `archive`."""
     out = subprocess.run(
         [
             "cargo", "nextest", "list",
@@ -155,7 +173,7 @@ def nextest_list(archive: str, expr: str) -> set[str]:
         stdout=subprocess.PIPE,
         cwd=ROOT,
     ).stdout
-    return matched_tests(json.loads(out))
+    return json.loads(out)
 
 
 def matched_tests(listing: dict) -> set[str]:
@@ -167,22 +185,22 @@ def matched_tests(listing: dict) -> set[str]:
     return tests
 
 
-def binary_of(test: str) -> str:
-    return test.split(" ", 1)[0].split("::", 1)[-1]
+def binary_names(listing: dict) -> set[str]:
+    return {suite["binary-name"] for suite in listing["rust-suites"].values()}
 
 
 def verify(config: Config, leg: str, archive: str) -> int:
     problems = check_assignment(config, serial_group_binaries())
-    all_binaries = {binary_of(t) for t in nextest_list(archive, "all()")}
-    for shard in config.shards:
-        for binary in shard.binaries:
-            if binary not in all_binaries:
-                problems.append(f"shard {shard.name} names {binary}, which is not a test binary")
+    known = binary_names(nextest_list(archive, "all()"))
+    for binary in config.named_binaries():
+        if binary not in known:
+            problems.append(f"{binary} is named in ci-shards.toml but is not a test binary")
 
-    base = nextest_list(archive, config.legs[leg])
-    selected = {UNIT: nextest_list(archive, shard_filter(config, leg, UNIT))}
-    for shard in config.shards:
-        selected[shard.name] = nextest_list(archive, shard_filter(config, leg, shard.name))
+    base = matched_tests(nextest_list(archive, config.legs[leg]))
+    selected = {
+        shard.name: matched_tests(nextest_list(archive, shard_filter(config, leg, shard.name)))
+        for shard in config.shards
+    }
     problems += check_partition(base, selected)
 
     for name, tests in selected.items():
@@ -196,7 +214,7 @@ def verify(config: Config, leg: str, archive: str) -> int:
     # A shard can be empty on one leg (macOS skips live_handoff), and nextest
     # fails a run that selects nothing, so only non-empty shards get a job.
     matrix = [
-        {"name": s.name, "binaries": ", ".join(s.binaries)}
+        {"name": s.name, "label": "rest" if s.rest else ", ".join(s.binaries)}
         for s in config.shards
         if selected[s.name]
     ]

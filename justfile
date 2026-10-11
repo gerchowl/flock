@@ -63,7 +63,7 @@ ci-archive leg archive:
     cargo nextest archive --locked --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
-# Run one CI shard (`unit` or a name from .config/ci-shards.toml) from an
+# Run one CI shard, named in .config/ci-shards.toml, from an
 # archive made by `ci-archive`. It is extracted into this checkout's target/
 # because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
 # time, so the binary must sit where the build put it. JUnit lands in

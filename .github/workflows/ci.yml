@@ -50,8 +50,8 @@ jobs:
       # job still reports success so it can stay a required context, which the
       # queue needs in order to gate on it.
 
-  # One platform each, split into a build job, a unit job and the serial-pty
-  # shards (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
+  # One platform each, split into lint, build and parallel test-shard jobs
+  # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
   # result can be judged alone in the check jobs below.
   ubuntu:
     name: ubuntu-latest
