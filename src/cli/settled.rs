@@ -247,13 +247,13 @@ impl SettledOutcome {
     /// below is the mapping those verbs had before the split.
     fn exit_code(&self) -> i32 {
         match self {
-            Self::Stalled { .. } => 7,
+            Self::Stalled { .. } => crate::cli::exit::STALLED,
             Self::Settled { .. } => exit::SETTLED,
             Self::Blocked { .. } => exit::BLOCKED,
             Self::Gone { .. } => exit::GONE,
-            Self::Refused(_) => 2,
+            Self::Refused(_) => crate::cli::exit::USAGE,
             Self::TimedOut => exit::TIMEOUT,
-            Self::ServerRefused(_) | Self::Error(_) => 1,
+            Self::ServerRefused(_) | Self::Error(_) => crate::cli::exit::FAILURE,
         }
     }
 }

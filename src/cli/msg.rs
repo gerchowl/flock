@@ -644,7 +644,7 @@ fn status_exit(state: Option<&str>) -> i32 {
             | "collect_failed"
             | "undeliverable",
         ) => EXIT_NO_ANSWER,
-        _ => 0,
+        _ => super::exit::SUCCESS,
     }
 }
 

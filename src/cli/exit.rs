@@ -67,15 +67,18 @@ exits! {
     FAILURE = 1, Maybe, "unclassified failure (transport, internal, refused before acting)";
     CONFIG_CHECK_ADVISORY = 1, Never, "config check: loaded with warnings";
     USAGE = 2, Never, "usage error";
+    WORKTREE_NOT_LINKED = 2, Never, "worktree kill / delegate reap: not a linked worktree, or no such workspace";
     CONFIG_CHECK_PARSE_FAILURE = 2, Never, "config check: the config did not load";
     NO_ANSWER = 3, AfterInspecting, "msg / wait reply: no answer is coming (deferred, expired, gone)";
     WAIT_BLOCKED = 3, AfterHuman, "agent wait / wait agent-status: the agent is blocked on a dialog";
     NOT_SHOWN = 3, Later, "notification show: recorded but not shown";
+    WORKTREE_GATE_WOULD_FAIL = 3, Later, "worktree kill --dry-run: the merge gate would not pass";
     GONE = 4, Never, "target not found or gone";
     MSG_REFUSED = 4, Never, "msg: the receiver refused the message";
+    WORKTREE_NEEDS_FORCE = 4, AfterInspecting, "worktree kill / delegate reap: dirty or has submodules, --force clears it";
     NO_SENTINEL = 5, AfterInspecting, "delegate wait: finished without the expected result";
     AGENT_BLOCKED = 6, AfterHuman, "delegate wait: the agent needs a human";
-    STALLED = 7, AfterInspecting, "delegate wait: working, no progress past the stall window";
+    STALLED = 7, AfterInspecting, "waits, delegate wait: working, no progress past the stall window";
     UNCONFIRMED = 8, AfterInspecting, "send: effect uncertain, text may be in the composer";
     DELEGATE_NOT_STARTED = 8, AfterInspecting, "delegate start / wait: the delegate did not start";
     ABANDONED = 9, Yes, "send: effect abandoned, composer restored";
@@ -116,12 +119,15 @@ pub(crate) mod tests {
             "1 FAILURE maybe",
             "1 CONFIG_CHECK_ADVISORY never",
             "2 USAGE never",
+            "2 WORKTREE_NOT_LINKED never",
             "2 CONFIG_CHECK_PARSE_FAILURE never",
             "3 NO_ANSWER after_inspecting",
             "3 WAIT_BLOCKED after_human",
             "3 NOT_SHOWN later",
+            "3 WORKTREE_GATE_WOULD_FAIL later",
             "4 GONE never",
             "4 MSG_REFUSED never",
+            "4 WORKTREE_NEEDS_FORCE after_inspecting",
             "5 NO_SENTINEL after_inspecting",
             "6 AGENT_BLOCKED after_human",
             "7 STALLED after_inspecting",
@@ -171,41 +177,87 @@ pub(crate) mod tests {
         out
     }
 
-    /// Bare `Ok(<n>)` returns in the CLI that predate the registry. They all
-    /// carry registered values. The count may only go down: lower it when you
-    /// replace one with a named code, and never raise it.
-    const GRANDFATHERED_BARE_CLI_RETURNS: usize = 445;
+    /// Bare `Ok(<n>)` returns in the CLI that predate the registry, per file.
+    /// They all carry registered values. A count may only go down: lower it
+    /// when you replace one with a named code, and never raise it. A file
+    /// missing from this list may hold none.
+    const GRANDFATHERED_BARE_CLI_RETURNS: &[(&str, usize)] = &[
+        ("src/cli.rs", 72),
+        ("src/cli/agent.rs", 63),
+        ("src/cli/checks.rs", 8),
+        ("src/cli/delegate.rs", 5),
+        ("src/cli/digest.rs", 6),
+        ("src/cli/fleet.rs", 7),
+        ("src/cli/hook.rs", 7),
+        ("src/cli/integration.rs", 22),
+        ("src/cli/issue.rs", 16),
+        ("src/cli/lineage.rs", 4),
+        ("src/cli/mcp.rs", 3),
+        ("src/cli/msg.rs", 28),
+        ("src/cli/notification.rs", 12),
+        ("src/cli/pane.rs", 74),
+        ("src/cli/peers.rs", 16),
+        ("src/cli/preflight.rs", 1),
+        ("src/cli/ready.rs", 1),
+        ("src/cli/report.rs", 14),
+        ("src/cli/revert.rs", 4),
+        ("src/cli/server.rs", 6),
+        ("src/cli/status.rs", 7),
+        ("src/cli/tab.rs", 16),
+        ("src/cli/workspace.rs", 14),
+        ("src/cli/worktree.rs", 39),
+    ];
 
     #[test]
     fn no_bare_or_unregistered_exit_literal_in_src() {
         let exit_call = regex::Regex::new(r"process::exit\(\s*(\d+)\s*\)").unwrap();
         let cli_return = regex::Regex::new(r"\bOk\((\d+)\)").unwrap();
+        // A literal as a match arm's value, or as both branches of an `if`.
+        // In the CLI those are exit codes, and none is grandfathered.
+        let cli_arm = regex::Regex::new(r"=>\s*(\d+)\s*,").unwrap();
+        let cli_if_else = regex::Regex::new(r"\{\s*(\d+)\s*\}\s*else\s*\{\s*(\d+)\s*\}").unwrap();
+        let root = format!("{}/", env!("CARGO_MANIFEST_DIR"));
         let mut offences = Vec::new();
-        let mut bare_cli_returns = 0;
+        let mut bare_cli_returns = Vec::new();
         for (path, text) in production_sources() {
+            let path = path.strip_prefix(&root).unwrap_or(&path).to_string();
             for m in exit_call.captures_iter(&text) {
                 offences.push(format!("{path}: process::exit({})", &m[1]));
             }
-            let is_cli = path.contains("/src/cli/") || path.ends_with("/src/cli.rs");
-            if !is_cli {
+            if !(path.starts_with("src/cli/") || path == "src/cli.rs") {
                 continue;
             }
+            for m in cli_arm.captures_iter(&text) {
+                offences.push(format!("{path}: match arm => {}", &m[1]));
+            }
+            for m in cli_if_else.captures_iter(&text) {
+                offences.push(format!("{path}: {{ {} }} else {{ {} }}", &m[1], &m[2]));
+            }
+            let mut count = 0;
             for m in cli_return.captures_iter(&text) {
-                bare_cli_returns += 1;
+                count += 1;
                 let code: i32 = m[1].parse().unwrap();
                 if !ALL.iter().any(|e| e.code == code) {
                     offences.push(format!("{path}: Ok({code}) is not a registered exit code"));
                 }
+            }
+            if count > 0 {
+                bare_cli_returns.push((path, count));
             }
         }
         assert!(
             offences.is_empty(),
             "use a cli::exit constant: {offences:#?}"
         );
+        bare_cli_returns.sort();
+        let expected: Vec<(String, usize)> = GRANDFATHERED_BARE_CLI_RETURNS
+            .iter()
+            .map(|(path, count)| (path.to_string(), *count))
+            .collect();
         assert_eq!(
-            bare_cli_returns, GRANDFATHERED_BARE_CLI_RETURNS,
-            "bare Ok(<n>) exit returns in src/cli changed: use a cli::exit constant, \
-             and lower the grandfathered count when you remove one"
+            bare_cli_returns, expected,
+            "bare Ok(<n>) exit returns per file in src/cli changed: use a cli::exit \
+             constant, and lower the grandfathered count when you remove one"
         );
     }
 }
