@@ -280,6 +280,7 @@ impl App {
         // never had it to allow through in the first place.
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
 
+        self.pretrust_claude_worktree(&argv, &cwd, &spawn_env);
         let (rows, cols) = self.state.estimate_pane_size();
         let spawned = self.spawn_agent_workspace(cwd, rows, cols, &argv, params.focus);
         let (ws_idx, pane_id) = match spawned {

@@ -446,6 +446,7 @@ impl App {
         // must disarm the id, or the next unrelated pane inherits it and
         // `flk revert-run` would revert that pane's work (US-8).
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
+        self.pretrust_claude_worktree(&plan.argv, &checkout_path, &spawn_env);
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
         let (ws_idx, spawned_pane) = match self.spawn_agent_workspace(
             checkout_path.clone(),
