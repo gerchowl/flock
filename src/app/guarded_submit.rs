@@ -416,6 +416,20 @@ impl App {
         if attempt.sent && started {
             return Some(Outcome::ObservedAccepted);
         }
+        // The screen can prove the turn before the cursor moves: the sent text
+        // echoed with the running turn under it, even past a provider notice
+        // that leaves no owned composer to retry into (#870).
+        if attempt.sent
+            && terminal.effective_known_agent().is_some_and(|agent| {
+                crate::detect::live_turn_follows_submitted(
+                    agent,
+                    &runtime.detection_text(),
+                    &reported_text,
+                )
+            })
+        {
+            return Some(Outcome::ObservedAccepted);
+        }
         if now < attempt.due {
             return None;
         }

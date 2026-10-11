@@ -49,6 +49,32 @@ pub(super) fn has_visible_working(content: &str) -> bool {
         || (!has_codex_current_prompt(content) && has_codex_visible_working_without_prompt(content))
 }
 
+/// The running turn just above the live composer follows `text`, echoed as
+/// the last prompt (#870). Notices Codex prints in between, like the weekly
+/// limit warning, are not prompts and do not break the chain.
+pub(in crate::detect) fn live_turn_follows_echo(content: &str, text: &str) -> bool {
+    let Some((lines, prompt)) = codex_current_prompt_region(content) else {
+        return false;
+    };
+    let Some(working) = lines[..prompt]
+        .iter()
+        .rposition(|line| codex_block_marker_line(line))
+    else {
+        return false;
+    };
+    // Queued input waits behind another turn, so it is not this prompt's turn.
+    if !codex_live_working_line(lines[working]) || codex_queued_input_header_line(lines[working]) {
+        return false;
+    }
+    let Some(echo) = lines[..working]
+        .iter()
+        .rposition(|line| codex_prompt_line(line))
+    else {
+        return false;
+    };
+    super::super::echo_matches(&lines, echo, working, &['›'], text)
+}
+
 fn has_codex_slow_model_notice(content: &str) -> bool {
     // Recent-buffer wrapping can split words. Ignore whitespace and the moving
     // selection marker, but require the menu controls and notice at the live tail.
@@ -323,6 +349,51 @@ mod tests {
     use super::*;
 
     const FOLDER_TRUST: &str = include_str!("../../../tests/fixtures/codex/folder-trust.txt");
+
+    const WEEKLY_NOTICE: &str =
+        include_str!("../../../tests/fixtures/codex/working-after-weekly-notice.txt");
+    const BRIEF_870: &str = "Read /fixture/codex-870/briefs/63.md and execute it exactly.";
+
+    #[test]
+    fn a_running_turn_past_the_weekly_notice_follows_its_echoed_prompt() {
+        assert!(live_turn_follows_echo(WEEKLY_NOTICE, BRIEF_870));
+        // Wrapping is not part of the prompt.
+        assert!(live_turn_follows_echo(
+            include_str!("../../../tests/fixtures/codex-submit-721/inline-working.txt"),
+            "Reply exactly INLINE_CAPTURE_721. Do not use tools."
+        ));
+    }
+
+    #[test]
+    fn a_running_turn_confirms_only_the_prompt_echoed_above_it() {
+        for text in [
+            "Read /fixture/codex-870/briefs/64.md and execute it exactly.",
+            // A prefix or an extension of the echo is a different prompt.
+            "Read /fixture/codex-870/briefs/63.md",
+            "Read /fixture/codex-870/briefs/63.md and execute it exactly. Then stop.",
+            "",
+        ] {
+            assert!(!live_turn_follows_echo(WEEKLY_NOTICE, text), "{text:?}");
+        }
+        // An older echo with a finished turn under it, or with a Working row
+        // in scrollback above it, is not a live turn of this prompt.
+        let finished = WEEKLY_NOTICE.replace("• Working (6s • esc to interrupt)", "• Done.");
+        assert!(!live_turn_follows_echo(&finished, BRIEF_870));
+        let scrollback = format!(
+            "{}\n› {BRIEF_870}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol default · /fixture/codex-870/…\n",
+            "• Working (6s • esc to interrupt)"
+        );
+        assert!(!live_turn_follows_echo(&scrollback, BRIEF_870));
+        // A later prompt between the echo and the turn owns that turn.
+        let later = WEEKLY_NOTICE.replace("⚠ Heads up", "› something else\n⚠ Heads up");
+        assert!(!live_turn_follows_echo(&later, BRIEF_870));
+        // Input queued behind another turn has not started.
+        let queued = WEEKLY_NOTICE.replace(
+            "• Working (6s • esc to interrupt)",
+            "• Queued follow-up inputs",
+        );
+        assert!(!live_turn_follows_echo(&queued, BRIEF_870));
+    }
 
     #[test]
     fn folder_trust_dialog_is_blocked_only_at_the_live_tail() {

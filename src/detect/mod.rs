@@ -394,6 +394,54 @@ pub fn codex_waiting_on_folder_trust(screen_content: &str) -> bool {
     agents::codex::has_codex_folder_trust(&screen_content.to_lowercase())
 }
 
+/// Whether `screen` shows a live turn that follows `text`, echoed as the last
+/// prompt submitted above it (#870).
+///
+/// A guarded submit's own confirmation: the agent's history shows what was
+/// sent and its running-turn chrome sits below that, so the turn is ours even
+/// when the turn cursor has not moved yet and a provider notice (the weekly
+/// limit warning, an update notice) was printed between the echo and the
+/// composer. A Working row with a different or no echo above it proves nothing.
+pub(crate) fn live_turn_follows_submitted(agent: Agent, screen: &str, text: &str) -> bool {
+    match agent {
+        Agent::Codex => agents::codex::live_turn_follows_echo(screen, text),
+        Agent::Claude => agents::claude_code::live_turn_follows_echo(screen, text),
+        _ => false,
+    }
+}
+
+/// Whether the prompt echoed at `lines[echo]` behind one of `markers` is
+/// exactly `text`, compared without whitespace so terminal wrapping does not
+/// matter. The echo must end at a row boundary before `end`, so a longer
+/// prompt that merely starts with `text` does not match.
+fn echo_matches(lines: &[&str], echo: usize, end: usize, markers: &[char], text: &str) -> bool {
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let target = compact(text);
+    let Some(first) = lines[echo].trim_start().strip_prefix(markers) else {
+        return false;
+    };
+    let mut echoed = compact(first);
+    let mut next = echo + 1;
+    while !target.is_empty() && target.starts_with(&echoed) {
+        if echoed == target {
+            // A continuation row is indented, so anything else starts a new block.
+            return next == end
+                || lines[next].trim().is_empty()
+                || !lines[next].starts_with(char::is_whitespace);
+        }
+        if next >= end {
+            return false;
+        }
+        echoed.push_str(&compact(lines[next]));
+        next += 1;
+    }
+    false
+}
+
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
     agent.is_some_and(|agent| agents::should_skip_state_update(agent, screen_content))
 }
