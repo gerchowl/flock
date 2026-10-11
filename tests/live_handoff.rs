@@ -2176,3 +2176,139 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
     drop(listener);
     cleanup_test_base(&base);
 }
+
+/// More panes than one SCM_RIGHTS batch carries, with a remainder, so the
+/// handoff needs three batches (64, 64, 22) (#471).
+const MANY_PANES: usize = 150;
+
+/// Open [`MANY_PANES`] panes, one workspace each, and return their ids in
+/// creation order.
+fn create_many_panes(api_socket: &Path) -> Vec<String> {
+    (0..MANY_PANES)
+        .map(|idx| {
+            let created = request(
+                api_socket,
+                serde_json::json!({
+                    "id": format!("test:workspace:create-{idx}"),
+                    "method": "workspace.create",
+                    "params": {"cwd": "/tmp", "focus": false}
+                }),
+            );
+            created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("workspace {idx} has no root pane: {created}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Prove a pane's pty is still wired to the server: the shell must evaluate
+/// arithmetic, so the needle never appears in the typed text itself.
+fn assert_pane_answers(api_socket: &Path, pane_id: &str, tag: usize) {
+    assert_ok(request(
+        api_socket,
+        serde_json::json!({
+            "id": format!("test:pane:answer-{tag}"),
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("echo $(({tag}+1000))ok"), "keys": ["Enter"]}
+        }),
+    ));
+    wait_for_output(api_socket, pane_id, &format!("{}ok", tag + 1000));
+}
+
+#[test]
+fn live_handoff_carries_more_panes_than_one_fd_batch() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    let panes = create_many_panes(&api_socket);
+    wait_for_server_ptmx_fd_count(server_pid, MANY_PANES, Duration::from_secs(30));
+
+    let handoff = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    );
+    assert_ok(handoff);
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(30));
+    wait_for_server_ptmx_fd_count(replacement_pid, MANY_PANES, Duration::from_secs(30));
+
+    // First, both batch boundaries, and last: each sits in a different batch.
+    for idx in [0, 63, 64, 127, 128, MANY_PANES - 1] {
+        assert_pane_answers(&api_socket, &panes[idx], idx);
+    }
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+
+    // The importer takes the first batch, then refuses: the transfer is cut
+    // with 64 of 150 descriptors already in the new process.
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("FLOCK_TEST_HANDOFF_IMPORT_FAIL", "mid_fds")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    let panes = create_many_panes(&api_socket);
+    wait_for_server_ptmx_fd_count(server_pid, MANY_PANES, Duration::from_secs(30));
+
+    let failed = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
+    );
+    let message = failed["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("test handoff import failure after 64 of 150 fds"),
+        "{failed}"
+    );
+
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(
+        unsafe { libc::kill(server_pid as libc::pid_t, 0) },
+        0,
+        "the old server must survive a refused handoff"
+    );
+    wait_for_server_ptmx_fd_count(server_pid, MANY_PANES, Duration::from_secs(10));
+    for idx in [0, 63, 64, MANY_PANES - 1] {
+        assert_pane_answers(&api_socket, &panes[idx], idx);
+    }
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
