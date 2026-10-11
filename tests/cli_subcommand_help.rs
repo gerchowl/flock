@@ -182,7 +182,8 @@ fn the_stand_in_really_allocates() {
         stderr_of(&output)
     );
 
-    assert_eq!(env.server.requests(), 1, "the server was asked");
+    // The protocol check (#868), then the create.
+    assert_eq!(env.server.requests(), 2, "the server was asked");
     assert_eq!(
         env.repo.worktrees().len(),
         2,
@@ -275,9 +276,16 @@ impl StandInServer {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let response = if line.contains("worktree.create") {
                     allocate_worktree(&repo);
-                    r#"{"id":"stand-in","result":{"type":"worktree_created"}}"#
+                    r#"{"id":"stand-in","result":{"type":"worktree_created"}}"#.to_owned()
+                } else if line.contains(r#""method":"ping""#) {
+                    // A state-changing verb checks the server protocol first (#868).
+                    format!(
+                        r#"{{"id":"stand-in","result":{{"type":"pong","version":"stand-in","protocol":{}}}}}"#,
+                        support::PROTOCOL_VERSION
+                    )
                 } else {
                     r#"{"id":"stand-in","error":{"code":"not_implemented","message":"stand-in"}}"#
+                        .to_owned()
                 };
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.write_all(b"\n");

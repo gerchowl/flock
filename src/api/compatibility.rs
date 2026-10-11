@@ -10,8 +10,6 @@ use super::schema::{Method, PingParams, Request};
 
 pub const EXIT_CODE: i32 = 78;
 pub const ERROR_CODE: &str = "server_version_gap";
-// pane.submit shipped with durable submission evidence in protocol 27.
-pub const SUBMIT_PROTOCOL: u32 = 27;
 
 #[derive(Clone)]
 pub struct ServerVersion {
@@ -20,10 +18,13 @@ pub struct ServerVersion {
 }
 
 impl ServerVersion {
-    pub fn message(&self, required: u32) -> String {
+    pub fn message(&self) -> String {
         format!(
-            "server is flk {} (protocol {}); this command needs protocol {required}. Hand off with 'flk server live-handoff' or restart the server",
-            self.version, self.protocol,
+            "server flk {} (protocol {}) is incompatible with client flk {} (protocol {}); hand it off with 'flk server live-handoff' or restart the server",
+            self.version,
+            self.protocol,
+            crate::build_info::version(),
+            crate::protocol::PROTOCOL_VERSION,
         )
     }
 }
@@ -33,6 +34,8 @@ struct Invocation {
     target: Option<PathBuf>,
     server: Option<ServerVersion>,
     probed: bool,
+    // Refuse state-changing requests to an older server (#868).
+    gate: bool,
     warn: Option<fn(&ServerVersion)>,
     failure: Option<String>,
 }
@@ -43,10 +46,11 @@ thread_local! {
     static INVOCATION: RefCell<Invocation> = RefCell::new(Invocation::default());
 }
 
-pub fn begin_cli(client: &ApiClient, warn: fn(&ServerVersion)) {
+pub fn begin_cli(client: &ApiClient, gate: bool, warn: fn(&ServerVersion)) {
     INVOCATION.with_borrow_mut(|state| {
         *state = Invocation {
             target: Some(client.socket_path()),
+            gate,
             warn: Some(warn),
             ..Default::default()
         };
@@ -127,13 +131,49 @@ pub fn normalize(client: &ApiClient, response: &mut Value) {
     }
     response["error"] = serde_json::json!({
         "code": ERROR_CODE,
-        "message": server.message(crate::protocol::PROTOCOL_VERSION),
+        "message": server.message(),
     });
+    record_failure(&path, &server);
+}
+
+fn record_failure(path: &Path, server: &ServerVersion) {
     INVOCATION.with_borrow_mut(|state| {
-        if state.target.as_deref() == Some(&path) {
-            state.failure = response["error"]["message"].as_str().map(str::to_owned);
+        if state.target.as_deref() == Some(path) {
+            state.failure = Some(server.message());
         }
     });
+}
+
+/// The refusal a CLI answers itself with instead of sending `request` to a
+/// server older than the client (#868).
+///
+/// An older server takes the first steps of `flk delegate start` (a worktree,
+/// a workspace, an agent) and then rejects a later method it has never heard
+/// of, so the skew surfaced as a raw serde error over a half-started delegate.
+/// Every state-changing request now checks first, through the one probe this
+/// invocation caches, so the whole command costs a single extra round trip
+/// and the refusal lands before anything is allocated. Only a CLI invocation
+/// that asked for the gate is checked: `flk server` and `flk status` must keep
+/// reaching an older server, since handing it off is the fix, and a server
+/// whose version cannot be read is let through to fail as it would have.
+pub fn refuse_skew(client: &ApiClient, request: &Request) -> Option<Value> {
+    if !request.method.needs_current_protocol() {
+        return None;
+    }
+    let path = client.socket_path();
+    let gated = INVOCATION.with_borrow(|state| state.gate && state.target.as_ref() == Some(&path));
+    if !gated {
+        return None;
+    }
+    let server = server_version(client)?;
+    if server.protocol >= crate::protocol::PROTOCOL_VERSION {
+        return None;
+    }
+    record_failure(&path, &server);
+    Some(serde_json::json!({
+        "id": request.id,
+        "error": {"code": ERROR_CODE, "message": server.message()},
+    }))
 }
 
 pub fn server_version(client: &ApiClient) -> Option<ServerVersion> {
@@ -149,9 +189,4 @@ pub fn server_version(client: &ApiClient) -> Option<ServerVersion> {
         }
     });
     server
-}
-
-pub fn require_submit(client: &ApiClient) -> Option<String> {
-    let server = server_version(client)?;
-    (server.protocol < SUBMIT_PROTOCOL).then(|| server.message(SUBMIT_PROTOCOL))
 }

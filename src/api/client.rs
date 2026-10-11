@@ -63,6 +63,9 @@ impl ApiClient {
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, None)?;
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
+            return Ok(refusal);
+        }
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
 
@@ -82,6 +85,9 @@ impl ApiClient {
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
+            return Ok(refusal);
+        }
         self.exchange_with_timeout(request, timeout)
             .map_err(Attempt::into_error)
     }
@@ -107,6 +113,9 @@ impl ApiClient {
         deadline: Option<Instant>,
     ) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
+            return Ok(refusal);
+        }
         let mut backoff = TRANSIENT_BACKOFF;
         let mut retries = 0;
         loop {

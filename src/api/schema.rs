@@ -296,6 +296,116 @@ impl Method {
                 | Self::FleetStatus(_)
         ) || self.is_allocation_preview()
     }
+
+    /// Must a CLI refuse to send this to a server older than itself (#868)?
+    ///
+    /// True for every request that changes session state: sent to an older
+    /// server it can allocate a workspace or start an agent and then fail at
+    /// a later step the server does not understand, leaving the work half
+    /// done. Reads, waits, previews and hook reports stay false so a skewed
+    /// client can still look around, and the server's own lifecycle stays
+    /// false because `flk server live-handoff` is how the skew is fixed.
+    /// Exhaustive on purpose, so every new method has to take a side.
+    pub(crate) fn needs_current_protocol(&self) -> bool {
+        if self.is_allocation_preview() {
+            return false;
+        }
+        match self {
+            Self::Ping(_)
+            | Self::ServerStop(_)
+            | Self::ServerLiveHandoff(_)
+            | Self::ServerReloadConfig(_)
+            | Self::NotificationList(_)
+            | Self::HandoffList(_)
+            | Self::HandoffRead(_)
+            | Self::WorkspaceList(_)
+            | Self::WorkspaceGet(_)
+            | Self::WorktreeList(_)
+            | Self::TabList(_)
+            | Self::TabGet(_)
+            | Self::PeersSummary(_)
+            | Self::PeersHubFleet(_)
+            | Self::PeersEnrollment(_)
+            | Self::AgentList(_)
+            | Self::AgentGet(_)
+            | Self::AgentRead(_)
+            | Self::AgentHistory(_)
+            | Self::AgentResult(_)
+            | Self::AgentLineage(_)
+            | Self::MsgList(_)
+            | Self::MsgRead(_)
+            | Self::MsgStatus(_)
+            | Self::MsgWaitReply(_)
+            | Self::MeshHello(_)
+            | Self::MeshRoutes { .. }
+            | Self::MeshDeliver(_)
+            | Self::MeshCollect(_)
+            | Self::PaneList(_)
+            | Self::PaneGet(_)
+            | Self::PaneRead(_)
+            | Self::PaneReportAgent(_)
+            | Self::PaneReportAgentSession(_)
+            | Self::PaneReportPrompt(_)
+            | Self::PaneReportRecap(_)
+            | Self::PaneReportReply(_)
+            | Self::PaneReportMetadata(_)
+            | Self::EventsSubscribe(_)
+            | Self::EventsWait(_)
+            | Self::PaneWaitForOutput(_)
+            | Self::ChecksList(_)
+            | Self::DigestRender(_)
+            | Self::FleetStatus(_) => false,
+            Self::NotificationShow(_)
+            | Self::NotificationAck(_)
+            | Self::WorkspaceCreate(_)
+            | Self::WorkspaceFocus(_)
+            | Self::WorkspaceRename(_)
+            | Self::WorkspaceClose(_)
+            | Self::WorktreeCreate(_)
+            | Self::WorktreeOpen(_)
+            | Self::WorktreeRemove(_)
+            | Self::WorktreeKill(_)
+            | Self::TabCreate(_)
+            | Self::TabFocus(_)
+            | Self::TabRename(_)
+            | Self::TabClose(_)
+            | Self::PeersCheckoutPrepare(_)
+            | Self::PeersEnrollReset(_)
+            | Self::AgentSend(_)
+            | Self::AgentSpawn(_)
+            | Self::AgentRename(_)
+            | Self::AgentFocus(_)
+            | Self::AgentStart(_)
+            | Self::AgentFork(_)
+            | Self::AgentHibernate(_)
+            | Self::AgentResume(_)
+            | Self::AgentRestart(_)
+            | Self::MsgSend(_)
+            | Self::MsgReply(_)
+            | Self::MsgWake(_)
+            | Self::MsgMute(_)
+            | Self::PaneSplit(_)
+            | Self::PaneMove(_)
+            | Self::PaneRename(_)
+            | Self::PaneSendText(_)
+            | Self::PaneSendKeys(_)
+            | Self::PaneSendInput(_)
+            | Self::PaneSubmit(_)
+            | Self::PaneArmSelfCompact(_)
+            | Self::PaneSetHeaderField(_)
+            | Self::PaneClearHeaderField(_)
+            | Self::PaneClearAgentAuthority(_)
+            | Self::PaneReleaseAgent(_)
+            | Self::PaneClose(_)
+            | Self::IntegrationInstall(_)
+            | Self::IntegrationUninstall(_)
+            | Self::ChecksAck(_)
+            | Self::ChecksRun(_)
+            | Self::FleetPause(_)
+            | Self::FleetResume(_)
+            | Self::RevertRun(_) => true,
+        }
+    }
 }
 
 /// `revert.run` params.

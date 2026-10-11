@@ -106,7 +106,10 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     // MCP stays alive across server upgrades and diagnoses each failed call.
     let cli_probe = command != "mcp";
     if cli_probe {
-        crate::api::compatibility::begin_cli(&ApiClient::local(), |server| {
+        // `flk server` and `flk status` are how an older server is found and
+        // handed off, and hooks report into whichever server is running.
+        let gate = !matches!(command, "server" | "status" | "hook");
+        crate::api::compatibility::begin_cli(&ApiClient::local(), gate, |server| {
             eprintln!(
                 "warning: server is flk {} (protocol {}); client protocol {} is incompatible",
                 server.version,
