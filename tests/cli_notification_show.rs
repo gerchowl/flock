@@ -32,15 +32,25 @@ fn show_response(response: serde_json::Value, expected_exit: i32) {
     let listener = UnixListener::bind(&socket.0).expect("bind isolated socket");
     let reply = response.clone();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("CLI connects");
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let (mut stream, request) = loop {
+            let (mut stream, _) = listener.accept().expect("CLI connects");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if request["method"] != "ping" {
+                break (stream, request);
+            }
+            // A state-changing verb checks the server protocol first (#868).
+            let pong = serde_json::json!({"id":request["id"],"result":{
+                "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION
+            }});
+            writeln!(stream, "{pong}").unwrap();
+        };
         assert_eq!(request["method"], "notification.show");
         assert_eq!(request["params"]["title"], "owner needed");
         writeln!(stream, "{reply}").unwrap();
