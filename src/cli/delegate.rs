@@ -2633,12 +2633,6 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     if let Err(reason) = validate_worktree_flags(&flags) {
         return Ok(usage(reason));
     }
-    if mode == Mode::Worktree {
-        let cwd = std::env::current_dir().ok();
-        if let Err(reason) = resolve_linked_repo(name, &mut flags, cwd.as_deref()) {
-            return Ok(usage(reason));
-        }
-    }
     let harness = match validate_harness(flags.harness.as_deref()) {
         Ok(harness) => harness,
         Err(reason) => return Ok(usage(reason)),
@@ -2699,6 +2693,13 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         }
     }
 
+    // Last before the create, so a start refused above never prints the swap.
+    if mode == Mode::Worktree {
+        let cwd = std::env::current_dir().ok();
+        if let Err(reason) = resolve_linked_repo(name, &mut flags, cwd.as_deref()) {
+            return Ok(usage(reason));
+        }
+    }
     let placement = match place(name, &flags, mode) {
         Ok(placement) => placement,
         Err(code) => return Ok(code),

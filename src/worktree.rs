@@ -885,9 +885,9 @@ pub(crate) struct LinkedSource {
 /// belongs to (#925).
 ///
 /// `Ok(None)` for a main checkout and for anything git does not recognise:
-/// the server already names those (`not_git_worktree`). A linked worktree of
-/// a bare repository has no main checkout to start from, which is an `Err`
-/// naming the fix.
+/// the server already names those (`not_git_worktree`). A linked worktree
+/// with no main checkout to start from (a bare repository's, or one whose git
+/// dir lives elsewhere) is an `Err` naming the fix.
 pub(crate) fn linked_worktree_source(path: &Path) -> Result<Option<LinkedSource>, String> {
     let root = path.display().to_string();
     let git = |args: &[&str]| {
@@ -911,16 +911,23 @@ pub(crate) fn linked_worktree_source(path: &Path) -> Result<Option<LinkedSource>
     if canonical(&git_dir) == canonical(&common_dir) {
         return Ok(None);
     }
+    let bare = is_bare(&common_dir);
     let main_checkout = match (common_dir.file_name(), common_dir.parent()) {
-        (Some(name), Some(parent)) if name == ".git" && !is_bare(&common_dir) => {
-            parent.to_path_buf()
-        }
+        (Some(name), Some(parent)) if name == ".git" && !bare => parent.to_path_buf(),
         _ => {
+            // A common dir not named `.git` is not always a bare repository:
+            // a submodule keeps its git dir under the superproject's
+            // `.git/modules/`, with no checkout beside it.
+            let kind = if bare {
+                "of a bare repository"
+            } else {
+                "whose git directory is not beside a main checkout (a submodule's, say)"
+            };
             return Err(format!(
-                "{root} is a linked worktree of a bare repository ({}), which has no main \
-                 checkout to start a new worktree from; pass a non-linked checkout as --repo",
+                "{root} is a linked worktree {kind} ({}), so there is no main checkout to \
+                 start a new worktree from; pass a main checkout as --repo",
                 common_dir.display()
-            ))
+            ));
         }
     };
     Ok(Some(LinkedSource {

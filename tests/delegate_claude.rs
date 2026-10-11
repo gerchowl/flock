@@ -1143,3 +1143,108 @@ fn a_relative_repo_resolves_against_the_caller_and_never_exits_zero_on_error() {
         "feat/p925-in"
     );
 }
+
+/// #925 (b): a linked worktree of a bare repository has no main checkout to
+/// start from, so it is refused as a usage error (exit 2) before anything is
+/// created, naming the fix and never announcing a swap.
+#[test]
+fn a_linked_worktree_of_a_bare_repo_is_refused() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let bare = server.base.join("bare.git");
+    git(
+        &server.base,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &repo.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    );
+    let linked = server.base.join("bare-wt");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "story",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let b = brief(&server, "task.md", "x\n");
+    let before = workspaces(&server).len();
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "bw",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &linked.to_string_lossy(),
+            "--branch",
+            "feat/p925-bare",
+        ],
+    );
+    let message = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{message}");
+    assert!(
+        message.contains("of a bare repository") && message.contains("pass a main checkout"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("starting from its main checkout"),
+        "{message}"
+    );
+    assert!(stdout(&out).is_empty());
+    assert_eq!(workspaces(&server).len(), before, "nothing was created");
+    assert!(agent_get(&server, "bw").is_none());
+}
+
+/// #925 (c): `--keep-on-failure` on the readiness path. An agent that never
+/// reaches its prompt times out, and the start keeps its workspace, agent and
+/// record (round 0) instead of rolling back; `reap` removes them.
+#[test]
+fn keep_on_failure_keeps_a_start_whose_readiness_timed_out() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let b = brief(&server, "slow.md", "brief\n");
+    let mut child = start_claude(
+        &server,
+        "slow",
+        &b,
+        &["--keep-on-failure", "--ready-timeout", "1500"],
+    );
+    delegate_pane(&server, "slow");
+    fs::write(server.base.join("screen"), "booting the harness\n").unwrap();
+    let status = exited_within(&mut child, WITHIN).expect("the timeout returns");
+    let out = finish(child);
+    let message = stderr(&out);
+    assert_eq!(status.code(), Some(1), "{message}");
+    assert!(message.contains("ready timeout"), "{message}");
+    assert!(
+        message.contains("kept for inspection (--keep-on-failure)"),
+        "{message}"
+    );
+    assert!(typed(&server).is_empty(), "nothing was typed");
+    assert_eq!(workspaces(&server).len(), before + 1, "the workspace stays");
+    assert!(agent_get(&server, "slow").is_some(), "the agent stays");
+
+    let status = cli(&server, &["delegate", "status", "slow", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["round"], 0);
+
+    let reaped = cli(&server, &["delegate", "reap", "slow", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
+    assert_eq!(workspaces(&server).len(), before, "reap removes it");
+}
