@@ -16,7 +16,10 @@ acceptor direction. `finish` carries the dialer's signature over the same
 transcript with the dialer direction. Both peers pin the proven key after
 successful verification. `check` verifies that the calling relay still holds
 an enrolled attachment, including after a server restart. Relay methods are
-bound to an SSH-descended process and its start time.
+bound to an SSH-descended process and its start time: some ancestor of the
+relay must be `sshd` (including `sshd-session` and the `sshd:` privsep child)
+or, for Tailscale SSH, `tailscaled`. Anything else is refused with
+`relay_not_from_ssh`.
 
 `peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
 `source` (`configured` or `inbound`), `state`, and `reason`. Its `routes` array
