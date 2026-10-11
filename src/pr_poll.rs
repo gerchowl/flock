@@ -265,16 +265,18 @@ impl PrEventLedger {
         self.seen.extend(events.into_iter().filter_map(Self::key));
     }
 
-    /// Seed from the log, and mark PRs the first round already sees merged or
-    /// closed as known: they ended before this server started, and announcing
-    /// them would flood a supervisor with history on every upgrade.
+    /// Seed from the log, and mark every fact about PRs the first round
+    /// already sees merged or closed as known, their CI included: they ended
+    /// before this server started, and announcing them would flood a
+    /// supervisor with history on every upgrade.
     pub(crate) fn seed(&mut self, logged: &[EventEnvelope], first_round: &[PrObservation]) {
         self.fold(logged);
-        let ended = Self::candidates(first_round)
-            .into_iter()
-            .filter(|event| matches!(event.event, EventKind::PrMerged | EventKind::PrClosed));
-        self.seen
-            .extend(ended.filter_map(|event| Self::key(&event)));
+        let ended: Vec<PrObservation> = first_round
+            .iter()
+            .filter(|obs| matches!(obs.info.state, PrState::Merged | PrState::Closed))
+            .cloned()
+            .collect();
+        self.fold(&Self::candidates(&ended));
         self.seeded = true;
     }
 

@@ -2897,7 +2897,8 @@ mod tests {
     /// #1020 acceptance: one `pr.ci_completed` per head SHA and one
     /// `pr.merged` per PR in the durable log, across repeated rounds AND
     /// server restarts on the same log. A PR the first round after a start
-    /// already sees merged is history, and is seeded silently.
+    /// already sees merged is history: its merge and its CI are seeded
+    /// silently.
     #[tokio::test]
     async fn pr_events_persist_once_across_rounds_and_a_restart() {
         use crate::api::schema::{EventData, EventKind};
@@ -2953,11 +2954,8 @@ mod tests {
             .collect();
         assert_eq!(
             events,
-            vec![
-                (EventKind::PrCiCompleted, 7),
-                (EventKind::PrMerged, 7),
-                (EventKind::PrCiCompleted, 8),
-            ]
+            vec![(EventKind::PrCiCompleted, 7), (EventKind::PrMerged, 7)],
+            "#8 had ended before its start: neither its merge nor its CI is announced"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
