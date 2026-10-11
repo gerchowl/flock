@@ -269,6 +269,36 @@ fn editor_shows(agent: Agent, runtime: &crate::terminal::TerminalRuntime, text: 
     })
 }
 
+/// Claude Code folds a long paste into one `[Pasted text #N]` row (with
+/// ` +M lines` for several lines), and Codex into `[Pasted Content]` (with
+/// ` <n> chars`), so the editor never shows the sent text itself (#995).
+fn is_paste_chip(agent: Agent, row: &str) -> bool {
+    let digits = |word: &str| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+    let Some(inner) = row.strip_prefix('[').and_then(|row| row.strip_suffix(']')) else {
+        return false;
+    };
+    match agent {
+        Agent::Claude => inner.strip_prefix("Pasted text #").is_some_and(|rest| {
+            let (number, lines) = rest.split_once(" +").unwrap_or((rest, ""));
+            digits(number) && (lines.is_empty() || lines.strip_suffix(" lines").is_some_and(digits))
+        }),
+        Agent::Codex => inner.strip_prefix("Pasted Content").is_some_and(|rest| {
+            rest.is_empty()
+                || rest
+                    .strip_prefix(' ')
+                    .and_then(|rest| rest.strip_suffix(" chars"))
+                    .is_some_and(digits)
+        }),
+        _ => false,
+    }
+}
+
+/// The editor holds exactly one paste chip and nothing else.
+fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> bool {
+    editor_rows(agent, runtime)
+        .is_some_and(|rows| matches!(rows.as_slice(), [row] if is_paste_chip(agent, row)))
+}
+
 /// A draft flock can move aside and put back exactly: one editor row, with
 /// no paste or image chip whose contents the screen does not show. Several
 /// rows are refused because the screen cannot tell a typed newline from the
@@ -618,9 +648,11 @@ impl App {
             // Both Enters went out and no turn started. If the composer still
             // holds the sent text, it swallowed the key and the caller must
             // clear it before retrying (ADR-0029 §1).
-            let typed = terminal
-                .effective_known_agent()
-                .is_some_and(|agent| editor_shows(agent, runtime, &reported_text));
+            // A folded paste chip stands in for the text it folded (#995).
+            let typed = terminal.effective_known_agent().is_some_and(|agent| {
+                editor_shows(agent, runtime, &reported_text)
+                    || editor_shows_paste_chip(agent, runtime)
+            });
             return Some(Outcome::Unconfirmed(if typed {
                 "typed_not_submitted"
             } else {
@@ -644,7 +676,12 @@ impl App {
         let editor = runtime_composer(agent, runtime, &attempt.text);
         // The first Enter may precede the child's paste repaint. An unchanged
         // empty editor remains safe, but only exact owned text permits a retry.
-        if editor != Composer::Owned && (attempt.sent || editor != Composer::Empty) {
+        // The composer read empty before the paste and no operator input came
+        // since, so a lone paste chip in the idle editor is the text flock
+        // typed, folded by the harness (#995).
+        let owned = editor == Composer::Owned
+            || (editor == Composer::Other && editor_shows_paste_chip(agent, runtime));
+        if !owned && (attempt.sent || editor != Composer::Empty) {
             // A partial paste repaint may omit the footer or still show only
             // part of our text. Wait for ownership before the first Enter.
             if !attempt.sent && now < attempt.deadline {
@@ -1209,3 +1246,7 @@ mod tests {
 #[cfg(test)]
 #[path = "guarded_submit/codex_721_tests.rs"]
 mod codex_721_tests;
+
+#[cfg(test)]
+#[path = "guarded_submit/paste_chip_995_tests.rs"]
+mod paste_chip_995_tests;
