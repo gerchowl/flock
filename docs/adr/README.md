@@ -36,6 +36,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0024](0024-accept-the-implemented-proposed-adrs.md) | The eleven implemented `Proposed` ADRs are decided; what each acceptance does and does not assert | Accepted |
 | [0025](0025-version-identity-and-release-automation.md) | Version identity: this project restarts its version line, and the deterministic `just release` path stays | Accepted |
 | [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody (implemented: v1.0.0, #623 / #661) | Accepted |
+| [0027](0027-architect-delegate-tracking.md) | An architect's delegates are a server-held edge, and everything else is a projection of it | Proposed |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
