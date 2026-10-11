@@ -81,6 +81,7 @@ struct SpawnedFlock {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         if let Some(pid) = pid {
@@ -174,6 +175,7 @@ fn spawn_server(
     cwd: &Path,
     extra_path: Option<&Path>,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
 

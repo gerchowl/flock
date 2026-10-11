@@ -514,6 +514,7 @@ impl App {
         let explicit_cwd = params.cwd.map(PathBuf::from);
         let argv = params.argv;
         let focus = params.focus;
+        let label = params.label;
         let (rows, cols) = self.state.estimate_pane_size();
 
         // #359: `flk agent start` execs argv directly, so the profile selector
@@ -810,7 +811,18 @@ impl App {
             .agent_info(ws_idx, pane_id)
             .ok_or_else(|| AgentStartError::SpawnFailed("agent disappeared".into()))?;
         debug_assert_eq!(agent.tab_id, self.public_tab_id(ws_idx, tab_idx).unwrap());
-        Ok(crate::api::schema::ResponseResult::AgentStarted { agent, argv })
+        let edge = self.record_delegation(
+            caller,
+            crate::api::schema::DelegationVia::Start,
+            ws_idx,
+            pane_id,
+            label,
+        );
+        Ok(crate::api::schema::ResponseResult::AgentStarted {
+            agent,
+            argv,
+            edge: Some(edge),
+        })
     }
 
     pub(super) fn agent_start_error_body(
@@ -1409,6 +1421,7 @@ mod tests {
         Request {
             id: "req_agent_start_cwd".into(),
             method: Method::AgentStart(AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd,
@@ -1429,6 +1442,7 @@ mod tests {
         Request {
             id: "req_agent_start_profile".into(),
             method: Method::AgentStart(AgentStartParams {
+                label: None,
                 dry_run: false,
                 name: "worker".into(),
                 cwd: Some("/".into()),

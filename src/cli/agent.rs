@@ -250,6 +250,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            label: None,
             dry_run,
             name: name.clone(),
             cwd,

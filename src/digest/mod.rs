@@ -266,6 +266,38 @@ where
                 ],
                 run_id: Some(run_id.clone()),
             }),
+            // #959: one row per edge as it was made. The copies a server
+            // start re-issues say nothing new, so they stay out of the digest.
+            EventData::AgentDelegated {
+                architect,
+                delegate,
+                via,
+                workspace,
+                branch,
+                label,
+                reissued: false,
+                ..
+            } => {
+                let mut context = vec![
+                    ("architect".into(), architect.clone()),
+                    ("delegate".into(), delegate.clone()),
+                    ("workspace".into(), workspace.clone()),
+                ];
+                if let Some(branch) = branch {
+                    context.push(("branch".into(), branch.clone()));
+                }
+                if let Some(label) = label {
+                    context.push(("label".into(), label.clone()));
+                }
+                sections.green.push(DigestRow {
+                    seq,
+                    ts_ms,
+                    kind: "agent_delegated",
+                    summary: format!("{architect} delegated {delegate} via {}", via.as_str()),
+                    context,
+                    run_id: None,
+                });
+            }
             EventData::TriggerFired {
                 repo,
                 issue,
@@ -614,6 +646,44 @@ mod tests {
         assert_eq!(sections.per_repo.len(), 1);
         assert_eq!(sections.per_repo[0].repo, "flock");
         assert_eq!(sections.per_repo[0].forks_spawned, 1);
+    }
+
+    /// #959: an edge is a digest row when it is made. The copy every server
+    /// start re-issues is bookkeeping, and listing it would repeat each open
+    /// edge once per restart.
+    #[test]
+    fn a_delegation_edge_is_one_green_row_and_its_reissued_copies_are_none() {
+        let edge = |reissued| EventData::AgentDelegated {
+            architect: "agent_arch".into(),
+            delegate: "agent_child".into(),
+            via: crate::api::schema::DelegationVia::Start,
+            workspace: "w2".into(),
+            worktree: None,
+            branch: Some("feat/x".into()),
+            repo: None,
+            label: Some("#614".into()),
+            reissued,
+        };
+        let evs = [
+            (1, 1_000, env(EventKind::AgentDelegated, edge(false))),
+            (2, 1_010, env(EventKind::AgentDelegated, edge(true))),
+        ];
+        let sections = categorize(evs.iter().map(|(seq, ts, env)| (*seq, *ts, env)));
+        let rows: Vec<_> = sections
+            .green
+            .iter()
+            .map(|row| (row.kind, row.summary.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "agent_delegated",
+                "agent_arch delegated agent_child via start"
+            )]
+        );
+        assert!(sections.green[0]
+            .context
+            .contains(&("label".to_string(), "#614".to_string())));
     }
 
     #[test]

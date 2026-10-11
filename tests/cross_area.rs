@@ -42,6 +42,7 @@ impl SpawnedFlock {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         self.close_master();
@@ -105,6 +106,7 @@ fn test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
+    let _timing = support::timing::wait("ready: socket");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
@@ -125,6 +127,7 @@ fn spawn_server_with_path(
     api_socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -172,6 +175,7 @@ fn spawn_client_process(
     runtime_dir: &Path,
     api_socket_path: &Path,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -448,6 +452,7 @@ fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), Stri
 }
 
 fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16) {
+    let _timing = support::timing::phase(support::timing::Phase::Handshake);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
