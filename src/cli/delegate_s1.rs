@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::config::model::{SystemOneConfig, SystemOneTier};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(super) struct Advice {
     pub fused: f64,
@@ -50,6 +52,92 @@ fn fuse(set: &Questions, response: &Value) -> Option<f64> {
     fused.is_finite().then_some(fused)
 }
 
+/// Why an endpoint gave no advice. Only an endpoint that answered and refused
+/// the request, or answered with something unusable, is reported. An endpoint
+/// that is down or busy stays silent, as the advice is optional.
+#[derive(Debug, PartialEq)]
+enum Failure {
+    /// Never connected, or a 5xx: the only failures the breaker counts.
+    Down,
+    /// Connected but did not answer in time, or 408/429. Clef serves one
+    /// request at a time, so a queue of other clients' requests looks like
+    /// this, and a healthy endpoint must not be skipped for it.
+    Busy,
+    Rejected {
+        status: u16,
+        error: String,
+    },
+    Unanswered,
+}
+
+impl Failure {
+    fn counts_against_breaker(&self) -> bool {
+        *self == Self::Down
+    }
+
+    fn report(&self, url: &str) -> Option<String> {
+        let what = match self {
+            Self::Down | Self::Busy => return None,
+            Self::Rejected { status, error } => {
+                format!("rejected the request (HTTP {status}): {error}")
+            }
+            Self::Unanswered => "answered without the questions' probabilities".into(),
+        };
+        Some(format!("flk delegate: System One at {url} {what}"))
+    }
+}
+
+// Reads `answers` and nothing else, so extra fields such as `model`, `usage`
+// or a cache count from either Kev or Clef never matter. Kev refused an
+// over-long state with 422, Clef refuses it with 400 or 413 and never
+// truncates, so a refusal is the only over-length signal to handle.
+fn interpret(set: &Questions, status: u16, body: &[u8]) -> Result<f64, Failure> {
+    let response = serde_json::from_slice::<Value>(body).ok();
+    if !(200..300).contains(&status) {
+        if status == 408 || status == 429 {
+            return Err(Failure::Busy);
+        }
+        if !(400..500).contains(&status) {
+            return Err(Failure::Down);
+        }
+        let error = match response.as_ref().and_then(|value| value.get("error")) {
+            Some(Value::String(error)) => error.clone(),
+            Some(error) => error.to_string(),
+            None => String::from_utf8_lossy(body).chars().take(200).collect(),
+        };
+        return Err(Failure::Rejected { status, error });
+    }
+    fuse(set, &response.ok_or(Failure::Unanswered)?).ok_or(Failure::Unanswered)
+}
+
+/// Classifies one curl run. curl appends `<status> <connects>` after the
+/// body, see `--write-out` below, and prints it even when the transfer fails.
+fn outcome(set: &Questions, succeeded: bool, stdout: &[u8]) -> Result<f64, Failure> {
+    let (body, trailer) = match stdout.iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => (&stdout[..newline], &stdout[newline + 1..]),
+        None => (stdout, &[][..]),
+    };
+    let mut fields = std::str::from_utf8(trailer)
+        .unwrap_or("")
+        .split_whitespace();
+    let status = fields
+        .next()
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let connected = fields
+        .next()
+        .and_then(|count| count.parse::<u32>().ok())
+        .is_some_and(|count| count > 0);
+    if !succeeded {
+        return Err(if connected {
+            Failure::Busy
+        } else {
+            Failure::Down
+        });
+    }
+    interpret(set, status, body)
+}
+
 pub(super) fn tail(screen: &str) -> &str {
     let mut start = screen.len().saturating_sub(4096);
     while !screen.is_char_boundary(start) {
@@ -67,30 +155,35 @@ pub(super) struct Client {
 impl Client {
     pub fn from_config() -> Self {
         let config = crate::config::Config::load().config.systemone;
+        let env = match config.tier {
+            SystemOneTier::Fast => "SYSTEMONE_URL",
+            SystemOneTier::Full => "SYSTEMONE_URL_FULL",
+        };
         Self::new(
-            std::env::var("SYSTEMONE_URL").ok().as_deref(),
+            std::env::var(env).ok().as_deref(),
             &config,
             crate::config::state_dir().join("systemone"),
         )
     }
 
-    fn new(
-        env: Option<&str>,
-        config: &crate::config::model::SystemOneConfig,
-        state_dir: PathBuf,
-    ) -> Self {
+    // `env` is the tier's own variable, which overrides that tier's URLs.
+    fn new(env: Option<&str>, config: &SystemOneConfig, state_dir: PathBuf) -> Self {
+        let (configured, timeout_s, fallback) = match config.tier {
+            SystemOneTier::Fast => (&config.urls, config.timeout_s, 4),
+            SystemOneTier::Full => (&config.full_urls, config.full_timeout_s, 12),
+        };
         let urls = match env {
             Some(env) => env
                 .split(|c: char| c == ',' || c.is_whitespace())
                 .filter(|url| !url.is_empty())
                 .map(str::to_string)
                 .collect(),
-            None => config.urls.clone(),
+            None => configured.clone(),
         };
-        let timeout = Duration::try_from_secs_f64(config.timeout_s)
+        let timeout = Duration::try_from_secs_f64(timeout_s)
             .ok()
             .filter(|duration| !duration.is_zero())
-            .unwrap_or(Duration::from_secs(3));
+            .unwrap_or(Duration::from_secs(fallback));
         Self {
             urls,
             timeout,
@@ -114,6 +207,10 @@ impl Client {
                 continue;
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
+            // The lock serialises calls per endpoint across every flk process
+            // on this host: a call that finds one in flight skips the endpoint
+            // without counting a failure, so a burst of delegates finishing
+            // together never queues locally behind a one-at-a-time backend.
             let Some(mut breaker) = Breaker::acquire(&self.state_dir, url, self.timeout) else {
                 continue;
             };
@@ -122,7 +219,8 @@ impl Client {
                     "--disable",
                     "--silent",
                     "--show-error",
-                    "--fail",
+                    "--write-out",
+                    "\n%{http_code} %{num_connects}",
                     "--proto",
                     "=http,https",
                     "--max-time",
@@ -134,13 +232,28 @@ impl Client {
                     "--url",
                     url,
                 ])
-                .output_traced_with_stdin_and_timeout(&body, remaining)
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
-                .and_then(|response| fuse(&set, &response));
-            breaker.record(response.is_some());
-            if let Some(fused) = response {
+                // The grace lets curl's own `--max-time` fire first, so a slow
+                // answer is reported with its trailer as busy, not as down.
+                .output_traced_with_stdin_and_timeout(
+                    &body,
+                    remaining.saturating_add(Duration::from_millis(500)),
+                )
+                .map_or(Err(Failure::Down), |output| {
+                    outcome(&set, output.status.success(), &output.stdout)
+                });
+            match &response {
+                Ok(_) => breaker.record(true),
+                Err(failure) if failure.counts_against_breaker() => breaker.record(false),
+                Err(_) => {}
+            }
+            if let Some(report) = response
+                .as_ref()
+                .err()
+                .and_then(|failure| failure.report(url))
+            {
+                eprintln!("{report}");
+            }
+            if let Ok(fused) = response {
                 return Some(Advice {
                     fused,
                     verdict: if fused >= 0.5 {
@@ -263,9 +376,10 @@ mod tests {
 
     #[test]
     fn delegate_s1_env_urls_override_config_without_changing_timeout() {
-        let config = crate::config::model::SystemOneConfig {
+        let config = SystemOneConfig {
             urls: vec!["http://config.invalid".into()],
             timeout_s: 0.2,
+            ..SystemOneConfig::default()
         };
         let client = Client::new(
             Some("http://one.invalid, http://two.invalid\nhttp://three.invalid"),
@@ -277,5 +391,153 @@ mod tests {
         assert!(Client::new(Some(""), &config, PathBuf::new())
             .urls
             .is_empty());
+    }
+
+    #[test]
+    fn delegate_s1_full_tier_uses_its_own_urls_and_timeout() {
+        let mut config = SystemOneConfig {
+            urls: vec!["http://fast.invalid".into()],
+            full_urls: vec!["http://full.invalid".into()],
+            ..SystemOneConfig::default()
+        };
+        let fast = Client::new(None, &config, PathBuf::new());
+        assert_eq!(fast.urls, ["http://fast.invalid"]);
+        assert_eq!(fast.timeout, Duration::from_secs(4));
+        config.tier = SystemOneTier::Full;
+        let full = Client::new(None, &config, PathBuf::new());
+        assert_eq!(full.urls, ["http://full.invalid"]);
+        assert_eq!(full.timeout, Duration::from_secs(12));
+        let env = Client::new(Some("http://env.invalid"), &config, PathBuf::new());
+        assert_eq!(env.urls, ["http://env.invalid"]);
+        let parsed: SystemOneConfig =
+            toml::from_str("tier = \"full\"\nfull_urls = [\"http://full.invalid\"]").unwrap();
+        assert_eq!(parsed.tier, SystemOneTier::Full);
+        assert_eq!(parsed.timeout_s, 4.0);
+    }
+
+    fn answers(shape: impl Fn(&str) -> Value) -> serde_json::Map<String, Value> {
+        let set: Questions = toml::from_str(include_str!("delegate_s1_questions.toml")).unwrap();
+        set.questions
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|name| (name.clone(), shape(name)))
+            .collect()
+    }
+
+    #[test]
+    fn delegate_s1_reads_only_answers_from_kev_and_clef_shaped_responses() {
+        let set: Questions = toml::from_str(include_str!("delegate_s1_questions.toml")).unwrap();
+        let kev = json!({
+            "model": "kev-latest",
+            "answers": answers(|name| if name == "outcome" {
+                json!({"probabilities": {"success": 0.05, "failure": 0.85, "partial": 0.05, "info": 0.05}})
+            } else {
+                json!({"noul": 0.9})
+            }),
+            "usage": {"input_tokens": 2184},
+        });
+        // Field for field what clef-flash on :8023 answered on 2026-10-11.
+        let clef = json!({
+            "model": "s1-fast",
+            "answers": answers(|name| if name == "outcome" {
+                json!({"type": "choice", "choice": "failure", "probabilities":
+                    {"success": 0.05, "failure": 0.85, "partial": 0.05, "info": 0.05},
+                    "confidence": 0.66})
+            } else {
+                json!({"type": "noul", "noul": 0.9})
+            }),
+            "usage": {"input_tokens": 2184, "output_tokens": 0},
+            "prompt_eval_cached_count": 2184,
+        });
+        let kev = interpret(&set, 200, kev.to_string().as_bytes()).unwrap();
+        let clef = interpret(&set, 200, clef.to_string().as_bytes()).unwrap();
+        assert!(kev > 0.5);
+        assert!((kev - clef).abs() < 1e-12);
+        let mut partial = answers(|_| json!({"type": "noul", "noul": 0.9}));
+        partial.remove("red");
+        assert_eq!(
+            interpret(
+                &set,
+                200,
+                json!({"answers": partial}).to_string().as_bytes()
+            ),
+            Err(Failure::Unanswered)
+        );
+        assert_eq!(interpret(&set, 200, b"not json"), Err(Failure::Unanswered));
+    }
+
+    #[test]
+    fn delegate_s1_names_rejections_but_not_outages_and_only_outages_trip_the_breaker() {
+        let set: Questions = toml::from_str(include_str!("delegate_s1_questions.toml")).unwrap();
+        let clef = br#"{"error":"Clef input has 17097 tokens; context limit is 16384"}"#;
+        let failure = interpret(&set, 400, clef).unwrap_err();
+        assert_eq!(
+            failure.report("http://s1.invalid").unwrap(),
+            "flk delegate: System One at http://s1.invalid rejected the request (HTTP 400): \
+             Clef input has 17097 tokens; context limit is 16384"
+        );
+        assert!(!failure.counts_against_breaker());
+        let kev = br#"{"error":{"detail":"state too long"}}"#;
+        assert!(matches!(
+            interpret(&set, 422, kev),
+            Err(Failure::Rejected { status: 422, error }) if error.contains("state too long")
+        ));
+        assert!(matches!(
+            interpret(&set, 413, b"too large"),
+            Err(Failure::Rejected { status: 413, error }) if error == "too large"
+        ));
+        assert!(!Failure::Unanswered.counts_against_breaker());
+        for (status, expected) in [
+            (408, Failure::Busy),
+            (429, Failure::Busy),
+            (502, Failure::Down),
+            (503, Failure::Down),
+        ] {
+            let failure = interpret(&set, status, b"").unwrap_err();
+            assert_eq!(failure, expected);
+            assert!(failure.report("u").is_none());
+            assert_eq!(failure.counts_against_breaker(), expected == Failure::Down);
+        }
+    }
+
+    #[test]
+    fn delegate_s1_curl_timeout_after_connecting_is_busy_not_down() {
+        let set: Questions = toml::from_str(include_str!("delegate_s1_questions.toml")).unwrap();
+        // curl 8 prints these trailers for: response timeout after connecting,
+        // refused connection, and connect timeout.
+        assert_eq!(outcome(&set, false, b"\n000 1"), Err(Failure::Busy));
+        assert_eq!(outcome(&set, false, b"\n000 0"), Err(Failure::Down));
+        assert_eq!(outcome(&set, false, b""), Err(Failure::Down));
+        assert_eq!(outcome(&set, true, b"garbage"), Err(Failure::Down));
+        let body = json!({"answers": answers(|name| if name == "outcome" {
+            json!({"probabilities": {"failure": 0.9, "partial": 0.1}})
+        } else {
+            json!({"noul": 0.9})
+        })});
+        let stdout = format!("{:#}\n200 1", body);
+        assert!(stdout.matches('\n').count() > 1);
+        assert!(outcome(&set, true, stdout.as_bytes()).unwrap() > 0.5);
+    }
+
+    #[test]
+    fn delegate_s1_breaker_skips_an_endpoint_in_flight_and_after_three_outages() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate_s1_breaker_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let timeout = Duration::from_secs(4);
+        let held = Breaker::acquire(&dir, "http://s1.invalid", timeout).unwrap();
+        assert!(Breaker::acquire(&dir, "http://s1.invalid", timeout).is_none());
+        assert!(Breaker::acquire(&dir, "http://other.invalid", timeout).is_some());
+        drop(held);
+        for _ in 0..3 {
+            Breaker::acquire(&dir, "http://s1.invalid", timeout)
+                .unwrap()
+                .record(false);
+        }
+        assert!(Breaker::acquire(&dir, "http://s1.invalid", timeout).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
