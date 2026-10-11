@@ -55,6 +55,7 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
         };
     }
 
@@ -75,6 +76,9 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         visible_blocker: has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),
         visible_working: has_visible_working(agent, screen_content, state),
+        settled_with_background_shells: agent == Agent::Claude
+            && state == AgentState::Idle
+            && claude_code::settled_with_background_shells(screen_content),
     }
 }
 

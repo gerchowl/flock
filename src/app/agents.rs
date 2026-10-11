@@ -1189,6 +1189,13 @@ impl App {
             agent: pane.agent,
             title: pane.title,
             display_agent: pane.display_agent,
+            // The detector's bit only describes a settled agent: a status
+            // that has since moved on (a hook reporting work) outranks it.
+            settled_with_background_shells: terminal.settled_with_background_shells
+                && matches!(
+                    pane.agent_status,
+                    crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+                ),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {
                 Some("resume_failed".into())

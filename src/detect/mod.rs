@@ -42,6 +42,10 @@ pub struct AgentDetection {
     /// narrower than a fallback `Working` heuristic and may guard against stale
     /// hook idle reports.
     pub visible_working: bool,
+    /// True when a Claude turn visibly ended (`done <time>`) while background
+    /// shells or agents it started keep running (#911). Only ever set with
+    /// `state == Idle`.
+    pub settled_with_background_shells: bool,
 }
 
 /// Which agent we detected running in a pane.
@@ -336,6 +340,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
         };
     };
     agents::detect(agent, screen_content)

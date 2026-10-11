@@ -103,6 +103,8 @@ pub enum AppEvent {
         visible_blocker: bool,
         visible_idle: bool,
         visible_working: bool,
+        /// A Claude turn ended with background shells still running (#922).
+        settled_with_background_shells: bool,
         process_exited: bool,
         observed_at: Instant,
     },

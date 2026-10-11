@@ -952,6 +952,10 @@ pub struct AgentResultInfo {
     /// The newest turn has finished. False means the agent is still working
     /// (or a prompt is pending), and `text` is the reply of an EARLIER turn.
     pub finished: bool,
+    /// The turn ended with background shells or agents still running
+    /// (#922), as `agent.get` reports it. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled_with_background_shells: bool,
     /// From the reply's final `DONE:` / `BLOCKED:` / `VERDICT:` line,
     /// lower-cased; absent when it ends on none of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3015,6 +3019,16 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// The agent is `idle`/`done` because its turn ended (Claude's
+    /// `done <time>` marker) while background shells or agents it started are
+    /// still running (#922). Carried from the server's own screen detector,
+    /// so a socket or MCP supervisor can tell that settle apart from one with
+    /// nothing left running.
+    ///
+    /// Additive and optional, so it needed no protocol bump: omitted when
+    /// false, and an older server never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled_with_background_shells: bool,
     /// Provider-limit wait or `resume_failed` while a retained identity is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
@@ -4843,6 +4857,7 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            settled_with_background_shells: false,
             blocked_reason: None,
             retry_after_ms: None,
             custom_status: None,

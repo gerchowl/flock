@@ -36,7 +36,7 @@ impl Pane {
             frames
                 .into_iter()
                 .map(|(status, screen)| {
-                    let cursor = if status == "idle" {
+                    let cursor = if status.starts_with("idle") {
                         "term_fixture:0:1:2:i"
                     } else {
                         "term_fixture:0:1:1:w"
@@ -96,10 +96,19 @@ impl Pane {
                     "agent.get" => {
                         frame = sampled.min(frames.len() - 1);
                         sampled += 1;
-                        let status = &frames[frame].0;
+                        // `idle+shells` is an idle record on which the server
+                        // itself reports a leftover shell (#922).
+                        let (status, server_shells) = match frames[frame].0.strip_suffix("+shells")
+                        {
+                            Some(status) => (status, true),
+                            None => (frames[frame].0.as_str(), false),
+                        };
                         let cursor = &frames[frame].2;
                         let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
                         "agent_status": status, "turn_cursor": cursor, "revision": 0}});
+                        if server_shells {
+                            record["agent"]["settled_with_background_shells"] = json!(true);
+                        }
                         if status == "blocked" && frames[frame].1.contains("retrying in ") {
                             record["agent"]["blocked_reason"] = json!("provider_limit");
                             record["agent"]["retry_after_ms"] =
@@ -635,6 +644,21 @@ fn delegate_status_without_leftover_shells_says_false() {
         .output()
         .unwrap();
     assert_eq!(Pane::json(&status)["settled_with_background_shells"], false);
+}
+
+/// #922: a server that carries the detector's answer on `agent.get` is
+/// believed, even though the screen this fixture serves shows no shell. A
+/// status that read the screen instead would report false here.
+#[test]
+fn delegate_status_takes_settled_shells_from_the_server_record() {
+    let pane = Pane::new("idle+shells", "DONE: recovered");
+    let status = pane
+        .command(&["delegate", "status", "fixture", "--json"], None)
+        .output()
+        .unwrap();
+    let status = Pane::json(&status);
+    assert_eq!(status["agent_status"], "idle");
+    assert_eq!(status["settled_with_background_shells"], true);
 }
 
 #[test]
