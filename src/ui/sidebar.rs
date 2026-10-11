@@ -7524,6 +7524,7 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
