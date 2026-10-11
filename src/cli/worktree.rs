@@ -635,7 +635,11 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         .unwrap_or(false);
     if dry_run {
         // Unchanged contract: 0 when the gate would pass, 3 when it would not.
-        return Ok(if merged { 0 } else { 3 });
+        return Ok(if merged {
+            super::exit::SUCCESS
+        } else {
+            super::exit::WORKTREE_GATE_WOULD_FAIL
+        });
     }
     Ok(0)
 }
@@ -650,10 +654,12 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 /// remedy for the same refusal.
 pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
     match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
-        "not_linked_worktree" | "workspace_not_found" => 2,
-        // 4 is the retryable class: the same call with --force clears it.
-        "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => 4,
-        _ => 1,
+        "not_linked_worktree" | "workspace_not_found" => super::exit::WORKTREE_NOT_LINKED,
+        // The retryable class: the same call with --force clears it.
+        "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
+            super::exit::WORKTREE_NEEDS_FORCE
+        }
+        _ => super::exit::FAILURE,
     }
 }
 
