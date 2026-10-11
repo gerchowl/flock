@@ -60,7 +60,8 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_agent_list",
             description: "List agents, and the fleet directory. `agents` is \
                           this server's own panes in full — each record \
-                          carries `seen` and `status_age_secs`, and the ones \
+                          carries `seen`, `status_age_secs` and `state` \
+                          (as on `flock_agent_get`), and the ones \
                           in `blocked` status need attention. `fleet` is \
                           every agent addressable from here INCLUDING other \
                           hosts, each row carrying `agent_id`, `host` and \
@@ -77,7 +78,10 @@ pub(super) fn table() -> &'static [Tool] {
                           `settled_with_background_shells: true` on an \
                           `idle`/`done` agent means its turn ended while \
                           shells or agents it started are still running; \
-                          the field is absent otherwise.",
+                          the field is absent otherwise. `state` carries \
+                          `turn`, `lifecycle`, a derived `phase` to branch \
+                          on, `held_ms` and a per-axis `source`; a server \
+                          without it means read `agent_status`.",
             input_schema: schema_target_only,
             build: build_agent_get,
         },

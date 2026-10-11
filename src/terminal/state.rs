@@ -727,6 +727,11 @@ impl TerminalState {
         })
     }
 
+    /// Which authority decided the current `state` (#309).
+    pub fn last_state_authority(&self) -> StateAuthority {
+        self.last_state_authority
+    }
+
     pub(crate) fn submission_session_id(&self) -> Option<String> {
         self.current_session_identity_for_persistence()
             .map(|(_, _, _, value)| value)

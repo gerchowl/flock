@@ -1208,6 +1208,14 @@ impl App {
                     pane.agent_status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
+            state: Some(super::api_helpers::agent_state(
+                pane.agent_status,
+                terminal.last_state_authority(),
+                terminal.effective_known_agent(),
+                terminal
+                    .state_changed_at
+                    .map(|changed| changed.elapsed().as_millis() as u64),
+            )),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {
                 Some("resume_failed".into())

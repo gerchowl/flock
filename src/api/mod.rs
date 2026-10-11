@@ -1,3 +1,4 @@
+pub mod agent_state;
 pub mod client;
 pub(crate) mod compatibility;
 mod event_hub;
