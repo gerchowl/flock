@@ -149,6 +149,10 @@ impl App {
     }
 
     pub(crate) fn record_agent_removal(&mut self, removal: Removal) {
+        // #959: a removed delegate's edge goes to gone, not closed. Done here
+        // rather than on the `AgentRemoved` event, which a node without mesh
+        // identity never writes.
+        self.delegations.mark_gone(&removal.agent);
         // Retire the identity before attempting storage: a queued tombstone must
         // never apply to the next agent launched in this terminal, either.
         let mut retired = false;

@@ -326,6 +326,13 @@ impl App {
         let Some(agent) = self.agent_info(ws_idx, pane_id) else {
             return encode_error(id, "internal_error", "spawned pane is not an agent");
         };
+        self.record_delegation(
+            &caller,
+            crate::api::schema::DelegationVia::Spawn,
+            ws_idx,
+            pane_id,
+            None,
+        );
         encode_success(id, ResponseResult::AgentSpawned { run_id, agent })
     }
 
@@ -651,6 +658,78 @@ mod tests {
             serde_json::json!(["claude", "opencode"]),
             "the refusal must name what IS accepted"
         );
+    }
+
+    /// #959: a spawn is always agent-initiated, so it always records the
+    /// edge, with the caller as architect and `via: spawn`.
+    #[tokio::test]
+    async fn an_agent_spawn_records_the_delegation_edge() {
+        // A stub `opencode` on PATH: nextest runs each test in its own
+        // process, so the PATH change stays here. opencode rather than claude
+        // because it carries no profile selector, so the #359 carry has no
+        // requester environment to read, which macOS does not hand over for
+        // this test process.
+        let bin_dir =
+            std::env::temp_dir().join(format!("flock-spawn-edge-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("opencode");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", bin_dir.display()));
+
+        let mut app = app_with_one_pane();
+        app.state.config.fleet.agent_spawn_enabled = true;
+        let (_pane, architect) = caller_pane_is_an_agent(&mut app);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::AgentSpawn(AgentSpawnParams {
+                agent: "opencode".into(),
+                prompt: "review #42".into(),
+                location: SpawnLocation::WorkspaceId {
+                    workspace_id: app.public_workspace_id(0),
+                },
+                name: None,
+                focus: false,
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).expect("json");
+        let delegate = value["result"]["agent"]["agent_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("spawn must succeed: {response}"))
+            .to_string();
+
+        let edges: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::AgentDelegated {
+                    architect,
+                    delegate,
+                    via,
+                    ..
+                } => Some((architect, delegate, via)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            [(
+                architect,
+                delegate,
+                crate::api::schema::DelegationVia::Spawn
+            )]
+        );
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(bin_dir);
     }
 
     /// Without an attested caller the ceiling cannot bound depth or fanout,

@@ -576,6 +576,13 @@ impl App {
                 seeded,
             },
         });
+        self.record_delegation(
+            &caller,
+            crate::api::schema::DelegationVia::Fork,
+            ws_idx,
+            spawned_pane,
+            None,
+        );
         encode_success(
             id,
             ResponseResult::AgentForked {
@@ -4121,6 +4128,31 @@ mod tests {
             child.spawn_depth, 1,
             "a child of a root agent sits one deeper"
         );
+        // #959: and the dispatcher is recorded as the child's architect.
+        let edges: Vec<_> = app
+            .event_hub
+            .events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::AgentDelegated {
+                    architect,
+                    delegate,
+                    via,
+                    worktree,
+                    ..
+                } => Some((architect, delegate, via, worktree)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            [(
+                caller_agent_id.clone(),
+                child.agent_id.to_string(),
+                crate::api::schema::DelegationVia::Fork,
+                Some(worktree.path.clone()),
+            )]
+        );
 
         let remove =
             crate::worktree::build_worktree_remove_command(&repo, Path::new(&worktree.path), true);
@@ -4214,6 +4246,13 @@ mod tests {
             app.state.terminals[&child_terminal].spawned_by, None,
             "an operator's fork is not agent-initiated; billing it to the ceiling \
              would shrink the fleet's headroom every time a human works"
+        );
+        assert!(
+            !app.event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| matches!(event.data, EventData::AgentDelegated { .. })),
+            "#959: the operator is not an architect, so its fork records no edge"
         );
 
         let remove =
