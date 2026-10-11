@@ -871,6 +871,76 @@ pub(crate) fn prepare_peer_checkout(
     })
 }
 
+/// A linked worktree a new checkout was asked to start from, and what to use
+/// instead (#925).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedSource {
+    /// The repository's main checkout, which `worktree.create` accepts.
+    pub(crate) main_checkout: PathBuf,
+    /// The commit the linked worktree has checked out.
+    pub(crate) head: Option<String>,
+}
+
+/// Whether `path` is a linked worktree, and if so which main checkout it
+/// belongs to (#925).
+///
+/// `Ok(None)` for a main checkout and for anything git does not recognise:
+/// the server already names those (`not_git_worktree`). A linked worktree of
+/// a bare repository has no main checkout to start from, which is an `Err`
+/// naming the fix.
+pub(crate) fn linked_worktree_source(path: &Path) -> Result<Option<LinkedSource>, String> {
+    let root = path.display().to_string();
+    let git = |args: &[&str]| {
+        let mut full = vec!["-C", root.as_str()];
+        full.extend_from_slice(args);
+        run_command_capture("git", &full, None).ok()
+    };
+    let Some(dirs) = git(&[
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+        "--git-common-dir",
+    ]) else {
+        return Ok(None);
+    };
+    let mut lines = dirs.lines().map(|line| PathBuf::from(line.trim()));
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    let canonical = |dir: &Path| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if canonical(&git_dir) == canonical(&common_dir) {
+        return Ok(None);
+    }
+    let main_checkout = match (common_dir.file_name(), common_dir.parent()) {
+        (Some(name), Some(parent)) if name == ".git" && !is_bare(&common_dir) => {
+            parent.to_path_buf()
+        }
+        _ => {
+            return Err(format!(
+                "{root} is a linked worktree of a bare repository ({}), which has no main \
+                 checkout to start a new worktree from; pass a non-linked checkout as --repo",
+                common_dir.display()
+            ))
+        }
+    };
+    Ok(Some(LinkedSource {
+        main_checkout,
+        head: git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty()),
+    }))
+}
+
+fn is_bare(common_dir: &Path) -> bool {
+    let dir = common_dir.display().to_string();
+    run_command_capture(
+        "git",
+        &["--git-dir", &dir, "rev-parse", "--is-bare-repository"],
+        None,
+    )
+    .is_ok_and(|out| out.trim() == "true")
+}
+
 /// How long refreshing a worktree base from its remote may take (#828).
 const BASE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -2935,6 +3005,48 @@ mod tests {
         );
 
         for dir in [&repo, &origin, &other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// #925: a linked worktree names its main checkout and its own HEAD, and a
+    /// main checkout or a plain directory is not a linked source at all.
+    #[test]
+    fn a_linked_worktree_resolves_to_its_main_checkout() {
+        let repo = create_committed_repo("linked-source");
+        let linked = unique_temp_path("linked-source-wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "story",
+                &linked.display().to_string(),
+            ],
+        );
+        run_git(
+            &linked,
+            &["commit", "--quiet", "--allow-empty", "-m", "story work"],
+        );
+
+        let source = linked_worktree_source(&linked)
+            .expect("a linked worktree of a normal repo resolves")
+            .expect("and is reported as linked");
+        assert_eq!(
+            source.main_checkout.canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
+        );
+        assert_eq!(source.head, Some(head_of(&linked, "HEAD")));
+        assert_ne!(source.head, Some(head_of(&repo, "HEAD")));
+
+        assert_eq!(linked_worktree_source(&repo), Ok(None), "a main checkout");
+        let plain = unique_temp_path("linked-source-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_source(&plain), Ok(None), "not a repo");
+
+        for dir in [&linked, &repo, &plain] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
