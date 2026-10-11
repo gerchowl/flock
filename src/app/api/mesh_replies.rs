@@ -118,6 +118,14 @@ impl App {
                     now_ms() as i64,
                 )
                 .map_err(|e| e.to_string())?;
+            // The relay enqueued below owns the first push. Without a deadline
+            // the retry scheduler sees ready custody and pushes it again while
+            // that push is in flight, as persist_mesh_send already prevents.
+            if push_peer.is_some() {
+                store
+                    .schedule_retry(&answer.key, 60_000, now_ms() as i64)
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(())
         })?;
         if !local && push_peer.is_none() {

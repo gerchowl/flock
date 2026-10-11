@@ -90,6 +90,12 @@ fn answers(node: &Node, pane: &Value) -> Value {
     })
 }
 
+/// Keep the held answer on the collect lane. The outbound poll offers it too,
+/// and when that poll wins it bypasses the collect-lane fault under test.
+fn withhold_outbound_answers(fleet: &fleet::Fleet) {
+    std::fs::write(fleet.base.join("withhold-outbound-answers-nodea-nodeb"), "").unwrap();
+}
+
 fn question(fleet: &fleet::Fleet, correlation: &str) -> (Value, Value) {
     let sender = agent(fleet.node("nodea"));
     let recipient = agent(fleet.node("nodeb"));
@@ -146,6 +152,7 @@ fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
     let (sender, _) = question(&fleet, "lost-ack");
     let gate = fleet.base.join("gate-collect-ack-nodea-nodeb");
     std::fs::create_dir(&gate).unwrap();
+    withhold_outbound_answers(&fleet);
     assert_eq!(
         reply(fleet.node("nodeb"), "lost-ack", "once")["result"]["state"],
         "held"
@@ -194,10 +201,15 @@ fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
         },
     );
     assert_eq!(read(fleet.node("nodea"), &sender["pane_id"]), json!([]));
+    // nodeb's read receipt is its own envelope, imported once more when it
+    // travels the outbound lane rather than riding the collect reply (#948).
     assert_eq!(
         database(fleet.node("nodea"))
-            .query_row("SELECT count(*) FROM inbox_imports", [], |r| r
-                .get::<_, i64>(0))
+            .query_row(
+                "SELECT count(*) FROM inbox_imports JOIN envelopes USING(origin,id) WHERE kind='message'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
             .unwrap(),
         1
     );
@@ -330,12 +342,13 @@ fn another_enrolled_node_cannot_collect_even_with_the_origins_token() {
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     ready(fleet.node("nodec"));
     let refused = fleet.base.join("collect-refused-nodec-nodeb");
-    fleet::wait_until("foreign origin refused", Duration::from_secs(30), || {
-        refused.exists().then_some(())
+    // The shim creates the file before writing it. Wait for the whole line.
+    let line = fleet::wait_until("foreign origin refused", Duration::from_secs(30), || {
+        std::fs::read_to_string(&refused)
+            .ok()
+            .filter(|line| line.ends_with('\n'))
     });
-    assert!(std::fs::read_to_string(refused)
-        .unwrap()
-        .contains("mesh_collection_refused"));
+    assert!(line.contains("mesh_collection_refused"), "{line}");
     assert_eq!(
         database(fleet.node("nodec"))
             .query_row("SELECT count(*) FROM inbox_imports", [], |r| r
@@ -508,6 +521,7 @@ fn collected_answer_signature_covers_the_binding_and_failure_is_visible() {
     let fleet = fleet::spawn("mesh-collect-failed", PAIR);
     question(&fleet, "invalid-answer");
     std::fs::write(fleet.base.join("corrupt-collect-answer-nodea-nodeb"), "").unwrap();
+    withhold_outbound_answers(&fleet);
     reply(
         fleet.node("nodeb"),
         "invalid-answer",
@@ -696,6 +710,19 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
     // Both collection lanes must be unavailable to exercise an idle holder.
     fleet.refuse_edge("nodea", "nodeb");
     fleet.kill_edge("nodea", "nodeb", Duration::from_secs(10));
+    // The cut withdraws nodeb's route to nodea, and the next routing pass
+    // clears the hop of every row still pointing there. That one write
+    // belongs to the cut, not to idle retry, so let it land first (#948).
+    fleet.wait_route("nodeb", "nodea", false);
+    fleet::wait_until("withdrawn hops cleared", Duration::from_secs(10), || {
+        db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM envelopes WHERE state IN ('custody','held') AND next_hop=?1)",
+            [&sender_node],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+        .then_some(())
+    });
     let sent = reply(
         fleet.node("nodeb"),
         "held-enroll",
@@ -858,15 +885,17 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
         },
     );
     // The question's read receipt rides nodeb's outbound collection from
-    // nodea and is marked sent once. That is a delivery transition, not an
-    // idle retry, so let it land before the idle window is measured.
+    // nodea and is marked sent once, and the receipt envelope that minted is
+    // then delivered. Those are delivery transitions, not idle retries, so
+    // let both land before the idle window is measured (#948).
     fleet::wait_until(
-        "question receipt marked sent",
+        "question receipt marked sent and delivered",
         Duration::from_secs(10),
         || {
             timeline.sample(&db, "waiting for receipt sent");
             db.query_row(
-                "SELECT receipt_sent IS NOT NULL FROM envelopes WHERE request_id IS NULL",
+                "SELECT (SELECT receipt_sent IS NOT NULL FROM envelopes WHERE request_id IS NULL AND kind='message')
+                    AND NOT EXISTS(SELECT 1 FROM envelopes WHERE kind='receipt' AND state IN ('custody','held'))",
                 [],
                 |r| r.get::<_, bool>(0),
             )

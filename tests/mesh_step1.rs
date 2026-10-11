@@ -577,6 +577,16 @@ fn lost_collect_ack_reimports_once_after_edge_is_killed() {
     conversation.read_question();
     let gate = conversation.fleet.base.join("gate-collect-ack-nodea-nodeb");
     std::fs::create_dir(&gate).unwrap();
+    // The outbound poll offers the held answer too. Keep it on the gated
+    // collect lane, or a poll that wins the race skips the gate (#948).
+    std::fs::write(
+        conversation
+            .fleet
+            .base
+            .join("withhold-outbound-answers-nodea-nodeb"),
+        "",
+    )
+    .unwrap();
     conversation.reply();
     due(conversation.fleet.node("nodea"));
     fleet::wait_until("collection ack after import", DEADLINE, || {
@@ -1100,14 +1110,18 @@ fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
     let hub = conversation.fleet.node("nodeb");
     let enrollment = api(hub, "peers.enrollment", json!({}));
     let store = db(hub);
-    fleet::wait_until("failed reply scheduled", DEADLINE, || {
-        store
+    // The reply is scheduled as soon as it is stored, so retry_at alone proves
+    // nothing. The failure handler reschedules and then returns the answer to
+    // held. Reset the deadline only after that, or it lands 60 s out (#948).
+    fleet::wait_until("failed reply returned to held", DEADLINE, || {
+        (store
             .query_row(
-                "SELECT retry_at>0 FROM envelopes WHERE correlation=?1",
+                "SELECT state FROM envelopes WHERE correlation=?1",
                 [correlation],
-                |row| row.get::<_, bool>(0),
+                |row| row.get::<_, String>(0),
             )
             .ok()?
+            == "held")
             .then_some(())
     });
     std::fs::remove_file(fault).unwrap();
@@ -1121,6 +1135,39 @@ fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
     conversation.answer_once();
     assert_eq!(api(hub, "peers.enrollment", json!({})), enrollment);
     assert!(delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2);
+}
+
+#[test]
+fn reply_push_in_flight_is_not_pushed_again_by_the_retry_scheduler() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let gate = conversation
+        .fleet
+        .base
+        .join("gate-delivery-ack-nodeb-nodea");
+    std::fs::create_dir(&gate).unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("reply push in flight", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
+    // Hold the relay's push across several one-second scheduler ticks. A
+    // second push for the same row queues behind it on the held edge (#948).
+    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(gate.join("release"), "").unwrap();
+    conversation.answer_once();
+    // A queued second push goes out once the first one's reply lands. Watch
+    // long enough for a loaded runner to log it.
+    let watched = std::time::Instant::now();
+    while watched.elapsed() < Duration::from_secs(5) {
+        assert_eq!(
+            delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation),
+            1,
+            "the retry scheduler pushed a reply its relay was already pushing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
