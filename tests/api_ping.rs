@@ -2890,7 +2890,10 @@ fn guarded_submit_cli_reports_exit_8_and_9_with_evidence() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = test_lock();
-    for expected_code in [8, 9] {
+    // (exit, operator presses Esc mid-injection, injection lock on). With the
+    // lock (#850) the Esc is held and replays after the injection, so only
+    // the lock switched off still abandons on it.
+    for (expected_code, esc, lock) in [(8, false, true), (9, true, false), (8, true, true)] {
         let base = unique_test_dir();
         fs::create_dir_all(&base).unwrap();
         let config_home = base.join("config");
@@ -2931,6 +2934,26 @@ with log.open('w') as out:
             shell.to_str().unwrap(),
         );
         wait_for_socket(&socket_path, Duration::from_secs(5));
+        if !lock {
+            // A debug server reads `flock-dev`, a release one `flock`.
+            let dir = if cfg!(debug_assertions) {
+                "flock-dev"
+            } else {
+                "flock"
+            };
+            fs::create_dir_all(config_home.join(dir)).unwrap();
+            fs::write(
+                config_home.join(dir).join("config.toml"),
+                "onboarding = false\n[ui.injection_lock]\nenabled = false\n",
+            )
+            .unwrap();
+            let reloaded = send_request(
+                &socket_path,
+                &serde_json::json!({"id": "reload", "method": "server.reload_config", "params": {}})
+                    .to_string(),
+            );
+            assert!(reloaded.get("error").is_none(), "{reloaded}");
+        }
         let created = send_request(
             &socket_path,
             &serde_json::json!({
@@ -2985,7 +3008,7 @@ with log.open('w') as out:
                 &["agent", "send", "--submit", &cli_pane, "failure prompt"],
             )
         });
-        if expected_code == 9 {
+        if esc {
             let deadline = Instant::now() + Duration::from_secs(5);
             while fs::read_to_string(&log).unwrap_or_default().is_empty() {
                 assert!(Instant::now() < deadline, "submit never typed its prompt");
@@ -3020,6 +3043,27 @@ with log.open('w') as out:
             }
         );
         assert!(result["result"]["attempt"]["attempt_id"].is_string());
+        if esc && lock {
+            // The held Esc reached the composer only after flock's last Enter.
+            let writes: Vec<Vec<u8>> = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|byte| byte.as_u64().unwrap() as u8)
+                        .collect()
+                })
+                .collect();
+            let last_enter = writes.iter().rposition(|w| w.contains(&b'\r'));
+            let esc_at = writes.iter().position(|w| w.as_slice() == b"\x1b");
+            assert!(
+                matches!((last_enter, esc_at), (Some(enter), Some(esc)) if esc > enter),
+                "{writes:?}"
+            );
+        }
         cleanup_spawned_flock(child, base);
     }
 }

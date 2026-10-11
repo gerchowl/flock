@@ -1081,6 +1081,24 @@ impl PeerConfig {
     }
 }
 
+/// `[ui.injection_lock]` (#850): while flock types a guarded injection into a
+/// pane, the operator's keystrokes for that pane are held and replayed after
+/// it, and `agent send --submit` or an inbox wake moves a one-row draft aside
+/// and types it back. Off restores the earlier behaviour: keystrokes go
+/// straight through and a draft refuses the injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct InjectionLockConfig {
+    /// Default: true.
+    pub enabled: bool,
+}
+
+impl Default for InjectionLockConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Idle animations on the sidebar (#16): the stage-1 grazing sheep and the
 /// stage-2 full screensaver. Every field has a sane default that preserves the
 /// shipped behavior (on), but each is opt-out-able and the thresholds are
@@ -1253,6 +1271,8 @@ pub struct UiConfig {
     pub sound: SoundConfig,
     /// Idle sidebar animations (grazing sheep + screensaver): opt-out + thresholds.
     pub idle: IdleConfig,
+    /// Hold a pane's input while flock injects into it (#850).
+    pub injection_lock: InjectionLockConfig,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -1758,6 +1778,7 @@ impl Default for UiConfig {
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
             idle: IdleConfig::default(),
+            injection_lock: InjectionLockConfig::default(),
         }
     }
 }

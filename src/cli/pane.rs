@@ -25,6 +25,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "split" => pane_split(&args[1..]),
         "move" => pane_move(&args[1..]),
         "close" => pane_close(&args[1..]),
+        "stash" => pane_stash(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
         "arm-self-compact" => pane_arm_self_compact(&args[1..]),
@@ -459,6 +460,49 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
             pane_id: super::normalize_pane_id(raw_pane_id),
         }),
     })?)
+}
+
+pub(super) const PANE_STASH_USAGE: &str = "flk pane stash show|restore <pane_id> [--json]\n  Drafts flock kept because an injection could not type them back; restore types the oldest into the pane's empty composer.";
+
+/// `flk pane stash show|restore` (#850). The drafts print one per line, so
+/// a kept draft can be read or copied as it was typed.
+fn pane_stash(args: &[String]) -> std::io::Result<i32> {
+    let json = args.iter().any(|arg| arg == "--json");
+    let rest: Vec<_> = args.iter().filter(|arg| *arg != "--json").collect();
+    let (verb, raw_pane_id) = match rest.as_slice() {
+        [verb, pane] => (verb.as_str(), pane.as_str()),
+        _ => {
+            eprintln!("usage: {PANE_STASH_USAGE}");
+            return Ok(2);
+        }
+    };
+    let target = PaneTarget {
+        pane_id: super::normalize_pane_id(raw_pane_id),
+    };
+    let method = match verb {
+        "show" => Method::PaneStashShow(target),
+        "restore" => Method::PaneStashRestore(target),
+        _ => {
+            eprintln!("usage: {PANE_STASH_USAGE}");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
+        id: format!("cli:pane:stash:{verb}"),
+        method,
+    })?;
+    if json || response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let drafts = response
+        .pointer("/result/drafts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for draft in drafts.iter().filter_map(serde_json::Value::as_str) {
+        println!("{draft}");
+    }
+    Ok(0)
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
@@ -1444,6 +1488,7 @@ fn pane_help_text() -> String {
         "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(out, "  flk pane close <target>");
+    let _ = writeln!(out, "  {PANE_STASH_USAGE}");
     let _ = writeln!(out, "  {PANE_SEND_TEXT_USAGE}");
     let _ = writeln!(out, "  flk pane send-keys <target> <key> [key ...]");
     let _ = writeln!(

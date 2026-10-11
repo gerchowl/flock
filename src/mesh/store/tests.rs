@@ -2674,6 +2674,7 @@ fn a_delivery_attempt_write_stays_keyed_with_a_full_registry() {
         submit_sent_at_ms: None,
         finished_at_ms: finished.then_some(id as u64),
         retried: false,
+        draft: None,
     };
     // Seed a full registry directly: the oldest is pending, the next is
     // unconfirmed while its message still sits in the inbox, the rest done.

@@ -25,6 +25,7 @@ pub(crate) mod config_io;
 mod creation;
 use crate::mesh::store::delivery_attempts;
 pub(crate) mod directory;
+pub(crate) mod draft_stash;
 pub(crate) mod edges;
 pub(crate) mod float;
 pub(crate) mod handoffs;
@@ -199,6 +200,8 @@ pub struct App {
     pub(crate) message_relays: message_relay::MessageRelays,
     /// Canonical pane ids reserved by a guarded client submission.
     pub(crate) active_submissions: std::collections::HashSet<String>,
+    /// Operator drafts an injection could not type back (#850).
+    pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
     /// Plain paste observation parked by `respond_or_park` after dispatch.
     pub(crate) pending_paste: Option<paste_confirm::Paste>,
     /// Deferred submit set by `handle_agent_send` and consumed by
@@ -965,6 +968,7 @@ impl App {
             pending_agent_submit: None,
             pending_paste: None,
             active_submissions: Default::default(),
+            kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
             self_compact_deadline: None,
             restarts: Default::default(),

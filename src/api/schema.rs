@@ -176,6 +176,13 @@ pub enum Method {
     PaneSubmit(PaneSubmitParams),
     #[serde(rename = "pane.arm_self_compact")]
     PaneArmSelfCompact(PaneArmSelfCompactParams),
+    /// Drafts an injection kept for a pane because it could not type them
+    /// back (#850).
+    #[serde(rename = "pane.stash_show")]
+    PaneStashShow(PaneTarget),
+    /// Type the oldest kept draft back into the pane's empty composer.
+    #[serde(rename = "pane.stash_restore")]
+    PaneStashRestore(PaneTarget),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.report_agent")]
@@ -349,6 +356,7 @@ impl Method {
             | Self::PaneReportRecap(_)
             | Self::PaneReportReply(_)
             | Self::PaneReportMetadata(_)
+            | Self::PaneStashShow(_)
             | Self::EventsSubscribe(_)
             | Self::EventsWait(_)
             | Self::PaneWaitForOutput(_)
@@ -392,6 +400,7 @@ impl Method {
             | Self::PaneSendInput(_)
             | Self::PaneSubmit(_)
             | Self::PaneArmSelfCompact(_)
+            | Self::PaneStashRestore(_)
             | Self::PaneSetHeaderField(_)
             | Self::PaneClearHeaderField(_)
             | Self::PaneClearAgentAuthority(_)
@@ -1474,6 +1483,11 @@ pub struct DeliveryAttempt {
     #[serde(default)]
     pub finished_at_ms: Option<u64>,
     pub retried: bool,
+    /// An operator draft moved aside for this injection (#850): `stashed`
+    /// while it is held, then `restored`, `untouched` (never cleared) or
+    /// `kept` (left in the pane's stash for `flk pane stash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2260,6 +2274,10 @@ pub enum ResponseResult {
         outcome: String,
         reason: String,
         evidence: serde_json::Value,
+    },
+    PaneStash {
+        pane_id: String,
+        drafts: Vec<String>,
     },
     GuardedSubmit {
         #[serde(default, skip_serializing_if = "Option::is_none")]

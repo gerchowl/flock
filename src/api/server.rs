@@ -556,6 +556,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSubmit(_) => "pane.submit",
         Method::PaneArmSelfCompact(_) => "pane.arm_self_compact",
+        Method::PaneStashShow(_) => "pane.stash_show",
+        Method::PaneStashRestore(_) => "pane.stash_restore",
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",

@@ -291,6 +291,9 @@ impl App {
         // #540: an armed self-compaction's turn boundary, its Enter, or its
         // timeout — mirrored in the headless loop (#25).
         self.tick_self_compacts(now);
+        // #850: an injection lease past its bound replays what it held —
+        // mirrored in the headless loop (#25).
+        changed |= self.tick_injection_leases(now);
         changed |= self.tick_agent_restarts(now);
         for update in &settled {
             self.emit_pane_state_update(update);
@@ -710,6 +713,9 @@ impl App {
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
+            // #850: a lease ends on its bound even in a quiet loop, so held
+            // keystrokes never wait for unrelated traffic.
+            self.next_injection_lease_deadline(),
             self.restarts
                 .next_deadline(&self.state.config.session, Instant::now()),
             (!self.state.agent_restarts.is_empty())

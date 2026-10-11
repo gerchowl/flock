@@ -981,6 +981,9 @@ impl HeadlessServer {
             self.rollback_handoff_before_commit(&socket_path, &[]);
             return Err(err.into());
         }
+        // #850: keystrokes held for an injection reach the PTY before it
+        // moves to the new server, which knows nothing of the lease.
+        self.app.end_all_injection_leases();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
@@ -3541,6 +3544,8 @@ impl HeadlessServer {
         self.app.tick_idle_wakes(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
+        // #850: mirrored in the TUI runtime loop (#25).
+        changed |= self.app.tick_injection_leases(now);
         changed |= self.app.tick_agent_restarts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
@@ -3655,6 +3660,8 @@ impl HeadlessServer {
         }
         info!("server shutdown initiated");
         self.shutting_down = true;
+        // #850: write any keystrokes an injection lease still holds.
+        self.app.end_all_injection_leases();
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();
@@ -3677,6 +3684,7 @@ impl HeadlessServer {
     /// close client connections, remove socket files, and clean up.
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+        self.app.end_all_injection_leases();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {

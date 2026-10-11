@@ -87,6 +87,7 @@ mod tests {
             submit_sent_at_ms: None,
             finished_at_ms: (state != "typed").then_some(id),
             retried: false,
+            draft: None,
         }
     }
 

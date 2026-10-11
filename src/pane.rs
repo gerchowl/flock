@@ -22,6 +22,7 @@ use crate::layout::PaneId;
 #[cfg(unix)]
 use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
 
+mod injection_lease;
 mod input;
 mod kitty_keyboard;
 mod osc;
@@ -725,6 +726,8 @@ pub struct PaneRuntime {
     operator_input: OperatorInputClock,
     /// Sticky input history for safe root-shell replacement.
     has_been_typed_into: Cell<bool>,
+    /// Flock's hold on operator input during one guarded injection (#850).
+    injection_lease: injection_lease::InjectionLease,
     spawned_with_default_shell: bool,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
@@ -1543,6 +1546,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
             spawned_with_default_shell: false,
             detect_handle,
         })
@@ -1975,6 +1979,7 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(false),
+            injection_lease: Default::default(),
             spawned_with_default_shell: initial_state.spawned_with_default_shell,
             detect_handle,
         })
@@ -2155,14 +2160,84 @@ impl PaneRuntime {
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.has_been_typed_into.set(true);
+        let Some(bytes) = self
+            .injection_lease
+            .intercept(bytes, std::time::Instant::now())
+        else {
+            return Ok(());
+        };
         self.operator_input.stamp();
         self.io.send_bytes(bytes).await
     }
 
+    /// Operator input: held, not written, while an injection lease is live
+    /// (#850), and stamped as operator input only when it is written.
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.has_been_typed_into.set(true);
+        let Some(bytes) = self
+            .injection_lease
+            .intercept(bytes, std::time::Instant::now())
+        else {
+            return Ok(());
+        };
         self.operator_input.stamp();
         self.io.try_send_bytes(bytes)
+    }
+
+    /// Hold this pane's operator input for `token`'s injection until `until`
+    /// (#850). False while another injection holds it.
+    pub(crate) fn begin_injection_lease(
+        &self,
+        token: &str,
+        until: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        match self.injection_lease.acquire(token, until, now) {
+            Ok(flush) => {
+                self.write_held_input(flush);
+                true
+            }
+            Err(()) => false,
+        }
+    }
+
+    /// End `token`'s lease and write what it held, in order.
+    pub(crate) fn end_injection_lease(&self, token: &str) {
+        let held = self.injection_lease.release(token);
+        self.write_held_input(held);
+    }
+
+    /// End a lease past its bound. True when one ended.
+    pub(crate) fn expire_injection_lease(&self, now: std::time::Instant) -> bool {
+        let Some(held) = self.injection_lease.expire(now) else {
+            return false;
+        };
+        self.write_held_input(Some(held));
+        true
+    }
+
+    /// End any lease, for a server that is stopping or handing off.
+    pub(crate) fn end_all_injection_leases(&self) {
+        let held = self.injection_lease.release_all();
+        self.write_held_input(held);
+    }
+
+    pub(crate) fn injection_lease_until(&self) -> Option<std::time::Instant> {
+        self.injection_lease.until()
+    }
+
+    pub(crate) fn holds_injection_lease(&self, token: &str, now: std::time::Instant) -> bool {
+        self.injection_lease.holds(token, now)
+    }
+
+    fn write_held_input(&self, held: Option<Bytes>) {
+        let Some(bytes) = held.filter(|bytes| !bytes.is_empty()) else {
+            return;
+        };
+        self.operator_input.stamp();
+        if let Err(err) = self.io.try_send_bytes(bytes) {
+            crate::logging::pane_held_input_write_failed(&err.to_string());
+        }
     }
 
     /// Write bytes flock authored on its own initiative, WITHOUT counting them
@@ -2384,6 +2459,7 @@ impl PaneRuntime {
                 preserve_processes_on_drop: true,
                 operator_input: OperatorInputClock::default(),
                 has_been_typed_into: Cell::new(false),
+                injection_lease: Default::default(),
                 spawned_with_default_shell: false,
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
@@ -2735,6 +2811,7 @@ mod tests {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
             spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
@@ -2766,6 +2843,7 @@ mod tests {
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
             has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
             spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
