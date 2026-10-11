@@ -69,13 +69,17 @@ unnecessary.
 
 That last fact matters for ADR-0027 §3: its digest is specified as intent
 `fyi`, so as written it would never wake a parked architect even after #697.
-§6 resolves that.
+§5 resolves that.
 
 ### Measurements taken for this ADR
 
 All in an isolated flk (sandbox `XDG_CONFIG_HOME`, copied 1.1.0 binary, a real
 throwaway Claude Code session on a small model) or read-only from one host's
-event log. Raw numbers are in the PR description.
+event log. The runbook that produced them is `tests/probes/agent_wake.py`
+(subcommands `idle-wake`, `busy`, `background`, `event-volume`,
+`judge-latency`). The samples are small (5 idle wakes, 3 busy runs, one
+background run, one host's log), so read them as orders of magnitude, not
+tails.
 
 **Event volume** (one host's durable log, last 7 days, 168 h, a median of 5
 and a peak of 22 agent panes active per hour):
@@ -251,6 +255,41 @@ the one log, not a second event system.
   delegates gets well under one digest per delegate per hour, which matches
   the cadence `supervisor.py` already had to batch to.
 
+### 3a. Mixed fleets: every change here is additive on the wire
+
+Clients and servers of different versions meet daily: a CLI updated before the
+server it talks to, an MCP server process started by an older binary, and mesh
+peers on older releases (#868). Requests carry no client protocol version, so a
+server cannot tailor a reply to an old client. Therefore:
+
+- **Responses only gain fields.** `state`, `phase`, `waiting` and the derived
+  kinds are additions. Old clients print the envelope as-is and ignore what they
+  do not know; MCP passes it through. A new client reading an old server treats
+  a missing `state` as `phase: unknown` and falls back to `agent_status`.
+- **New methods are new `Method` variants**, gated by #868: a state-changing one
+  (`wait.park`, channel binding calls) is in `needs_current_protocol()` and
+  refused locally with `server_version_gap` (exit 78) against an older server;
+  a read-only one (`events.read`) reaches the old server, fails as an unknown
+  variant, and `normalize` turns that into the same exit 78 with the handoff
+  hint. No new method is ever sent to an old server and misread as success.
+- **One protocol bump per release** that adds methods or changes request
+  shapes (AGENTS.md rule: compare `PROTOCOL_VERSION` with the last released
+  tag, bump only if not already ahead). Field additions alone need no bump.
+- **Behaviour changes on existing methods are named.** `events.subscribe`
+  starting at "now" instead of replaying the ring from 0 is visible to an old
+  client talking to a new server; nothing in-tree relies on the replay, and
+  ADR-0005 calls it a non-goal, so it ships as a changelog line.
+- **The durable log must stay readable by the previous release.** New kinds
+  are appended to `event-log.jsonl`; an older server (after a downgrade, or the
+  old side of a live handoff) must skip kinds it does not know rather than
+  quarantine the file. E3 verifies that against the last released binary before
+  it adds a kind, and fixes the reader first if it does not hold.
+- **Mesh peers on an older version** relay nothing new. This ADR's events and
+  waits are local to a server; cross-host agents appear with whatever their own
+  server reports, so an older peer's agents read `phase: unknown`, and a wait on
+  a remote subject is refused with `peer_incompatible` rather than left open
+  forever.
+
 ### 4. Background work is attributed, and harness background waits count as waits
 
 The sandbox measurement (Context) shows both halves: today's Claude detector
@@ -309,9 +348,12 @@ Rules:
   write goes through the one guarded injection (#850). One lease per pane; the
   operator's keys are buffered, a one-row draft is stashed and restored, a
   multi-row draft makes the wake wait. Priority when several are due at the
-  same boundary: armed compaction, then operator input, then a wake, then a goal
-  continuation (ADR-0030 §4). This settles the 2026-10-09 starvation between a
-  goal continue-hook and an idle-gated compaction.
+  same boundary: **operator input first** (as #850 and ADR-0027 §3 already
+  decide: a human typing is never overridden), then an armed compaction, then a
+  wake, then a goal continuation (ADR-0030 §4). Compaction above continuation
+  settles the 2026-10-09 starvation between a goal continue-hook and an
+  idle-gated compaction; operator input above compaction means a compaction
+  waits for the operator's quiet window like every other write.
 - **Wake follows the wait, not the intent.** ADR-0018 keeps `fyi` from waking
   an agent. That rule stands for peer mail, and gains one clause: **a message
   or event that opens a wait the recipient registered wakes it, whatever its
@@ -332,7 +374,7 @@ Rules:
 | Key | Default | Why |
 | --- | --- | --- |
 | `[events] settle_ms` | 20000 | §1; 54 % of raw transitions removed, compaction and quota screens filtered |
-| `[events] read_max_wait_ms` | 600000 | the MCP tool-call ceiling |
+| `[events] read_max_wait_ms` | 540000 | 60 s of headroom below the 600 s MCP tool-call cap, so the server answers (with an empty batch and `next_after`) before the harness kills the call |
 | `[digest] max_lines` | 12 | one screen; overflow → `+k more: flk delegate list --mine` |
 | `[wake] operator_quiet_ms` | 15000 | unchanged from idle wake |
 
@@ -378,9 +420,11 @@ other client. It gets no private path.
   `reply`), and the server refuses anything outside them and logs every inbound
   message with the external user id. The adapter's own allow-list of chat and
   user ids is a second check, not the only one.
-- **One owner per binding.** A binding is served by exactly one node (a lease
-  in the server config); an offline node means the channel is quiet and resumes
-  from its cursor, not that another node double-posts. Cross-host agents are
+- **One owner per binding.** A binding is served by exactly one node, named
+  statically in the binding's config (`owner_node`); there is no lease and no
+  automatic failover. An offline owner means the channel is quiet and resumes
+  from its cursor when the node returns, not that another node double-posts.
+  Moving a binding is a config change. Cross-host agents are
   reached through mesh mail (ADR-0026), not through a second bot.
 - **Not decided here:** Telegram formatting, attachments, the onboarding flow
   and whether flk embeds the adapter later. The contract above is what any
@@ -390,14 +434,14 @@ other client. It gets no private path.
 
 | Today | Becomes | Slice |
 | --- | --- | --- |
-| `until [ "$(flk agent get …)" = idle ]; do sleep …` | `flk events wait --subject <agent> --phase finished,needs_human,gone` | E4 |
+| `until [ "$(flk agent get …)" = idle ]; do sleep …` | `flk events wait --subject <agent> --phase finished,needs_human,gone` | E4b |
 | `supervisor.py` status loop, `[fleet] …` typed lines | ADR-0027 digest (#961) triggered by `agent.phase_changed`, delivered via §5 | E3, #961 |
 | `supervisor.py` CI watcher (watcher-s1 around `gh pr checks --watch`) | `pr.ci_completed` events | E7 |
 | `landbatches.sh` `sleep 60` over `gh pr checks` | `flk events wait --kinds pr.ci_completed,pr.merged --subject pr:<n>` | E7 |
-| `delegate wait` / `agent wait --status settled` client polling at 200 ms | thin wrappers over `events.read` with a server-side predicate | E4 |
+| `delegate wait` / `agent wait --status settled` client polling at 200 ms | thin wrappers over `events.read` with a server-side predicate | E4c |
 | goal-s1 `bg-checkin` on harness background waits | registered waits make the agent `waiting_on_event`; ADR-0030 parks it | E5 |
-| watch-nudge hook pointing at a skill agents rarely load | the hook points at `flk events wait` and Claude's `Monitor`, one story | E4 (docs) |
-| briefs' "send fallback: send-text + send-keys Enter" | ADR-0029 | C4 |
+| watch-nudge hook pointing at a skill agents rarely load | the hook points at `flk events wait` and Claude's `Monitor`, one story | E4b |
+| briefs' "send fallback: send-text + send-keys Enter" | ADR-0029 | C4b, C4d |
 
 Skills and docs to update in the same slices: the `architect` skill, the
 `watch-job` skill and watch-nudge text, `flk agent wait --help`, the brief
@@ -408,16 +452,20 @@ template's Rules section, and `docs/next` CLI reference pages.
 Each is ≤ ~400 diff lines and independently shippable. The cross-ADR order is
 in ADR-0030 §8.
 
-| # | Slice | Depends on | Replaces / amends | Acceptance |
-| --- | --- | --- | --- | --- |
-| E1 | `state` object (turn / background / attention / lifecycle, `phase`, `held_ms`, per-axis source) on `agent.get` / `agent.list`; detector `blocked` → `needs_human`; Claude background from the footer | — | #697 (first half), #922 follow-up | Fixture screens per harness map to the documented `phase`; a Claude pane with a live background shell after its turn reads `turn: idle, background: running`, `phase: finished_with_background` |
-| E2 | Idle wake, self-compact and the guarded-submit settle gate key on `turn`, not on background | E1 | #697 (second half) | Sandbox probe: Claude with a `run_in_background` loop ends its turn, an armed self-compact fires, a `needs_reply` message wakes it |
-| E3 | Derived durable kinds `agent.phase_changed`, `agent.needs_human`, `agent.limit_reached`, `agent.gone` after the server settle window | E1 | #663 A (event half) | A status that flips back inside the window emits nothing; a real `PaneAgentStatusChanged` sequence produces exactly one `agent.phase_changed` |
-| E4 | `events.read { after, kinds, subjects, limit, wait_ms }` with ring-then-disk replay and `gap`; `flk events read/wait`; MCP `flock_events_read`; `events.subscribe` starts at `after` or now and reports `lagged`; `delegate wait` and `agent wait --status settled` re-based on it | — (E3 for the useful kinds) | `EventsWait` schema stub | Property test: random rotations and restarts, a reader resuming from any retained cursor sees every event once or more, never a silent gap; a reader past retention gets `gap` |
-| E5 | Wait registry: blocking and `park` waits recorded against the attested caller, `state.waiting`, `phase: waiting_on_event`, deadline expiry event | E1, E4 | — | A parked agent reads `waiting_on_event`; a `flk events wait` started under Claude `run_in_background` makes the pane `waiting_on_event`, not `finished_with_background` |
-| E6 | Wake-follows-wait: a message or event that opens a registered wait wakes regardless of intent; idle wake for Codex and opencode where the inbox tool is configured | E2, E5 | ADR-0027 §3 wake gap (#961) | An architect parked on its delegates is woken by an `fyi` digest within one injection; an unparked one is not; a Codex agent with the flock MCP server is woken |
-| E7 | PR poller adds check-run conclusions; `pr.ci_completed`, `pr.merged`, `pr.closed` kinds | — | #663 B | One `pr.ci_completed` per head SHA with failed check names; no added per-worktree `gh` exec |
-| E8 | Channel adapter contract: binding config, capability token, per-binding coalescing buffer, inbound `msg.send` / `msg.reply` attribution and scope checks; a reference adapter test double | E4, ADR-0029 C1 | #1005 (contract half) | #1005's first-slice acceptance against a fake adapter; an unauthorised sender is refused and logged |
+| # | Slice | Depends on | Replaces / amends | Skew (§3a) | Acceptance |
+| --- | --- | --- | --- | --- | --- |
+| E1a | `state` object with `turn`, `lifecycle`, `phase`, `held_ms` and per-axis `source` on `agent.get` / `agent.list`, from today's detectors only; `background` and `attention` present as `unknown` | — | #697 (first half), #922 follow-up | Fields only, no bump. Old client: prints them. New client, old server: no `state`, falls back to `agent_status`. Old mesh peer: remote rows `unknown` | Fixture screens per harness map to the documented `phase`; precedence table drift-locked |
+| E1b | `background` axis: Claude footer counter, process-tree attribution for Codex / opencode (#663 A) | E1a | #663 A (predicate half) | Fields only | A Claude pane with a live background shell after its turn reads `turn: idle, background: running`, `phase: finished_with_background`; a Codex pane with a running child reads the same |
+| E1c | `attention` axis: detector `blocked` becomes `needs_human{reason}`; `blocked{provider_limit}` for Claude and Codex quota screens (captured per the AGENTS.md evidence rule) | E1a | — | Fields only; `agent_status` keeps reporting `blocked` for old consumers | Captured screens for each dialog kind and each quota screen map to the right `attention` |
+| E2 | Idle wake, self-compact and the guarded-submit settle gate key on `turn`, not on background | E1b | #697 (second half) | Server-internal, no wire change | Sandbox probe: Claude with a `run_in_background` loop ends its turn, an armed self-compact fires, a `needs_reply` message wakes it |
+| E3 | Derived durable kinds `agent.phase_changed`, `agent.needs_human`, `agent.limit_reached`, `agent.gone` after the server settle window | E1a (E1b, E1c enrich it) | #663 A (event half) | New persisted kinds: first verify the last released server skips unknown kinds in the log, fix the reader if not | A status that flips back inside the window emits nothing; a real `PaneAgentStatusChanged` sequence produces exactly one `agent.phase_changed` |
+| E4a | `events.read { after, kinds, subjects, limit, wait_ms }` on the socket: ring-then-disk replay, `gap`, server-side long-poll on the hub condvar | — | `EventsWait` schema stub | New method, protocol bump. Old server: exit 78 via `normalize` | Property test: random rotations and restarts, a reader resuming from any retained cursor sees every event once or more, never a silent gap; a reader past retention gets `gap` |
+| E4b | `flk events read` / `flk events wait` and MCP `flock_events_read`; watch-nudge text and the `watch-job` skill point at them | E4a | — | Client side only; against an old server the verbs exit 78 | `flk events wait --kinds agent.phase_changed --subject <agent> --timeout 5s` returns the event, or exits 124 |
+| E4c | `events.subscribe` takes `after`, starts at now when omitted, reports `lagged`; `delegate wait` and `agent wait --status settled` re-based on `events.read` | E4a | — | Changes `events.subscribe` defaults (changelog line); new clients use `events.read` only when the server advertises the protocol, else keep today's polling | `delegate wait` makes one request per state change instead of 5 per second; existing wait exit codes unchanged |
+| E5 | Wait registry: blocking and `park` waits recorded against the attested caller, `state.waiting`, `phase: waiting_on_event`, deadline expiry event | E1a, E4a | — | `wait.park` is state-changing: gated, exit 78 against an old server | A parked agent reads `waiting_on_event`; a `flk events wait` started under Claude `run_in_background` makes the pane `waiting_on_event`, not `finished_with_background` |
+| E6 | Wake-follows-wait: a message or event that opens a registered wait wakes regardless of intent; idle wake for Codex and opencode where the inbox tool is configured | E2, E5 | ADR-0027 §3 wake gap (#961) | Server-internal. Mail relayed from an older peer is woken by the local rule, since the rule runs at the recipient | An architect parked on its delegates is woken by an `fyi` digest within one injection; an unparked one is not; a Codex agent with the flock MCP server is woken |
+| E7 | PR poller adds check-run conclusions; `pr.ci_completed`, `pr.merged`, `pr.closed` kinds | — | #663 B | New persisted kinds (same reader check as E3) | One `pr.ci_completed` per head SHA with failed check names; no added per-worktree `gh` exec |
+| E8 | Channel adapter contract: binding config, capability token, per-binding coalescing buffer, inbound `msg.send` / `msg.reply` attribution and scope checks; a reference adapter test double | E4a, ADR-0029 C1 | #1005 (contract half) | New state-changing methods, gated; an adapter refuses to start against a server without them | #1005's first-slice acceptance against a fake adapter; an unauthorised sender is refused and logged |
 
 ## Consequences
 
@@ -461,7 +509,7 @@ in ADR-0030 §8.
 ## Risks
 
 - **Detector gaps for `needs_human` and `provider_limit`** on Claude and Codex.
-  E1 ships the axes with `unknown` where evidence is missing, and the
+  E1a ships the axes with `unknown` where evidence is missing, and the
   detector work follows the evidence rule in AGENTS.md.
 - **Process-tree background attribution** can mis-count shells that outlive
   their purpose (a forgotten `tail -f`). `finished_with_background` is a
@@ -482,7 +530,33 @@ in ADR-0030 §8.
   restarts and torn tails asserting the §3 guarantee; a test that starts at a
   real `PaneAgentStatusChanged` and ends at `agent.phase_changed`.
 - **Waiting and wake:** the sandbox runbook used for this ADR's measurements
-  (isolated flk, throwaway Claude, `msg send` → turn start timing) becomes a
-  `tests/probes/` runbook, run against two builds for E2 and E6.
+  (isolated flk, throwaway Claude, `msg send` → turn start timing) is
+  `tests/probes/agent_wake.py`; E2 and E6 run it against the build before and
+  after the slice.
 - **Channels:** a fake adapter over the socket exercising cursor resume,
   coalescing under a rate limit, scope refusal and inbound attribution.
+
+## Owner decisions
+
+Each of these is open until the operator answers it. The recommendation comes
+first.
+
+1. **Wake follows the wait (§5).** Recommended: amend ADR-0027 §3 through this
+   rule, so the digest stays `fyi` and wakes only an architect that parked.
+   Alternative: give the digest a waking intent, which would interrupt
+   architects that did not ask to be woken.
+2. **Injection priority (§5).** Recommended: operator input first, then
+   compaction, then a wake, then a goal continuation, which keeps #850 and
+   ADR-0027 §3 intact. Alternative: compaction above the operator, which would
+   be the only write allowed to override a human and is not proposed.
+3. **Defaults (§6).** Recommended: 20 s settle (5 s already removes 48 % of raw
+   transitions, 20 s removes 54 % and also covers compaction and quota
+   screens), a 12-line digest, and 540 s maximum read wait.
+4. **Channels (§8).** Recommended: inbound text defaults to `needs_reply` (it
+   wakes, since a person sent it on purpose); adapters authenticate with a
+   per-binding capability token issued by the server; one statically named
+   node per binding, no failover.
+5. **Channel adapter placement.** Recommended: out of process (the
+   telegram-bot daemon over the socket) now; embedding later must keep §8's
+   contract.
+

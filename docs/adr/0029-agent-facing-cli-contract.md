@@ -7,7 +7,7 @@
   submit and confirmed outcomes), #850 (injection lock), #868 (client/server
   skew). Consumed by ADR-0028 §8 (external channels).
 - Decision owner: operator.
-- Implemented: none. Slices are listed in §7 and are not filed yet.
+- Implemented: none. Slices are listed in §8 and are not filed yet.
 
 ## Context
 
@@ -75,13 +75,20 @@ itself the point: the caller's only defence is an exit code it can trust.
   | `accepted`, `observed_accepted` | empty, a new turn confirmed | no (done) | 0 |
   | `refused` (reason: `not_settled`, `input_not_empty`, `operator_active`, `injection_pending`, `unknown_composer`, `restart_pending`, …) | untouched, nothing typed | yes, later | 10 |
   | `abandoned` (reason …) | restored to what it was (the text was removed or never committed) | yes | 9 |
-  | `typed_not_submitted` | **holds the sent text** | no: inspect or clear first | 8 |
-  | `unconfirmed` (reason `confirm_timeout`, `owned_composer_not_visible`) | unknown | no: inspect first | 8 |
+  | `unconfirmed`, reason `typed_not_submitted` | **holds the sent text** | no: inspect or clear first | 8 |
+  | `unconfirmed`, reason `confirm_timeout` / `owned_composer_not_visible` | unknown | no: inspect first | 8 |
 
-  `typed_not_submitted` is new and is the outcome the survey and the owner
+  `typed_not_submitted` is new and is the case the survey and the owner
   describe: the text was observed in the composer and no turn started after
-  the Enter retry. It shares exit 8 with `unconfirmed` because the caller's
-  action is the same (look before retrying), and the JSON names which.
+  the Enter retry. **On the wire it is a `reason`, not a new `outcome`**: an old
+  client maps every outcome other than `unconfirmed` and `abandoned` to exit 0
+  (`effect_exit_code`), so a new outcome string would read as success to every
+  CLI and MCP process older than the server. Carried under `outcome:
+  "unconfirmed"`, it keeps exit 8 on old clients and gains its name on new
+  ones. The caller's action is the same either way: look before retrying.
+- **`refused` is a client-side name.** The server keeps returning refusals as
+  error envelopes with today's codes; the new client maps those codes to the
+  `refused` outcome and exit 10. Nothing changes on the wire.
 - **A send never reports success it did not observe.** Plain `--no-submit`
   reports `delivered` only on an observed change, as today.
 - **`pane run` without a guard** stays for shells (it is how a human script
@@ -100,10 +107,10 @@ their meaning where they do not collide; collisions are resolved once:
 | 0 | success, effect observed | — | all |
 | 1 | unclassified failure (transport, internal) | maybe | all |
 | 2 | usage error | never (fix the call) | all |
-| 3 | the other side answered "no / not now" (BLOCKED reply, deferred, expired) | after reading the answer | waits, `msg`, `delegate wait` |
+| 3 | the other side answered "no / not now" (BLOCKED reply, deferred, expired) | after reading the answer | `msg`, `wait reply`, `delegate wait` |
 | 4 | target not found or gone | never (re-resolve) | all |
 | 5 | finished without the expected result (no sentinel, no result) | after inspecting | `delegate wait` |
-| 6 | the agent needs a human or is blocked | after the human acts | waits, `delegate wait` |
+| 6 | the agent needs a human or is blocked (was 3 for `agent wait` / `wait agent-status`) | after the human acts | waits, `delegate wait` |
 | 7 | stalled (working, no progress past the stall window) | after inspecting | waits |
 | 8 | effect uncertain: text may be in the composer (`typed_not_submitted`, `unconfirmed`) | inspect first | send-like verbs |
 | 9 | effect abandoned, composer restored | yes | send-like verbs |
@@ -111,14 +118,29 @@ their meaning where they do not collide; collisions are resolved once:
 | 11 | delegate not started (was 8) | after inspecting | `delegate start/wait` |
 | 12 | `--field` path missing in the result | never | all (§3) |
 | 13 | refused by policy or scope (`msg` refused, channel scope, ADR-0014 boundary; was 4 for `msg`) | never without a change | `msg`, channel adapters |
+| 75 | the client gave up reconnecting to its server (`RECONNECT_GAVE_UP_EXIT_CODE`, #436; EX_TEMPFAIL) | yes, once the server is back | the attached client and launcher |
 | 78 | client/server protocol gap (#868) | after a handoff | all |
 | 124 | timeout | yes | waits |
 
-- The two moves (`delegate` `not_started` 8 → 11, `msg` `refused` 4 → 13) are
-  breaking for scripts that branch on them. They ship in one release with a
-  changelog entry under *changed* and a one-release stderr notice when the new
-  code is returned. The survey counts make this cheap: `delegate wait` is the
-  only one with real usage and its `not_started` branch is rare.
+- **Four changes break scripts that branch on the old code**, and all four
+  are listed in the release's changelog under *changed*:
+
+  | Verb | Case | Old | New |
+  | --- | --- | --- | --- |
+  | every send-like and guarded verb | refused before acting (`not_settled`, `input_not_empty`, `operator_active`, …) | 1 | 10 |
+  | `agent wait`, `wait agent-status` (`settled::exit::BLOCKED`) | the agent is blocked on a dialog | 3 | 6 |
+  | `delegate start` / `delegate wait` | not started | 8 | 11 |
+  | `msg` waits and status | refused | 4 | 13 |
+
+  The 1 → 10 move is the widest: any `|| retry` written against today's exit 1
+  starts seeing 10 for the cases it actually meant. The 3 → 6 move aligns the
+  plain waits with `delegate wait`, which already uses 6 for the same signal
+  (`AGENT_BLOCKED`) and 3 for a BLOCKED *reply*; today the same agent state
+  yields 3 or 6 depending on the verb. All four ship together in one release
+  (C4c), each with a one-release stderr notice naming the old code when the new
+  one is returned. The survey shows real usage only for `delegate wait` and the
+  plain waits (343 blocking waits in 21 days), and their blocked branches are a
+  small share.
 - Every verb's `--help` lists the exit codes it can return, generated from the
   registry.
 - MCP returns the same retry class in `data.retry` and the exit code in
@@ -180,15 +202,37 @@ table: `queued`, `woken` (wake `accepted`), `read`, `replied`, and
 `unconfirmed` / `abandoned` / `refused` as themselves. Scope refusals are exit
 and code 13 (`channel_scope_refused`).
 
-### 7. Slices
+### 7. Mixed fleets
 
-| # | Slice | Depends on | Replaces / amends | Acceptance |
-| --- | --- | --- | --- | --- |
-| C1 | Exit-code registry and error-code enum with retry class; refusals before acting map to exit 10; `--help` exit sections generated; drift-lock tests | — | — | Every existing code path returns the same code as before except refusals (1 → 10); a test lists every code and fails on an unregistered literal |
-| C2 | Error envelope on stdout under `--json` / `--format json` / `--field`, human line on stderr; global `--format`; MCP `data.retry` / `data.exit` | C1 | #996 (errors half) | `flk agent get nosuch --json | python3 -c 'import json,sys; json.load(sys.stdin)'` succeeds and exits 4; plain `flk agent get nosuch` prints one human line |
-| C3 | Global `--field <path>` with `[]` / `[n]`, exit 12 on a missing path | C2 | #996 (selector half) | `flk agent list --field 'agents[].name'` prints one name per line; a missing path exits 12 with the envelope |
-| C4 | `agent send` submits by default; `--no-submit`; `typed_not_submitted` outcome; `delegate` `not_started` → 11 and `msg` `refused` → 13 with notices; brief template, architect skill and docs move off `send-keys Enter` | C1 | #995 | Sandbox probe: a send into a composer that swallows Enter returns `typed_not_submitted`, exit 8; a send into a settled empty composer is `accepted`, exit 0; a send into a busy agent exits 10 with nothing typed |
-| C5 | Uniform target resolution for pane-id-only verbs; MCP `to` accepts a bare string; `data.expected` on shape refusals | — | survey item 11 | `flk pane get <agent-name>` works; `flock_msg_send {to: "w3:p2"}` delivers |
+Requests carry no client protocol version, so every change in this ADR is either
+client-side or additive on the wire:
+
+- **Client-side only:** exit-code and error-code mapping (C1, C4c), the error
+  envelope on stdout, `--format` and `--field` (C2, C3), the `agent send` default
+  (C4b: the new client calls the guarded submit, which every server since
+  v1.0.0 has), and MCP's bare-string `to` (the bridge converts it to the tagged
+  object before sending, so old servers accept it).
+- **Additive on the wire:** `reason: "typed_not_submitted"` under `outcome:
+  "unconfirmed"` (C4a; old clients still exit 8), and `data.retry` / `data.exit`
+  in MCP errors (produced by the bridge, which is the client binary).
+- **Server behaviour a new client may lean on:** name resolution for today's
+  pane-id-only verbs (C5). Against an older server the new client resolves the
+  name through `agent.get` first and sends the pane id.
+- No slice here needs a protocol bump on its own; C5's resolver change is a
+  relaxation, not a new shape.
+
+### 8. Slices
+
+| # | Slice | Depends on | Replaces / amends | Skew (§7) | Acceptance |
+| --- | --- | --- | --- | --- | --- |
+| C1 | Exit-code registry and error-code enum with retry class; `--help` exit sections generated; drift-lock tests. No code changes value yet | — | — | Client-side | Every existing code path returns the same code as before; a test lists every code and fails on an unregistered literal |
+| C2 | Error envelope on stdout under `--json` / `--format json` / `--field`, human line on stderr; global `--format`; MCP `data.retry` / `data.exit` | C1 | #996 (errors half) | Client-side | `flk agent get nosuch --json | python3 -c 'import json,sys; json.load(sys.stdin)'` succeeds and exits 4; plain `flk agent get nosuch` prints one human line |
+| C3 | Global `--field <path>` with `[]` / `[n]`, exit 12 on a missing path | C2 | #996 (selector half) | Client-side | `flk agent list --field 'agents[].name'` prints one name per line; a missing path exits 12 with the envelope |
+| C4a | `typed_not_submitted` detection in the guarded submit, as a `reason` under `unconfirmed` | — | #995 (outcome half) | Additive; old clients exit 8 | Sandbox probe with a composer that swallows Enter: `unconfirmed` / `typed_not_submitted`, exit 8, on both the new client and the last released client |
+| C4b | `agent send` submits by default; `--no-submit`; `--submit` becomes a deprecated no-op | C1 | #995 (default half) | Client-side | A send into a settled empty composer is `accepted`, exit 0; `--no-submit` types only |
+| C4c | The four exit-code moves of §2 with one-release stderr notices and the changelog table | C1 | — | Client-side | Each moved case returns its new code and names the old one on stderr |
+| C4d | Docs, `architect` skill, brief template and watch-nudge text move off `send-keys Enter` and the `send-text` fallback | C4b | survey item 2 | — | `rg 'send-keys .* Enter'` finds no agent-facing recommendation in docs or skills |
+| C5 | Uniform target resolution for pane-id-only verbs; MCP `to` accepts a bare string; `data.expected` on shape refusals | — | survey item 11 | New client pre-resolves against old servers | `flk pane get <agent-name>` works; `flock_msg_send {to: "w3:p2"}` delivers |
 
 ## Consequences
 
@@ -233,3 +277,21 @@ and code 13 (`channel_scope_refused`).
 - A sandbox probe with fake composers (Claude, Codex, opencode fixtures from
   `tests/delegate.rs`) for each send outcome, including one whose Enter is
   swallowed.
+
+## Owner decisions
+
+Recommendation first; each is open until the operator answers it.
+
+1. **`agent send` submits by default** (C4b), with `--no-submit` and a
+   one-release deprecation of `--submit` as a no-op. Recommended: yes; the
+   survey shows teaching `--submit` failed (32 of 951 sends).
+2. **The four exit-code moves in one release** (§2: 1 → 10, 3 → 6, 8 → 11,
+   4 → 13), each with a one-release stderr notice. Recommended: yes, together,
+   so scripts are updated once. Alternative: keep 3 for the plain waits and
+   accept that one signal has two codes depending on the verb.
+3. **Errors on stdout with `--json` / `--field`**, a human line on stderr.
+   Recommended: yes; without machine output nothing changes.
+4. **Refuse multi-row text without bracketed paste** (`unsafe_text`) instead
+   of typing it line by line. Recommended: yes; line-by-line typing submits the
+   first line early in every harness.
+

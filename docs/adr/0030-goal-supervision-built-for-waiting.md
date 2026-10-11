@@ -64,8 +64,10 @@ re-validation fixtures (median 1.5 KB):
 | 6 concurrent distinct | 724 / 1,495 / 2,220 / 2,936 / 3,703 / 4,354 ms |
 
 So the judge is fast and deterministic alone, and its tail is set entirely by
-queueing: each request ahead adds about 0.73 s, and the sixth concurrent
-request already exceeds goal-s1's 3.5 s timeout. A per-host fleet with several
+queueing: each request ahead adds about 0.73 s, and the **fifth** concurrent
+request (3,703 ms) already exceeds goal-s1's 3.5 s timeout. The samples are
+small (30 sequential and 9 concurrent calls, `tests/probes/agent_wake.py
+judge-latency`); the per-request queueing cost is the robust part. A per-host fleet with several
 agents stopping at once will hit that.
 
 ## Decision
@@ -98,7 +100,7 @@ decides in this order and stops at the first rung that applies:
 | 2 | a compaction is armed or the handoff sentinel (#884) is present and fresh | allow, so the compaction can run | no |
 | 3 | `state.attention` is `needs_human` or `blocked` (ADR-0028) | allow; notify the supervisor or operator (§5) | no |
 | 4 | the agent has an open **registered wait** (ADR-0028 §5): parked on a delegate, a PR's CI, a reply, or a `flk events wait` running under the harness's background mechanism | **parked**: allow silently, no push, no check-in timer | no |
-| 5 | every open subtask is owned by a live delegate edge (ADR-0027) that is `working` or `waiting_on_event` | parked (as 4, derived from edges) | no |
+| 5 | every open subtask is owned by a live delegate edge (ADR-0027) whose `phase` is `working`, `settling`, `finished_with_background` or `waiting_on_event` | parked (as 4, derived from edges) | no |
 | 6 | frozen checks are green | enter the done gate: independent review, then `GoalMet` | no |
 | 7 | background work flk cannot attribute (`finished_with_background`) | allow, start a check-in deadline (`[goal] background_checkin_s`, default 30 min) instead of a push | no |
 | 8 | otherwise: classify the final message | judge (§3): `asks` / `routine` / `legit` / `deferred` → block with a continue nudge, or allow | yes |
@@ -110,8 +112,17 @@ Consequences of the order:
   pushes, because an agent that waits through flk is visibly parked. Only
   waits flk cannot see (rung 7) get a timer, and the timer is a deadline, not a
   per-stop push.
+- **Delegates that will still produce an event park the architect.** A
+  `settling` delegate becomes `finished` or `working` within the settle window,
+  and a `finished_with_background` delegate becomes `finished` when its build or
+  push ends (or hits its own check-in deadline); either way an event follows
+  and wakes the architect. Delegates that are `finished`, `needs_human`,
+  `blocked` or `gone` do not park it, because each means the architect has
+  something to do now (review, answer, re-plan).
 - **Compaction beats continuation.** Rung 2 is above every block, which
-  removes the 2026-10-09 starvation.
+  removes the 2026-10-09 starvation. A verdict is not a write into the pane, so
+  this does not touch the injection priority in §4, where the operator comes
+  first.
 - **A human-owed answer is never pushed back.** Rung 3 is above the judge, and
   owner-reserved actions (#883: merge, release, deploy, "your call") are
   classified as `legit` before the routine threshold is applied.
@@ -151,9 +162,12 @@ Consequences of the order:
 Goal nudges are typed only when the agent's turn has ended without a block (an
 idle agent the stopwatch decided to nudge). They go through the one guarded
 injection of #850, like every other wake (ADR-0028 §5). When several writes are
-due at one boundary the order is: armed compaction, operator input, a wake for
-a registered wait or mail, a goal continuation. A goal nudge never interleaves
-with a compaction, and an operator typing always wins.
+due at one boundary the order is: **operator input**, then an armed
+compaction, then a wake for a registered wait or mail, then a goal
+continuation. That is the order ADR-0028 §5 states and the one #850 and
+ADR-0027 §3 already imply: an operator typing always wins, and a compaction
+waits for the operator's quiet window like any other write. A goal nudge never
+interleaves with a compaction.
 
 ### 5. Goals report up through ADR-0027's edges and ADR-0028's digest
 
@@ -193,14 +207,26 @@ with a compaction, and an operator typing always wins.
 
 ### 7. Slices
 
+Skew: every goal verb is a new `Method` variant. The state-changing ones (`arm`,
+`amend`, `status set`, `pause`, `stop`) are gated by #868 and refused locally
+with exit 78 against an older server; `goal.status` is read-only and gets exit
+78 via `normalize`. Adapters (the Stop hook, the opencode plugin) talk to the
+server in their own pane, so a hook binary newer than its server treats any
+`server_version_gap` from a goal call as "no goal armed" and allows the stop:
+an old server never makes a new hook block. The `Goal*` events are new
+persisted kinds and take ADR-0028 §3a's reader check. Goals are per host;
+mesh peers relay none of it.
+
 | # | Slice | Depends on | Replaces / amends | Acceptance |
 | --- | --- | --- | --- | --- |
 | G0 | Storage decision (#573's spike): event fold vs SQLite, measured on the Stop-hook hot path | — | #573 spike | A short ADR with the measured cost of `goal.status` and a verdict write |
-| G1 | Goal record (arm / status / pause / resume / stop, CLI + MCP), Claude and opencode adapters returning the server's verdict for rungs 1, 6 | G0 | #573 core | Restart the server, move the pane, duplicate an event: the goal and its verdicts survive (#573's acceptance probe) |
+| G1 | Goal record (arm / status / pause / resume / stop, CLI + MCP), Claude and opencode adapters returning the server's verdict for rungs 1, 6 | G0 | #573 core | Restart the server, move the pane, duplicate an event: the goal and its verdicts survive (#573's acceptance probe); a hook against an older server allows the stop |
 | G2 | Deterministic rungs 2–5 and 7: compaction first, attention, registered waits, edge-derived parking, background check-in deadline | G1, ADR-0028 E5, ADR-0027 slice 2 | #573 "parked" comment, #697 consumer | An architect parked on two delegates stops 10 times with no judge call and no push; a delegate going `finished` wakes it once |
-| G3 | Server judge client: serialization with stale-drop, turn-cursor cache, timeout, breaker, optional fallback, `degraded`, `GoalVerdict` with all scores and a label slot | G1 | #885, #886 | Fake judge with injected latency: six concurrent stops send one request per live turn; two timeouts open the breaker; a judge outage never yields `met` |
-| G4 | Question set, versioned thresholds, committed corpus, `flk goal judge revalidate`; owner-reserved clauses extracted from the goal text | G3 | #882, #883 | Revalidate prints per-question AUC against the corpus; an ask about a reserved action is never `routine` |
-| G5 | Handoff sentinel, compaction priority over continuation, pre-compaction `GoalStatusSet` handshake, multi-line continuations via a file | G2 | #884, survey item 10 | A continue-armed agent at the context band compacts within one boundary; a multi-line continuation is accepted |
+| G3a | Server judge client: timeout inside the adapter deadline, breaker (own-deadline timeouts excluded), optional fallback judge, `degraded` state, never `met` on failure | G1 | #885 | Fake judge: two timeouts open the breaker for 5 min; an outage yields allow + `degraded`, never `met` |
+| G3b | One request in flight per host, stale-turn drop, `(agent, turn_cursor)` cache, state cut to the final-message tail under the model's context | G3a | — | Fake judge with 0.73 s per queued request: six concurrent stops send one request per live turn, and none waits behind a stale one |
+| G3c | `GoalVerdict` events with all scores, thresholds version and a label slot; `flk goal decisions` export | G3a | #886 | Every judged stop appends one `GoalVerdict` with the full score set; a label can be attached later |
+| G4 | Question set, versioned thresholds, committed corpus, `flk goal judge revalidate`; owner-reserved clauses extracted from the goal text | G3c | #882, #883 | Revalidate prints per-question AUC against the corpus; an ask about a reserved action is never `routine` |
+| G5 | Handoff sentinel, compaction priority over continuation, pre-compaction `GoalStatusSet` handshake, multi-line continuations via a file | G2 | #884, survey item 10 | A continue-armed agent at the context band compacts within one boundary once the operator is quiet; a multi-line continuation is accepted |
 | G6 | SessionStart re-inject of goal + checklist + status + delegate table; goal link on edges; goal events as digest lines and operator notifications | G1, ADR-0027 slices 2 and 4, #961 | #962, #965 | An unarmed auto-compaction of an armed architect yields the four parts as hook output and types nothing |
 
 ### 8. Cross-ADR implementation order
@@ -208,18 +234,18 @@ with a compaction, and an operator typing always wins.
 The three ADRs of this spike and ADR-0027 interleave. Dependency order, with
 each line shippable on its own:
 
-1. **C1** exit and error registries (ADR-0029) — unblocks honest outcomes everywhere.
-2. **E1** state object, **E7** PR/CI events, **C5** target resolution — independent.
-3. **E2** turn-keyed wake and self-compact; **E3** derived events; **C2**, **C3** output contract; **C4** submit by default.
-4. **E4** `events.read` with cursor; ADR-0027 slices 1–2 (#959, #960).
+1. **C1** exit and error registries (ADR-0029), **C4a** `typed_not_submitted` — honest outcomes first.
+2. **E1a** state object, **E7** PR/CI events, **C5** target resolution — independent.
+3. **E1b**, **E1c** background and attention axes; **C2**, **C3** output contract; **C4b**, **C4c**, **C4d** submit by default, exit moves, docs.
+4. **E2** turn-keyed wake and self-compact; **E3** derived events; **E4a** → **E4b**, **E4c** event reads; ADR-0027 slice 2 (#960; slice 1, #959, has landed).
 5. **E5** wait registry; **E6** wake-follows-wait; ADR-0027 slice 3 (#961, now woken by E6).
-6. **G0** → **G1** → **G2**, **G3** → **G4**, **G5**; ADR-0027 slice 4 (#962).
+6. **G0** → **G1** → **G2**, **G3a** → **G3b**, **G3c** → **G4**, **G5**; ADR-0027 slice 4 (#962).
 7. **G6** with ADR-0027 slice 8 (#965); **E8** channel contract (#1005).
 
 Retirement checkpoints for the flock fleet's own scaffolding: after step 5,
 `supervisor.py`'s status loop, CI watcher and typed `[fleet]` lines; after
 ADR-0027's reap slice, its reap loop; after step 6, `goal_check` and the
-STATUS.md compaction phases; after C4, the send-keys fallback in briefs and
+STATUS.md compaction phases; after C4b and C4d, the send-keys fallback in briefs and
 the dialog scraping in `spawn-claude.sh` (with #605 already landed).
 
 ## Consequences
@@ -239,7 +265,7 @@ the dialog scraping in `spawn-claude.sh` (with #605 already landed).
   and a model cannot know what flk already knows.
 - **Codex native goals** as the mechanism. Prior art and, for Codex workers, at
   most a stop-control bridge (#573 owner decision 1).
-- **Let Clef's queue serialize concurrent judge calls.** Measured: the sixth
+- **Let Clef's queue serialize concurrent judge calls.** Measured: the fifth
   concurrent call misses the timeout.
 - **Goal state in repo files (GOAL.md / STATUS.md).** Owner decision 2 on #573,
   and the field report's lost STATUS.md.
@@ -269,3 +295,28 @@ the dialog scraping in `spawn-claude.sh` (with #605 already landed).
   pane, duplicate an event, lose the judge.
 - An offline corpus re-validation in CI for G4 (no network: scores are
   recorded, the command checks the scoring code and thresholds).
+
+## Owner decisions
+
+Recommendation first; each is open until the operator answers it. The
+decisions for ADR-0028 and ADR-0029 are listed at the end of each.
+
+1. **Judge failure default.** Recommended: allow the stop and mark the goal
+   `degraded` (visible, reported to the supervisor, never `met`). Alternative:
+   hold the stop until the judge returns, which turns a System One outage into
+   a fleet that cannot stop (the opencode twin's bug, claude-config#12).
+2. **Compaction vs operator.** Recommended: the operator first, compaction
+   second (§4). Compaction beats goal continuation in the stop ladder (rung 2)
+   either way.
+3. **Background check-in deadline** for work flk cannot attribute (rung 7).
+   Recommended: 30 minutes, then one check-in, then doubling. The survey's
+   median allowed wait was 2.4 h to 19 h, so a shorter default would bring back
+   the `bg-checkin` pushes this ADR removes.
+4. **G0: goal state as an event fold in the log vs a SQLite store.**
+   Recommended: the event fold, unless G0 measures the Stop-hook read path over
+   budget; it is the pattern lineage and ADR-0027 already use, and it gives the
+   versioned, auditable state the field report asked for.
+5. **Parking on delegates that are `settling` or `finished_with_background`**
+   (rung 5). Recommended: yes, because each produces a waking event; `finished`
+   and `needs_human` delegates do not park the architect.
+
