@@ -2541,7 +2541,7 @@ fn run_handoff_cli(
     runtime_dir: &Path,
     api_socket: &Path,
 ) -> (bool, String) {
-    let output = std::process::Command::new(exe)
+    let output = support::environment::Command::new(exe)
         .args(["server", "live-handoff"])
         .args(extra_args)
         .current_dir(cwd)
@@ -2573,7 +2573,7 @@ fn server_version(api_socket: &Path) -> String {
 }
 
 fn client_version() -> String {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--version")
         .env_remove("FLOCK_TEST_BUILD_VERSION")
         .output()
@@ -2594,7 +2594,7 @@ fn stop_and_clean(api_socket: &Path, base: &Path) {
 }
 
 fn process_argv0(pid: u32) -> String {
-    let output = std::process::Command::new("ps")
+    let output = support::environment::Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
         .expect("ps runs");
@@ -2627,7 +2627,7 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
         .expect("test server should expose pid");
     assert_eq!(process_argv0(server_pid), old_exe.display().to_string());
 
-    let output = std::process::Command::new(&profile_flk)
+    let output = support::environment::Command::new(&profile_flk)
         .args(["server", "live-handoff"])
         .envs(support::environment::isolated_env(
             &config_home,
