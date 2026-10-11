@@ -115,7 +115,6 @@ pub(super) fn agent_state(
     };
     let source = StateSources {
         turn: (turn != Turn::Unknown).then_some(turn_source),
-        lifecycle: Some(StateSource::Server),
         ..StateSources::default()
     };
     AgentState::derive(
@@ -249,7 +248,10 @@ mod tests {
             (hibernated.phase, hibernated.source.turn),
             (Phase::Hibernated, None)
         );
-        assert_eq!(hibernated.source.lifecycle, Some(StateSource::Server));
+        assert_eq!(
+            hibernated.held_ms, None,
+            "the screen's age is not the lifecycle's"
+        );
         assert_eq!(state(S::Offline, By::Hook, None).phase, Phase::Offline);
         let turn_source = |status, by, agent| state(status, by, agent).source.turn;
         let kimi = turn_source(S::Done, By::Hook, Some(Agent::Kimi));

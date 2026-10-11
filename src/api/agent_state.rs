@@ -17,50 +17,50 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// One server constant (ADR-0028 §1, owner decision 3).
 pub const SETTLE_MS: u64 = 20_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Turn {
     Working,
     Idle,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
 /// This slice emits only `unknown` here and for [`Attention`]. The other
 /// values exist so the phase table can be derived and locked whole; E1b and
 /// E1c give them their ADR payloads (`running { count, … }`, reasons).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Background {
     None,
     Running,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
     None,
     NeedsHuman,
     ProviderLimit,
     Blocked,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     Live,
     Hibernated,
     Offline,
     Gone,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Gone,
@@ -74,47 +74,72 @@ pub enum Phase {
     FinishedWithBackground,
     Finished,
     Settling,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
 /// Where an axis's value came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateSource {
     Screen,
     Hook,
     Plugin,
-    Server,
-    #[serde(other)]
+    #[default]
     Unknown,
 }
 
-/// Per-axis sources. An axis nothing reports has no entry.
+/// Per-axis sources for the observed axes (ADR-0028 §1's source table).
+/// An axis nothing reports has no entry. `lifecycle` has none: it is the
+/// server's own record of the process, not an observation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSources {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "or_unknown",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub turn: Option<StateSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "or_unknown",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub background: Option<StateSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "or_unknown",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attention: Option<StateSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<StateSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Every field reads leniently: a missing, renamed or reshaped value (a
+/// newer server's `background: running { … }`) becomes `unknown` on its own
+/// and the other axes survive (ADR-0028 §3a).
 pub struct AgentState {
+    #[serde(default, deserialize_with = "or_unknown")]
     pub turn: Turn,
+    #[serde(default, deserialize_with = "or_unknown")]
     pub background: Background,
+    #[serde(default, deserialize_with = "or_unknown")]
     pub attention: Attention,
+    #[serde(default, deserialize_with = "or_unknown")]
     pub lifecycle: Lifecycle,
+    #[serde(default, deserialize_with = "or_unknown")]
     pub phase: Phase,
     /// How long `phase` has held. Absent when the agent never reported a
-    /// state transition.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// state transition, and for `hibernated` / `offline`: their entry is not
+    /// timestamped yet, and the screen's last change predates it.
+    #[serde(
+        default,
+        deserialize_with = "or_unknown",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub held_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_unknown")]
     pub source: StateSources,
 }
 
@@ -134,8 +159,8 @@ impl AgentState {
         }
     }
 
-    /// Derive the state from the axes. `turn_held_ms` is how long `turn`
-    /// (or, off `live`, the lifecycle) has held.
+    /// Derive the state from the axes. `turn_held_ms` is how long `turn` has
+    /// held, and is dropped off `live` (see `held_ms`).
     pub fn derive(
         turn: Turn,
         background: Background,
@@ -162,7 +187,9 @@ impl AgentState {
         };
         // The settle boundary is itself a phase change: a settled phase has
         // held only since the window closed.
-        let held_ms = turn_held_ms.map(|ms| if settled { ms - SETTLE_MS } else { ms });
+        let held_ms = turn_held_ms
+            .filter(|_| matches!(lifecycle, Lifecycle::Live))
+            .map(|ms| if settled { ms - SETTLE_MS } else { ms });
         Self {
             turn,
             background,
@@ -175,12 +202,21 @@ impl AgentState {
     }
 }
 
-/// Deserialize `state` so that a missing, malformed or future-shaped value
-/// reads as absent, and the client falls back to `agent_status` rather than
-/// failing the whole record (ADR-0028 §3a).
+/// Deserialize `state` so that a value that is not an object at all reads as
+/// absent, and the client falls back to `agent_status` (ADR-0028 §3a).
 pub fn lenient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<AgentState>, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(serde_json::from_value(value).ok())
+}
+
+/// One field read on its own: anything it cannot parse is its `unknown`.
+fn or_unknown<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -236,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_future_state_falls_back_instead_of_failing() {
+    fn an_unparseable_axis_reads_unknown_and_the_others_survive() {
         #[derive(Deserialize)]
         struct Row {
             #[serde(default, deserialize_with = "lenient")]
@@ -244,18 +280,25 @@ mod tests {
         }
         let parse = |json: &str| serde_json::from_str::<Row>(json).unwrap().state;
         assert_eq!(parse("{}"), None);
-        assert_eq!(
-            parse(r#"{"state":{"turn":"idle","background":{"running":{}}}}"#),
-            None
-        );
-        let renamed = parse(
-            r#"{"state":{"turn":"paused","background":"unknown","attention":"unknown",
-                "lifecycle":"live","phase":"stalled"}}"#,
+        assert_eq!(parse(r#"{"state":"working"}"#), None);
+        let future = parse(
+            r#"{"state":{"turn":"idle","background":{"running":{"count":2}},"phase":"stalled",
+                "lifecycle":"live","held_ms":"soon","source":{"turn":"hook","background":{"pid":1}}}}"#,
         )
         .unwrap();
         assert_eq!(
-            (renamed.turn, renamed.phase),
-            (Turn::Unknown, Phase::Unknown)
+            (future.turn, future.lifecycle),
+            (Turn::Idle, Lifecycle::Live)
+        );
+        assert_eq!(
+            (future.background, future.attention),
+            (B::Unknown, A::Unknown)
+        );
+        assert_eq!((future.phase, future.held_ms), (Phase::Unknown, None));
+        assert_eq!(future.source.turn, Some(StateSource::Hook));
+        assert_eq!(
+            future.source.background, None,
+            "an unreadable source is no source"
         );
     }
 }
