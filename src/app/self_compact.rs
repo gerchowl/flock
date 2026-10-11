@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::agent_self_compact::{
-    ArmedSelfCompact, SelfCompactAbort, SelfCompactPhase, COMPACT_COMMAND, MAX_CONTINUATION_BYTES,
+    ArmedSelfCompact, SelfCompactAbort, SelfCompactPhase, MAX_CONTINUATION_BYTES,
 };
 use crate::app::App;
 
@@ -57,6 +57,7 @@ impl App {
         &mut self,
         pane: &str,
         continuation: String,
+        instructions: Option<String>,
         now: Instant,
     ) -> bool {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
@@ -75,7 +76,8 @@ impl App {
         {
             return false;
         }
-        terminal.armed_self_compact = Some(ArmedSelfCompact::new(continuation));
+        terminal.armed_self_compact =
+            Some(ArmedSelfCompact::new(continuation).with_instructions(instructions));
         crate::logging::self_compact_armed(pane, terminal_continuation_len(terminal));
         true
     }
@@ -366,7 +368,18 @@ impl App {
             return SelfCompactDecision::Abandoned(SelfCompactAbort::PaneGone);
         };
         let text = match write {
-            Write::CompactCommand => COMPACT_COMMAND.to_string(),
+            // The command and its instructions go out as ONE paste, so the
+            // Enter a gap later submits both or neither (#854).
+            Write::CompactCommand => {
+                let Some(line) = terminal
+                    .armed_self_compact
+                    .as_ref()
+                    .map(ArmedSelfCompact::compact_line)
+                else {
+                    return SelfCompactDecision::Suppressed("not_armed");
+                };
+                line
+            }
             Write::Continuation => {
                 let Some(continuation) = terminal
                     .armed_self_compact
@@ -520,6 +533,17 @@ impl App {
         } else {
             Some("agent_cannot_self_compact")
         }
+    }
+
+    /// Whether this pane's harness can take instructions with its compact
+    /// command (#854). Asked at the verb, after [`Self::self_compact_refusal`],
+    /// so an arming that would silently lose them is refused instead.
+    pub(crate) fn self_compact_takes_instructions(&self, pane: &str) -> bool {
+        let agent = self
+            .parse_pane_id(pane)
+            .and_then(|(ws_idx, pane_id)| self.terminal_for_pane(ws_idx, pane_id))
+            .and_then(|terminal| terminal.effective_known_agent());
+        crate::agent_self_compact::compact_takes_instructions(agent)
     }
 
     /// The terminal a pane's state lives on. Reached directly rather than
