@@ -259,6 +259,9 @@ enum Shape {
     Kev,
     Clef,
     Rejected(&'static str),
+    // Reads the request and never answers, like a one-at-a-time backend
+    // with other clients' requests queued ahead.
+    Silent,
 }
 
 impl Shape {
@@ -286,6 +289,7 @@ impl Shape {
                 "prompt_eval_cached_count": 36})
             .to_string(),
             Self::Rejected(body) => body.to_string(),
+            Self::Silent => String::new(),
         }
     }
 }
@@ -304,6 +308,7 @@ impl S1 {
         let stop = Arc::new(AtomicBool::new(false));
         let (count, captured, stopped) = (calls.clone(), bodies.clone(), stop.clone());
         let worker = thread::spawn(move || {
+            let mut held = Vec::new();
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     thread::sleep(Duration::from_millis(5));
@@ -338,6 +343,10 @@ impl S1 {
                 let response = shape.respond(body["questions"].as_object().unwrap());
                 captured.lock().unwrap().push(body);
                 count.fetch_add(1, Ordering::SeqCst);
+                if matches!(shape, Shape::Silent) {
+                    held.push(stream);
+                    continue;
+                }
                 let _ = write!(stream, "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
             }
         });
@@ -569,17 +578,56 @@ fn delegate_s1_rejection_is_named_on_stderr_and_leaves_the_outcome_alone() {
         400,
         Shape::Rejected(r#"{"error":"Clef input has 17097 tokens; context limit is 16384"}"#),
     );
-    let out = pane.command(&args, Some(&s1.url)).output().unwrap();
-    assert_eq!(out.status.code(), baseline.status.code());
-    assert_eq!(Pane::json(&out), Pane::json(&baseline));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!(
-            "System One at {} rejected the request (HTTP 400): Clef input has 17097 tokens",
-            s1.url
-        )),
-        "{stderr}"
-    );
+    // A refusal is about this request, not the endpoint's health, so
+    // repeated refusals never trip the three-failure breaker.
+    for call in 1..=4 {
+        let out = pane.command(&args, Some(&s1.url)).output().unwrap();
+        assert_eq!(out.status.code(), baseline.status.code());
+        assert_eq!(Pane::json(&out), Pane::json(&baseline));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "System One at {} rejected the request (HTTP 400): Clef input has 17097 tokens",
+                s1.url
+            )),
+            "{stderr}"
+        );
+        assert_eq!(s1.calls.load(Ordering::SeqCst), call);
+    }
+}
+
+#[test]
+fn delegate_s1_busy_endpoint_times_out_without_tripping_the_breaker() {
+    let pane = Pane::new("working", "same screen");
+    let args = [
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "100ms",
+        "--timeout",
+        "5000",
+        "--json",
+    ];
+    let config = pane.base.join("s1-config.toml");
+    std::fs::write(&config, "[systemone]\ntimeout_s = 0.3\n").unwrap();
+    let baseline = pane.command(&args, None).output().unwrap();
+    let s1 = S1::serve(200, Shape::Silent);
+    for call in 1..=4 {
+        let out = pane
+            .command(&args, Some(&s1.url))
+            .env("FLOCK_CONFIG_PATH", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), baseline.status.code());
+        assert_eq!(Pane::json(&out), Pane::json(&baseline));
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(s1.calls.load(Ordering::SeqCst), call);
+    }
 }
 
 #[test]
