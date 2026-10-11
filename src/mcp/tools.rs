@@ -569,8 +569,9 @@ fn schema_msg_send() -> Value {
         "type": "object",
         "properties": {
             "to": {
-                "type": "object",
-                "description": "Message recipient, one of three shapes. \
+                "type": ["object", "string"],
+                "description": "Message recipient: a bare string such as `\"w3:p2\"`, an agent name or an agent id, or one of three objects. \
+                                A bare agent id is sent as the `agent` shape, anything else as the `pane` shape. \
                                 `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` is the ONLY shape that reaches another host — \
                                 `agent_id` is fleet-global and restart-stable. \
                                 `{\"type\":\"pane\",\"pane\":\"<pane>\"}` addresses a pane on THIS server only. \
@@ -928,14 +929,35 @@ fn build_agent_result(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+/// `to` as typed by the model: a bare string (ADR-0029 §5) or the tagged
+/// object. The string becomes the structured target here, so the wire keeps
+/// one shape and an older server accepts it unchanged.
+fn message_target(to: Value) -> Result<MessageTarget, McpError> {
+    if let Value::String(target) = to {
+        return Ok(if crate::terminal::AgentId::is_well_formed(&target) {
+            MessageTarget::Agent { agent: target }
+        } else {
+            MessageTarget::Pane { pane: target }
+        });
+    }
+    serde_json::from_value(to).map_err(|e| McpError {
+        data: Some(json!({ "expected": [
+            "a pane id, terminal id, agent name or agent id as a string",
+            {"type": "pane", "pane": "<pane>"},
+            {"type": "repo_pane", "repo": "<repo>", "pane": "<pane>"},
+            {"type": "agent", "agent": "<agent_id>"},
+        ]})),
+        ..McpError::invalid_params(format!("invalid `to`: {e}"))
+    })
+}
+
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
     // MCP sender identity comes from the server's process ancestry.
     let to_value = args
         .get("to")
         .cloned()
         .ok_or_else(|| McpError::invalid_params("missing `to`"))?;
-    let to: MessageTarget = serde_json::from_value(to_value)
-        .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
+    let to = message_target(to_value)?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
         to,
@@ -2134,6 +2156,44 @@ mod tests {
             MessageTarget::Agent { agent } => assert_eq!(agent, "agent_atlas_6f21c4"),
             other => panic!("expected agent target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_msg_send_accepts_a_bare_string_target() {
+        let to = |target: &str| {
+            let method =
+                build_msg_send(json!({"to": target, "body": "x", "intent": "fyi"})).unwrap();
+            let Method::MsgSend(params) = method else {
+                panic!("expected MsgSend");
+            };
+            params.to
+        };
+        assert_eq!(
+            to("w3:p2"),
+            MessageTarget::Pane {
+                pane: "w3:p2".into()
+            }
+        );
+        assert_eq!(
+            to("reviewer"),
+            MessageTarget::Pane {
+                pane: "reviewer".into()
+            }
+        );
+        assert_eq!(
+            to("agent_atlas_6f21c4"),
+            MessageTarget::Agent {
+                agent: "agent_atlas_6f21c4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn build_msg_send_refuses_a_wrong_shape_with_the_expected_ones() {
+        let err = build_msg_send(json!({"to": 7, "body": "x", "intent": "fyi"})).unwrap_err();
+        assert_eq!(err.code, -32602);
+        let expected = err.data.unwrap()["expected"].as_array().unwrap().len();
+        assert_eq!(expected, 4);
     }
 
     #[test]
