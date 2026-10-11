@@ -90,6 +90,22 @@ fn spawn_server_with_env(
     api_socket: &Path,
     extra_env: &[(&str, &str)],
 ) -> SpawnedFlock {
+    spawn_server_exe(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket,
+        extra_env,
+    )
+}
+
+fn spawn_server_exe(
+    exe: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    extra_env: &[(&str, &str)],
+) -> SpawnedFlock {
     fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -106,7 +122,7 @@ fn spawn_server_with_env(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let mut cmd = CommandBuilder::new(exe);
     cmd.arg("server");
     // Config diagnostics must come from the fixture, not the runner's name aliases.
     cmd.env_remove("FLOCK_HOST_NAME");
@@ -2310,5 +2326,111 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// A Nix-shaped install: every version lives at its own store path forever,
+/// and the profile's `bin/flk` is a symlink that a switch repoints.
+fn nix_style_install(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let built = Path::new(env!("CARGO_BIN_EXE_flk"));
+    let install = |name: &str| {
+        let bin = base.join("store").join(name).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("flk");
+        // A hard link is a second path to the same build, the way two store
+        // paths of one derivation would be; copy when the temp dir is on
+        // another filesystem.
+        if fs::hard_link(built, &exe).is_err() {
+            fs::copy(built, &exe).unwrap();
+        }
+        fs::canonicalize(&exe).unwrap()
+    };
+    let old = install("aaaa-flock-old");
+    let new = install("bbbb-flock-new");
+    let profile_bin = base.join("profile/bin");
+    fs::create_dir_all(&profile_bin).unwrap();
+    let profile_flk = profile_bin.join("flk");
+    std::os::unix::fs::symlink(&new, &profile_flk).unwrap();
+    (old, new, profile_flk)
+}
+
+fn process_argv0(pid: u32) -> String {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #958: a server running from an old store path, handed off by the client
+/// the profile now points at, must come back as the client's binary. Before
+/// the fix the CLI sent no import path and the server re-executed its own,
+/// which on Nix is the old version again, and still reported success.
+#[test]
+fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let (old_exe, new_exe, profile_flk) = nix_style_install(&base);
+
+    let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+    assert_eq!(process_argv0(server_pid), old_exe.display().to_string());
+
+    let output = std::process::Command::new(&profile_flk)
+        .args(["server", "live-handoff"])
+        .envs(support::environment::isolated_env(
+            &config_home,
+            &runtime_dir,
+        ))
+        .env("XDG_STATE_HOME", runtime_dir.join("state"))
+        .env("FLOCK_SOCKET_PATH", &api_socket)
+        .env(
+            "FLOCK_CLIENT_SOCKET_PATH",
+            runtime_dir.join("flock-client.sock"),
+        )
+        .env_remove("FLOCK_ENV")
+        .output()
+        .expect("client runs");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "handoff failed:\n{stderr}");
+
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    drop(spawned);
+    assert_eq!(
+        process_argv0(replacement_pid),
+        new_exe.display().to_string(),
+        "the replacement must run the client's binary, not the old server's"
+    );
+    let version = request(
+        &api_socket,
+        serde_json::json!({"id":"version","method":"ping","params":{}}),
+    )["result"]["version"]
+        .as_str()
+        .expect("replacement reports a version")
+        .to_string();
+    assert!(
+        stderr.contains(&format!(
+            "live handoff complete: server flk {version} -> flk {version}"
+        )),
+        "the report must name both versions; stderr was:\n{stderr}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
     cleanup_test_base(&base);
 }
