@@ -903,6 +903,12 @@ pub struct WorktreesConfig {
     /// evidence. Each entry is also protected from auto-deletion. Entries with
     /// no such branch or `refs/remotes/origin/<entry>` are ignored.
     pub integration_branches: Vec<String>,
+    /// Mark a linked worktree trusted in Claude Code's `.claude.json` before
+    /// flock launches `claude` in it, when the repository it was checked out
+    /// from is already trusted there (#605). Never widens trust: an untrusted
+    /// source, or a directory that is not a linked worktree, is left alone.
+    /// Default: true.
+    pub pretrust_claude: bool,
 }
 
 /// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
@@ -1730,6 +1736,7 @@ impl Default for WorktreesConfig {
             branch_pivot_message: default_branch_pivot_message().to_string(),
             protected_branches: Vec::new(),
             integration_branches: Vec::new(),
+            pretrust_claude: true,
         }
     }
 }

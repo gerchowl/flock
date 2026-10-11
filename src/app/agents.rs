@@ -775,6 +775,7 @@ impl App {
                     "placement": kind, "workspace_id": workspace_id, "target_pane_id": target_pane_id, "direction": direction}),
             });
         }
+        self.pretrust_claude_worktree(&argv, &cwd, &spawn_env);
         let (ws_idx, tab_idx, pane_id) = match placement {
             StartPlacement::Replace(ws, tab) => {
                 self.replace_agent_root_shell(ws, tab, cwd, &argv, focus)?
@@ -1009,6 +1010,24 @@ impl App {
             }
             other => other,
         })
+    }
+
+    /// Mark `cwd` trusted for Claude Code before an argv spawn execs `claude`
+    /// there, when it is a linked worktree of an already-trusted repository
+    /// (#605). Shared by every spawn door, so a delegate, a dispatch and a
+    /// fork all start past the trust dialog for the same reason.
+    pub(crate) fn pretrust_claude_worktree(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        spawn_env: &[(String, String)],
+    ) {
+        crate::integration::claude_trust::pretrust_for_launch(
+            self.state.config.worktrees.pretrust_claude,
+            argv,
+            cwd,
+            spawn_env,
+        );
     }
 
     pub(super) fn spawn_agent_workspace(
@@ -1466,6 +1485,66 @@ mod tests {
             before,
             "a refused start must create nothing"
         );
+    }
+
+    /// #605: the trust write has to happen on the real `agent.start` path,
+    /// not only in the helper, or a delegate still parks on Claude's trust
+    /// dialog. Driven through the API with a `claude` argv (a live shell under
+    /// that name) launched in a linked worktree of a repo the profile trusts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claude_start_in_a_worktree_of_a_trusted_repo_pretrusts_it() {
+        use crate::test_support::{create_committed_repo, run_git, unique_temp_path};
+        let _env = crate::integration::integration_env_lock();
+        let repo = std::fs::canonicalize(create_committed_repo("agent-pretrust")).unwrap();
+        let base = unique_temp_path("agent-pretrust-base");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        std::fs::create_dir_all(base.join("profile")).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let worktree = base.join("wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let claude = base.join("bin/claude");
+        std::os::unix::fs::symlink(crate::test_support::live_program(), &claude).unwrap();
+        let config = base.join("profile/.claude.json");
+        let trusted = serde_json::json!({"projects": {
+            repo.to_str().unwrap(): {"hasTrustDialogAccepted": true}
+        }});
+        std::fs::write(&config, trusted.to_string()).unwrap();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", base.join("profile"));
+
+        let mut app = test_app();
+        let mut request = start_request(claude.to_str().unwrap());
+        if let Method::AgentStart(params) = &mut request.method {
+            params.cwd = Some(worktree.to_string_lossy().into_owned());
+        }
+        let raw = app.handle_api_request(request);
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            written["projects"][worktree.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true,
+            "{written}"
+        );
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// The refusal is scoped to agents flock knows to have shell-supplied

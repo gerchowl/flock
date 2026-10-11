@@ -1804,6 +1804,7 @@ impl App {
                     spawn_env
                         .map_err(|unresolved| unresolved.message())
                         .and_then(|vars| {
+                            self.pretrust_claude_worktree(&plan.argv, &path, &vars);
                             let _spawn_env_guard = crate::integration::set_pending_spawn_env(vars);
                             self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
                                 .map(|(ws_idx, _, pane_id)| {
