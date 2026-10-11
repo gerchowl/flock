@@ -50,75 +50,90 @@ jobs:
       # job still reports success so it can stay a required context, which the
       # queue needs in order to gate on it.
 
-  check:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            nextest_filter: all()
-          # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to
-          # the macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt
-          # zig 0.15.2 build can't link against (undefined libSystem symbols like
-          # __availability_version_check). macos-15 is the last image this
-          # toolchain builds on. Revisit when zig gains macOS 26 SDK support.
-          - os: macos-15
-            nextest_filter: not binary(live_handoff)
-    runs-on: ${{ matrix.os }}
-    # Serializing the heavy multi-process PTY suites (see .config/nextest.toml)
-    # adds wall-clock; give the job headroom over the previous 10-minute cap.
-    #
-    # 15 was then reached, and jobs CANCELLED at 15m0s-15m2s on PRs that touch
-    # no Rust at all, so the budget was the variable rather than the change. A
-    # cancelled job is worse than a red one: nextest fail-fasts, so the tail of
-    # the suite never runs, and a cancellation is reported as neither success nor
-    # a test failure, so it reads as inconclusive. #462 and #539 each lost most
-    # of a leg this way (#539 stopped at 1522 of 4401). 25 leaves room for the
-    # mac leg's zig build of the vendored libghostty-vt, which has no cache
-    # entry, plus the serialized suites, on a runner that may be carrying other
-    # work.
-    #
-    # 25 was then reached in turn, on 2026-10-10 (#873). The macOS leg was
-    # cancelled at 25m0s after nextest had finished all 5865 tests (Summary
-    # 1254 s), because the step-2 acceptance suite adds deterministic idle
-    # windows, so 40 gives headroom.
-    timeout-minutes: 40
+  # One platform each, split into lint, build and parallel test-shard jobs
+  # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
+  # result can be judged alone in the check jobs below.
+  ubuntu:
+    name: ubuntu-latest
+    uses: ./.github/workflows/ci-leg.yml
+    with:
+      leg: ubuntu-latest
+
+  # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to the
+  # macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt zig 0.15.2
+  # build can't link against (undefined libSystem symbols like
+  # __availability_version_check). macos-15 is the last image this toolchain
+  # builds on. Revisit when zig gains macOS 26 SDK support.
+  macos:
+    name: macos-15
+    uses: ./.github/workflows/ci-leg.yml
+    with:
+      leg: macos-15
+
+  # The required checks. Branch protection and the landing driver wait on
+  # exactly `check (macos-15)` and `check (ubuntu-latest)`, so these keep the
+  # names of the single job they replace, and pass only when every job of
+  # their leg passed. `always()` rather than `!cancelled()`: a skipped
+  # required check counts as passing, so a leg that was cancelled, timed out
+  # or never started must still run this job and turn it red.
+  check-ubuntu:
+    name: check (ubuntu-latest)
+    needs: ubuntu
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Rust tools
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+      - name: Download JUnit reports
+        uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
-          tool: just,cargo-nextest
+          pattern: junit-ubuntu-latest-*
+          path: junit
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Summarize shards
+        run: python3 scripts/ci_shards.py summary --title 'check (ubuntu-latest)' --strip-prefix junit-ubuntu-latest- junit >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require every job of the leg
+        env:
+          RESULT: ${{ needs.ubuntu.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "ubuntu-latest leg ended as $RESULT" >&2
+            exit 1
+          fi
+
+  check-macos:
+    name: check (macos-15)
+    needs: macos
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          version: 0.15.2
+          persist-credentials: false
 
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: brew install cmake ninja
-
-      - name: Restore cargo cache
-        uses: Swatinem/rust-cache@v2
+      - name: Download JUnit reports
+        uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
-          cache-bin: false
+          pattern: junit-macos-15-*
+          path: junit
 
-      - name: Run checks
-        run: just ci '${{ matrix.nextest_filter }}'
+      - name: Summarize shards
+        run: python3 scripts/ci_shards.py summary --title 'check (macos-15)' --strip-prefix junit-macos-15- junit >> "$GITHUB_STEP_SUMMARY"
 
-      # Maintenance-script unittests and the platform test-gap ratchet, which
-      # previously ran only under `just check` (#597). Ubuntu only: pure
-      # Python plus git fixtures, so one platform is enough and the seconds
-      # of cost are not paid on every matrix leg.
-      - name: Run maintenance script tests
-        if: runner.os == 'Linux'
-        run: just script-tests
+      - name: Require every job of the leg
+        env:
+          RESULT: ${{ needs.macos.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "macos-15 leg ended as $RESULT" >&2
+            exit 1
+          fi

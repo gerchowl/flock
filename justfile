@@ -56,6 +56,21 @@ lint:
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
+# Build every test binary once into a nextest archive for CI's shard jobs, then
+# fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
+# exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
+ci-archive leg archive:
+    cargo nextest archive --locked --archive-file "{{archive}}"
+    python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
+
+# Run one CI shard, named in .config/ci-shards.toml, from an
+# archive made by `ci-archive`. It is extracted into this checkout's target/
+# because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
+# time, so the binary must sit where the build put it. JUnit lands in
+# target/nextest/ci/junit.xml.
+ci-shard leg shard archive:
+    cargo nextest run --profile ci --archive-file "{{archive}}" --workspace-remap . --extract-to . --extract-overwrite -E "$(python3 scripts/ci_shards.py filter --leg '{{leg}}' --shard '{{shard}}')" --status-level fail --final-status-level slow --failure-output final --success-output never
+
 # Check formatting + run unit tests + maintenance script tests
 check: ci script-tests
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
