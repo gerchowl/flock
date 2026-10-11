@@ -443,12 +443,19 @@ fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Du
 
 #[cfg(target_os = "macos")]
 fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
+    wait_for_handoff_importer_pid(old_pid, timeout)
+}
+
+/// The importer the server `old_pid` spawned, found by the handoff socket
+/// named on its command line. Unlike the runtime-dir sweep this also finds an
+/// importer running a binary other than the test build, such as a store copy.
+fn wait_for_handoff_importer_pid(old_pid: u32, timeout: Duration) -> u32 {
     let handoff_socket_pattern = format!("flock-handoff-{old_pid}.sock");
     let deadline = Instant::now() + timeout;
     let mut last_stdout = String::new();
     while Instant::now() < deadline {
         if let Ok(output) = std::process::Command::new("pgrep")
-            .args(["-af", &handoff_socket_pattern])
+            .args(["-f", &handoff_socket_pattern])
             .output()
         {
             last_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -467,9 +474,7 @@ fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: D
         thread::sleep(Duration::from_millis(25));
     }
     panic!(
-        "replacement server for {} did not appear; last pgrep output: {}",
-        _runtime_dir.display(),
-        last_stdout
+        "handoff importer for server {old_pid} did not appear; last pgrep output: {last_stdout}"
     );
 }
 
@@ -2640,8 +2645,7 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "handoff failed:\n{stderr}");
 
-    let replacement_pid =
-        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    let replacement_pid = wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(
         process_argv0(replacement_pid),
@@ -2698,8 +2702,7 @@ fn live_handoff_upgrades_an_older_server_to_the_client_version() {
         &api_socket,
     );
     assert!(ok, "handoff failed:\n{stderr}");
-    let replacement_pid =
-        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    let replacement_pid = wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(
         process_argv0(replacement_pid),
@@ -2786,7 +2789,7 @@ fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
     );
     assert!(stderr.contains("same server version"), "{stderr}");
     assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
-    wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(server_version(&api_socket), "0.0.1");
 
