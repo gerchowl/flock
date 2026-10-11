@@ -84,17 +84,22 @@ SQLite with `fullfsync=ON` costs the same 4–5 ms as the fold's append.
    0.37–0.6 s and is ruled out.
 4. **Open goals are re-issued on start and on every log rotation.** Re-issuing
    only on start, as ADR-0027 does for edges, is not enough: rotation happens
-   during uptime (`PersistentLog::append` → `rotate`), so a server that stays up
-   past the five files (about 500k events or 160 MiB) can rotate out a goal's
-   last record-carrying event before the next restart. Parked goals emit
-   nothing by design (ADR-0030 §2) and would be the first to go. So the hub
-   announces each rotation, and the server answers by re-emitting every open
-   goal's record into the new active file. The re-issued event carries the
-   record (goal text, status, checklist, counters, last verdict), not the
-   verdict history. Rotation renames the old active file to `.1` and drops
-   only `.4`, so a record written before the rotation survives until the
-   re-issue lands. The cost is one 4 ms append per open goal per rotation, and
-   a rotation comes every 100k events or 32 MiB.
+   during uptime (`PersistentLog::append` → `rotate`), so a server that stays
+   up past the five files (about 500k events or 160 MiB) can rotate out a
+   goal's last record-carrying event before the next restart. Parked goals emit
+   nothing by design (ADR-0030 §2) and would be the first to go. So each
+   rotation must lead to a re-emit of every open goal's record into the new
+   active file. `rotate()` runs inside `push()` while the hub's
+   `std::sync::Mutex` is held, so a callback that re-emits through `push()`
+   would deadlock. Instead, `rotate()` only bumps a rotation counter on the
+   hub. The server loop reads that counter after the lock is released and, when
+   it has moved, re-issues the open goals through `emit_event`, the same path
+   `reissue_open_delegations` uses. The re-issued event carries the record
+   (goal text, status, checklist, counters, last verdict), not the verdict
+   history. Rotation renames the old active file to `.1` and drops only `.4`,
+   so a record written before the rotation survives until the re-issue lands.
+   The cost is one 4 ms append per open goal per rotation, and a rotation comes
+   every 100k events or 32 MiB.
 5. **SQLite is not used for goal state.** It would be faster on paper only at
    weaker durability, and it would add a second store, a schema migration
    story and a second crash-consistency rule next to the log, which already
@@ -130,8 +135,9 @@ SQLite with `fullfsync=ON` costs the same 4–5 ms as the fold's append.
     quarantining the log, #1020) being in a *released* binary. Without it, a
     server older than G1 that reads a log holding `Goal*` events quarantines the
     active file, for example after a downgrade or a handoff to an older binary.
-    #1058 merges with batch b109 and ships in v1.3.0. G1 must not ship to the
-    fleet before v1.3.0 is the oldest running version.
+    #1058 is still open in batch #1066 and is planned to ship in v1.3.0. G1
+    must not ship to the fleet before the release carrying #1058 is the
+    oldest running version.
   - **G2 (#1035), G5 (#884):** rungs and the pre-compaction `GoalStatusSet`
     handshake read the in-memory record only.
   - **G3a (#885), G3b (#1036):** the breaker, `degraded` state and
