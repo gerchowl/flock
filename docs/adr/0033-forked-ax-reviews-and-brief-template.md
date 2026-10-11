@@ -1,7 +1,7 @@
 # ADR 0033 — Agent-experience reviews are answered by a fork of the warm agent, against a versioned rubric, recorded as events, and filed only after a search; builder briefs put acceptance and size first
 
-- Status: Proposed
-- Date: 2026-10-11
+- Status: Accepted
+- Date: 2026-10-11 (proposed); accepted 2026-10-12
 - Issues: #1043 (the spike this records). Composes with ADR-0027 (delegate
   edges, #632), ADR-0028 (events, registered waits, channels, #1005),
   ADR-0029 (exit-code registry), ADR-0030 (goal supervision, #573),
@@ -9,9 +9,12 @@
   (spawn ceiling), ADR-0015 / ADR-0023 (filing), #987 (toolchain survey),
   #1041 (proactive interactions).
 - Decision owner: operator.
+- Scope of acceptance: the owner accepted all six owner decisions as
+  recommended on 2026-10-12 (see "Owner decisions"). The acceptance claims
+  the decisions, not code.
 - Implemented: none. The measurement runbook is `tests/probes/fork_cache.py`.
-  The slices (§10) are not filed; the architect files them after the owner
-  accepts.
+  The slices (§10) are not filed yet; the architect files them now that the
+  owner has accepted.
 
 ## Context
 
@@ -594,25 +597,32 @@ the architect's, so the run costs less (the cache argument is the same).
 - **Cache TTL is per account.** On a 5-minute-TTL account a delayed trigger
   pays full creation. Triggers fire at the turn boundary for that reason.
 
-## Owner decisions requested
+## Owner decisions
+
+Decided 2026-10-12: the owner accepted all six as recommended. Each item
+keeps the recommendation and the alternative it was weighed against.
 
 1. **Phase 1 is dry-run** (candidates recorded, nothing filed by the fork),
    and auto filing is enabled per repo after ten dry runs. Recommended: yes.
    Alternative: auto-file from day one with the caps.
+   **Decided: as recommended.**
 2. **Rubric home:** `docs/ax/` in this repo, versioned, with the skill
    referencing the version. Recommended: yes. Alternative: inside the
-   architect skill.
+   architect skill. **Decided: as recommended.**
 3. **Trigger defaults** as in §4 (lifecycle on, fallback-count on, dev-red and
-   stall off). Recommended: yes.
+   stall off). Recommended: yes. **Decided: as recommended.**
 4. **Caps** (3 new issues and 5 comments per run, 10 new per day) and the 0.8
    confidence bar. Recommended: yes, revisit after the dry runs.
+   **Decided: as recommended.**
 5. **Brief template** (§7) for the next wave, with the architect deciding
    splits before dispatch. Recommended: v2 for half of the next wave's
    briefs and the current template for the other half, so AX10 has a
    control arm; every brief moves to v2 after that wave. Alternative: v2 for
    every brief at once, which leaves no comparison.
+   **Decided: as recommended.**
 6. **Size enforcement:** acceptance item now, pre-push gate AX11 only if AX10
    shows the item alone does not hold. Recommended: yes.
+   **Decided: as recommended.**
 
 ## Test strategy
 
@@ -635,7 +645,7 @@ the architect's, so the run costs less (the cache argument is the same).
 
 Each is sized below, in estimated production lines (docs and tests
 excluded), and the two that came out over ~400 are split. They are not
-filed; the architect files them after the owner accepts.
+filed yet; the owner accepted on 2026-10-12, and the architect files them.
 
 | # | Slice | Size (est.) | Depends on | Acceptance |
 | --- | --- | --- | --- | --- |
