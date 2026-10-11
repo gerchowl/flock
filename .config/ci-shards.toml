@@ -1,0 +1,44 @@
+# How CI splits one platform's test run across parallel jobs (#991).
+#
+# The serial-pty group in `.config/nextest.toml` runs one test at a time, and
+# it used to be a single ~20-minute chain on the critical path of every PR,
+# while the rest of the runner's cores sat idle. Running those tests in
+# parallel on ONE runner is not the fix: that is the CPU contention the group
+# exists to prevent. So each shard below is its own runner, and inside it the
+# group still holds them to one at a time — the same contention profile as
+# before, with several lanes instead of one.
+#
+# Every serial-pty binary must appear in exactly one shard, and
+# `scripts/ci_shards.py verify` fails the build unless the shards plus the
+# unit job together list exactly the tests the leg's base filter selects, each
+# once. The unit job runs everything not named here (unit tests and the
+# parallel integration binaries), next to fmt and clippy.
+#
+# Balance the shards with the measured times: the check job's summary prints
+# per-shard wall clock and per-binary totals from every shard's JUnit report.
+
+# One leg per required check, `check (<leg>)`. `filter` is what that leg's
+# single job used to run, and the shards partition exactly that set.
+[legs.ubuntu-latest]
+filter = "all()"
+
+[legs.macos-15]
+# live_handoff has been skipped on macOS since 3503209b ("ci: skip live
+# handoff tests on macos"), carried over unchanged here.
+filter = "not binary(live_handoff)"
+
+[[shards]]
+name = "serial-1"
+binaries = ["mesh_forwarding", "mesh_routes", "peer_federation"]
+
+[[shards]]
+name = "serial-2"
+binaries = ["mesh_step1", "mcp_fleet_messaging"]
+
+[[shards]]
+name = "serial-3"
+binaries = ["mesh_step2", "fleet_gossip", "cross_area"]
+
+[[shards]]
+name = "serial-4"
+binaries = ["live_handoff", "mesh_enrollment"]

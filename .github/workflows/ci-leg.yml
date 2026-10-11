@@ -1,0 +1,184 @@
+# guardrails-ok(ci-shim): host-bound: one platform leg of ci.yml (cargo-nextest with zig 0.15 + macos-15 SDK constraints); every step is a `just` recipe or scripts/ci_shards.py
+name: CI leg
+
+# One platform's test run, split across parallel jobs (#991). ci.yml calls this
+# once per platform and reports `check (<leg>)` from the result, so a red
+# shard on one platform never fails the other platform's required check.
+#
+#   build   compile every test binary once into a nextest archive, and fail
+#           unless the shards partition the leg's tests exactly
+#   unit    fmt, clippy, and every test outside the serial-pty group
+#   serial  one job per shard of .config/ci-shards.toml, each running its
+#           serial-pty binaries one at a time, as the single job used to
+#
+# Shards run the archive rather than rebuilding, which is what makes a shard
+# cost minutes of tests and not minutes of compile.
+
+on:
+  workflow_call:
+    inputs:
+      leg:
+        description: Runner image, and the leg's key in .config/ci-shards.toml
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ${{ inputs.leg }}
+    timeout-minutes: 30
+    outputs:
+      shards: ${{ steps.archive.outputs.shards }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: just,cargo-nextest
+
+      # Pinned to 0.15.2, and the macOS leg to macos-15 rather than
+      # macos-latest: the vendored libghostty-vt zig build cannot link against
+      # the macOS 26 SDK (see ci.yml).
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Build test archive and verify the shard partition
+        id: archive
+        run: just ci-archive '${{ inputs.leg }}' nextest-archive.tar.zst
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive-${{ inputs.leg }}
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          # Already zstd.
+          compression-level: 0
+
+  unit:
+    name: unit + lint
+    needs: build
+    runs-on: ${{ inputs.leg }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: just,cargo-nextest
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Lint
+        run: just lint
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ inputs.leg }}
+
+      - name: Run unit and parallel integration tests
+        run: just ci-shard '${{ inputs.leg }}' unit nextest-archive.tar.zst
+
+      - name: Summarize
+        if: always()
+        run: python3 scripts/ci_shards.py summary --title 'unit (${{ inputs.leg }})' unit=target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ inputs.leg }}-unit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          overwrite: true
+
+      # Maintenance-script unittests and the platform test-gap ratchet (#597).
+      # Ubuntu only: pure Python plus git fixtures, so one platform is enough.
+      - name: Run maintenance script tests
+        if: runner.os == 'Linux'
+        run: just script-tests
+
+  serial:
+    name: ${{ matrix.shard.name }} (${{ matrix.shard.binaries }})
+    needs: build
+    runs-on: ${{ inputs.leg }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # No toolchain, zig or cache: nothing is compiled here. The runner
+      # image's cargo only dispatches to cargo-nextest, and the archive
+      # carries its own standard library.
+      - name: Install Rust tools
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: just,cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ inputs.leg }}
+
+      - name: Run serial-pty shard
+        run: just ci-shard '${{ inputs.leg }}' '${{ matrix.shard.name }}' nextest-archive.tar.zst
+
+      - name: Summarize
+        if: always()
+        run: python3 scripts/ci_shards.py summary --title '${{ matrix.shard.name }} (${{ inputs.leg }})' '${{ matrix.shard.name }}=target/nextest/ci/junit.xml' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ inputs.leg }}-${{ matrix.shard.name }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          overwrite: true
