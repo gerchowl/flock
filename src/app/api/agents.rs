@@ -134,6 +134,18 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        // `self` is the caller's own agent, attested from its process
+        // ancestry (#1010). `agent hibernate --all` asks for it so an agent
+        // running the loop does not park itself halfway through.
+        if target.target == "self" {
+            let agent = self
+                .parse_pane_id_or_peer("", self.current_api_peer_pid)
+                .and_then(|(ws_idx, pane_id)| self.agent_info(ws_idx, pane_id));
+            return match agent {
+                Some(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+                None => agent_not_found(id, "self"),
+            };
+        }
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),

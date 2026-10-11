@@ -4350,7 +4350,9 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
 /// the proof (#975). An entry from before the agent id was recorded has one
 /// more: a worktree delegate whose agent still runs in that worktree under
 /// the same name, which is what an agent that merely inherited the name
-/// would not do.
+/// would not do. The cwd must equal the worktree path exactly: an agent that
+/// moved into a subdirectory stays "not a delegate", because a prefix match
+/// would also accept an agent in a nested checkout.
 fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
     let record_agent_id = field(record, "agent_id").map(str::to_string);
     let same_terminal = field(record, "terminal_id") == Some(entry.terminal_id.as_str());

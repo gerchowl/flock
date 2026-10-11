@@ -1681,6 +1681,85 @@ fn a25_an_unplanned_restart_leaves_the_delegate_resumable() {
     );
 }
 
+/// #1010: an agent that runs `agent hibernate --all` from its own pane skips
+/// itself. Parking it would kill the loop halfway through, with the rest of
+/// the fleet still running and no summary or exit code.
+#[test]
+fn a26_hibernate_all_from_an_agent_pane_skips_the_caller() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+
+    // The caller: an agent pane that waits for a go file, then runs the loop.
+    let go = server.base.join("go");
+    let out = server.base.join("bulk.json");
+    let script = server.base.join("bin").join("architect");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile [ ! -e '{go}' ]; do sleep 0.05; done\nFLOCK_SOCKET_PATH='{socket}' '{flk}' agent hibernate --all > '{out}.tmp'\nprintf '%s\\n' \"$?\" > '{out}.rc'\nmv '{out}.tmp' '{out}'\nwhile :; do sleep 1; done\n",
+            go = go.display(),
+            socket = server.socket.display(),
+            flk = env!("CARGO_BIN_EXE_flk"),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let started = request(
+        &server,
+        &serde_json::json!({"id":"arch","method":"agent.start","params":{
+            "name":"architect","cwd":work_dir(&server),"argv":[script]}})
+        .to_string(),
+    );
+    let caller = started["result"]["agent"].clone();
+    assert!(caller.is_object(), "{started}");
+    let caller_pane = caller["pane_id"].as_str().unwrap();
+    // A resumable session, so nothing but being the caller can skip it.
+    let reported = request(
+        &server,
+        &format!(
+            r#"{{"id":"ses","method":"pane.report_agent_session","params":{{"pane_id":"{caller_pane}","source":"flock:opencode","agent":"opencode","agent_session_id":"ses_architect"}}}}"#
+        ),
+    );
+    assert!(reported.get("error").is_none(), "{reported}");
+
+    fs::write(&go, "").unwrap();
+    let deadline = Instant::now() + WITHIN;
+    while !out.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the bulk hibernate never finished"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+    let rc = fs::read_to_string(format!("{}.rc", out.display())).unwrap();
+    assert_eq!(rc.trim(), "0", "{summary}");
+    let rows = summary["results"].as_array().unwrap();
+    let row = |id: &serde_json::Value| {
+        rows.iter()
+            .find(|row| row["agent_id"] == *id)
+            .unwrap_or_else(|| panic!("{id} missing from {summary}"))
+            .clone()
+    };
+    let me = row(&caller["agent_id"]);
+    assert_eq!(me["outcome"], "skipped", "{summary}");
+    assert_eq!(me["code"], "caller", "{summary}");
+    let d1 = agent_get(&server, "d1").unwrap();
+    assert_eq!(row(&d1["agent_id"])["outcome"], "hibernated", "{summary}");
+    assert_eq!(d1["agent_status"], "hibernated");
+    let after = agent_get(&server, "architect").unwrap();
+    assert_ne!(after["agent_status"], "hibernated", "{after}");
+}
+
 /// E13: the delegate's pane closes while the await blocks: exit 4 `gone`.
 #[test]
 fn a13_closed_pane_is_gone() {

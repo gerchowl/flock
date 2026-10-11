@@ -496,6 +496,19 @@ fn agent_bulk(verb: BulkVerb) -> std::io::Result<i32> {
     if listed.get("error").is_some() {
         return super::print_response(&listed);
     }
+    // The caller's own agent, when it runs in a pane. Hibernating it would
+    // kill this very process mid-loop: the rest of the fleet stays running and
+    // no summary or exit code ever arrives. A server that predates `self`
+    // answers not-found, and then nothing is skipped.
+    let caller = super::send_request(&Request {
+        id: "cli:agent:self".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: "self".into(),
+        }),
+    })?
+    .pointer("/result/agent/agent_id")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_string);
     let mut results = Vec::new();
     let mut failed = false;
     for agent in local_agents(&listed) {
@@ -507,7 +520,12 @@ fn agent_bulk(verb: BulkVerb) -> std::io::Result<i32> {
             "name": agent.get("name"),
             "pane_id": agent.get("pane_id"),
         });
-        match verb.applies(&agent) {
+        let applies = if caller.as_deref() == Some(agent_id) {
+            Err("caller")
+        } else {
+            verb.applies(&agent)
+        };
+        match applies {
             Err(reason) => {
                 row["outcome"] = "skipped".into();
                 row["code"] = reason.into();

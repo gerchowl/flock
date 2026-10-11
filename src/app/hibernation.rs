@@ -138,7 +138,10 @@ impl App {
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
             runtime.shutdown();
         }
-        self.state.mark_session_dirty();
+        // Saved now rather than after the debounce (#1010): hibernating is
+        // what an operator does right before stopping the server, and a stop
+        // inside the debounce window would lose the only record of the plan.
+        self.save_session_now();
 
         self.event_hub.push(crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::AgentHibernated,
