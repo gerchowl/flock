@@ -120,7 +120,7 @@ failing relay are refused with a concrete reason. Version refusals include
 ```bash
 flk server
 flk server stop
-flk server live-handoff
+flk server live-handoff [--skip-undrained]
 flk server reload-config
 ```
 
@@ -137,6 +137,10 @@ flk server live-handoff --import-exe "$(readlink -f "$(command -v flk)")"
 ```
 
 When `flk` finds an older server, its `Flock was updated` message names both commands, before the stop-and-restart fallback that exits pane processes.
+
+Before a pane moves, its queued input is written out before its terminal moves. All panes drain at the same time. If a pane's input does not drain within two seconds, or its terminal keeps accepting zero bytes, the handoff is refused. The old server keeps running with that input still queued, and the error names each stuck pane with its pending byte count, pid and title, for example `timed out draining PTY writes before handoff: w2:p6 (17 bytes pending, pid 4242, "zsh")`. Close those panes and retry, or pass `--skip-undrained` to hand off anyway: the stuck panes' pending input is dropped, and each is printed as `skipped undrained pane <id>: dropped <n> bytes`. If the handoff then fails at a later step, its error still lists the input that was dropped.
+
+The old server writes the drain error, so a server from before this release still prints the bare `timed out draining PTY writes before handoff` and ignores `--skip-undrained`. The CLI then prints how to get off it. First, find the stuck internal pane numbers: grep the server log for `write returned zero bytes` and note each `"pane":N`. Map each `N` to its public id with `jq -r --arg n N '.workspaces[] | select(.public_pane_numbers[$n]) | "\(.id):p\(.public_pane_numbers[$n])"' session.json` in the data directory (numbers 1 to 9 read as they are, 10 is `pA`). Then close those panes and retry the handoff.
 
 ## Config
 
@@ -275,14 +279,14 @@ flk tab close <tab_id>
 
 ```bash
 flk pane list [--workspace <workspace_id>]
-flk pane get <pane_id>
-flk pane rename <pane_id> <label>|--clear
-flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]
+flk pane get <target>
+flk pane rename <target> <label>|--clear
+flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]
 flk pane close <pane_id>
 flk pane stash show|restore <pane_id> [--json]
 ```
 
-`pane read`, `pane send-text`, `pane send-keys`, and `pane close` also accept a terminal ID or a unique agent name/label. A pane ID takes precedence over a same-named agent. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one.
+Every pane verb takes a target: a pane ID, a terminal ID, an agent ID, a unique agent name/label, or `self` for the calling pane. A pane ID takes precedence over a same-named agent. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one. An unknown target is refused with `data.expected` listing these shapes. Against an older server, `flk` first resolves a name to its pane ID through `agent get`. It skips that step for an agent whose name is shaped like a pane ID (`w1:p2`, `p_3`, `1-2`), so on an older server such a name means the pane, not the agent.
 
 Read output:
 
@@ -299,7 +303,7 @@ Send input:
 ```bash
 flk pane send-text <pane_id> <text>
 flk pane send-keys <pane_id> <key> [key ...]
-flk pane run <pane_id> <command>
+flk pane run <target> <command>
 ```
 
 `pane send-text` reports the same observed delivery result and exit codes as `agent send --no-submit` (see below).

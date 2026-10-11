@@ -101,7 +101,8 @@ impl App {
     /// The stash is keyed by the public id, which outlives the pane, so a
     /// closed pane's drafts can still be read by the id it had.
     fn stash_key(&self, pane: &str) -> String {
-        self.parse_pane_id(pane)
+        self.resolve_pane_target(pane)
+            .ok()
             .and_then(|(ws, pane_id)| self.public_pane_id(ws, pane_id))
             .unwrap_or_else(|| pane.to_owned())
     }

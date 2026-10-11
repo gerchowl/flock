@@ -356,8 +356,12 @@ impl App {
         mut params: PaneSubmitParams,
         stash: bool,
     ) -> String {
-        let Some((ws, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return encode_error(id, "pane_gone", "pane_gone");
+        let (ws, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) if error.code == "pane_not_found" => {
+                return encode_error(id, "pane_gone", "pane_gone")
+            }
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
             return encode_error(id, "pane_gone", "pane_gone");
@@ -501,7 +505,9 @@ impl App {
         };
         if runtime.try_send_flock_authored(Bytes::from(first)).is_err() {
             // Nothing reached the pane, so a draft is still where it was.
-            runtime.end_injection_lease(&evidence.attempt_id);
+            if !runtime.end_injection_lease(&evidence.attempt_id) {
+                evidence.held_input_not_written = true;
+            }
             abandon(evidence, "write_failed");
             return Err("write_failed");
         }
@@ -869,7 +875,11 @@ impl App {
             attempt.evidence.draft = Some(verdict.into());
         }
         if let Some((_, runtime)) = target {
-            runtime.end_injection_lease(&attempt.evidence.attempt_id);
+            // #1011 review: a pane that refuses the replay loses the operator's
+            // held keystrokes, and the attempt's outcome says so.
+            if !runtime.end_injection_lease(&attempt.evidence.attempt_id) {
+                attempt.evidence.held_input_not_written = true;
+            }
         }
     }
 
@@ -894,7 +904,9 @@ impl App {
         let mut ended = 0;
         for runtime in self.pane_runtimes() {
             ended += usize::from(runtime.expire_injection_lease(now));
-            runtime.drain_held_input();
+            // A refusal is logged per pane where it happens. No attempt is
+            // left to carry it here: the lease past its bound has no owner.
+            let _ = runtime.drain_held_input();
         }
         self.surface_kept_drafts();
         ended > 0
@@ -927,7 +939,7 @@ impl App {
         self.surface_kept_drafts();
         for runtime in self.pane_runtimes() {
             runtime.end_all_injection_leases();
-            runtime.drain_held_input();
+            let _ = runtime.drain_held_input();
         }
     }
 
@@ -1003,6 +1015,7 @@ fn new_evidence(
         finished_at_ms: None,
         retried: false,
         draft: None,
+        held_input_not_written: false,
     }
 }
 
