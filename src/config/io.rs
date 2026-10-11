@@ -9,6 +9,7 @@ use super::{
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "checks",
+    "events",
     "experimental",
     "fleet",
     "gossip",
@@ -678,6 +679,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.msg = section,
+    );
+    load_live_section(
+        &table,
+        "events",
+        "events config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.events = section,
     );
     // #397: canonicalise the declared agent names and merge them over the
     // compiled default, so a fleet declaring one agent does not un-declare the
