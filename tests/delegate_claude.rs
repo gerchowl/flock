@@ -905,6 +905,14 @@ fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
     assert_eq!(status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("input_not_empty"), "{}", stderr(&out));
     assert!(!stderr(&out).contains("Workspace kept"));
+    // #925: the pane is gone after the rollback, so the error carries what it
+    // showed, read before the teardown.
+    assert!(
+        stderr(&out).contains("delegate refused: last ")
+            && stderr(&out).contains("  | \u{276f} operator draft"),
+        "the error carries the pane's last lines: {}",
+        stderr(&out)
+    );
     assert_eq!(workspaces(&server).len(), before);
     assert!(agent_get(&server, "refused").is_none());
     assert!(typed(&server).is_empty());
@@ -942,4 +950,301 @@ fn report_a_removed_agent_fails_with_the_agent_list() {
         began.elapsed() < WITHIN,
         "must fail before the status deadline"
     );
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #925 (c): with `--keep-on-failure` a start the composer refuses keeps its
+/// workspace, agent and registry entry, prints the pane's last lines, and
+/// `reap` removes what was kept.
+#[test]
+fn keep_on_failure_keeps_a_refused_start_for_inspection() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let b = brief(&server, "kept.md", "brief\n");
+    let mut child = start_claude(&server, "kept", &b, &["--keep-on-failure", "--json"]);
+    let pane = delegate_pane(&server, "kept");
+    report_session(&server, &pane);
+    fs::write(
+        server.base.join("screen"),
+        claude_prompt_box().replace("❯ ", "❯ leftover suggestion"),
+    )
+    .unwrap();
+    let status = exited_within(&mut child, WITHIN).expect("refusal returns");
+    let out = finish(child);
+    let message = stderr(&out);
+    assert_eq!(status.code(), Some(1), "{message}");
+    assert!(message.contains("input_not_empty"), "{message}");
+    assert!(
+        message.contains("  | \u{276f} leftover suggestion"),
+        "the pane's last lines: {message}"
+    );
+    assert!(
+        message.contains("kept for inspection (--keep-on-failure)")
+            && message.contains("flk delegate reap kept"),
+        "{message}"
+    );
+    assert!(
+        stdout(&out).is_empty(),
+        "a failure prints nothing on stdout"
+    );
+    assert!(typed(&server).is_empty(), "nothing was typed");
+    assert_eq!(workspaces(&server).len(), before + 1, "the workspace stays");
+    assert!(agent_get(&server, "kept").is_some(), "the agent stays");
+
+    let status = cli(&server, &["delegate", "status", "kept", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let json = stdout_json(&status);
+    assert_eq!(json["round"], 0, "no round ran: {json}");
+
+    let reaped = cli(&server, &["delegate", "reap", "kept", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
+    assert_eq!(workspaces(&server).len(), before, "reap removes it");
+    let after = cli(&server, &["delegate", "status", "kept"]);
+    assert_eq!(after.status.code(), Some(2), "{}", stderr(&after));
+}
+
+/// #925 (b): a `--repo` that is a linked worktree starts from its main
+/// checkout, branching from the linked worktree's HEAD, instead of failing
+/// with `linked_worktree_source`.
+#[test]
+fn a_linked_worktree_repo_starts_from_its_main_checkout() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let linked = server.base.join("story-wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "story",
+            &linked.to_string_lossy(),
+        ],
+    );
+    git(
+        &linked,
+        &["commit", "-q", "--allow-empty", "-m", "story work"],
+    );
+    let story_head = git_out(&linked, &["rev-parse", "HEAD"]);
+    assert_ne!(story_head, git_out(&repo, &["rev-parse", "HEAD"]));
+    let b = brief(&server, "task.md", "x\n");
+
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "lw",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &linked.to_string_lossy(),
+            "--branch",
+            "feat/p925-linked",
+            "--json",
+        ],
+    );
+    make_ready(&server, "lw");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    let message = stderr(&out);
+    assert_eq!(status.code(), Some(0), "{message}");
+    assert!(
+        message.contains("is a linked worktree; starting from its main checkout")
+            && message.contains(&story_head[..12]),
+        "the swap is said, with the commit it branches from: {message}"
+    );
+    let json = stdout_json(&out);
+    let checkout = PathBuf::from(json["worktree"].as_str().expect("a checkout"));
+    assert_eq!(git_out(&checkout, &["rev-parse", "HEAD"]), story_head);
+    assert_eq!(
+        git_out(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/p925-linked"
+    );
+    assert_eq!(json["base_sha"], story_head.as_str(), "{json}");
+}
+
+/// #925 (a): `--repo .` is the caller's directory. Inside a repository the
+/// start succeeds from it; outside one it fails non-zero with the server's
+/// reason, and nothing is created.
+#[test]
+fn a_relative_repo_resolves_against_the_caller_and_never_exits_zero_on_error() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let before = workspaces(&server).len();
+    let args = |name: &'static str, branch: &'static str| {
+        [
+            "delegate",
+            "start",
+            name,
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            ".",
+            "--branch",
+            branch,
+            "--json",
+        ]
+        .map(str::to_string)
+    };
+
+    let outside = command(&server, &[])
+        .args(args("rel-out", "feat/p925-out"))
+        .current_dir(server.base.join("work"))
+        .output()
+        .unwrap();
+    assert_eq!(outside.status.code(), Some(1), "{}", stderr(&outside));
+    assert!(
+        stderr(&outside).contains("not_git_worktree")
+            && !stderr(&outside).contains("must be an absolute path"),
+        "the path reached the server absolute: {}",
+        stderr(&outside)
+    );
+    assert!(stdout(&outside).is_empty());
+    assert_eq!(workspaces(&server).len(), before, "nothing was created");
+
+    let mut inside = command(&server, &[])
+        .args(args("rel-in", "feat/p925-in"))
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    make_ready(&server, "rel-in");
+    let status = exited_within(&mut inside, WITHIN).expect("start returns");
+    let out = finish(inside);
+    assert_eq!(status.code(), Some(0), "{}", stderr(&out));
+    let json = stdout_json(&out);
+    let checkout = PathBuf::from(json["worktree"].as_str().expect("a checkout"));
+    assert_eq!(
+        git_out(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/p925-in"
+    );
+}
+
+/// #925 (b): a linked worktree of a bare repository has no main checkout to
+/// start from, so it is refused as a usage error (exit 2) before anything is
+/// created, naming the fix and never announcing a swap.
+#[test]
+fn a_linked_worktree_of_a_bare_repo_is_refused() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let bare = server.base.join("bare.git");
+    git(
+        &server.base,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &repo.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    );
+    let linked = server.base.join("bare-wt");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "story",
+            &linked.to_string_lossy(),
+            "main",
+        ],
+    );
+    let b = brief(&server, "task.md", "x\n");
+    let before = workspaces(&server).len();
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "bw",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &linked.to_string_lossy(),
+            "--branch",
+            "feat/p925-bare",
+        ],
+    );
+    let message = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{message}");
+    assert!(
+        message.contains("of a bare repository") && message.contains("pass a main checkout"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("starting from its main checkout"),
+        "{message}"
+    );
+    assert!(stdout(&out).is_empty());
+    assert_eq!(workspaces(&server).len(), before, "nothing was created");
+    assert!(agent_get(&server, "bw").is_none());
+}
+
+/// #925 (c): `--keep-on-failure` on the readiness path. An agent that never
+/// reaches its prompt times out, and the start keeps its workspace, agent and
+/// record (round 0) instead of rolling back; `reap` removes them.
+#[test]
+fn keep_on_failure_keeps_a_start_whose_readiness_timed_out() {
+    let server = start_server();
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    let b = brief(&server, "slow.md", "brief\n");
+    let mut child = start_claude(
+        &server,
+        "slow",
+        &b,
+        &["--keep-on-failure", "--ready-timeout", "1500"],
+    );
+    delegate_pane(&server, "slow");
+    fs::write(server.base.join("screen"), "booting the harness\n").unwrap();
+    let status = exited_within(&mut child, WITHIN).expect("the timeout returns");
+    let out = finish(child);
+    let message = stderr(&out);
+    assert_eq!(status.code(), Some(1), "{message}");
+    assert!(message.contains("ready timeout"), "{message}");
+    assert!(
+        message.contains("kept for inspection (--keep-on-failure)"),
+        "{message}"
+    );
+    assert!(typed(&server).is_empty(), "nothing was typed");
+    assert_eq!(workspaces(&server).len(), before + 1, "the workspace stays");
+    assert!(agent_get(&server, "slow").is_some(), "the agent stays");
+
+    let status = cli(&server, &["delegate", "status", "slow", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["round"], 0);
+
+    let reaped = cli(&server, &["delegate", "reap", "slow", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
+    assert_eq!(workspaces(&server).len(), before, "reap removes it");
 }
