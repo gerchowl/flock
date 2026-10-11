@@ -449,7 +449,7 @@ The result carries the turns plus the cursor that resumes after them:
 
 Two properties are deliberate. `agent.history` touches **no pane state** — it does not mark the pane seen and does not move the operator's attention ordering, which is what makes polling it safe. And it renders at the `detail` the *caller* asked for, never at whatever level the operator's prompt-history panel happens to be showing.
 
-Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet, or no opencode database under `$XDG_DATA_HOME/opencode` / `~/.local/share/opencode`), `transcript_unreadable`.
+Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock reads), `session_unconfirmed` (a Claude or OpenCode session Flock restored that no hook from the running agent has confirmed since; retry after the agent's next turn), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet, or no opencode database under `$XDG_DATA_HOME/opencode` / `~/.local/share/opencode`), `transcript_unreadable`.
 
 ### The result of a turn
 
