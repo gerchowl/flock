@@ -561,16 +561,36 @@ impl Default for WebSectionConfig {
 #[serde(default)]
 pub struct SystemOneConfig {
     pub urls: Vec<String>,
+    /// Sized for clef-flash on the fleet endpoint (#714): an uncached 4 KB tail with the
+    /// ten delegate questions measured p95 1.55 s, and the backend serves one
+    /// request at a time, so this leaves room for one request queued ahead.
     pub timeout_s: f64,
+    /// `fast` asks `urls`. `full` asks `full_urls` (or `SYSTEMONE_URL_FULL`),
+    /// the larger and slower model, within `full_timeout_s`.
+    pub tier: SystemOneTier,
+    pub full_urls: Vec<String>,
+    /// The 27B full tier measured p95 5.0 s for the same request (#714).
+    pub full_timeout_s: f64,
 }
 
 impl Default for SystemOneConfig {
     fn default() -> Self {
         Self {
             urls: Vec::new(),
-            timeout_s: 3.0,
+            timeout_s: 4.0,
+            tier: SystemOneTier::Fast,
+            full_urls: Vec::new(),
+            full_timeout_s: 12.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemOneTier {
+    #[default]
+    Fast,
+    Full,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
