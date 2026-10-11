@@ -2007,12 +2007,12 @@ pub struct EventsReadParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     /// Hold the request until a matching event arrives, at most
-    /// [`EVENTS_READ_MAX_WAIT_MS`]. Absent or 0 answers at once.
+    /// `[events] read_max_wait_ms`. Absent or 0 answers at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
 }
 
-/// ADR-0028 owner decision 3: the longest an `events.read` is held.
+/// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
 pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
 pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
 pub const EVENTS_READ_MAX_LIMIT: u32 = 4096;

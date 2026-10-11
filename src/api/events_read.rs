@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventEnvelope, EventGap, EventsReadParams, ResponseResult,
     SequencedEvent, SuccessResponse, EVENTS_READ_DEFAULT_LIMIT, EVENTS_READ_MAX_LIMIT,
-    EVENTS_READ_MAX_WAIT_MS,
 };
 use crate::api::server::{should_stop_connection, CONNECTION_POLL_INTERVAL};
 use crate::api::EventHub;
@@ -63,8 +62,10 @@ pub(super) fn read_events(
             format!("{kind:?} is not durable; events.read serves durable kinds only"),
         )));
     }
-    let head = event_hub.current_sequence();
-    if params.after > head {
+    if params.after > event_hub.current_sequence() {
+        // Suggest the durable head: a later sequence may belong to an
+        // ephemeral event that a restart hands out again.
+        let head = event_hub.durable_sequence();
         return Ok(Some(refuse(
             request_id,
             "cursor_ahead",
@@ -78,7 +79,8 @@ pub(super) fn read_events(
         .limit
         .unwrap_or(EVENTS_READ_DEFAULT_LIMIT)
         .clamp(1, EVENTS_READ_MAX_LIMIT) as usize;
-    let wait = Duration::from_millis(params.wait_ms.unwrap_or(0).min(EVENTS_READ_MAX_WAIT_MS));
+    let wait_ms = params.wait_ms.unwrap_or(0);
+    let wait = Duration::from_millis(wait_ms.min(event_hub.read_max_wait_ms()));
     let deadline = Instant::now() + wait;
     let keep = |envelope: &EventEnvelope| {
         (params.kinds.is_empty() || params.kinds.contains(&envelope.event))
