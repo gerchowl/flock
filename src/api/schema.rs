@@ -3021,6 +3021,15 @@ pub struct FleetAgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub status: AgentStatus,
+    /// The agent's `state` (#1019). A local row carries the full record's
+    /// value. A remote row is all `unknown`: the mesh summary carries no
+    /// state, and the mesh protocol is unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<crate::api::agent_state::AgentState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3039,6 +3048,16 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// The cross-harness state (ADR-0028 §1, #1019): orthogonal axes with a
+    /// per-axis `source`, and the derived `phase` supervisors branch on.
+    /// Additive: absent from older servers, and a client reads a missing or
+    /// unparseable value as absent, so it falls back to `agent_status`.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<crate::api::agent_state::AgentState>,
     /// The agent is `idle`/`done` because its turn ended (Claude's
     /// `done <time>` marker) while background shells or agents it started are
     /// still running (#922). Carried from the server's own screen detector,
@@ -4981,6 +5000,7 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            state: None,
             settled_with_background_shells: false,
             blocked_reason: None,
             retry_after_ms: None,

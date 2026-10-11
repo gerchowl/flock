@@ -28,7 +28,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
 fn server_stop(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
         eprintln!("usage: flk server stop");
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     }
 
     super::send_ok_request(Method::ServerStop(EmptyParams::default()))
@@ -37,7 +37,7 @@ fn server_stop(args: &[String]) -> std::io::Result<i32> {
 fn server_reload_config(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
         eprintln!("usage: flk server reload-config");
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     }
 
     super::print_response(&super::send_request(&Request {
@@ -51,7 +51,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
         eprintln!(
             "usage: flk server live-handoff [--import-exe <path>] [--expected-protocol <n>] [--expected-version <version>]"
         );
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     };
 
     let socket_path = crate::api::socket_path();
@@ -69,7 +69,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
             Ok(resolved) => resolved,
             Err(err) => {
                 eprintln!("refusing live handoff: --import-exe {exe} cannot be resolved: {err}");
-                return Ok(1);
+                return Ok(super::exit::FAILURE);
             }
         };
         if params.expected_version.is_none() {
@@ -85,7 +85,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
             &socket_path,
         ) {
             eprintln!("{refusal}");
-            return Ok(1);
+            return Ok(super::exit::FAILURE);
         }
         fill_import_target_from_client(&mut params, own_exe);
     }
@@ -95,7 +95,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
         &client_version,
     ) {
         eprintln!("{refusal}");
-        return Ok(1);
+        return Ok(super::exit::FAILURE);
     }
     let target_version = params.expected_version.clone();
 
@@ -111,7 +111,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
         // machine-readable shape.
         if let Some(message) = error_message_for_human(&response) {
             eprintln!("{message}");
-            return Ok(1);
+            return Ok(super::exit::FAILURE);
         }
         let rendered = serde_json::to_string(&response).unwrap_or_else(|err| {
             format!(
@@ -119,7 +119,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
             )
         });
         eprintln!("{rendered}");
-        return Ok(1);
+        return Ok(super::exit::FAILURE);
     }
 
     let after = wait_for_replacement_version(&socket_path, target_version.as_deref());
@@ -132,11 +132,11 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     ) {
         Ok(summary) => {
             eprintln!("{summary}; server log: {}", log.display());
-            Ok(0)
+            Ok(super::exit::SUCCESS)
         }
         Err(problem) => {
             eprintln!("{problem}\nserver log: {}", log.display());
-            Ok(1)
+            Ok(super::exit::FAILURE)
         }
     }
 }
