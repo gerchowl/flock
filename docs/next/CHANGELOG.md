@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## [1.2.0] - 2026-10-11
+
+### Added
+- Claude Code agents started in a linked git worktree no longer stop on Claude's folder-trust dialog when the repository the worktree came from is already trusted. Before `flk agent start`, `flk delegate start` (`--worktree`, or `--cwd` into a linked worktree), `agent.spawn` or a fork execs `claude`, flock writes `projects[<worktree>].hasTrustDialogAccepted = true` into the global config of the profile the child runs under, found the way Claude Code finds it (a legacy `.config.json` in `$CLAUDE_CONFIG_DIR` or `~/.claude` first, then `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`). It never widens trust: the entry is written only when the same directory in the main checkout is trusted by Claude's own lookup (which stops at the git root), and a directory that is not inside a linked worktree, such as `$HOME`, is never touched. A `.git` file only counts when git's own worktree records point back at it. The edit is made under the same `<config>.lock` lock Claude Code takes for its own config writes, and is skipped rather than written unlocked when another process holds it. It splices only the bytes it adds, keeps the file's mode, re-reads the file just before an atomic replace and retries once if it changed, and skips a symlinked or read-only config. Opt out with `[worktrees] pretrust_claude = false` (#605)
+- `agent.get`, `agent.list`, `agent.result` and MCP `flock_agent_get` now report `settled_with_background_shells: true` for an `idle`/`done` Claude agent whose turn ended while background shells it started are still running. The server carries the result of its own screen detector, so socket and MCP supervisors can tell that settle apart from one with nothing left running; the field is omitted when false. `delegate status` uses the server's field and falls back to reading the screen against older servers (#922)
+
+### Fixed
+- `flk delegate start` prints the agent pane's last 20 lines when a start fails once its agent exists, read before the rollback, and `--keep-on-failure` keeps the workspace, agent and record for inspection instead (`flk delegate reap` removes it) (#925, #938)
+- `flk delegate start --worktree --repo <linked worktree>` starts from the repository's main checkout, branching from the linked worktree's HEAD unless `--base` is given, instead of failing with `linked_worktree_source`; `--repo .` names the current directory itself (#925)
+- A mesh relay reached over Tailscale SSH (`tailscale up --ssh`) is accepted: the relay check matches a `tailscaled` ancestor as well as `sshd`, so such a peer no longer fails `mesh.hello` with `relay_not_from_ssh` (#976)
+
 ## [1.1.0] - 2026-10-11
 
 ### Fixed
