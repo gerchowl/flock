@@ -871,6 +871,161 @@ pub(crate) fn prepare_peer_checkout(
     })
 }
 
+/// How long refreshing a worktree base from its remote may take (#828).
+const BASE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The base a new worktree branches from, after refreshing it from its remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FreshBase {
+    /// What `git worktree add` is given.
+    pub(crate) base: String,
+    /// The commit that resolves to, when it resolves.
+    pub(crate) sha: Option<String>,
+    /// What the operator should hear: a fetch that failed, or a local branch
+    /// that was kept although its remote moved.
+    pub(crate) note: Option<String>,
+}
+
+/// Which of a branch's two refs a new worktree should start from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseChoice {
+    Local,
+    Remote,
+    /// The local branch has commits its remote does not: keep it, and say so.
+    LocalAhead,
+}
+
+/// The decision half of [`resolve_fresh_base`].
+///
+/// The remote-tracking ref wins whenever it holds everything the local branch
+/// does, because a local integration branch nobody pulls is the stale base
+/// #828 reports. A local branch with commits of its own is never discarded.
+fn choose_base(local: Option<&str>, remote: Option<&str>, local_in_remote: bool) -> BaseChoice {
+    match (local, remote) {
+        (_, None) => BaseChoice::Local,
+        (None, Some(_)) => BaseChoice::Remote,
+        (Some(local), Some(remote)) if local == remote || local_in_remote => BaseChoice::Remote,
+        (Some(_), Some(_)) => BaseChoice::LocalAhead,
+    }
+}
+
+/// Resolve `--base` for a new worktree against a freshly fetched remote (#828).
+///
+/// A branch name is refreshed from its remote (its configured upstream remote,
+/// else `origin`) and resolved to the remote-tracking ref unless the local
+/// branch has commits of its own. An explicit `<remote>/<branch>` is fetched
+/// and kept as written. `HEAD`, a commit id, or any other revision is passed
+/// through untouched. A fetch that fails is reported and the refs already on
+/// disk decide, so an offline start still works.
+pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
+    let root = repo.display().to_string();
+    let git = |args: &[&str]| {
+        let mut full = vec!["-C", root.as_str()];
+        full.extend_from_slice(args);
+        run_command_capture("git", &full, None).ok()
+    };
+    let commit = |rev: &str| {
+        git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+    };
+    let fetch = |remote: &str, branch: &str| {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        run_command_capture_with_timeout(
+            "git",
+            &[
+                "-C",
+                &root,
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--",
+                remote,
+                &refspec,
+            ],
+            None,
+            BASE_FETCH_TIMEOUT,
+        )
+        .err()
+        .filter(|err| !err.contains("couldn't find remote ref"))
+        .map(|err| format!("could not fetch {remote}/{branch}, using the refs on disk: {err}"))
+    };
+    let as_written = |note: Option<String>| FreshBase {
+        base: base.to_string(),
+        sha: commit(base),
+        note,
+    };
+
+    let remotes: Vec<String> = git(&["remote"])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    if let Some((remote, branch)) = remotes.iter().find_map(|remote| {
+        base.strip_prefix(&format!("{remote}/"))
+            .map(|branch| (remote.as_str(), branch))
+    }) {
+        let note = git(&["check-ref-format", &format!("refs/heads/{branch}")])
+            .and_then(|_| fetch(remote, branch));
+        return as_written(note);
+    }
+
+    let branch_like =
+        base != "HEAD" && git(&["check-ref-format", &format!("refs/heads/{base}")]).is_some();
+    let local = commit(&format!("refs/heads/{base}"));
+    let commit_id = (7..=40).contains(&base.len()) && base.chars().all(|c| c.is_ascii_hexdigit());
+    if !branch_like || (local.is_none() && commit_id) {
+        return as_written(None);
+    }
+    let remote = git(&["config", &format!("branch.{base}.remote")])
+        .filter(|remote| remotes.contains(remote))
+        .or_else(|| remotes.iter().find(|remote| *remote == "origin").cloned());
+    let Some(remote) = remote else {
+        return as_written(None);
+    };
+    let fetch_note = fetch(&remote, base);
+    let tracking = format!("{remote}/{base}");
+    let remote_sha = commit(&format!("refs/remotes/{tracking}"));
+    let local_in_remote = match (&local, &remote_sha) {
+        (Some(local), Some(remote)) => {
+            git(&["merge-base", "--is-ancestor", local, remote]).is_some()
+        }
+        _ => false,
+    };
+    let join = |a: Option<String>, b: Option<String>| match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
+    match choose_base(local.as_deref(), remote_sha.as_deref(), local_in_remote) {
+        BaseChoice::Local => FreshBase {
+            base: base.to_string(),
+            sha: local,
+            note: fetch_note,
+        },
+        BaseChoice::Remote => FreshBase {
+            note: join(
+                fetch_note,
+                (local.is_some() && local != remote_sha).then(|| {
+                    format!("local {base} is behind {tracking}; branching from {tracking}")
+                }),
+            ),
+            base: tracking,
+            sha: remote_sha,
+        },
+        BaseChoice::LocalAhead => FreshBase {
+            base: base.to_string(),
+            sha: local,
+            note: join(
+                fetch_note,
+                Some(format!(
+                    "local {base} has commits {tracking} does not; branching from local {base}"
+                )),
+            ),
+        },
+    }
+}
+
 /// Bring a peer's branch across to this machine (#125, the hub's local leg):
 /// `git fetch origin <branch>` into a local checkout of the project, then add a
 /// linked worktree on it — reusing an existing local branch when present, else
@@ -2675,6 +2830,124 @@ mod tests {
             &["remote", "add", "origin", &origin.display().to_string()],
         );
         (repo, origin)
+    }
+
+    fn head_of(repo: &Path, rev: &str) -> String {
+        run_command_capture(
+            "git",
+            &["-C", &repo.display().to_string(), "rev-parse", rev],
+            None,
+        )
+        .expect("rev-parse")
+    }
+
+    #[test]
+    fn a_base_prefers_its_remote_unless_the_local_branch_is_ahead() {
+        use BaseChoice::*;
+        assert_eq!(choose_base(Some("a"), None, false), Local);
+        assert_eq!(choose_base(None, Some("b"), false), Remote);
+        assert_eq!(choose_base(Some("a"), Some("a"), false), Remote);
+        assert_eq!(choose_base(Some("a"), Some("b"), true), Remote);
+        assert_eq!(choose_base(Some("a"), Some("b"), false), LocalAhead);
+    }
+
+    /// #828: the main checkout's `dev` never pulled while `origin/dev` moved on.
+    /// `--base dev` must fetch and branch from what the remote holds.
+    #[test]
+    fn a_stale_local_base_is_refreshed_from_its_remote() {
+        let (repo, origin) = create_repo_with_bare_origin("fresh-base");
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(&repo, &["push", "--quiet", "origin", &default]);
+        let stale = head_of(&repo, "HEAD");
+
+        // Another clone lands work on the remote; this checkout never pulls.
+        let other = unique_temp_path("fresh-base-other");
+        run_git(
+            &repo,
+            &[
+                "clone",
+                "--quiet",
+                &origin.display().to_string(),
+                &other.display().to_string(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&other, &["config", "user.name", "Flock Test"]);
+        run_git(
+            &other,
+            &["commit", "--quiet", "--allow-empty", "-m", "merged pr"],
+        );
+        run_git(&other, &["push", "--quiet", "origin", &default]);
+        let landed = head_of(&other, "HEAD");
+
+        let fresh = resolve_fresh_base(&repo, &default);
+        assert_eq!(fresh.base, format!("origin/{default}"));
+        assert_eq!(fresh.sha.as_deref(), Some(landed.as_str()));
+        assert!(
+            fresh
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("is behind")),
+            "{fresh:?}"
+        );
+
+        // An explicit remote-tracking base and a commit id keep working as written.
+        let explicit = resolve_fresh_base(&repo, &format!("origin/{default}"));
+        assert_eq!(explicit.base, format!("origin/{default}"));
+        assert_eq!(explicit.sha.as_deref(), Some(landed.as_str()));
+        assert_eq!(explicit.note, None);
+        let pinned = resolve_fresh_base(&repo, &stale);
+        assert_eq!(
+            (pinned.base.as_str(), pinned.sha.as_deref()),
+            (stale.as_str(), Some(stale.as_str()))
+        );
+        assert_eq!(resolve_fresh_base(&repo, "HEAD").base, "HEAD");
+
+        // A local-only branch has no remote counterpart and stays local, quietly.
+        run_git(&repo, &["branch", "local-only"]);
+        let local_only = resolve_fresh_base(&repo, "local-only");
+        assert_eq!(local_only.base, "local-only");
+        assert_eq!(local_only.note, None, "{local_only:?}");
+
+        // Local commits of its own are never discarded for the remote.
+        run_git(
+            &repo,
+            &[
+                "merge",
+                "--quiet",
+                "--ff-only",
+                &format!("origin/{default}"),
+            ],
+        );
+        run_git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "unpushed"],
+        );
+        let ahead = resolve_fresh_base(&repo, &default);
+        assert_eq!(ahead.base, default);
+        assert_eq!(ahead.sha, Some(head_of(&repo, "HEAD")));
+        assert!(
+            ahead
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("has commits")),
+            "{ahead:?}"
+        );
+
+        for dir in [&repo, &origin, &other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_base_without_a_remote_is_used_as_written() {
+        let repo = create_committed_repo("fresh-base-no-remote");
+        let default = detect_default_branch(&repo).expect("default branch");
+        let fresh = resolve_fresh_base(&repo, &default);
+        assert_eq!(fresh.base, default);
+        assert_eq!(fresh.sha, Some(head_of(&repo, "HEAD")));
+        assert_eq!(fresh.note, None);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// A repo whose PR was brought up to date ON GITHUB, which is #646's shape:

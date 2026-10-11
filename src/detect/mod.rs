@@ -389,6 +389,11 @@ pub fn codex_waiting_on_hook_review(screen_content: &str) -> bool {
     agents::codex::has_codex_hook_review(&screen_content.to_lowercase())
 }
 
+/// The live Codex folder-trust dialog (#828), shared with delegate readiness.
+pub fn codex_waiting_on_folder_trust(screen_content: &str) -> bool {
+    agents::codex::has_codex_folder_trust(&screen_content.to_lowercase())
+}
+
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
     agent.is_some_and(|agent| agents::should_skip_state_update(agent, screen_content))
 }
