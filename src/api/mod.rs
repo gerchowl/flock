@@ -1,6 +1,7 @@
 pub mod client;
 pub(crate) mod compatibility;
 mod event_hub;
+mod events_read;
 mod reply_wait;
 pub mod schema;
 mod server;

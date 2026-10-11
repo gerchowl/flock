@@ -29,6 +29,12 @@ pub struct EventHub {
 #[derive(Default)]
 struct EventHubState {
     next_sequence: u64,
+    /// The newest sequence of a persisted kind. A restart resumes numbering
+    /// from it, so a sequence above it may be handed out again and must
+    /// never become a reader's cursor.
+    durable_sequence: u64,
+    #[cfg(test)]
+    ring_cap: Option<usize>,
     events: Vec<(u64, EventEnvelope)>,
     log: Option<PersistentLog>,
 }
@@ -70,14 +76,7 @@ impl PersistentLog {
     }
 
     fn rotated_path(&self, index: usize) -> PathBuf {
-        let mut name = self
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("event-log")
-            .to_string();
-        name.push_str(&format!(".{index}.jsonl"));
-        self.path.with_file_name(name)
+        rotated_path(&self.path, index)
     }
 
     fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
@@ -203,6 +202,24 @@ fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
     Ok(events)
 }
 
+#[derive(Default)]
+pub(crate) struct EventRead {
+    pub gap: Option<(u64, u64)>,
+    pub events: Vec<(u64, EventEnvelope)>,
+    /// The cursor to hand a reader: never past the newest durable event.
+    pub next_after: u64,
+    /// How far this read looked, for waiting on the hub.
+    pub scanned: u64,
+}
+
+fn rotated_path(path: &Path, index: usize) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("event-log");
+    path.with_file_name(format!("{stem}.{index}.jsonl"))
+}
+
 pub(crate) struct ReplyWaitGuard {
     hub: EventHub,
     correlation: String,
@@ -300,6 +317,7 @@ impl EventHub {
                 .map(|event| event.seq)
                 .unwrap_or(0)
                 .max(highest_quarantined_seq);
+            state.durable_sequence = state.next_sequence;
             state.events = restored
                 .iter()
                 .rev()
@@ -322,6 +340,7 @@ impl EventHub {
         state.next_sequence += 1;
         let sequence = state.next_sequence;
         if event.event.is_persisted() {
+            state.durable_sequence = sequence;
             if let Some(log) = state.log.as_mut() {
                 let persisted = PersistedEvent {
                     seq: sequence,
@@ -337,7 +356,11 @@ impl EventHub {
             }
         }
         state.events.push((sequence, event));
-        let overflow = state.events.len().saturating_sub(Self::MAX_EVENTS);
+        #[cfg(test)]
+        let cap = state.ring_cap.unwrap_or(Self::MAX_EVENTS);
+        #[cfg(not(test))]
+        let cap = Self::MAX_EVENTS;
+        let overflow = state.events.len().saturating_sub(cap);
         if overflow > 0 {
             state.events.drain(0..overflow);
         }
@@ -387,6 +410,100 @@ impl EventHub {
             return 0;
         };
         state.next_sequence
+    }
+
+    /// `events.read` (ADR-0028 §3): durable events with `seq > after` that
+    /// `keep` accepts, at most `limit`, oldest first.
+    ///
+    /// The ring answers when it still reaches back to `after`. Otherwise the
+    /// log files are read newest first WITHOUT the hub lock, so a slow disk
+    /// never stalls a push. A rotation racing that read can only cost the
+    /// oldest end, which then surfaces as a gap, never as a silent hole.
+    pub(crate) fn read(
+        &self,
+        after: u64,
+        limit: usize,
+        keep: impl Fn(&EventEnvelope) -> bool,
+    ) -> EventRead {
+        let (ring_floor, path) = {
+            let Ok(state) = self.inner.lock() else {
+                return EventRead::default();
+            };
+            let floor = state.events.first().map(|(seq, _)| *seq);
+            (floor, state.log.as_ref().map(|log| log.path.clone()))
+        };
+        let mut gap = None;
+        let mut disk: Vec<(u64, EventEnvelope)> = Vec::new();
+        if ring_floor.is_some_and(|floor| floor > after + 1) {
+            if let Some(path) = path {
+                let mut dropped = false;
+                for index in 0..=MAX_ROTATED {
+                    let file = match index {
+                        0 => path.clone(),
+                        index => rotated_path(&path, index),
+                    };
+                    dropped |= index == MAX_ROTATED && file.exists();
+                    let Ok(events) = read_log_file(&file) else {
+                        dropped = true;
+                        break;
+                    };
+                    let reaches = events.first().is_some_and(|event| event.seq <= after + 1);
+                    disk.extend(events.into_iter().map(|event| (event.seq, event.envelope)));
+                    if reaches {
+                        dropped = false;
+                        break;
+                    }
+                }
+                disk.retain(|(seq, _)| *seq > after);
+                disk.sort_by_key(|(seq, _)| *seq);
+                disk.dedup_by_key(|(seq, _)| *seq);
+                let floor = disk.first().map(|(seq, _)| *seq).or(ring_floor);
+                if let Some(floor) = floor.filter(|floor| dropped && *floor > after + 1) {
+                    gap = Some((after + 1, floor - 1));
+                }
+            } else if let Some(floor) = ring_floor {
+                gap = Some((after + 1, floor - 1));
+            }
+        }
+        let Ok(state) = self.inner.lock() else {
+            return EventRead::default();
+        };
+        let disk_max = disk.last().map(|(seq, _)| *seq);
+        // The ring continues the disk read only if it has not moved past it
+        // meanwhile. If it has, the rest is on disk for the next call.
+        let ring_joins = match (disk_max, state.events.first()) {
+            (Some(max), Some((first, _))) => *first <= max + 1,
+            _ => true,
+        };
+        let mut scanned = disk_max.unwrap_or(after).max(after);
+        let ring = state
+            .events
+            .iter()
+            .filter(|(seq, _)| ring_joins && *seq > scanned)
+            .cloned()
+            .collect::<Vec<_>>();
+        if ring_joins {
+            scanned = scanned.max(state.next_sequence);
+        }
+        let durable = state.durable_sequence;
+        drop(state);
+        let mut events = Vec::new();
+        for (seq, envelope) in disk.into_iter().chain(ring) {
+            if !envelope.event.is_persisted() || !keep(&envelope) {
+                continue;
+            }
+            if events.len() == limit {
+                scanned = events.last().map(|(seq, _)| *seq).unwrap_or(after);
+                break;
+            }
+            events.push((seq, envelope));
+        }
+        EventRead {
+            gap,
+            events,
+            next_after: scanned.min(durable),
+            scanned,
+        }
     }
 
     #[cfg(test)]
@@ -681,6 +798,131 @@ mod tests {
         let persisted = hub.persisted_events_after(0);
         assert_eq!(persisted.len(), 1, "disk sees only the persisted kind");
         assert_eq!(persisted[0].0, 2, "persisted event keeps its ring seq");
+        cleanup(&path);
+    }
+
+    /// Drain `read` from `after` to the head the way a consumer would:
+    /// every seq seen, plus every range a gap reported.
+    fn drain(hub: &EventHub, mut after: u64, limit: usize) -> (Vec<u64>, Vec<(u64, u64)>, u64) {
+        let (mut seen, mut gaps) = (Vec::new(), Vec::new());
+        loop {
+            let read = hub.read(after, limit, |_| true);
+            gaps.extend(read.gap);
+            seen.extend(read.events.iter().map(|(seq, _)| *seq));
+            if read.events.is_empty() && read.gap.is_none() {
+                return (seen, gaps, after);
+            }
+            assert!(read.next_after >= after, "a cursor never moves back");
+            after = read.next_after;
+        }
+    }
+
+    /// #1028 / ADR-0028 §3: across random rotations, restarts and
+    /// ephemeral kinds, a reader resuming from any cursor sees every durable
+    /// event or a gap that names it. Silent loss fails the test.
+    #[test]
+    fn read_is_at_least_once_or_an_explicit_gap_across_rotations_and_restarts() {
+        for seed in 1..=8u64 {
+            let path = temp_log(&format!("read-{seed}"));
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut next = |bound: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % bound
+            };
+            let ring_cap = Some(2 + next(8) as usize);
+            let mut hub = EventHub::with_persistence(path.clone());
+            hub.inner.lock().unwrap().ring_cap = ring_cap;
+            let mut durable: Vec<u64> = Vec::new();
+            let (mut cursor, mut seen, mut gaps) = (0, Vec::new(), Vec::new());
+            for step in 0..160 {
+                match next(20) {
+                    0..=11 => {
+                        hub.push(workspace_event(&format!("w{step}")));
+                        durable.push(hub.current_sequence());
+                    }
+                    12..=14 => hub.push(output_event()),
+                    15..=16 => {
+                        let mut state = hub.inner.lock().unwrap();
+                        state.log.as_mut().unwrap().rotate().unwrap();
+                    }
+                    17 => {
+                        drop(hub);
+                        hub = EventHub::with_persistence(path.clone());
+                        hub.inner.lock().unwrap().ring_cap = ring_cap;
+                    }
+                    _ => {
+                        let (got, gap, resumed) = drain(&hub, cursor, 1 + next(4) as usize);
+                        seen.extend(got);
+                        gaps.extend(gap);
+                        cursor = resumed;
+                    }
+                }
+            }
+            let (got, gap, _) = drain(&hub, cursor, 3);
+            seen.extend(got);
+            gaps.extend(gap);
+            let covered = |seq: u64, seen: &[u64], gaps: &[(u64, u64)]| {
+                seen.contains(&seq) || gaps.iter().any(|(from, to)| (*from..=*to).contains(&seq))
+            };
+            for seq in &durable {
+                assert!(
+                    covered(*seq, &seen, &gaps),
+                    "seed {seed}: {seq} lost silently"
+                );
+            }
+
+            let retained: Vec<u64> = hub
+                .persisted_events_after(0)
+                .iter()
+                .map(|(seq, _, _)| *seq)
+                .collect();
+            for start in 0..=hub.current_sequence() {
+                let (got, gap, _) = drain(&hub, start, 1 + next(5) as usize);
+                let later: Vec<u64> = durable.iter().copied().filter(|s| *s > start).collect();
+                for seq in &later {
+                    assert!(
+                        covered(*seq, &got, &gap),
+                        "seed {seed} from {start}: {seq} lost"
+                    );
+                }
+                if later.iter().any(|seq| !retained.contains(seq)) {
+                    assert!(!gap.is_empty(), "seed {seed} from {start}: past retention");
+                }
+                if retained.first().is_none_or(|first| start + 1 >= *first) {
+                    assert!(gap.is_empty(), "seed {seed} from {start}: inside retention");
+                }
+                for seq in &retained {
+                    assert!(
+                        !gap.iter().any(|(from, to)| (*from..=*to).contains(seq)),
+                        "seed {seed} from {start}: a gap hides retained {seq}"
+                    );
+                }
+            }
+            cleanup(&path);
+        }
+    }
+
+    /// A restart resumes numbering from the newest durable event, so the
+    /// sequence of an ephemeral event after it is handed out again. A cursor
+    /// that pointed at it would skip the durable event that reuses it.
+    #[test]
+    fn read_cursor_never_lands_on_a_sequence_a_restart_reuses() {
+        let path = temp_log("read-reuse");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        hub.push(output_event());
+        let cursor = hub.read(0, 10, |_| true).next_after;
+        assert_eq!(cursor, 1);
+        drop(hub);
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w2"));
+        let read = hub.read(cursor, 10, |_| true);
+        assert_eq!(
+            read.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [2]
+        );
         cleanup(&path);
     }
 
