@@ -32,6 +32,7 @@ struct RequestError {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         unregister_spawned_flock_pid(pid);
@@ -90,6 +91,7 @@ fn spawn_server_with_env(
     api_socket: &Path,
     extra_env: &[(&str, &str)],
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -139,6 +141,7 @@ fn spawn_named_session_server(
     runtime_dir: &Path,
     session_name: &str,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -176,6 +179,7 @@ fn spawn_named_session_server(
 }
 
 fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(config_home.join("flock-dev")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -272,6 +276,7 @@ fn assert_ok(response: serde_json::Value) {
 }
 
 fn wait_for_api(socket_path: &Path, timeout: Duration) {
+    let _timing = support::timing::wait("ready: api");
     let deadline = Instant::now() + timeout;
     let mut last_error = String::new();
     while Instant::now() < deadline {
