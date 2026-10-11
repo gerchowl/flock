@@ -116,6 +116,24 @@ rubric `ax/1` from §2 in dry-run mode (no filing):
 | Dedup searches | failed inside the sandbox (`gh` reads `$XDG_CONFIG_HOME/gh`, exit 4); re-run read-only by hand |
 | After the search | 4 of 5 match existing issues: #892 (shipped, not yet rolled out), #639 / #911 (shipped), #663 / #819 (open, covered by ADR-0028 E1b, E3 and E7), claude-config#49 (closed). The fifth (builders ignore the size budget) is new but is exactly §7 of this ADR |
 
+**At real architect sizes.** The probe ran at 84k and 136k tokens; ADR-0032
+records real architect contexts of 210k–637k before compaction. Every call a
+fork makes re-reads the whole prefix, so the cost scales linearly with the
+context and with the number of calls. In ADR-0032's units (input-token
+equivalents: cache read × 0.1, 1h creation × 2):
+
+| Context | First turn | Whole run, 4 calls as in the prototype | Whole run, 2 calls (rubric inline in the pivot, searches batched in one shell call) |
+| --- | --- | --- | --- |
+| 136k (measured) | 16k units | 89k units + 10k output | ≈ 40k units |
+| 400k | ≈ 43k units | ≈ 200k units + 10k output | ≈ 95k units |
+| 637k | ≈ 66k units | ≈ 290k units + 10k output | ≈ 140k units |
+
+Everything except the first row's first two cells is extrapolated from the
+measured per-call shape (≈ 1–7k created per call, the rest read), not
+measured. The two-call column assumes ≈ 6.5k created in total. Two consequences:
+the fork's rubric goes inline in the pivot and its searches run in one call
+(§3), and above a context size the compiled reviewer is cheaper (§1).
+
 So the cost is small and the answers were grounded, but **filing without a
 search would have produced 4 duplicates out of 5**, and a confidence of
 0.5–0.7 did not separate them from the new one. That sets the filing policy
@@ -131,7 +149,7 @@ before the target or right after it, never after the text.
 
 ### Brief styles against review rounds
 
-Data: every brief in the fleet's `briefs/` directory (255 files), mapped
+Data: every brief in the fleet's `briefs/` directory (256 files at the time of the analysis), mapped
 through `agents.json` to its PR, and each PR's review history (`gh pr view
 --comments`, the follow-up briefs, STATUS.md verdict lines). 115 initial
 briefs map to a PR (68 Codex, 47 Claude Opus). A round is one follow-up brief
@@ -164,13 +182,16 @@ bound, mostly for Codex.
   | > 600 | 52 | 31 % |
 
   Median diff by rounds: 227 lines (0 rounds), 615 (1), 1,263 (2), 1,790 (3+).
-- **The prose size budget does not hold.** Of the four slice briefs carrying
-  "at most ~400 diff lines; if it grows past that, stop and report the split",
-  one builder split before opening its PR (#1017 → #1048, 375 lines, with the
-  rest announced as a follow-up). Three opened one PR over the budget with a
-  split offered in the body: #1050 (514), #1056 (558 at open, 775 after
-  fixes; the reviewer ruled "don't split"), #1057 (592; split only after a
-  sequencing blocker). The owner's data point is confirmed. Builders almost
+- **The prose size budget does not hold.** Five slice briefs carried "at
+  most ~400 diff lines; if it grows past that, stop and report the split"
+  (#1017, #1018, #1019, #1020, #1028). Two held: #1017's builder split
+  before opening its PR (#1048, 375 lines, the rest announced as a
+  follow-up), and #1018's PR (#1060) came in at 84 lines. Three opened one PR
+  over the budget with a split offered in the body: #1050 (514), #1056 (558
+  at open, 775 after fixes; the reviewer ruled "don't split") and #1057 (592;
+  split only after a sequencing blocker). The owner's count of three overruns
+  is confirmed, with one correction: the list on the issue names #1048, which
+  is #1017's split, and the third overrun is #1057. Builders almost
   never stop: no `BLOCKED:` final line occurs in the 115 PRs, and only two
   builders stopped to report (623-1h, which the architect confirmed as right,
   and #1017's self-split).
@@ -215,9 +236,17 @@ correlational survey, not the "measured comparison" the owner asked for.
   issue searches, filings and comments within §6, one `AxReviewRecorded`
   event (§5), and its report.
 - **Harnesses without fork** (Codex, opencode) get no AX fork. They fall back
-  to a fresh agent started from ADR-0032's compiled context plus the agent's
-  transcript tail, which costs a cold prefix and sees less. That fallback is
-  slice AX9 and is explicitly second-class.
+  to ADR-0032's compiled reviewer (its slice X7: layers 1–2 from cache, the
+  compiled state as the task) plus the agent's transcript tail. That is
+  slice AX9.
+- **Above a context size the compiled reviewer is used instead.** A fork's
+  cost grows with the parent's context (≈ 95k units for a two-call run at
+  400k, ≈ 140k at 637k); ADR-0032 measured a compiled architect resume at 58k–77k units,
+  independent of how long the architect has run. The compiled reviewer sees
+  the state, not the lived friction, so the fork stays the default, and
+  `[ax] fork_max_context` (default 400k tokens) switches a trigger to the
+  compiled reviewer above it. The pre-compaction trigger is exempt: that
+  review exists precisely to capture what only the context holds.
 
 ### 2. The rubric is fixed, versioned, and lives in the repo
 
@@ -266,6 +295,9 @@ bump.
   measured the same cache hit as the worktree fork. A read-only reviewer has
   nothing to commit, and a worktree per review would be one more thing for
   ADR-0027 §5 to reap.
+- **Two calls, not four.** The rubric text goes inline in the pivot rather
+  than as a file to read, and the candidate searches run in one shell call.
+  Each call re-reads the whole prefix, so this halves the cost at any size.
 - **Read-only by a command allowlist, not by a tool flag alone.** Claude's
   `--disallowedTools Edit Write NotebookEdit` removes the edit tools, but the
   fork needs a shell for `gh`, and a shell can write. So the in-place fork
@@ -280,7 +312,7 @@ bump.
   edges, so a running review neither wakes nor parks the architect
   (ADR-0030 rung 5).
 - **A server-started fork still gets an edge.** ADR-0027 §1 records an edge
-  only for an attested agent caller, and a trigger (AX6) is the server, not
+  only for an attested agent caller, and a trigger (AX6a) is the server, not
   an agent. For a fork the server starts on its own trigger, the edge's
   architect is the forked subject itself, with `label: "ax:<trigger>"`. The
   server records it; it is never a parameter, so ADR-0027's spoofing argument
@@ -320,7 +352,7 @@ bump.
   fork's sentinel through a registered wait (ADR-0028 §5), prints the answer,
   and reaps the fork. It files nothing unless the question asks it to, and
   then under §6. The architect is not stopped and learns nothing of it.
-- **The first phase needs no server code.** Until slice AX6, the architect
+- **The first phase needs no server code.** Until slice AX6a, the architect
   skill fires the lifecycle triggers itself: at the end of the boundary turn it
   calls `flock_agent_fork` on itself with the rubric pivot, then continues.
 
@@ -392,13 +424,19 @@ The prototype's 4 duplicates out of 5 decide the order:
    gates nothing until its agreement with the human verdict is measured
    (`s1_rate`).
 
-### 7. Builder briefs: acceptance and size first, rules as a shared layer
+### 7. Builder briefs: acceptance and size first
 
 From §Context: the template is uniform, PR size predicts rounds best, the
 prose budget is ignored, and correctness, claims, weak tests, docs and
 platform gates are the recurring blockers. A brief line cannot fix judgement,
 but it can turn the recurring blockers into checks the builder runs before
-the reviewer does. The revised template, in this order:
+the reviewer does.
+
+**Placement is ADR-0032's.** ADR-0032 §5 compiles a brief down to its task
+layer (layer 3) and moves what every builder shares out of the brief: the
+shared rules to layer 1, the repo's known traps to layer 2 (its owner
+question 3: an authored traps file). This ADR does not decide placement. It
+changes only what the task section asks for, in this order:
 
 ```text
 # <issue>: <slice title>       budget: <N> production lines · model: <m>
@@ -410,13 +448,9 @@ the reviewer does. The revised template, in this order:
   n. Size: `git diff --numstat origin/dev...HEAD -- src/` sums to ≤ N.
      Over N → do not open a PR; end with `BLOCKED: split proposal: …`.
 ## Context            files and functions; decisions (ADRs, owner rulings)
-## Known traps        the repo's grown list, e.g. a fix that touches X must
-                      test neighbour Y; a write path returns Err, never Ok,
-                      when it drops data; grep docs/ for every removed flag
 ## Claims             the PR body states only what you ran; `Refs #n` unless
                       every acceptance item holds, then `Fixes #n`
 ## Out of scope
-## Repo process       (shared layer, byte-identical across briefs)
 ## Report             ≤ 15 lines; last line DONE: <url> | BLOCKED: <reason>
 ```
 
@@ -432,10 +466,12 @@ the reviewer does. The revised template, in this order:
   holds.
 - **Acceptance test first** is the "test fails on origin/dev" item. It targets
   the 52 % weak-test blocker and the tests that cannot fail.
-- **Repo process and known traps are the shared layer.** They are identical
-  for every builder in a repo and go into ADR-0032's stable layer, so N
-  concurrent spawns share one cached prefix and only the issue-specific
-  sections differ.
+- **Known traps the analysis found** go into ADR-0032's traps file (layer
+  2), not into each brief: a fix that touches one path must test its
+  neighbour; a write path that drops data returns `Err`, never `Ok`; every
+  removed key or flag is grepped out of `docs/`; `Fixes` only when every
+  acceptance item holds; `just check` on Linux before a PR that touches
+  platform code.
 - **Fix rounds go to the same warm builder, on the same model.** Variant D
   shows why: a model switch costs the whole context again. The existing
   fix-brief shape (verdict, `file:line` + required behaviour, "merge, test,
@@ -459,7 +495,7 @@ the architect's, so the run costs less (the cache argument is the same).
 - **ADR-0027 / #632:** the fork is an edge with `via: fork`, label
   `ax:<trigger>`, reap policy `on-exit`, and no worktree. Its summary is a
   digest line.
-- **ADR-0028:** triggers are `events.read` consumers (AX6). The on-demand wait
+- **ADR-0028:** triggers are `events.read` consumers (AX6a, AX6b). The on-demand wait
   is a registered wait. `ax.review_recorded` is one more kind for channel
   bindings (#1005).
 - **ADR-0029:** exit classes 8, 9 and 10 are what the fallback trigger counts.
@@ -467,6 +503,19 @@ the architect's, so the run costs less (the cache argument is the same).
 - **ADR-0030 / #573:** an `ax:` edge never parks or wakes the architect's
   goal (rung 5 ignores it). The pre-compaction trigger runs before ADR-0030
   §6's handshake.
+- **#1044 heartbeat:** the hard-send is for agents with an armed goal, and
+  skips `ax:` forks: a fork has no goal and is bounded by its own deadline
+  (§3). The two never write into the same pane, because an AX trigger types
+  nothing into the architect; it starts a separate process from the
+  transcript. They still meet on an idle architect, so two rules apply. A
+  fork's activity never counts as the architect's liveness, so a running
+  review does not postpone the heartbeat. And an AX trigger that fires at
+  the turn boundary holds a per-subject snapshot lease until the fork's first
+  API call (measured: about 2 s), during which a due heartbeat waits; the
+  heartbeat then sends as usual. Neither suppresses the other. When the
+  heartbeat and the pre-compaction trigger are both due, ADR-0028 §5's order
+  stands (compaction before a goal continuation), and the fork starts before
+  either, as §4 requires.
 - **ADR-0032 / #1042:** compiled layers make the brief's shared sections
   cache-stable, and they are the fallback warm start for harnesses without
   fork.
@@ -481,13 +530,14 @@ the architect's, so the run costs less (the cache argument is the same).
 - A review costs about one extra parent turn to start (≈ 1k created
   tokens), plus the fork's own answer turns, all at cached-read prices. The
   prototype's whole run was 0.56M cached-read, 16k created and 10k output
-  tokens.
+  tokens (89k units at 136k context); at a real 400k context a two-call run
+  is about 95k units.
 - AX answers become comparable over time per rubric version, as a metric
   vector per run in the event log.
 - Issue volume is bounded by caps and a search, and the first phase files
   nothing on its own.
 - Codex and opencode architects are not covered until AX9, and then only with
-  a cold, compiled-context reviewer.
+  a compiled-context reviewer that sees state, not turns.
 - `agent.fork` gains an in-place mode. That is a second fork shape to keep
   correct, and it puts a second process on the parent's cwd (read-only, by
   flag and by rubric).
@@ -497,8 +547,17 @@ the architect's, so the run costs less (the cache argument is the same).
 - **The architect answers the rubric itself.** It spends the exact context the
   review exists to protect, and it competes with landing. Rejected.
 - **A fresh reviewer agent reading the transcript.** A cold prefix (variant D
-  is the cost shape: 17 % hit), and it sees the transcript, not the
-  reasoning in context. Kept only as the non-Claude fallback (AX9).
+  is the cost shape: 17 % hit) the size of the transcript, so at 400k it costs
+  several times the fork, and it sees the transcript, not the reasoning in
+  context. Rejected.
+- **ADR-0032's compiled reviewer (its X7) for every review.** Layers 1–2 come
+  from cache and the cost does not grow with the architect's context, so it
+  is cheaper than a two-call fork above roughly 250k–350k tokens of
+  architect context. But it starts from
+  derived state, and the friction this review is for (a fallback that worked,
+  a poll that should have been an event) lives in the turns, not in the
+  state. Kept as the non-Claude fallback and as the choice above `[ax]
+  fork_max_context` (§1), not as the default.
 - **Generated questions per run.** They cannot be compared across runs, which
   is the point of recording them. Rejected for a versioned fixed rubric.
 - **A cheaper model for the fork.** The cache is per model, so it starts
@@ -511,8 +570,8 @@ the architect's, so the run costs less (the cache argument is the same).
   0.5–0.7, the same as its new candidate. Rejected for search-first.
 - **One AX score from day one.** Weights would be invented. Deferred until
   the metric vectors show structure.
-- **Keep the size budget as prose and trust the builder.** Measured: 1 of 4
-  held. Rejected for an acceptance item with a command, a plan-time split and
+- **Keep the size budget as prose and trust the builder.** Measured: 2 of 5
+  held, and one of those two was an 84-line change that never came near it. Rejected for an acceptance item with a command, a plan-time split and
   an optional gate.
 
 ## Risks
@@ -523,7 +582,7 @@ the architect's, so the run costs less (the cache argument is the same).
   misremember. Evidence citations are mandatory so a reader can check them,
   and filing requires exact evidence.
 - **The pre-compaction fork races the compaction.** The fork has to have read
-  the transcript before the compaction rewrites the session. AX6 orders it
+  the transcript before the compaction rewrites the session. AX6c orders it
   (fork started and first turn begun, then the compaction proceeds) and
   tests that order.
 - **Stop hooks dominate wall time.** In the probe the profile's Stop hooks
@@ -574,22 +633,26 @@ the architect's, so the run costs less (the cache argument is the same).
 
 ## 10. Slices
 
-Each is sized at about 400 diff lines or less and is independently useful.
-They are not filed; the architect files them after the owner accepts.
+Each is sized below, in estimated production lines (docs and tests
+excluded), and the two that came out over ~400 are split. They are not
+filed; the architect files them after the owner accepts.
 
-| # | Slice | Depends on | Acceptance |
-| --- | --- | --- | --- |
-| AX1 | Rubric files `docs/ax/rubric-architect.md` and `rubric-builder.md` (`ax/1`); architect skill: self-fork via `flock_agent_fork` at boundaries, dry-run, summary into HANDOFF, reap the fork's worktree by hand; brief template v2 (§7) in the skill | — | A dry run on a real architect session produces the JSON and the summary; the skill names the rubric version |
-| AX2 | `ax:` edges: `on-exit` reap policy (extends ADR-0027 §5); the digest and ADR-0030's rung 5 ignore edges labelled `ax:`; server-started forks record an edge attributed to the subject | ADR-0027 slices 1 and 3 | An `ax:` fork neither adds a digest line nor parks the architect; it closes when the fork exits |
-| AX3 | `agent.fork --in-place`: parent cwd, no branch, worktree or workspace; `--disallowedTools` plus the command-allowlist hook; deadline | AX2 | Fake Claude: no worktree created, a shell `touch` in the cwd refused, reaped on sentinel and on deadline; `fork_cache.py` shows the same hit as the verb |
-| AX4 | `AxReviewRecorded` kind, `state_dir()/ax/<run>.json` as an MCP resource, `flk ax record -`, `flk ax report` | ADR-0028 E3's reader check | Folding is rotation-proof; the last release skips the kind; `ax report` shows per-run metrics |
-| AX5 | `flk agent ask <agent> "<q>"` / MCP `flock_agent_ask`: fork in place, registered wait on the sentinel, print, reap | AX3, ADR-0028 E5 | The answer prints, the parent's transcript is untouched, the fork is gone afterwards; refused for a non-Claude target with `fork_unsupported` |
-| AX6 | Server-side triggers: `[ax]` config, lifecycle and event triggers from `events.read`, fire at `turn: idle`, rate limits, `suppressed` and `skipped` records, pre-compaction ordering | AX3, AX4, ADR-0028 E3 / E4a / E7, ADR-0030 G5 | A merged batch fires one review; a second within 30 min is `suppressed`; an armed compaction waits for the fork's first turn |
-| AX7 | Filing policy in a helper (`flk ax file`, or ADR-0015's filing path): search-first, comment-with-new-evidence, caps, dry-run vs auto per repo, optional System One shadow verdict | AX4 | Fake `gh`: the search precedes every candidate, caps hold, dry-run files nothing, a closed match is reported, not reopened |
-| AX8 | Builder fork at DONE with the builder rubric, before hibernate | AX3, AX4, ADR-0027 slice 5 | A builder printing `DONE:` yields one builder `AxReviewRecorded` before it hibernates |
-| AX9 | Non-Claude fallback: a fresh reviewer from ADR-0032's compiled context plus the transcript tail | ADR-0032's `flk context compile` slice | A Codex architect gets a review, marked `cold: true`, with its cache cost recorded |
-| AX10 | Brief comparison: tag each brief with its template version; `flk ax report --briefs` joins rounds, blocker kinds, size and builder-rubric answers per version | AX1, AX4, AX8 | After one wave, a table of zero-round share and size overrun per template version |
-| AX11 | Optional pre-push size gate for builder worktrees: production lines against a budget the brief declares | AX10 (only if the acceptance item alone does not hold) | A push over budget is refused with the split instruction |
+| # | Slice | Size (est.) | Depends on | Acceptance |
+| --- | --- | --- | --- | --- |
+| AX1 | Rubric files `docs/ax/rubric-architect.md` and `rubric-builder.md` (`ax/1`); architect skill: self-fork via `flock_agent_fork` at boundaries with the rubric inline, dry-run, summary into HANDOFF, reap the fork's worktree by hand; the §7 task-section changes in the skill | 0 code (~250 docs) | — | A dry run on a real architect session produces the JSON and the summary; the skill names the rubric version |
+| AX2 | `ax:` edges: `on-exit` reap policy (extends ADR-0027 §5); the digest and ADR-0030's rung 5 ignore edges labelled `ax:`; server-started forks record an edge attributed to the subject | ~200 | ADR-0027 slices 1 and 3 | An `ax:` fork neither adds a digest line nor parks the architect; it closes when the fork exits |
+| AX3 | `agent.fork --in-place`: parent cwd, no branch, worktree or workspace; `--disallowedTools` plus the command-allowlist hook; deadline | ~350 | AX2 | Fake Claude: no worktree created, a shell `touch` in the cwd refused, reaped on sentinel and on deadline; `fork_cache.py` shows the same hit as the verb |
+| AX4a | `AxReviewRecorded` kind, `flk ax record -` (stdin), `state_dir()/ax/<run>.json` served as an MCP resource | ~300 | ADR-0028 E3's reader check | A record round-trips; the last release skips the kind; the resource resolves by `run_id` |
+| AX4b | `flk ax report [--role] [--since] [--rubric]`: rotation-proof fold, per-run and per-day metrics, normalised per turn hour | ~250 | AX4a | Property test: random records across rotations fold to the same report |
+| AX5 | `flk agent ask <agent> "<q>"` / MCP `flock_agent_ask`: fork in place, registered wait on the sentinel, print, reap | ~250 | AX3, ADR-0028 E5 | The answer prints, the parent's transcript is untouched, the fork is gone afterwards; refused for a non-Claude target with `fork_unsupported` |
+| AX6a | Trigger engine: `[ax]` config, lifecycle triggers (batch merged, release, milestone, builder `DONE:`), firing at `turn: idle`, rate limits, `suppressed` / `skipped` records, `fork_max_context` cutover | ~350 | AX3, AX4a, ADR-0028 E3 / E4a / E7 | A merged batch fires one review; a second within 30 min is `suppressed`; a context over the limit routes to the compiled reviewer (or `skipped` before AX9) |
+| AX6b | Event triggers: fallback count from ADR-0029 exit classes 8–10 per window, `dev` red from `pr.ci_completed`, stalled delegate from `delegate wait` exit 7 | ~250 | AX6a, ADR-0029 C1, ADR-0028 E7 | Three exit-8 sends within the window fire one Q1/Q4 review; defaults off stay off |
+| AX6c | Pre-compaction ordering with ADR-0030's handshake, and the per-subject snapshot lease shared with #1044's heartbeat | ~200 | AX6a, ADR-0030 G5, #1044 | An armed compaction waits for the fork's first call; a due heartbeat waits out the lease and then sends; fork activity does not reset liveness |
+| AX7 | Filing policy in a helper (`flk ax file`, or ADR-0015's filing path): search-first, comment-with-new-evidence, caps, dry-run vs auto per repo, optional System One shadow verdict | ~350 | AX4a | Fake `gh`: the search precedes every candidate, caps hold, dry-run files nothing, a closed match is reported, not reopened |
+| AX8 | Builder fork at DONE with the builder rubric, before hibernate | ~150 | AX3, AX4a, ADR-0027 slice 5 | A builder printing `DONE:` yields one builder `AxReviewRecorded` before it hibernates |
+| AX9 | Compiled-reviewer path: AX triggers use ADR-0032's reviewer role for non-Claude subjects and above `fork_max_context`, plus the transcript tail | ~150 | ADR-0032 X7, AX6a | A Codex architect gets a review, marked `compiled: true`, with its cost recorded |
+| AX10 | Brief comparison: tag each brief with its template version; `flk ax report --briefs` joins rounds, blocker kinds, size and builder-rubric answers per version | ~250 | AX1, AX4b, AX8 | After one wave, a table of zero-round share and size overrun per template version |
+| AX11 | Optional pre-push size gate for builder worktrees: production lines against a budget the brief declares | ~100 | AX10 (only if the acceptance item alone does not hold) | A push over budget is refused with the split instruction |
 
 The prefix is `AX` so these do not collide with ADR-0032's own `X` slices.
 
@@ -597,5 +660,5 @@ The prefix is `AX` so these do not collide with ADR-0032's own `X` slices.
 self-fork goes through today's `flock_agent_fork`, so each review creates a
 worktree the architect must reap (`flk worktree kill`) and appears in the
 digest as an ordinary delegate. Dry-run only, plus the new brief template.
-AX2 and AX3 make it clean and cheap, AX4 makes it comparable, AX6 takes the
+AX2 and AX3 make it clean and cheap, AX4a/b make it comparable, AX6a–c take the
 triggers away from the architect, and AX7 turns on filing.
