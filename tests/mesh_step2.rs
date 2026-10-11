@@ -525,6 +525,108 @@ fn failed_offer_on_one_way_edge_is_reoffered_after_backoff() {
     lost_offer_on_one_way_edge_is_reoffered_after_backoff("error");
 }
 
+// Wait until no edge has polled for 8 s, so each dialer sits on its idle
+// ladder rather than on the tail of the round trip's own receipt traffic.
+fn quiesce(fleet: &Fleet, specs: &[NodeSpec]) {
+    let polls = |name: &str, peer: &str| {
+        fs::read_to_string(fleet.base.join(format!("outbound-polls-{name}-{peer}")))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let snapshot = || -> Vec<usize> {
+        specs
+            .iter()
+            .flat_map(|spec| spec.peers.iter().map(move |peer| (spec.name, *peer)))
+            .map(|(name, peer)| polls(name, peer))
+            .collect()
+    };
+    let mut last = (snapshot(), Instant::now());
+    fleet::wait_until("idle edges", Duration::from_secs(60), || {
+        let now = snapshot();
+        if now != last.0 {
+            last = (now, Instant::now());
+        }
+        (last.1.elapsed() >= Duration::from_secs(8)).then_some(())
+    });
+}
+
+// A receipt the spoke owes its dialer is minted only inside the dialer's
+// outbound poll. With the spoke's wakes lost, as on an edge whose held stream
+// is down, the summary is the only prompt left, so it must carry that debt or
+// the read waits for the idle poll, 60 to 299 s out once the edge has any
+// history (#780). The round trip first gives every edge that history.
+fn read_receipt_reaches_origin_without_wakes(specs: &[NodeSpec], target: &str) {
+    let c = Conversation::to(specs, target);
+    round_trip(&c);
+    for spec in specs {
+        for peer in spec.peers {
+            fs::write(
+                c.fleet
+                    .base
+                    .join(format!("drop-wakes-{}-{peer}", spec.name)),
+                "",
+            )
+            .unwrap();
+        }
+    }
+    quiesce(&c.fleet, specs);
+    // Fyi: a needs-reply request's answer collection would carry its
+    // receipt back on its own ladder and hide the outbound path.
+    api(
+        c.fleet.node("nodea"),
+        "msg.send",
+        json!({"to":{"type":"agent","agent":c.receiver.id},
+        "from_agent":c.sender.id, "body":"later body", "intent":"fyi", "correlation_id":"later"}),
+    );
+    state(c.fleet.node("nodea"), "later", "delivered");
+    if target == "nodeb" {
+        // A direct origin also pulls the receipt per message, on a 5/60/299 s
+        // ladder. Read only once its 5 s step has passed, so that ladder
+        // cannot stand in for the outbound poll.
+        fleet::wait_until("first per-message collect", DEADLINE, || {
+            (scalar(
+                c.fleet.node("nodea"),
+                "SELECT collect_attempts FROM envelopes WHERE correlation='later'",
+            ) >= 2)
+                .then_some(())
+        });
+    }
+    let messages = mail(c.fleet.node(target), &c.receiver.pane);
+    assert_eq!(messages[0]["correlation_id"], "later", "{messages}");
+    state(c.fleet.node(target), "later", "read");
+    // Far below the 60 s idle step, with room for a loaded runner.
+    let started = Instant::now();
+    fleet::wait_until("read receipt at origin", Duration::from_secs(20), || {
+        assert!(
+            started.elapsed() < Duration::from_secs(19),
+            "read receipt still missing at nodea; custody: {}",
+            custody(c.fleet.node("nodea"))
+        );
+        (status(c.fleet.node("nodea"), "later")["state"] == "read").then_some(())
+    });
+    let dropped = fs::read_dir(&c.fleet.base)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("dropped-wakes-")
+        });
+    assert!(dropped, "the fault never dropped a wake");
+}
+
+#[test]
+fn direct_spoke_read_receipt_reaches_dialer_without_wakes() {
+    read_receipt_reaches_origin_without_wakes(DIRECT, "nodeb");
+}
+
+#[test]
+fn multihop_read_receipt_reaches_origin_without_wakes() {
+    read_receipt_reaches_origin_without_wakes(fleet::CHAIN_ABC, "nodec");
+}
+
 #[test]
 fn laptop_collects_answer_through_a_different_hub() {
     let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");

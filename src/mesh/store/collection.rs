@@ -353,13 +353,18 @@ impl<D: DiskSpace> Store<D> {
 
 impl<D: DiskSpace> Store<D> {
     /// The existing summary carries only ready work, so a backed-off row cannot cause hot polling.
+    /// Receipts owed to `hub` are ready work too. They exist only once its
+    /// outbound poll mints them, and without this a lost wake leaves them to
+    /// the hub's idle poll or the origin's per-message ladder, up to 299 s
+    /// (#780). That poll marks them sent, so each one advertises only once.
     pub fn has_outbound(&self, hub: &str, wall_ms: i64) -> Result<bool> {
         let mut clock = self.clock()?;
         if clock.paused {
             return Ok(false);
         }
         let now = clock.advance(wall_ms);
-        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2)", params![hub, now], |r| r.get(0))?)
+        let held: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM envelopes WHERE next_hop=?1 AND state='held' AND retry_at<=?2 AND custody_deadline>?2)", params![hub, now], |r| r.get(0))?;
+        Ok(held || self.owes_receipts(hub, now)?)
     }
 
     /// Next hops whose offered rows came off their lease in `(after, now]`.

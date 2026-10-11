@@ -2370,6 +2370,34 @@ fn receipt_collection_is_repeatable_until_ack_and_read_advances_it() {
 }
 
 #[test]
+fn owed_receipts_are_advertised_once_without_committing() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    let hub = request.key.origin_node.clone();
+    assert!(!store.has_outbound(&hub, 1).unwrap());
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let changes = store.connection.total_changes();
+    assert!(store.has_outbound(&hub, 1).unwrap());
+    assert!(!store.has_outbound("other.example", 1).unwrap());
+    assert_eq!(store.connection.total_changes(), changes);
+    // The hub's poll mints and marks what it took, which clears the flag.
+    let receipts = store.pending_receipts(&hub, 1).unwrap();
+    store.receipts_sent(&receipts).unwrap();
+    assert!(!store.has_outbound(&hub, 1).unwrap());
+    store
+        .read_inbox(std::slice::from_ref(&request.key), 2)
+        .unwrap();
+    assert!(store.has_outbound(&hub, 2).unwrap());
+    let receipts = store.pending_receipts(&hub, 2).unwrap();
+    assert_eq!(receipts[0].state, "read");
+    store.receipts_sent(&receipts).unwrap();
+    assert!(!store.has_outbound(&hub, 3).unwrap());
+}
+
+#[test]
 fn a_delivered_notice_is_polled_until_a_terminal_read_receipt() {
     let f = Fixture::new();
     let mut store = f.open(0);
