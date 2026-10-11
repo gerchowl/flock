@@ -789,6 +789,15 @@ struct Entry {
     /// The commit that ref named at start.
     #[serde(default)]
     base_sha: Option<String>,
+    /// The agent's restart-stable identity (#975).
+    ///
+    /// `terminal_id` is re-minted by every server restart, so an entry that
+    /// knew only it called a delegate that survived a restart "not a
+    /// delegate". The agent id survives, and a match on it re-points the
+    /// entry at the new terminal. Absent in entries written before it; those
+    /// are backfilled the first time a verb proves the terminal still matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
 }
 
 /// The directory holding this server's delegates: one file per name, under the
@@ -2762,6 +2771,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         root_pane_terminal_id: placement.root_pane_terminal_id.clone(),
         base: placement.base.as_ref().map(|fresh| fresh.base.clone()),
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
+        agent_id: field(&agent, "agent_id").map(str::to_string),
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(
@@ -4297,22 +4307,81 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
     let Some(entry) = read_entry(name) else {
         return Err(RequireFailure::NotDelegate);
     };
+    let before = entry.clone();
     let by_name = agent_record(name, deadline);
     let terminal_id = entry.terminal_id.clone();
-    recorded_decide(entry, by_name, || agent_record(&terminal_id, deadline))
+    let recorded = recorded_decide(entry, by_name, || agent_record(&terminal_id, deadline))?;
+    if let Recorded::Live(live) = &recorded {
+        persist_reidentified(&before, live);
+    }
+    Ok(recorded)
+}
+
+/// Write back an entry that `require_decide` re-pointed at the delegate's new
+/// terminal after a restart, or backfilled with its agent id (#975).
+///
+/// Only the identity fields move, and onto a fresh read of the file, so a
+/// `send` that advanced the round meanwhile keeps its round. Best-effort: the
+/// verb that asked already has the right identity in hand, and the next one
+/// re-derives it the same way if this write is lost.
+fn persist_reidentified(before: &Entry, live: &Entry) {
+    if before.terminal_id == live.terminal_id
+        && before.pane_id == live.pane_id
+        && before.agent_id == live.agent_id
+    {
+        return;
+    }
+    let mut fresh = read_entry(&live.name).unwrap_or_else(|| before.clone());
+    if fresh.terminal_id != before.terminal_id {
+        // Someone else already rewrote the identity; theirs is as new as ours.
+        return;
+    }
+    fresh.terminal_id = live.terminal_id.clone();
+    fresh.pane_id = live.pane_id.clone();
+    fresh.agent_id = live.agent_id.clone();
+    let _ = write_entry(&fresh);
+}
+
+/// Whether `record` is the agent `entry` was written for, and the entry
+/// re-pointed at it.
+///
+/// The terminal id is the first proof, and backfills the agent id an older
+/// entry lacks. After a restart the terminal id is new, and the agent id is
+/// the proof (#975). An entry from before the agent id was recorded has one
+/// more: a worktree delegate whose agent still runs in that worktree under
+/// the same name, which is what an agent that merely inherited the name
+/// would not do. The cwd must equal the worktree path exactly: an agent that
+/// moved into a subdirectory stays "not a delegate", because a prefix match
+/// would also accept an agent in a nested checkout.
+fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
+    let record_agent_id = field(record, "agent_id").map(str::to_string);
+    let same_terminal = field(record, "terminal_id") == Some(entry.terminal_id.as_str());
+    let same_agent = entry.agent_id.is_some() && entry.agent_id == record_agent_id;
+    let legacy_same_worktree = entry.agent_id.is_none()
+        && entry.worktree.is_some()
+        && field(record, "cwd") == entry.worktree.as_deref();
+    if !(same_terminal || same_agent || legacy_same_worktree) {
+        return None;
+    }
+    if !same_terminal {
+        if let Some(terminal_id) = field(record, "terminal_id") {
+            entry.terminal_id = terminal_id.to_string();
+        }
+        if let Some(pane_id) = field(record, "pane_id") {
+            entry.pane_id = pane_id.to_string();
+        }
+    }
+    if entry.agent_id.is_none() {
+        entry.agent_id = record_agent_id;
+    }
+    Some(entry)
 }
 
 /// The pure decision half of `require_delegate`, given the entry already read
 /// and the agent-lookup outcome. The call-site tests (W7) exercise this.
 fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailure> {
     match fetch {
-        AgentFetch::Found(record) => {
-            if field(&record, "terminal_id") != Some(entry.terminal_id.as_str()) {
-                Err(RequireFailure::NotDelegate)
-            } else {
-                Ok(entry)
-            }
-        }
+        AgentFetch::Found(record) => reidentify(entry, &record).ok_or(RequireFailure::NotDelegate),
         AgentFetch::Missing => Err(RequireFailure::NotDelegate),
         AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
         AgentFetch::Failed(reason) => Err(RequireFailure::Failed(reason)),

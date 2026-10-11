@@ -253,26 +253,22 @@ impl App {
             }
         };
 
-        // Re-select the Claude account profile the session was launched under.
-        // flk spawns a FRESH login shell here with no CLAUDE_CONFIG_DIR, so
-        // without this the resumed session falls back to the default ~/.claude
-        // account and is orphaned from the profile it belongs to. The
-        // SessionStart hook recorded session_id -> config_dir; restore it by
-        // exporting into the pane so the resume (and any later relaunch in this
-        // pane) run under the right account. See
-        // `agent_resume::claude_config_dir_for_session`.
+        // Re-select the account profile the session was launched under
+        // (#1010). flk spawns a FRESH login shell here with no selector such
+        // as CLAUDE_CONFIG_DIR, so without this the resumed session falls back
+        // to the CLI's default account and is orphaned from the profile it
+        // belongs to. What the terminal recorded at start or hibernate, and
+        // the session record Claude's SessionStart hook wrote, are exported
+        // into the pane so the resume (and any later relaunch in this pane)
+        // run under the right account. See `App::resume_profile_env`.
         let mut input = String::new();
-        if let Some(config_dir) = claude_resume_config_dir(&plan) {
+        let shell = crate::pane::pane_shell(&self.state.default_shell);
+        for (key, value) in self.resume_profile_env(&terminal_id, &plan) {
             // In the pane shell's OWN syntax. `export FOO=bar` is a syntax
             // error in fish, so a fish user would get no profile set at all and
             // silently resume under the default account — precisely the failure
             // this restore exists to prevent, just moved to a different shell.
-            let shell = crate::pane::pane_shell(&self.state.default_shell);
-            input.push_str(&env_assignment_for_shell(
-                &shell,
-                "CLAUDE_CONFIG_DIR",
-                &config_dir,
-            ));
+            input.push_str(&env_assignment_for_shell(&shell, &key, &value));
             input.push('\r');
         }
         input.push_str(&resume_command);
@@ -335,14 +331,6 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
         pane_inner.width.saturating_sub(1),
         pane_inner.height,
     )
-}
-
-/// The recorded `CLAUDE_CONFIG_DIR` (account profile) for a Claude resume plan,
-/// if the SessionStart hook captured one. `None` for non-Claude agents, or a
-/// Claude session launched under the default `~/.claude` (nothing recorded).
-fn claude_resume_config_dir(plan: &crate::agent_resume::AgentResumePlan) -> Option<String> {
-    let session_id = crate::agent_resume::claude_resume_session_id(plan)?;
-    crate::agent_resume::claude_config_dir_for_session(session_id)
 }
 
 fn shell_command_from_argv(argv: &[String]) -> Option<String> {
