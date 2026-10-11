@@ -3037,7 +3037,8 @@ with log.open('w') as out:
         assert_eq!(
             result["result"]["reason"],
             if expected_code == 8 {
-                "confirm_timeout"
+                // The fake composer swallows Enter and keeps the text (#1018).
+                "typed_not_submitted"
             } else {
                 "operator_active"
             }
