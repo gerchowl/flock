@@ -165,6 +165,13 @@ impl App {
             .and_then(crate::terminal::TerminalRuntime::child_pid)
     }
 
+    /// The API caller's own pane by process ancestry alone, for a `self`
+    /// target. Unlike [`Self::parse_pane_id_or_peer`] it memoizes nothing.
+    pub(super) fn caller_pane(&self) -> Option<(usize, crate::layout::PaneId)> {
+        let chain = peer_ancestor_chain(self.current_api_peer_pid?);
+        self.resolve_pane_in_chain(&chain)
+    }
+
     fn resolve_pane_in_chain(&self, chain: &[u32]) -> Option<(usize, crate::layout::PaneId)> {
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             for tab in &ws.tabs {
