@@ -1759,6 +1759,10 @@ impl App {
         if !invalid_section("worktrees") {
             self.state.config.worktrees = config.worktrees.clone();
         }
+        if !invalid_section("events") {
+            self.event_hub
+                .set_read_max_wait_ms(config.events.read_max_wait_ms);
+        }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
         }

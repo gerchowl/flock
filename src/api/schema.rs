@@ -211,6 +211,8 @@ pub enum Method {
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]
     EventsWait(EventsWaitParams),
+    #[serde(rename = "events.read")]
+    EventsRead(EventsReadParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -359,6 +361,7 @@ impl Method {
             | Self::PaneStashShow(_)
             | Self::EventsSubscribe(_)
             | Self::EventsWait(_)
+            | Self::EventsRead(_)
             | Self::PaneWaitForOutput(_)
             | Self::ChecksList(_)
             | Self::DigestRender(_)
@@ -1987,6 +1990,49 @@ pub enum Subscription {
     MsgQueued { pane: String },
 }
 
+/// `events.read` (ADR-0028 §3): every durable event with `seq > after`,
+/// served from the ring and then from the rotated log files on disk.
+/// Delivery is at-least-once, so consumers dedupe on `seq`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsReadParams {
+    #[serde(default)]
+    pub after: u64,
+    /// Durable kinds only; empty means every durable kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<EventKind>,
+    /// Matches an event whose data carries one of these as a top-level
+    /// string value (a pane, workspace, agent or message id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Hold the request until a matching event arrives, at most
+    /// `[events] read_max_wait_ms`. Absent or 0 answers at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
+pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
+pub const EVENTS_READ_MAX_LIMIT: u32 = 4096;
+
+/// Sequences this server no longer retains, both ends inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventGap {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub envelope: EventEnvelope,
+}
+
+/// The ADR-0028 successor is `events.read`. This variant still has no
+/// handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsWaitParams {
     pub match_event: EventMatch,
@@ -2650,6 +2696,14 @@ pub enum ResponseResult {
         /// message's own delivery; this is what came back.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
+    },
+    /// `events.read`: a `gap` first when the cursor is older than what is
+    /// retained, then the events, then the cursor to resume from.
+    EventsRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gap: Option<EventGap>,
+        events: Vec<SequencedEvent>,
+        next_after: u64,
     },
     /// #576: how a `msg.wait_reply` ended.
     MsgReplyAwaited {

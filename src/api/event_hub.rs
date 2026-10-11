@@ -22,13 +22,39 @@ pub struct EventHub {
     /// mutex, and `inner` is held across disk writes — a waiter must never
     /// queue behind an fsync just to learn that nothing new arrived.
     arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    read_max_wait_ms: ReadMaxWait,
     #[cfg(test)]
     cold_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Runs once between a read's disk pass and its ring pass, so a test
+    /// can interleave a push or a rotation there deterministically.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) disk_read_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>,
+}
+
+#[derive(Clone)]
+struct ReadMaxWait(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Default for ReadMaxWait {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::api::schema::EVENTS_READ_MAX_WAIT_MS,
+        )))
+    }
 }
 
 #[derive(Default)]
 struct EventHubState {
     next_sequence: u64,
+    /// The newest sequence of a persisted kind. A restart resumes numbering
+    /// from it, so a sequence above it may be handed out again and must
+    /// never become a reader's cursor.
+    durable_sequence: u64,
+    /// The newest durable sequence no longer in the ring. Every durable
+    /// event past it is in the ring, so only an older cursor reads disk.
+    evicted_durable: u64,
+    #[cfg(test)]
+    ring_cap: Option<usize>,
     events: Vec<(u64, EventEnvelope)>,
     log: Option<PersistentLog>,
 }
@@ -70,14 +96,7 @@ impl PersistentLog {
     }
 
     fn rotated_path(&self, index: usize) -> PathBuf {
-        let mut name = self
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("event-log")
-            .to_string();
-        name.push_str(&format!(".{index}.jsonl"));
-        self.path.with_file_name(name)
+        rotated_path(&self.path, index)
     }
 
     fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
@@ -223,6 +242,24 @@ fn read_log_file(path: &Path) -> Result<(Vec<PersistedEvent>, u64), String> {
     Ok((events, skipped_seq))
 }
 
+#[derive(Default)]
+pub(crate) struct EventRead {
+    pub gap: Option<(u64, u64)>,
+    pub events: Vec<(u64, EventEnvelope)>,
+    /// The cursor to hand a reader: never past the newest durable event.
+    pub next_after: u64,
+    /// How far this read looked, for waiting on the hub.
+    pub scanned: u64,
+}
+
+fn rotated_path(path: &Path, index: usize) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("event-log");
+    path.with_file_name(format!("{stem}.{index}.jsonl"))
+}
+
 pub(crate) struct ReplyWaitGuard {
     hub: EventHub,
     correlation: String,
@@ -328,6 +365,14 @@ impl EventHub {
                 .unwrap_or(0)
                 .max(highest_quarantined_seq)
                 .max(highest_skipped_seq);
+            state.durable_sequence = state.next_sequence;
+            // Everything below the ring is on disk at best, including what a
+            // rotation already deleted, so an older cursor must check there.
+            let seeded = restored.len().saturating_sub(Self::MAX_EVENTS);
+            state.evicted_durable = restored
+                .get(seeded)
+                .map(|first| first.seq.saturating_sub(1))
+                .unwrap_or(state.next_sequence);
             state.events = restored
                 .iter()
                 .rev()
@@ -350,6 +395,7 @@ impl EventHub {
         state.next_sequence += 1;
         let sequence = state.next_sequence;
         if event.event.is_persisted() {
+            state.durable_sequence = sequence;
             if let Some(log) = state.log.as_mut() {
                 let persisted = PersistedEvent {
                     seq: sequence,
@@ -365,9 +411,21 @@ impl EventHub {
             }
         }
         state.events.push((sequence, event));
-        let overflow = state.events.len().saturating_sub(Self::MAX_EVENTS);
+        #[cfg(test)]
+        let cap = state.ring_cap.unwrap_or(Self::MAX_EVENTS);
+        #[cfg(not(test))]
+        let cap = Self::MAX_EVENTS;
+        let overflow = state.events.len().saturating_sub(cap);
         if overflow > 0 {
-            state.events.drain(0..overflow);
+            let evicted = state
+                .events
+                .drain(0..overflow)
+                .filter(|(_, event)| event.event.is_persisted())
+                .map(|(seq, _)| seq)
+                .max();
+            if let Some(evicted) = evicted {
+                state.evicted_durable = evicted;
+            }
         }
         drop(state);
         let (latest, condvar) = &*self.arrived;
@@ -415,6 +473,139 @@ impl EventHub {
             return 0;
         };
         state.next_sequence
+    }
+
+    /// `events.read` (ADR-0028 §3): durable events with `seq > after` that
+    /// `keep` accepts, at most `limit`, oldest first.
+    ///
+    /// The ring holds every durable event newer than `evicted_durable`, so
+    /// a reader at or past it never touches disk. An older cursor reads the
+    /// log files newest first WITHOUT the hub lock, so a slow disk never
+    /// stalls a push. A rotation racing that read can only cost the oldest
+    /// end, which then surfaces as a gap, never as a silent hole.
+    pub(crate) fn read(
+        &self,
+        after: u64,
+        limit: usize,
+        keep: impl Fn(&EventEnvelope) -> bool,
+    ) -> EventRead {
+        let (evicted, path) = {
+            let Ok(state) = self.inner.lock() else {
+                return EventRead::default();
+            };
+            let path = state.log.as_ref().map(|log| log.path.clone());
+            (state.evicted_durable, path)
+        };
+        let mut floor = None;
+        let mut disk: Vec<(u64, EventEnvelope)> = Vec::new();
+        if after < evicted {
+            #[cfg(test)]
+            self.cold_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut dropped = false;
+            for index in 0..=MAX_ROTATED {
+                let Some(path) = path.as_ref() else { break };
+                let file = match index {
+                    0 => path.clone(),
+                    index => rotated_path(path, index),
+                };
+                dropped |= index == MAX_ROTATED && file.exists();
+                let Ok((events, _)) = read_log_file(&file) else {
+                    dropped = true;
+                    break;
+                };
+                let reaches = events.first().is_some_and(|event| event.seq <= after + 1);
+                disk.extend(events.into_iter().map(|event| (event.seq, event.envelope)));
+                if reaches {
+                    dropped = false;
+                    break;
+                }
+            }
+            disk.retain(|(seq, _)| *seq > after);
+            disk.sort_by_key(|(seq, _)| *seq);
+            disk.dedup_by_key(|(seq, _)| *seq);
+            // `evicted` is a durable event that was pushed before the files
+            // were read, so finding nothing past the cursor means it is gone.
+            floor = match disk.first() {
+                None => Some(evicted + 1),
+                Some((first, _)) => dropped.then_some(*first),
+            };
+            #[cfg(test)]
+            if let Some(mut hook) = self.disk_read_hook.lock().ok().and_then(|mut h| h.take()) {
+                hook();
+            }
+        }
+        let reached = disk
+            .last()
+            .map(|(seq, _)| *seq)
+            .into_iter()
+            .chain(floor.map(|floor| floor - 1))
+            .fold(after, u64::max);
+        let Ok(state) = self.inner.lock() else {
+            return EventRead::default();
+        };
+        // The ring continues the disk read only if it has not evicted a
+        // durable event past it meanwhile. If it has, that event is on disk
+        // for the next call.
+        let ring_joins = state.evicted_durable <= reached;
+        let mut scanned = reached;
+        if ring_joins {
+            // A rotation can delete a file whose events the ring still
+            // holds, so the ring can move the retention floor down.
+            let ring_floor = state
+                .events
+                .iter()
+                .find(|(seq, event)| *seq > after && event.event.is_persisted())
+                .map(|(seq, _)| *seq);
+            floor = floor.map(|floor| ring_floor.map_or(floor, |ring| floor.min(ring)));
+            disk.extend(state.events.iter().filter(|(seq, _)| *seq > after).cloned());
+            disk.sort_by_key(|(seq, _)| *seq);
+            disk.dedup_by_key(|(seq, _)| *seq);
+            scanned = scanned.max(state.next_sequence);
+        }
+        let durable = state.durable_sequence;
+        drop(state);
+        let gap = floor
+            .filter(|floor| *floor > after + 1)
+            .map(|floor| (after + 1, floor - 1));
+        let mut events = Vec::new();
+        for (seq, envelope) in disk {
+            if !envelope.event.is_persisted() || !keep(&envelope) {
+                continue;
+            }
+            if events.len() == limit {
+                scanned = events.last().map(|(seq, _)| *seq).unwrap_or(after);
+                break;
+            }
+            events.push((seq, envelope));
+        }
+        EventRead {
+            gap,
+            events,
+            next_after: scanned.min(durable),
+            scanned,
+        }
+    }
+
+    /// The newest durable sequence: the furthest cursor a reader may hold.
+    pub(crate) fn durable_sequence(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|state| state.durable_sequence)
+            .unwrap_or(0)
+    }
+
+    /// `[events] read_max_wait_ms`, applied at start and on config reload.
+    pub(crate) fn set_read_max_wait_ms(&self, ms: u64) {
+        self.read_max_wait_ms
+            .0
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn read_max_wait_ms(&self) -> u64 {
+        self.read_max_wait_ms
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -465,6 +656,7 @@ mod goal_storage_bench;
 mod tests {
     use super::*;
     use crate::api::schema::EventData;
+    use std::sync::{Arc, Mutex};
 
     fn temp_log(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -768,6 +960,215 @@ mod tests {
         let persisted = hub.persisted_events_after(0);
         assert_eq!(persisted.len(), 1, "disk sees only the persisted kind");
         assert_eq!(persisted[0].0, 2, "persisted event keeps its ring seq");
+        cleanup(&path);
+    }
+
+    /// Drain `read` from `after` to the head the way a consumer would:
+    /// every seq seen, plus every range a gap reported.
+    fn drain(hub: &EventHub, mut after: u64, limit: usize) -> (Vec<u64>, Vec<(u64, u64)>, u64) {
+        let (mut seen, mut gaps) = (Vec::new(), Vec::new());
+        loop {
+            let read = hub.read(after, limit, |_| true);
+            gaps.extend(read.gap);
+            seen.extend(read.events.iter().map(|(seq, _)| *seq));
+            if read.events.is_empty() && read.gap.is_none() {
+                return (seen, gaps, after);
+            }
+            assert!(read.next_after >= after, "a cursor never moves back");
+            after = read.next_after;
+        }
+    }
+
+    /// Arm a one-shot hook that runs inside the next disk read: `durable`
+    /// durable pushes, `churn` ephemeral ones, then a rotation if asked.
+    fn interleave(
+        hub: &EventHub,
+        pushed: &Arc<Mutex<Vec<u64>>>,
+        durable: u64,
+        churn: u64,
+        rotate: bool,
+    ) {
+        let (target, pushed) = (hub.clone(), pushed.clone());
+        *hub.disk_read_hook.lock().unwrap() = Some(Box::new(move || {
+            for _ in 0..durable {
+                target.push(workspace_event("raced"));
+                pushed.lock().unwrap().push(target.current_sequence());
+            }
+            for _ in 0..churn {
+                target.push(output_event());
+            }
+            if rotate {
+                let mut state = target.inner.lock().unwrap();
+                state.log.as_mut().unwrap().rotate().unwrap();
+            }
+        }));
+    }
+
+    /// Review of #1056: a durable event pushed and evicted from the ring
+    /// while a reader is on disk must reach that reader on a later call.
+    #[test]
+    fn a_durable_event_evicted_during_the_disk_read_is_not_skipped() {
+        let path = temp_log("read-race");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.inner.lock().unwrap().ring_cap = Some(2);
+        for index in 0..5 {
+            hub.push(workspace_event(&format!("w{index}")));
+        }
+        let pushed = Arc::new(Mutex::new(Vec::new()));
+        interleave(&hub, &pushed, 1, 3, false);
+        let (seen, gaps, _) = drain(&hub, 0, 10);
+        assert_eq!(seen, [1, 2, 3, 4, 5, 6]);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        cleanup(&path);
+    }
+
+    /// Review of #1056: a reader at the durable head stays off the disk
+    /// however much ephemeral output pushes the ring along.
+    #[test]
+    fn an_idle_reader_at_the_head_never_reads_disk() {
+        let path = temp_log("read-idle");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.inner.lock().unwrap().ring_cap = Some(2);
+        hub.push(workspace_event("w"));
+        for _ in 0..10 {
+            hub.push(output_event());
+            let read = hub.read(1, 10, |_| true);
+            assert!(read.events.is_empty() && read.gap.is_none());
+            assert_eq!(read.next_after, 1);
+        }
+        assert_eq!(hub.cold_read_count(), 0);
+        cleanup(&path);
+    }
+
+    /// #1028 / ADR-0028 §3: across random rotations, restarts, ephemeral
+    /// kinds, and pushes or rotations landing in the middle of a disk read,
+    /// a reader resuming from any cursor sees every durable event or a gap
+    /// that names it. Silent loss fails the test.
+    #[test]
+    fn read_is_at_least_once_or_an_explicit_gap_across_rotations_and_restarts() {
+        // Seeds run in parallel: the per-push fsync dominates the runtime.
+        std::thread::scope(|scope| {
+            for seed in 1..=32u64 {
+                scope.spawn(move || {
+                    let path = temp_log(&format!("read-{seed}"));
+                    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let mut next = |bound: u64| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng % bound
+                    };
+                    let ring_cap = Some(2 + next(8) as usize);
+                    let mut hub = EventHub::with_persistence(path.clone());
+                    hub.inner.lock().unwrap().ring_cap = ring_cap;
+                    let durable = Arc::new(Mutex::new(Vec::new()));
+                    let (mut cursor, mut seen, mut gaps) = (0, Vec::new(), Vec::new());
+                    for step in 0..120 {
+                        match next(20) {
+                            0..=10 => {
+                                hub.push(workspace_event(&format!("w{step}")));
+                                durable.lock().unwrap().push(hub.current_sequence());
+                            }
+                            11..=13 => hub.push(output_event()),
+                            14..=15 => {
+                                let mut state = hub.inner.lock().unwrap();
+                                state.log.as_mut().unwrap().rotate().unwrap();
+                            }
+                            16 => {
+                                drop(hub);
+                                hub = EventHub::with_persistence(path.clone());
+                                hub.inner.lock().unwrap().ring_cap = ring_cap;
+                            }
+                            raced => {
+                                if raced == 19 {
+                                    interleave(&hub, &durable, next(3), next(12), next(2) == 0);
+                                }
+                                let (got, gap, resumed) = drain(&hub, cursor, 1 + next(4) as usize);
+                                *hub.disk_read_hook.lock().unwrap() = None;
+                                seen.extend(got);
+                                gaps.extend(gap);
+                                cursor = resumed;
+                            }
+                        }
+                    }
+                    let (got, gap, _) = drain(&hub, cursor, 3);
+                    seen.extend(got);
+                    gaps.extend(gap);
+                    let covered = |seq: u64, seen: &[u64], gaps: &[(u64, u64)]| {
+                        seen.contains(&seq)
+                            || gaps.iter().any(|(from, to)| (*from..=*to).contains(&seq))
+                    };
+                    let durable = durable.lock().unwrap().clone();
+                    for seq in &durable {
+                        assert!(
+                            covered(*seq, &seen, &gaps),
+                            "seed {seed}: {seq} lost silently"
+                        );
+                    }
+
+                    // Retained is the disk plus the ring: back-to-back rotations can
+                    // delete a file whose events the ring still holds.
+                    let mut retained: Vec<u64> = hub
+                        .persisted_events_after(0)
+                        .iter()
+                        .map(|(seq, _, _)| *seq)
+                        .chain(
+                            hub.events_after(0)
+                                .iter()
+                                .filter(|(_, e)| e.event.is_persisted())
+                                .map(|(seq, _)| *seq),
+                        )
+                        .collect();
+                    retained.sort_unstable();
+                    retained.dedup();
+                    for start in 0..=hub.current_sequence() {
+                        let (got, gap, _) = drain(&hub, start, 8 + next(64) as usize);
+                        let later: Vec<u64> =
+                            durable.iter().copied().filter(|s| *s > start).collect();
+                        for seq in &later {
+                            assert!(
+                                covered(*seq, &got, &gap),
+                                "seed {seed} from {start}: {seq} lost"
+                            );
+                        }
+                        if later.iter().any(|seq| !retained.contains(seq)) {
+                            assert!(!gap.is_empty(), "seed {seed} from {start}: past retention");
+                        }
+                        if retained.first().is_none_or(|first| start + 1 >= *first) {
+                            assert!(gap.is_empty(), "seed {seed} from {start}: inside retention");
+                        }
+                        for seq in &retained {
+                            assert!(
+                                !gap.iter().any(|(from, to)| (*from..=*to).contains(seq)),
+                                "seed {seed} from {start}: a gap hides retained {seq}"
+                            );
+                        }
+                    }
+                    cleanup(&path);
+                });
+            }
+        });
+    }
+
+    /// A restart resumes numbering from the newest durable event, so the
+    /// sequence of an ephemeral event after it is handed out again. A cursor
+    /// that pointed at it would skip the durable event that reuses it.
+    #[test]
+    fn read_cursor_never_lands_on_a_sequence_a_restart_reuses() {
+        let path = temp_log("read-reuse");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        hub.push(output_event());
+        let cursor = hub.read(0, 10, |_| true).next_after;
+        assert_eq!(cursor, 1);
+        drop(hub);
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w2"));
+        let read = hub.read(cursor, 10, |_| true);
+        assert_eq!(
+            read.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [2]
+        );
         cleanup(&path);
     }
 
