@@ -1050,6 +1050,11 @@ pub struct AgentStartParams {
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+    /// #959: free text recorded on the delegation edge, e.g. `#614`. Sent
+    /// only to a server advertising `ServerCapabilities::agent_start_label`
+    /// (#868): an older one would drop it without a word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// `skip_serializing_if` predicate for a defaulted `bool` flag: absent on the
@@ -2124,6 +2129,9 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     AgentForked,
+    /// #959 / ADR-0027 §1: an attested agent started another agent. See
+    /// `EventData::AgentDelegated`.
+    AgentDelegated,
     AgentRemoved,
     DeliveryAttemptUpdated,
     MessageQueued,
@@ -2202,6 +2210,7 @@ impl EventKind {
             | Self::PaneAgentStatusChanged
             | Self::AgentRemoved
             | Self::AgentForked
+            | Self::AgentDelegated
             | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
@@ -2268,6 +2277,11 @@ pub struct ServerCapabilities {
     pub node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone_detection_warning: Option<String>,
+    /// #959: `agent.start` accepts `label` and records it on the delegation
+    /// edge. Absent on an older server, which is how a client knows to omit
+    /// the field (#868).
+    #[serde(default)]
+    pub agent_start_label: bool,
 }
 
 /// Accept failures retained for the lifetime of the API listener.
@@ -2532,6 +2546,12 @@ pub enum ResponseResult {
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+        /// #959: what this start recorded as its delegation edge:
+        /// `architect <agent id>` for an attested agent caller, or
+        /// `none (unattested)` when ancestry placed the caller in no agent
+        /// pane. Absent from an older server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edge: Option<String>,
     },
     AgentForked {
         /// Unique id for this fork, stamped on the lineage event (#175 O2).
@@ -3206,6 +3226,25 @@ pub struct EventEnvelope {
     pub data: EventData,
 }
 
+/// Which verb produced an `AgentDelegated` edge (#959).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationVia {
+    Start,
+    Spawn,
+    Fork,
+}
+
+impl DelegationVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Spawn => "spawn",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubscriptionEventKind {
     #[serde(rename = "pane.output_matched")]
@@ -3540,6 +3579,27 @@ pub enum EventData {
         agent_id: String,
         session: String,
         reason: String,
+    },
+    /// #959 / ADR-0027 §1: the architect -> delegate edge. `architect` is the
+    /// caller `spawn_caller()` attested, never a request parameter, because
+    /// the edge will carry teardown authority. `reissued` marks the copy a
+    /// server start re-emits for every open edge, so log rotation cannot
+    /// drop one.
+    AgentDelegated {
+        architect: String,
+        delegate: String,
+        via: DelegationVia,
+        workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default)]
+        reissued: bool,
     },
     AgentHibernated {
         pane_id: String,
@@ -4468,6 +4528,7 @@ mod tests {
                     live_handoff: true,
                     node_id: None,
                     clone_detection_warning: None,
+                    agent_start_label: true,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -4622,9 +4683,64 @@ mod tests {
             EventKind::PaneClosed,
             EventKind::PaneAgentStatusChanged,
             EventKind::AgentForked,
+            EventKind::AgentDelegated,
         ] {
             assert!(kind.is_persisted(), "{kind:?} must persist");
         }
+    }
+
+    /// #959: the edge is read back from the durable log by the fold, so its
+    /// wire shape is the persistence format.
+    #[test]
+    fn agent_delegated_event_round_trips() {
+        let envelope = EventEnvelope {
+            event: EventKind::AgentDelegated,
+            data: EventData::AgentDelegated {
+                architect: "agent_arch".into(),
+                delegate: "agent_child".into(),
+                via: DelegationVia::Fork,
+                workspace: "w3".into(),
+                worktree: Some("/wt/child".into()),
+                branch: Some("feat/child".into()),
+                repo: Some("/repo/.git".into()),
+                label: Some("#614".into()),
+                reissued: true,
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"event\":\"agent_delegated\""), "{json}");
+        assert!(json.contains("\"via\":\"fork\""), "{json}");
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, envelope);
+
+        let minimal: EventEnvelope = serde_json::from_str(
+            r#"{"event":"agent_delegated","data":{"type":"agent_delegated","architect":"a","delegate":"d","via":"start","workspace":"w1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            minimal.data,
+            EventData::AgentDelegated {
+                reissued: false,
+                label: None,
+                worktree: None,
+                ..
+            }
+        ));
+    }
+
+    /// #959 / #868: `label` is absent on the wire unless set, and a ping from
+    /// an older server, which has no `agent_start_label`, reads as "does not
+    /// take it" rather than failing to parse.
+    #[test]
+    fn agent_start_label_is_optional_on_the_wire_and_absent_from_old_capabilities() {
+        let params: AgentStartParams =
+            serde_json::from_str(r#"{"name":"n","argv":["sh"]}"#).unwrap();
+        assert_eq!(params.label, None);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(!json.contains("label"), "{json}");
+
+        let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.agent_start_label);
     }
 
     #[test]
