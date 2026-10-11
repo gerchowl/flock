@@ -57,6 +57,8 @@ fn send(node: &Node, sender: &Value, target: &Value, correlation: &str) -> Value
         "from_agent":sender["agent_id"], "body":"fixture question", "intent":"needs_reply", "correlation_id":correlation}),
     )
 }
+/// Mail to an agent on the asking node reads `queued` until the agent reads
+/// it, and `delivered` only once another node's inbox imported it (#977).
 fn state(node: &Node, correlation: &str, expected: &str) -> Value {
     fleet::wait_until(expected, DEADLINE, || {
         let result = api(node, "msg.status", json!({"correlation_id":correlation}));
@@ -149,7 +151,7 @@ fn assert_harness_restart(harness: &str, screen: &str) {
     assert_eq!(current["agent_id"], target["agent_id"]);
     assert_eq!(current["agent_session"]["value"], "retained-session");
     assert_eq!(removals(node), 0);
-    state(node, "harness-restart-mail", "delivered");
+    state(node, "harness-restart-mail", "queued");
     let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
     let messages = messages["messages"].as_array().unwrap();
     assert!(messages
@@ -208,7 +210,7 @@ fn codex_resume_failed_keeps_mail_without_tombstone() {
             .then_some(())
     });
     assert_eq!(removals(node), 0);
-    state(node, "codex-failed-resume-mail", "delivered");
+    state(node, "codex-failed-resume-mail", "queued");
     let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
     assert!(messages["messages"]
         .as_array()
@@ -302,7 +304,7 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     let sender = start(node);
     let _restored = restore_server(node);
     send(node, &sender, &old, "removed-unread-mail");
-    state(node, "removed-unread-mail", "delivered");
+    state(node, "removed-unread-mail", "queued");
     let replacement = replacement_in_same_pane(node, &old);
     assert_eq!(removals(node), 1);
     state(node, "removed-unread-mail", "recipient_gone");
@@ -312,7 +314,7 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     );
     assert!(!stop_hook(node, &replacement).contains("unread message"));
     send(node, &sender, &replacement, "replacement-mail");
-    state(node, "replacement-mail", "delivered");
+    state(node, "replacement-mail", "queued");
     assert!(stop_hook(node, &replacement).contains("1 unread message"));
     let messages = api(node, "msg.read", json!({"pane":replacement["pane_id"]}));
     assert!(messages["messages"]
@@ -425,7 +427,7 @@ fn hibernation_does_not_tombstone() {
             .then_some(())
     });
     assert_eq!(removals(node), 0);
-    state(node, "hibernate-mail", "delivered");
+    state(node, "hibernate-mail", "queued");
 }
 
 #[test]
@@ -454,7 +456,7 @@ fn restart_resume_582_keeps_identity_and_delivers_without_tombstone() {
     assert_eq!(current["agent_id"], target["agent_id"]);
     assert_eq!(current["agent_session"]["value"], "retained-session");
     assert_eq!(removals(node), 0);
-    state(node, "restart-mail", "delivered");
+    state(node, "restart-mail", "queued");
     let messages = api(node, "msg.read", json!({"pane":target["pane_id"]}));
     assert!(messages["messages"]
         .as_array()
@@ -483,7 +485,7 @@ fn resume_failure_reports_offline_not_removed() {
             .then_some(())
     });
     assert_eq!(removals(node), 0);
-    state(node, "failed-resume-mail", "delivered");
+    state(node, "failed-resume-mail", "queued");
 }
 
 #[test]
@@ -555,7 +557,7 @@ fn confirmed_exit_only_removes_agents_without_resumable_sessions() {
         send(node, &sender, &target, correlation);
         exit_to_shell(node, &target);
         if retained {
-            state(node, correlation, "delivered");
+            state(node, correlation, "queued");
         } else {
             state(node, correlation, "recipient_gone");
         }

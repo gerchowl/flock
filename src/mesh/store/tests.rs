@@ -2251,6 +2251,51 @@ fn status_reads_are_pure_and_survive_restart_handoff_and_retention() {
 }
 
 #[test]
+fn unread_local_inbox_mail_is_queued_for_the_sender_and_delivered_on_the_wire() {
+    // #977: `msg status` said `delivered` for mail an agent had never read,
+    // while `msg list` showed it queued. The sender asks this node, where the
+    // row sits unread in a local inbox. The receipt for a remote origin keeps
+    // `delivered`, the one fact that node can learn before the read.
+    let f = Fixture::new();
+    let mut store = f.open(0);
+    let mail = envelope();
+    store
+        .accept_local(&mail, CUSTODY_TTL_MS, "recipient", "session", 0)
+        .unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+    let unread = store
+        .status("origin.example", "thread", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unread.state, "queued");
+    assert_eq!(
+        unread.detail.as_deref(),
+        Some("waiting in a local inbox, not yet read")
+    );
+    assert_eq!(
+        store
+            .referenced_status("thread", &unread.reference, 1)
+            .unwrap()
+            .state,
+        "queued"
+    );
+    assert_eq!(
+        store.receipt(&mail.key, 1).unwrap().as_deref(),
+        Some("delivered")
+    );
+    assert!(store
+        .read_inbox(std::slice::from_ref(&mail.key), 2)
+        .unwrap()
+        .is_empty());
+    let read = store
+        .status("origin.example", "thread", 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.state, "read");
+    assert_eq!(read.detail, None);
+}
+
+#[test]
 fn status_reports_held_collected_custody_and_expiry_without_commits() {
     let fixture = Fixture::new();
     let mut store = fixture.open(0);
