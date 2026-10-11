@@ -164,7 +164,7 @@ fn exit_if_nested_disabled(config: &config::Config) {
         eprintln!("see configuration if you want to enable it.");
         eprintln!();
         eprintln!("\x1b[2m\"{}\"\x1b[0m", random_nested_message());
-        std::process::exit(1);
+        std::process::exit(cli::exit::FAILURE);
     }
 }
 
@@ -435,7 +435,7 @@ fn switch_failure_reason(err: &io::Error) -> String {
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
-        std::process::exit(1);
+        std::process::exit(cli::exit::FAILURE);
     }
 }
 
@@ -446,7 +446,7 @@ fn run() -> io::Result<()> {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(2);
+            std::process::exit(cli::exit::USAGE);
         }
     };
     let (args, remote_launch) = match remote::extract_remote_args(&args) {
@@ -454,7 +454,7 @@ fn run() -> io::Result<()> {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(2);
+            std::process::exit(cli::exit::USAGE);
         }
     };
 
@@ -469,7 +469,7 @@ fn run() -> io::Result<()> {
     {
         eprintln!("error: --remote can only be used with the default launch command");
         eprintln!("run 'flk --help' for usage");
-        std::process::exit(2);
+        std::process::exit(cli::exit::USAGE);
     }
 
     if prints_removed_config_warnings(&args) {
@@ -505,12 +505,12 @@ fn run() -> io::Result<()> {
             Ok(options) => options,
             Err(err) if err.starts_with("usage:") => {
                 eprintln!("{err}");
-                std::process::exit(0);
+                std::process::exit(cli::exit::SUCCESS);
             }
             Err(err) => {
                 eprintln!("{err}");
                 eprintln!("usage: flk update [--handoff]");
-                std::process::exit(2);
+                std::process::exit(cli::exit::USAGE);
             }
         };
         match update::self_update(options) {
@@ -521,7 +521,7 @@ fn run() -> io::Result<()> {
                 } else {
                     eprintln!("update failed: {e}");
                 }
-                std::process::exit(1);
+                std::process::exit(cli::exit::FAILURE);
             }
         }
     }
@@ -643,6 +643,7 @@ fn run() -> io::Result<()> {
         println!("  --version, -V       Print version and exit");
         println!("  --help, -h          Show this help");
         println!();
+        println!("{}", cli::exit::help_section());
         println!("Config: {}", config::config_path().display());
         println!("Logs:   {}", logging::help_log_paths_summary());
         println!("Env:    FLOCK_CONFIG_PATH overrides config file path");
@@ -677,7 +678,7 @@ fn run() -> io::Result<()> {
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         if !arg.starts_with('-')
             && ![
@@ -699,14 +700,14 @@ fn run() -> io::Result<()> {
         {
             eprintln!("unknown command: {arg}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
     }
 
     if let Some(remote_launch) = remote_launch {
         if let Err(err) = run_attach_legs(AttachLeg::Remote(remote_launch)) {
             report_attach_chain_error(&err);
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         return Ok(());
     }
@@ -720,7 +721,7 @@ fn run() -> io::Result<()> {
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
             report_attach_chain_error(&err);
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         return Ok(());
     }
@@ -738,7 +739,7 @@ fn run() -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
             eprintln!("socket: {}", api::socket_path().display());
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         Err(err) => return Err(err),
     };

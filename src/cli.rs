@@ -20,6 +20,7 @@ mod delegate;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;
+pub(crate) mod exit;
 mod fleet;
 mod help;
 mod hook;
@@ -347,12 +348,11 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-/// Exit codes for `flk config check`. The split between "loaded with warnings"
-/// and "did not load" is what makes the command usable as a deploy gate: a
-/// deprecation rename should not block a rollout, a config that leaves the
-/// session running on defaults should (#240).
-const CONFIG_CHECK_ADVISORY: i32 = 1;
-const CONFIG_CHECK_PARSE_FAILURE: i32 = 2;
+// Exit codes for `flk config check`. The split between "loaded with warnings"
+// and "did not load" is what makes the command usable as a deploy gate: a
+// deprecation rename should not block a rollout, a config that leaves the
+// session running on defaults should (#240).
+use exit::{CONFIG_CHECK_ADVISORY, CONFIG_CHECK_PARSE_FAILURE};
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
     let mut json = false;

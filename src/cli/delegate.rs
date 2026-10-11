@@ -363,16 +363,16 @@ fn without_retries<T>(work: impl FnOnce() -> T) -> T {
 /// means them.
 mod exit {
     /// A finished reply, `no_result`, or an unfinished one under `result`.
-    pub(super) const OK: i32 = 0;
+    pub(super) const OK: i32 = crate::cli::exit::SUCCESS;
     /// A usage error, a refused cursor, or something that is not a delegate.
-    pub(super) const USAGE: i32 = 2;
+    pub(super) const USAGE: i32 = crate::cli::exit::USAGE;
     /// A held `blocked` — the agent is sitting on a prompt a human must answer.
-    pub(super) const AGENT_BLOCKED: i32 = 6;
+    pub(super) const AGENT_BLOCKED: i32 = crate::cli::exit::AGENT_BLOCKED;
     /// A finished reply with no `DONE:` / `BLOCKED:` / `VERDICT:` line, or a
     /// settle with no reply at all inside the grace.
-    pub(super) const NO_SENTINEL: i32 = 5;
-    pub(super) const STALLED: i32 = 7;
-    pub(super) const NOT_STARTED: i32 = 8;
+    pub(super) const NO_SENTINEL: i32 = crate::cli::exit::NO_SENTINEL;
+    pub(super) const STALLED: i32 = crate::cli::exit::STALLED;
+    pub(super) const NOT_STARTED: i32 = crate::cli::exit::DELEGATE_NOT_STARTED;
 }
 
 /// Characters a brief path may not contain.

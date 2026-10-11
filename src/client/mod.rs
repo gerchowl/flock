@@ -1397,7 +1397,7 @@ pub const LEG_FALLBACK_ENV_VAR: &str = "FLOCK_LEG_FALLBACK";
 
 /// Exit status of a client that gave up reconnecting (#436), so the launcher
 /// can tell "the transport is gone" from any other failure. EX_TEMPFAIL.
-pub const RECONNECT_GAVE_UP_EXIT_CODE: i32 = 75;
+pub const RECONNECT_GAVE_UP_EXIT_CODE: i32 = crate::cli::exit::RECONNECT_GAVE_UP;
 
 /// The ssh target this client leg would redial, and how: set only for a remote
 /// leg (the launcher tags its client with the target) with `[remote]
@@ -2065,7 +2065,7 @@ fn run_client_with_mode(
         std::process::exit(if gave_up_reconnecting {
             RECONNECT_GAVE_UP_EXIT_CODE
         } else {
-            1
+            crate::cli::exit::FAILURE
         });
     }
 
