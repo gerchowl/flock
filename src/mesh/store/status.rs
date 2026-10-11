@@ -28,6 +28,15 @@ pub enum ReceiptImport {
     OriginalNotReady,
 }
 
+/// Who a status is computed for. A receipt tells the origin what reached
+/// this node, so an unread inbox row is `delivered` there, while the sender
+/// asking its own node about mail still in a local inbox is told `queued`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusView {
+    Sender,
+    Receipt,
+}
+
 pub struct Status {
     pub state: String,
     pub reference: StatusReference,
@@ -107,11 +116,25 @@ impl<D: DiskSpace> Store<D> {
             }))
     }
 
+    /// The sender's view of one message. A row still in an inbox on this
+    /// node has not been read, so it reports `queued`, as `msg list` and the
+    /// pre-mesh local path do. `delivered` stays the word for mail imported
+    /// into another node's inbox, which is all an origin can know (#977).
     pub(crate) fn status_key(
         &self,
         key: &MessageKey,
         wall_ms: i64,
         reference: Option<&StatusReference>,
+    ) -> Result<Option<Status>> {
+        self.status_view(key, wall_ms, reference, StatusView::Sender)
+    }
+
+    fn status_view(
+        &self,
+        key: &MessageKey,
+        wall_ms: i64,
+        reference: Option<&StatusReference>,
+        view: StatusView,
     ) -> Result<Option<Status>> {
         let Some(record) = self.get(key)? else {
             return Ok(None);
@@ -126,6 +149,7 @@ impl<D: DiskSpace> Store<D> {
             "inbox" if inbox.is_some_and(|until| until <= now) => "expired",
             "custody" if record.envelope.request_key.is_none() => "queued",
             "held" if record.envelope.request_key.is_none() => "queued",
+            "inbox" if view == StatusView::Sender => "queued",
             "inbox" => "delivered",
             "inbox_expired" => "expired",
             "transferred" => "custody",
@@ -138,6 +162,7 @@ impl<D: DiskSpace> Store<D> {
                 state = remote;
             }
         }
+        let local_inbox = record.state == "inbox" && state == "queued";
         if error.is_some()
             && !matches!(
                 state.as_str(),
@@ -188,14 +213,16 @@ impl<D: DiskSpace> Store<D> {
                 None => self.reference(key, &record.envelope.correlation_id)?,
             },
             reply,
-            detail: error,
+            detail: error.or_else(|| {
+                local_inbox.then(|| "waiting in a local inbox, not yet read".to_string())
+            }),
         }))
     }
 
     /// Called only after the collection edge and conversation token are authenticated.
     pub fn receipt(&self, key: &MessageKey, wall_ms: i64) -> Result<Option<String>> {
         Ok(self
-            .status_key(key, wall_ms, None)?
+            .status_view(key, wall_ms, None, StatusView::Receipt)?
             .map(|s| s.state)
             .filter(|state| RECEIPT_STATES.contains(&state.as_str())))
     }

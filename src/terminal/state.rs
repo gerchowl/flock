@@ -1325,6 +1325,25 @@ impl TerminalState {
                 }))
     }
 
+    /// True when the session the snapshot captures for this pane was named
+    /// by a hook from the live process, which is exactly what
+    /// `persist::capture` writes: the hook authority's ref when it has one,
+    /// else the persisted ref. A live handoff carries this so the importer can
+    /// keep the confirmation the exporter already held (#977).
+    pub(crate) fn agent_session_hook_confirmed(&self) -> bool {
+        self.restart_session_confirmed()
+    }
+
+    /// Live handoff only: the PTY and its process moved to this server intact,
+    /// so a session the exporter had hook-confirmed is still confirmed here.
+    /// A cold restore must keep using [`Self::set_persisted_agent_session`]
+    /// alone, because there the process may be gone (#328).
+    pub(crate) fn confirm_persisted_agent_session_after_handoff(&mut self) {
+        if self.persisted_agent_session.is_some() {
+            self.session_ref_hook_confirmed = true;
+        }
+    }
+
     pub(crate) fn restart_session_confirmed(&self) -> bool {
         self.session_ref_hook_confirmed
             || self

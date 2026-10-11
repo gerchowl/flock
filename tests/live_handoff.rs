@@ -2454,3 +2454,222 @@ fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff
     );
     cleanup_test_base(&base);
 }
+
+/// A Claude session id that passes `valid_session_id`. A UUID, like the real
+/// ones, so the transcript file name has the shape Claude writes.
+const IDLE_CLAUDE_SESSION: &str = "0975c14a-1111-4222-8333-444455556666";
+
+fn visible_text(api_socket: &Path, pane_id: &str) -> String {
+    let response = request(
+        api_socket,
+        serde_json::json!({
+            "id": "test:pane:visible",
+            "method": "pane.read",
+            "params": {
+                "pane_id": pane_id,
+                "source": "visible",
+                "lines": 20,
+                "format": "text",
+                "strip_ansi": true
+            }
+        }),
+    );
+    response["result"]["read"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #977: one idle, hook-confirmed Claude pane with unread mail, carried across
+/// a live handoff with no client attached. Each assertion after the handoff
+/// is one of the issue's symptoms.
+#[test]
+fn live_handoff_keeps_an_idle_claude_pane_readable_repainted_and_its_mail_queued() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    // An idle TUI in miniature: it paints once, then draws again only when a
+    // SIGWINCH asks it to, the way claude, codex and opencode behave at rest.
+    let script = "n=0; trap 'n=$((n+1)); printf \"\\033[2J\\033[HREPAINTED-%s %s\\n\" \"$n\" \"$(stty size)\"' WINCH; \
+                  printf 'IDLE-SCREEN %s\\n' \"$(stty size)\"; while :; do sleep 0.1; done";
+    let started = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent-start",
+            "method": "agent.start",
+            "params": {
+                "name": "idle-claude",
+                "cwd": "/tmp",
+                "focus": true,
+                "argv": ["/bin/sh", "-c", script]
+            }
+        }),
+    );
+    assert_ok(started.clone());
+    let pane_id = started["result"]["agent"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_output(&api_socket, &pane_id, "IDLE-SCREEN");
+    // The hook report the real claude integration sends: it names the session,
+    // which is what licenses a transcript read.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:claude-hook",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "flock:claude",
+                "agent": "claude",
+                "state": "idle",
+                "agent_session_id": IDLE_CLAUDE_SESSION
+            }
+        }),
+    ));
+    // Move the operator elsewhere. A detached server resizes only the panes
+    // of the active tab on its first render, so a pane in a background
+    // workspace, where most of a fleet's agents sit, gets no SIGWINCH from
+    // the importer's layout pass and keeps the empty screen it arrived with.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:foreground",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    ));
+
+    let project = config_home.join("home/.claude/projects/-tmp");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join(format!("{IDLE_CLAUDE_SESSION}.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": "before the handoff"}
+            })
+        ),
+    )
+    .unwrap();
+    let history_request = serde_json::json!({
+        "id": "test:agent-history",
+        "method": "agent.history",
+        "params": {"target": pane_id}
+    });
+    let before = request(&api_socket, history_request.clone());
+    assert_eq!(
+        before["result"]["history"]["session_id"], IDLE_CLAUDE_SESSION,
+        "the hook-confirmed session must be readable before the handoff: {before}"
+    );
+
+    // fyi never wakes the pane, so the message stays unread in its inbox.
+    let sent = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:msg-send",
+            "method": "msg.send",
+            "params": {
+                "to": {"type": "pane", "pane": pane_id},
+                "body": "unread across the handoff",
+                "intent": "fyi",
+                "correlation_id": "c-977-unread"
+            }
+        }),
+    );
+    assert_ok(sent.clone());
+    let status_request = serde_json::json!({
+        "id": "test:msg-status",
+        "method": "msg.status",
+        "params": {"correlation_id": "c-977-unread"}
+    });
+    let status_before = request(&api_socket, status_request.clone());
+    assert!(
+        status_before["result"]["reference"].is_object(),
+        "the message must travel the mesh store path the issue observed: {status_before}"
+    );
+    assert_eq!(
+        status_before["result"]["state"], "queued",
+        "unread mail is queued, not delivered: {status_before}"
+    );
+
+    // An operator attached at some point, so every pane already has the size
+    // the detached layout gives it, and the importer's own layout pass, which
+    // resizes only what changed, sends this pane no SIGWINCH. The pane must
+    // repaint for that resize first, or its later repaint proves nothing.
+    let protocol = request(
+        &api_socket,
+        serde_json::json!({"id":"test:protocol","method":"ping","params":{}}),
+    )["result"]["protocol"]
+        .as_u64()
+        .unwrap() as u32;
+    let mut client_stream = UnixStream::connect(runtime_dir.join("flock-client.sock")).unwrap();
+    let (_, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
+    assert!(error.is_none(), "client handshake failed: {error:?}");
+    wait_for_output(&api_socket, &pane_id, "REPAINTED-");
+    drop(client_stream);
+    thread::sleep(Duration::from_millis(500));
+    let settled_screen = visible_text(&api_socket, &pane_id);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(30));
+
+    // (a) No client attaches. The importer itself must get the idle pane to
+    // draw again: its screen arrives empty, since agent panes replay no history.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let repainted = |screen: &str| screen.contains("REPAINTED-") && screen != settled_screen;
+    let mut screen = visible_text(&api_socket, &pane_id);
+    while !repainted(&screen) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        screen = visible_text(&api_socket, &pane_id);
+    }
+    assert!(
+        repainted(&screen),
+        "an idle agent pane came back blank after a headless live handoff: \
+         {screen:?}, before the handoff it showed {settled_screen:?}"
+    );
+
+    // (b) Still unread, so still queued.
+    let status_after = request(&api_socket, status_request);
+    assert_eq!(
+        status_after["result"]["state"], "queued",
+        "msg status must not claim delivery of unread mail after a handoff: {status_after}"
+    );
+    let queued = request(
+        &api_socket,
+        serde_json::json!({"id":"test:msg-list","method":"msg.list","params":{"pane": pane_id}}),
+    );
+    assert!(
+        queued.to_string().contains("c-977-unread"),
+        "the message is still in the inbox: {queued}"
+    );
+
+    // (c) The same process holds the same session, so it stays readable.
+    let after = request(&api_socket, history_request);
+    assert_eq!(
+        after["result"]["history"]["session_id"], IDLE_CLAUDE_SESSION,
+        "a hook-confirmed claude session must stay readable across a live handoff: {after}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}

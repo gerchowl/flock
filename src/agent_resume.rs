@@ -213,12 +213,37 @@ pub fn branch_plan(
 /// claude-internal and not worth replicating. A missing or empty transcript
 /// means `claude --resume` would print "No conversation found" and exit,
 /// leaving a dead pane, so fork callers refuse up front.
+///
+/// A session launched under an account profile (`CLAUDE_CONFIG_DIR`) keeps
+/// its transcripts under that directory instead of `~/.claude`. The
+/// `SessionStart` hook records which one (see `record_claude_config_dir`),
+/// so the recorded profile is searched first and `~/.claude` after it (#977).
 pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    claude_transcript_path_in(home, &claude_config_dir_records_dir(), session_id)
+}
+
+fn claude_transcript_path_in(
+    home: &Path,
+    records_dir: &Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
     if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
         return None;
     }
-    let projects = home.join(".claude").join("projects");
-    let entries = std::fs::read_dir(projects).ok()?;
+    let profile = claude_config_dir_for_session_in(records_dir, session_id)
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute());
+    profile
+        .into_iter()
+        .chain(std::iter::once(home.join(".claude")))
+        .find_map(|config_dir| claude_transcript_in_config_dir(&config_dir, session_id))
+}
+
+fn claude_transcript_in_config_dir(
+    config_dir: &Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(config_dir.join("projects")).ok()?;
     let file_name = format!("{session_id}.jsonl");
     for entry in entries.flatten() {
         let candidate = entry.path().join(&file_name);
@@ -758,6 +783,52 @@ mod tests {
             "path traversal in a session id must never resolve"
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_transcript_path_reads_the_recorded_config_dir_profile_first() {
+        // #977: a pane launched under `claude-auth <profile>` writes its
+        // transcript under that CLAUDE_CONFIG_DIR, never under ~/.claude, so
+        // `agent result` failed with transcript_not_found on every such pane.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("flock-profile-{}-{nanos}", std::process::id()));
+        let home = base.join("home");
+        let records = base.join("records");
+        let profile = home.join(".claude-profiles/eth");
+        let profile_project = profile.join("projects/-tmp-repo");
+        let default_project = home.join(".claude/projects/-tmp-repo");
+        std::fs::create_dir_all(&profile_project).unwrap();
+        std::fs::create_dir_all(&default_project).unwrap();
+        std::fs::write(profile_project.join("sess-profile.jsonl"), "{}\n").unwrap();
+        std::fs::write(default_project.join("sess-default.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-profile"),
+            None,
+            "without the record the profile is not searched"
+        );
+        record_claude_config_dir_in(&records, "sess-profile", &profile.to_string_lossy());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-profile"),
+            Some(profile_project.join("sess-profile.jsonl"))
+        );
+        record_claude_config_dir_in(&records, "sess-default", &profile.to_string_lossy());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-default"),
+            Some(default_project.join("sess-default.jsonl")),
+            "a recorded profile without the transcript falls back to ~/.claude"
+        );
+        record_claude_config_dir_in(&records, "sess-relative", "relative/profile");
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-relative"),
+            None,
+            "a relative record names no directory flock can trust"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
