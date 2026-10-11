@@ -4112,7 +4112,8 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     // so, rather than leaving the caller to wonder what the footer counts.
     // The server carries the detector's answer on the record (#922). It omits
     // the field when false, and an older server never sends it, so an absent
-    // field falls back to reading the screen here.
+    // field falls back to reading the screen here. Telling the two apart would
+    // take a capability ping, which a successful delegate command never sends.
     let background_shells = !gone
         && matches!(status, "idle" | "done")
         && (record
