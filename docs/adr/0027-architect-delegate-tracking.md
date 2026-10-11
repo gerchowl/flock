@@ -153,6 +153,15 @@ receipts addressed to nobody.
   anyway. A successor adopting its predecessor's edges on its own start, with
   the predecessor's consent token, is a possible later refinement and is not
   decided here.
+- **A known limit of the operator boundary.** "Operator" means "no pane in
+  the caller's ancestry" (ADR-0014). An agent that detaches a child
+  (`setsid`, a reparenting `nohup`) makes that child attest as the operator,
+  so it could run `reassign` or `forget`. This ADR does not close that gap,
+  which is ADR-0014's. It bounds the damage instead: reassigned or not, a reap
+  still needs the merge gate to pass, worktree ownership (§5), a clean,
+  pushed tip, and no other open edge on the checkout. A mis-reassigned edge
+  can therefore at most remove a worktree whose work is already merged.
+  `DelegateReassigned` records `by` for the audit.
 
 ### 2. `delegate.list` is the one read, and every surface is a projection of it
 
@@ -278,9 +287,19 @@ it must not let the architect's policy remove it. So:
 - `worktree.create` records its attested creator in a durable
   `WorktreeCreated { path, branch, created_by: AgentId }` event (it already
   resolves `spawn_caller()`, `src/app/api/worktrees.rs`);
-- an edge **owns** its worktree only when that worktree was created by the
-  same architect within the same `delegate start` (the CLI's `worktree.create`
-  then `agent.start` pair), or by the `agent.fork` that produced the delegate;
+- an edge **owns** its worktree when, at the moment the edge is recorded, the
+  delegate's worktree path matches a `WorktreeCreated` whose `created_by` is
+  the edge's architect, or when the `agent.fork` that produced the delegate
+  created it. The server cannot see "the same `delegate start`": it sees two
+  socket calls from one attested caller. So ownership is defined as **path
+  plus creator**, not as one invocation. An architect that creates a worktree
+  and later starts a second delegate in it owns it on both edges, and the
+  "another open edge points at it" rule below is what keeps the first
+  delegate's checkout safe;
+- ownership is decided once, recorded on the edge, and **travels with it on
+  reassign** (§1a). A reassign is an operator act, so the successor inherits
+  exactly the teardown authority the predecessor had, no more. Re-deriving it
+  against the new architect would make every reassigned edge unreapable;
 - reap refuses an edge that does not own its worktree, and says so in the
   digest. A checkout that another open edge still points at is never removed
   either.
@@ -384,7 +403,7 @@ Each slice is independently shippable and testable, and is sized at roughly
 | --- | --- | --- | --- |
 | 1 | `AgentDelegated` edge from the attested caller at `agent.start` / `agent.spawn` / `agent.fork`; `gone` without closing; re-issue checked against live records; unattested starts reported | | #959 |
 | 2 | `delegate.list` verb, `flk delegate list --mine/--architect/--all`, MCP `flock_delegate_list`, all edge states | 1 | #960 |
-| 3 | `from: flock` digest from a server-side buffer, one immutable message at a time, through the existing nudge and wake paths | 1, #697 | #961 |
+| 3 | `from: flock` digest from a server-side buffer, one immutable message at a time, through the existing nudge and wake paths | 1; #697 (wake acceptance only) | #961 |
 | 4 | Delegate table as SessionStart hook output after compaction or resume | 2 | #962 |
 | 5 | Hibernate-on-done: `hibernated, awaiting merge` state | 1, 3 | #963 |
 | 6 | Worktree provenance and `--reap-on merged`: ownership check, merge gate, evidence retention, children settled, receipt | 1, 3, 5 | #968 |
