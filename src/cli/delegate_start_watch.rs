@@ -31,11 +31,16 @@ impl StartWatch {
             baseline: baseline.filter(|cursor| !cursor.working),
             agent,
             submitted,
-            window: STARTUP_ALLOWANCE.saturating_add(settle),
+            window: Self::window(settle),
             empty_since: None,
             contents: None,
             state_seq: None,
         }
+    }
+
+    /// How long an empty idle composer must hold before a turn counts as never started.
+    pub(super) fn window(settle: Duration) -> Duration {
+        STARTUP_ALLOWANCE.saturating_add(settle)
     }
 
     pub(super) fn interrupted(&mut self) {

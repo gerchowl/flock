@@ -108,6 +108,7 @@ fn has_codex_visible_working_without_prompt(content: &str) -> bool {
 
 fn has_codex_strong_blocked_prompt(lower_content: &str) -> bool {
     has_codex_hook_review(lower_content)
+        || has_codex_folder_trust(lower_content)
         || lower_content.contains("press enter to confirm or esc to cancel")
         || lower_content.contains("enter to submit answer")
         || lower_content.contains("enter to submit all")
@@ -298,9 +299,62 @@ pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
         && bottom.iter().any(|line| line.trim() == "› 1. review hooks")
 }
 
+/// Codex's first-start "Folder access" dialog (#828), which has no composer.
+///
+/// All three controls must sit in the live tail: the question that opens the
+/// explanation, the selected trust choice, and the footer as the last line.
+/// A transcript quoting the dialog is followed by a prompt, so it fails the
+/// footer gate.
+pub(in crate::detect) fn has_codex_folder_trust(content: &str) -> bool {
+    let bottom = bottom_non_empty_lines(content, 16);
+    bottom
+        .last()
+        .is_some_and(|line| line.trim() == "enter continue · esc quit")
+        && bottom
+            .iter()
+            .any(|line| line.trim_start().starts_with("trust this folder?"))
+        && bottom
+            .iter()
+            .any(|line| line.trim() == "› 1. trust and continue")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FOLDER_TRUST: &str = include_str!("../../../tests/fixtures/codex/folder-trust.txt");
+
+    #[test]
+    fn folder_trust_dialog_is_blocked_only_at_the_live_tail() {
+        assert_eq!(detect(FOLDER_TRUST), AgentState::Blocked);
+        assert!(has_visible_blocker(FOLDER_TRUST));
+        // The dialog at the repository root itself carries no `Note:` paragraph.
+        let at_root: String = FOLDER_TRUST
+            .lines()
+            .filter(|line| !line.contains("Note:") && !line.ends_with("/repo"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(detect(&at_root), AgentState::Blocked);
+        // Accepted: the dialog is history above a live prompt.
+        let accepted = format!("{FOLDER_TRUST}\n› Ask Codex to do anything\n  ? for shortcuts\n");
+        assert_eq!(detect(&accepted), AgentState::Idle);
+        assert!(!has_visible_blocker(&accepted));
+        // Each control alone is not the dialog.
+        for missing in [
+            "Trust this folder?",
+            "› 1. Trust and continue",
+            "enter continue · esc quit",
+        ] {
+            let partial = FOLDER_TRUST.replace(missing, "");
+            assert!(
+                !has_codex_folder_trust(&partial.to_lowercase()),
+                "{missing}"
+            );
+        }
+        // The update modal shares the `enter continue` footer but not the dialog.
+        let update = include_str!("../../../tests/fixtures/codex/startup-update-dialog.txt");
+        assert!(!has_codex_folder_trust(&update.to_lowercase()));
+    }
 
     #[test]
     fn detect_codex_compaction_remains_working_under_its_visible_prompt() {

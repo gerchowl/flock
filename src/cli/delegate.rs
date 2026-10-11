@@ -81,10 +81,13 @@ pub(super) const START_USAGE: &str = concat!(
     "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
-    "  --harness NAME      the agent to run, default opencode; claude's folder-trust dialog is\n",
-    "                      named rather than typed into (see #605)\n",
+    "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
+    "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review\n",
     "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
+    "  --base REF          fetched first; a branch resolves to its remote-tracking ref unless the local\n",
+    "                      branch has commits of its own; the ref and commit used are printed\n",
+    "  a brief codex swallowed at startup is typed once more after the not_started window\n",
     "  --await             stay and report the round's outcome instead of returning after the submit\n",
     "  --timeout MS        bound the AWAIT only, counted from the submit; absent waits forever\n",
     "  --silence DURATION  unchanged working screen ends the await as stalled; default 3m, 0 disables\n",
@@ -459,21 +462,31 @@ struct HarnessSpec {
     supports_sandbox: bool,
     /// Require a turn after the pre-submit cursor and guard any composer retry.
     confirm_submit: bool,
+    /// Type the brief once more when `start` cannot confirm it and the
+    /// not-started evidence then holds for its whole window (#828).
+    ///
+    /// Codex only: its startup can swallow the paste and leave an empty
+    /// composer. opencode keeps #636's rule that a dropped brief is never
+    /// retyped, and Claude has shown no such loss.
+    resubmit_lost_brief: bool,
     /// Where the session id comes from — read for what the operator has to be
     /// told when a turn produces no reply at all.
     session_source: SessionSource,
     /// How long after a settle the delegate keeps looking for the reply.
     result_grace: Duration,
-    /// A dialog this harness puts up before it will take input, recognised on
-    /// screen so readiness can name it instead of reporting a bare `blocked`.
+    /// The dialogs this harness puts up before it will take input, recognised
+    /// on screen so readiness can name one instead of reporting a bare
+    /// `blocked`.
     ///
-    /// `None` for a harness with no such dialog.
-    startup_dialog: Option<StartupDialog>,
+    /// Empty for a harness with no such dialog.
+    startup_dialogs: &'static [StartupDialog],
 }
 
 /// A known blocking dialog, and the refusal that names it.
 #[derive(Debug)]
 struct StartupDialog {
+    /// The stable name readiness and `status` report, e.g. `codex_folder_trust`.
+    code: &'static str,
     /// Whether the pane's bottom buffer is showing that dialog.
     ///
     /// The DETECTOR's own predicate rather than a marker string restated here.
@@ -513,36 +526,50 @@ const HARNESSES: [HarnessSpec; 3] = [
         argv: opencode_argv,
         supports_sandbox: false,
         confirm_submit: true,
+        resubmit_lost_brief: false,
         session_source: SessionSource::Plugin,
         result_grace: Duration::from_secs(10),
-        startup_dialog: None,
+        startup_dialogs: &[],
     },
     HarnessSpec {
         name: "claude",
         argv: claude_argv,
         supports_sandbox: false,
         confirm_submit: true,
+        resubmit_lost_brief: false,
         session_source: SessionSource::Hook,
         // The TUI clears its spinner before Claude has flushed its last
         // transcript entry, so the gap this covers is the same one it covers
         // for opencode: the store, not the screen, is the slow side.
         result_grace: Duration::from_secs(10),
-        startup_dialog: Some(StartupDialog {
+        startup_dialogs: &[StartupDialog {
+            code: "claude_folder_trust",
             shows: crate::detect::claude_waiting_on_folder_trust,
             refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
-        }),
+        }],
     },
     HarnessSpec {
         name: "codex",
         argv: codex_argv,
         supports_sandbox: true,
         confirm_submit: true,
+        resubmit_lost_brief: true,
         session_source: SessionSource::Hook,
         result_grace: Duration::from_secs(10),
-        startup_dialog: Some(StartupDialog {
-            shows: crate::detect::codex_waiting_on_hook_review,
-            refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
-        }),
+        startup_dialogs: &[
+            StartupDialog {
+                code: "codex_hook_review",
+                shows: crate::detect::codex_waiting_on_hook_review,
+                refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
+            },
+            // Codex keys trust on the repository root, so one acceptance in the
+            // main checkout covers every later worktree of that repository.
+            StartupDialog {
+                code: "codex_folder_trust",
+                shows: crate::detect::codex_waiting_on_folder_trust,
+                refusal: "Codex is waiting on its folder-trust dialog (see #828); trust the repository once in Codex, which covers its worktrees, or add a trusted [projects] entry for the repository root to ~/.codex/config.toml",
+            },
+        ],
     },
 ];
 
@@ -748,6 +775,12 @@ struct Entry {
     /// Used for positive identity in cwd-mode reap/rollback.
     #[serde(default)]
     root_pane_terminal_id: String,
+    /// The ref a `--base` worktree was branched from, after the refresh (#828).
+    #[serde(default)]
+    base: Option<String>,
+    /// The commit that ref named at start.
+    #[serde(default)]
+    base_sha: Option<String>,
 }
 
 /// The directory holding this server's delegates: one file per name, under the
@@ -1435,6 +1468,8 @@ struct Placement {
     parent_workspace_id: Option<String>,
     repo_root: Option<String>,
     repo_key: Option<String>,
+    /// The `--base` the worktree was branched from, after the refresh (#828).
+    base: Option<crate::worktree::FreshBase>,
 }
 
 impl Placement {
@@ -1501,13 +1536,28 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
         }
         Mode::Cwd => (String::new(), None),
     };
+    // A local integration branch nobody pulls is a stale base, so `--base`
+    // is refreshed from its remote before anything is created (#828).
+    let fresh_base = match (mode, flags.base.as_deref()) {
+        (Mode::Worktree, Some(base)) => {
+            let fresh = crate::worktree::resolve_fresh_base(Path::new(&repo), base);
+            if let Some(note) = &fresh.note {
+                eprintln!("delegate {name}: --base {base}: {note}");
+            }
+            Some(fresh)
+        }
+        _ => None,
+    };
     let bounded_res = match mode {
         Mode::Worktree => bounded(
             Method::WorktreeCreate(WorktreeCreateParams {
                 dry_run: false,
                 cwd: Some(repo.clone()),
                 branch: flags.branch.clone(),
-                base: flags.base.clone(),
+                base: fresh_base
+                    .as_ref()
+                    .map(|fresh| fresh.base.clone())
+                    .or_else(|| flags.base.clone()),
                 focus: false,
                 ..WorktreeCreateParams::default()
             }),
@@ -1654,6 +1704,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
         parent_workspace_id,
         repo_root,
         repo_key,
+        base: fresh_base,
     })
 }
 
@@ -2649,9 +2700,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             return Ok(fail(reason));
         }
     };
-    let submitted_at_ms = now_ms();
+    let mut submitted_at_ms = now_ms();
 
-    let entry = Entry {
+    let mut entry = Entry {
         name: name.to_string(),
         terminal_id: terminal_id.clone(),
         pane_id: pane_id.clone(),
@@ -2677,6 +2728,8 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         cursor: cursor.clone(),
         created_at_ms: now_ms(),
         root_pane_terminal_id: placement.root_pane_terminal_id.clone(),
+        base: placement.base.as_ref().map(|fresh| fresh.base.clone()),
+        base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
     };
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
@@ -2694,7 +2747,26 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    if let Err(reason) = submit_brief(&pane_id, &sentence, None) {
+    let submit_started = Instant::now();
+    let submitted = submit_brief(&pane_id, &sentence, None)
+        .map(|()| false)
+        .or_else(|reason| match reason {
+            // A Codex still starting up can swallow the paste: its composer stays
+            // empty and no turn begins (#828). One guarded resubmit, only once
+            // that has held for the whole start-watch window.
+            SubmitFailure::Unconfirmed(_) if harness.resubmit_lost_brief => {
+                recover_lost_brief(&entry, &sentence, flags.settle_ms, submit_started, reason)
+            }
+            other => Err(other),
+        });
+    if let Ok(true) = submitted {
+        submitted_at_ms = now_ms();
+        entry.submitted_at_ms = submitted_at_ms;
+        if let Err(err) = write_entry(&entry) {
+            eprintln!("delegate {name}: the registry could not record the resubmit: {err}");
+        }
+    }
+    if let Err(reason) = submitted {
         if matches!(reason, SubmitFailure::Gone) {
             return Ok(emit_submit_gone(&entry, flags.json));
         }
@@ -2832,6 +2904,153 @@ fn emit_submit_gone(entry: &Entry, json: bool) -> i32 {
         entry.name
     );
     Outcome::Gone.exit_code()
+}
+
+/// Extra time a lost-brief watch allows past the start-watch window, for the
+/// sample gaps and the one resubmit's own confirmation.
+const LOST_BRIEF_MARGIN: Duration = Duration::from_secs(15);
+
+/// What one look at a delegate whose brief went unconfirmed found.
+enum Probe {
+    Record {
+        status: crate::api::schema::AgentStatus,
+        cursor: Cursor,
+        screen: String,
+        unfaint: String,
+    },
+    /// The record or the screen could not be read this time.
+    Unreadable,
+    /// The agent no longer resolves.
+    Gone,
+}
+
+/// Watch an unconfirmed brief until its turn starts, or resubmit it once when
+/// it was provably lost (#828). `Ok(true)` means it was submitted again.
+fn recover_lost_brief(
+    entry: &Entry,
+    sentence: &str,
+    settle_ms: Option<u64>,
+    submitted: Instant,
+    original: SubmitFailure,
+) -> Result<bool, SubmitFailure> {
+    let settle = Duration::from_millis(settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS));
+    let deadline = submitted + start_watch::StartWatch::window(settle) + LOST_BRIEF_MARGIN;
+    eprintln!(
+        "delegate {}: {original}; watching for the turn before deciding the brief was lost",
+        entry.name
+    );
+    recover_lost_brief_with(
+        entry,
+        sentence,
+        settle,
+        submitted,
+        deadline,
+        original,
+        || match agent_record(&entry.terminal_id, Some(deadline)) {
+            AgentFetch::Found(record) => {
+                let status = record
+                    .get("agent_status")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok());
+                let cursor = cursor_of(&record)
+                    .ok()
+                    .and_then(|raw| Cursor::parse(&raw).ok());
+                let screens = detection_screens_with(&entry.pane_id, Some(deadline), bounded);
+                match (status, cursor, screens) {
+                    (Some(status), Some(cursor), Some((screen, unfaint))) => Probe::Record {
+                        status,
+                        cursor,
+                        screen,
+                        unfaint,
+                    },
+                    _ => Probe::Unreadable,
+                }
+            }
+            AgentFetch::Missing => Probe::Gone,
+            AgentFetch::TimedOut | AgentFetch::Failed(_) => Probe::Unreadable,
+        },
+        || {
+            eprintln!(
+                "delegate {}: the brief was not taken and the composer stayed empty; submitting it once more",
+                entry.name
+            );
+            submit_brief(&entry.pane_id, sentence, None)
+        },
+        Instant::now,
+        || std::thread::sleep(READY_POLL),
+    )
+}
+
+/// The decision half of [`recover_lost_brief`], with its I/O and clock handed in.
+///
+/// A resubmit needs everything `not_started` needs (the start watch's empty,
+/// idle composer with no queued or startup evidence, held for its whole window)
+/// and one thing more: the brief's sentence never appeared anywhere on screen.
+/// A harness that queued or echoed the brief shows it, and a second copy then
+/// would be the duplicate #828 saw.
+#[allow(clippy::too_many_arguments)] // The four seams are the point: each is a fake in tests.
+fn recover_lost_brief_with(
+    entry: &Entry,
+    sentence: &str,
+    settle: Duration,
+    submitted: Instant,
+    deadline: Instant,
+    original: SubmitFailure,
+    mut probe: impl FnMut() -> Probe,
+    resubmit: impl FnOnce() -> Result<(), SubmitFailure>,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
+) -> Result<bool, SubmitFailure> {
+    let Ok(baseline) = Cursor::parse(&entry.cursor) else {
+        return Err(original);
+    };
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let brief = compact(sentence);
+    let mut watch = start_watch::StartWatch::new(
+        Some(baseline.clone()),
+        crate::detect::parse_agent_label(&entry.harness),
+        submitted,
+        settle,
+    );
+    loop {
+        let at = now();
+        if at >= deadline {
+            return Err(original);
+        }
+        match probe() {
+            Probe::Gone => return Err(SubmitFailure::Gone),
+            Probe::Unreadable => watch.interrupted(),
+            Probe::Record {
+                status,
+                cursor,
+                screen,
+                unfaint,
+            } => {
+                if cursor.terminal_id != baseline.terminal_id || cursor.epoch != baseline.epoch {
+                    return Err(original);
+                }
+                if status == crate::api::schema::AgentStatus::Working
+                    || cursor.working
+                    || cursor.entries > baseline.entries
+                {
+                    return Ok(false);
+                }
+                // The brief is on screen, so it was not lost: queued, echoed,
+                // or waiting in the composer. Nothing will be typed again.
+                if compact(&screen).contains(&brief) {
+                    return Err(original);
+                }
+                if watch.observe_unfaint(&cursor, status, &screen, &unfaint, at) {
+                    return resubmit().map(|()| true);
+                }
+            }
+        }
+        pause();
+    }
 }
 
 fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
@@ -2997,7 +3216,7 @@ fn await_ready(
                     .unwrap_or("unknown")
                     .to_string();
                 if matches!(status.as_str(), "idle" | "done") {
-                    if harness.startup_dialog.is_some() {
+                    if !harness.startup_dialogs.is_empty() {
                         if let Some(refusal) =
                             startup_dialog_refusal(name, harness, &pane_id, deadline)
                         {
@@ -3070,30 +3289,54 @@ fn startup_dialog_refusal(
     pane_id: &str,
     deadline: Instant,
 ) -> Option<String> {
-    let dialog = harness.startup_dialog.as_ref()?;
-    pane_shows_startup_dialog(pane_id, dialog, deadline)
-        .then(|| format!("delegate {name}: {}", dialog.refusal))
+    let dialog = startup_dialog_shown(harness, pane_id, deadline)?;
+    Some(format!(
+        "delegate {name}: {}: {}",
+        dialog.code, dialog.refusal
+    ))
+}
+
+/// The harness's startup dialog this pane is showing, from one bounded read.
+fn startup_dialog_shown(
+    harness: &HarnessSpec,
+    pane_id: &str,
+    deadline: Instant,
+) -> Option<&'static StartupDialog> {
+    if harness.startup_dialogs.is_empty() {
+        return None;
+    }
+    let text = startup_dialog_screen(pane_id, deadline, bounded)?;
+    harness
+        .startup_dialogs
+        .iter()
+        .find(|dialog| (dialog.shows)(&text))
 }
 
 /// Whether the pane's bottom buffer is showing this dialog.
-///
-/// `pane.read` rather than the agent record, because the dialog is screen
-/// chrome and the record carries no screen. Bounded by the caller's deadline
-/// like every other request here: an unbounded read against a stalled server
-/// would freeze `start` rather than report it (G1). A read that fails answers
-/// `false`, so a flaky socket degrades to the plain `blocked` refusal rather
-/// than inventing a diagnosis.
-fn pane_shows_startup_dialog(pane_id: &str, dialog: &StartupDialog, deadline: Instant) -> bool {
-    pane_shows_startup_dialog_with(pane_id, dialog, deadline, bounded)
-}
-
+#[cfg(test)]
 fn pane_shows_startup_dialog_with(
     pane_id: &str,
     dialog: &StartupDialog,
     deadline: Instant,
     read: impl FnOnce(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
 ) -> bool {
-    let response = match read(
+    startup_dialog_screen(pane_id, deadline, read).is_some_and(|text| (dialog.shows)(&text))
+}
+
+/// The pane's bottom buffer, for the startup-dialog scan.
+///
+/// `pane.read` rather than the agent record, because the dialog is screen
+/// chrome and the record carries no screen. Bounded by the caller's deadline
+/// like every other request here: an unbounded read against a stalled server
+/// would freeze `start` rather than report it (G1). A read that fails answers
+/// `None`, so a flaky socket degrades to the plain `blocked` refusal rather
+/// than inventing a diagnosis.
+fn startup_dialog_screen(
+    pane_id: &str,
+    deadline: Instant,
+    read: impl FnOnce(Method, Option<Instant>) -> Result<serde_json::Value, BoundedError>,
+) -> Option<String> {
+    let response = read(
         Method::PaneRead(PaneReadParams {
             pane_id: pane_id.to_owned(),
             source: ReadSource::Detection,
@@ -3102,14 +3345,12 @@ fn pane_shows_startup_dialog_with(
             strip_ansi: true,
         }),
         Some(deadline),
-    ) {
-        Ok(response) => response,
-        Err(_) => return false,
-    };
+    )
+    .ok()?;
     response
         .pointer("/result/read/text")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|text| (dialog.shows)(text))
+        .map(str::to_string)
 }
 
 fn sleep_bounded(deadline: Instant, interval: Duration) {
@@ -3669,6 +3910,18 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         && matches!(status, "idle" | "done")
         && detection_screen(&entry.pane_id, None)
             .is_some_and(|screen| crate::detect::settled_with_background_shells(&screen));
+    // A bare `blocked` gives the operator nothing to act on when the harness is
+    // sitting on a dialog it shows before any input (#828).
+    let startup_dialog = (!gone && status == "blocked")
+        .then(|| {
+            startup_dialog_shown(
+                harness_for(&entry),
+                &entry.pane_id,
+                Instant::now() + REQUEST_TIMEOUT,
+            )
+        })
+        .flatten()
+        .map(|dialog| dialog.code);
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
         // that appears with its first value is not a field a caller can test for.
@@ -3679,6 +3932,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
                 "agent_status": status,
                 "settled_with_background_shells": background_shells,
                 "blocked_reason": record.get("blocked_reason"),
+                "startup_dialog": startup_dialog,
                 "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
                 "workspace_id": entry.workspace_id,
@@ -3699,6 +3953,9 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         println!("delegate {name}: {status}");
         if background_shells {
             println!("  settled with background shells still running");
+        }
+        if let Some(dialog) = startup_dialog {
+            println!("  waiting on {dialog}");
         }
         if let Some(reason) = field(&record, "blocked_reason") {
             if let Some(eta) = record
@@ -4507,12 +4764,20 @@ fn emit_submit(entry: &Entry, json: bool) {
                 "workspace_id": entry.workspace_id,
                 "worktree": entry.worktree,
                 "branch": entry.branch,
+                "base": entry.base,
+                "base_sha": entry.base_sha,
                 "round": entry.round,
                 "turn_cursor": entry.cursor,
             })
         );
     } else {
         println!("delegate {}: submitted round {}", entry.name, entry.round);
+        if let Some(base) = &entry.base {
+            match &entry.base_sha {
+                Some(sha) => println!("  base {base} ({})", &sha[..sha.len().min(12)]),
+                None => println!("  base {base}"),
+            }
+        }
     }
 }
 
@@ -5140,9 +5405,10 @@ mod tests {
     fn hook_and_folder_trust_dialogs_are_declared_by_their_harnesses() {
         let claude = validate_harness(Some("claude")).expect("in the table");
         let dialog = claude
-            .startup_dialog
-            .as_ref()
+            .startup_dialogs
+            .first()
             .expect("claude asks for folder trust on a fresh worktree");
+        assert_eq!(dialog.code, "claude_folder_trust");
         assert!(dialog.refusal.contains("#605"), "{}", dialog.refusal);
         assert!(
             (dialog.shows)(TRUST_DIALOG_SCREEN),
@@ -5153,13 +5419,35 @@ mod tests {
             "and not a bare mention of it"
         );
         let codex = validate_harness(Some("codex")).expect("in the table");
-        let dialog = codex.startup_dialog.as_ref().expect("Codex hook review");
+        let shown = |screen: &str| {
+            codex
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+                .map(|dialog| dialog.code)
+        };
         let screen = "Hooks need review\n› 1. Review hooks\nenter confirm · esc skip";
-        assert!((dialog.shows)(screen));
-        assert!(!(dialog.shows)(&format!("{screen}\n› ")));
-        assert!(dialog.refusal.contains("#626"));
+        assert_eq!(shown(screen), Some("codex_hook_review"));
+        assert_eq!(shown(&format!("{screen}\n› ")), None);
+        let trust = include_str!("../../tests/fixtures/codex/folder-trust.txt");
+        assert_eq!(shown(trust), Some("codex_folder_trust"));
+        assert_eq!(
+            shown(&format!(
+                "{trust}\n› Ask Codex to do anything\n  ? for shortcuts"
+            )),
+            None
+        );
+        for dialog in codex.startup_dialogs {
+            assert!(dialog
+                .refusal
+                .contains(if dialog.code == "codex_hook_review" {
+                    "#626"
+                } else {
+                    "#828"
+                }));
+        }
         let opencode = validate_harness(Some("opencode")).expect("in the table");
-        assert!(opencode.startup_dialog.is_none());
+        assert!(opencode.startup_dialogs.is_empty());
     }
 
     /// A quoted character in the file would break the help table's flag scan,

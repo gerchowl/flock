@@ -1079,3 +1079,239 @@ while True:
             })
     );
 }
+
+/// #828: Codex's own folder-trust dialog on a first start in an untrusted
+/// repository. Readiness names it and nothing is typed into it.
+#[test]
+fn codex_delegate_folder_trust_is_refused_by_name() {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    let before = workspaces(&server).len();
+    startup_screen_harness(&server, include_str!("fixtures/codex/folder-trust.txt"));
+    let b = brief(&server, "task.md", "do it\n");
+    let mut child = start_codex(&server, "trust", &b, &["--ready-timeout", "10000"]);
+    let status = exited_within(&mut child, WITHIN).expect("folder-trust refusal");
+    let out = finish(child);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{} / {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let message = stderr(&out);
+    assert!(
+        message.contains("codex_folder_trust") && message.contains("#828"),
+        "{message}"
+    );
+    assert!(!message.contains("unknown_composer"), "{message}");
+    assert!(fs::read(server.base.join("startup-input"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(workspaces(&server).len(), before);
+    assert!(agent_get(&server, "trust").is_none());
+}
+
+/// A delegate that lands on the dialog later reports it by name in `status`.
+#[test]
+fn codex_delegate_status_names_the_folder_trust_dialog() {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "do it\n");
+    let mut child = start_codex(&server, "d1", &b, &[]);
+    let pane = make_ready(&server, "d1");
+    wait_typed(&server, 1);
+    assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/codex/folder-trust.txt"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WITHIN;
+    while agent_get(&server, "d1").unwrap()["agent_status"] != "blocked" {
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} never showed blocked"
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+    let out = cli(&server, &["delegate", "status", "d1", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status = stdout_json(&out);
+    assert_eq!(status["agent_status"], "blocked", "{status}");
+    assert_eq!(status["startup_dialog"], "codex_folder_trust", "{status}");
+    let text = cli(&server, &["delegate", "status", "d1"]);
+    assert!(
+        stdout(&text).contains("waiting on codex_folder_trust"),
+        "{}",
+        stdout(&text)
+    );
+}
+
+/// #828: a Codex that is still starting can swallow the paste. Its composer
+/// stays empty and no turn begins, so after the start-watch window the brief
+/// is submitted exactly once more.
+#[test]
+fn codex_delegate_start_resubmits_a_brief_lost_at_startup() {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    fs::create_dir_all(server.base.join("raw")).unwrap();
+    let script = server.base.join("raw/codex");
+    fs::write(
+        &script,
+        r#"import os, sys, tty
+from pathlib import Path
+base = Path(__file__).parent.parent
+tty.setraw(0)
+log = base / 'lost-bytes'
+log.write_bytes(b'')
+text = b''
+pastes = 0
+paste = False
+pending = b''
+def draw(working=False):
+    chrome = '• Working (1s • esc to interrupt)\r\n' if working else ''
+    sys.stdout.write('\x1b[2J\x1b[HOpenAI Codex\r\n' + chrome + '› ' + (text.decode() or 'Ask Codex to do anything') + '\r\n  ? for shortcuts\r\n')
+    sys.stdout.flush()
+sys.stdout.write('\x1b[?2004h')
+draw()
+while True:
+    byte = os.read(0, 1)
+    with log.open('ab') as out: out.write(byte)
+    if byte == b'\x1b' or pending:
+        pending += byte
+        if pending == b'\x1b[200~':
+            paste = True
+            pending = b''
+            pastes += 1
+        elif pending == b'\x1b[201~':
+            paste = False
+            pending = b''
+            draw()
+        elif not b'\x1b[200~'.startswith(pending) and not b'\x1b[201~'.startswith(pending):
+            pending = b''
+        continue
+    if pastes < 2:
+        continue
+    if byte == b'\r' and not paste:
+        text = b''
+        draw(True)
+    else:
+        text += byte
+"#,
+    )
+    .unwrap();
+    let path = bin_dir(&server.base).join("codex");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    let b = brief(&server, "task.md", "do it\n");
+    let mut child = start_codex(&server, "lost", &b, &["--ready-timeout", "10000"]);
+    let status = exited_within(&mut child, Duration::from_secs(60)).expect("start finished");
+    let out = finish(child);
+    assert!(status.success(), "{} / {}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("submitting it once more"),
+        "{}",
+        stderr(&out)
+    );
+    let bytes = fs::read(server.base.join("lost-bytes")).unwrap();
+    let paste = format!("\x1b[200~{}\x1b[201~", expected_line(&b));
+    let pasted = String::from_utf8_lossy(&bytes)
+        .matches(paste.as_str())
+        .count();
+    assert_eq!(pasted, 2, "{:?}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        agent_get(&server, "lost").unwrap()["agent_status"],
+        "working"
+    );
+}
+
+/// #828: `--base main` in a checkout whose local `main` never pulled branches
+/// from what the remote holds, and says which commit that was.
+#[test]
+fn codex_delegate_worktree_base_is_refreshed_from_the_remote() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let origin = server.base.join("origin.git");
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let other = server.base.join("other");
+    git(
+        &server.base,
+        &[
+            "clone",
+            "-q",
+            &origin.to_string_lossy(),
+            &other.to_string_lossy(),
+        ],
+    );
+    git(
+        &other,
+        &["commit", "-q", "--allow-empty", "-m", "merged elsewhere"],
+    );
+    git(&other, &["push", "-q", "origin", "main"]);
+    let landed = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &other.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let b = brief(&server, "task.md", "do it\n");
+    let repo_arg = repo.to_string_lossy().into_owned();
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "fresh",
+            "--harness",
+            "codex",
+            "--brief",
+            &b,
+            "--worktree",
+            "--branch",
+            "feat/fresh",
+            "--repo",
+            &repo_arg,
+            "--base",
+            "main",
+            "--settle",
+            SETTLE,
+            "--json",
+        ],
+    );
+    make_ready(&server, "fresh");
+    wait_typed(&server, 1);
+    let status = exited_within(&mut child, WITHIN).expect("start finished");
+    let out = finish(child);
+    assert!(status.success(), "{} / {}", stdout(&out), stderr(&out));
+    let started = stdout_json(&out);
+    assert_eq!(started["base"], "origin/main", "{started}");
+    assert_eq!(started["base_sha"], landed.as_str(), "{started}");
+    assert!(
+        stderr(&out).contains("is behind origin/main"),
+        "{}",
+        stderr(&out)
+    );
+    let worktree = started["worktree"].as_str().expect("worktree path");
+    let head = Command::new("git")
+        .args(["-C", worktree, "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), landed);
+}

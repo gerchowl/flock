@@ -26,6 +26,11 @@ filter = 'binary(delegate_verdict) & test(delegate_idle_without_new_turn_reports
 slow-timeout = { period = "30s" }
 
 [[profile.default.overrides]]
+# The lost-brief resubmit (#828) waits out the same 30-second startup window.
+filter = 'binary(delegate_codex) & test(codex_delegate_start_resubmits_a_brief_lost_at_startup)'
+slow-timeout = { period = "60s" }
+
+[[profile.default.overrides]]
 # Acceptance must expose flakes even without a command-line retry override.
 filter = 'binary(mesh_step1) | binary(mesh_step2) | binary(mesh_forwarding)'
 test-group = 'serial-pty'
