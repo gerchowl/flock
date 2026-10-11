@@ -92,6 +92,14 @@ Plain `flk update` and plain `flk --remote workbox` use the normal restart/stop 
 
 `flk update --handoff` only applies to installs managed by Flock's own updater. Homebrew, mise, and Nix installs are updated through their package managers, so `flk update` is disabled there and cannot perform live handoff.
 
+### Pane count
+
+Live handoff carries any number of panes. The pane terminals cross to the new server in batches of 64, and the old server keeps every pane until the new one confirms it has restored all of them. A handoff that fails part-way leaves every pane with the old server.
+
+The old server is the one sending, so its own limits apply. A server older than this change refuses a session with more than 64 panes. To move off one, close panes down to 64 once, or stop and restart Flock normally. Every handoff after that goes through the new code.
+
+During a handoff the old server briefly holds two descriptors per pane. On macOS the server raises its open-file limit to 8192. On Linux a typical soft limit of 1024 allows about 450 panes. Above that the handoff fails cleanly and the old server keeps every pane. Raise `ulimit -n` for the server to go further.
+
 ## What Survives
 
 | Case | Processes keep running | Layout returns | Recent screen returns | Agent conversation resumes |
