@@ -341,6 +341,15 @@ The compiled side uses exactly the §3 placement:
   seen. That is a resume after more than an hour with no call, or after
   layer 1 changed.
 
+**Replay inputs.** Three inputs are not in the repo, so the replays cannot be
+rerun from this branch alone: the compaction summary (the architect's last
+real one, 2026-10-11, taken from its transcript), the `.fleet/` copy (a
+read-only snapshot of the architect's state directory, taken 2026-10-11) and
+the transcripts behind the Context table (eight architect compactions and 16
+builder spawns in the operator's Claude Code profile). Slice X9 makes the
+replays reproducible: it checks in a sanitized fixture of each input and
+reruns `replay.sh` against them.
+
 Units as in Context (read × 0.1, creation × 2, uncached input). Haiku: median
 (min–max) of 3. Opus: n = 1.
 
@@ -348,12 +357,20 @@ Units as in Context (read × 0.1, creation × 2, uncached input). Haiku: median
 | --- | --- | --- | --- |
 | Builder #1021, first of a round (cold layers 1–2), Haiku | 6 turns (6–8), 13.8 s, 64.4k units (42.0k–66.3k) | 1 turn, 4.5 s, 51.1k units (51.1k–51.1k) | −21 % |
 | Builder #1018, second of a round (warm layers 1–2), Haiku | 5 turns (5–6), 11.8 s, 61.0k units (55.8k–61.0k) | 1 turn, 5.1 s, 45.1k units (45.1k–83.4k) | −26 % |
-| Architect resume → next action, Haiku | 11 turns (9–14), 20.0 s, 84.1k units (54.7k–99.9k) | warm: 1 turn, 8.0 s, 42.3k units; cold: 1 turn, 8.1 s, 58.1k units | warm −50 %, cold −31 % |
+| Architect resume → next action, Haiku | 11 turns (9–14), 20.0 s, 84.1k units (54.7k–99.9k) | warm: 1 turn (1–1), 8.0 s (7.3–8.6), 42.3k units (42.3k–42.3k); cold: 1 turn (1–1), 8.1 s (6.6–10.3), 58.1k units (58.1k–58.1k) | warm −50 %, cold −31 % |
 | Builder #1021 / #1018, Opus | 9 / 10 turns, 62.9k / 57.6k units, $0.264 / $0.243 | 1 turn, 49.5k / 45.0k units, $0.213 / $0.194 | −21 % / −22 % units, −20 % $ |
 | Architect resume, Opus | 13 turns, 67.8k units, $0.269 | warm: 42.2k units, $0.187; cold: 56.5k units, $0.245 | warm −38 %, cold −17 % units |
 
 What the numbers do and do not show:
 
+- **The robust result is turns.** Every compiled run, in every cell, took one
+  turn; today's took 5–14 on Haiku and 9–13 on Opus. That holds at n = 3 and
+  on Opus. The builder unit figures are not robust: −21 % and −26 % are
+  within the noise, since the compiled #1021 median (51.1k) lies inside
+  today's #1021 range (42.0k–66.3k), and one compiled #1018 run (83.4k) lay
+  above every run of today's. The architect cells are steadier (the compiled
+  runs varied by under 0.1k units, and both medians are below today's
+  minimum of 54.7k), but they rest on one summary and one `.fleet/` copy.
 - **Most of the saving is turns, not cross-worktree sharing.** With
   `AGENTS.md` out of layer 2 (§3), layers 1–2 are about 3.9k tokens: the warm
   builder read 20.1k from cache against 16.2k for the cold one. Each compiled
@@ -465,6 +482,6 @@ files them after the owner accepts.
 | X6 | SessionStart re-inject renders `--layers 2-5` / `3-5` as `additionalContext`, replacing the separate goal, checklist, status and delegate parts | X3, X4, #962, ADR-0030 G6 | An unarmed auto-compaction of a sandbox architect yields the compiled layers and types nothing |
 | X7 | Reviewer role: `--role reviewer --pr <n>`, the fresh-spawn option for #1043 | X2, #1043 | A reviewer spawned for a PR starts from cached layers 1–2 and the PR task |
 | X8 | Codex and opencode placement verified and wired, or a documented fallback to message placement | X1 | Probe per harness reports the shared prefix on a second spawn |
-| X9 | Promote the measurement scripts to `tests/probes/context_cache.py` (before/after runbook, harness-version check) | X2 | Runs against two flk builds and prints the table in this ADR |
+| X9 | Promote the measurement scripts to `tests/probes/context_cache.py` (before/after runbook, harness-version check) and check in sanitized fixtures of the replay inputs (compaction summary, `.fleet/` copy, transcript usage extracts) | X2 | Runs against two flk builds from the checked-in fixtures alone and prints the table in this ADR |
 | X10 | Retire the fleet's own STATUS.md appends, HANDOFF rewrite and CONTINUE.md; update the architect skill §7 to the compiled resume | X6, X11 | A full resume of the fleet's architect needs no `.fleet` file reads |
 | X11 | Wakes and continuations point at the compile: the #1044 heartbeat names `flk context compile --layers 4-5`; the `flock_self_compact` continuation shrinks to "act on the next action"; #1062's slash-command continuation documented as the path for sessions started without `--context` | X5, X6, #1044, #1062 | A heartbeat wake and a self-compaction of a sandbox architect each carry the compile hint, and the architect's next turn reads no `.fleet` file |
