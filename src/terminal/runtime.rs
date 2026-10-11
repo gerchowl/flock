@@ -391,6 +391,14 @@ impl TerminalRuntime {
         self.0.end_all_injection_leases();
     }
 
+    pub(crate) fn drain_held_input(&self) -> bool {
+        self.0.drain_held_input()
+    }
+
+    pub(crate) fn has_held_backlog(&self) -> bool {
+        self.0.has_held_backlog()
+    }
+
     pub(crate) fn injection_lease_until(&self) -> Option<std::time::Instant> {
         self.0.injection_lease_until()
     }

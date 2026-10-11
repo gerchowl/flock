@@ -9,6 +9,12 @@
 //! The lease is bounded by `until` whatever happens to the injection: the
 //! runtime checks it on every write and the app loop expires it on its own
 //! deadline, so an injection whose owner vanished cannot leave a pane frozen.
+//! Esc or Ctrl-C from the operator ends it at once: those keys are how a
+//! human stops what is happening in a pane, and they must not wait.
+//!
+//! Held bytes that meet a full PTY channel when the lease ends are not
+//! dropped. They wait in a backlog, and every later operator write queues
+//! behind them until the loop drains it, so the order still holds.
 
 use std::cell::RefCell;
 use std::time::Instant;
@@ -19,9 +25,41 @@ use bytes::{Bytes, BytesMut};
 /// huge paste reaches the pane instead of memory.
 const MAX_HELD_BYTES: usize = 256 * 1024;
 
+/// A backlog past this size is reported, though still kept.
+const BACKLOG_WARN_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub(crate) struct InjectionLease {
     held: RefCell<Option<Held>>,
+    backlog: RefCell<BytesMut>,
+}
+
+/// Esc or Ctrl-C as a terminal sends it: legacy bytes, or the kitty
+/// keyboard protocol's CSI u form with no other modifier.
+pub(crate) fn is_interrupt(bytes: &[u8]) -> bool {
+    if bytes == b"\x1b" || bytes == b"\x03" {
+        return true;
+    }
+    let Some(body) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|body| body.strip_suffix(b"u"))
+        .and_then(|body| std::str::from_utf8(body).ok())
+    else {
+        return false;
+    };
+    let mut fields = body.split(';');
+    let code = fields.next().unwrap_or_default();
+    let modifiers = fields
+        .next()
+        .and_then(|field| field.split(':').next())
+        .unwrap_or("1");
+    let event = body
+        .split(';')
+        .nth(1)
+        .and_then(|field| field.split(':').nth(1))
+        .unwrap_or("1");
+    // A key release (event type 3) is not a request to stop.
+    event != "3" && ((code == "27" && modifiers == "1") || (code == "99" && modifiers == "5"))
 }
 
 #[derive(Debug)]
@@ -60,7 +98,9 @@ impl InjectionLease {
         let mut held = self.held.borrow_mut();
         match held.as_mut() {
             Some(lease)
-                if lease.until > now && lease.buffered.len() + bytes.len() <= MAX_HELD_BYTES =>
+                if lease.until > now
+                    && lease.buffered.len() + bytes.len() <= MAX_HELD_BYTES
+                    && !is_interrupt(&bytes) =>
             {
                 lease.buffered.extend_from_slice(&bytes);
                 None
@@ -100,6 +140,37 @@ impl InjectionLease {
             .borrow_mut()
             .take()
             .map(|lease| lease.buffered.freeze())
+    }
+
+    /// Put `bytes` behind anything already waiting in the backlog, and return
+    /// everything to write now, in order.
+    pub(crate) fn behind_backlog(&self, bytes: Bytes) -> Bytes {
+        let mut backlog = self.backlog.borrow_mut();
+        if backlog.is_empty() {
+            return bytes;
+        }
+        backlog.extend_from_slice(&bytes);
+        std::mem::take(&mut *backlog).freeze()
+    }
+
+    /// Keep bytes a full channel refused. They are older than anything already
+    /// in the backlog, so they go in front of it.
+    /// True when the backlog has grown past the size worth reporting.
+    pub(crate) fn defer(&self, bytes: Bytes) -> bool {
+        let mut backlog = self.backlog.borrow_mut();
+        let mut kept = BytesMut::from(&bytes[..]);
+        kept.extend_from_slice(&backlog);
+        *backlog = kept;
+        backlog.len() > BACKLOG_WARN_BYTES
+    }
+
+    pub(crate) fn take_backlog(&self) -> Option<Bytes> {
+        let mut backlog = self.backlog.borrow_mut();
+        (!backlog.is_empty()).then(|| std::mem::take(&mut *backlog).freeze())
+    }
+
+    pub(crate) fn has_backlog(&self) -> bool {
+        !self.backlog.borrow().is_empty()
     }
 
     pub(crate) fn until(&self) -> Option<Instant> {
@@ -187,6 +258,54 @@ mod tests {
             Ok(Some(bytes("a")))
         );
         assert!(lease.holds("u", later));
+    }
+
+    #[test]
+    fn esc_or_ctrl_c_ends_the_lease_at_once() {
+        for key in [
+            &b"\x1b"[..],
+            b"\x03",
+            b"\x1b[27u",
+            b"\x1b[27;1:1u",
+            b"\x1b[99;5u",
+        ] {
+            let now = Instant::now();
+            let lease = InjectionLease::default();
+            lease
+                .acquire("t", now + Duration::from_secs(5), now)
+                .unwrap();
+            assert_eq!(lease.intercept(bytes("a"), now), None);
+            let out = lease.intercept(Bytes::copy_from_slice(key), now);
+            assert_eq!(
+                out.as_deref(),
+                Some([b"a", key].concat().as_slice()),
+                "{key:?}"
+            );
+            assert_eq!(lease.until(), None, "{key:?}");
+        }
+        for not_an_interrupt in [
+            &b"\x1b[A"[..],
+            b"\x1b[27;1:3u",
+            b"\x1b[99u",
+            b"\x1b[I",
+            b"\x1b[<0;3;4M",
+        ] {
+            assert!(!is_interrupt(not_an_interrupt), "{not_an_interrupt:?}");
+        }
+    }
+
+    #[test]
+    fn a_backlog_keeps_its_place_ahead_of_later_writes() {
+        let lease = InjectionLease::default();
+        assert_eq!(lease.behind_backlog(bytes("x")), bytes("x"));
+        assert!(!lease.defer(bytes("ab")));
+        assert!(lease.has_backlog());
+        assert_eq!(lease.behind_backlog(bytes("c")), bytes("abc"));
+        assert!(!lease.has_backlog());
+        lease.defer(bytes("c"));
+        lease.defer(bytes("ab"));
+        assert_eq!(lease.take_backlog(), Some(bytes("abc")));
+        assert_eq!(lease.take_backlog(), None);
     }
 
     #[test]

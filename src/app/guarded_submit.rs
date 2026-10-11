@@ -480,6 +480,13 @@ impl App {
             evidence.typed_at_ms = Some(super::api::messages::now_ms());
             self.record_delivery_attempt(&evidence);
         }
+        if let Some(draft) = &draft {
+            // From here until the attempt is released, the draft lives only in
+            // memory, so the server can find it whoever holds the attempt.
+            self.kept_drafts
+                .borrow_mut()
+                .track_in_flight(&evidence.attempt_id, pane, draft);
+        }
         let (due, deadline) = match draft {
             Some(_) => (now + POLL, now + DRAFT_STEP),
             None => (
@@ -790,6 +797,12 @@ impl App {
             ))
         });
         if let Some(stash) = attempt.stash.take() {
+            // Settled already (a handoff or shutdown kept every draft in
+            // flight): the stash has it, so keeping it again would duplicate.
+            let owned = self
+                .kept_drafts
+                .borrow_mut()
+                .claim_in_flight(&attempt.evidence.attempt_id);
             let untouched = || {
                 target.is_some_and(|(terminal, runtime)| {
                     terminal
@@ -798,6 +811,7 @@ impl App {
                 })
             };
             let verdict = match stash.phase {
+                _ if !owned => "kept",
                 StashPhase::Restored => "restored",
                 StashPhase::Clearing if untouched() => "untouched",
                 _ => {
@@ -830,26 +844,43 @@ impl App {
     /// End every lease past its bound and replay what it held (#850). The
     /// bound holds even when the injection's owner never comes back.
     pub(crate) fn tick_injection_leases(&mut self, now: Instant) -> bool {
-        let ended = self
-            .pane_runtimes()
-            .into_iter()
-            .filter(|runtime| runtime.expire_injection_lease(now))
-            .count();
+        let mut ended = 0;
+        for runtime in self.pane_runtimes() {
+            ended += usize::from(runtime.expire_injection_lease(now));
+            runtime.drain_held_input();
+        }
         self.surface_kept_drafts();
         ended > 0
     }
 
+    /// The next lease bound, or a prompt retry while held input waits on a
+    /// full channel.
     pub(crate) fn next_injection_lease_deadline(&self) -> Option<Instant> {
-        self.pane_runtimes()
-            .into_iter()
+        let runtimes = self.pane_runtimes();
+        let retry = runtimes
+            .iter()
+            .any(|runtime| runtime.has_held_backlog())
+            .then(|| Instant::now() + POLL);
+        runtimes
+            .iter()
             .filter_map(|runtime| runtime.injection_lease_until())
+            .chain(retry)
             .min()
     }
 
-    /// Replay every held keystroke now, for a server stopping or handing off.
-    pub(crate) fn end_all_injection_leases(&self) {
+    /// Before the server stops or hands off: every draft an injection holds
+    /// goes to the stash (and is announced), then every held keystroke is
+    /// written. The attempts themselves die with this server, so nothing
+    /// else would ever put those drafts back.
+    pub(crate) fn settle_injections_for_exit(&mut self) {
+        let kept = self.kept_drafts.borrow_mut().keep_all_in_flight();
+        for pane in &kept {
+            crate::logging::pane_draft_kept(pane);
+        }
+        self.surface_kept_drafts();
         for runtime in self.pane_runtimes() {
             runtime.end_all_injection_leases();
+            runtime.drain_held_input();
         }
     }
 

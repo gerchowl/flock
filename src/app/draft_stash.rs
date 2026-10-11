@@ -16,20 +16,63 @@ pub(crate) struct KeptDrafts {
     drafts: BTreeMap<String, Vec<String>>,
     /// Panes whose new draft the operator has not been told about yet.
     unannounced: Vec<String>,
+    /// Drafts an injection has moved aside and not yet settled, by attempt
+    /// id: (pane, draft).
+    in_flight: BTreeMap<String, (String, String)>,
 }
 
 impl KeptDrafts {
     pub(crate) fn drafts(&self, pane: &str) -> &[String] {
         self.drafts.get(pane).map_or(&[], Vec::as_slice)
     }
+
+    pub(crate) fn track_in_flight(&mut self, attempt: &str, pane: &str, draft: &str) {
+        self.in_flight
+            .insert(attempt.to_owned(), (pane.to_owned(), draft.to_owned()));
+    }
+
+    /// The attempt takes its draft back to settle it. False when an exit
+    /// already kept it.
+    pub(crate) fn claim_in_flight(&mut self, attempt: &str) -> bool {
+        self.in_flight.remove(attempt).is_some()
+    }
+
+    /// Keep every draft still in flight, returning the panes they belong to.
+    pub(crate) fn keep_all_in_flight(&mut self) -> Vec<String> {
+        let in_flight = std::mem::take(&mut self.in_flight);
+        in_flight
+            .into_values()
+            .map(|(pane, draft)| {
+                self.keep(&pane, draft);
+                pane
+            })
+            .collect()
+    }
+
+    fn keep(&mut self, pane: &str, draft: String) {
+        self.drafts.entry(pane.to_owned()).or_default().push(draft);
+        self.unannounced.push(pane.to_owned());
+    }
+
+    /// What a live handoff carries to the next server.
+    pub(crate) fn export(&self) -> BTreeMap<String, Vec<String>> {
+        self.drafts.clone()
+    }
+
+    /// Take a previous server's kept drafts, ahead of any this one keeps.
+    pub(crate) fn import(&mut self, drafts: BTreeMap<String, Vec<String>>) {
+        for (pane, mut carried) in drafts {
+            let entry = self.drafts.entry(pane).or_default();
+            carried.append(entry);
+            *entry = carried;
+        }
+    }
 }
 
 impl App {
     pub(crate) fn keep_draft(&self, pane: &str, draft: String) {
         crate::logging::pane_draft_kept(pane);
-        let mut kept = self.kept_drafts.borrow_mut();
-        kept.drafts.entry(pane.to_owned()).or_default().push(draft);
-        kept.unannounced.push(pane.to_owned());
+        self.kept_drafts.borrow_mut().keep(pane, draft);
     }
 
     /// Tell the operator about each newly kept draft. The notification names

@@ -2890,10 +2890,10 @@ fn guarded_submit_cli_reports_exit_8_and_9_with_evidence() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = test_lock();
-    // (exit, operator presses Esc mid-injection, injection lock on). With the
-    // lock (#850) the Esc is held and replays after the injection, so only
-    // the lock switched off still abandons on it.
-    for (expected_code, esc, lock) in [(8, false, true), (9, true, false), (8, true, true)] {
+    // (exit, operator presses Esc mid-injection, injection lock on). The
+    // lock (#850) holds ordinary keys, but Esc is how a human stops a pane,
+    // so it goes straight through and abandons the injection either way.
+    for (expected_code, esc, lock) in [(8, false, true), (9, true, false), (9, true, true)] {
         let base = unique_test_dir();
         fs::create_dir_all(&base).unwrap();
         let config_home = base.join("config");
@@ -3044,7 +3044,7 @@ with log.open('w') as out:
         );
         assert!(result["result"]["attempt"]["attempt_id"].is_string());
         if esc && lock {
-            // The held Esc reached the composer only after flock's last Enter.
+            // The Esc reached the composer at once, and no Enter followed it.
             let writes: Vec<Vec<u8>> = fs::read_to_string(&log)
                 .unwrap()
                 .lines()
@@ -3057,12 +3057,9 @@ with log.open('w') as out:
                         .collect()
                 })
                 .collect();
-            let last_enter = writes.iter().rposition(|w| w.contains(&b'\r'));
             let esc_at = writes.iter().position(|w| w.as_slice() == b"\x1b");
-            assert!(
-                matches!((last_enter, esc_at), (Some(enter), Some(esc)) if esc > enter),
-                "{writes:?}"
-            );
+            assert!(esc_at.is_some(), "{writes:?}");
+            assert!(!writes.iter().any(|w| w.contains(&b'\r')), "{writes:?}");
         }
         cleanup_spawned_flock(child, base);
     }

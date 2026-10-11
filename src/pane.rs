@@ -2167,6 +2167,10 @@ impl PaneRuntime {
             return Ok(());
         };
         self.operator_input.stamp();
+        if self.injection_lease.has_backlog() {
+            self.write_in_order(bytes);
+            return Ok(());
+        }
         self.io.send_bytes(bytes).await
     }
 
@@ -2181,6 +2185,10 @@ impl PaneRuntime {
             return Ok(());
         };
         self.operator_input.stamp();
+        if self.injection_lease.has_backlog() {
+            self.write_in_order(bytes);
+            return Ok(());
+        }
         self.io.try_send_bytes(bytes)
     }
 
@@ -2235,9 +2243,38 @@ impl PaneRuntime {
             return;
         };
         self.operator_input.stamp();
-        if let Err(err) = self.io.try_send_bytes(bytes) {
-            crate::logging::pane_held_input_write_failed(&err.to_string());
+        self.write_in_order(bytes);
+    }
+
+    /// Write behind any backlog. A full channel keeps the bytes for the loop
+    /// to drain rather than dropping them; only a closed pane loses them, and
+    /// that is logged.
+    fn write_in_order(&self, bytes: Bytes) {
+        let bytes = self.injection_lease.behind_backlog(bytes);
+        match self.io.try_send_bytes(bytes) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(bytes)) => {
+                let len = bytes.len();
+                if self.injection_lease.defer(bytes) {
+                    crate::logging::pane_held_input_write_failed(&format!(
+                        "pane input channel full; {len} held bytes still waiting"
+                    ));
+                }
+            }
+            Err(err) => crate::logging::pane_held_input_write_failed(&err.to_string()),
         }
+    }
+
+    pub(crate) fn has_held_backlog(&self) -> bool {
+        self.injection_lease.has_backlog()
+    }
+
+    /// Retry held input a full channel refused. True while some still waits.
+    pub(crate) fn drain_held_input(&self) -> bool {
+        if let Some(bytes) = self.injection_lease.take_backlog() {
+            self.write_in_order(bytes);
+        }
+        self.injection_lease.has_backlog()
     }
 
     /// Write bytes flock authored on its own initiative, WITHOUT counting them

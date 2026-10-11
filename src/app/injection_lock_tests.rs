@@ -54,6 +54,16 @@ mod harness {
 
 /// A pane wide enough for the widest fixture, showing `harness` idle.
 fn lock_rig(harness: &Harness) -> Rig {
+    lock_rig_with(
+        harness,
+        crate::terminal::TerminalRuntime::test_with_channel(160, 40),
+    )
+}
+
+fn lock_rig_with(
+    harness: &Harness,
+    (runtime, pty): (crate::terminal::TerminalRuntime, mpsc::Receiver<Bytes>),
+) -> Rig {
     let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
         &crate::config::Config::default(),
@@ -65,7 +75,6 @@ fn lock_rig(harness: &Harness) -> Rig {
     let sender = crate::workspace::Workspace::test_new("alpha");
     let mut recipient = crate::workspace::Workspace::test_new("beta");
     let focused = recipient.focused_pane_id().expect("pane");
-    let (runtime, pty) = crate::terminal::TerminalRuntime::test_with_channel(160, 40);
     recipient.tabs[0].runtimes.insert(focused, runtime);
     app.state.workspaces = vec![sender, recipient];
     app.state.ensure_test_terminals();
@@ -284,16 +293,161 @@ async fn an_injection_that_fails_releases_the_pane() {
 
 #[tokio::test]
 async fn a_stopping_or_handing_off_server_writes_what_a_lease_holds() {
-    let Rig { app, pane, mut pty } = lock_rig(&CLAUDE);
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CLAUDE);
     let _attempt = inject(&app, &pane, Instant::now());
     drain(&mut pty);
     runtime(&app)
         .try_send_bytes(Bytes::from_static(b"z"))
         .unwrap();
     assert!(drain(&mut pty).is_empty());
-    app.end_all_injection_leases();
+    app.settle_injections_for_exit();
     assert_eq!(drain(&mut pty), vec![b"z".to_vec()]);
     assert!(!held(&app));
+}
+
+/// A handoff while a draft is mid-clear: the attempt dies with the old server,
+/// so the draft must ride the manifest into the new server's stash.
+#[tokio::test]
+async fn a_handoff_mid_clear_carries_the_draft_to_the_new_server() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CLAUDE);
+    paint(&app, &CLAUDE, DRAFT);
+    let now = Instant::now();
+    let mut attempt = inject(&app, &pane, now);
+    drain(&mut pty);
+    paint(&app, &CLAUDE, "");
+    runtime(&app)
+        .try_send_bytes(Bytes::from_static(b"z"))
+        .unwrap();
+
+    app.settle_injections_for_exit();
+    assert_eq!(drain(&mut pty), vec![b"z".to_vec()]);
+    assert_eq!(app.kept_drafts.borrow().drafts(&pane), [DRAFT.to_string()]);
+    let notice = app
+        .state
+        .notifications
+        .newest_first()
+        .next()
+        .expect("filed");
+    assert_eq!(notice.pane_id.as_deref(), Some(pane.as_str()));
+
+    // The manifest's copy lands in the importing server's stash. A real
+    // import restores the same public ids from the snapshot; this fixture's
+    // second app numbers its workspaces afresh, so the key is carried over.
+    let carried = app.kept_drafts.borrow().export();
+    assert_eq!(carried.keys().collect::<Vec<_>>(), [&pane]);
+    let Rig {
+        app: mut next,
+        pane: next_pane,
+        ..
+    } = lock_rig(&CLAUDE);
+    next.kept_drafts.borrow_mut().import(
+        carried
+            .into_values()
+            .map(|drafts| (next_pane.clone(), drafts))
+            .collect(),
+    );
+    let shown: serde_json::Value = serde_json::from_str(&next.handle_api_request(Request {
+        id: "stash".into(),
+        method: Method::PaneStashShow(crate::api::schema::PaneTarget {
+            pane_id: next_pane.clone(),
+        }),
+    }))
+    .unwrap();
+    assert_eq!(shown["result"]["drafts"], serde_json::json!([DRAFT]));
+
+    // A rolled-back handoff lets the old attempt finish: it does not keep the
+    // same draft twice.
+    let outcome = app.advance_guarded_submit(&pane, &mut attempt, now + STEP);
+    assert!(outcome.is_some());
+    assert_eq!(app.kept_drafts.borrow().drafts(&pane).len(), 1);
+}
+
+#[tokio::test]
+async fn esc_or_ctrl_c_interrupts_the_injection_at_once() {
+    for key in [&b"\x1b"[..], b"\x03"] {
+        // No draft: the key goes through with what was held, and the
+        // injection stops short of its Enter.
+        let Rig { app, pane, mut pty } = lock_rig(&CLAUDE);
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app)
+            .try_send_bytes(Bytes::from_static(b"a"))
+            .unwrap();
+        runtime(&app)
+            .try_send_bytes(Bytes::copy_from_slice(key))
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![[b"a", key].concat()], "{key:?}");
+        assert!(!held(&app));
+        paint(&app, &CLAUDE, "hello");
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(Outcome::Abandoned("operator_active"))
+        );
+        assert!(drain(&mut pty).is_empty(), "{key:?}: no Enter");
+
+        // A draft moved aside and not yet back is kept, not lost.
+        let Rig { app, pane, mut pty } = lock_rig(&CLAUDE);
+        paint(&app, &CLAUDE, DRAFT);
+        let now = Instant::now();
+        let mut attempt = inject(&app, &pane, now);
+        paint(&app, &CLAUDE, "");
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + POLL),
+            None
+        );
+        drain(&mut pty);
+        runtime(&app)
+            .try_send_bytes(Bytes::copy_from_slice(key))
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![key.to_vec()]);
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + POLL + GAP),
+            Some(Outcome::Abandoned("operator_active"))
+        );
+        assert_eq!(app.kept_drafts.borrow().drafts(&pane), [DRAFT.to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn held_keys_wait_out_a_full_channel_in_order() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig_with(
+        &CLAUDE,
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(160, 40, 1),
+    );
+    let now = Instant::now();
+    let _attempt = inject(&app, &pane, now);
+    // The sentence fills the one slot; the PTY reader has not come round.
+    runtime(&app)
+        .try_send_bytes(Bytes::from_static(b"a"))
+        .unwrap();
+    assert!(app.tick_injection_leases(now + INJECTION_LEASE));
+    assert!(runtime(&app).has_held_backlog(), "kept, not dropped");
+    assert!(
+        app.next_injection_lease_deadline().is_some(),
+        "the loop retries"
+    );
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    // A later key queues behind the backlog rather than overtaking it.
+    runtime(&app)
+        .try_send_bytes(Bytes::from_static(b"b"))
+        .unwrap();
+    assert_eq!(drain(&mut pty), vec![b"ab".to_vec()]);
+    assert!(!runtime(&app).has_held_backlog());
 }
 
 fn clear_keys_for(app: &App, draft: &str) -> Vec<u8> {
@@ -521,16 +675,57 @@ async fn drafts_flock_cannot_put_back_exactly_still_refuse() {
 }
 
 #[tokio::test]
-async fn an_inbox_wake_moves_a_draft_aside_too() {
-    let Rig {
-        mut app,
-        pane,
-        mut pty,
-    } = lock_rig(&CLAUDE);
-    paint(&app, &CLAUDE, DRAFT);
-    send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
-    assert_eq!(drain(&mut pty), vec![clear_keys_for(&app, DRAFT)]);
-    assert!(held(&app));
+async fn an_inbox_wake_moves_a_draft_aside_and_back() {
+    for read_first in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        paint(&app, &CLAUDE, DRAFT);
+        let now = Instant::now();
+        send(&mut app, &pane, "c-1", MsgIntent::NeedsReply);
+        assert_eq!(drain(&mut pty), vec![clear_keys_for(&app, DRAFT)]);
+        assert!(held(&app));
+        let sentence = super::super::idle_wake_text(1);
+
+        paint(&app, &CLAUDE, "");
+        let at = now + GAP + POLL;
+        app.tick_idle_wakes(at);
+        assert_eq!(drain(&mut pty), vec![sentence.clone().into_bytes()]);
+        paint(&app, &CLAUDE, &sentence);
+        let at = at + GAP + POLL;
+        app.tick_idle_wakes(at);
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        took_turn(&mut app, Agent::Claude, at);
+        paint(&app, &CLAUDE, "");
+        let at = at + POLL;
+        app.tick_idle_wakes(at);
+        assert_eq!(drain(&mut pty), vec![DRAFT.as_bytes().to_vec()]);
+
+        if read_first {
+            // The agent reads its inbox before the draft reads back: the wake
+            // ends there, so the draft goes to the stash and is announced.
+            read_inbox(&mut app, &pane);
+            assert_eq!(app.kept_drafts.borrow().drafts(&pane), [DRAFT.to_string()]);
+            let notice = app
+                .state
+                .notifications
+                .newest_first()
+                .next()
+                .expect("filed");
+            assert_eq!(notice.pane_id.as_deref(), Some(pane.as_str()));
+        } else {
+            paint(&app, &CLAUDE, DRAFT);
+            app.tick_idle_wakes(at + POLL);
+            assert!(app.kept_drafts.borrow().drafts(&pane).is_empty());
+            assert!(app
+                .delivery_attempts()
+                .iter()
+                .any(|attempt| attempt.draft.as_deref() == Some("restored")));
+        }
+        assert!(!held(&app), "read_first={read_first}");
+    }
 }
 
 #[tokio::test]
@@ -551,4 +746,29 @@ async fn an_inbox_read_mid_flight_releases_the_pane() {
     read_inbox(&mut app, &pane);
     assert!(!held(&app));
     assert_eq!(drain(&mut pty), vec![b"z".to_vec()]);
+}
+
+#[tokio::test]
+async fn a_paste_held_by_an_injection_claims_no_evidence() {
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CLAUDE);
+    let _attempt = inject(&app, &pane, Instant::now());
+    drain(&mut pty);
+    let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+        id: "paste".into(),
+        method: Method::AgentSend(crate::api::schema::AgentSendParams {
+            target: pane.clone(),
+            text: "note".into(),
+            submit: false,
+        }),
+    }))
+    .unwrap();
+    assert_eq!(response["result"]["outcome"], "unconfirmed", "{response}");
+    assert_eq!(response["result"]["reason"], "held_by_injection");
+    assert!(response["result"]["evidence"]["level"].is_null());
+    assert!(app.pending_paste.is_none(), "nothing left to observe");
+    assert!(drain(&mut pty).is_empty(), "held behind the injection");
 }
