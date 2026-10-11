@@ -120,7 +120,7 @@ failing relay are refused with a concrete reason. Version refusals include
 ```bash
 flk server
 flk server stop
-flk server live-handoff
+flk server live-handoff [--skip-undrained]
 flk server reload-config
 ```
 
@@ -137,6 +137,10 @@ flk server live-handoff --import-exe "$(readlink -f "$(command -v flk)")"
 ```
 
 When `flk` finds an older server, its `Flock was updated` message names both commands, before the stop-and-restart fallback that exits pane processes.
+
+Before a pane moves, its queued input is written out before its terminal moves. All panes drain at the same time. If a pane's input does not drain within two seconds, or its terminal keeps accepting zero bytes, the handoff is refused. The old server keeps running with that input still queued, and the error names each stuck pane with its pending byte count, pid and title, for example `timed out draining PTY writes before handoff: w2:p6 (17 bytes pending, pid 4242, "zsh")`. Close those panes and retry, or pass `--skip-undrained` to hand off anyway: the stuck panes' pending input is dropped, and each is printed as `skipped undrained pane <id>: dropped <n> bytes`. If the handoff then fails at a later step, its error still lists the input that was dropped.
+
+The old server writes the drain error, so a server from before this release still prints the bare `timed out draining PTY writes before handoff` and ignores `--skip-undrained`. The CLI then prints how to get off it. First, find the stuck internal pane numbers: grep the server log for `write returned zero bytes` and note each `"pane":N`. Map each `N` to its public id with `jq -r --arg n N '.workspaces[] | select(.public_pane_numbers[$n]) | "\(.id):p\(.public_pane_numbers[$n])"' session.json` in the data directory (numbers 1 to 9 read as they are, 10 is `pA`). Then close those panes and retry the handoff.
 
 ## Config
 

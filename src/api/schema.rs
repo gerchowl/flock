@@ -1500,6 +1500,11 @@ pub struct DeliveryAttempt {
     /// `kept` (left in the pane's stash for `flk pane stash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// Operator keystrokes held for this injection (#850) could not be
+    /// replayed because the pane refused them (a closed pane or a writer
+    /// accepting zero bytes, #1011). They are lost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_input_not_written: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1753,6 +1758,28 @@ pub struct ServerLiveHandoffParams {
     pub expected_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Hand off even when a pane's queued input will not drain, dropping and
+    /// reporting what was pending per pane (#981, #1011). Opt-in: without it a
+    /// stuck pane fails the handoff and the error names it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_undrained: bool,
+}
+
+/// A pane whose queued PTY input did not drain before a live handoff (#981).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndrainedPane {
+    /// The public pane id (`wX:pN`), or the internal number when the pane has
+    /// no public id.
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending_bytes: usize,
+    /// The pane's writer kept accepting zero bytes, rather than the drain
+    /// simply running out of time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2844,6 +2871,11 @@ pub enum ResponseResult {
         run_id: String,
         dry_run: bool,
         results: Vec<RevertRepoResult>,
+    },
+    /// A live handoff that went ahead under `--skip-undrained` and dropped the
+    /// listed panes' pending input. A handoff that dropped nothing answers `Ok`.
+    LiveHandoff {
+        skipped_undrained: Vec<UndrainedPane>,
     },
     Ok {},
 }

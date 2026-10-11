@@ -3627,6 +3627,68 @@ pub(crate) fn pty_write_failed(pane: u32, err: &str) {
     );
 }
 
+/// The writer kept accepting zero bytes of a non-empty buffer, so its queue
+/// was dropped rather than retried hot and input is refused until it is
+/// re-armed (#1011). Rate-limited per pane: `suppressed` counts the breaks
+/// since the last warning. This replaces the per-attempt "write returned zero
+/// bytes" warning that filled server logs (#997).
+pub(crate) fn pty_writer_broken(
+    pane: u32,
+    zero_writes: u32,
+    dropped_bytes: usize,
+    suppressed: u32,
+) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "writer_broken",
+        pane,
+        zero_writes,
+        dropped_bytes,
+        suppressed,
+        "PTY writer accepts zero bytes; dropped its pending writes and refusing input"
+    );
+}
+
+/// A broken writer was re-armed; `rejected_writes` is how much input it
+/// refused (each refusal already returned an error to its caller).
+pub(crate) fn pty_writer_rearmed(pane: u32, rejected_writes: u64) {
+    tracing::debug!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "writer_rearmed",
+        pane,
+        rejected_writes,
+        "PTY writer re-armed after refusing input"
+    );
+}
+
+/// The aggregate count of writes refused while a pane's writer was broken and
+/// not yet re-armed, logged once when the actor exits.
+pub(crate) fn pty_writes_rejected_while_broken(pane: u32, rejected_writes: u64) {
+    tracing::warn!(
+        event = "pty.write",
+        subsystem = "pty",
+        outcome = "rejected",
+        pane,
+        rejected_writes,
+        "PTY actor exited with input refused by a broken writer"
+    );
+}
+
+/// `--skip-undrained`: what a pane still had queued when the handoff drain
+/// deadline passed, dropped so the handoff could proceed.
+pub(crate) fn pty_handoff_dropped_undrained(pane: u32, dropped_bytes: usize) {
+    tracing::warn!(
+        event = "session.handoff",
+        subsystem = "handoff",
+        outcome = "dropped_undrained",
+        pane,
+        dropped_bytes,
+        "dropped undrained PTY writes to proceed with handoff"
+    );
+}
+
 pub(crate) fn pty_resize_failed(pane: u32, err: &str) {
     tracing::debug!(
         event = "pty.resize",
