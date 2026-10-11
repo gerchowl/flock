@@ -946,10 +946,12 @@ mod tests {
             })
             .unwrap()
         };
-        let looped = forward("looped", 300);
         let refused = forward("refused-by-hub", CUSTODY_TTL_MS);
         let owner_refused = forward("refused-by-owner", CUSTODY_TTL_MS);
         let live = forward("live", CUSTODY_TTL_MS);
+        // Forwarded last, with a window wide enough that a loaded runner still
+        // asserts "nothing owed" before the deadline passes (#948).
+        let looped = forward("looped", 2_000);
         with_store(|store| {
             store
                 .refuse_route(&looped.key, "loop_detected")
@@ -975,12 +977,15 @@ mod tests {
         .unwrap();
         app.settle_refusal(&refused, "invalid_envelope", None, None)
             .unwrap();
-        // The looped row reaches its deadline still unrouted.
-        std::thread::sleep(std::time::Duration::from_millis(400));
         let expected = vec![
             (refused.key.clone(), "invalid_envelope".to_string()),
             (looped.key.clone(), "loop_detected".to_string()),
         ];
+        // The looped row reaches its deadline still unrouted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while owed().len() < expected.len() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert_eq!(owed(), expected, "{:?}", live.key);
 
         app.route_mesh_receipts();

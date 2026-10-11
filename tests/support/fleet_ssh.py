@@ -303,6 +303,12 @@ try:
         if response.get("id") in outbound_collections:
             outbound_collections.discard(response.get("id"))
             answers = response.get("result", {}).get("answers", [])
+            # A held answer is offered on both lanes. A test that injects a
+            # fault into the collect lane withholds it from this one, or the
+            # outbound poll can win the race and bypass the fault (#948).
+            if answers and (base / f"withhold-outbound-answers-{source}-{target}").exists():
+                answers[:] = [a for a in answers if not a.get("envelope", {}).get("request_key")]
+                line = json.dumps(response) + "\n"
             if answers:
                 with (base / f"outbound-offers-{source}-{target}").open("a") as log:
                     log.write(json.dumps(answers) + "\n")
