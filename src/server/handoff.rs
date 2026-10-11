@@ -31,8 +31,20 @@ const IMPORT_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 // 30-second socket exchange, without allowing an indefinite startup stall.
 #[cfg(unix)]
 const IMPORT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most pane descriptors one SCM_RIGHTS message carries. A handoff of more
+/// panes sends several batches of at most this many, and a handoff of this
+/// many or fewer sends exactly one, so its wire bytes match the pre-batching
+/// protocol and [`HANDOFF_VERSION`] stays 1 (#471).
 #[cfg(unix)]
-pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
+pub(crate) const MAX_FDS_PER_BATCH: usize = 64;
+/// The one data byte every fd batch rides on.
+#[cfg(unix)]
+const FD_BATCH_TAG: u8 = b'F';
+/// Room the receiver leaves for one SCM_RIGHTS message. Linux caps a message
+/// at 253 descriptors (`SCM_MAX_FD`), so no Linux sender can overflow this,
+/// and anything above [`MAX_FDS_PER_BATCH`] is refused after it arrives.
+#[cfg(unix)]
+const RECV_FD_CAPACITY: usize = 256;
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
@@ -323,12 +335,6 @@ pub(crate) fn report_import_refusal(stream: &mut UnixStream, reason: &str) -> io
 
 #[cfg(unix)]
 pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd]) -> io::Result<()> {
-    if fds.len() > MAX_FDS_PER_HANDOFF {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("handoff supports at most {MAX_FDS_PER_HANDOFF} pane file descriptors at once"),
-        ));
-    }
     send_fds(stream, fds)?;
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
@@ -445,6 +451,17 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
+    if cfg!(debug_assertions)
+        && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("mid_fds")
+    {
+        let partial = recv_fds(stream, manifest.panes.len().min(MAX_FDS_PER_BATCH))?;
+        close_fds(&partial);
+        return Err(io::Error::other(format!(
+            "test handoff import failure after {} of {} fds",
+            partial.len(),
+            manifest.panes.len()
+        )));
+    }
     let fds = recv_fds(stream, manifest.panes.len())?;
     Ok((manifest, fds))
 }
@@ -553,12 +570,26 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
     }
 }
 
+/// Send every descriptor in SCM_RIGHTS batches of at most
+/// [`MAX_FDS_PER_BATCH`], each riding one `F` byte. The caller keeps its own
+/// copies: a failure part-way leaves the receiver short, it refuses, and the
+/// kernel closes whatever was still in flight when the stream drops.
 #[cfg(unix)]
 fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
-    if fds.is_empty() {
-        return Ok(());
+    for batch in fds.chunks(MAX_FDS_PER_BATCH) {
+        send_fd_batch(stream, batch)?;
     }
-    let byte = b"F";
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_fd_batch(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
+    send_tagged_fd_batch(stream, fds, FD_BATCH_TAG)
+}
+
+#[cfg(unix)]
+fn send_tagged_fd_batch(stream: &UnixStream, fds: &[RawFd], tag: u8) -> io::Result<()> {
+    let byte = [tag];
     let iov = [libc::iovec {
         iov_base: byte.as_ptr() as *mut libc::c_void,
         iov_len: byte.len(),
@@ -580,64 +611,167 @@ fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
         std::ptr::copy_nonoverlapping(fds.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), fd_bytes);
-        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) < 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            if libc::sendmsg(stream.as_raw_fd(), &msg, 0) >= 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
     }
     Ok(())
 }
 
+/// Receive `expected` descriptors across as many batches as the sender split
+/// them into. Every descriptor taken from the kernel is held in `out` from
+/// the moment it arrives, so any refusal, including one part-way through a
+/// batch, closes all of them rather than leaking into the importer.
 #[cfg(unix)]
 fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
-    if expected == 0 {
-        return Ok(Vec::new());
+    let mut out = Vec::with_capacity(expected);
+    match recv_fds_into(stream, expected, &mut out) {
+        Ok(()) => Ok(out),
+        Err(err) => {
+            close_fds(&out);
+            Err(err)
+        }
     }
-    let mut byte = [0u8; 1];
-    let mut iov = [libc::iovec {
-        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
-        iov_len: byte.len(),
-    }];
-    let fd_bytes = expected * std::mem::size_of::<RawFd>();
-    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize }];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = iov.as_mut_ptr();
-    msg.msg_iovlen = iov.len() as _;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = control.len() as _;
+}
 
-    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
-    if read < 0 {
-        return Err(io::Error::last_os_error());
+#[cfg(unix)]
+fn close_fds(fds: &[RawFd]) {
+    for &fd in fds {
+        let _ = unsafe { libc::close(fd) };
     }
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(io::Error::other("handoff fd control message was truncated"));
-    }
+}
 
-    let mut out = Vec::new();
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null()
-            || (*cmsg).cmsg_level != libc::SOL_SOCKET
-            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-        {
+#[cfg(unix)]
+fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> io::Result<()> {
+    // Sized well past one batch, so a batch carrying more than the remainder,
+    // or more than the batch limit, arrives whole and is refused by count.
+    // Truncation is not a safe way to refuse: on macOS the kernel installs
+    // the descriptors that did not fit into this process without reporting
+    // them, and they leak.
+    let space = unsafe {
+        libc::CMSG_SPACE((RECV_FD_CAPACITY * std::mem::size_of::<RawFd>()) as u32) as usize
+    };
+    // u64 backing keeps the control buffer aligned for `cmsghdr`.
+    let mut control = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
+    while out.len() < expected {
+        let mut byte = [0u8; 1];
+        let mut iov = [libc::iovec {
+            iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+            iov_len: byte.len(),
+        }];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+
+        let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        if read < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let before = out.len();
+        // Collect before judging the message, so descriptors that did arrive
+        // with a malformed or truncated batch are still closed.
+        let collected = unsafe { collect_scm_rights(&msg, out) };
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "handoff stream closed after {} of {expected} handoff fds",
+                    out.len()
+                ),
+            ));
+        }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::other("handoff fd control message was truncated"));
+        }
+        collected?;
+        if byte[0] != FD_BATCH_TAG {
+            return Err(io::Error::other(format!(
+                "handoff fd batch carried data byte {:#04x}, expected {:#04x}",
+                byte[0], FD_BATCH_TAG
+            )));
+        }
+        let batch = out.len() - before;
+        if batch == 0 {
             return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
         }
-        let data_len = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-        let count = data_len / std::mem::size_of::<RawFd>();
-        let data = libc::CMSG_DATA(cmsg) as *const RawFd;
-        for idx in 0..count {
-            out.push(*data.add(idx));
+        if batch > MAX_FDS_PER_BATCH {
+            return Err(io::Error::other(format!(
+                "handoff fd batch of {batch} exceeds the {MAX_FDS_PER_BATCH} fd batch limit"
+            )));
+        }
+        if out.len() > expected {
+            return Err(io::Error::other(format!(
+                "handoff fd batch of {batch} overruns the {expected} expected handoff fds"
+            )));
         }
     }
-    if out.len() != expected {
-        for fd in out {
-            let _ = unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// Append every SCM_RIGHTS descriptor in `msg` to `out`. Each payload is
+/// bounded by the control length the kernel returned, never by the sender's
+/// claimed `cmsg_len` alone, so a header that overstates its size cannot
+/// make this read past what was written.
+///
+/// # Safety
+/// `msg` must be the header of a completed `recvmsg` whose control buffer is
+/// still alive.
+#[cfg(unix)]
+unsafe fn collect_scm_rights(msg: &libc::msghdr, out: &mut Vec<RawFd>) -> io::Result<()> {
+    let control = msg.msg_control as *const u8;
+    // `as _`: msg_controllen is usize on Linux and u32 on macOS.
+    let controllen: usize = msg.msg_controllen as _;
+    let control_end = control.wrapping_add(controllen);
+    let mut result = Ok(());
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        let header = cmsg as *const u8;
+        let available = (control_end as usize).saturating_sub(header as usize);
+        let claimed = unsafe { (*cmsg).cmsg_len as usize };
+        let header_len = unsafe { libc::CMSG_LEN(0) as usize };
+        if available < header_len || claimed < header_len {
+            result = Err(io::Error::other("handoff fd control header is malformed"));
+            break;
         }
-        return Err(io::Error::other(format!(
-            "expected {expected} handoff fds, received fewer"
-        )));
+        let len = claimed.min(available);
+        if claimed > available {
+            result = Err(io::Error::other(
+                "handoff fd control message overstates its length",
+            ));
+        }
+        let is_rights = unsafe {
+            (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+        };
+        if is_rights {
+            let data = unsafe { libc::CMSG_DATA(cmsg) };
+            let data_offset = data as usize - header as usize;
+            let count = len.saturating_sub(data_offset) / std::mem::size_of::<RawFd>();
+            for idx in 0..count {
+                out.push(unsafe { std::ptr::read_unaligned((data as *const RawFd).add(idx)) });
+            }
+        } else if result.is_ok() {
+            result = Err(io::Error::other(
+                "handoff fd message carried an unexpected control message",
+            ));
+        }
+        if claimed > available {
+            break;
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
     }
-    Ok(out)
+    result
 }
 
 #[cfg(unix)]
@@ -889,5 +1023,216 @@ mod tests {
         assert_eq!(received.matches('\n').count(), 1);
         assert!(received.ends_with('\n'));
         assert!(!received[..received.len() - 1].contains('\n'));
+    }
+
+    /// `count` pipes. The write ends travel through the handoff; the read
+    /// ends stay here so [`assert_all_write_ends_closed`] can prove no copy of
+    /// a write end survived anywhere in this process.
+    fn pipes(count: usize) -> (Vec<RawFd>, Vec<RawFd>) {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for _ in 0..count {
+            let mut pair = [0; 2];
+            assert_eq!(unsafe { libc::pipe(pair.as_mut_ptr()) }, 0, "pipe");
+            let flags = unsafe { libc::fcntl(pair[0], libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(pair[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            reads.push(pair[0]);
+            writes.push(pair[1]);
+        }
+        (reads, writes)
+    }
+
+    /// A read end returns EOF only once every copy of its write end is
+    /// closed, including copies the kernel delivered to a receiver. So EOF on
+    /// all of them is the no-leak proof, and `EAGAIN` names a leaked one.
+    fn assert_all_write_ends_closed(reads: &[RawFd]) {
+        for (idx, &fd) in reads.iter().enumerate() {
+            let mut byte = 0u8;
+            let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            assert_eq!(
+                read,
+                0,
+                "pipe {idx}: a write end leaked ({})",
+                io::Error::last_os_error()
+            );
+        }
+        close_fds(reads);
+    }
+
+    fn pair_with_timeout() -> (UnixStream, UnixStream) {
+        let (sender, receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        (sender, receiver)
+    }
+
+    /// Count the SCM_RIGHTS messages `send_fds` emits for `count` fds by
+    /// reading them back one recvmsg at a time with room for far more than a
+    /// batch, so a batching change cannot hide inside a small buffer.
+    fn batch_sizes_on_the_wire(count: usize) -> Vec<usize> {
+        let (_reads, writes) = pipes(count);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes).expect("send");
+        drop(sender);
+        let mut sizes = Vec::new();
+        let space = unsafe { libc::CMSG_SPACE((1024 * std::mem::size_of::<RawFd>()) as u32) };
+        let mut control = vec![0u64; space as usize / 8 + 1];
+        loop {
+            let mut byte = [0u8; 4];
+            let mut iov = [libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: byte.len(),
+            }];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = iov.as_mut_ptr();
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            let read = unsafe { libc::recvmsg(receiver.as_raw_fd(), &mut msg, 0) };
+            if read <= 0 {
+                break;
+            }
+            assert_eq!(read, 1, "each batch rides exactly one byte");
+            assert_eq!(byte[0], b'F');
+            let mut got = Vec::new();
+            unsafe { collect_scm_rights(&msg, &mut got) }.expect("well-formed batch");
+            sizes.push(got.len());
+            close_fds(&got);
+        }
+        close_fds(&writes);
+        sizes
+    }
+
+    #[test]
+    fn a_handoff_of_up_to_one_batch_is_one_message_and_more_is_split_by_64() {
+        assert_eq!(batch_sizes_on_the_wire(1), vec![1]);
+        assert_eq!(batch_sizes_on_the_wire(64), vec![64]);
+        assert_eq!(batch_sizes_on_the_wire(65), vec![64, 1]);
+        assert_eq!(batch_sizes_on_the_wire(150), vec![64, 64, 22]);
+    }
+
+    #[test]
+    fn receiver_accumulates_150_fds_across_batches_in_order() {
+        let (reads, writes) = pipes(150);
+        let (sender, receiver) = pair_with_timeout();
+        let sent = writes.clone();
+        let send = thread::spawn(move || send_fds(&sender, &sent));
+        let received = recv_fds(&receiver, 150).expect("all 150 fds");
+        send.join().expect("sender").expect("send");
+        assert_eq!(received.len(), 150);
+        close_fds(&writes);
+        // Each received fd must be the write end of the pipe at the same
+        // index: the importer pairs fds with manifest panes by position.
+        for (idx, &fd) in received.iter().enumerate() {
+            let tag = idx as u8;
+            assert_eq!(unsafe { libc::write(fd, (&tag as *const u8).cast(), 1) }, 1);
+            let mut got = 0u8;
+            assert_eq!(
+                unsafe { libc::read(reads[idx], (&mut got as *mut u8).cast(), 1) },
+                1
+            );
+            assert_eq!(got, tag, "fd {idx} arrived out of order");
+        }
+        close_fds(&received);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn over_count_batch_is_refused_and_every_held_fd_closed() {
+        let (reads, writes) = pipes(3);
+        let (sender, receiver) = pair_with_timeout();
+        send_fd_batch(&sender, &writes).expect("send three");
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 2).expect_err("three fds where two were expected");
+        assert!(err.to_string().contains("overruns"), "{err}");
+        drop(sender);
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn over_count_batch_after_earlier_batches_closes_the_earlier_ones_too() {
+        let (reads, writes) = pipes(70);
+        let (sender, receiver) = pair_with_timeout();
+        send_fd_batch(&sender, &writes[..64]).expect("first batch");
+        send_fd_batch(&sender, &writes[64..]).expect("six where one is left");
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 65).expect_err("overrun in the second batch");
+        assert!(err.to_string().contains("overruns"), "{err}");
+        drop(sender);
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn batch_larger_than_the_limit_is_refused_without_leaking() {
+        let (reads, writes) = pipes(MAX_FDS_PER_BATCH + 1);
+        let (sender, receiver) = pair_with_timeout();
+        send_fd_batch(&sender, &writes).expect("one oversized batch");
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 200).expect_err("65 fds in one batch");
+        assert!(err.to_string().contains("batch limit"), "{err}");
+        drop(sender);
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn batch_on_a_byte_other_than_f_is_refused_and_its_fds_closed() {
+        let (reads, writes) = pipes(2);
+        let (sender, receiver) = pair_with_timeout();
+        send_tagged_fd_batch(&sender, &writes, b'X').expect("send");
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 2).expect_err("wrong data byte");
+        assert!(err.to_string().contains("data byte 0x58"), "{err}");
+        drop(sender);
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn sender_dying_mid_transfer_closes_every_fd_already_received() {
+        let (reads, writes) = pipes(150);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes[..100]).expect("first 100 of 150");
+        drop(sender);
+        close_fds(&writes);
+        let err = recv_fds(&receiver, 150).expect_err("stream ends short");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(err.to_string().contains("100 of 150"), "{err}");
+        drop(receiver);
+        assert_all_write_ends_closed(&reads);
+    }
+
+    #[test]
+    fn scm_rights_payload_is_bounded_by_the_kernel_control_length() {
+        // A header claiming 64 descriptors inside a control buffer the kernel
+        // reported as holding only two must yield at most those two, never
+        // the 62 that follow in memory.
+        let space = unsafe { libc::CMSG_SPACE((64 * std::mem::size_of::<RawFd>()) as u32) };
+        let mut control = vec![0u64; space as usize / 8 + 1];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN((64 * std::mem::size_of::<RawFd>()) as u32) as _;
+            let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
+            for idx in 0..64 {
+                data.add(idx).write_unaligned(-1 - idx as RawFd);
+            }
+        }
+        msg.msg_controllen =
+            unsafe { libc::CMSG_LEN((2 * std::mem::size_of::<RawFd>()) as u32) } as _;
+        let mut out = Vec::new();
+        let result = unsafe { collect_scm_rights(&msg, &mut out) };
+        assert!(result.is_err(), "an overstated cmsg_len must be refused");
+        assert_eq!(out, vec![-1, -2]);
     }
 }
