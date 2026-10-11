@@ -37,6 +37,9 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0025](0025-version-identity-and-release-automation.md) | Version identity: this project restarts its version line, and the deterministic `just release` path stays | Accepted |
 | [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody (implemented: v1.0.0, #623 / #661) | Accepted |
 | [0027](0027-architect-delegate-tracking.md) | An architect's delegates are a server-held edge, and everything else is a projection of it | Proposed |
+| [0028](0028-agent-observation-events-and-waiting.md) | An agent's state has one cross-harness vocabulary, supervisors read it as a resumable event stream, and waiting is a registered wait that the server wakes | Accepted |
+| [0029](0029-agent-facing-cli-contract.md) | The agent-facing CLI keeps one contract: a send submits and says whether it did, one exit-code table, selectable output, stable JSON errors | Accepted |
+| [0030](0030-goal-supervision-built-for-waiting.md) | Goal supervision decides most stops without a judge: parked is silent, the judge is a bounded last step, the goal survives compaction | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
