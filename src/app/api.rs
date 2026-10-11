@@ -98,7 +98,7 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
 /// nobody counted.
 fn run_pr_poll_round(
     targets: Vec<PrPollTarget>,
-) -> Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, crate::pr_poll::PrPollErrorKind> {
+) -> Result<crate::events::PrPollRound, crate::pr_poll::PrPollErrorKind> {
     use std::collections::HashMap;
 
     let mut repo_for_root: HashMap<std::path::PathBuf, Option<String>> = HashMap::new();
@@ -132,11 +132,14 @@ fn run_pr_poll_round(
 
     let mut results: Vec<(String, Option<crate::worktree::PrStateInfo>)> = Vec::new();
     for (query, workspace_ids) in fanout {
-        let state = found.get(&query).copied();
+        let state = found.get(&query).map(|obs| obs.info);
         results.extend(workspace_ids.into_iter().map(|id| (id, state)));
     }
     results.extend(unresolved.into_iter().map(|id| (id, None)));
-    Ok(results)
+    Ok(crate::events::PrPollRound {
+        states: results,
+        observed: found.into_values().collect(),
+    })
 }
 
 impl App {
@@ -286,10 +289,10 @@ impl App {
             // clearing them: the data is stale, not known-absent, and blanking
             // every badge on a transient network blip would be a worse lie
             // than showing the last known state marked degraded.
-            let results = match outcome {
-                Ok(results) => {
+            let round = match outcome {
+                Ok(round) => {
                     self.pr_poll_health.mark_success(now);
-                    results
+                    round
                 }
                 Err(err) => {
                     // An auth failure is the one error a restart would fix, so
@@ -302,8 +305,9 @@ impl App {
                     return;
                 }
             };
+            self.emit_pr_events(&round.observed);
             let mut changed = false;
-            for (workspace_id, pr_state) in results {
+            for (workspace_id, pr_state) in round.states {
                 if let Some(ws) = self
                     .state
                     .workspaces
@@ -1232,6 +1236,20 @@ impl App {
                 },
             };
             self.emit_event(envelope);
+        }
+    }
+
+    /// Record the `pr.*` facts a round adds (#1020). The ledger is seeded from
+    /// the durable log on the first round, so a restart re-announces nothing.
+    fn emit_pr_events(&mut self, observed: &[crate::pr_poll::PrObservation]) {
+        if !self.pr_events.restored {
+            let restored = self.event_hub.persisted_events_after(0);
+            self.pr_events
+                .fold(restored.iter().map(|(_, _, envelope)| envelope));
+            self.pr_events.restored = true;
+        }
+        for event in self.pr_events.derive(observed) {
+            self.emit_event(event);
         }
     }
 
@@ -2845,13 +2863,18 @@ mod tests {
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("wt")];
         let id = app.state.workspaces[0].id.clone();
 
-        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(vec![(
-            id,
-            Some(crate::worktree::PrStateInfo {
-                state: crate::worktree::PrState::Merged,
-                number: 6,
-            }),
-        )])));
+        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(
+            crate::events::PrPollRound {
+                states: vec![(
+                    id,
+                    Some(crate::worktree::PrStateInfo {
+                        state: crate::worktree::PrState::Merged,
+                        number: 6,
+                    }),
+                )],
+                observed: Vec::new(),
+            },
+        )));
 
         assert_eq!(
             app.state.workspaces[0].pr_state(),
@@ -2860,6 +2883,51 @@ mod tests {
                 number: 6,
             })
         );
+    }
+
+    /// #1020 acceptance: one `pr.ci_completed` per head SHA and one
+    /// `pr.merged` per PR in the durable log, across repeated rounds AND a
+    /// server restart on the same log.
+    #[tokio::test]
+    async fn pr_events_persist_once_across_rounds_and_a_restart() {
+        use crate::api::schema::EventKind;
+        let dir = std::env::temp_dir().join(format!("flock-pr-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("event-log.jsonl");
+        let observe = |state| crate::pr_poll::PrObservation {
+            repo: "o/n".into(),
+            branch: "feat".into(),
+            info: crate::worktree::PrStateInfo { state, number: 7 },
+            head_sha: Some("abc".into()),
+            ci: Some(crate::pr_poll::CiConclusion {
+                conclusion: "failure".into(),
+                failed_checks: vec!["test".into()],
+            }),
+        };
+        let round = |state| {
+            crate::events::AppEvent::PrStatesUpdated(Ok(crate::events::PrPollRound {
+                states: Vec::new(),
+                observed: vec![observe(state)],
+            }))
+        };
+        for state in [
+            crate::worktree::PrState::Open,
+            crate::worktree::PrState::Merged,
+        ] {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = crate::api::EventHub::with_persistence(log.clone());
+            let mut app = App::new(&crate::config::Config::default(), true, None, api_rx, hub);
+            app.handle_internal_event(round(state));
+            app.handle_internal_event(round(state));
+        }
+        let kinds: Vec<EventKind> = crate::api::EventHub::with_persistence(log)
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(_, _, envelope)| envelope.event)
+            .filter(|kind| matches!(kind, EventKind::PrCiCompleted | EventKind::PrMerged))
+            .collect();
+        assert_eq!(kinds, vec![EventKind::PrCiCompleted, EventKind::PrMerged]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The 120s PR poll covers ALL workspaces with a branch (#42): linked

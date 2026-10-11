@@ -314,6 +314,8 @@ pub struct App {
     /// Source-scoped health for the batched PR poller (#294/#295). One row for
     /// one poller — see `PrPollHealth` for why this is not per-workspace.
     pub(crate) pr_poll_health: crate::pr_poll::PrPollHealth,
+    /// Which `pr.*` events are already in the log (#1020).
+    pub(crate) pr_events: crate::pr_poll::PrEventLedger,
     /// Source-scoped health for the periodic git-status refresh (#295). The
     /// refresh drives the sidebar's branch / dirty / ahead-behind numbers;
     /// without a row here "no update fired" is indistinguishable from "the
@@ -1014,6 +1016,7 @@ impl App {
             gossip_poll_interval_secs,
             peer_poll_tracker: crate::peers::PeerPollTracker::new(),
             pr_poll_health: crate::pr_poll::PrPollHealth::default(),
+            pr_events: crate::pr_poll::PrEventLedger::default(),
             git_refresh_health: crate::health::PollerHealthCore::default(),
             checks_runner_health: crate::health::PollerHealthCore::default(),
             peer_poll_health: crate::health::PollerHealthCore::default(),
