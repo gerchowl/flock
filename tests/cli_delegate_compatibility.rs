@@ -273,6 +273,24 @@ fn every_mutating_verb_refuses_skew_before_sending() {
     }
 }
 
+/// Right after a live handoff the shell's old client talks to a newer
+/// server, and that must not be refused: only an OLDER server is.
+#[test]
+fn mutating_verbs_reach_an_equal_or_newer_server() {
+    for version in ["current", "future"] {
+        let (output, methods) = run(
+            &["agent", "send", "fixture", "hello"],
+            Some(version),
+            None,
+            false,
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(0), "{version}: {stderr}");
+        assert!(!stderr.contains("is incompatible with client"), "{stderr}");
+        assert_eq!(methods, ["ping", "agent.send"], "{version}");
+    }
+}
+
 #[test]
 fn read_only_verbs_still_reach_an_older_server() {
     let (output, methods) = run(&["agent", "result", "fixture"], Some("0.9.0"), None, false);
