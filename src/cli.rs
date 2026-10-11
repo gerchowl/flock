@@ -1136,7 +1136,12 @@ pub(super) fn normalize_pane_id(value: &str) -> String {
 /// which servers answered long before their pane verbs took names, so a new
 /// client names agents against an old server too. When that fails the target
 /// goes on as typed and the verb's own refusal names the expected shapes.
+///
+/// An agent whose name is shaped like a pane id (`w1:p2`, `p_3`, `1-2`) is
+/// not pre-resolved: the id goes as typed, so against an old server it means
+/// the pane, and only a new server falls back to the name.
 pub(super) fn resolve_pane_arg(value: &str) -> String {
+    // The server resolves `self` by ancestry; the env saves it a lookup.
     if value == "self" {
         return std::env::var("FLOCK_PANE_ID").unwrap_or_else(|_| value.to_string());
     }

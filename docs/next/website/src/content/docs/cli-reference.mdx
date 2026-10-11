@@ -282,7 +282,7 @@ flk pane close <pane_id>
 flk pane stash show|restore <pane_id> [--json]
 ```
 
-`pane read`, `pane send-text`, `pane send-keys`, and `pane close` also accept a terminal ID or a unique agent name/label. A pane ID takes precedence over a same-named agent. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one.
+Every pane verb takes a target: a pane ID, a terminal ID, an agent ID, a unique agent name/label, or `self` for the calling pane. A pane ID takes precedence over a same-named agent. Ambiguous names are rejected with candidate details; use a terminal ID or pane ID to select one. An unknown target is refused with `data.expected` listing these shapes. Against an older server, `flk` first resolves a name to its pane ID through `agent get`. It skips that step for an agent whose name is shaped like a pane ID (`w1:p2`, `p_3`, `1-2`), so on an older server such a name means the pane, not the agent.
 
 Read output:
 

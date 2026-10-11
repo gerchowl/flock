@@ -1564,6 +1564,25 @@ mod tests {
     }
 
     #[test]
+    fn self_resolves_to_the_callers_pane_by_ancestry() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let get = |app: &mut App| {
+            let response = app.handle_pane_get(
+                "get".into(),
+                PaneTarget {
+                    pane_id: "self".into(),
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
+    }
+
+    #[test]
     fn unknown_pane_target_names_the_expected_shapes() {
         let (mut app, _, _) = app_with_terminal();
         let response = app.handle_pane_get(

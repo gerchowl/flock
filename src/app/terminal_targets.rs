@@ -41,16 +41,26 @@ pub(crate) const PANE_TARGET_EXPECTED: &[&str] = &[
     "pane id (w1:p2)",
     "terminal id",
     "unique agent name or label",
-    "fleet agent id (agent_<host>_<suffix>) of an agent on this server",
+    "agent id (agent_<host>_<suffix>) of an agent on this server",
+    "self (the caller's own pane)",
 ];
 
 impl App {
-    /// The one target resolver (ADR-0029 §5): terminal id, pane id, unique
-    /// agent name or label, then a local fleet agent id.
+    /// The one target resolver (ADR-0029 §5): `self`, terminal id, pane id,
+    /// agent id, then unique agent name or label.
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
+        // `self` is the API caller's own pane, from its process ancestry.
+        if target == "self" {
+            return self
+                .caller_pane()
+                .and_then(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+                .ok_or_else(|| TerminalTargetError::NotFound {
+                    target: target.to_string(),
+                });
+        }
         let terminal_matches: Vec<_> = self
             .terminal_targets()
             .into_iter()
@@ -101,19 +111,6 @@ impl App {
             .collect();
         if let Some(resolved) = self.single_terminal_match(target, name_matches)? {
             return Ok(resolved);
-        }
-
-        // A fleet agent id last (ADR-0029 §5): it names this server's pane
-        // only while the agent lives here.
-        if crate::terminal::AgentId::is_well_formed(target) {
-            let local = self.locate_agent(target).filter(|location| location.local);
-            if let Some((ws_idx, pane_id)) =
-                local.and_then(|location| self.parse_pane_id(&location.pane_id))
-            {
-                if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
-                    return Ok(resolved);
-                }
-            }
         }
 
         Err(TerminalTargetError::NotFound {

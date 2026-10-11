@@ -582,10 +582,17 @@ fn pane_get_pre_resolves_an_agent_name_against_an_old_server() {
         }
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, value) in
+        support::environment::isolated_env(&base.join("config"), &base.join("runtime"))
+    {
+        cmd.env(key, value);
+    }
+    let output = cmd
         .args(["pane", "get", "reviewer"])
         .env("FLOCK_SOCKET_PATH", &socket_path)
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_PANE_ID")
         .output()
         .expect("run flk");
     old_server.join().unwrap();
