@@ -419,6 +419,35 @@ async fn esc_or_ctrl_c_interrupts_the_injection_at_once() {
     }
 }
 
+/// #1011 review: when the pane refuses the replay of held operator keys, the
+/// attempt's outcome says they were not written.
+#[tokio::test]
+async fn a_refused_replay_of_held_keys_is_in_the_attempt_outcome() {
+    let Rig { app, pane, mut pty } = lock_rig(&CLAUDE);
+    let now = Instant::now();
+    let mut attempt = app
+        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+        .unwrap();
+    drain(&mut pty);
+    runtime(&app)
+        .try_send_bytes(Bytes::from_static(b"a"))
+        .unwrap();
+    drop(pty);
+    paint(&app, &CLAUDE, "something else");
+
+    assert_eq!(
+        app.advance_guarded_submit(
+            &pane,
+            &mut attempt,
+            now + crate::app::guarded_submit::CONFIRM_WINDOW
+        ),
+        Some(Outcome::Unconfirmed("owned_composer_not_visible"))
+    );
+
+    assert!(attempt.evidence.held_input_not_written);
+    assert!(!held(&app));
+}
+
 #[tokio::test]
 async fn held_keys_wait_out_a_full_channel_in_order() {
     let Rig {
