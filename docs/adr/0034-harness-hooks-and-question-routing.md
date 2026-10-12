@@ -1,7 +1,10 @@
 # ADR 0034 — Delegates never ask the human: flk owns one policy point per harness hook, a delegate's question becomes a structured question to its architect, and only the root of a delegation tree reaches the operator
 
-- Status: Proposed
-- Date: 2026-10-12
+- Status: Accepted
+- Date: 2026-10-12 (proposed); accepted 2026-10-13
+- Scope of acceptance: the decisions in this record, with all eleven owner
+  questions answered as recommended by the owner on 2026-10-13 (#1160, "Owner
+  decisions" below). Acceptance claims no code.
 - Issues: #1160 (the spike this records). Composes with ADR-0027 (delegation
   edges, #632), ADR-0028 (state axes §1, registered waits §5, channels §8,
   open questions §8a; slices E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b
@@ -18,7 +21,9 @@
 - Implemented: none. Every Claude and Codex probe below (P1–P4, P6, P7,
   P9–P18) is re-runnable as `tests/probes/harness_question_hooks.py`, and all
   sixteen passed in one run on 2026-10-13 against the versions recorded in the
-  inventory. The slices (§10) are filed after acceptance.
+  inventory. Slices (§10) filed 2026-10-13: Q1 #1179, Q2 #1180, Q3 #1181, Q4
+  #1182, Q5 #1183, Q6 #1184, Q7 #1185, Q8 #1186, Q9 #1187, Q10 #1188, Q11
+  #1189, Q12 #1190, Q13 #1191, Q14 #1192, Q15 #1193, Q16 #1194.
 - Revised: 2026-10-12, round 2 after review. Adds the shell command gate
   (§1a, the mechanism ADR-0035 §6(b) relies on) and mid-turn delivery (§1b),
   per-harness failure rows (§4), `ask_operator` for roots nobody watches
@@ -242,7 +247,7 @@ and a harness that lacks a point says so rather than emulating it.
 - **flk wires a point only when a policy or a state axis consumes it.** This
   ADR consumes `question`, `permission.request` and `elicitation`, plus
   `tool.after` on the question tools only if the owner accepts the §9
-  amendment to ADR-0028 §8a (owner question 6; slice Q16).
+  amendment to ADR-0028 §8a (owner decision 6; slice Q16).
   `session.start`, `prompt.submit`, `stop` and `compact.before` are already
   wired for state and hand-off. The shell tool gets a `tool.before` entry for
   the command gate (§1a). Nothing installs a catch-all `tool.before` over
@@ -413,7 +418,7 @@ trigger action). Only the first is a human who may be watching the pane.
 
 ### 3. Mechanism: intercept the question, convert it into a question to the architect, and answer it in the same tool call
 
-Recommended: option **(c)**, built on the denial path of **(b)**, with **(a)**
+Decided: option **(c)**, built on the denial path of **(b)**, with **(a)**
 rejected as the primary mechanism (see Alternatives).
 
 **The flow for a `route` agent:**
@@ -516,7 +521,7 @@ handoff, since only a server that knows `hook.decide` stamps the hint). The
 exception is narrow on purpose: it covers only question points and only
 hinted panes. Refusing a dialog nobody will answer does not stop the agent's
 work, while passing it would. Goal verdicts and every other hook keep
-ADR-0030 §7's rule. Owner question 8 asks for this exception explicitly.
+ADR-0030 §7's rule. Owner decision 8 accepted this exception explicitly.
 
 **When the hook itself fails (question points, hinted panes).** Today's stub
 prints a diagnostic and exits 0 when `FLOCK_BIN` is missing
@@ -591,7 +596,7 @@ fails open on timeout (claude < 2.1.295)`, and the adapter's internal deadline
   addressed to this architect, even though its phase is `waiting_on_event`.
   Without both clauses, an architect whose goal parks on its delegates and a
   delegate waiting on that architect would wait on each other silently, and
-  the stop falls through to the later rungs instead. Owner question 9.
+  the stop falls through to the later rungs instead. Owner decision 9.
 - **Escalation is explicit and keeps the link.** The addressee can answer, or
   call `question.escalate { question_id, note? }` (CLI `flk question
   escalate`, MCP `flock_question_escalate`). That opens a new question to the
@@ -641,7 +646,7 @@ fails open on timeout (claude < 2.1.295)`, and the adapter's internal deadline
   and whether the question point fails closed (§4).
 - **Operator opt-in:** installation stays an explicit `flk integration
   install` / `sync`, as today. Routing itself is on by default for agents
-  with an edge once the hook is installed (owner question 1). `[questions]
+  with an edge once the hook is installed (owner decision 1). `[questions]
   enabled = false` turns every verdict into `pass`. A managed policy that
   disables user hooks disables all of this, and `flk integration status`
   reports it.
@@ -675,7 +680,7 @@ fails open on timeout (claude < 2.1.295)`, and the adapter's internal deadline
   harness bump the fleet pins. Claude below 2.1.295 is covered by §4.
 - **Mesh:** questions are per host. A delegate started over `ssh` has no edge
   (ADR-0027 §8) and so defaults to `ask_human`. Until mesh-attested edges
-  exist, a remote start should pass `--questions deny` (owner question 5).
+  exist, a remote start should pass `--questions deny` (owner decision 5).
 - **Command gate and notice:** an old server answers `hook.decide` with
   `server_version_gap`, so the gate passes and no notice is sent. An old hook
   never sends `tool.before` for the shell tool, so it is ungated, and the
@@ -683,22 +688,37 @@ fails open on timeout (claude < 2.1.295)`, and the adapter's internal deadline
   ignores it.
 - **Protocol VERSION stays 5** for the mesh, because nothing here is relayed.
 
-### 9. Amendments to other ADRs (each needs the owner's acceptance)
+### 9. Amendments to other ADRs (accepted with this ADR on 2026-10-13)
 
-ADR-0028, ADR-0030 and ADR-0032 are Accepted. ADR-0027 is still Proposed, so
-its amendment can be folded into its acceptance.
+The owner accepted every amendment below with this ADR. **The amendment text
+lands here**, and this section is the record of it. The amended files are not
+edited by this ADR. Each implementing slice adds a one-line "Amended by
+ADR-0034 §…" cross-reference to the ADR it changes, when the behaviour ships,
+as ADR-0027's header already does for ADR-0028 §5. ADR-0028, ADR-0030 and
+ADR-0032 are Accepted. ADR-0027 is still Proposed, so its amendment is folded
+into its acceptance.
 
 - **ADR-0028 §8a, sources:** the hook becomes the primary source of the
   structured `question` payload on every harness where it is installed. It
   sees the exact options, which a screen scrape can only reconstruct. Screen
-  detection stays the fallback (owner question 6). For `ask_human` agents
+  detection stays the fallback (owner decision 6). For `ask_human` agents
   the hook observes and returns `pass`; `PostToolUse` reports the answer, so
-  `agent.question_answered` gets a structured source too.
-- **ADR-0030 §2, rungs 4 and 5:** the exception in §5 (owner question 9).
+  `agent.question_answered` gets a structured source too. §8a's payload,
+  events, `question.answer` and reply path are unchanged. Only the source
+  list gains the hook. Lands with Q16 (#1194).
+- **ADR-0030 §2, rungs 4 and 5:** the exception in §5 (owner decision 9).
+  Rung 4 still parks on registered waits and rung 5 still parks on live
+  delegate edges. The amendment only removes the two cases where the
+  architect owes the answer. Lands with Q10 (#1188).
+- **ADR-0030 §7, skew:** the narrow fail-closed exception for question points
+  on hinted panes (§4, owner decision 8). Goal verdicts keep §7's rule. Lands
+  with Q2 (#1180).
 - **ADR-0032, delegate layer:** one line telling delegates that questions go
-  to the architect through the question tool or `flock_question_ask` (Q15).
+  to the architect through the question tool or `flock_question_ask`. Lands
+  with Q15 (#1193).
 - **ADR-0027 §3:** the digest gains a `question` line kind (`<delegate>
-  asks: <prompt> [<n> options]`).
+  asks: <prompt> [<n> options]`), one more line kind in the same buffer
+  (§3's "later triggers come from other issues"). Lands with Q9 (#1187).
 
 ### 10. Slices
 
@@ -709,22 +729,22 @@ production lines, sized against the code they touch today (`src/cli/hook.rs`,
 
 | # | Slice | ~Lines | Depends on | Acceptance | Skew |
 | --- | --- | --- | --- | --- | --- |
-| Q1 | `questions` policy on the agent record (`ask_human`, `ask_operator`, `route`, `deny`), defaulted from the edge and from the starter (operator, agent, or the server itself, §2) at start / spawn / fork; `--questions` and `--unattended` on `agent start` and `delegate start`; narrowing-only for agent callers; `FLOCK_QUESTIONS` stamped in `apply_pane_env`; shown in `agent.get` and `delegate.list` | 250 | #959 (landed) | An agent started by an agent reads `route` and its pane env has `FLOCK_QUESTIONS=route`. An operator start reads `ask_human` with no hint. A server-started agent reads `ask_operator`. A restart keeps the value. An agent widening a delegate is refused with exit 13 | Field only. The client sends `questions` only to a server that advertises it, and says so otherwise |
-| Q2 | `hook.decide` with verdicts `pass` / `deny` and §4's tables; Claude `PreToolUse` entry on `AskUserQuestion\|ExitPlanMode` (timeout, `onFailure: block` where ≥ 2.1.295); the fail-closed stub path (§4); `[questions] human_tools`; `CLAUDE_INTEGRATION_VERSION` bump. Until Q5, the `route` and `ask_operator` verdict is `deny` with "state the question and options in your final message and end your turn" | 380 | Q1 | Isolated flk with a throwaway Claude delegate: `AskUserQuestion` draws no dialog and the model gets the reason. A root agent's dialog draws as today, within 500 ms with the server stopped. A hinted delegate is denied with the fallback text when the server is stopped, `FLOCK_BIN` is missing, or a fake `flk` crashes or hangs. No process spawns for a non-shell, non-question tool | New method, gated. The old-server path is §4 |
-| Q3 | **Command gate** (§1a): shell-tool `tool.before` entries for Claude `Bash`, Codex `Bash` (with its trusted hash) and opencode `bash`; role-keyed deny-list shape and in-memory lookup on argv prefixes; deny reason naming the verb; fail open everywhere. ADR-0035 supplies the rows | 360 | Q1, Q2 | With a test row `delegate: gh pr merge`, a Claude and a Codex delegate running `gh pr merge 1` are refused with the reason, `echo hi` passes, and in an operator pane (no `FLOCK_GATE`) no `flk` process starts. With the server stopped, the command runs. A sandbox measurement of the gated call stays within p50 25 ms | Gate rows are server config; an old server answers `pass` by `server_version_gap` |
-| Q4 | `question.ask` (CLI and MCP): message-sourced question to the caller's architect, or to the operator for `ask_operator` and roots; options; `hold_ms` long-poll; wait registered; orphaned edge routed to the operator; `agent.question_routed` | 350 | Q1, E9a's `options` on `msg.send` (#1038), E5 (#1031), E6 (#1032) | A fake architect answering within hold returns `answered`. No answer returns `pending` and the delegate reads `waiting_on_event`, not `needs_human`. A later answer wakes it. An `ask_operator` agent's question lands in `flk question list` | New method, gated, exit 78 against an old server |
-| Q5 | Claude `answer` and `defer` verdicts: hold, `updatedInput.answers`, the `defer` reason, `ExitPlanMode` approve and reject, `[questions] hold_ms` and `wait_deadline` | 300 | Q2, Q4, E9b (#1039) | Sandbox probe: `flk question answer <id> --option 2` inside the hold returns option 2 to the model with no dialog. After the hold, the delegate ends its turn and is woken with the answer. Multi-select and Other round-trip. A plan-mode delegate's `ExitPlanMode` is approved by the architect with no dialog and the session leaves plan mode, and a rejection reaches the model as feedback (P18 as the acceptance test) | Fields only beyond Q2 |
-| Q6 | **Early Claude permission routing:** `PermissionRequest` entry; in-worktree requests routed to the architect as `allow once` / `deny`; widening requests offered only `escalate`; `[questions] architect_may_grant` | 280 | Q2, Q4, Q5 | A Claude delegate without bypass permissions asks to run a command in its worktree: the architect's `allow once` runs it with no dialog. A request for a path outside the worktree reaches the operator only through escalation | Additive; `onFailure: block` on `PermissionRequest` denies (docs) |
-| Q7 | Codex question adapter: `PreToolUse` on `request_user_input` with answer-in-reason and `defer`; fail-closed stub path; `hooks.json` entry and its trusted hash; `CODEX_INTEGRATION_VERSION` bump; P7 re-checked under flk's exact argv | 250 | Q2, Q4 | Probe: a Codex delegate's `request_user_input` is answered by the architect, and the model continues with the answer (the open point of §3). The trust hash covers only flk's entries | Codex re-reviews hooks whose hash changed. The installer re-trusts flk's own entries, as #626 does |
-| Q8 | opencode question adapter. Step 1: prove `Question.reply` and `client.permission.reply` from a plugin, and record what the model sees when `tool.execute.before` throws (the branch taken is recorded in the PR). Then `question.asked` → `hook.decide` → reply, or a throw with the answer; every await bounded; `OPENCODE_INTEGRATION_VERSION` bump | 300 | Q2, Q4 | Probe in an opencode TUI pane: the `question` tool is answered by the architect. A stalled flk never holds the plugin past its bound | Plugin only |
-| Q9 | Architect side: `question.escalate` with chained answers down the chain; digest `question` line; `delegate.list` column | 350 | Q4, E9b, #961 | A delegate → architect → operator chain: the operator's answer reaches the delegate, and each architect is told who answered | New method, gated |
-| Q10 | ADR-0030 rungs 4 and 5 exception (§5) in G2's ladder | 120 | Q4, G2 (#1035) | An architect parked on `any-delegate-of-mine changed` with an unanswered question in its inbox is not parked. An architect parked on two delegates is not parked while one waits on a question addressed to it | Server-internal |
-| Q11 | Re-addressing open questions on reassign and orphan (§2): `readdressed_from`, first answer wins across copies | 200 | Q4, ADR-0027 slice 9 (#969) | After `flk delegate reassign`, an open question appears for the new architect, and its answer wakes the delegate. After the architect's removal, the question appears for the operator | Additive field |
-| Q12 | Codex `PermissionRequest` and opencode `permission.asked` routing by §6's table | 280 | Q6, Q7, Q8 | One case per §6 row and harness: in-worktree requests are answered by the architect; widening reaches the operator only through escalation; a trust dialog is never routed | Additive |
-| Q13 | Elicitations: Claude `Elicitation` (form mode, no credential field) routed to the architect; Codex form elicitation off for `route` delegates; URL mode stays human | 180 | Q5 | A form elicitation from a test MCP server is answered by the architect with no dialog; a URL-mode one reaches the operator | Additive |
-| Q14 | **Mid-turn notice** (§1b): `notice?` in `hook.decide` replies; Claude and Codex adapters return it as `additionalContext`; once-per-item marking; opencode measured first, otherwise documented as next turn boundary | 220 | Q2, Q3; ADR-0035's *now* class | A busy delegate running shell commands receives the pointer before its next command, exactly once. An agent with nothing pending receives nothing | Field only; an old hook ignores it |
-| Q15 | Verification and teaching: byte-exact manifest verification for every stub, entry and trust hash; `flk integration status` policy-point listing, including the fail-open cells of §4; `docs/next` pages; architect skill and brief template; ADR-0032 delegate-layer line | 300 | Q2, Q3, Q7, Q8 | `flk integration status` flags a hand-edited stub, a missing question entry and a managed lockout. A delegate's compiled context carries the line | Client and docs only |
-| Q16 | (only if owner question 6 is accepted) The hook as the primary question source: for `ask_human` agents `hook.decide` observes the question tool (`agent.question_opened` with exact options) and returns `pass`; `tool.after` on the question tools reports `agent.question_answered`; screen detection stays the fallback | 250 | Q2, E9a (#1038) | A root agent's AskUserQuestion yields `agent.question_opened` with the exact options before the dialog draws, and the answer from `PostToolUse`. With the hook removed, the screen detector still opens the question | New kinds share E9a's; reader check per ADR-0028 §3a |
+| Q1 #1179 | `questions` policy on the agent record (`ask_human`, `ask_operator`, `route`, `deny`), defaulted from the edge and from the starter (operator, agent, or the server itself, §2) at start / spawn / fork; `--questions` and `--unattended` on `agent start` and `delegate start`; narrowing-only for agent callers; `FLOCK_QUESTIONS` stamped in `apply_pane_env`; shown in `agent.get` and `delegate.list` | 250 | #959 (landed) | An agent started by an agent reads `route` and its pane env has `FLOCK_QUESTIONS=route`. An operator start reads `ask_human` with no hint. A server-started agent reads `ask_operator`. A restart keeps the value. An agent widening a delegate is refused with exit 13 | Field only. The client sends `questions` only to a server that advertises it, and says so otherwise |
+| Q2 #1180 | `hook.decide` with verdicts `pass` / `deny` and §4's tables; Claude `PreToolUse` entry on `AskUserQuestion\|ExitPlanMode` (timeout, `onFailure: block` where ≥ 2.1.295); the fail-closed stub path (§4); `[questions] human_tools`; `CLAUDE_INTEGRATION_VERSION` bump. Until Q5, the `route` and `ask_operator` verdict is `deny` with "state the question and options in your final message and end your turn" | 380 | Q1 | Isolated flk with a throwaway Claude delegate: `AskUserQuestion` draws no dialog and the model gets the reason. A root agent's dialog draws as today, within 500 ms with the server stopped. A hinted delegate is denied with the fallback text when the server is stopped, `FLOCK_BIN` is missing, or a fake `flk` crashes or hangs. No process spawns for a non-shell, non-question tool | New method, gated. The old-server path is §4 |
+| Q3 #1181 | **Command gate** (§1a): shell-tool `tool.before` entries for Claude `Bash`, Codex `Bash` (with its trusted hash) and opencode `bash`; role-keyed deny-list shape and in-memory lookup on argv prefixes; deny reason naming the verb; fail open everywhere. ADR-0035 supplies the rows | 360 | Q1, Q2 | With a test row `delegate: gh pr merge`, a Claude and a Codex delegate running `gh pr merge 1` are refused with the reason, `echo hi` passes, and in an operator pane (no `FLOCK_GATE`) no `flk` process starts. With the server stopped, the command runs. A sandbox measurement of the gated call stays within p50 25 ms | Gate rows are server config; an old server answers `pass` by `server_version_gap` |
+| Q4 #1182 | `question.ask` (CLI and MCP): message-sourced question to the caller's architect, or to the operator for `ask_operator` and roots; options; `hold_ms` long-poll; wait registered; orphaned edge routed to the operator; `agent.question_routed` | 350 | Q1, E9a's `options` on `msg.send` (#1038), E5 (#1031), E6 (#1032) | A fake architect answering within hold returns `answered`. No answer returns `pending` and the delegate reads `waiting_on_event`, not `needs_human`. A later answer wakes it. An `ask_operator` agent's question lands in `flk question list` | New method, gated, exit 78 against an old server |
+| Q5 #1183 | Claude `answer` and `defer` verdicts: hold, `updatedInput.answers`, the `defer` reason, `ExitPlanMode` approve and reject, `[questions] hold_ms` and `wait_deadline` | 300 | Q2, Q4, E9b (#1039) | Sandbox probe: `flk question answer <id> --option 2` inside the hold returns option 2 to the model with no dialog. After the hold, the delegate ends its turn and is woken with the answer. Multi-select and Other round-trip. A plan-mode delegate's `ExitPlanMode` is approved by the architect with no dialog and the session leaves plan mode, and a rejection reaches the model as feedback (P18 as the acceptance test) | Fields only beyond Q2 |
+| Q6 #1184 | **Early Claude permission routing:** `PermissionRequest` entry; in-worktree requests routed to the architect as `allow once` / `deny`; widening requests offered only `escalate`; `[questions] architect_may_grant` | 280 | Q2, Q4, Q5 | A Claude delegate without bypass permissions asks to run a command in its worktree: the architect's `allow once` runs it with no dialog. A request for a path outside the worktree reaches the operator only through escalation | Additive; `onFailure: block` on `PermissionRequest` denies (docs) |
+| Q7 #1185 | Codex question adapter: `PreToolUse` on `request_user_input` with answer-in-reason and `defer`; fail-closed stub path; `hooks.json` entry and its trusted hash; `CODEX_INTEGRATION_VERSION` bump; P7 re-checked under flk's exact argv | 250 | Q2, Q4 | Probe: a Codex delegate's `request_user_input` is answered by the architect, and the model continues with the answer (the open point of §3). The trust hash covers only flk's entries | Codex re-reviews hooks whose hash changed. The installer re-trusts flk's own entries, as #626 does |
+| Q8 #1186 | opencode question adapter. Step 1: prove `Question.reply` and `client.permission.reply` from a plugin, and record what the model sees when `tool.execute.before` throws (the branch taken is recorded in the PR). Then `question.asked` → `hook.decide` → reply, or a throw with the answer; every await bounded; `OPENCODE_INTEGRATION_VERSION` bump | 300 | Q2, Q4 | Probe in an opencode TUI pane: the `question` tool is answered by the architect. A stalled flk never holds the plugin past its bound | Plugin only |
+| Q9 #1187 | Architect side: `question.escalate` with chained answers down the chain; digest `question` line; `delegate.list` column | 350 | Q4, E9b (#1039), #961 | A delegate → architect → operator chain: the operator's answer reaches the delegate, and each architect is told who answered | New method, gated |
+| Q10 #1188 | ADR-0030 rungs 4 and 5 exception (§5) in G2's ladder | 120 | Q4, G2 (#1035) | An architect parked on `any-delegate-of-mine changed` with an unanswered question in its inbox is not parked. An architect parked on two delegates is not parked while one waits on a question addressed to it | Server-internal |
+| Q11 #1189 | Re-addressing open questions on reassign and orphan (§2): `readdressed_from`, first answer wins across copies | 200 | Q4, ADR-0027 slice 9 (#969) | After `flk delegate reassign`, an open question appears for the new architect, and its answer wakes the delegate. After the architect's removal, the question appears for the operator | Additive field |
+| Q12 #1190 | Codex `PermissionRequest` and opencode `permission.asked` routing by §6's table | 280 | Q6, Q7, Q8 | One case per §6 row and harness: in-worktree requests are answered by the architect; widening reaches the operator only through escalation; a trust dialog is never routed | Additive |
+| Q13 #1191 | Elicitations: Claude `Elicitation` (form mode, no credential field) routed to the architect; Codex form elicitation off for `route` delegates; URL mode stays human | 180 | Q5 | A form elicitation from a test MCP server is answered by the architect with no dialog; a URL-mode one reaches the operator | Additive |
+| Q14 #1192 | **Mid-turn notice** (§1b): `notice?` in `hook.decide` replies; Claude and Codex adapters return it as `additionalContext`; once-per-item marking; opencode measured first, otherwise documented as next turn boundary | 220 | Q2, Q3; ADR-0035's *now* class (#1172) | A busy delegate running shell commands receives the pointer before its next command, exactly once. An agent with nothing pending receives nothing | Field only; an old hook ignores it |
+| Q15 #1193 | Verification and teaching: byte-exact manifest verification for every stub, entry and trust hash; `flk integration status` policy-point listing, including the fail-open cells of §4; `docs/next` pages; architect skill and brief template; ADR-0032 delegate-layer line | 300 | Q2, Q3, Q7, Q8 | `flk integration status` flags a hand-edited stub, a missing question entry and a managed lockout. A delegate's compiled context carries the line | Client and docs only |
+| Q16 #1194 | (owner decision 6 accepted it) The hook as the primary question source: for `ask_human` agents `hook.decide` observes the question tool (`agent.question_opened` with exact options) and returns `pass`; `tool.after` on the question tools reports `agent.question_answered`; screen detection stays the fallback | 250 | Q2, E9a (#1038) | A root agent's AskUserQuestion yields `agent.question_opened` with the exact options before the dialog draws, and the answer from `PostToolUse`. With the hook removed, the screen detector still opens the question | New kinds share E9a's; reader check per ADR-0028 §3a |
 
 **Order.**
 - **Now:** Q1 → Q2 → Q3 can land before the ADR-0028 slices. Q2 already ends
@@ -736,7 +756,7 @@ production lines, sized against the code they touch today (`src/cli/hook.rs`,
 - **Then:** Q7 and Q8 (Codex and opencode questions), Q9 after E9b, Q10 with
   G2, Q11 after ADR-0027 slice 9, Q12 and Q13 for the remaining prompts, Q14
   with ADR-0035's wake classes, and Q15 to close.
-- **Q16** rides on E9a if the owner accepts it. E9a's screen half is not on
+- **Q16** rides on E9a (owner decision 6 accepted it). E9a's screen half is not on
   this path, because routed questions are message-sourced.
 
 ## Consequences
@@ -870,47 +890,47 @@ production lines, sized against the code they touch today (`src/cli/hook.rs`,
   isolated flk instead of a fixed codeword (Q14).
 - **Rungs 4 and 5 exception:** ladder table cases in G2's tests.
 
-## Open questions for the owner
+## Owner decisions
 
-Each has a recommendation. Accepting the ADR accepts the recommended answer
-unless the owner says otherwise.
+Decided by the owner on 2026-10-13 (#1160): all eleven questions were
+accepted as recommended. Each rejected alternative is kept for the record.
 
-1. **Default for delegates once the hook is installed.** Recommended: `route`
+1. **Default for delegates once the hook is installed.** Decided: `route`
    by default, with `[questions] enabled = false` as the off switch.
-   Alternative: opt-in per architect, which leaves today's unwatched dialogs
+   Rejected: opt-in per architect, which leaves today's unwatched dialogs
    as the default.
-2. **Orphaned delegates' questions.** Recommended: route to the operator
-   (§2), consistent with ADR-0027 §1a. Alternative: `deny`, which keeps the
+2. **Orphaned delegates' questions.** Decided: route to the operator
+   (§2), consistent with ADR-0027 §1a. Rejected: `deny`, which keeps the
    operator out but leaves the delegate guessing.
-3. **Hold and deadline defaults.** Recommended: `hold_ms` 120 s (inside the
+3. **Hold and deadline defaults.** Decided: `hold_ms` 120 s (inside the
    prompt-cache window) and `wait_deadline` 2 h.
-4. **May an architect grant authority-widening permissions?** Recommended:
+4. **May an architect grant authority-widening permissions?** Decided:
    no by default, with classes opted in through `[questions]
    architect_may_grant` (§6).
-5. **Remote delegates started over `ssh`.** Recommended: architects pass
+5. **Remote delegates started over `ssh`.** Decided: architects pass
    `--questions deny` until mesh-attested edges exist (ADR-0027 §8). The
    architect skill says so.
 6. **Hook as the primary question source for every agent** (the §9 amendment
-   to ADR-0028 §8a). Recommended: yes. It gives E9a exact options for roots
+   to ADR-0028 §8a). Decided: yes. It gives E9a exact options for roots
    too, and leaves screen detection as the fallback.
-7. **Escalation verb vs a free re-ask.** Recommended: ship
+7. **Escalation verb vs a free re-ask.** Decided: ship
    `question.escalate` (§5), so an operator's answer flows down the chain
    automatically. The root architect's own question tool stays allowed.
-8. **The fail-closed exception to ADR-0030 §7** (§4). Recommended: accept
-   it for question points on hinted panes only. Alternative: fail open
+8. **The fail-closed exception to ADR-0030 §7** (§4). Decided: accept
+   it for question points on hinted panes only. Rejected: fail open
    there too, which shows the dialog to nobody whenever the server is down.
-9. **The ADR-0030 rung 4 and 5 amendment** (§5). Recommended: accept both
+9. **The ADR-0030 rung 4 and 5 amendment** (§5). Decided: accept both
    clauses, so an owed answer is never mistaken for parking.
-10. **Default for roots nobody watches** (§2). Recommended: agents the server
+10. **Default for roots nobody watches** (§2). Decided: agents the server
     starts itself (ADR-0035 owner episodes, cron and trigger starts, any
     `--unattended` start) default to `ask_operator`, so their questions reach
     the operator as structured questions (`flk question list`, the
-    notification log, channels under E9c). Alternative: `ask_human`, which
+    notification log, channels under E9c). Rejected: `ask_human`, which
     draws dialogs nobody sees, or `deny`, which silences an owner that
     legitimately needs the operator.
-11. **Early Claude permission routing** (Q6). Recommended: route Claude
+11. **Early Claude permission routing** (Q6). Decided: route Claude
     delegates' in-worktree permission prompts to the architect right after
     Q5, since flk passes Claude delegates no permission flags today.
-    Alternative: start Claude delegates with a permission mode that never
+    Rejected: start Claude delegates with a permission mode that never
     prompts, which would widen their authority without anyone deciding it
     per action.
