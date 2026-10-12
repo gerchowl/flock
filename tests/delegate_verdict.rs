@@ -22,6 +22,9 @@ struct Pane {
     registry: PathBuf,
     socket: PathBuf,
     calls: Arc<AtomicUsize>,
+    /// `wait_ms` of each held `events.read`, when the fake plays a server
+    /// with it (#1030).
+    holds: Arc<Mutex<Vec<u64>>>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -48,6 +51,33 @@ impl Pane {
     }
 
     fn samples(frames: Vec<(String, String, String)>) -> Self {
+        Self::serve(frames, false, false)
+    }
+
+    /// A settled pane whose server stops answering `agent.result` for the
+    /// first 25 s it is asked, holding each request past the client's
+    /// timeout, then answers `DONE` (#1121). Each poll retries for about 9 s
+    /// before it fails, so 25 s fails polls on both sides of the 10 s grace.
+    fn stalling_results(status: &str, screen: &str) -> Self {
+        Self::serve(
+            vec![(status.into(), screen.into(), "term_fixture:0:1:2:i".into())],
+            false,
+            true,
+        )
+    }
+
+    /// A pane on a server at protocol 28, which has `events.read`: it holds
+    /// each read for its whole `wait_ms` and reports no event, as a working
+    /// agent whose screen changes raises none (#1030).
+    fn evented(status: &str, screen: &str) -> Self {
+        Self::serve(
+            vec![(status.into(), screen.into(), "term_fixture:0:1:1:w".into())],
+            true,
+            false,
+        )
+    }
+
+    fn serve(frames: Vec<(String, String, String)>, evented: bool, stall_results: bool) -> Self {
         let suffix = format!(
             "{}-{}",
             std::process::id(),
@@ -65,6 +95,9 @@ impl Pane {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let counted = calls.clone();
+        let mut stall_until: Option<Instant> = None;
+        let holds = Arc::new(Mutex::new(Vec::new()));
+        let held = holds.clone();
 
         let worker = thread::spawn(move || {
             let mut frame = 0usize;
@@ -126,10 +159,44 @@ impl Pane {
                             .contains(&request["params"]["source"].as_str().unwrap_or_default()));
                         json!({"read": {"text": frames[frame].1}})
                     }
+                    "agent.result"
+                        if stall_results
+                            && Instant::now()
+                                < *stall_until
+                                    .get_or_insert(Instant::now() + Duration::from_secs(25)) =>
+                    {
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_secs(3));
+                            drop(stream);
+                        });
+                        continue;
+                    }
                     "agent.result" => {
                         json!({"result": {"finished": true, "at_ms": 2, "status": "done", "text": "DONE: recovered"}})
                     }
-                    "workspace.get" => {
+                    "ping" if evented => {
+                        json!({"type": "pong", "version": "1.2.0", "protocol": 28})
+                    }
+                    "events.read" if request["params"]["after"] == u64::MAX => {
+                        let _ = writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"], "error": {"code": "cursor_ahead",
+                                "message": "cursor is past this server's newest event 0; read from 0 or 0",
+                                "data": {"head": 0}}})
+                        );
+                        let _ = stream.read(&mut [0_u8; 1]);
+                        continue;
+                    }
+                    "events.read" => {
+                        let wait_ms = request["params"]["wait_ms"].as_u64().unwrap_or(0);
+                        held.lock().unwrap().push(wait_ms);
+                        thread::sleep(Duration::from_millis(wait_ms.min(15_000)));
+                        json!({"events": [], "next_after": 0})
+                    }
+                    // #1030: no `ping` answer leaves the client without a
+                    // protocol, so it polls, which is what these tests count.
+                    "ping" | "workspace.get" => {
                         let _ = writeln!(
                             stream,
                             "{}",
@@ -180,6 +247,7 @@ impl Pane {
             base,
             socket,
             calls,
+            holds,
             stop,
             worker: Some(worker),
         }
@@ -413,6 +481,63 @@ fn delegate_silence_stalls_a_working_pane_and_status_remembers_the_verdict() {
         .output()
         .unwrap();
     assert_eq!(Pane::json(&status)["verdict"], "stalled");
+}
+
+/// #1030: on a server with `events.read`, nothing wakes the wait while a
+/// working screen stays the same, so the hold must end when the silence
+/// window does. Held for the 10 s resample instead, `--silence 1s` reported
+/// the stall about 10 s late.
+#[test]
+fn delegate_silence_fires_on_time_when_the_wait_is_evented() {
+    let pane = Pane::evented("working", "tool has stopped changing\n\n");
+    let started = Instant::now();
+    let out = pane.wait_for_verdict(&[
+        "delegate",
+        "wait",
+        "fixture",
+        "--silence",
+        "1s",
+        "--timeout",
+        "30000",
+        "--json",
+    ]);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value = Pane::json(&out);
+    assert_eq!(value["outcome"], "stalled");
+    assert_eq!(value["reason"], "silence");
+    let holds = pane.holds.lock().unwrap().clone();
+    assert!(!holds.is_empty(), "the wait never held an events.read");
+    assert!(holds.iter().all(|ms| *ms <= 1_000), "{holds:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "stalled after {elapsed:?}"
+    );
+}
+
+/// #1121: a server that stops answering during the reply grace is not an
+/// agent with no result. With no `--timeout`, as the report's waits ran, the
+/// stall outlasts the 10 s grace; the wait keeps asking and reports the reply
+/// once the server answers, never `no_result`.
+#[test]
+fn delegate_wait_never_reports_no_result_for_a_server_that_stopped_answering() {
+    let pane = Pane::stalling_results("idle", "> \n");
+    let started = Instant::now();
+    let out = pane.wait_for_verdict(&["delegate", "wait", "fixture", "--settle", "100", "--json"]);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{} after {elapsed:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(Pane::json(&out)["outcome"], "done");
+    assert!(elapsed >= Duration::from_secs(25), "{elapsed:?}");
 }
 
 #[test]

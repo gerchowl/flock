@@ -166,7 +166,7 @@ fn head_cursor() -> std::io::Result<Result<u64, Value>> {
     Ok(cursor_ahead_head(&response).ok_or(response))
 }
 
-fn cursor_ahead_head(response: &Value) -> Option<u64> {
+pub(super) fn cursor_ahead_head(response: &Value) -> Option<u64> {
     let error = &response["error"];
     if error["code"] != "cursor_ahead" {
         return None;
