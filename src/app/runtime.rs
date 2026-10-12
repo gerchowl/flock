@@ -715,8 +715,9 @@ impl App {
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
-            // ADR-0028 §2: the next agent-state sample for derived events.
-            self.agent_phases.next_deadline(),
+            // ADR-0028 §2: a touched agent, or the close of a pending
+            // phase's settle window. None while nothing is pending.
+            self.agent_phases.next_deadline(now),
             // #850: a lease ends on its bound even in a quiet loop, so held
             // keystrokes never wait for unrelated traffic.
             self.next_injection_lease_deadline(),
