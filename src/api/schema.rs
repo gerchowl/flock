@@ -2372,6 +2372,19 @@ pub enum EventKind {
     /// here; the BYTES never do. A JSONL audit log is not a blob store, and
     /// ADR-0005's rotation should not be holding 16 MB of base64 hostage.
     FileHandedOver,
+    /// ADR-0028 §2 (#1027): derived supervisor facts, emitted once a phase
+    /// has held for the server settle window. `AgentNeedsHuman`,
+    /// `AgentLimitReached` and `AgentGone` repeat the `AgentPhaseChanged` that
+    /// entered that phase as a kind of their own, for notification routing.
+    /// See `EventData::AgentPhaseChanged`.
+    #[serde(rename = "agent.phase_changed")]
+    AgentPhaseChanged,
+    #[serde(rename = "agent.needs_human")]
+    AgentNeedsHuman,
+    #[serde(rename = "agent.limit_reached")]
+    AgentLimitReached,
+    #[serde(rename = "agent.gone")]
+    AgentGone,
     /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
     /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
     #[serde(rename = "pr.ci_completed")]
@@ -2445,6 +2458,10 @@ impl EventKind {
             | Self::NotificationFiled
             | Self::NotificationSeen
             | Self::FileHandedOver
+            | Self::AgentPhaseChanged
+            | Self::AgentNeedsHuman
+            | Self::AgentLimitReached
+            | Self::AgentGone
             | Self::PrCiCompleted
             | Self::PrMerged
             | Self::PrClosed
@@ -3625,6 +3642,25 @@ pub struct PaneAgentStatusChangedEvent {
     pub state_labels: HashMap<String, String>,
 }
 
+/// A settled phase transition of one local agent (ADR-0028 §2, #1027).
+/// `from` is `unknown` for the first transition a server announces for an
+/// agent its log has no earlier phase for. Phases read leniently, so a
+/// newer server's phase never makes the line unreadable (§3a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPhaseEvent {
+    pub agent_id: String,
+    /// The public pane id the agent ran in.
+    pub pane: String,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub from: crate::api::agent_state::Phase,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub to: crate::api::agent_state::Phase,
+    /// The `state` that settled into `to`, as `agent.get` reported it.
+    pub state: crate::api::agent_state::AgentState,
+    /// How long `to` had held when it was announced.
+    pub held_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
@@ -4100,6 +4136,17 @@ pub enum EventData {
         origin_host: String,
         received_at_ms: u64,
     },
+    /// ADR-0028 §2 (#1027): a settled phase transition. Every
+    /// `agent.needs_human`, `agent.limit_reached` and `agent.gone` carries the
+    /// same payload as the `agent.phase_changed` it accompanies.
+    #[serde(rename = "agent.phase_changed")]
+    AgentPhaseChanged(AgentPhaseEvent),
+    #[serde(rename = "agent.needs_human")]
+    AgentNeedsHuman(AgentPhaseEvent),
+    #[serde(rename = "agent.limit_reached")]
+    AgentLimitReached(AgentPhaseEvent),
+    #[serde(rename = "agent.gone")]
+    AgentGone(AgentPhaseEvent),
     /// #1020: every check on `head_sha` has concluded. `conclusion` is the
     /// rollup (`success`, `failure`, `error`).
     #[serde(rename = "pr.ci_completed")]
