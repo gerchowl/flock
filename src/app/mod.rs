@@ -41,6 +41,7 @@ pub(crate) mod mailboxes;
 pub(crate) mod message_relay;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
+pub(crate) mod owners;
 mod peer_checkout;
 mod runtime;
 mod session;
@@ -184,8 +185,11 @@ pub struct App {
     pub(crate) delegations: delegation::DelegationIndex,
     /// ADR-0030 §1: goals by `AgentId`, folded in the same start pass.
     pub(crate) goals: goals::GoalIndex,
-    /// The `EventHub::rotations` value the open goals were last re-issued at.
-    pub(crate) goal_rotations_seen: u64,
+    /// ADR-0035 §1: owner bindings by repo slug, folded in the same pass.
+    pub(crate) owners: owners::OwnerIndex,
+    /// The `EventHub::rotations` value the open goals and the owner bindings
+    /// were last re-issued at.
+    pub(crate) record_rotations_seen: u64,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
     /// Mail requests that arrived while the recovery worker was still
@@ -1001,7 +1005,8 @@ impl App {
             pending_agent_removals: Default::default(),
             delegations: Default::default(),
             goals: Default::default(),
-            goal_rotations_seen: 0,
+            owners: Default::default(),
+            record_rotations_seen: 0,
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
             recovery_parked: Vec::new(),

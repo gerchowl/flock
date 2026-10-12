@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
     EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
-    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
+    MsgSendParams, OwnerRepoParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams,
+    WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -430,6 +431,18 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_events_read,
             build: build_events_read,
         },
+        Tool {
+            name: "flock_owner_show",
+            description: "Return a repo's resident-owner binding (ADR-0035 \
+                          §1), read-only: home `node`, the owner's \
+                          `agent_id`, `checkout`, `harness`, `model`, \
+                          `profiles` and `since_ms`. `repo` is the GitHub \
+                          slug `owner/name`. Binding is an operator verb and \
+                          is not reachable from MCP. Refusal: `not_found` \
+                          (no owner is bound to the repo on this node).",
+            input_schema: schema_owner_show,
+            build: build_owner_show,
+        },
     ]
 }
 
@@ -557,6 +570,20 @@ fn schema_delegate_list() -> Value {
                 "description": "Only edges in this repository (the edge's repo key).",
             },
         },
+        "additionalProperties": false,
+    })
+}
+
+fn schema_owner_show() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repo": {
+                "type": "string",
+                "description": "GitHub slug of the repo, `owner/name`.",
+            },
+        },
+        "required": ["repo"],
         "additionalProperties": false,
     })
 }
@@ -893,6 +920,12 @@ fn build_worktree_kill(args: Value) -> Result<Method, McpError> {
 fn build_agent_get(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentGet(AgentTarget {
         target: required_string(&args, "target")?,
+    }))
+}
+
+fn build_owner_show(args: Value) -> Result<Method, McpError> {
+    Ok(Method::OwnerShow(OwnerRepoParams {
+        repo: required_string(&args, "repo")?,
     }))
 }
 
@@ -1566,6 +1599,19 @@ mod tests {
         assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
     }
 
+    /// ADR-0035 §1: MCP reads an owner binding and never writes one.
+    #[test]
+    fn owner_show_is_a_read_and_no_tool_binds() {
+        let method = build_owner_show(json!({"repo": "example/widgets"})).unwrap();
+        assert!(matches!(&method, Method::OwnerShow(p) if p.repo == "example/widgets"));
+        assert!(method.is_retry_safe() && !method.needs_current_protocol());
+        assert!(build_owner_show(json!({})).is_err());
+        assert!(!table().iter().any(|tool| matches!(
+            (tool.build)(json!({"repo": "a/b", "target": "x"})),
+            Ok(Method::OwnerBind(_) | Method::OwnerUnbind(_))
+        )));
+    }
+
     #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
@@ -1597,6 +1643,7 @@ mod tests {
                 "flock_agent_history",
                 "flock_agent_result",
                 "flock_events_read",
+                "flock_owner_show",
             ]
         );
     }

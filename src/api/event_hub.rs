@@ -963,6 +963,75 @@ mod tests {
         cleanup(&path);
     }
 
+    /// ADR-0028 §3a for the owner kinds (ADR-0035 §1), the way the goal
+    /// kinds are proved above: renamed to kinds no build knows, the
+    /// `owner_bound` and `owner_unbound` lines are skipped, not quarantined.
+    #[test]
+    fn a_reader_without_the_owner_kinds_skips_their_lines() {
+        use crate::api::schema::{OwnerBinding, OwnerHarness};
+        let path = temp_log("owner-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let binding = OwnerBinding {
+            repo: "example/widgets".into(),
+            node: "node-a".into(),
+            agent_id: "agent_a".into(),
+            checkout: "/srv/widgets".into(),
+            harness: OwnerHarness::Claude,
+            model: None,
+            profiles: vec!["main".into()],
+            since_ms: 1,
+        };
+        for (event, data) in [
+            (
+                EventKind::OwnerBound,
+                EventData::OwnerBound {
+                    binding,
+                    reissued: true,
+                },
+            ),
+            (
+                EventKind::OwnerUnbound,
+                EventData::OwnerUnbound {
+                    repo: "example/widgets".into(),
+                },
+            ),
+        ] {
+            assert!(event.is_persisted(), "{event:?} must persist");
+            hub.push(EventEnvelope { event, data });
+        }
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        let mut owner_lines = 0;
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            if kind.as_str().unwrap().starts_with("owner_") {
+                owner_lines += 1;
+                *kind = serde_json::Value::String(format!("unknown_{}", kind.as_str().unwrap()));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        assert_eq!(owner_lines, 2);
+        std::fs::write(&path, renamed).unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "owner lines must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        assert_eq!(
+            restarted.current_sequence(),
+            3,
+            "skipped owner seqs stay spent"
+        );
+        cleanup(&path);
+    }
+
     /// Skipping is for kinds this binary does not know. A known kind with
     /// malformed data is corruption, and must still be caught.
     #[test]

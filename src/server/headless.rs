@@ -558,7 +558,7 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
-            self.app.reissue_goals_after_rotation();
+            self.app.reissue_records_after_rotation();
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;

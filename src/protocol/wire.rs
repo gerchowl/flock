@@ -109,7 +109,10 @@ use serde::{Deserialize, Serialize};
 /// it as an unknown variant, which the client normalizes to exit 78.
 /// v29 adds `channel.hello` (#1037). A channel adapter refuses to start below
 /// it, through the #868 skew gate.
-pub const PROTOCOL_VERSION: u32 = 29;
+/// v30 adds `owner.bind`, `owner.unbind`, `owner.list` and `owner.show`
+/// (ADR-0035 §1, #1196). Bind and unbind are gated by #868, so an older
+/// server is never sent them.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -1850,7 +1853,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 29;
+    const PINNED_PROTOCOL_VERSION: u32 = 30;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

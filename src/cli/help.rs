@@ -308,6 +308,10 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("events", "read", super::events::READ_USAGE),
     ("events", "wait", super::events::WAIT_USAGE),
     ("adapter", "hello", super::adapter::HELLO_USAGE),
+    ("owner", "bind", super::owner::BIND_USAGE),
+    ("owner", "unbind", super::owner::UNBIND_USAGE),
+    ("owner", "list", super::owner::LIST_USAGE),
+    ("owner", "show", super::owner::SHOW_USAGE),
     ("checks", "list", "flk checks list"),
     ("checks", "ack", "flk checks ack <name>"),
     ("checks", "run", "flk checks run <name>"),
@@ -619,6 +623,7 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
+            "owner" => include_str!("owner.rs"),
             // These six live inline in the dispatcher itself.
             "config" | "channel" | "terminal" | "wait" | "session" | "hook" => {
                 include_str!("../cli.rs")

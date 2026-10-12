@@ -552,6 +552,7 @@ fn run() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
         println!("       flk adapter hello <binding> ...");
+        println!("       flk owner <bind|unbind|list|show> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
@@ -629,6 +630,10 @@ fn run() -> io::Result<()> {
             (
                 "flk adapter hello <binding>",
                 "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk owner <bind|unbind|list|show>",
+                "Bind a repo to its resident owner (operator only), or read the bindings",
             ),
             (
                 "flk session <subcommand>",
