@@ -120,7 +120,7 @@ const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent na
 
 pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
-pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  Use pane send-keys for control keys (Enter, C-c, Esc).";
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
 pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
