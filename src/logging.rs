@@ -497,6 +497,19 @@ pub(crate) fn channel_hello(binding: &str, refused: Option<&'static str>) {
     }
 }
 
+/// An untrusted token file (empty, malformed, too open) was replaced with a
+/// new token (#1037). Never the token.
+pub(crate) fn channel_token_reissued(binding: &str, reason: &'static str) {
+    tracing::warn!(
+        event = "channel.token.reissued",
+        subsystem = "channel",
+        outcome = "recovered",
+        binding,
+        reason,
+        "channel token reissued"
+    );
+}
+
 /// A binding's capability token could not be issued (#1037).
 pub(crate) fn channel_token_issue_failed(binding: &str, err: &str) {
     tracing::warn!(

@@ -824,13 +824,19 @@ scopes = ["notify", "reply"]      # any of notify, send_to_agent, reply
 | Key | Meaning |
 | --- | --- |
 | `name` | Names the binding, its token file and, in a later release, the inbound sender `channel:<name>/<user>`. |
-| `owner_node` | Compared with this node's `name`, or with the host name when `name` is unset. Only the owner issues the token and accepts the adapter. There is no failover: when the owner is offline, the channel is quiet. To move a binding, change `owner_node`. |
+| `owner_node` | Compared with this node's `name`, or with the host name when `name` is unset. The server reads its own name once per process, so changing `name` takes effect on restart, not on reload. Changing `owner_node` takes effect on reload. Only the owner issues the token and accepts the adapter. There is no failover: when the owner is offline, the channel is quiet. To move a binding, change `owner_node`. |
 | `target` | What the binding is about: the whole fleet, one repo or one agent. |
 | `scopes` | What the adapter may do: `notify` (receive events), `send_to_agent` (mail an agent), `reply` (answer an agent's question). This release reports scopes in `channel.hello`. Enforcement arrives with the inbound and outbound methods. |
 
 An entry with an invalid name, no `owner_node` or a duplicate name is dropped with a diagnostic, and the rest of the config still applies. Unknown keys in an entry make the whole `channels` section invalid, and a reload keeps the previous bindings.
 
-**Tokens.** At startup and on every config reload, the owner node issues a token for each binding it owns that has none yet. Each token is 32 random bytes, hex-encoded, written to `<data dir>/channel-tokens/<name>.token` with mode 0600 in a 0700 directory. The data dir is the directory that holds `config.toml` and the flock logs. Give the adapter that file, or the path to it. The server reads the file on every check, so:
+**Tokens.** At startup and on every config reload, the owner node issues a token for each binding it owns that has no trusted token yet. Each token is 32 random bytes, hex-encoded (64 lowercase hex digits, no newline), written to `<data dir>/channel-tokens/<name>.token`. The data dir is the directory that holds `config.toml` and the flock logs. Give the adapter that file, or the path to it.
+
+- **Trusted files only.** The server trusts a token file only when it is a regular file (not a symlink), owned by the user running the server, with mode exactly 0600, holding a well-formed token. Any other file matches no hello. At the next startup or reload, such a file (empty, malformed, too open, owned by someone else) is replaced by a new token, and the server logs `channel.token.reissued` with the binding and the reason (`malformed`, `not_private`, `unreadable`), never the token. A file that was readable by others is therefore rotated, not reused.
+- **Crash safety.** A token is written to a temp file in the same directory, flushed to disk, then hard-linked into place. A crash can leave a stray `.<random>.tmp` file, but never an empty or partial token under the binding's name.
+- **The directory.** `channel-tokens/` is created 0700. If it already exists and the server's user owns it, it is tightened back to 0700 on every issue. If another user owns it, the server issues nothing into it and logs `channel.token.issue_failed`. That binding then refuses every hello until the directory is fixed.
+
+The server reads the file on every check, so:
 
 - to **revoke** a binding, delete its token file, and the next hello is refused;
 - to **rotate**, delete the file and run `flk server reload-config`, which issues a new token;

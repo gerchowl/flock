@@ -3,17 +3,26 @@
 //!
 //! A binding is a `[[channels]]` entry in config. The node named in its
 //! `owner_node` issues one capability token for it into
-//! `<data dir>/channel-tokens/<name>.token` (mode 0600, in a 0700 directory)
-//! at startup and on every config reload, and an adapter proves it may serve
-//! the binding by presenting that token in `channel.hello`. The token never
-//! reaches a log, an event or a response: the server compares SHA-256 digests
-//! in constant time and logs only the binding name and the refusal reason.
-//! The file is read on every check, so deleting it revokes the binding at
-//! once, and a reload then issues a new token.
+//! `<data dir>/channel-tokens/<name>.token` at startup and on every config
+//! reload, and an adapter proves it may serve the binding by presenting that
+//! token in `channel.hello`. The token never reaches a log, an event or a
+//! response: the server compares SHA-256 digests in constant time and logs
+//! only the binding name and the refusal reason.
+//!
+//! A token file is trusted only when it is a regular file owned by this user
+//! with mode 0600 holding 64 lowercase hex digits. Issuing writes a temp file
+//! in the same directory, fsyncs it and hard-links it into place, so a crash
+//! never leaves a partial token behind a valid name. A file that fails the
+//! check (empty, malformed, too open, someone else's) is replaced the same way
+//! on the next startup or reload, logged with the reason. The directory is
+//! tightened to 0700 when this user owns it and refused otherwise. The file is
+//! read on every check, so deleting it revokes the binding at once, and a
+//! reload then issues a new token.
 
 use std::fmt;
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -124,43 +133,104 @@ pub(crate) fn token_path(name: &str) -> PathBuf {
         .join(format!("{name}.token"))
 }
 
-/// Issue a token for every binding `node` owns that has none yet. A failure
-/// is logged and leaves that binding refusing every hello.
+/// Issue a token for every binding `node` owns that has no valid one yet. A
+/// failure is logged and leaves that binding refusing every hello.
 pub(crate) fn issue_tokens(bindings: &[ChannelBinding], node: &str) {
     for binding in bindings.iter().filter(|b| b.owner_node == node) {
-        if let Err(err) = issue_token(&token_path(&binding.name)) {
-            crate::logging::channel_token_issue_failed(&binding.name, &err.to_string());
+        match issue_token(&token_path(&binding.name)) {
+            Ok(Some(reason)) => crate::logging::channel_token_reissued(&binding.name, reason),
+            Ok(None) => {}
+            Err(err) => {
+                crate::logging::channel_token_issue_failed(&binding.name, &err.to_string());
+            }
         }
     }
 }
 
-fn issue_token(path: &Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+fn euid() -> u32 {
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// The token in `path` if the file is trusted, else why not.
+fn read_token(path: &Path) -> Result<String, &'static str> {
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err("missing"),
+        Err(_) => return Err("unreadable"),
+    };
+    let meta = file.metadata().map_err(|_| "unreadable")?;
+    if !meta.is_file() || meta.uid() != euid() || meta.mode() & 0o777 != 0o600 {
+        return Err("not_private");
     }
-    let mut random = [0u8; 32];
+    let mut token = String::new();
+    file.read_to_string(&mut token).map_err(|_| "unreadable")?;
+    let valid = token.len() == 64
+        && token
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    valid.then_some(token).ok_or("malformed")
+}
+
+/// Make sure `path` holds a trusted token. `Some(reason)` when an untrusted
+/// file was replaced.
+fn issue_token(path: &Path) -> io::Result<Option<&'static str>> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by this user", dir.display()),
+        ));
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    let replaced = match read_token(path) {
+        Ok(_) => return Ok(None),
+        Err("missing") => None,
+        Err(reason) => {
+            fs::remove_file(path)?;
+            Some(reason)
+        }
+    };
+    let mut random = [0u8; 40];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
-    let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    match std::fs::OpenOptions::new()
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let temp = dir.join(format!(".{}.tmp", hex(&random[32..])));
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-    {
-        Ok(mut file) => file.write_all(token.as_bytes()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(err) => Err(err),
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    let linked = file
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.write_all(hex(&random[..32]).as_bytes()))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::hard_link(&temp, path));
+    let _ = fs::remove_file(&temp);
+    match linked {
+        // Another issuer linked a complete token first.
+        Err(err) if err.kind() != io::ErrorKind::AlreadyExists => return Err(err),
+        _ => {}
     }
+    fs::File::open(dir)?.sync_all()?;
+    Ok(replaced)
 }
 
 /// Why a `channel.hello` was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HelloRefusal {
-    /// An unknown binding or a token that does not match. One answer for
-    /// both, so a wrong guess learns nothing about which binding exists.
+    /// An unknown binding or a token that does not match: one answer for
+    /// both. `NotOwner` is checked first, so anyone who can reach the socket
+    /// can learn binding names and owners, never a token.
     Unauthorized,
     NotOwner {
         owner: String,
@@ -192,13 +262,10 @@ pub(crate) fn hello<'a>(
 }
 
 fn token_matches(path: &Path, presented: &ChannelToken) -> bool {
-    let Ok(issued) = std::fs::read_to_string(path) else {
+    let Ok(issued) = read_token(path) else {
         return false;
     };
-    if issued.trim().is_empty() {
-        return false;
-    }
-    let issued = Sha256::digest(issued.trim().as_bytes());
+    let issued = Sha256::digest(issued.as_bytes());
     let presented = Sha256::digest(presented.0.trim().as_bytes());
     let diff = issued
         .iter()
@@ -275,31 +342,66 @@ mod tests {
 
     #[test]
     fn an_issued_token_is_private_kept_and_matched_only_exactly() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("flk-chan-{}", std::process::id()));
         let path = dir.join("tokens/phone.token");
-        issue_token(&path).unwrap();
-        let issued = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(issue_token(&path).unwrap(), None);
+        let issued = fs::read_to_string(&path).unwrap();
         assert_eq!(issued.len(), 64);
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
-        issue_token(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), issued, "kept");
+        assert_eq!(issue_token(&path).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), issued, "kept");
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temp file is left behind");
 
         assert!(token_matches(&path, &ChannelToken(issued.clone())));
         assert!(!token_matches(&path, &ChannelToken(issued[1..].to_owned())));
         assert!(!token_matches(&path, &ChannelToken(String::new())));
-        std::fs::write(&path, "").unwrap();
-        assert!(
-            !token_matches(&path, &ChannelToken(String::new())),
-            "an empty file matches nothing"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
         assert!(
             !token_matches(&path, &ChannelToken(issued)),
             "a deleted file revokes"
         );
+    }
+
+    /// A crash between create and write used to leave an empty token file
+    /// that counted as issued and refused every hello forever.
+    #[test]
+    fn an_empty_or_too_open_token_file_is_never_trusted_and_is_reissued() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-bad-{}", std::process::id()));
+        let path = dir.join("tokens/phone.token");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert!(!token_matches(&path, &ChannelToken(String::new())));
+        assert_eq!(read_token(&path), Err("malformed"));
+
+        assert_eq!(issue_token(&path).unwrap(), Some("malformed"));
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(path.parent().unwrap()),
+            0o700,
+            "an owned dir is tightened"
+        );
+        let recovered = fs::read_to_string(&path).unwrap();
+        assert!(token_matches(&path, &ChannelToken(recovered.clone())));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!token_matches(&path, &ChannelToken(recovered.clone())));
+        assert_eq!(issue_token(&path).unwrap(), Some("not_private"));
+        let rotated = fs::read_to_string(&path).unwrap();
+        assert_ne!(
+            rotated, recovered,
+            "a token that was readable by others is rotated"
+        );
+        assert!(token_matches(&path, &ChannelToken(rotated)));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
