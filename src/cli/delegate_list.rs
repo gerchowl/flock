@@ -82,8 +82,7 @@ pub(super) fn delegate_list(args: &[String]) -> io::Result<i32> {
         println!("{result}");
         return Ok(exit::SUCCESS);
     }
-    let rows: Vec<DelegateRow> =
-        serde_json::from_value(result["delegates"].clone()).map_err(io::Error::other)?;
+    let rows = rows(&result).map_err(io::Error::other)?;
     if rows.is_empty() {
         eprintln!("no open delegate edges");
     }
@@ -95,6 +94,11 @@ pub(super) fn delegate_list(args: &[String]) -> io::Result<i32> {
 /// MCP `flock_delegate_list` hands back.
 pub(crate) fn json_output(response: &Value) -> Value {
     response.get("result").cloned().unwrap_or(Value::Null)
+}
+
+/// The rows of a `delegate.list` result, as the CLI renders them.
+pub(crate) fn rows(result: &Value) -> serde_json::Result<Vec<DelegateRow>> {
+    serde_json::from_value(result["delegates"].clone())
 }
 
 /// One block per architect, in id order.

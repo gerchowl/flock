@@ -113,10 +113,7 @@ impl App {
             .workspaces
             .iter()
             .filter(|ws| ws.branch().as_deref() == Some(branch))
-            .filter(|ws| {
-                edge.repo.is_none()
-                    || ws.worktree_space_here().map(|space| &space.key) == edge.repo.as_ref()
-            })
+            .filter(|ws| edge.repo.is_none() || ws.repo_group_key() == edge.repo.as_deref())
             .find_map(|ws| ws.pr_state())
     }
 }
@@ -287,6 +284,13 @@ mod handler_tests {
         want.sort();
         assert_eq!(delegates_of(&a_rows), want);
 
+        // A's own `--mine`, run from A's pane, is exactly A's three.
+        app.test_pane_child_pids.clear();
+        assert_eq!(caller_is_an_agent(&mut app), a);
+        let a_mine = list(&mut app, &["--mine"]).expect("a lists");
+        assert_eq!(delegates_of(&a_mine), want);
+        app.current_api_peer_pid = None;
+
         let all = list(&mut app, &["--all"]).expect("all");
         let mut want_all = want.clone();
         want_all.push((b.clone(), b_delegate));
@@ -348,6 +352,26 @@ mod handler_tests {
         app.delegations
             .insert(edge("agent_removed", "feat/removed", EdgeState::Live));
         app.delegations.mark_gone("agent_removed");
+        // A workspace known only by its cached git space, with no worktree
+        // membership, still carries the PR for an edge that names its repo.
+        let mut space_only = crate::workspace::Workspace::test_new("space-only");
+        space_only.cached_git_branch = Some("feat/space".into());
+        space_only.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "/repo/.git".into(),
+            checkout_key: "/repo".into(),
+            label: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+            project_key: "dir:repo".into(),
+        });
+        space_only.pr_state = Some(PrStateInfo {
+            state: PrState::Merged,
+            number: 626,
+        });
+        app.state.workspaces.push(space_only);
+        let mut in_repo = edge("agent_space", "feat/space", EdgeState::Live);
+        in_repo.repo = Some("/repo/.git".into());
+        app.delegations.insert(in_repo);
 
         let owner = list(&mut app, &["--all", "--branch", "feat/open"]).expect("by branch");
         assert_eq!(owner.len(), 1);
@@ -366,6 +390,12 @@ mod handler_tests {
             Some("closed, not merged")
         );
         assert_eq!(state("agent_removed").as_deref(), Some("gone"));
+        let space_pr = rows
+            .iter()
+            .find(|row| row.delegate == "agent_space")
+            .and_then(|row| row.pr.clone())
+            .expect("the PR of a workspace matched by its git space");
+        assert_eq!((space_pr.number, space_pr.state.as_str()), (626, "merged"));
 
         // The operator has no pane, so it has no `self`.
         let refused = list(&mut app, &["--mine"]).expect_err("operator self");

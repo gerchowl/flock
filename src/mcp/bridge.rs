@@ -482,7 +482,8 @@ mod tests {
                 state: "closed".into(),
             }),
         };
-        let raw = json!({"id": "mcp:1", "result": {"type": "delegate_list", "delegates": [row]}});
+        let raw =
+            json!({"id": "mcp:1", "result": {"type": "delegate_list", "delegates": [row.clone()]}});
         for (cli, mcp) in [
             (
                 vec!["--all", "--branch", "feat/614"],
@@ -503,8 +504,13 @@ mod tests {
             )
             .unwrap();
             let text = result["content"][0]["text"].as_str().unwrap();
-            let mcp_rows: Value = serde_json::from_str(text).unwrap();
-            assert_eq!(mcp_rows, crate::cli::delegate_list::json_output(&raw));
+            let mcp_result: Value = serde_json::from_str(text).unwrap();
+            let mcp_rows = crate::cli::delegate_list::rows(&mcp_result).expect("mcp rows");
+            let cli_rows =
+                crate::cli::delegate_list::rows(&crate::cli::delegate_list::json_output(&raw))
+                    .expect("cli rows");
+            assert_eq!(mcp_rows, cli_rows);
+            assert_eq!(cli_rows, std::slice::from_ref(&row));
 
             let words: Vec<String> = cli.iter().map(|word| word.to_string()).collect();
             let (params, _) = crate::cli::delegate_list::parse_list_args(&words).unwrap();
