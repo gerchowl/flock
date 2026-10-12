@@ -13,8 +13,10 @@
 //! with mode 0600 holding 64 lowercase hex digits. Issuing writes a temp file
 //! in the same directory, fsyncs it and hard-links it into place, so a crash
 //! never leaves a partial token behind a valid name. A file that fails the
-//! check (empty, malformed, too open, someone else's) is replaced the same way
-//! on the next startup or reload, logged with the reason. The directory is
+//! check (a symlink, unreadable, empty, malformed, too open, someone else's) is
+//! replaced the same way on the next startup or reload, logged with the
+//! reason. Any other I/O error leaves the file untouched and is reported as
+//! `channel_token_unavailable`. Stale temp files are swept at each issue. The directory is
 //! tightened to 0700 when this user owns it and refused otherwise. The file is
 //! read on every check, so deleting it revokes the binding at once, and a
 //! reload then issues a new token.
@@ -137,7 +139,7 @@ pub(crate) fn token_path(name: &str) -> PathBuf {
 /// failure is logged and leaves that binding refusing every hello.
 pub(crate) fn issue_tokens(bindings: &[ChannelBinding], node: &str) {
     for binding in bindings.iter().filter(|b| b.owner_node == node) {
-        match issue_token(&token_path(&binding.name)) {
+        match issue_token(&token_path(&binding.name), read_token) {
             Ok(Some(reason)) => crate::logging::channel_token_reissued(&binding.name, reason),
             Ok(None) => {}
             Err(err) => {
@@ -152,33 +154,55 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Why a token file gave no token.
+#[derive(Debug)]
+pub(crate) enum TokenFault {
+    Missing,
+    /// The file must not be trusted (`symlink`, `unreadable`, `not_private`,
+    /// `malformed`), and is replaced at the next issue.
+    Untrusted(&'static str),
+    /// Any other I/O failure (EMFILE, EIO, ...): the file is left untouched
+    /// and the caller reports it as transient.
+    Io(io::Error),
+}
+
 /// The token in `path` if the file is trusted, else why not.
-fn read_token(path: &Path) -> Result<String, &'static str> {
+fn read_token(path: &Path) -> Result<String, TokenFault> {
     let mut file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err("missing"),
-        Err(_) => return Err("unreadable"),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(TokenFault::Missing),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(TokenFault::Untrusted("symlink"))
+        }
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(TokenFault::Untrusted("unreadable"))
+        }
+        Err(err) => return Err(TokenFault::Io(err)),
     };
-    let meta = file.metadata().map_err(|_| "unreadable")?;
+    let meta = file.metadata().map_err(TokenFault::Io)?;
     if !meta.is_file() || meta.uid() != euid() || meta.mode() & 0o777 != 0o600 {
-        return Err("not_private");
+        return Err(TokenFault::Untrusted("not_private"));
     }
-    let mut token = String::new();
-    file.read_to_string(&mut token).map_err(|_| "unreadable")?;
-    let valid = token.len() == 64
-        && token
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    valid.then_some(token).ok_or("malformed")
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).map_err(TokenFault::Io)?;
+    let valid = raw.len() == 64 && raw.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    match String::from_utf8(raw) {
+        Ok(token) if valid => Ok(token),
+        _ => Err(TokenFault::Untrusted("malformed")),
+    }
 }
 
-/// Make sure `path` holds a trusted token. `Some(reason)` when an untrusted
-/// file was replaced.
-fn issue_token(path: &Path) -> io::Result<Option<&'static str>> {
+/// Make sure `path` holds a trusted token, as judged by `read`.
+/// `Some(reason)` when an untrusted file was replaced. Stale temp files a
+/// crashed issue left behind are swept first.
+fn issue_token(
+    path: &Path,
+    read: impl Fn(&Path) -> Result<String, TokenFault>,
+) -> io::Result<Option<&'static str>> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::DirBuilder::new()
         .recursive(true)
@@ -192,13 +216,22 @@ fn issue_token(path: &Path) -> io::Result<Option<&'static str>> {
         ));
     }
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let replaced = match read_token(path) {
-        Ok(_) => return Ok(None),
-        Err("missing") => None,
-        Err(reason) => {
-            fs::remove_file(path)?;
-            Some(reason)
+    for entry in fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // symlink_metadata never follows a link, and only our own regular
+        // files are removed.
+        let ours =
+            fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_file() && m.uid() == euid());
+        if name.starts_with('.') && name.ends_with(".tmp") && ours {
+            let _ = fs::remove_file(entry.path());
         }
+    }
+    let replaced = match read(path) {
+        Ok(_) => return Ok(None),
+        Err(TokenFault::Missing) => None,
+        Err(TokenFault::Untrusted(reason)) => Some(reason),
+        Err(TokenFault::Io(err)) => return Err(err),
     };
     let mut random = [0u8; 40];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
@@ -210,10 +243,15 @@ fn issue_token(path: &Path) -> io::Result<Option<&'static str>> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)?;
+    // The untrusted file goes only once the new token is safely on disk.
     let linked = file
         .set_permissions(fs::Permissions::from_mode(0o600))
         .and_then(|()| file.write_all(hex(&random[..32]).as_bytes()))
         .and_then(|()| file.sync_all())
+        .and_then(|()| match replaced {
+            Some(_) => fs::remove_file(path),
+            None => Ok(()),
+        })
         .and_then(|()| fs::hard_link(&temp, path));
     let _ = fs::remove_file(&temp);
     match linked {
@@ -235,6 +273,9 @@ pub(crate) enum HelloRefusal {
     NotOwner {
         owner: String,
     },
+    /// The token file could not be read for a reason other than trust (see
+    /// [`TokenFault::Io`]). Nothing changed; retry once it clears.
+    TokenUnavailable(String),
 }
 
 /// Check one `channel.hello`, logging the outcome without the token.
@@ -252,18 +293,26 @@ pub(crate) fn hello<'a>(
                 owner: b.owner_node.clone(),
             }),
         ),
-        Some(_) if !token_matches(&token_path(name), token) => {
-            (Some("bad_token"), Err(HelloRefusal::Unauthorized))
-        }
-        Some(b) => (None, Ok(b)),
+        Some(b) => match token_matches(&token_path(name), token) {
+            Ok(true) => (None, Ok(b)),
+            Ok(false) => (Some("bad_token"), Err(HelloRefusal::Unauthorized)),
+            Err(err) => (
+                Some("token_unavailable"),
+                Err(HelloRefusal::TokenUnavailable(err.to_string())),
+            ),
+        },
     };
     crate::logging::channel_hello(name, refused);
     outcome
 }
 
-fn token_matches(path: &Path, presented: &ChannelToken) -> bool {
-    let Ok(issued) = read_token(path) else {
-        return false;
+/// Whether `presented` is the issued token. An untrusted or missing file
+/// matches nothing; any other read failure is an error.
+fn token_matches(path: &Path, presented: &ChannelToken) -> io::Result<bool> {
+    let issued = match read_token(path) {
+        Ok(issued) => issued,
+        Err(TokenFault::Io(err)) => return Err(err),
+        Err(_) => return Ok(false),
     };
     let issued = Sha256::digest(issued.as_bytes());
     let presented = Sha256::digest(presented.0.trim().as_bytes());
@@ -271,12 +320,16 @@ fn token_matches(path: &Path, presented: &ChannelToken) -> bool {
         .iter()
         .zip(presented.iter())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    diff == 0
+    Ok(diff == 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches(path: &Path, token: impl Into<String>) -> bool {
+        token_matches(path, &ChannelToken(token.into())).unwrap()
+    }
 
     fn binding(name: &str, owner: &str) -> ChannelBinding {
         ChannelBinding {
@@ -344,25 +397,22 @@ mod tests {
     fn an_issued_token_is_private_kept_and_matched_only_exactly() {
         let dir = std::env::temp_dir().join(format!("flk-chan-{}", std::process::id()));
         let path = dir.join("tokens/phone.token");
-        assert_eq!(issue_token(&path).unwrap(), None);
+        assert_eq!(issue_token(&path, read_token).unwrap(), None);
         let issued = fs::read_to_string(&path).unwrap();
         assert_eq!(issued.len(), 64);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
-        assert_eq!(issue_token(&path).unwrap(), None);
+        assert_eq!(issue_token(&path, read_token).unwrap(), None);
         assert_eq!(fs::read_to_string(&path).unwrap(), issued, "kept");
         let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "no temp file is left behind");
 
-        assert!(token_matches(&path, &ChannelToken(issued.clone())));
-        assert!(!token_matches(&path, &ChannelToken(issued[1..].to_owned())));
-        assert!(!token_matches(&path, &ChannelToken(String::new())));
+        assert!(matches(&path, issued.clone()));
+        assert!(!matches(&path, issued[1..].to_owned()));
+        assert!(!matches(&path, String::new()));
         fs::remove_dir_all(&dir).unwrap();
-        assert!(
-            !token_matches(&path, &ChannelToken(issued)),
-            "a deleted file revokes"
-        );
+        assert!(!matches(&path, issued), "a deleted file revokes");
     }
 
     /// A crash between create and write used to leave an empty token file
@@ -379,10 +429,13 @@ mod tests {
             .mode(0o600)
             .open(&path)
             .unwrap();
-        assert!(!token_matches(&path, &ChannelToken(String::new())));
-        assert_eq!(read_token(&path), Err("malformed"));
+        assert!(!matches(&path, String::new()));
+        assert!(matches!(
+            read_token(&path),
+            Err(TokenFault::Untrusted("malformed"))
+        ));
 
-        assert_eq!(issue_token(&path).unwrap(), Some("malformed"));
+        assert_eq!(issue_token(&path, read_token).unwrap(), Some("malformed"));
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode(path.parent().unwrap()),
@@ -390,17 +443,64 @@ mod tests {
             "an owned dir is tightened"
         );
         let recovered = fs::read_to_string(&path).unwrap();
-        assert!(token_matches(&path, &ChannelToken(recovered.clone())));
+        assert!(matches(&path, recovered.clone()));
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(!token_matches(&path, &ChannelToken(recovered.clone())));
-        assert_eq!(issue_token(&path).unwrap(), Some("not_private"));
+        assert!(!matches(&path, recovered.clone()));
+        assert_eq!(issue_token(&path, read_token).unwrap(), Some("not_private"));
         let rotated = fs::read_to_string(&path).unwrap();
         assert_ne!(
             rotated, recovered,
             "a token that was readable by others is rotated"
         );
-        assert!(token_matches(&path, &ChannelToken(rotated)));
+        assert!(matches(&path, rotated));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// EMFILE, EIO and the like are not trust failures: the token stays as
+    /// it is and the error is reported, rather than a valid token destroyed.
+    #[test]
+    fn a_non_trust_read_error_neither_deletes_nor_rotates_the_token() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-io-{}", std::process::id()));
+        let path = dir.join("tokens/phone.token");
+        issue_token(&path, read_token).unwrap();
+        let issued = fs::read_to_string(&path).unwrap();
+        let eio = |_: &Path| Err(TokenFault::Io(io::Error::from_raw_os_error(libc::EIO)));
+        let err = issue_token(&path, eio).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(fs::read_to_string(&path).unwrap(), issued, "left untouched");
+        assert!(matches(&path, issued));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_token_is_replaced_and_stale_temp_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-ln-{}", std::process::id()));
+        let tokens = dir.join("tokens");
+        let path = tokens.join("phone.token");
+        fs::create_dir_all(&tokens).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::write(&elsewhere, "a".repeat(64)).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        fs::write(tokens.join(".stale.tmp"), "partial").unwrap();
+        let outside = dir.join("outside");
+        fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, tokens.join(".link.tmp")).unwrap();
+
+        assert!(!matches(&path, "a".repeat(64)));
+        assert_eq!(issue_token(&path, read_token).unwrap(), Some("symlink"));
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "a".repeat(64));
+        assert!(
+            !tokens.join(".stale.tmp").exists(),
+            "a stale temp file is swept"
+        );
+        assert!(
+            fs::symlink_metadata(tokens.join(".link.tmp")).is_ok(),
+            "a symlink is never swept"
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -36,6 +36,14 @@ impl App {
                     params.binding
                 ),
             ),
+            Err(HelloRefusal::TokenUnavailable(reason)) => encode_error(
+                id,
+                "channel_token_unavailable",
+                format!(
+                    "the token file for binding {:?} could not be read ({reason}); it was left untouched, retry once that clears",
+                    params.binding
+                ),
+            ),
             Err(HelloRefusal::NotOwner { owner }) => encode_error(
                 id,
                 "channel_not_owner",
