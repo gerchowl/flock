@@ -166,6 +166,8 @@ Remove a linked checkout:
 
 When `agent.start`, `agent.spawn` or `agent.fork` succeeds and the caller's process ancestry reaches an agent's pane, the server emits a durable `agent_delegated` event: `architect` (that agent's id, never taken from the request), `delegate`, `via` (`start`, `spawn` or `fork`), `workspace`, and, where the start produced them, `worktree`, `branch`, `repo` and `label`. On every server start, including after a live handoff, each still-open edge is emitted again with `reissued: true`, so log rotation cannot drop it. An edge stays open while its delegate is in the server's agent records, or while a removed delegate's worktree is still on disk. `agent.start` accepts an optional `label` for the edge, sent only to a server whose `ping` capabilities include `agent_start_label: true`, and its `agent_started` response carries `edge`: `architect <agent id>`, or `none (unattested)` when no agent pane is in the caller's ancestry.
 
+An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. There are no goal methods yet: `goal.*` verbs, the CLI and the MCP tools follow (#1155, #1156).
+
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
@@ -586,6 +588,39 @@ A phase is announced only once it has held for the server's settle window: 20 s,
 The server does not poll for these. It re-reads an agent's `state` when the detector or a hook reports a change on its pane or a pane lifecycle event fires, and otherwise only when a pending phase's window closes. Codex and opencode count background jobs from the process tree, which raises no event, so a job ending while nothing else on the pane changes is seen at the pane's next change ([#1163](https://github.com/gerchowl/flock/issues/1163)).
 
 `from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
+
+## Channel adapters
+
+An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
+
+**Start-up.** Before an adapter touches its chat, it calls `channel.hello` and starts only when that succeeds:
+
+```json
+{"id":"a1","method":"channel.hello","params":{"binding":"phone","token":"<contents of phone.token>"}}
+```
+
+```json
+{"id":"a1","result":{"type":"channel_hello","binding":"phone","owner_node":"atlas","target":"agent:agent_atlas_1","scopes":["notify","reply"]}}
+```
+
+`flk adapter hello <binding> [--token-file PATH]` does the same from a shell. It reads the token from the binding's token file unless `--token-file` names another one, prints the reply, and returns the exit codes below. An adapter that shells out to it gets the version check for free.
+
+**Version check.** `channel.hello` is new in protocol 29 and counts as state-changing for the skew gate (#868). `flk adapter hello` sends `ping` first, and against an older server exits 78 with `server_version_gap` without sending the hello. An adapter that speaks the socket directly must do the same: send `ping`, and refuse to start unless `protocol` is 29 or higher. An older server answers `channel.hello` itself with `invalid_request` ("unknown variant"), which an adapter must also treat as "this server has no channel support".
+
+**Failure modes.** Each one is a refusal from the [error-code registry](#response-shapes), and the adapter must not start:
+
+| Code | Exit | Meaning | Fix |
+| --- | --- | --- | --- |
+| `channel_unauthorized` | 1 | No binding by that name on this server, or the token does not match the issued one. These two cases share one answer. A token file that is not trusted (see [Channel bindings](/configuration/#channel-bindings)) matches nothing. | Use the binding's current token file. After a rotation, the old token is refused. |
+| `channel_not_owner` | 1 | The binding exists, but its `owner_node` is a different node. | Run the adapter on the owner node, or move the binding by changing `owner_node`. |
+| `channel_token_unavailable` | 1 | The token file could not be read for a reason other than trust (too many open files, an I/O error). The file is left untouched. | Retry once the reported condition clears. |
+| `server_version_gap` | 78 | The server is older than protocol 29. | Hand the server off with `flk server live-handoff`, or restart it. |
+
+`channel_not_owner` is answered before the token is checked, so anyone who can reach the socket can learn which binding names exist on a node and which node owns each one. Tokens can't be learned this way. Socket access is already the trust boundary: the socket is private to the user running the server.
+
+`channel_unauthorized` and `channel_not_owner` are in the `never` retry class: sending the same hello again can't succeed until the config or the token changes. `channel_token_unavailable` is in the `later` class: nothing changed, so retry once the condition clears. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`). The token itself never appears in a log, an event or a response.
+
+**Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
 
 ## Reading panes
 

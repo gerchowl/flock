@@ -32,6 +32,7 @@ pub(crate) mod directory;
 pub(crate) mod draft_stash;
 pub(crate) mod edges;
 pub(crate) mod float;
+pub(crate) mod goals;
 pub(crate) mod handoffs;
 mod ids;
 mod input;
@@ -180,8 +181,12 @@ pub struct App {
     pub(crate) mesh_receipt_log_at: Option<Instant>,
     pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
     /// #959: open architect -> delegate edges, folded from the durable log
-    /// once per server start by `reissue_open_delegations`.
+    /// once per server start by `reissue_open_records`.
     pub(crate) delegations: delegation::DelegationIndex,
+    /// ADR-0030 §1: goals by `AgentId`, folded in the same start pass.
+    pub(crate) goals: goals::GoalIndex,
+    /// The `EventHub::rotations` value the open goals were last re-issued at.
+    pub(crate) goal_rotations_seen: u64,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
     /// Mail requests that arrived while the recovery worker was still
@@ -471,6 +476,7 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::channels::issue_tokens(&config.channels, &short_host_name());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         crate::system_stats::spawn_sampler(
             event_tx.clone(),
@@ -998,6 +1004,8 @@ impl App {
             mesh_receipt_log_at: None,
             pending_agent_removals: Default::default(),
             delegations: Default::default(),
+            goals: Default::default(),
+            goal_rotations_seen: 0,
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
             recovery_parked: Vec::new(),
@@ -1776,6 +1784,10 @@ impl App {
         }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
+        }
+        if !invalid_section("channels") {
+            self.state.config.channels = config.channels.clone();
+            crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
         // Sections without an explicit invalidation gate always follow the
         // incoming config.
