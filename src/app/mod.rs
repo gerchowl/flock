@@ -468,6 +468,7 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::channels::issue_tokens(&config.channels, &short_host_name());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         crate::system_stats::spawn_sampler(
             event_tx.clone(),
@@ -1769,6 +1770,10 @@ impl App {
         }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
+        }
+        if !invalid_section("channels") {
+            self.state.config.channels = config.channels.clone();
+            crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
         // Sections without an explicit invalidation gate always follow the
         // incoming config.
