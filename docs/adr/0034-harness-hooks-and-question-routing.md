@@ -280,10 +280,11 @@ supplies the rows.
   the entry is registered for every session of the profile. The server
   stamps `FLOCK_GATE=1` at spawn only into panes whose role has rows: a
   delegate, a bound owner or a segment architect (ADR-0035 §1, §1a). The stub
-  exits before starting `flk` when the variable is absent. An operator's own
-  pane therefore pays only the stub's shell start and never reaches the
-  server, which matches ADR-0035's "no entry in an operator's own pane"
-  without a per-pane settings file. Like `FLOCK_QUESTIONS`, the variable is a
+  exits before starting `flk` when the variable is absent. So the entry is
+  registered in every pane, but in a pane without `FLOCK_GATE` (an
+  operator's own, for example) the stub exits early. Such a pane pays only
+  the stub's shell start, never reaches the server, and needs no per-pane
+  settings file. Like `FLOCK_QUESTIONS`, the variable is a
   hint, not authority: a pane that drops it loses only the defence-in-depth
   layer.
 - **The policy is a role-keyed deny list held by the server.** Roles are
