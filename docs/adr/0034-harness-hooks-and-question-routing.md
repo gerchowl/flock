@@ -288,7 +288,10 @@ supplies the rows.
   layer.
 - **The policy is a role-keyed deny list held by the server.** Roles are
   `delegate` (an agent with a live parent edge), `owner` (an agent bound as a
-  repo owner, ADR-0035 §1) and `root` (operator-started). Each row is
+  repo owner, ADR-0035 §1) and `segment` (a segment architect, ADR-0035
+  §1a), exactly the roles whose panes get `FLOCK_GATE`. Operator-started
+  roots have no role here and are never gated. The operator acts for itself,
+  and the server-side boundary binds its tokens too. Each row is
   `{ roles, command pattern, reason, verb }`. Patterns match the
   shell-parsed argv prefix of each simple command in the line (`gh pr
   merge`, `just release`), not a regex over the raw string, so quoting and
@@ -501,7 +504,7 @@ only when the server cannot decide:
 | Situation | Verdict | Why |
 | --- | --- | --- |
 | server answers `hook.decide` | the server's verdict | it holds the edge and the policy |
-| server unreachable, no reply within the question deadline (hold + 5 s; the 500 ms deadline of the other hook calls does not apply to questions), or too old for `hook.decide` (`server_version_gap`), and the hint is `route` or `deny` | `deny`, with the fallback reason: `flk could not reach your architect. Do not ask the human. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` | **fail closed for the question tool only.** Failing open draws a dialog in a pane nobody watches, which is the wedge itself: the agent sits in `needs_human` until a human happens to look. A denial returns control to the model at once. |
+| server unreachable, no reply within the question deadline (hold + 5 s; the 500 ms deadline of the other hook calls does not apply to questions), or too old for `hook.decide` (`server_version_gap`), and the hint is `route`, `ask_operator` or `deny` | `deny`, with the fallback reason for the hinted role (below) | **fail closed for the question tool only.** Failing open draws a dialog in a pane nobody watches, which is the wedge itself: the agent sits in `needs_human` until a human happens to look. A denial returns control to the model at once. |
 | server unreachable or too old, and no hint (a root, or a pane spawned by a pre-ADR server) | `pass`, within the 500 ms deadline of every other hook call (§3: roots never use the hold deadline) | the agent is not known to be a delegate, so today's behaviour is the safe one |
 | the hook itself fails | see the per-harness table below | |
 
@@ -527,6 +530,17 @@ binary is missing; `flk` exits non-zero; `flk` prints nothing or something
 that does not start with `{`; or `flk` outlives a watchdog. The watchdog is a
 background `sleep` and `kill` set to hold + 10 s, below the entry's
 `timeout` of hold + 30 s.
+
+**Fallback reasons, one per hinted role.** The stub and `flk hook` print the
+same fixed sentences, keyed by `FLOCK_QUESTIONS`, so the reason never names a
+recipient the agent does not have:
+
+| Hint | Fallback reason |
+| --- | --- |
+| `route` | `flk could not reach your architect. Do not ask the human. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` |
+| `ask_operator` | `flk could not reach the operator's question queue, and nobody is watching this pane. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` |
+| `deny` | `Questions are disabled for this agent. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` (the same sentence the server's `deny` verdict uses, §3) |
+| `ask_human`, or no hint | none: the stub passes, and the dialog draws as today |
 
 | Failure | Claude Code 2.1.296 | Codex 0.160.1 | opencode 1.18.35 |
 | --- | --- | --- | --- |
@@ -739,8 +753,10 @@ production lines, sized against the code they touch today (`src/cli/hook.rs`,
   entry changes. The installer absorbs that for flk's own entries.
 - An architect has a new kind of work: answering. Its digest and inbox carry
   it, and rungs 4 and 5 stop it from mistaking an owed answer for parking.
-- Every shell call in a flk pane pays about 17 ms for the command gate (§1a),
-  including roots, whose rows are usually empty. In exchange, ADR-0035's
+- Every shell call in a gated pane (delegate, owner, segment architect) pays
+  about 17 ms for the command gate (§1a). Every other flk pane, including the
+  operator's own, pays about 7.5 ms for the stub's early exit and never
+  reaches the server. In exchange, ADR-0035's
   gated actions are refused at once and with an explanation, and a busy agent
   can hear of an urgent item between shell calls (§1b).
 - Roots nobody watches (owner episodes, cron and trigger agents) ask the

@@ -255,7 +255,33 @@ def claude_midturn(a, scratch, event: str):
     screen = claude_turn(
         a.cwd, a.claude_model, ["--tools", "Bash", "--allowedTools", "Bash(echo:*)", "--settings", settings], prompt
     )
-    return any(f"CODEWORD={CODEWORD}" in line for line in reply_lines(screen)), screen
+    return codeword_between(screen.splitlines(), is_claude_tool_line), screen
+
+
+def is_claude_tool_line(line: str) -> bool:
+    """Claude draws a finished shell call as `Ran N shell command(s)` or `⏺ Bash(...)`."""
+    text = line.strip()
+    return ("Ran " in text and "shell command" in text) or text.lstrip("⏺ ").startswith("Bash(")
+
+
+def is_codex_tool_line(line: str) -> bool:
+    """Codex prints each shell call as `<shell> -lc '<command>' in <dir>`."""
+    return " -lc " in line and "echo " in line
+
+
+def codeword_between(lines: list[str], is_tool_line) -> bool:
+    """The model wrote the codeword AFTER one tool call and BEFORE another, in one turn.
+
+    The echoed prompt contains `CODEWORD=<...>`, so only a line carrying the
+    real codeword counts, and the first such line is the one the model wrote
+    between the calls (a later summary may repeat it).
+    """
+    written = [i for i, line in enumerate(lines) if f"CODEWORD={CODEWORD}" in line]
+    tools = [i for i, line in enumerate(lines) if is_tool_line(line)]
+    if not written:
+        return False
+    first = written[0]
+    return any(t < first for t in tools) and any(t > first for t in tools)
 
 
 def probe_claude_midturn(a, scratch):
@@ -359,7 +385,7 @@ def codex_midturn(scratch, event: str):
         "Run the shell command `echo one`. Then, before running anything else, write the line "
         "CODEWORD=<the codeword you were given after that command, or none>. Then run `echo two`, and stop.",
     )
-    return f"CODEWORD={CODEWORD}" in text, text
+    return codeword_between(text.splitlines(), is_codex_tool_line), text
 
 
 def probe_codex_midturn(a, scratch):
