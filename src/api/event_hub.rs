@@ -23,6 +23,11 @@ pub struct EventHub {
     /// queue behind an fsync just to learn that nothing new arrived.
     arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     read_max_wait_ms: ReadMaxWait,
+    /// How many times the active log file has rotated since this hub opened
+    /// (ADR-0031 §4). `rotate()` runs inside `push()` with `inner` held, so
+    /// it only counts, and the server loop re-issues what must outlive the
+    /// rotation once the lock is released.
+    rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     cold_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Runs once between a read's disk pass and its ring pass, so a test
@@ -103,7 +108,8 @@ impl PersistentLog {
         rotated_path(&self.path, index)
     }
 
-    fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
+    /// Append one line, rotating past either bound. Returns whether it rotated.
+    fn append(&mut self, event: &PersistedEvent) -> std::io::Result<bool> {
         let mut line = serde_json::to_vec(event)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         line.push(b'\n');
@@ -113,8 +119,9 @@ impl PersistentLog {
         self.active_events += 1;
         if self.active_bytes >= MAX_ACTIVE_BYTES || self.active_events >= MAX_ACTIVE_EVENTS {
             self.rotate()?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
@@ -410,8 +417,13 @@ impl EventHub {
                         .unwrap_or(0),
                     envelope: event.clone(),
                 };
-                if let Err(err) = log.append(&persisted) {
-                    crate::logging::event_log_write_failed(&err.to_string());
+                match log.append(&persisted) {
+                    Ok(true) => {
+                        self.rotations
+                            .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                    Ok(false) => {}
+                    Err(err) => crate::logging::event_log_write_failed(&err.to_string()),
                 }
             }
         }
@@ -493,6 +505,22 @@ impl EventHub {
             .cloned()
             .collect();
         (lagged, events)
+    }
+
+    /// Make the next persisted push rotate the active file, the way a full
+    /// one does, so a test can drive rotations without writing 100k events.
+    #[cfg(test)]
+    pub(crate) fn rotate_on_next_push(&self) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(log) = state.log.as_mut() {
+            log.active_events = MAX_ACTIVE_EVENTS - 1;
+        }
+    }
+
+    /// The rotation count (see the `rotations` field). A caller compares it
+    /// with the value it last acted on.
+    pub(crate) fn rotations(&self) -> u64 {
+        self.rotations.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn current_sequence(&self) -> u64 {
@@ -846,6 +874,92 @@ mod tests {
             .map(|(seq, _, _)| seq)
             .collect();
         assert_eq!(seqs, vec![1, 3], "seq 2 stays spent");
+        cleanup(&path);
+    }
+
+    /// ADR-0028 §3a for the goal kinds (ADR-0030 §1): a reader that predates
+    /// them must skip every `Goal*` line, not quarantine the log. This binary
+    /// knows the kinds, so the older reader's view is made by renaming each
+    /// goal line's kind to one no build knows, leaving its data as written.
+    #[test]
+    fn a_reader_without_the_goal_kinds_skips_their_lines() {
+        use crate::api::schema::GoalRecord;
+        let path = temp_log("goal-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let agent_id = || "agent_a".to_string();
+        let goal_events = [
+            EventData::GoalArmed {
+                agent_id: agent_id(),
+                record: GoalRecord {
+                    goal: "g".into(),
+                    ..Default::default()
+                },
+                reissued: false,
+            },
+            EventData::GoalAmended {
+                agent_id: agent_id(),
+                goal: "g2".into(),
+                checks: vec![],
+            },
+            EventData::GoalStatusSet {
+                agent_id: agent_id(),
+                status: "s".into(),
+            },
+            EventData::GoalMet {
+                agent_id: agent_id(),
+            },
+            EventData::GoalPaused {
+                agent_id: agent_id(),
+                until_ms: None,
+            },
+            EventData::GoalResumed {
+                agent_id: agent_id(),
+            },
+            EventData::GoalDisarmed {
+                agent_id: agent_id(),
+                reason: None,
+            },
+        ];
+        let kinds = [
+            EventKind::GoalArmed,
+            EventKind::GoalAmended,
+            EventKind::GoalStatusSet,
+            EventKind::GoalMet,
+            EventKind::GoalPaused,
+            EventKind::GoalResumed,
+            EventKind::GoalDisarmed,
+        ];
+        for (event, data) in kinds.into_iter().zip(goal_events) {
+            assert!(event.is_persisted(), "{event:?} must persist");
+            hub.push(EventEnvelope { event, data });
+        }
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            if kind.as_str().unwrap().starts_with("goal_") {
+                *kind = serde_json::Value::String(format!("unknown_{}", kind.as_str().unwrap()));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        std::fs::write(&path, renamed).unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "goal lines must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        assert_eq!(
+            restarted.current_sequence(),
+            8,
+            "skipped goal seqs stay spent"
+        );
         cleanup(&path);
     }
 

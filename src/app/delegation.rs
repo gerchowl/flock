@@ -223,16 +223,23 @@ impl App {
         format!("architect {architect}")
     }
 
-    /// Once per server start: fold the durable log, decide openness against
-    /// the live agent records and the checkouts on disk, and re-emit every
-    /// open edge so log rotation cannot drop it.
+    /// Once per server start: read the durable log once and fold both the
+    /// delegation edges and the goals from it (ADR-0031 §3), re-issuing what
+    /// is open so log rotation cannot drop it.
     ///
     /// Run from the server loop rather than from `App::new`, so a live
     /// handoff folds the log only after the exporting server has stopped
     /// writing to it.
-    pub(crate) fn reissue_open_delegations(&mut self) {
-        let mut index = DelegationIndex::default();
+    pub(crate) fn reissue_open_records(&mut self) {
         let restored = self.event_hub.persisted_events_after(0);
+        self.reissue_open_delegations(&restored);
+        self.reissue_open_goals(&restored);
+    }
+
+    /// Fold the edges, decide openness against the live agent records and
+    /// the checkouts on disk, and re-emit every open edge.
+    fn reissue_open_delegations(&mut self, restored: &[(u64, u64, EventEnvelope)]) {
+        let mut index = DelegationIndex::default();
         index.fold(
             restored
                 .iter()
@@ -550,7 +557,7 @@ pub(crate) mod handler_tests {
             .expect("terminal")
             .agent_id = crate::terminal::AgentId::from_persisted(kept.clone());
 
-        app.reissue_open_delegations();
+        app.reissue_open_records();
 
         let reissued: Vec<_> = persisted_edges(&hub)
             .into_iter()
