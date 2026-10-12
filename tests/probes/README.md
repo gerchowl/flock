@@ -55,3 +55,12 @@ figures in ADR-0028 and ADR-0030. It refuses to run the pane probes without
 docstring is the setup (an isolated flk, a warm throwaway Claude session, a
 fork through `agent.fork` or in place), and `usage <session id>` prints the
 cache read and creation tokens of every turn from the Claude transcript.
+
+`harness_question_hooks.py` re-measures the six harness facts ADR-0034's
+question routing rests on: a Claude `PreToolUse` hook answering
+`AskUserQuestion`, `--disallowedTools`, a hook timeout failing open, and
+`onFailure: "block"` failing closed; a Codex deny and Codex's
+`request_user_input` reaching `PreToolUse`. It talks to no flk at all: it
+unsets `FLOCK_*`, runs Claude in a private `tmux -L` server, and needs `--cwd`
+to be a folder Claude already trusts. Re-run it on every harness version the
+fleet pins.
