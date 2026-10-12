@@ -126,7 +126,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 8 not started, 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -358,10 +358,10 @@ fn without_retries<T>(work: impl FnOnce() -> T) -> T {
 
 /// `delegate`'s own exit codes.
 ///
-/// `0`/`3`/`4`/`124` are `settled::exit`, shared with the two wait verbs so a
-/// supervisor reading one exit code reads it the same way. `5` and `6` are the
-/// delegate's own and live here rather than in `settled`, because nothing else
-/// means them.
+/// `4`/`124` are `settled::exit`, shared with the two wait verbs so a
+/// supervisor reading one exit code reads it the same way, and so is `6`: a
+/// blocked agent, which the waits returned as 3 before #1025. The rest are the
+/// delegate's own and live here rather than in `settled`.
 mod exit {
     /// A finished reply, `no_result`, or an unfinished one under `result`.
     pub(super) const OK: i32 = crate::cli::exit::SUCCESS;
@@ -369,6 +369,8 @@ mod exit {
     pub(super) const USAGE: i32 = crate::cli::exit::USAGE;
     /// A held `blocked` — the agent is sitting on a prompt a human must answer.
     pub(super) const AGENT_BLOCKED: i32 = crate::cli::exit::AGENT_BLOCKED;
+    /// A reply whose sentinel is `BLOCKED:`, the agent's own "not now".
+    pub(super) const REPLY_BLOCKED: i32 = crate::cli::exit::REPLY_BLOCKED;
     /// A finished reply with no `DONE:` / `BLOCKED:` / `VERDICT:` line, or a
     /// settle with no reply at all inside the grace.
     pub(super) const NO_SENTINEL: i32 = crate::cli::exit::NO_SENTINEL;
@@ -2894,13 +2896,23 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             entry.round = 0;
             entry.submitted_at_ms = 0;
         }
-        return Ok(failed(
+        let rolled_back = undo_start(
             &entry,
+            &cleanup,
             true,
+            &flags,
             Some(&format!(
                 "delegate {name}: the brief was not submitted: {reason}"
             )),
-        ));
+            None,
+        );
+        return Ok(match &reason {
+            // Nothing typed and rolled back: nothing the caller can see
+            // persists, so it is a refusal (#1025). A kept delegate, or one
+            // whose rollback failed, persists and stays a failure.
+            SubmitFailure::Refused(error) if rolled_back => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
     }
 
     if !flags.await_result {
@@ -2958,6 +2970,20 @@ fn fail_started(
     reason: Option<&str>,
     screen: Option<&str>,
 ) -> i32 {
+    undo_start(entry, cleanup, written, flags, reason, screen);
+    1
+}
+
+/// [`fail_started`], saying whether it rolled back cleanly, so nothing the
+/// caller can see persists (#1025).
+fn undo_start(
+    entry: &Entry,
+    cleanup: &Cleanup,
+    written: bool,
+    flags: &StartFlags,
+    reason: Option<&str>,
+    screen: Option<&str>,
+) -> bool {
     let name = &entry.name;
     if let Some(reason) = reason {
         eprintln!("{reason}");
@@ -2989,13 +3015,12 @@ fn fail_started(
             "delegate {name}: kept for inspection (--keep-on-failure); \
              `flk delegate reap {name}` removes it"
         );
-        return 1;
+        return false;
     }
     if written {
         let _ = std::fs::remove_file(entry_path(name));
     }
-    rollback(cleanup);
-    1
+    rollback(cleanup)
 }
 
 /// The `start_failed` outcome `--json` prints for a start that failed once its
@@ -3082,13 +3107,16 @@ fn tail_lines(text: &str) -> Vec<&str> {
 /// The one call, and the exit stays 1 whatever it says: a rollback that partly
 /// failed is still a failed start, and the reason it could not finish is on
 /// stderr beside the cause.
-fn rollback(cleanup: &Cleanup) {
-    if let Err(err) = without_retries(|| tear_down(cleanup, true, true)) {
-        eprintln!(
-            "delegate {}: rollback also failed: {}",
-            cleanup.name, err.message
-        );
-    }
+/// True when the rollback finished.
+fn rollback(cleanup: &Cleanup) -> bool {
+    let Err(err) = without_retries(|| tear_down(cleanup, true, true)) else {
+        return true;
+    };
+    eprintln!(
+        "delegate {}: rollback also failed: {}",
+        cleanup.name, err.message
+    );
+    false
 }
 
 /// Submit through the server's composer guard and bounded confirmation loop.
@@ -3139,7 +3167,8 @@ fn composer_state(screen: &str, sentence: &str) -> Composer {
 /// later genuine turn can still be observed without retyping the brief.
 #[derive(Debug)]
 enum SubmitFailure {
-    Refused(String),
+    /// The server refused before typing anything.
+    Refused(ServerError),
     Unconfirmed(String),
     /// The pane exited before the harness took the brief: the harness died at
     /// launch or on the brief, so no round is running (#817).
@@ -3149,7 +3178,8 @@ enum SubmitFailure {
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(reason) | Self::Unconfirmed(reason) => f.write_str(reason),
+            Self::Refused(error) => write!(f, "{error}"),
+            Self::Unconfirmed(reason) => f.write_str(reason),
             Self::Gone => f.write_str("the agent exited before it accepted the brief"),
         }
     }
@@ -3347,7 +3377,7 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
         if error.get("code") == Some(&pane_gone) {
             return Err(SubmitFailure::Gone);
         }
-        return Err(SubmitFailure::Refused(server_error(error)));
+        return Err(SubmitFailure::Refused(parse_server_error(error)));
     }
     if response.pointer("/result/outcome") == Some(&serde_json::json!("abandoned"))
         && response.pointer("/result/reason") == Some(&pane_gone)
@@ -3920,10 +3950,16 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
                 "delegate {name}: the brief was not submitted and the registry could not be \
                  restored: {err}"
             );
+            return Ok(fail(format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )));
         }
-        return Ok(fail(format!(
-            "delegate {name}: the brief was not submitted: {reason}"
-        )));
+        eprintln!("delegate {name}: the brief was not submitted: {reason}");
+        return Ok(match &reason {
+            // Nothing typed and the registry restored: nothing changed (#1025).
+            SubmitFailure::Refused(error) => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
     }
 
     if !flags.await_result {
@@ -4648,11 +4684,11 @@ impl Outcome {
     fn exit_code(self) -> i32 {
         match self {
             Self::Done | Self::Verdict => exit::OK,
-            Self::Blocked => super::settled::exit::BLOCKED,
+            Self::Blocked => exit::REPLY_BLOCKED,
             Self::Gone => super::settled::exit::GONE,
             Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
             Self::Stalled => exit::STALLED,
-            Self::NotStarted => exit::NOT_STARTED,
+            Self::NotStarted => crate::cli::exit::moved(exit::NOT_STARTED),
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
             Self::ServerUnavailable => crate::cli::exit::RECONNECT_GAVE_UP,
@@ -5499,7 +5535,7 @@ mod tests {
         let working = Cursor::parse("term_fixture:0:3:8:w").unwrap();
         assert!(!idle_without_new_turn(&working, &before, AgentStatus::Idle));
         assert_eq!(Outcome::NotStarted.as_str(), "not_started");
-        assert_eq!(Outcome::NotStarted.exit_code(), 8);
+        assert_eq!(Outcome::NotStarted.exit_code(), 11);
     }
 
     #[test]

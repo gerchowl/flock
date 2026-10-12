@@ -1,11 +1,10 @@
 //! The one exit-code registry (ADR-0029 §2, #1017).
 //!
 //! Every exit status a `flk` verb returns is named here, together with what it
-//! means and whether retrying is safe. The values are today's: three meanings
-//! still share a code with another verb's meaning (`WAIT_BLOCKED`,
-//! `MSG_REFUSED`, `DELEGATE_NOT_STARTED`), and moving them to the codes the ADR
-//! assigns is #1025, not this table. `flk --help` prints the table from [`ALL`],
-//! and the tests below pin it and refuse a bare exit literal outside it.
+//! means and whether retrying is safe. `flk --help` prints the table from
+//! [`ALL`], and the tests below pin it and refuse a bare exit literal outside
+//! it. Four cases moved to the codes ADR-0029 §2 assigns them (#1025), and
+//! [`MOVED`] names the code each one had before.
 
 /// Whether a caller that got this exit status may simply run the call again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,27 +63,56 @@ macro_rules! exits {
 
 exits! {
     SUCCESS = 0, NotApplicable, "success, effect observed";
-    FAILURE = 1, Maybe, "unclassified failure (transport, internal, refused before acting)";
+    FAILURE = 1, Maybe, "unclassified failure (transport, internal)";
     CONFIG_CHECK_ADVISORY = 1, Never, "config check: loaded with warnings";
     USAGE = 2, Never, "usage error";
     WORKTREE_NOT_LINKED = 2, Never, "worktree kill / delegate reap: not a linked worktree, or no such workspace";
     CONFIG_CHECK_PARSE_FAILURE = 2, Never, "config check: the config did not load";
     NO_ANSWER = 3, AfterInspecting, "msg / wait reply: no answer is coming (deferred, expired, gone)";
-    WAIT_BLOCKED = 3, AfterHuman, "agent wait / wait agent-status: the agent is blocked on a dialog";
+    REPLY_BLOCKED = 3, AfterInspecting, "delegate wait: the agent answered BLOCKED";
     NOT_SHOWN = 3, Later, "notification show: recorded but not shown";
     WORKTREE_GATE_WOULD_FAIL = 3, Later, "worktree kill --dry-run: the merge gate would not pass";
     GONE = 4, Never, "target not found or gone";
-    MSG_REFUSED = 4, Never, "msg: the receiver refused the message";
     WORKTREE_NEEDS_FORCE = 4, AfterInspecting, "worktree kill / delegate reap: dirty or has submodules, --force clears it";
     NO_SENTINEL = 5, AfterInspecting, "delegate wait: finished without the expected result";
     AGENT_BLOCKED = 6, AfterHuman, "delegate wait: the agent needs a human";
+    WAIT_BLOCKED = 6, AfterHuman, "agent wait / wait agent-status: the agent is blocked on a dialog";
     STALLED = 7, AfterInspecting, "waits, delegate wait: working, no progress past the stall window";
     UNCONFIRMED = 8, AfterInspecting, "send: effect uncertain, text may be in the composer";
-    DELEGATE_NOT_STARTED = 8, AfterInspecting, "delegate start / wait: the delegate did not start";
     ABANDONED = 9, Yes, "send: effect abandoned, composer restored";
+    REFUSED = 10, Later, "refused before acting, nothing changed";
+    DELEGATE_NOT_STARTED = 11, AfterInspecting, "delegate start / wait: the delegate did not start";
+    MSG_REFUSED = 13, Never, "msg: the receiver refused the message";
     RECONNECT_GAVE_UP = 75, Later, "client gave up reconnecting to its server (EX_TEMPFAIL)";
     PROTOCOL_GAP = 78, AfterHandoff, "client/server protocol gap";
     TIMEOUT = 124, Yes, "timed out";
+}
+
+/// The cases that moved code in #1025, as `(new, old)`. For one release a
+/// moved case names its old code on stderr, through [`moved`].
+pub(crate) const MOVED: &[(i32, i32)] = &[
+    (REFUSED, 1),
+    (WAIT_BLOCKED, 3),
+    (DELEGATE_NOT_STARTED, 8),
+    (MSG_REFUSED, 4),
+];
+
+/// The stderr notice for a moved case's code, if `code` is one.
+pub(crate) fn move_notice(code: i32) -> Option<String> {
+    let (new, old) = MOVED.iter().find(|(new, _)| *new == code)?;
+    Some(format!(
+        "note: exit code is now {new} (was {old}); see CHANGELOG"
+    ))
+}
+
+/// Return a moved case's code, printing its notice on stderr. Only a moved
+/// case may come through here: code 6 also means `AGENT_BLOCKED`, which did not
+/// move and prints nothing.
+pub(crate) fn moved(code: i32) -> i32 {
+    if let Some(notice) = move_notice(code) {
+        eprintln!("{notice}");
+    }
+    code
 }
 
 /// The `Exit codes:` section of `flk --help`.
@@ -98,6 +126,11 @@ pub(crate) fn help_section() -> String {
             exit.retry.as_str()
         ));
     }
+    out.push_str("Moved this release (the old code is named on stderr):");
+    for (new, old) in MOVED {
+        out.push_str(&format!(" {old} -> {new}"));
+    }
+    out.push('\n');
     out
 }
 
@@ -122,23 +155,47 @@ pub(crate) mod tests {
             "2 WORKTREE_NOT_LINKED never",
             "2 CONFIG_CHECK_PARSE_FAILURE never",
             "3 NO_ANSWER after_inspecting",
-            "3 WAIT_BLOCKED after_human",
+            "3 REPLY_BLOCKED after_inspecting",
             "3 NOT_SHOWN later",
             "3 WORKTREE_GATE_WOULD_FAIL later",
             "4 GONE never",
-            "4 MSG_REFUSED never",
             "4 WORKTREE_NEEDS_FORCE after_inspecting",
             "5 NO_SENTINEL after_inspecting",
             "6 AGENT_BLOCKED after_human",
+            "6 WAIT_BLOCKED after_human",
             "7 STALLED after_inspecting",
             "8 UNCONFIRMED after_inspecting",
-            "8 DELEGATE_NOT_STARTED after_inspecting",
             "9 ABANDONED yes",
+            "10 REFUSED later",
+            "11 DELEGATE_NOT_STARTED after_inspecting",
+            "13 MSG_REFUSED never",
             "75 RECONNECT_GAVE_UP later",
             "78 PROTOCOL_GAP after_handoff",
             "124 TIMEOUT yes",
         ];
         assert_eq!(actual, expected);
+    }
+
+    /// Each moved case names its old code, and only a moved code has a notice.
+    #[test]
+    fn every_moved_code_names_its_old_one() {
+        let notices: Vec<_> = [10, 6, 11, 13]
+            .into_iter()
+            .map(|code| super::move_notice(code).unwrap())
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "note: exit code is now 10 (was 1); see CHANGELOG",
+                "note: exit code is now 6 (was 3); see CHANGELOG",
+                "note: exit code is now 11 (was 8); see CHANGELOG",
+                "note: exit code is now 13 (was 4); see CHANGELOG",
+            ]
+        );
+        for code in [0, 1, 2, 3, 4, 5, 7, 8, 9, 124] {
+            assert_eq!(super::move_notice(code), None, "{code}");
+        }
+        assert!(super::help_section().contains(" 1 -> 10 3 -> 6 8 -> 11 4 -> 13\n"));
     }
 
     #[test]
