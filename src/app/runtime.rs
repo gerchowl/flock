@@ -288,6 +288,8 @@ impl App {
         self.expire_relayed_entries();
         // ADR-0018 §2: mail that became wakeable since it was queued.
         self.tick_idle_wakes(now);
+        // ADR-0028 §2: derived agent events, mirrored in the headless loop (#25).
+        self.tick_agent_phases(now);
         // #540: an armed self-compaction's turn boundary, its Enter, or its
         // timeout — mirrored in the headless loop (#25).
         self.tick_self_compacts(now);
@@ -713,6 +715,8 @@ impl App {
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
+            // ADR-0028 §2: the next agent-state sample for derived events.
+            self.agent_phases.next_deadline(),
             // #850: a lease ends on its bound even in a quiet loop, so held
             // keystrokes never wait for unrelated traffic.
             self.next_injection_lease_deadline(),

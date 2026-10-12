@@ -2324,6 +2324,15 @@ pub enum EventKind {
     /// here; the BYTES never do. A JSONL audit log is not a blob store, and
     /// ADR-0005's rotation should not be holding 16 MB of base64 hostage.
     FileHandedOver,
+    /// ADR-0028 §2 (#1027): derived supervisor facts, emitted once a phase
+    /// has held for the server settle window. `AgentNeedsHuman`,
+    /// `AgentLimitReached` and `AgentGone` repeat the `AgentPhaseChanged` that
+    /// entered that phase as a kind of their own, for notification routing.
+    /// See `EventData::AgentPhaseChanged`.
+    AgentPhaseChanged,
+    AgentNeedsHuman,
+    AgentLimitReached,
+    AgentGone,
 }
 
 impl EventKind {
@@ -2376,7 +2385,11 @@ impl EventKind {
             | Self::RunReverted
             | Self::NotificationFiled
             | Self::NotificationSeen
-            | Self::FileHandedOver => true,
+            | Self::FileHandedOver
+            | Self::AgentPhaseChanged
+            | Self::AgentNeedsHuman
+            | Self::AgentLimitReached
+            | Self::AgentGone => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -3485,6 +3498,25 @@ pub struct PaneAgentStatusChangedEvent {
     pub state_labels: HashMap<String, String>,
 }
 
+/// A settled phase transition of one local agent (ADR-0028 §2, #1027).
+/// `from` is `unknown` for the first transition a server announces for an
+/// agent its log has no earlier phase for. Phases read leniently, so a
+/// newer server's phase never makes the line unreadable (§3a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPhaseEvent {
+    pub agent_id: String,
+    /// The public pane id the agent ran in.
+    pub pane: String,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub from: crate::api::agent_state::Phase,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub to: crate::api::agent_state::Phase,
+    /// The `state` that settled into `to`, as `agent.get` reported it.
+    pub state: crate::api::agent_state::AgentState,
+    /// How long `to` had held when it was announced.
+    pub held_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
@@ -3906,6 +3938,13 @@ pub enum EventData {
         origin_host: String,
         received_at_ms: u64,
     },
+    /// ADR-0028 §2 (#1027): a settled phase transition. Every
+    /// `agent_needs_human`, `agent_limit_reached` and `agent_gone` carries the
+    /// same payload as the `agent_phase_changed` it accompanies.
+    AgentPhaseChanged(AgentPhaseEvent),
+    AgentNeedsHuman(AgentPhaseEvent),
+    AgentLimitReached(AgentPhaseEvent),
+    AgentGone(AgentPhaseEvent),
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
     AgentForked {

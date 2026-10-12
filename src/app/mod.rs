@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_phases;
 mod agent_profile;
 pub(crate) mod agent_removal;
 pub(crate) mod agent_restart;
@@ -217,6 +218,8 @@ pub struct App {
     pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// Settled phase per local agent, for ADR-0028 §2's derived events.
+    pub(crate) agent_phases: agent_phases::AgentPhaseTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
     /// of a typed write, a settle that lifts, or the timeout. `None` when
     /// nothing is armed anywhere, which is the state the loop is quiet in.
@@ -976,6 +979,7 @@ impl App {
             active_submissions: Default::default(),
             kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            agent_phases: Default::default(),
             self_compact_deadline: None,
             restarts: Default::default(),
             event_hub,
@@ -1038,6 +1042,9 @@ impl App {
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.
         let restored = this.event_hub.persisted_events_after(0);
+        // ADR-0028 §2 (#1027): a restart must not repeat a phase it announced.
+        this.agent_phases
+            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
         this.state
             .notifications
             .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
