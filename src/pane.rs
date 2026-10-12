@@ -91,6 +91,7 @@ async fn publish_state_changed_event(
     visible_working: bool,
     settled_with_background_shells: bool,
     background_tasks: Option<u32>,
+    needs_human: Option<crate::api::agent_state::HumanReason>,
     process_exited: bool,
     observed_at: std::time::Instant,
 ) {
@@ -109,6 +110,7 @@ async fn publish_state_changed_event(
             visible_working,
             settled_with_background_shells,
             background_tasks,
+            needs_human,
             process_exited,
             observed_at,
         })
@@ -395,6 +397,7 @@ fn detection_update_for_publish(
             visible_working: false,
             settled_with_background_shells: false,
             background_tasks: None,
+            needs_human: None,
         });
     }
 
@@ -435,7 +438,7 @@ fn spawn_basic_detection_task(
         let mut last_visible_blocker = false;
         let mut last_visible_idle = false;
         let mut last_visible_working = false;
-        let mut last_background_signal = (false, None);
+        let mut last_background_signal = (false, None, None);
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
@@ -455,7 +458,7 @@ fn spawn_basic_detection_task(
                     last_visible_blocker = false;
                     last_visible_idle = false;
                     last_visible_working = false;
-                    last_background_signal = (false, None);
+                    last_background_signal = (false, None, None);
                     last_visible_signal_refresh = None;
                     last_process_check = std::time::Instant::now();
                     last_foreground_pgid = None;
@@ -587,15 +590,21 @@ fn spawn_basic_detection_task(
                 false,
                 stable_refresh_due,
             ) || activity_changed
-                || (settled_with_background_shells, detection.background_tasks)
-                    != last_background_signal
+                || (
+                    settled_with_background_shells,
+                    detection.background_tasks,
+                    detection.needs_human,
+                ) != last_background_signal
             {
                 state = new_state;
                 last_visible_blocker = visible_blocker;
                 last_visible_idle = visible_idle;
                 last_visible_working = visible_working;
-                last_background_signal =
-                    (settled_with_background_shells, detection.background_tasks);
+                last_background_signal = (
+                    settled_with_background_shells,
+                    detection.background_tasks,
+                    detection.needs_human,
+                );
                 last_activity.clone_from(&detection.activity);
                 if visible_blocker || visible_idle || visible_working {
                     last_visible_signal_refresh = Some(now);
@@ -614,6 +623,7 @@ fn spawn_basic_detection_task(
                     visible_working,
                     settled_with_background_shells,
                     detection.background_tasks,
+                    detection.needs_human,
                     false,
                     now,
                 )
@@ -1777,7 +1787,7 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_idle = false;
                 let mut last_visible_working = false;
-                let mut last_background_signal = (false, None);
+                let mut last_background_signal = (false, None, None);
                 let mut last_activity: Option<String> = None;
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
@@ -1812,7 +1822,7 @@ impl PaneRuntime {
                             last_visible_blocker = false;
                             last_visible_idle = false;
                             last_visible_working = false;
-                            last_background_signal = (false, None);
+                            last_background_signal = (false, None, None);
                             last_visible_signal_refresh = None;
                             last_detection_text.clear();
                         }
@@ -1995,8 +2005,11 @@ impl PaneRuntime {
                         process_exited,
                         stable_refresh_due,
                     ) || detection.activity != last_activity
-                        || (settled_with_background_shells, detection.background_tasks)
-                            != last_background_signal
+                        || (
+                            settled_with_background_shells,
+                            detection.background_tasks,
+                            detection.needs_human,
+                        ) != last_background_signal
                     {
                         debug!(
                             pane = pane_id.raw(),
@@ -2010,8 +2023,11 @@ impl PaneRuntime {
                         last_visible_blocker = visible_blocker;
                         last_visible_idle = visible_idle;
                         last_visible_working = visible_working;
-                        last_background_signal =
-                            (settled_with_background_shells, detection.background_tasks);
+                        last_background_signal = (
+                            settled_with_background_shells,
+                            detection.background_tasks,
+                            detection.needs_human,
+                        );
                         last_activity.clone_from(&detection.activity);
                         if visible_blocker || visible_idle || visible_working {
                             last_visible_signal_refresh = Some(now);
@@ -2030,6 +2046,7 @@ impl PaneRuntime {
                             visible_working,
                             settled_with_background_shells,
                             detection.background_tasks,
+                            detection.needs_human,
                             process_exited,
                             now,
                         )
@@ -3683,6 +3700,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             false,
             std::time::Instant::now(),
         );
@@ -3726,6 +3744,7 @@ mod tests {
                 visible_working: false,
                 settled_with_background_shells: false,
                 background_tasks: None,
+                needs_human: None,
                 process_exited: false,
                 observed_at: _,
             } if delivered_pane == pane_id

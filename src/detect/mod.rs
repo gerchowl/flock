@@ -49,6 +49,9 @@ pub struct AgentDetection {
     /// Background tasks the agent's own screen counts (Claude's footer,
     /// #1022), whatever the turn. `None` when this screen cannot say.
     pub background_tasks: Option<u32>,
+    /// What a `Blocked` screen asks of a human (#1023), for harnesses whose
+    /// prompts the detector can name. `None` otherwise, and on a provider limit.
+    pub needs_human: Option<crate::api::agent_state::HumanReason>,
 }
 
 /// Which agent we detected running in a pane.
@@ -345,6 +348,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
             visible_working: false,
             settled_with_background_shells: false,
             background_tasks: None,
+            needs_human: None,
         };
     };
     agents::detect(agent, screen_content)
