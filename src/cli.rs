@@ -17,6 +17,7 @@ mod agent;
 mod checks;
 mod compatibility;
 mod delegate;
+pub(crate) mod delegate_list;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;
@@ -1008,6 +1009,7 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
             Request {
                 id: "cli:wait:agent-status".into(),
                 method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                    after: None,
                     // `idle` is "ready for input", so it watches `done` too.
                     // Without the pair this verb hung on every unattended
                     // agent — an agent nobody is looking at goes quiet as
@@ -1063,6 +1065,16 @@ pub(super) fn wait_for_agent_change(
 }
 
 pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, false)
+}
+
+/// [`print_response`] for a send-like or guarded verb, where a refusal that
+/// changed nothing exits `REFUSED` (ADR-0029 §2, #1025).
+pub(crate) fn print_send_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, true)
+}
+
+fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io::Result<i32> {
     if let Some(code) = response
         .get("result")
         .and_then(crate::api::effect_exit_code)
@@ -1072,14 +1084,44 @@ pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i3
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(response, send_like));
     }
 
     println!("{}", serde_json::to_string(response).unwrap());
     Ok(0)
 }
 
+/// The exit status for an error response. Only a send-like or guarded verb
+/// maps a refusal to `REFUSED`; every other verb keeps `FAILURE`.
+pub(crate) fn error_exit(response: &serde_json::Value, send_like: bool) -> i32 {
+    match response["error"]["code"].as_str() {
+        Some(code) if send_like => refusal_exit(code),
+        _ => exit::FAILURE,
+    }
+}
+
+/// A send-like or guarded verb's exit for a server refusal: `REFUSED` for an
+/// error whose retry class is `later` (refused before acting, nothing
+/// changed), which names its old code on stderr (#1025), else `FAILURE`.
+pub(crate) fn refusal_exit(code: &str) -> i32 {
+    let later = crate::api::error_code::ErrorCode::from_code(code)
+        .is_some_and(|code| code.retry() == exit::Retry::Later);
+    if later {
+        return exit::moved(exit::REFUSED);
+    }
+    exit::FAILURE
+}
+
 pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, false)
+}
+
+/// [`send_ok_request`] for a guarded verb.
+pub(super) fn send_guarded_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, true)
+}
+
+fn send_ok_request_for(method: Method, send_like: bool) -> std::io::Result<i32> {
     let response = send_request(&Request {
         id: "cli:request".into(),
         method,
@@ -1094,7 +1136,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(&response, send_like));
     }
 
     Ok(0)

@@ -94,6 +94,16 @@ impl Monitor {
         }
     }
 
+    /// When a sample could next report a stall: the silence window ends,
+    /// or a provider retry outlasts it. `None` while nothing is timing.
+    pub fn due(&self) -> Option<Instant> {
+        let silence = self.silence?;
+        match self.retry_since {
+            Some(since) => Some(since + silence),
+            None => self.working.then(|| self.changed + silence),
+        }
+    }
+
     pub fn interrupted(&mut self, now: Instant) {
         self.hash = None;
         self.retry_since = None;

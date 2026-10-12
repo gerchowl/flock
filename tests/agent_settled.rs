@@ -414,10 +414,10 @@ fn a4_turn_completed_before_the_wait_still_counts() {
 }
 
 /// E6: a blocked agent is not settled; a `blocked` held for the settle
-/// window ends the wait with exit 3 and status "blocked", even before a new
+/// window ends the wait with exit 6 and status "blocked", even before a new
 /// working entry.
 #[test]
-fn a5_held_blocked_exits_3() {
+fn a5_held_blocked_exits_6() {
     let server = start_server();
     let pane = worker_pane(&server);
     let before = cursor(&server);
@@ -438,7 +438,13 @@ fn a5_held_blocked_exits_3() {
             "5000",
         ],
     );
-    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    // 6 since #1025 (was 3), named on stderr for one release.
+    assert_eq!(out.status.code(), Some(6), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("note: exit code is now 6 (was 3); see CHANGELOG"),
+        "stderr: {}",
+        stderr(&out)
+    );
     let line = stdout_json(&out);
     assert_eq!(line["status"], "blocked", "{line}");
     assert_eq!(line["agent_status"], "blocked", "{line}");

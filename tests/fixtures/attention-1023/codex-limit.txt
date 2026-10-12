@@ -1,0 +1,22 @@
+
+
+› ASK plan
+
+
+■ Conversation interrupted - use /feedback if
+something went wrong
+
+
+› LIMIT now
+
+
+■ You’ve hit your usage limit. Upgrade to Pro
+(https://chatgpt.com/explore/pro), visit https://
+chatgpt.com/codex/settings/usage to purchase more
+credits or try again at 5:46 AM.
+
+
+› Ask Codex to do anything
+
+  gpt-fake medium · /fixture/attention-1023… Plan mode
+  ? for shortcuts            ⚠ 1 warning · f2 to view

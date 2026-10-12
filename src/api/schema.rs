@@ -125,6 +125,10 @@ pub enum Method {
     AgentRestart(AgentRestartParams),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
+    /// #960 (ADR-0027 §2): an architect's delegates, from the edge index
+    /// joined with cached state only.
+    #[serde(rename = "delegate.list")]
+    DelegateList(DelegateListParams),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSendParams),
     #[serde(rename = "msg.reply")]
@@ -295,6 +299,7 @@ impl Method {
                 | Self::AgentHistory(_)
                 | Self::AgentResult(_)
                 | Self::AgentLineage(_)
+                | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
                 | Self::PeersEnrollment(_)
@@ -341,6 +346,7 @@ impl Method {
             | Self::AgentHistory(_)
             | Self::AgentResult(_)
             | Self::AgentLineage(_)
+            | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
             | Self::MsgStatus(_)
@@ -1176,6 +1182,60 @@ pub struct LineageNode {
     pub branch: Option<String>,
 }
 
+/// `delegate.list` (#960, ADR-0027 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateListParams {
+    /// `self` (the attested caller), `all`, or an architect's agent id.
+    #[serde(default = "delegate_list_self")]
+    pub architect: String,
+    /// Only the edge whose delegate works on this branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Only edges in this repository (the edge's repo key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+fn delegate_list_self() -> String {
+    "self".to_string()
+}
+
+/// One architect -> delegate edge joined with what the server has cached
+/// about the delegate. Nothing here costs a git or `gh` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRow {
+    pub architect: String,
+    pub delegate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub via: DelegationVia,
+    /// `live` | `hibernated, awaiting merge` | `gone` |
+    /// `gone, worktree retained` | `orphaned` | `closed, not merged`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The harness, when the delegate is still an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
+    pub edge_age_secs: u64,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The PR poller's cached answer for the branch, never a live read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrInfo>,
+}
+
 /// Does the sender want an answer (#280, R4 of #213)?
 ///
 /// Stamped by the SENDER, never inferred by the receiver — the same principle
@@ -1951,6 +2011,11 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
+    /// from now, never a replay of the ring. A cursor older than the ring
+    /// gets a `lagged { skipped_to }` line first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2674,6 +2739,9 @@ pub enum ResponseResult {
     },
     Lineage {
         chain: Vec<LineageEdge>,
+    },
+    DelegateList {
+        delegates: Vec<DelegateRow>,
     },
     MsgQueued {
         #[serde(default, skip_serializing_if = "Option::is_none")]

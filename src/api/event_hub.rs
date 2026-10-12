@@ -468,6 +468,28 @@ impl EventHub {
             .collect()
     }
 
+    /// The ring's events with `seq > sequence`, and the cursor a subscriber
+    /// that fell behind the ring skips to (#1030, ADR-0028 §3). The ring holds
+    /// everything newer than its oldest entry, so a cursor below that has
+    /// lost events, and the stream says so instead of dropping them silently.
+    pub(crate) fn events_since(&self, sequence: u64) -> (Option<u64>, Vec<(u64, EventEnvelope)>) {
+        let Ok(state) = self.inner.lock() else {
+            return (None, Vec::new());
+        };
+        let floor = state
+            .events
+            .first()
+            .map_or(state.next_sequence, |(first, _)| first.saturating_sub(1));
+        let lagged = (sequence < floor).then_some(floor);
+        let events = state
+            .events
+            .iter()
+            .filter(|(event_sequence, _)| *event_sequence > sequence.max(floor))
+            .cloned()
+            .collect();
+        (lagged, events)
+    }
+
     pub fn current_sequence(&self) -> u64 {
         let Ok(state) = self.inner.lock() else {
             return 0;
@@ -584,6 +606,13 @@ impl EventHub {
             events,
             next_after: scanned.min(durable),
             scanned,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ring_cap(&self, cap: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.ring_cap = Some(cap);
         }
     }
 

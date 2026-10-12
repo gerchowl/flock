@@ -763,10 +763,18 @@ fn c2_claude_trust_dialog_is_refused_and_nothing_is_typed() {
         message.contains("delegate w1:"),
         "and names the delegate: {message}"
     );
+    // #938: under `--json` the one thing on stdout is the failure, with the
+    // dialog the agent was showing.
+    let json = stdout_json(&out);
+    assert_eq!(json["outcome"], "start_failed", "{json}");
+    assert_eq!(json["kept"], false, "{json}");
     assert!(
-        stdout(&out).is_empty(),
-        "a failure prints nothing on stdout: {:?}",
-        stdout(&out)
+        json["data"]["pane_tail"]
+            .as_array()
+            .is_some_and(|tail| tail.iter().any(|line| line
+                .as_str()
+                .is_some_and(|l| l.contains("Yes, I trust this folder")))),
+        "{json}"
     );
     assert!(
         typed(&server).is_empty(),
@@ -902,7 +910,13 @@ fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
     .unwrap();
     let status = exited_within(&mut child, WITHIN).expect("refusal returns");
     let out = finish(child);
-    assert_eq!(status.code(), Some(1), "{}", stderr(&out));
+    // Rolled back with nothing typed: a refusal, 10 since #1025 (was 1).
+    assert_eq!(status.code(), Some(10), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("note: exit code is now 10 (was 1); see CHANGELOG"),
+        "{}",
+        stderr(&out)
+    );
     assert!(stderr(&out).contains("input_not_empty"), "{}", stderr(&out));
     assert!(!stderr(&out).contains("Workspace kept"));
     // #925: the pane is gone after the rollback, so the error carries what it
@@ -918,6 +932,46 @@ fn guarded_delegate_start_rolls_back_when_composer_refuses_before_typing() {
     assert!(typed(&server).is_empty());
     let list = cli(&server, &["delegate", "list", "--json"]);
     assert!(!stdout(&list).contains("refused"), "{}", stdout(&list));
+}
+
+/// #1025: a `send` the composer refuses before typing restores the registry
+/// and exits 10, the refusal code, naming the old 1 on stderr.
+#[test]
+fn delegate_send_refused_before_typing_exits_10() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_claude(&server, "s1", &b, &["--json"]);
+    let pane = make_ready(&server, "s1");
+    let status = exited_within(&mut child, WITHIN).expect("start returns");
+    let out = finish(child);
+    assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
+    let typed_before = wait_typed(&server, 1).len();
+    // `report` paints its own screen, so the draft goes on after it.
+    report(&server, &pane, "idle");
+    fs::write(
+        server.base.join("screen"),
+        claude_prompt_box().replace("❯ ", "❯ operator draft"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WITHIN;
+    while !stdout(&cli(&server, &["pane", "read", &pane])).contains("operator draft") {
+        assert!(Instant::now() < deadline, "the draft was never painted");
+        thread::sleep(Duration::from_millis(30));
+    }
+    let b2 = brief(&server, "next.md", "y\n");
+    let sent = cli(&server, &["delegate", "send", "s1", "--brief", &b2]);
+    let message = stderr(&sent);
+    assert_eq!(sent.status.code(), Some(10), "{message}");
+    assert!(message.contains("input_not_empty"), "{message}");
+    assert!(
+        message.contains("note: exit code is now 10 (was 1); see CHANGELOG"),
+        "{message}"
+    );
+    assert_eq!(typed(&server).len(), typed_before, "nothing was typed");
+    // The registry went back to the round that ran.
+    let status = cli(&server, &["delegate", "status", "s1", "--json"]);
+    assert_eq!(stdout_json(&status)["round"], 1, "{}", stderr(&status));
 }
 
 #[test]
@@ -984,7 +1038,9 @@ fn keep_on_failure_keeps_a_refused_start_for_inspection() {
     let status = exited_within(&mut child, WITHIN).expect("refusal returns");
     let out = finish(child);
     let message = stderr(&out);
+    // A kept start persists, so it stays a failure (#1025).
     assert_eq!(status.code(), Some(1), "{message}");
+    assert!(!message.contains("note: exit code"), "{message}");
     assert!(message.contains("input_not_empty"), "{message}");
     assert!(
         message.contains("  | \u{276f} leftover suggestion"),
@@ -995,9 +1051,15 @@ fn keep_on_failure_keeps_a_refused_start_for_inspection() {
             && message.contains("flk delegate reap kept"),
         "{message}"
     );
+    // #938: `--json` carries the same lines, structured.
+    let json = stdout_json(&out);
+    assert_eq!(json["outcome"], "start_failed", "{json}");
+    assert_eq!(json["kept"], true, "{json}");
+    let tail = json["data"]["pane_tail"].as_array().expect("pane_tail");
     assert!(
-        stdout(&out).is_empty(),
-        "a failure prints nothing on stdout"
+        tail.iter()
+            .any(|line| line == "\u{276f} leftover suggestion"),
+        "{json}"
     );
     assert!(typed(&server).is_empty(), "nothing was typed");
     assert_eq!(workspaces(&server).len(), before + 1, "the workspace stays");

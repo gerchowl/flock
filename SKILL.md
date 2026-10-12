@@ -188,9 +188,10 @@ flk agent wait worker --status settled --after "$c" --timeout 3600000
 `flk agent list` or `flk pane get` (all the same string). `flk wait agent-status
 1-1 --status settled` is the same signal if that is the verb you already have.
 
-exit codes: `0` settled · `3` blocked (a human has to look) · `4` pane gone
-(the line says whether it was closed, hibernated or restarted) · `124` timeout ·
-`2` a usage error or a refused cursor. on `0`, `3` and `4` it prints one json
+exit codes: `0` settled · `6` blocked (a human has to look; `3` before #1025) ·
+`4` pane gone (the line says whether it was closed, hibernated or restarted) ·
+`124` timeout · `2` a usage error or a refused cursor. on `0`, `6` and `4` it
+prints one json
 object:
 
 ```bash
