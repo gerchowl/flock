@@ -30,7 +30,7 @@ fn assert_moved(output: &Output, new: i32, old: i32) {
     );
 }
 
-fn refuse(_: &str) -> serde_json::Value {
+fn refuse(_: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"error":{"code":"not_settled","message":"not_settled"}})
 }
 
@@ -56,7 +56,7 @@ fn agent_send_refused_before_acting_exits_10() {
 /// anything restarts, and that is 10 too.
 #[test]
 fn agent_restart_refused_before_acting_exits_10() {
-    fn busy(_: &str) -> serde_json::Value {
+    fn busy(_: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({"error":{"code":"restart_busy","message":"restart_busy"}})
     }
     let (socket, _server) = scripted_server("restart", busy);
@@ -78,7 +78,7 @@ fn a_refusal_from_a_read_verb_keeps_exit_1() {
 /// An error that is not a refusal keeps exit 1 and prints no notice.
 #[test]
 fn an_ordinary_error_keeps_exit_1_without_a_notice() {
-    fn missing(_: &str) -> serde_json::Value {
+    fn missing(_: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({"error":{"code":"pane_not_found","message":"no pane"}})
     }
     let (socket, _server) = scripted_server("missing", missing);
@@ -88,8 +88,8 @@ fn an_ordinary_error_keeps_exit_1_without_a_notice() {
     assert!(!stderr.contains("note: exit code"), "{stderr}");
 }
 
-fn refused_message(method: &str) -> serde_json::Value {
-    match method {
+fn refused_message(request: &serde_json::Value) -> serde_json::Value {
+    match request["method"].as_str().unwrap_or_default() {
         "msg.status" => serde_json::json!({"result":{
             "correlation_id":"q1025","state":"refused","detail":"msg_not_allowed"
         }}),

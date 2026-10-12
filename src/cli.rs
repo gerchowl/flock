@@ -96,7 +96,18 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         }
     };
     output::set(format);
-    let args = args.as_slice();
+    let outcome = run(&args);
+    // The envelope prints last, so its `exit` is the status the process
+    // returns, a skew failure's 78 included.
+    match &outcome {
+        Ok(CommandOutcome::Handled(code)) => output::finish(*code),
+        Err(_) => output::finish(exit::FAILURE),
+        Ok(CommandOutcome::NotCli) => {}
+    }
+    outcome
+}
+
+fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
@@ -147,7 +158,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             if let Err(error) = &outcome {
                 eprintln!("{error}");
             }
-            if output::json() && !output::envelope_printed() {
+            if output::json() && !output::envelope_pending() {
                 // §4: the skew error keeps exit 78 and gains the envelope.
                 let gap = crate::api::error_code::ErrorCode::ServerVersionGap;
                 let exit_code = output::failure(gap, &message, gap.exit());
@@ -162,7 +173,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     match outcome {
         // An io error ends the verb before it reported anything: under
         // machine output it is still an envelope on stdout, exit 1.
-        Err(error) if output::json() && !output::envelope_printed() => {
+        Err(error) if output::json() && !output::envelope_pending() => {
             let code = output::io_error_code(&error);
             let exit_code = output::failure(code, &error.to_string(), exit::FAILURE);
             Ok(CommandOutcome::Handled(exit_code))

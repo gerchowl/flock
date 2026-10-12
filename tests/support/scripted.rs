@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use super::environment::Command;
 
-/// A socket that answers every request with `answer(method)`, and the protocol
-/// check a state-changing verb sends first (#868) with this build's protocol.
+/// A socket that answers every request with `answer(request)`, and the protocol
+/// check a state-changing verb sends first (#868) with this build's protocol
+/// unless `answer` returns a pong of its own.
 pub fn scripted_server(
     name: &str,
-    answer: fn(&str) -> serde_json::Value,
+    answer: fn(&serde_json::Value) -> serde_json::Value,
 ) -> (PathBuf, thread::JoinHandle<()>) {
     let dir = std::env::temp_dir().join(format!("flk-scripted-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -39,12 +40,17 @@ pub fn scripted_server(
             }
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let method = request["method"].as_str().unwrap_or_default();
-            let mut reply = if method == "ping" {
+            // `answer` may script the ping too (an older server's protocol);
+            // anything but a pong there means this build's protocol.
+            let answered = answer(&request);
+            let mut reply = if method == "ping"
+                && answered.pointer("/result/type") != Some(&serde_json::json!("pong"))
+            {
                 serde_json::json!({"result":{
                     "type":"pong","version":"fixture","protocol":super::PROTOCOL_VERSION
                 }})
             } else {
-                answer(method)
+                answered
             };
             reply["id"] = request["id"].clone();
             let _ = writeln!(stream, "{reply}");

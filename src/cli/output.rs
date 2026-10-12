@@ -1,19 +1,26 @@
 //! Output selection and the error envelope (ADR-0029 §3, §4, #1024).
 //!
 //! `--format json|text` is global, and `--json` is its synonym: [`take_global`]
-//! lifts them out of argv before any verb parses it, so every verb accepts
-//! them in any position before a `--`. A verb that has a text form reads
-//! [`json`] where it used to read its own `--json`; a verb that only prints
-//! JSON keeps doing so under `--format text`. `pane read` and `agent read`
-//! own a `--format text|ansi` for the screen they return, so after those verbs
-//! only `--format json` is the global flag.
+//! lifts them out of argv before any verb parses it. They are recognised in the
+//! global position (before the verb) and in a verb's flag position, never in
+//! a verb's free text: the words `pane run`, `pane send-text`, `agent send`
+//! and the other verbs in [`FREE_TEXT`] type into a pane or store as a label
+//! pass through verbatim, and so does everything after a `--`. A verb that has
+//! a text form reads [`json`] where it used to read its own `--json`; a verb
+//! that only prints JSON keeps doing so under `--format text`. `pane read` and
+//! `agent read` own a `--format text|ansi` for the screen they return, so after
+//! those verbs only `--format json` is the global flag.
 //!
 //! Under machine output (`--format json` or `--json`) an error prints on
 //! STDOUT as the envelope ADR-0029 §4 defines, `{"id", "error": {"code",
 //! "message", "retry", "exit", "data"}}`, with a one-line human message on
-//! stderr, so a pipe into a JSON parser always has a document to read. Without
-//! machine output nothing changes (owner decision 3 on ADR-0029): the error
-//! goes to stderr as the one line it always was.
+//! stderr, so a pipe into a JSON parser always has a document to read. The
+//! envelope is held until the invocation ends ([`finish`]), so its `exit` is
+//! the status the process returns, and one invocation prints one envelope.
+//! `id` is the request's id, or `null` for a failure the client found before
+//! or without a request. Without machine output nothing changes (owner
+//! decision 3 on ADR-0029): the error goes to stderr as the one line it always
+//! was.
 //!
 //! Known limit: only errors reported through [`error`] and [`failure`] gain
 //! the envelope. Usage lines and a verb's own text failures still print on
@@ -25,7 +32,7 @@
     reason = "CLI output: the error envelope and its human line are the product surface"
 )]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Display;
 
 use serde_json::{json, Value};
@@ -44,7 +51,9 @@ pub(crate) enum Format {
 
 thread_local! {
     static FORMAT: Cell<Format> = const { Cell::new(Format::Default) };
-    static ENVELOPE_PRINTED: Cell<bool> = const { Cell::new(false) };
+    /// The first error response reported in this invocation, printed by
+    /// [`finish`] with the exit status the process returns.
+    static PENDING: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Whether the caller asked for JSON (`--format json` or `--json`).
@@ -55,18 +64,78 @@ pub(crate) fn json() -> bool {
 /// Set the invocation's format. Called once per invocation, from `maybe_run`.
 pub(crate) fn set(format: Format) {
     FORMAT.set(format);
-    ENVELOPE_PRINTED.set(false);
+    PENDING.set(None);
 }
 
-/// Whether an error envelope already went to stdout in this invocation. A
-/// failure found after that (the skew diagnosis, an io error) adds its human
-/// line but no second document.
-pub(crate) fn envelope_printed() -> bool {
-    ENVELOPE_PRINTED.get()
+/// Whether an error envelope is already waiting for [`finish`]. A failure
+/// found after it (the skew diagnosis, an io error) adds its human line but
+/// no second document.
+pub(crate) fn envelope_pending() -> bool {
+    PENDING.with_borrow(Option::is_some)
 }
 
-/// Split the global output flags off `args`. Everything after a `--` is left
-/// alone (an agent's argv, a command to run). Returns the remaining argv and
+/// Print the pending envelope, if any, with the exit status the invocation
+/// returns. Called once, by `maybe_run`, as the invocation ends.
+pub(crate) fn finish(exit_code: i32) {
+    if let Some(response) = PENDING.take() {
+        println!("{}", envelope(&response, exit_code));
+    }
+}
+
+/// A verb whose trailing words are free text, typed into a pane or stored as
+/// a label verbatim. Its grammar says where that text starts: after
+/// `operands` positional words (a target, an id), at the first word that is
+/// not one of its own `flags` or `value_flags` (which take the next word as
+/// their value). A global flag is looked for only before that point.
+struct FreeText {
+    verb: [&'static str; 2],
+    operands: usize,
+    flags: &'static [&'static str],
+    value_flags: &'static [&'static str],
+}
+
+const fn free_text(
+    verb: [&'static str; 2],
+    operands: usize,
+    flags: &'static [&'static str],
+    value_flags: &'static [&'static str],
+) -> FreeText {
+    FreeText {
+        verb,
+        operands,
+        flags,
+        value_flags,
+    }
+}
+
+/// Every verb that joins its trailing arguments into text. `msg send` and
+/// `msg reply` are not here: their parsers read options anywhere in the text
+/// and take dash-leading text after `--`.
+const FREE_TEXT: &[FreeText] = &[
+    free_text(
+        ["pane", "run"],
+        1,
+        &["--if-input-empty"],
+        &["--if-session", "--min-age-secs"],
+    ),
+    free_text(["pane", "send-text"], 1, &[], &[]),
+    free_text(["pane", "send-keys"], 1, &[], &[]),
+    free_text(["agent", "send"], 1, &["--submit", "--no-submit"], &[]),
+    free_text(
+        ["pane", "arm-self-compact"],
+        0,
+        &["--abort"],
+        &["--pane", "--instructions", "--instructions-file"],
+    ),
+    free_text(["agent", "rename"], 1, &[], &[]),
+    free_text(["pane", "rename"], 1, &[], &[]),
+    free_text(["tab", "rename"], 1, &[], &[]),
+    free_text(["workspace", "rename"], 1, &[], &[]),
+];
+
+/// Split the global output flags off `args` (argv, program name first), in
+/// the global and verb-flag positions only: a verb's free text ([`FREE_TEXT`])
+/// and everything after a `--` are left alone. Returns the remaining argv and
 /// the format, or a usage message for a bad or conflicting value.
 pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), String> {
     let mut kept: Vec<String> = Vec::with_capacity(args.len());
@@ -80,13 +149,29 @@ pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), Stri
         _ => Err("--json / --format json and --format text cannot be combined".to_string()),
     };
     let mut rest = args.iter();
+    kept.extend(rest.next().cloned());
+    // The group and verb words, and the verb's free-text grammar once known.
+    let mut verb: Vec<&str> = Vec::new();
+    let mut grammar: Option<&FreeText> = None;
+    let mut operands = 0;
     while let Some(arg) = rest.next() {
-        let value = match arg.as_str() {
-            "--" => {
-                kept.push(arg.clone());
+        if arg == "--" {
+            kept.push(arg.clone());
+            kept.extend(rest.cloned());
+            break;
+        }
+        if let Some(grammar) = grammar.filter(|grammar| operands == grammar.operands) {
+            kept.push(arg.clone());
+            if grammar.value_flags.contains(&arg.as_str()) {
+                kept.extend(rest.next().cloned());
+            } else if !grammar.flags.contains(&arg.as_str()) {
+                // The free text starts here.
                 kept.extend(rest.cloned());
                 break;
             }
+            continue;
+        }
+        let value = match arg.as_str() {
             "--json" => {
                 choose(Format::Json)?;
                 continue;
@@ -99,13 +184,22 @@ pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), Stri
                 Some(value) => value.to_string(),
                 None => {
                     kept.push(arg.clone());
+                    if let Some(grammar) = grammar {
+                        if grammar.value_flags.contains(&arg.as_str()) {
+                            kept.extend(rest.next().cloned());
+                        } else if !arg.starts_with('-') {
+                            operands += 1;
+                        }
+                    } else if verb.len() < 2 && !arg.starts_with('-') {
+                        verb.push(arg);
+                        grammar = FREE_TEXT.iter().find(|text| text.verb[..] == verb[..]);
+                    }
                     continue;
                 }
             },
         };
-        // argv[0], then the verb: `pane read` and `agent read` own `--format`.
-        let reads = matches!(kept.get(1..3), Some([group, verb])
-            if matches!(group.as_str(), "pane" | "agent") && verb == "read");
+        // `pane read` and `agent read` own `--format`.
+        let reads = matches!(verb[..], ["pane" | "agent", "read"]);
         match value.as_str() {
             "json" => choose(Format::Json)?,
             _ if reads => kept.extend(["--format".to_string(), value]),
@@ -156,25 +250,18 @@ pub(crate) fn error_as(response: &Value, default_line: impl Display, exit_code: 
     let error = &response["error"];
     let code = error["code"].as_str().unwrap_or("internal_error");
     let message = error["message"].as_str().unwrap_or(code);
-    // A recorded skew failure turns this call's exit into 78 on the way out
-    // (`maybe_run`), so the envelope says 78 now.
-    let gap = ErrorCode::ServerVersionGap;
-    let exit_code = if code == gap.as_str() && crate::api::compatibility::failure_pending() {
-        gap.exit()
-    } else {
-        exit_code
-    };
     eprintln!("{}", human_line(code, message));
-    if !ENVELOPE_PRINTED.replace(true) {
-        println!("{}", envelope(response, exit_code));
-    }
+    PENDING.with_borrow_mut(|pending| {
+        pending.get_or_insert_with(|| response.clone());
+    });
     exit_code
 }
 
-/// Report a failure the client found itself, with a registered `code`.
-/// Without machine output the message prints on stderr as it is.
+/// Report a failure the client found itself, with a registered `code`. It
+/// answers no request, so its envelope's `id` is `null`. Without machine
+/// output the message prints on stderr as it is.
 pub(crate) fn failure(code: ErrorCode, message: &str, exit_code: i32) -> i32 {
-    let response = json!({"error": {"code": code.as_str(), "message": message}});
+    let response = json!({"id": null, "error": {"code": code.as_str(), "message": message}});
     error_as(&response, message, exit_code)
 }
 
@@ -202,9 +289,12 @@ pub(crate) fn io_error_code(err: &std::io::Error) -> ErrorCode {
 }
 
 /// The envelope: the response as the server sent it, with the retry class
-/// and exit status added to `error`.
+/// and exit status added to `error`, and `id: null` when it carries none.
 fn envelope(response: &Value, exit_code: i32) -> Value {
     let mut envelope = response.clone();
+    if let Some(fields) = envelope.as_object_mut() {
+        fields.entry("id").or_insert(Value::Null);
+    }
     if let Some(error) = envelope.get_mut("error").and_then(Value::as_object_mut) {
         let code = error.get("code").and_then(Value::as_str).unwrap_or("");
         let retry = retry_for(code, exit_code).as_str();
@@ -255,6 +345,88 @@ mod tests {
         );
     }
 
+    /// A verb's free text is never scanned: the grammar says where it starts.
+    #[test]
+    fn free_text_passes_through_verbatim() {
+        for args in [
+            &["flk", "pane", "run", "1-1", "git", "log", "--format=%H"][..],
+            &[
+                "flk", "pane", "run", "1-1", "gh", "pr", "view", "--json", "state",
+            ],
+            &[
+                "flk",
+                "pane",
+                "run",
+                "1-1",
+                "--if-session",
+                "s",
+                "--if-input-empty",
+                "--json",
+            ],
+            &["flk", "pane", "send-text", "1-1", "--format", "yaml"],
+            &[
+                "flk",
+                "agent",
+                "send",
+                "--no-submit",
+                "w1",
+                "--no-submit",
+                "a",
+                "--json",
+            ],
+            &["flk", "agent", "rename", "w1", "--json"],
+            &[
+                "flk",
+                "pane",
+                "arm-self-compact",
+                "--pane",
+                "1-1",
+                "go",
+                "--json",
+            ],
+            &[
+                "flk",
+                "pane",
+                "arm-self-compact",
+                "--instructions",
+                "--json",
+                "go",
+            ],
+        ] {
+            assert_eq!(taken(args), (argv(args), Format::Default), "{args:?}");
+        }
+    }
+
+    /// Before the free text, in the global or the verb-flag position, they
+    /// are global flags.
+    #[test]
+    fn flags_before_the_free_text_are_global() {
+        assert_eq!(
+            taken(&["flk", "--json", "pane", "run", "1-1", "ls", "--json"]),
+            (
+                argv(&["flk", "pane", "run", "1-1", "ls", "--json"]),
+                Format::Json
+            )
+        );
+        assert_eq!(
+            taken(&["flk", "pane", "run", "--format=json", "1-1", "ls"]),
+            (argv(&["flk", "pane", "run", "1-1", "ls"]), Format::Json)
+        );
+        // Its text starts right after the verb: the flag goes before it.
+        assert_eq!(
+            taken(&["flk", "pane", "--json", "arm-self-compact", "--abort"]),
+            (
+                argv(&["flk", "pane", "arm-self-compact", "--abort"]),
+                Format::Json
+            )
+        );
+        // `msg send` reads its options anywhere in the text, `--json` among them.
+        assert_eq!(
+            taken(&["flk", "msg", "send", "w1", "hi", "--json"]),
+            (argv(&["flk", "msg", "send", "w1", "hi"]), Format::Json)
+        );
+    }
+
     #[test]
     fn the_read_verbs_keep_their_own_screen_format() {
         assert_eq!(
@@ -286,6 +458,32 @@ mod tests {
         ] {
             assert!(take_global(&argv(args)).is_err(), "{args:?}");
         }
+    }
+
+    /// The envelope prints once, at the end, with the exit the process
+    /// returns: a later skew override to 78 is what it says (#1024 r2).
+    #[test]
+    fn the_pending_envelope_carries_the_final_exit_and_an_id() {
+        set(Format::Json);
+        error(
+            &json!({"id": "cli:x", "error": {"code": "agent_not_found", "message": "m"}}),
+            1,
+        );
+        failure(ErrorCode::Transport, "later failure", 1);
+        let pending = PENDING.with_borrow(Clone::clone).unwrap();
+        assert_eq!(
+            pending["error"]["code"], "agent_not_found",
+            "the first one wins"
+        );
+        assert_eq!(envelope(&pending, 78)["error"]["exit"], 78);
+        set(Format::Default);
+        assert!(!envelope_pending());
+        let client_side = json!({"error": {"code": "transport", "message": "m"}});
+        assert_eq!(envelope(&client_side, 1)["id"], Value::Null);
+        assert!(envelope(&client_side, 1)
+            .as_object()
+            .unwrap()
+            .contains_key("id"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::process::Output;
 use serde_json::{json, Value};
 use support::scripted::{flk, scripted_server};
 
-fn not_found(_: &str) -> Value {
+fn not_found(_: &Value) -> Value {
     json!({"error":{"code":"agent_not_found","message":"agent target nosuch not found"}})
 }
 
@@ -111,7 +111,7 @@ fn format_json_is_global_in_any_position() {
 /// `--json` it is the envelope, and its own `--format text` stays its own.
 #[test]
 fn pane_read_error_is_an_envelope() {
-    fn gone(_: &str) -> Value {
+    fn gone(_: &Value) -> Value {
         json!({"error":{"code":"pane_not_found","message":"no pane 9-9"}})
     }
     let (socket, _server) = scripted_server("envelope-pane", gone);
@@ -136,13 +136,13 @@ fn pane_read_error_is_an_envelope() {
 /// notice on stderr and never on stdout.
 #[test]
 fn a_guarded_pane_refusal_is_an_envelope_with_exit_10() {
-    fn refuse(_: &str) -> Value {
+    fn refuse(_: &Value) -> Value {
         json!({"error":{"code":"not_settled","message":"agent is working"}})
     }
     let (socket, _server) = scripted_server("envelope-refused", refuse);
     let output = flk(
         &socket,
-        &["pane", "run", "1-1", "--if-input-empty", "hi", "--json"],
+        &["--json", "pane", "run", "1-1", "--if-input-empty", "hi"],
     );
     let value = envelope(&output, 10);
     assert_eq!(value["error"]["retry"], "later");
@@ -153,7 +153,7 @@ fn a_guarded_pane_refusal_is_an_envelope_with_exit_10() {
 /// `msg send` and its `--await` form: a refused send is the envelope.
 #[test]
 fn msg_send_error_is_an_envelope() {
-    fn unknown(_: &str) -> Value {
+    fn unknown(_: &Value) -> Value {
         json!({"error":{"code":"msg_target_not_found","message":"no agent w9"}})
     }
     let (socket, _server) = scripted_server("envelope-msg", unknown);
@@ -181,7 +181,7 @@ fn msg_send_error_is_an_envelope() {
 /// A delegate usage error (`not a delegate`) is `invalid_params`, exit 2.
 #[test]
 fn delegate_not_a_delegate_is_an_envelope() {
-    fn unused(_: &str) -> Value {
+    fn unused(_: &Value) -> Value {
         json!({"error":{"code":"internal_error","message":"unexpected call"}})
     }
     let (socket, _server) = scripted_server("envelope-delegate", unused);
@@ -205,6 +205,8 @@ fn an_unreachable_server_is_a_transport_envelope() {
     let output = flk(&socket, &["agent", "get", "w1", "--json"]);
     let value = envelope(&output, 1);
     assert_eq!(value["error"]["code"], "transport", "{value}");
+    // A client-side failure answers no request: its `id` is null, not absent.
+    assert_eq!(value.get("id"), Some(&Value::Null), "{value}");
     assert_eq!(value["error"]["retry"], "maybe");
     one_human_line(&output, "transport");
 }
@@ -212,13 +214,13 @@ fn an_unreachable_server_is_a_transport_envelope() {
 /// An effect failure is a result: under `--json` it is the stdout document.
 #[test]
 fn an_unconfirmed_send_is_the_stdout_document_under_json() {
-    fn unconfirmed(_: &str) -> Value {
+    fn unconfirmed(_: &Value) -> Value {
         json!({"result":{"type":"pane_send","outcome":"unconfirmed","reason":"confirm_timeout"}})
     }
     let (socket, _server) = scripted_server("envelope-effect", unconfirmed);
     let output = flk(
         &socket,
-        &["agent", "send", "--no-submit", "w1", "hi", "--json"],
+        &["agent", "send", "--json", "--no-submit", "w1", "hi"],
     );
     assert_eq!(output.status.code(), Some(8), "{}", stderr(&output));
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -227,4 +229,137 @@ fn an_unconfirmed_send_is_the_stdout_document_under_json() {
     let plain = flk(&socket, &["agent", "send", "--no-submit", "w1", "hi"]);
     assert_eq!(plain.status.code(), Some(8));
     assert!(plain.stdout.is_empty());
+}
+
+/// Answers every request with an error whose message is the request's params,
+/// so a test reads back exactly what the verb sent.
+fn echo(request: &Value) -> Value {
+    json!({"error":{"code":"invalid_params","message": request["params"].to_string()}})
+}
+
+/// The params the verb sent, from the one stderr line without machine output.
+fn sent(output: &Output) -> Value {
+    let stderr = stderr(output);
+    let line: Value = serde_json::from_str(stderr.lines().last().unwrap_or_default())
+        .unwrap_or_else(|err| panic!("{err}: {stderr}"));
+    serde_json::from_str(line["error"]["message"].as_str().unwrap()).unwrap()
+}
+
+/// The global flags are never looked for in a verb's free text: these words
+/// reach the pane verbatim, and the output mode stays the default.
+#[test]
+fn global_flags_inside_typed_text_pass_through_verbatim() {
+    let (socket, _server) = scripted_server("envelope-freetext", echo);
+    for (args, text) in [
+        (
+            &["pane", "run", "1-1", "git", "log", "--format=%H"][..],
+            "git log --format=%H",
+        ),
+        (
+            &[
+                "pane", "run", "1-1", "gh", "pr", "view", "12", "--json", "state",
+            ],
+            "gh pr view 12 --json state",
+        ),
+        (
+            &[
+                "pane",
+                "run",
+                "1-1",
+                "--if-input-empty",
+                "ls",
+                "--format",
+                "text",
+            ],
+            "ls --format text",
+        ),
+        (
+            &["pane", "send-text", "1-1", "--json", "state"],
+            "--json state",
+        ),
+        (&["pane", "send-text", "1-1", "--format=%H"], "--format=%H"),
+        (
+            &["agent", "send", "w1", "hi", "--format=%H", "--json"],
+            "hi --format=%H --json",
+        ),
+        (
+            &["agent", "send", "--no-submit", "w1", "--json", "x"],
+            "--json x",
+        ),
+    ] {
+        let output = flk(&socket, args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: output mode changed");
+        assert_eq!(sent(&output)["text"], text, "{args:?}");
+    }
+}
+
+/// Before the verb's free text the flags are global: before the verb, or in
+/// the verb's flag position.
+#[test]
+fn global_flags_before_the_free_text_switch_the_output() {
+    let (socket, _server) = scripted_server("envelope-flagpos", echo);
+    for (args, text) in [
+        (
+            &["--json", "pane", "run", "1-1", "ls", "--json"][..],
+            "ls --json",
+        ),
+        (&["pane", "--format", "json", "send-text", "1-1", "a"], "a"),
+        (
+            &["pane", "run", "--json", "1-1", "--if-input-empty", "b"],
+            "b",
+        ),
+    ] {
+        let output = flk(&socket, args);
+        let value = envelope(&output, 1);
+        let params: Value =
+            serde_json::from_str(value["error"]["message"].as_str().unwrap()).unwrap();
+        assert_eq!(params["text"], text, "{args:?}");
+    }
+}
+
+/// `--` keeps its documented meaning: everything after it is left alone, and
+/// for `pane run --if-input-empty` it still ends the guard's flags.
+#[test]
+fn a_double_dash_still_ends_the_flags() {
+    let (socket, _server) = scripted_server("envelope-dashdash", echo);
+    let guarded = flk(
+        &socket,
+        &[
+            "pane",
+            "run",
+            "--if-input-empty",
+            "--",
+            "1-1",
+            "--json",
+            "x",
+        ],
+    );
+    assert!(guarded.stdout.is_empty());
+    assert_eq!(sent(&guarded)["text"], "--json x");
+    let agent = flk(&socket, &["agent", "send", "--", "w1", "--format", "json"]);
+    assert!(agent.stdout.is_empty());
+    assert_eq!(sent(&agent)["text"], "--format json");
+}
+
+/// An older server: the verb's error becomes `server_version_gap` and the
+/// process exits 78. The one envelope says 78 too, because it prints last.
+#[test]
+fn the_skew_envelope_says_the_exit_the_process_returns() {
+    fn old_server(request: &Value) -> Value {
+        if request["method"] == "ping" {
+            return json!({"result":{"type":"pong","version":"0.1.0","protocol":1}});
+        }
+        json!({"error":{"code":"unknown_method","message":"unknown method"}})
+    }
+    let (socket, _server) = scripted_server("envelope-skew", old_server);
+    let output = flk(&socket, &["agent", "get", "w1", "--json"]);
+    let value = envelope(&output, 78);
+    assert_eq!(value["error"]["code"], "server_version_gap", "{value}");
+    assert_eq!(value["error"]["retry"], "after_handoff");
 }
