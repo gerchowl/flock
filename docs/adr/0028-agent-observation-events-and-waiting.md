@@ -234,7 +234,10 @@ from `state` after the settle window, so that no consumer re-derives them:
   because notification routing (§8, ADR-0016) keys on them;
 - `pr.ci_completed { repo, branch, pr, head_sha, conclusion, failed_checks }`
   and `pr.merged` / `pr.closed` from the batched PR poller (#663 part B, no
-  per-worktree `gh` exec);
+  per-worktree `gh` exec). `pr.ci_completed` is emitted once per head SHA:
+  the first conclusion wins, and a re-run of CI on the same SHA is never
+  announced again. A PR already merged or closed when the server starts is
+  history and is not announced;
 - ADR-0027's `AgentDelegated`, `DelegateReaped`, … and ADR-0030's `goal.*`.
 
 Raw `pane_agent_status_changed` stays (the sidebar uses it), but it is not
