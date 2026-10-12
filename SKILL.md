@@ -180,8 +180,7 @@ agent that is already idle settles after one settle window:
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)
-flk agent send worker "review the auth module"
-flk pane send-keys 1-2 Enter
+flk agent send worker "review the auth module"   # submits; no Enter needed
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
@@ -218,27 +217,65 @@ flk wait reply "$id" --timeout 600000
 
 stdout is the reply body alone. Exit `0` replied, `3` the recipient is muted (its deferral is printed) or the message was dropped unread, `124` timed out (`--json` shows whether it was at least read). Run it as a background task to be woken by the answer instead of polling `flk msg status`. It works from outside any pane too (an ssh shell): the reply is held for you under the correlation id.
 
-## send text or keys to a pane
+## send a prompt to an agent
 
-send text without pressing Enter:
+`agent send` types the text **and submits it**. do not follow it with
+`pane send-keys … Enter`: that is a second Enter, and it lands on whatever the
+agent shows next.
+
+```bash
+flk agent send worker "review the auth module"
+```
+
+it needs an idle agent with an empty composer, presses Enter 120 ms after the
+paste, retries only that Enter once, and confirms that a turn started. a long
+paste that the agent folds into a chip (`[Pasted text #1]`,
+`[Pasted Content 1099 chars]`) counts as the sent text. it prints json; branch
+on the exit code, and read `result.outcome` and `result.reason` for detail:
+
+- `0` — `accepted` or `observed_accepted`: the turn started.
+- `8` — `unconfirmed`: flock could not see the turn start. with reason
+  `typed_not_submitted` the text is still sitting in the composer; any other
+  reason leaves the composer state unknown. read the pane
+  (`flk pane read <pane> --source recent --lines 20`) before you send again,
+  or you will submit it twice.
+- `9` — `abandoned`: something changed before the Enter (operator input, a
+  dialog). nothing was submitted and the composer is untouched; send again.
+- `10` — refused before typing anything (`not_settled`, `input_not_empty`,
+  `operator_active`, `injection_pending`, …): nothing changed. the error json
+  on stderr names the code (it was exit `1` before #1025). wait for the
+  agent (`flk agent wait worker --status idle`) and send again.
+
+`--no-submit` types only, without Enter, and reports `delivered` or
+`unconfirmed` (exit 8). to message another agent rather than prompt it, use
+`flk msg send` (see above): it lands in the agent's inbox and wakes it.
+
+## type into a terminal or press keys
+
+send text without pressing Enter, for shells and other non-agent terminals:
 
 ```bash
 flk pane send-text 1-1 "hello from claude"
 ```
 
-press Enter or other keys:
+press real keys — answer a dialog, cancel, move a selection:
 
 ```bash
-flk pane send-keys 1-1 Enter
+flk pane send-keys 1-1 Esc
+flk pane send-keys 1-1 Down Enter     # pick the second option of a menu
 ```
 
-`pane run` types the text and then presses a real `Enter`:
+do not use `send-keys … Enter` to submit a prompt to an agent; use
+`agent send`, which confirms the submit.
+
+`pane run` types a shell command and then presses a real `Enter`:
 
 ```bash
 flk pane run 1-1 "echo hello"
 ```
 
-the two are deliberately separate writes with a short pause between them. a
+it confirms nothing, so it is for shells, not agents. the text and the Enter
+are deliberately separate writes with a short pause between them. a
 program reading raw stdin sees read boundaries, not keystrokes, and every agent
 tui uses those boundaries to tell typing from pasting — text and a carriage
 return arriving in one read look like a pasted block containing a newline, so
@@ -436,7 +473,7 @@ flk pane read 1-3 --source recent-unwrapped --lines 40
 ```bash
 # prints the agent as json once it is up; read result.agent.pane_id from it
 flk agent start reviewer --cwd /path/to/project --wait-ready -- claude
-flk pane run 1-3 "review the test coverage in src/api/"
+flk agent send reviewer "review the test coverage in src/api/"
 ```
 
 `--wait-ready` returns once the pane reports an agent status other than
@@ -459,7 +496,8 @@ flk agent result worker          # once #575 lands
 - `pane read` prints text, not json.
 - `pane read --format ansi` or `pane read --ansi` returns a rendered ANSI snapshot for TUI feedback loops.
 - `pane read --source recent-unwrapped` is useful when you want to inspect the same unwrapped transcript that `wait output --source recent` matches against.
-- `pane send-text` prints JSON with the delivery outcome and evidence level; unconfirmed delivery exits 8.
+- `agent send` prints JSON with the submit outcome; unconfirmed exits 8 and abandoned exits 9.
+- `pane send-text` and `agent send --no-submit` print JSON with the delivery outcome and evidence level; unconfirmed delivery exits 8.
 - `pane send-keys` and `pane run` print nothing on success.
 - parse ids from `workspace create`, `tab create`, and `pane split` responses when you need new ids. `workspace create` returns `result.workspace`, `result.tab`, and `result.root_pane`. `tab create` returns `result.tab` and `result.root_pane`. for `pane split`, the new pane id is at `result.pane.pane_id`.
 - use `pane read` for current output that already exists. use `wait output` for future output you expect next.
