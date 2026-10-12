@@ -80,7 +80,7 @@ fn integration_sync(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let json = args.iter().any(|arg| arg == "--json");
+    let json = super::output::json();
     let report = crate::integration::sync::run(dry_run);
     let failed = report.outcomes.iter().any(|outcome| outcome.failed);
     if json {
@@ -164,7 +164,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn integration_manifest(args: &[String]) -> std::io::Result<i32> {
-    let json = args.iter().any(|arg| arg == "--json");
+    let json = super::output::json();
     let rest: Vec<String> = args
         .iter()
         .filter(|arg| arg.as_str() != "--json")
