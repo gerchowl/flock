@@ -19,7 +19,15 @@ use crate::api::schema::{EventData, EventEnvelope, EventKind, OwnerBinding};
 
 use super::App;
 
-/// Owner bindings by repo slug.
+/// The key a repo slug folds and looks up under. GitHub resolves
+/// `owner/name` case-insensitively, so `Example/Widgets` and
+/// `example/widgets` are one repo and one binding. `owner.bind` records the
+/// slug in this form too.
+pub(crate) fn repo_key(repo: &str) -> String {
+    repo.to_ascii_lowercase()
+}
+
+/// Owner bindings by repo slug, keyed by [`repo_key`].
 #[derive(Debug, Default)]
 pub(crate) struct OwnerIndex {
     bindings: BTreeMap<String, OwnerBinding>,
@@ -31,17 +39,18 @@ impl OwnerIndex {
     pub(crate) fn apply(&mut self, data: &EventData) {
         match data {
             EventData::OwnerBound { binding, .. } => {
-                self.bindings.insert(binding.repo.clone(), binding.clone());
+                self.bindings
+                    .insert(repo_key(&binding.repo), binding.clone());
             }
             EventData::OwnerUnbound { repo } => {
-                self.bindings.remove(repo);
+                self.bindings.remove(&repo_key(repo));
             }
             _ => {}
         }
     }
 
     pub(crate) fn get(&self, repo: &str) -> Option<&OwnerBinding> {
-        self.bindings.get(repo)
+        self.bindings.get(&repo_key(repo))
     }
 
     /// Every binding, ordered by repo slug.
@@ -345,6 +354,108 @@ mod tests {
             show(&mut app)["result"]["binding"]["agent_id"],
             *binding.agent_id
         );
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// The operator check fails closed: a caller whose pid the server could
+    /// not read, and a request relayed from an enrolled mesh peer (an inbound
+    /// relay edge on the caller's pid), are refused like an agent, and nothing is
+    /// recorded. Neither has an agent pane in its ancestry, so without the
+    /// check each would pass as the operator.
+    #[tokio::test]
+    async fn an_unattested_or_relayed_caller_cannot_bind_or_unbind() {
+        let log = temp_log("owner-unattested");
+        let checkout = checkout(&log);
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        let pid = std::process::id();
+        app.current_api_peer_pid = Some(pid);
+        bind(&mut app, bind_params(&checkout));
+        let refusals = |app: &mut App| {
+            let unbind = Method::OwnerUnbind(OwnerRepoParams { repo: REPO.into() });
+            [Method::OwnerBind(bind_params(&checkout)), unbind]
+                .map(|method| call(app, method)["error"]["code"].clone())
+        };
+
+        app.current_api_peer_pid = None;
+        assert_eq!(refusals(&mut app), ["operator_only", "operator_only"]);
+
+        app.current_api_peer_pid = Some(pid);
+        let started = crate::platform::process_start_time(pid).expect("own start time");
+        app.inbound
+            .attach(pid, started, crate::platform::process_start_time)
+            .expect("relay edge");
+        // An enrolled relay: an unenrolled one is refused earlier, with
+        // `mesh_not_enrolled`, before any method runs.
+        let edge = app
+            .inbound
+            .edge_mut(Some(pid), crate::platform::process_start_time)
+            .expect("relay edge");
+        edge.enrollment.state = "pinned".into();
+        edge.enrollment.node_id = Some("node-relay.example".into());
+        assert_eq!(refusals(&mut app), ["operator_only", "operator_only"]);
+
+        assert_eq!(owner_events(&hub).len(), 1, "only the operator's bind");
+        assert!(app.owners.get(REPO).is_some());
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// GitHub slugs are case-insensitive, so two spellings are one binding:
+    /// a rebind in another case keeps the `AgentId`, both spellings read it,
+    /// and an unbind in either case ends it, in memory and after a restart.
+    #[tokio::test]
+    async fn a_slug_in_another_case_is_the_same_binding() {
+        let log = temp_log("owner-case");
+        let checkout = checkout(&log);
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        app.current_api_peer_pid = Some(std::process::id());
+        let mut params = bind_params(&checkout);
+        params.repo = "Example/Widgets".into();
+        let (first, rebound) = bind(&mut app, params);
+        assert!(!rebound);
+        assert_eq!(first.repo, REPO, "recorded in lowercase");
+        let (second, rebound) = bind(&mut app, bind_params(&checkout));
+        assert!(rebound);
+        assert_eq!(second.agent_id, first.agent_id);
+        let shown = call(
+            &mut app,
+            Method::OwnerShow(OwnerRepoParams {
+                repo: "EXAMPLE/widgets".into(),
+            }),
+        );
+        assert_eq!(shown["result"]["binding"]["agent_id"], *first.agent_id);
+        let listed = call(&mut app, Method::OwnerList(Default::default()));
+        assert_eq!(
+            listed["result"]["bindings"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        // A fold over differently-cased lines lands on one key as well.
+        let mut index = OwnerIndex::default();
+        let mut upper = sample("Example/Widgets");
+        upper.agent_id = first.agent_id.clone();
+        index.apply(&bound(upper));
+        index.apply(&bound(sample(REPO)));
+        assert_eq!(index.all().count(), 1);
+        index.apply(&EventData::OwnerUnbound {
+            repo: "EXAMPLE/WIDGETS".into(),
+        });
+        assert_eq!(index.all().count(), 0);
+
+        call(
+            &mut app,
+            Method::OwnerUnbind(OwnerRepoParams {
+                repo: "example/WIDGETS".into(),
+            }),
+        );
+        assert_eq!(app.owners.get("Example/Widgets"), None);
+        shutdown(app);
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        app.reissue_open_records();
+        assert_eq!(app.owners.all().count(), 0);
         shutdown(app);
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }

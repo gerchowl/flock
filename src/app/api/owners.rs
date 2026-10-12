@@ -21,6 +21,10 @@ impl App {
         if let Err(problem) = validate_bind(&params) {
             return encode_error(id, "invalid_params", problem);
         }
+        let params = OwnerBindParams {
+            repo: crate::app::owners::repo_key(&params.repo),
+            ..params
+        };
         let node = crate::app::short_host_name();
         let previous = self.owners.get(&params.repo).cloned();
         let binding = OwnerBinding {
@@ -65,7 +69,9 @@ impl App {
         };
         self.record_owner_event(EventEnvelope {
             event: EventKind::OwnerUnbound,
-            data: EventData::OwnerUnbound { repo: params.repo },
+            data: EventData::OwnerUnbound {
+                repo: binding.repo.clone(),
+            },
         });
         encode_success(id, ResponseResult::OwnerUnbound { binding })
     }
@@ -88,12 +94,14 @@ impl App {
     }
 
     /// The `operator_only` refusal for an operator verb, or `None` when the
-    /// caller is the operator. Refused: a caller whose process ancestry
-    /// reaches an agent's pane, and a request relayed from a mesh peer,
-    /// whose caller this node cannot attest. ADR-0014's known gap stands: a
-    /// detached (`setsid`) child of an agent attests as the operator until
-    /// uid attestation lands (ADR-0035 §6.3 point 1, O19a #1208).
+    /// caller is the operator. Refused: a caller whose pid the server could
+    /// not read (fail closed, as `peers.enroll_reset` does), a caller whose
+    /// process ancestry reaches an agent's pane, and a request relayed from a
+    /// mesh peer, whose caller this node cannot attest. This is cooperative
+    /// only: a detached (`setsid`) child of an agent attests as the operator
+    /// until uid attestation lands (ADR-0035 §6.3 points 1 and 6, O19a #1208).
     fn refuse_non_operator(&mut self, id: &str, verb: &str) -> Option<String> {
+        let unattested = self.current_api_peer_pid.is_none();
         let relayed = self
             .inbound
             .edge(
@@ -102,12 +110,12 @@ impl App {
             )
             .is_some();
         let agent = matches!(self.spawn_caller(), SpawnCaller::Agent { .. });
-        (agent || relayed).then(|| {
+        (unattested || agent || relayed).then(|| {
             encode_error(
                 id.to_string(),
                 "operator_only",
                 format!(
-                    "{verb} is an operator verb (ADR-0035 §1): an agent or relayed caller cannot change an owner binding; run it from a shell outside any agent pane"
+                    "{verb} is an operator verb (ADR-0035 §1): an agent, relayed or unattested caller cannot change an owner binding; run it from a shell outside any agent pane"
                 ),
             )
         })
