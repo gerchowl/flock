@@ -1006,54 +1006,6 @@ mod tests {
         cleanup(&path);
     }
 
-    /// ADR-0031's downgrade recovery: a 1.x server quarantined the active
-    /// file over its goal lines and went on numbering above them in a fresh
-    /// one. With the servers stopped, putting the quarantined lines back in
-    /// front of the fresh file gives a 2.0.0 reader every event, goals
-    /// included, with no sequence handed out twice.
-    #[test]
-    fn a_log_a_1x_server_quarantined_is_recovered_by_prepending_it() {
-        use crate::api::schema::GoalRecord;
-        let path = temp_log("goal-downgrade-recovery");
-        let hub = EventHub::with_persistence(path.clone());
-        hub.push(workspace_event("w1"));
-        hub.push(EventEnvelope {
-            event: EventKind::GoalArmed,
-            data: EventData::GoalArmed {
-                agent_id: "agent_a".into(),
-                record: GoalRecord {
-                    goal: "g".into(),
-                    ..Default::default()
-                },
-                reissued: false,
-            },
-        });
-        drop(hub);
-        let quarantined = path.with_file_name("event-log.corrupt.jsonl");
-        std::fs::rename(&path, &quarantined).unwrap();
-        let after_downgrade = PersistedEvent {
-            seq: 3,
-            ts_ms: 1,
-            envelope: workspace_event("w3"),
-        };
-        let mut fresh = serde_json::to_string(&after_downgrade).unwrap();
-        fresh.push('\n');
-        std::fs::write(&path, &fresh).unwrap();
-
-        let mut merged = std::fs::read_to_string(&quarantined).unwrap();
-        merged.push_str(&fresh);
-        std::fs::write(&path, merged).unwrap();
-        std::fs::remove_file(&quarantined).unwrap();
-
-        let restarted = EventHub::with_persistence(path.clone());
-        let events = restarted.persisted_events_after(0);
-        let seqs: Vec<u64> = events.iter().map(|(seq, _, _)| *seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3]);
-        assert!(matches!(events[1].2.data, EventData::GoalArmed { .. }));
-        assert_eq!(restarted.current_sequence(), 3);
-        cleanup(&path);
-    }
-
     /// Skipping is for kinds this binary does not know. A known kind with
     /// malformed data is corruption, and must still be caught.
     #[test]

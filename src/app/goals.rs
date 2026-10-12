@@ -511,6 +511,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
 
+    /// ADR-0031's downgrade recovery: a 1.x server quarantined the active
+    /// file over its goal lines, then numbered on above them and rotated its
+    /// fresh file to `.1`. Putting the quarantined lines in front of the
+    /// active file brings every event back in sequence order, and the goal is
+    /// live in the record and re-issued after the next start.
+    #[tokio::test]
+    async fn a_log_a_1x_server_quarantined_is_recovered_with_its_goals_live() {
+        let log = temp_log("goal-downgrade-recovery");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        for envelope in open_script() {
+            app.record_goal_event(envelope);
+        }
+        shutdown(app);
+        let goal_lines = open_script().len() as u64;
+
+        let quarantined = log.with_file_name("event-log.corrupt.jsonl");
+        std::fs::rename(&log, &quarantined).expect("quarantine");
+        let line = |seq: u64, workspace_id: &str| {
+            let envelope = event(
+                EventKind::WorkspaceClosed,
+                EventData::WorkspaceClosed {
+                    workspace_id: workspace_id.into(),
+                },
+            );
+            format!(
+                "{}\n",
+                serde_json::json!({ "seq": seq, "ts_ms": 1, "envelope": envelope })
+            )
+        };
+        std::fs::write(
+            log.with_file_name("event-log.1.jsonl"),
+            line(goal_lines + 1, "before-rotation"),
+        )
+        .expect("rotated 1.x file");
+        let fresh = line(goal_lines + 2, "after-rotation");
+
+        let mut merged = std::fs::read_to_string(&quarantined).expect("quarantined lines");
+        merged.push_str(&fresh);
+        std::fs::write(&log, merged).expect("merged");
+        std::fs::remove_file(&quarantined).expect("remove quarantined");
+
+        let hub = EventHub::with_persistence(log.clone());
+        let seqs: Vec<u64> = hub
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(seq, _, _)| seq)
+            .collect();
+        assert_eq!(seqs, (1..=goal_lines + 2).collect::<Vec<_>>());
+        let mut app = app_on(hub.clone());
+        app.reissue_open_records();
+        assert_eq!(app.goals.get(AGENT), Some(&expected_open_record()));
+        assert_eq!(
+            goal_events(&hub).last(),
+            Some(&EventData::GoalArmed {
+                agent_id: AGENT.into(),
+                record: expected_open_record(),
+                reissued: true,
+            })
+        );
+        assert_eq!(hub.current_sequence(), goal_lines + 3, "no seq reused");
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
     /// ADR-0031 §4: a goal that writes nothing (parked) outlives more
     /// rotations than the log keeps files, because each rotation re-issues it.
     #[tokio::test]
