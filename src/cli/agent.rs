@@ -605,7 +605,9 @@ fn agent_restart(args: &[String]) -> std::io::Result<i32> {
         // A terminal newline in a handoff file is not part of the prompt.
         params.continue_with = Some(body.trim_end_matches(['\r', '\n']).to_string());
     }
-    super::print_response(&super::send_request(&Request {
+    // Guarded: a busy, rate-limited or drafted agent is refused before
+    // anything restarts, so that refusal exits 10 (#1025).
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:agent:restart".into(),
         method: Method::AgentRestart(params),
     })?)

@@ -110,6 +110,18 @@ fn agent_send_refused_before_acting_exits_10() {
     assert_moved(&output, 10, 1);
 }
 
+/// `agent restart` is guarded: a busy or rate-limited agent is refused before
+/// anything restarts, and that is 10 too.
+#[test]
+fn agent_restart_refused_before_acting_exits_10() {
+    fn busy(_: &str) -> serde_json::Value {
+        serde_json::json!({"error":{"code":"restart_busy","message":"restart_busy"}})
+    }
+    let (socket, _server) = scripted_server("restart", busy);
+    let output = flk(&socket, &["agent", "restart", "worker", "--reason", "r"]);
+    assert_moved(&output, 10, 1);
+}
+
 /// A verb that is neither send-like nor guarded keeps exit 1 for a `later`
 /// refusal, with no notice: the move is scoped to those verbs (ADR-0029 §2).
 #[test]
