@@ -6,8 +6,10 @@
 - Builds on: ADR-0005 (durable event log), ADR-0027 (re-issued edges),
   ADR-0030 §1 (the event fold as the recommendation to test here).
 - Decision owner: operator.
-- Implemented: the benchmark only (`src/api/event_hub/goal_storage_bench.rs`,
-  an ignored test). No goal state exists yet.
+- Implemented: the benchmark (`src/api/event_hub/goal_storage_bench.rs`, an
+  ignored test); G1a (#1034): decisions 1 to 4 (`src/app/goals.rs`, the
+  rotation counter `EventHub::rotations`, and the shared start pass
+  `App::reissue_open_records`).
 
 ## Context
 

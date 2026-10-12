@@ -153,6 +153,7 @@ impl App {
         // rather than on the `AgentRemoved` event, which a node without mesh
         // identity never writes.
         self.delegations.mark_gone(&removal.agent);
+        self.disarm_removed_agent_goal(&removal.agent);
         // Retire the identity before attempting storage: a queued tombstone must
         // never apply to the next agent launched in this terminal, either.
         let mut retired = false;
