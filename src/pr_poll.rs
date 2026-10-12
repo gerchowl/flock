@@ -35,9 +35,10 @@
 //! several PRs and a closed one was touched more recently than an open one —
 //! rare, and the badge self-corrects on the next change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::worktree::{parse_pr_state_fields, PrStateInfo};
+use crate::api::schema::{EventData, EventEnvelope, EventKind};
+use crate::worktree::{parse_pr_state_fields, PrState, PrStateInfo};
 
 /// Aliases per request. GitHub enforces node/complexity ceilings, and an
 /// oversized document is refused wholesale — which without chunking means the
@@ -51,6 +52,26 @@ pub(crate) const MAX_ALIASES_PER_REQUEST: usize = 100;
 pub(crate) struct PrQuery {
     pub repo: String,
     pub branch: String,
+}
+
+/// One PR as a round saw it: the sidebar badge plus the head commit and its
+/// checks (#1020). Read from the SAME aliased query as the badge, so the CI
+/// events cost no request of their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrObservation {
+    pub repo: String,
+    pub branch: String,
+    pub info: PrStateInfo,
+    pub head_sha: Option<String>,
+    /// `Some` only once every check on `head_sha` has concluded.
+    pub ci: Option<CiConclusion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CiConclusion {
+    /// The rollup state, lowercased: `success`, `failure` or `error`.
+    pub conclusion: String,
+    pub failed_checks: Vec<String>,
 }
 
 /// Split `owner/name`, rejecting anything that is not exactly two segments.
@@ -86,7 +107,11 @@ pub(crate) fn build_query(queries: &[PrQuery]) -> String {
             " a{idx}: repository(owner: {owner}, name: {name}) {{ \
              pullRequests(headRefName: {branch}, first: 1, \
              orderBy: {{field: UPDATED_AT, direction: DESC}}) \
-             {{ nodes {{ number state isDraft }} }} }}"
+             {{ nodes {{ number state isDraft headRefOid \
+             commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state \
+             contexts(first: 100) {{ totalCount nodes {{ __typename \
+             ... on CheckRun {{ name status conclusion }} \
+             ... on StatusContext {{ context state }} }} }} }} }} }} }} }} }} }}"
         ));
     }
     doc.push_str(" }");
@@ -99,7 +124,7 @@ pub(crate) fn build_query(queries: &[PrQuery]) -> String {
 /// branch" — the same answer the old `gh pr view` gave on exit 1. It is
 /// deliberately NOT an error for the round: one unresolvable repo must not
 /// discard the other 30 results.
-pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery, PrStateInfo> {
+pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery, PrObservation> {
     let mut out = HashMap::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return out;
@@ -119,11 +144,191 @@ pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery
         let is_draft = node.get("isDraft").and_then(serde_json::Value::as_bool);
         if let (Some(number), Some(state)) = (number, state) {
             if let Some(info) = parse_pr_state_fields(state, number, is_draft) {
-                out.insert(q.clone(), info);
+                let head_sha = node
+                    .get("headRefOid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let commit = node.pointer("/commits/nodes/0/commit");
+                // CI read off a commit that is no longer the head would
+                // conclude the wrong SHA, so it only counts when they match.
+                let ci = commit
+                    .filter(|commit| {
+                        head_sha.is_some()
+                            && commit.get("oid").and_then(serde_json::Value::as_str)
+                                == head_sha.as_deref()
+                    })
+                    .and_then(|commit| commit.get("statusCheckRollup"))
+                    .and_then(parse_ci);
+                out.insert(
+                    q.clone(),
+                    PrObservation {
+                        repo: q.repo.clone(),
+                        branch: q.branch.clone(),
+                        info,
+                        head_sha,
+                        ci,
+                    },
+                );
             }
         }
     }
     out
+}
+
+/// The conclusion of a head commit's checks, or `None` while any is still
+/// running. A commit with no checks at all has a null rollup and never
+/// concludes, which is the honest answer for a repo without CI. Neither does
+/// one with more checks than a page holds: an unread check could still be
+/// running.
+fn parse_ci(rollup: &serde_json::Value) -> Option<CiConclusion> {
+    let state = rollup.get("state")?.as_str()?;
+    if !matches!(state, "SUCCESS" | "FAILURE" | "ERROR") {
+        return None;
+    }
+    let mut failed_checks = Vec::new();
+    let contexts = rollup
+        .pointer("/contexts/nodes")
+        .and_then(serde_json::Value::as_array)?;
+    let total = rollup.pointer("/contexts/totalCount")?.as_u64()?;
+    if total > contexts.len() as u64 {
+        return None;
+    }
+    for ctx in contexts {
+        let field = |key: &str| ctx.get(key).and_then(serde_json::Value::as_str);
+        let (name, failed) = match field("__typename") {
+            Some("CheckRun") => {
+                if field("status") != Some("COMPLETED") {
+                    return None;
+                }
+                let failed = matches!(
+                    field("conclusion"),
+                    Some(
+                        "FAILURE"
+                            | "TIMED_OUT"
+                            | "CANCELLED"
+                            | "ACTION_REQUIRED"
+                            | "STARTUP_FAILURE"
+                    )
+                );
+                (field("name"), failed)
+            }
+            Some("StatusContext") => match field("state") {
+                Some("PENDING" | "EXPECTED") => return None,
+                state => (field("context"), matches!(state, Some("FAILURE" | "ERROR"))),
+            },
+            _ => continue,
+        };
+        if failed {
+            failed_checks.push(name.unwrap_or("unnamed").to_string());
+        }
+    }
+    Some(CiConclusion {
+        conclusion: state.to_ascii_lowercase(),
+        failed_checks,
+    })
+}
+
+/// Which PR facts the durable log already holds, so each is emitted once
+/// (#1020): one `pr.ci_completed` per head SHA, one `pr.merged` or
+/// `pr.closed` per PR. Seeded from the log on the first round after a start,
+/// which is what keeps a restart from re-announcing them. A re-run of CI on
+/// the same SHA is never announced again: the first conclusion wins.
+#[derive(Debug, Default)]
+pub(crate) struct PrEventLedger {
+    pub seeded: bool,
+    seen: HashSet<String>,
+}
+
+/// The `pr.*` events already in the durable log. Read on the poll worker, not
+/// the App loop: it parses every retained log file.
+pub(crate) fn logged_pr_events(hub: &crate::api::EventHub) -> Vec<EventEnvelope> {
+    hub.persisted_events_after(0)
+        .into_iter()
+        .map(|(_, _, envelope)| envelope)
+        .filter(|envelope| PrEventLedger::key(envelope).is_some())
+        .collect()
+}
+
+impl PrEventLedger {
+    fn key(envelope: &EventEnvelope) -> Option<String> {
+        match &envelope.data {
+            EventData::PrCiCompleted {
+                repo, pr, head_sha, ..
+            } => Some(format!("ci {repo}#{pr} {head_sha}")),
+            EventData::PrMerged { repo, pr, .. } => Some(format!("merged {repo}#{pr}")),
+            EventData::PrClosed { repo, pr, .. } => Some(format!("closed {repo}#{pr}")),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fold<'a>(&mut self, events: impl IntoIterator<Item = &'a EventEnvelope>) {
+        self.seen.extend(events.into_iter().filter_map(Self::key));
+    }
+
+    /// Seed from the log, and mark every fact about PRs the first round
+    /// already sees merged or closed as known, their CI included: they ended
+    /// before this server started, and announcing them would flood a
+    /// supervisor with history on every upgrade.
+    pub(crate) fn seed(&mut self, logged: &[EventEnvelope], first_round: &[PrObservation]) {
+        self.fold(logged);
+        let ended: Vec<PrObservation> = first_round
+            .iter()
+            .filter(|obs| matches!(obs.info.state, PrState::Merged | PrState::Closed))
+            .cloned()
+            .collect();
+        self.fold(&Self::candidates(&ended));
+        self.seeded = true;
+    }
+
+    /// The events this round adds, already folded into the ledger.
+    pub(crate) fn derive(&mut self, observed: &[PrObservation]) -> Vec<EventEnvelope> {
+        let mut out = Self::candidates(observed);
+        out.retain(|event| Self::key(event).is_some_and(|key| self.seen.insert(key)));
+        out
+    }
+
+    fn candidates(observed: &[PrObservation]) -> Vec<EventEnvelope> {
+        let mut out = Vec::new();
+        for obs in observed {
+            let (repo, branch, pr) = (obs.repo.clone(), obs.branch.clone(), obs.info.number);
+            if let (Some(sha), Some(ci)) = (&obs.head_sha, &obs.ci) {
+                out.push(EventEnvelope {
+                    event: EventKind::PrCiCompleted,
+                    data: EventData::PrCiCompleted {
+                        repo: repo.clone(),
+                        branch: branch.clone(),
+                        pr,
+                        head_sha: sha.clone(),
+                        conclusion: ci.conclusion.clone(),
+                        failed_checks: ci.failed_checks.clone(),
+                    },
+                });
+            }
+            let head_sha = obs.head_sha.clone();
+            match obs.info.state {
+                PrState::Merged => out.push(EventEnvelope {
+                    event: EventKind::PrMerged,
+                    data: EventData::PrMerged {
+                        repo,
+                        branch,
+                        pr,
+                        head_sha,
+                    },
+                }),
+                PrState::Closed => out.push(EventEnvelope {
+                    event: EventKind::PrClosed,
+                    data: EventData::PrClosed {
+                        repo,
+                        branch,
+                        pr,
+                        head_sha,
+                    },
+                }),
+                PrState::Open | PrState::Draft => {}
+            }
+        }
+        out
+    }
 }
 
 /// Whether the response carried a top-level `errors` array. GraphQL answers
@@ -136,7 +341,17 @@ pub(crate) fn parse_response(body: &str, queries: &[PrQuery]) -> HashMap<PrQuery
 /// "none of these branches have PRs".
 pub(crate) fn fetch_batch(
     queries: &[PrQuery],
-) -> Result<HashMap<PrQuery, PrStateInfo>, PrPollErrorKind> {
+) -> Result<HashMap<PrQuery, PrObservation>, PrPollErrorKind> {
+    fetch_batch_with(queries, &mut |document| {
+        crate::github::graphql::execute(document, serde_json::Value::Null, "pr_poll")
+    })
+}
+
+/// `fetch_batch` over an injectable transport, so a test can count requests.
+fn fetch_batch_with(
+    queries: &[PrQuery],
+    execute: &mut dyn FnMut(&str) -> Result<String, PrPollErrorKind>,
+) -> Result<HashMap<PrQuery, PrObservation>, PrPollErrorKind> {
     if queries.is_empty() {
         return Ok(HashMap::new());
     }
@@ -145,12 +360,11 @@ pub(crate) fn fetch_batch(
     if queries.len() > MAX_ALIASES_PER_REQUEST {
         let mut merged = HashMap::new();
         for chunk in queries.chunks(MAX_ALIASES_PER_REQUEST) {
-            merged.extend(fetch_batch(chunk)?);
+            merged.extend(fetch_batch_with(chunk, execute)?);
         }
         return Ok(merged);
     }
-    let text =
-        crate::github::graphql::execute(&build_query(queries), serde_json::Value::Null, "pr_poll")?;
+    let text = execute(&build_query(queries))?;
     Ok(parse_response(&text, queries))
 }
 
@@ -251,8 +465,112 @@ mod tests {
             "a0":{"pullRequests":{"nodes":[{"number":7,"state":"OPEN","isDraft":false}]}},
             "a1":{"pullRequests":{"nodes":[{"number":9,"state":"MERGED","isDraft":false}]}}}}"#;
         let got = parse_response(body, &queries);
-        assert_eq!(got.get(&queries[0]).map(|p| p.number), Some(7));
-        assert_eq!(got.get(&queries[1]).map(|p| p.number), Some(9));
+        assert_eq!(got.get(&queries[0]).map(|p| p.info.number), Some(7));
+        assert_eq!(got.get(&queries[1]).map(|p| p.info.number), Some(9));
+    }
+
+    /// A PR node whose head commit carries `contexts` (#1020).
+    fn pr_node(number: u64, state: &str, sha: &str, rollup: &str, contexts: &str) -> String {
+        format!(
+            r#"{{"pullRequests":{{"nodes":[{{"number":{number},"state":"{state}","isDraft":false,
+            "headRefOid":"{sha}","commits":{{"nodes":[{{"commit":{{"oid":"{sha}",
+            "statusCheckRollup":{{"state":"{rollup}","contexts":{{"totalCount":{total},
+            "nodes":[{contexts}]}}}}}}}}]}}}}]}}}}"#,
+            total = contexts.matches("__typename").count()
+        )
+    }
+
+    const FAILED_RUN: &str = r#"{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"},
+        {"__typename":"StatusContext","context":"ci/legacy","state":"SUCCESS"}"#;
+
+    #[test]
+    fn a_concluded_head_carries_its_failed_check_names() {
+        let queries = vec![q("o/a", "feat")];
+        let body = format!(
+            r#"{{"data":{{"a0":{}}}}}"#,
+            pr_node(7, "OPEN", "abc", "FAILURE", FAILED_RUN)
+        );
+        let got = &parse_response(&body, &queries)[&queries[0]];
+        assert_eq!(got.head_sha.as_deref(), Some("abc"));
+        assert_eq!(
+            got.ci,
+            Some(CiConclusion {
+                conclusion: "failure".into(),
+                failed_checks: vec!["test".into()],
+            })
+        );
+    }
+
+    /// A check still running means CI has not completed, whatever the rollup
+    /// says about the ones that finished.
+    #[test]
+    fn a_running_check_or_a_stale_commit_is_not_a_conclusion() {
+        let queries = vec![q("o/a", "feat")];
+        let running =
+            r#"{"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":null}"#;
+        let body = format!(
+            r#"{{"data":{{"a0":{}}}}}"#,
+            pr_node(7, "OPEN", "abc", "FAILURE", running)
+        );
+        assert_eq!(parse_response(&body, &queries)[&queries[0]].ci, None);
+        let stale = format!(
+            r#"{{"data":{{"a0":{}}}}}"#,
+            pr_node(7, "OPEN", "abc", "SUCCESS", "")
+        )
+        .replacen(r#""oid":"abc""#, r#""oid":"old""#, 1);
+        assert_eq!(parse_response(&stale, &queries)[&queries[0]].ci, None);
+        let truncated = format!(
+            r#"{{"data":{{"a0":{}}}}}"#,
+            pr_node(7, "OPEN", "abc", "SUCCESS", FAILED_RUN)
+        )
+        .replacen(r#""totalCount":2"#, r#""totalCount":101"#, 1);
+        assert_eq!(
+            parse_response(&truncated, &queries)[&queries[0]].ci,
+            None,
+            "unread checks beyond the page could still be running"
+        );
+    }
+
+    /// #1020 acceptance: the checks ride the existing batched request (one
+    /// call for the whole fleet, every round), and repeated rounds over the
+    /// same head emit `pr.ci_completed` exactly once.
+    #[test]
+    fn ci_events_add_no_request_and_fire_once_per_head_sha() {
+        let queries: Vec<PrQuery> = (0..30).map(|i| q("o/n", &format!("b{i}"))).collect();
+        let mut sha = "abc";
+        let mut calls = 0;
+        let mut ledger = PrEventLedger::default();
+        let mut emitted = Vec::new();
+        for round in 0..4 {
+            if round == 2 {
+                sha = "def";
+            }
+            let mut fake = |_: &str| -> Result<String, PrPollErrorKind> {
+                calls += 1;
+                Ok(format!(
+                    r#"{{"data":{{"a0":{}}}}}"#,
+                    pr_node(7, "OPEN", sha, "FAILURE", FAILED_RUN)
+                ))
+            };
+            let found = fetch_batch_with(&queries, &mut fake).expect("round");
+            emitted.extend(ledger.derive(&found.into_values().collect::<Vec<_>>()));
+        }
+        assert_eq!(calls, 4, "one request per round for 30 branches");
+        let heads: Vec<&str> = emitted
+            .iter()
+            .filter_map(|event| match &event.data {
+                EventData::PrCiCompleted {
+                    head_sha,
+                    failed_checks,
+                    ..
+                } => {
+                    assert_eq!(failed_checks, &vec!["test".to_string()]);
+                    Some(head_sha.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heads, vec!["abc", "def"]);
     }
 
     /// Partial failure is the batching-specific hazard: one repo erroring must
@@ -266,7 +584,7 @@ mod tests {
         let got = parse_response(body, &queries);
         assert!(!got.contains_key(&queries[0]));
         assert_eq!(
-            got.get(&queries[1]).map(|p| p.state),
+            got.get(&queries[1]).map(|p| p.info.state),
             Some(crate::worktree::PrState::Draft)
         );
     }

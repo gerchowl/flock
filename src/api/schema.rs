@@ -2324,6 +2324,14 @@ pub enum EventKind {
     /// here; the BYTES never do. A JSONL audit log is not a blob store, and
     /// ADR-0005's rotation should not be holding 16 MB of base64 hostage.
     FileHandedOver,
+    /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
+    /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted,
+    #[serde(rename = "pr.merged")]
+    PrMerged,
+    #[serde(rename = "pr.closed")]
+    PrClosed,
 }
 
 impl EventKind {
@@ -2376,7 +2384,10 @@ impl EventKind {
             | Self::RunReverted
             | Self::NotificationFiled
             | Self::NotificationSeen
-            | Self::FileHandedOver => true,
+            | Self::FileHandedOver
+            | Self::PrCiCompleted
+            | Self::PrMerged
+            | Self::PrClosed => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -3905,6 +3916,33 @@ pub enum EventData {
         agent_id: Option<String>,
         origin_host: String,
         received_at_ms: u64,
+    },
+    /// #1020: every check on `head_sha` has concluded. `conclusion` is the
+    /// rollup (`success`, `failure`, `error`).
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted {
+        repo: String,
+        branch: String,
+        pr: u64,
+        head_sha: String,
+        conclusion: String,
+        failed_checks: Vec<String>,
+    },
+    #[serde(rename = "pr.merged")]
+    PrMerged {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    #[serde(rename = "pr.closed")]
+    PrClosed {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
