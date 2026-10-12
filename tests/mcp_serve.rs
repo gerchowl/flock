@@ -406,6 +406,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_agent_read",
             "flock_agent_fork",
             "flock_agent_lineage",
+            "flock_delegate_list",
             "flock_msg_send",
             "flock_msg_reply",
             "flock_msg_list",
