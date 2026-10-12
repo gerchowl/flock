@@ -620,7 +620,7 @@ fn start_summary_push(socket: std::path::PathBuf) {
             "params": { "subscriptions": PUSH_SUBSCRIPTIONS
                 .iter()
                 .map(|kind| serde_json::json!({ "type": kind }))
-                .collect::<Vec<_>>() },
+                .collect::<Vec<_>>(), "after": REPLAY_FROM },
         });
         if writeln!(stream, "{subscribe}").is_err() {
             return;
@@ -793,7 +793,7 @@ fn mesh_wake_push(
         "{}",
         serde_json::json!({
             "id":"relay-wake", "method":"events.subscribe",
-            "params":{"subscriptions":[{"type":"mesh.outbound_pending"}]}
+            "params":{"subscriptions":[{"type":"mesh.outbound_pending"}], "after": REPLAY_FROM}
         })
     )?;
     let mut reader = std::io::BufReader::new(stream);
@@ -919,6 +919,15 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// `events.subscribe` invalid — the server rejects it, this thread exits, and
 /// pushes silently never arrive, indistinguishable from a quiet node. That is
 /// only caught at runtime, against a live server.
+/// Where the mesh push and wake subscriptions start (#1030). A subscription
+/// now starts at now by default, but these must see what happened while
+/// they were down: mail queued during a 1-30 s resubscribe backoff, and the
+/// change that should make the first push on connect. Stream lines carry no
+/// `seq` to resume from, so they replay what the server still holds, as every
+/// subscription did before; past its retention they get `lagged`, which
+/// wakes them the same way.
+const REPLAY_FROM: u64 = 0;
+
 const PUSH_SUBSCRIPTIONS: [&str; 8] = [
     "mesh.routes_changed",
     "workspace.created",
@@ -1055,6 +1064,9 @@ mod tests {
                     .read_line(&mut line)
                     .unwrap();
                 assert!(line.contains("mesh.outbound_pending"));
+                // #1030: it replays what it missed while it was down.
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["params"]["after"], 0, "{line}");
                 writeln!(stream, "{{\"result\":{{}}}}").unwrap();
                 writeln!(stream, "{{\"event\":\"mesh_outbound_pending\"}}").unwrap();
             }

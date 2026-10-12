@@ -690,21 +690,42 @@ fn stream_subscriptions(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    // ADR-0028 §3 (#1030): from the caller's cursor, else from now. A
+    // cursor past the newest event is refused, as `events.read` refuses it,
+    // rather than streaming nothing until the hub catches up to it.
+    let head = event_hub.current_sequence();
+    let start = params.after.unwrap_or(head);
+    if start > head {
+        let refusal = ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "cursor_ahead".into(),
+                message: format!("cursor {start} is past this server's newest event {head}"),
+            },
+        };
+        return write_json_line_allow_disconnect(&mut stream, &refusal);
+    }
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
-        let active =
-            match ActiveSubscription::new(subscription, &request_id, index, api_tx, event_hub) {
-                Ok(active) => active,
-                Err(response) => {
-                    if let Err(err) = write_json_line(&mut stream, &response) {
-                        if is_connection_closed_error(&err) {
-                            return Ok(());
-                        }
-                        return Err(err);
+        let active = match ActiveSubscription::new(
+            subscription,
+            &request_id,
+            index,
+            start,
+            api_tx,
+            event_hub,
+        ) {
+            Ok(active) => active,
+            Err(response) => {
+                if let Err(err) = write_json_line(&mut stream, &response) {
+                    if is_connection_closed_error(&err) {
+                        return Ok(());
                     }
-                    return Ok(());
+                    return Err(err);
                 }
-            };
+                return Ok(());
+            }
+        };
         subscriptions.push(active);
     }
 
@@ -1526,6 +1547,101 @@ mod tests {
 
         running.store(false, Ordering::Relaxed);
         assert!(server_thread.join().unwrap().is_ok());
+    }
+
+    /// #1030 (ADR-0028 §3): a subscription without `after` starts at now; one
+    /// whose cursor the ring has passed is told `lagged` before the events it
+    /// still can have; one past the newest event is refused.
+    #[test]
+    fn a_subscription_starts_at_now_or_its_cursor_and_reports_lag() {
+        let event_hub = EventHub::default();
+        event_hub.set_ring_cap(2);
+        for correlation in ["c1", "c2", "c3"] {
+            event_hub.push(queued_for("ws_1:p1", correlation));
+        }
+        let subscribe = |after: &str| {
+            let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            writeln!(
+                client,
+                r#"{{"id":"s","method":"events.subscribe","params":{{"subscriptions":[{{"type":"msg.queued","pane":"ws_1:p1"}}]{after}}}}}"#
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
+            let thread = std::thread::spawn(move || {
+                handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+            });
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            (BufReader::new(client), running, thread)
+        };
+        let next = |reader: &mut BufReader<UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+
+        // The ring holds c2 and c3, so c1 is gone.
+        let (mut behind, behind_running, behind_thread) = subscribe(r#","after":0"#);
+        assert_eq!(next(&mut behind)["result"]["type"], "subscription_started");
+        let lagged = next(&mut behind);
+        assert_eq!(lagged["event"], "lagged", "{lagged}");
+        assert_eq!(lagged["data"]["skipped_to"], 1);
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c2");
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c3");
+
+        let (mut now, now_running, now_thread) = subscribe("");
+        assert_eq!(next(&mut now)["result"]["type"], "subscription_started");
+        event_hub.push(queued_for("ws_1:p1", "c4"));
+        assert_eq!(next(&mut now)["data"]["correlation_id"], "c4", "no replay");
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c4");
+
+        let (mut ahead, _, ahead_thread) = subscribe(r#","after":99"#);
+        assert_eq!(next(&mut ahead)["error"]["code"], "cursor_ahead");
+        assert!(ahead_thread.join().unwrap().is_ok());
+        for (running, thread) in [(now_running, now_thread), (behind_running, behind_thread)] {
+            running.store(false, Ordering::Relaxed);
+            assert!(thread.join().unwrap().is_ok());
+        }
+    }
+
+    /// #1030: mail queued while the mesh wake subscription was down still
+    /// wakes it, because it resubscribes with `after: 0` and the push is
+    /// still in the ring.
+    #[test]
+    fn a_wake_subscription_resuming_from_zero_sees_mail_queued_while_it_was_down() {
+        let event_hub = EventHub::default();
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::MeshOutboundPending,
+            data: crate::api::schema::EventData::MeshOutboundPending {},
+        });
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(
+            client,
+            r#"{{"id":"relay-wake","method":"events.subscribe","params":{{"subscriptions":[{{"type":"mesh.outbound_pending"}}],"after":0}}}}"#
+        )
+        .unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
+        let thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(next()["result"]["type"], "subscription_started");
+        assert_eq!(next()["event"], "mesh_outbound_pending");
+        running.store(false, Ordering::Relaxed);
+        assert!(thread.join().unwrap().is_ok());
     }
 
     #[test]
