@@ -1,30 +1,16 @@
 //! Output selection and the error envelope (ADR-0029 §3, §4, #1024).
 //!
-//! `--format json|text` is global, and `--json` is its synonym: [`take_global`]
-//! lifts them out of argv before any verb parses it. They are recognised in the
-//! global position (before the verb) and in a verb's flag position, never in
-//! a verb's free text: the words `pane run`, `pane send-text`, `agent send`
-//! and the other verbs in [`FREE_TEXT`] type into a pane or store as a label
-//! pass through verbatim, and so does everything after a `--`. A verb that has
-//! a text form reads [`json`] where it used to read its own `--json`; a verb
-//! that only prints JSON keeps doing so under `--format text`. `pane read` and
-//! `agent read` own a `--format text|ansi` for the screen they return, so after
-//! those verbs only `--format json` is the global flag.
-//!
-//! Under machine output (`--format json` or `--json`) an error prints on
-//! STDOUT as the envelope ADR-0029 §4 defines, `{"id", "error": {"code",
-//! "message", "retry", "exit", "data"}}`, with a one-line human message on
-//! stderr, so a pipe into a JSON parser always has a document to read. The
-//! envelope is held until the invocation ends ([`finish`]), so its `exit` is
-//! the status the process returns, and one invocation prints one envelope.
-//! `id` is the request's id, or `null` for a failure the client found before
-//! or without a request. Without machine output nothing changes (owner
-//! decision 3 on ADR-0029): the error goes to stderr as the one line it always
-//! was.
+//! `--format json|text`, and its synonym `--json`, are global: [`take_global`]
+//! lifts them out of argv before the verb, or among the verb's flags, never
+//! from a verb's free text ([`FREE_TEXT`]) or after a `--`. Under JSON an error
+//! is the §4 envelope on STDOUT, `{"id", "error": {"code", "message", "retry",
+//! "exit", "data"}}`, and one human line on stderr. It prints once, last
+//! ([`finish`]), so `exit` is the process's exit status; `id` is `null` for a
+//! failure that answers no request. Without JSON nothing changes (owner
+//! decision 3): the error stays the one stderr line it always was.
 //!
 //! Known limit: only errors reported through [`error`] and [`failure`] gain
-//! the envelope. Usage lines and a verb's own text failures still print on
-//! stderr alone; #1150 tracks moving them.
+//! the envelope; usage lines and a verb's own text failures do not (#1150).
 
 #![expect(
     clippy::print_stdout,
@@ -83,60 +69,43 @@ pub(crate) fn finish(exit_code: i32) {
 }
 
 /// A verb whose trailing words are free text, typed into a pane or stored as
-/// a label verbatim. Its grammar says where that text starts: after
-/// `operands` positional words (a target, an id), at the first word that is
-/// not one of its own `flags` or `value_flags` (which take the next word as
-/// their value). A global flag is looked for only before that point.
-struct FreeText {
-    verb: [&'static str; 2],
-    operands: usize,
-    flags: &'static [&'static str],
-    value_flags: &'static [&'static str],
-}
-
-const fn free_text(
-    verb: [&'static str; 2],
-    operands: usize,
-    flags: &'static [&'static str],
-    value_flags: &'static [&'static str],
-) -> FreeText {
-    FreeText {
-        verb,
-        operands,
-        flags,
-        value_flags,
-    }
-}
+/// a label verbatim: the verb, its operand count (a target, an id), its own
+/// flags, and its flags that take a value. The text starts at the first word
+/// after the operands that is not one of its flags.
+type FreeText = (
+    [&'static str; 2],
+    usize,
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 /// Every verb that joins its trailing arguments into text. `msg send` and
-/// `msg reply` are not here: their parsers read options anywhere in the text
-/// and take dash-leading text after `--`.
+/// `msg reply` are not here: they read options anywhere in their text.
 const FREE_TEXT: &[FreeText] = &[
-    free_text(
+    (
         ["pane", "run"],
         1,
         &["--if-input-empty"],
         &["--if-session", "--min-age-secs"],
     ),
-    free_text(["pane", "send-text"], 1, &[], &[]),
-    free_text(["pane", "send-keys"], 1, &[], &[]),
-    free_text(["agent", "send"], 1, &["--submit", "--no-submit"], &[]),
-    free_text(
+    (["pane", "send-text"], 1, &[], &[]),
+    (["pane", "send-keys"], 1, &[], &[]),
+    (["agent", "send"], 1, &["--submit", "--no-submit"], &[]),
+    (
         ["pane", "arm-self-compact"],
         0,
         &["--abort"],
         &["--pane", "--instructions", "--instructions-file"],
     ),
-    free_text(["agent", "rename"], 1, &[], &[]),
-    free_text(["pane", "rename"], 1, &[], &[]),
-    free_text(["tab", "rename"], 1, &[], &[]),
-    free_text(["workspace", "rename"], 1, &[], &[]),
+    (["agent", "rename"], 1, &[], &[]),
+    (["pane", "rename"], 1, &[], &[]),
+    (["tab", "rename"], 1, &[], &[]),
+    (["workspace", "rename"], 1, &[], &[]),
 ];
 
-/// Split the global output flags off `args` (argv, program name first), in
-/// the global and verb-flag positions only: a verb's free text ([`FREE_TEXT`])
-/// and everything after a `--` are left alone. Returns the remaining argv and
-/// the format, or a usage message for a bad or conflicting value.
+/// Split the global output flags off `args` (argv, program name first).
+/// Returns the remaining argv and the format, or a usage message for a bad or
+/// conflicting value.
 pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), String> {
     let mut kept: Vec<String> = Vec::with_capacity(args.len());
     let mut format = Format::Default;
@@ -150,26 +119,17 @@ pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), Stri
     };
     let mut rest = args.iter();
     kept.extend(rest.next().cloned());
-    // The group and verb words, and the verb's free-text grammar once known.
     let mut verb: Vec<&str> = Vec::new();
-    let mut grammar: Option<&FreeText> = None;
+    let mut grammar: Option<FreeText> = None;
     let mut operands = 0;
     while let Some(arg) = rest.next() {
-        if arg == "--" {
+        let (_, want, flags, value_flags) = grammar.unwrap_or(([""; 2], 0, &[], &[]));
+        let own_flag = flags.contains(&arg.as_str()) || value_flags.contains(&arg.as_str());
+        if arg == "--" || (grammar.is_some() && operands == want && !own_flag) {
+            // A `--`, or the verb's free text: the rest is the verb's.
             kept.push(arg.clone());
             kept.extend(rest.cloned());
             break;
-        }
-        if let Some(grammar) = grammar.filter(|grammar| operands == grammar.operands) {
-            kept.push(arg.clone());
-            if grammar.value_flags.contains(&arg.as_str()) {
-                kept.extend(rest.next().cloned());
-            } else if !grammar.flags.contains(&arg.as_str()) {
-                // The free text starts here.
-                kept.extend(rest.cloned());
-                break;
-            }
-            continue;
         }
         let value = match arg.as_str() {
             "--json" => {
@@ -184,15 +144,18 @@ pub(crate) fn take_global(args: &[String]) -> Result<(Vec<String>, Format), Stri
                 Some(value) => value.to_string(),
                 None => {
                     kept.push(arg.clone());
-                    if let Some(grammar) = grammar {
-                        if grammar.value_flags.contains(&arg.as_str()) {
-                            kept.extend(rest.next().cloned());
-                        } else if !arg.starts_with('-') {
-                            operands += 1;
-                        }
-                    } else if verb.len() < 2 && !arg.starts_with('-') {
+                    if value_flags.contains(&arg.as_str()) {
+                        kept.extend(rest.next().cloned());
+                    } else if arg.starts_with('-') || verb.len() == 2 && grammar.is_none() {
+                        // A verb flag, or a word of a verb without free text.
+                    } else if grammar.is_some() {
+                        operands += 1;
+                    } else {
                         verb.push(arg);
-                        grammar = FREE_TEXT.iter().find(|text| text.verb[..] == verb[..]);
+                        grammar = FREE_TEXT
+                            .iter()
+                            .find(|text| text.0[..] == verb[..])
+                            .copied();
                     }
                     continue;
                 }
