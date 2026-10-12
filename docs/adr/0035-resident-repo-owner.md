@@ -7,7 +7,12 @@
   #1078 (watch surface and cross-repo blocking); §5 answers them. Composes with
   #1160 (harness hooks and question routing), which another spike is writing
   in parallel as its own ADR. This record references that ADR's decisions and
-  makes none of its own about hook mechanics or question routing.
+  makes none of its own about hook mechanics or question routing. Answers
+  #1167 (architects of architects) for its identity, intake and protocol
+  parts (§1a); its dry run stays #1167's.
+- Revised: 2026-10-12, round 2. Adds the owner's daily standup and
+  transcript-driven improvement (§7a, §7b, owner addition on #1172) and
+  two-level coordination inside one repo (§1a, #1167).
 - Builds on: ADR-0004 (per-repo `.flk.toml`), ADR-0005 (durable log), ADR-0006
   (addressing), ADR-0014 (agent spawn ceiling, operator boundary), ADR-0018 /
   ADR-0026 (mail intent and custody), ADR-0023 (decision records), ADR-0027
@@ -32,6 +37,23 @@
 > itself should hold its repo dear and not destroy it by taking any
 > isse/request -- i.e. spike it -- communicate with a requesting architect and
 > become part of a software team
+
+### The owner's addition (2026-10-12, #1172, verbatim)
+
+> it could also provide a daily standup -- of what has been achieved, on what
+> is planned, what is pending/blockers/experiences/wishes for it to run
+> smoother?! -- i.e. looking always into the transcripts of itself/the
+> delegates on what tools were expensive, which could e.g. be lifted into just
+> scripts and advertised in the claude.md of a repo -- or the general claude
+> config?
+
+The owner scoped it on the same comment. The standup's sources are durable
+events, edges, `gh` and the goal record, never whole transcripts. It is
+delivered through a channel or a digest, never typed into the composer
+(#1162). Improvement proposals are filed for a human to approve. They never
+change another repo's configuration on their own. They reuse ADR-0033 and the
+survey method. Transcripts stay local, and reports quote patterns, not
+content.
 
 ### What runs today: a hand-built owner
 
@@ -136,6 +158,24 @@ of this repo therefore needs about **24–38 wakes** at a 15–30 min window. Th
 compares with 150 raw events, and with 72 deliveries into a live session today.
 More than 40 % of clock hours hold no event at all.
 
+**Lessons learned once, pasted forever.** `.fleet/briefs/_traps.md` (1,572
+bytes, eight rules) says "paste verbatim into every brief and reviewer
+prompt". Of the 292 brief files in `.fleet/briefs/` on 2026-10-12:
+
+| Rule | Briefs carrying it | Origin |
+| --- | --- | --- |
+| `cargo nextest` only, never bare `cargo test` | 146 | shared-process state fakes about 14 failures |
+| commit with `nix develop --command git commit` | 156 | #642, hooks need the devShell |
+| no "placeholder" and no comment line ending in `;` | 142 | guardrail gates scan comment prose |
+| unset `FLOCK_SOCKET_PATH` for isolated probes | 6 | added 2026-10-12 after a #1159 reviewer probe reached the live server |
+| the size cap binds production code, not a fix round | 3 | #1161 stalled twice on it |
+| one extra Enter for a paste chip | 7 | the same workaround lives in `supervisor.py:88-92` |
+
+Each lesson was learned once and is then paid for in every brief: the same
+bytes are created again per builder (ADR-0032 Context: rules collapse from 110
+distinct strings to 18 when templated). Each is a fact about the repo or a
+product defect, not a judgement call. This is the pattern §7b is for.
+
 **Authorship carries no signal.** Every author is the operator's account, so
 "something the owner has not worked on" cannot be computed from GitHub's
 author field. §2 decides how instead.
@@ -233,6 +273,86 @@ author field. §2 decides how instead.
 recorded (goal status, intake decision, ADR-0023 decision, note) is gone at
 the next fresh episode. That is the quality bar's "nothing undocumented"
 applied to the owner itself, and it is the price of zero idle cost.
+
+### 1a. Architects of architects (#1167): one owner per repo, with segment architects as its delegates, never several owners
+
+#1167 asks for two-level coordination inside one repo. A top architect owns
+landing, and segment architects own disjoint scopes. The question for this ADR
+is how §1's identity, §3's intake and §4's protocol extend to it.
+
+**Recommended: one owner, with segment architects as delegates that are
+themselves architects.**
+
+- **Identity.** The owner stays the only binding for the repo (§1). A
+  segment architect is a delegate: an ADR-0027 edge from the owner, plus a
+  durable `SegmentAssigned { owner, delegate, segment, scope_paths[],
+  sub_goal, integration_branch? }` event. The server refuses a scope that
+  overlaps another open segment's paths (`scope_overlap`, exit 13), because
+  "file ownership decides who changes what" is the coordination mechanism
+  #1167's owner comments rely on. The segment architect keeps its `AgentId`
+  and lives in episodes like the owner (§1, slice O2). Its edge survives
+  episodes, as every edge does (ADR-0027 §1). The depth is owner → segment →
+  builder, which is the depth-2 ceiling ADR-0014 §5 already sets for
+  agent-initiated spawns (`max_spawn_depth = 2`, `src/spawn/mod.rs:213`). No
+  third level exists.
+- **Intake stays with the owner.** Every subject still goes through the
+  owner's intake (§3). An accepted subject gains one more state,
+  `assigned { segment }`, decided by the owner from the paths it touches. A
+  subject that spans two scopes is either split by the owner or held by the
+  owner itself, never given to both segments. A segment architect cannot
+  accept, decline or spike on its own authority. New work it discovers is
+  filed through the O4 verbs, comes back to the owner's buffer as
+  `actor: delegate:<segment>` (not `self`, so it is not dropped) and is
+  triaged like any other subject.
+- **Protocol inside the repo is the edge, not §4.** Upward, segment
+  architects report through the owner's buffer: their delegates' events are
+  their own, and the owner receives the segment's **wave reports**. A wave
+  report is a `GoalStatusSet` on the segment's sub-goal (ADR-0030 §6), so it
+  is a durable fact and not a chat message. Questions go up to the owner by
+  #1160's routing, and only the owner asks the operator. Downward, the owner
+  uses `delegate send`. Segment architects do not message each other. A
+  change to an interface between segments is an ADR or contract issue that
+  the owner decides and lands first, and the segments merge it down. That is
+  #1167's "coordinate through artifacts, not chat", with the owner as the
+  decider. `owner.request` (§4) stays for repo-to-repo traffic only.
+- **The turn contract #1167 names is solved by parking, not by a new wait
+  kind.** A segment architect that ends a turn waiting on its builders
+  registers a wait (ADR-0028 §5), so it reads `waiting_on_event`, not
+  stalled and not "no sentinel". ADR-0030 rung 5 already parks the owner on a
+  delegate whose phase is `waiting_on_event`, because that delegate will
+  produce an event.
+- **Landing stays with the owner.** Segment architects never merge into the
+  integration branch. They hand reviewed PRs, or a reviewed segment branch,
+  to the owner's landing (`flk land`, #694; gates per §6). Two options remain
+  open: per-segment integration branches (`dev-partA`, merged by the segment
+  architect on its own authority and handed to the owner once per wave), or
+  segment PRs straight into the owner's queue on `dev`. #1167's dry run
+  compares them. Either way the owner is the only agent that writes `dev`.
+- **Caps count the subtree.** `max_delegates` (§6) counts the owner's whole
+  subtree, with segment sub-caps assigned by the owner, as ADR-0014 §5 counts
+  live descendants and as #822 asks for nested agents.
+
+**Rejected: several owners per repo with a landing owner.**
+
+- Two bindings per repo breaks §1's invariant that one agent speaks for a
+  repo. `owner:<repo>` (§4) would no longer resolve to one recipient.
+- No rule says which owner triages an issue that touches two scopes. Two
+  intake records for one subject is exactly the "no one decides" failure the
+  owner predicted on #1167 for a peer team.
+- Peers coordinate by chat, which burns the scarcest context (#1167, owner
+  comment: "in the field runs the architect's context always failed first").
+- The landing owner would decide merge order, shared files and interface
+  contracts. That makes it the top owner in all but name, with a weaker
+  identity.
+- Separate services that need real independence get separate repos, and §4
+  already covers those.
+
+**Cost.** Every segment adds one long-lived architect with its own episodes,
+roughly another owner's wake budget, so §8's per-owner figures scale with the
+number of segments. The owner becomes the bottleneck for intake and landing
+in a large repo. That is deliberate, and #1167's dry run measures whether it
+holds. A segment cannot take an outside request directly; the request waits
+for the owner's triage.
 
 ### 2. Wake vs insight: every input is a durable event; a per-owner buffer classifies it; a hibernated owner wakes with the digest as its context; a busy one gets it at the next boundary
 
@@ -705,7 +825,9 @@ is the first owned repo, in shadow mode, before anything is switched off.
 | `spawn-claude.sh` dialog scraping | `delegate start` (exists) and #1116 | — | per ADR-0030 §8 |
 | skill §0 preflight and arm | `flk owner bind` (O1) and the owner role text | O1, O12 | O12 |
 | skill §3 "observe through events" and background waits | wake classes; the owner never waits in a loop | O5 | O5 live |
-| skill §6 friction filing | ADR-0033 AX reviews and filing policy | AX1–AX7 | per ADR-0033 |
+| skill §6 friction filing | ADR-0033 AX reviews and filing policy, plus lift proposals (§7b) | AX1–AX7, O16, O17 | per ADR-0033 |
+| `.fleet/briefs/_traps.md` pasted into every brief | the repo traps file compiled into layer 2 (ADR-0032 owner decision 3), kept current by lift proposals (§7b) | ADR-0032 X1, O17 | X1 live and the rules merged into the traps file |
+| STATUS.md "Next action" and hand-written progress reports to the operator | the daily standup (§7a) | O15 | O15 live |
 | skill §7 HANDOFF and compaction | episode rotation | O2 | O2 live |
 | skill §8 harness takeover | profile ladder in the binding, fresh episodes | O2 | O2 live |
 
@@ -730,6 +852,157 @@ is the first owned repo, in shadow mode, before anything is switched off.
   stall the repo it builds.
 - *Keep `.fleet/` as the owner's state store.* ADR-0027, ADR-0030 and ADR-0032
   each already rejected hand-kept files as the source of truth.
+
+### 7a. The daily standup is a fold flk compiles, not a turn the owner writes
+
+**Recommended.**
+
+- **What it says** (the owner's six headings), and where each comes from.
+  Nothing re-reads a transcript:
+
+  | Heading | Source |
+  | --- | --- |
+  | achieved | `pr.merged`, `issue.closed{completed}`, `release.published` in the window (O3, #1020); reaped edges (`DelegateReaped`, ADR-0027 §5); intake records that reached `done` (§3) |
+  | planned | the goal record's open subtasks and wave structure (ADR-0030 §1); intake records in `accepted`, `planned` and `assigned` (§3, §1a); queued start intents (ADR-0027 §6) |
+  | pending | PRs awaiting review or landing (`delegate.list` joined with the poller's PR state, ADR-0027 §2); open ADR-0023 decisions and gate requests for the operator (§6); open `owner.request`s both ways (§4); open watches (§5) |
+  | blockers | delegates or owner in `needs_human`, `blocked` or `limit_reached` (ADR-0028 §1); red default branch (`branch.ci_completed`); expired wait deadlines; blocked-on cycles (§4); wake budget exhausted (§6) |
+  | experiences | AX review records in the window, with their metrics and the issues they filed or commented on (`AxReviewRecorded`, ADR-0033 §5); friction issues filed by the owner or its delegates (O4 `OwnerActed` with action `file`) |
+  | wishes | open lift proposals awaiting approval (§7b), and the top Q8 answer ("which single change would have saved the most turns", ADR-0033 §2) of the last AX review |
+
+- **Compiled by flk, with no model in the loop.** `flk owner standup <repo>
+  [--since <time>]` folds the sources above into a bounded markdown and JSON
+  report: twelve lines per heading, overflow as `+k more: <command>`
+  (ADR-0028 §6). This is the same pattern as `WriteDigest`, which already
+  folds the log into a digest "with no LLM in the loop"
+  (`src/checks/config.rs:284-293`). The prose parts (experiences, wishes) are
+  quoted from records that a model already produced for its own reason (an
+  AX review, a lift proposal), never written for the standup. The owner is
+  not woken to produce it.
+- **Scheduled through §5.** A `[[checks.cron]]` entry with a new closed
+  action `Standup { repo, deliver: [notification, channel:<binding>, file] }`
+  (slice O15). The default is weekdays 08:00 local, set in the repo's
+  `.flk.toml [owner.standup]`.
+- **Delivered, never typed.** The standup is filed as an operator
+  notification (ADR-0016), posted to a channel binding that subscribes to the
+  `owner.standup` kind (ADR-0028 §8, E8 #1037), and written as a file like
+  `WriteDigest`. It enters the owner's own buffer as a *digest*-class line
+  (§2), so the owner sees it at its next wake. It is never typed into any
+  composer (#1162).
+- **Answering it.** A reply on the channel post is inbound mail to the owner
+  (ADR-0028 §8, `needs_reply`, *now* class), so "do X first today" from a
+  phone reaches the owner as an operator message.
+
+**Alternatives rejected.**
+
+- *The owner writes the standup each morning.* That is one cold episode a
+  day (about 57k units, §8) to restate facts flk already holds, with the
+  risk that the prose drifts from the records. ADR-0032 §1 settles this: a
+  snapshot is derived, not authored.
+- *Build it from transcripts.* The owner excluded this explicitly. Records
+  are smaller, exact and auditable.
+- *Type it into the architect's pane each morning.* That is the #1162
+  failure.
+
+**Cost.** Zero model tokens. A standup is only as good as its records: a
+delegate's work that never produced an event (an unattested start, ADR-0027
+§8) is missing from it. The standup lists such gaps (`unattributed: n`)
+rather than hiding them.
+
+### 7b. Transcript-driven improvement: a local miner finds expensive patterns, ADR-0033's review engine turns them into lift proposals, and a human approves every lift
+
+**Recommended.**
+
+- **Two stages, so that a model only sees what a counter already found.**
+  1. **Mine, with no model.** `flk ax mine --subject <owner> [--include
+     delegates] --window <dur>` reads the local transcripts of the owner and
+     of every agent on its edges in the window (Claude Code, Codex, opencode
+     session logs). It is a port of the toolchain survey's read-only,
+     aggregate-and-redact method (`scripts/research/toolchain_survey.py:1-24`:
+     "Raw transcript text never leaves the host: only counters, short
+     redacted examples"). It emits pattern fingerprints with counts and cost:
+     - repeated multi-step tool sequences: n-grams of normalised commands
+       (paths, numbers and ids templated) seen in at least N sessions;
+     - large reads: tool results over a byte bound, by source;
+     - polling loops: repeated identical reads or `sleep`/`until` shapes,
+       which is ADR-0033 Q2's question, counted rather than recalled;
+     - retries: the same command template run again after a non-zero exit;
+     - re-derived facts: the same read or command template whose output hash
+       repeats across sessions (the same fact computed twice);
+     - repeated brief text: identical paragraphs across briefs, the
+       `_traps.md` case in Context.
+
+     Each fingerprint carries its count, the sessions it spans and the
+     tokens attributed to it, from the harness's own `usage` fields where it
+     records them (ADR-0032's `cache_usage.py` method). The output is one
+     JSON file under `state_dir()/ax/`, served as an MCP resource (ADR-0017),
+     like ADR-0033 §5's answers.
+  2. **Propose, through ADR-0033.** When the miner finds a fingerprint above
+     a threshold (default: seen in at least 3 sessions and 5 times, or more
+     than 50k tokens attributed in the window), it fires an ADR-0033 trigger
+     of a new kind, `lift`, with a versioned rubric `docs/ax/rubric-lifts.md`
+     (`ax-lifts/1`). It runs through ADR-0033's trigger engine, rate limits,
+     `AxReviewRecorded` event and filing policy (AX6a, AX4a, AX7), not
+     through a parallel mechanism. The reviewer's state is the mined table,
+     not one agent's warm context, so it uses ADR-0033's compiled-reviewer
+     path (AX9) rather than a fork: the patterns span many sessions, and no
+     single warm context holds them.
+- **What a lift proposal is.** One candidate per fingerprint, with a target
+  and the evidence (count, sessions, tokens, the command template, never
+  output text):
+
+  | Target | Example from this fleet | How it lands |
+  | --- | --- | --- |
+  | a `just` recipe or script in the repo | a multi-step check sequence repeated by builders | an issue in the repo, through the owner's intake (§3); if approved, a delegate builds it |
+  | a line in the repo's `AGENTS.md` / `CLAUDE.md`, or the repo traps file of ADR-0032 owner decision 3 (`docs/agents/traps.md`, compiled into layer 2) | the six pasted rules in Context: nextest, `nix develop` commits, the comment-prose gates, `FLOCK_SOCKET_PATH`, the size cap | as above; once merged, layer 2 carries them and briefs stop repeating them (ADR-0032 §5) |
+  | a product fix | the paste-chip Enter (`supervisor.py:88-92`) is a symptom of #1162 / #950, not a rule to teach | a comment with the new evidence on the existing issue (ADR-0033 §6 search-first) |
+  | a rule or skill in the general Claude config (claude-config) | a harness-level habit seen across repos | an issue in `gerchowl/claude-config`, never a change to it |
+  | a flk feature | a state agents rebuild by hand | an issue in `gerchowl/flock`, through that repo's owner if it has one (§4) |
+
+- **Humans approve, and the owner changes only its own repo.** Every lift is
+  a proposal. In phase 1 it is recorded and nothing is filed (ADR-0033 owner
+  decision 1). Afterwards it is filed under ADR-0033 §6's caps and
+  search-first rule, as an issue labelled `lift` or as an ADR-0023 decision
+  for the operator. An approved lift for the owner's own repo enters intake
+  as an operator decision (§3) and is built by a delegate. For another repo,
+  the owner sends an `owner.request` to that repo's owner (§4), or files an
+  issue where no owner exists. It never edits another repo, the general
+  Claude config or a host's config itself. Host config stays the operator's
+  (GOAL.md Rollout: no applies).
+- **Privacy.**
+  - Transcripts are read on the host that holds them and never leave it.
+  - The miner's output contains counts, hashes and templated command shapes
+    only. Templating removes paths under `$HOME`, hostnames and ids, with
+    the same redaction the survey uses. A filed issue passes the repo's
+    fixture-host gates like any other text (AGENTS.md, "Fixture hosts must
+    be declared fictions").
+  - Output text from tools is never quoted, only its size and hash.
+  - The miner reads transcripts of agents on this owner's edges only, not
+    every session on the host. Delegates running under another Claude
+    profile are read only if the operator listed that profile in the
+    binding (§1).
+
+**Alternatives rejected.**
+
+- *A model reads the transcripts directly.* That costs a model call over
+  hundreds of thousands of tokens per pass, it recalls instead of counting
+  (ADR-0033's prototype found four of five candidates were duplicates when
+  recalled), and it puts raw transcript text into another context.
+- *A separate improvement engine beside ADR-0033.* The owner asked for
+  reuse. ADR-0033 already has the rubric versioning, records, report fold,
+  rate limits and filing policy that this needs.
+- *Auto-apply lifts in the owner's own repo.* A lift changes what every
+  later agent reads (layer 2) or runs (a recipe). That is a change like any
+  other, so it goes through intake and review.
+- *Edit claude-config or other repos directly.* The owner excluded it, and
+  it would break §4's rule that an owner's authority ends at its own repo.
+
+**Cost.** The miner is new code that must keep up with three transcript
+formats. The survey script already parses all three
+(`scripts/research/toolchain_survey.py`, `claude`, `codex`, `opencode`
+readers), so the port starts from working parsers. Each lift review is one
+compiled-reviewer run (§8). A lift that is proposed and declined costs a
+review and an issue comment; the 0.8 confidence bar and caps from ADR-0033 §6
+bound that.
 
 ### 8. Token cost, explicitly
 
@@ -756,6 +1029,25 @@ ones.
 | Quiet (intake only, under 20 events, 2 h window) | 2–12 | 2–12 cold episodes ≈ 0.1–0.7M units (≈ $0.5–3) |
 | Busy, as measured (15 min window while delegates are in flight) | ≈ 38 | if two thirds land inside the warm TTL: 25 × 9k + 13 × 57k ≈ 1.0M units (≈ $4.4) |
 | Today's shape on the same day | 72 deliveries into a live 100k–300k-token context | 72 × 10k–30k ≈ 0.7–2.2M units for first calls alone (≈ $3–9), plus self-compactions and resumes, and the session never idles to zero |
+
+**Additions from §1a, §7a and §7b:**
+
+| Item | Model tokens | Basis |
+| --- | --- | --- |
+| Daily standup (§7a) | **0** | a fold over records, as `WriteDigest` is; one cron fire a day |
+| Transcript miner (§7b, stage 1) | **0** | local CPU and disk only. The survey script walked 21 days on four hosts this way (ADR-0028 Context, #987) |
+| Lift review (§7b, stage 2) | ≈ 58k–77k units per review, at most `[ax] lift_reviews_per_day` (default 1) per owner, so ≤ ≈ 77k units a day (≈ $0.33) | ADR-0033 §1: a compiled reviewer measured at 58k–77k units, independent of the subject's context size |
+| Each segment architect (§1a) | up to one more owner's figure on a busy day | its wakes are a partition of the owner's events plus its own builders. Bounded by its own wake budget (§6) |
+
+A lift pays for itself when it removes more than its review cost. The
+worked example in Context: the six pasted rules are created anew in every
+builder's first message. Moving them into the cached layer 2 (ADR-0032 §3)
+turns that creation into a cache read. At about 1.5 KB (the size of
+`_traps.md`, roughly 400 tokens) created at 2 units a token (800 units) against
+read at 0.1 (40 units), that saves about 760 units per builder, so one
+≈ 77k-unit review pays back after about 100 builder starts. That is weeks at this fleet's measured rate of 303
+PRs a week. The larger saving is the rounds the rules prevent, such as
+#1161's two stalls, which this ADR does not try to price.
 
 What these figures support:
 
@@ -796,17 +1088,28 @@ the fields treats the typed block as plain text.
 | O11 | Safety: `max_delegates` at `delegate start` for an owner caller, `max_wakes_per_day`, `max_episode_turns`, `flk owner pause|resume|stop`, fleet pause covering owners, gate checks in `flk land` (#694) and `flk owner release` raising ADR-0023 decisions | ~350 | O1, O5, #694, #1160 slices (hook deny) | #822 (per-owner part) | new verbs, gated | A fifth `delegate start` exits with `at_owner_capacity`; past the wake budget only operator mail wakes; `fleet pause` stops a wake and keeps the events; a merge under `ask` parks on a decision |
 | O12 | Shadow run on `gerchowl/flock` and migration: owner role text (from the architect skill), the `.fleet` mapping of §7 in docs, `flk owner shadow-report` comparing owner decisions with the operator's triage | ~150 | O1–O6 | `.fleet/` (retires per §7), architect skill | — | Seven days of shadow decisions and wake counts are reported, and the operator's go is recorded before the supervisor stops |
 | O13 | Episode usage: per-episode tokens from the harness transcript into `OwnerEpisodeEnded`; `[owner] max_units_per_day` enforced | ~300 | O2 | `src/costs` (adds tokens) | new kind | A fake transcript with known usage yields the exact units; past the budget behaves as the wake budget does |
+| O14 | Segment architects (§1a): `SegmentAssigned` kind and fold, disjoint `scope_paths` (`scope_overlap` refusal), the `assigned { segment }` intake state with path-based routing, depth limit owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, segment wave reports as `GoalStatusSet` lines in the owner's buffer | ~350 | O5, O6, O11, G1 #1034, #1160 routing; **after #1167's dry run** decides integration branches vs direct queue | #1167 (flk primitives part) | new kinds and verb, gated | Two segments with overlapping paths: the second is refused; an issue touching segment A's paths is routed to A; a segment architect parked on its builders reads `waiting_on_event` and parks the owner; a third-level `delegate start` is refused |
+| O15 | Daily standup (§7a): `flk owner standup [--since]` fold over records, bounded markdown and JSON, `Standup` cron action delivering to the notification log, a channel binding and a file; `owner.standup` kind; `unattributed: n` gap line | ~350 | O3, O5, O6; ADR-0033 AX4b for experiences; E8 #1037 for channel delivery | `WriteDigest` (extends); STATUS.md progress reports | new action and kind | A fixture day of records yields all six headings with the right items and no model call; nothing is typed into any pane; a channel reply reaches the owner as `needs_reply` mail |
+| O16 | Transcript miner (§7b stage 1): `flk ax mine` ported from `scripts/research/toolchain_survey.py` (Claude, Codex, opencode readers), edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised); `_traps.md` detection | client-side read; new MCP resource | A fixture transcript set yields the expected fingerprints and counts; no output text and no `$HOME` path or hostname appears in the JSON; sessions outside the owner's edges are not read |
+| O17 | Lift reviews (§7b stage 2): trigger kind `lift` with thresholds, `docs/ax/rubric-lifts.md` (`ax-lifts/1`), compiled-reviewer path, target routing (own repo → intake, owned repo → `owner.request`, otherwise an issue), dry run first, `[ax] lift_reviews_per_day` | ~300 | O16, AX6a, AX7, AX9, O6, O8 | — | config, existing AX kinds | Mined fixture over the threshold fires one review, which records candidates and files nothing in dry run; a lift for claude-config becomes an issue candidate there and never a change; a second review the same day is `suppressed` |
 
 **Order.** O0, O1 → O3 → O4 → (E3, E5, E6, #961 from ADR-0028 and ADR-0027) →
 O2 (after G1 and ADR-0032 X1/X3/X4) → O5 → O6 → O12 (shadow starts) → O7 →
-O8 → O9 → O10 → O11 (after #694 and #1160's hook slices) → O13. O12 can start
+O8 → O9 → O10 → O11 (after #694 and #1160's hook slices) → O13. O15
+(standup) follows O6, because it needs intake and goal records to say
+anything. O16 (miner) has no dependency on the owner and can start at any
+time. O17 follows O16 and ADR-0033's AX6a, AX7 and AX9. O14 (segments) waits
+for #1167's dry run and for O11. O12 can start
 as soon as O6 runs in shadow mode. Shadow needs neither cross-repo traffic
 (O7–O9) nor live gates (O11).
 
 **What the three spikes become.** #1073: O10 plus `cron.fired` routing. Its
 "singleton architect per repo" question is answered by the binding (O1).
 #1074: O3, O4, O6 and O10. Its `RunScript` question goes to #503. #1078: O9
-and O8. Its process-watch question stays open (§10).
+and O8. Its process-watch question stays open (§10). #1167: its identity,
+intake and protocol questions are answered by §1a and become O14. Its dry run
+(hierarchy against artifact-coordinated peers, integration branches against
+a direct queue) stays #1167's and gates O14.
 
 ## Consequences
 
@@ -825,7 +1128,16 @@ and O8. Its process-watch question stays open (§10).
 - New durable kinds: `OwnerBound`, `OwnerUnbound`, `OwnerActed`,
   `OwnerDigestDelivered`, `IntakeDecided`, `OwnerEpisodeEnded`, `issue.*`,
   `pr.opened`, `branch.ci_completed`, `release.published`, `watch.fired`,
-  `trigger.fired`, and the owner request fold events. All are additive.
+  `trigger.fired`, `SegmentAssigned`, `owner.standup`, and the owner request
+  fold events. All are additive.
+
+- The operator gets one standup a day from flk, at zero model cost, instead of
+  reconstructing progress from STATUS.md.
+- Lessons learned once can become repo facts that every later agent reads
+  from cache, instead of paragraphs pasted into every brief. A human approves
+  each one.
+- A large repo can run segment architects under one owner, without a second
+  identity, intake or landing authority.
 
 ## Risks
 
@@ -845,6 +1157,17 @@ and O8. Its process-watch question stays open (§10).
 - **Harness dependence.** Warm continue, fresh-session restarts and
   system-prompt placement are harness behaviour (ADR-0032 Risks). O2's probe
   re-measures them per harness version.
+
+- **Miner false positives.** A frequent sequence is not always waste (`just
+  check` before every commit is meant to repeat). The 0.8 bar, dry-run phase
+  and human approval of every lift bound this. Declined lifts are recorded so
+  the same fingerprint is not proposed again within `[ax] lift_cooldown`
+  (default 30 days).
+- **Transcript format drift.** Harness transcript formats are not contracts.
+  O16 carries fixture transcripts per harness version, and an unknown shape
+  is counted as `unparsed`, never guessed.
+- **Owner bottleneck with segments.** One owner triages and lands for every
+  segment. #1167's dry run measures it before O14 is filed.
 
 ## Test strategy
 
@@ -895,3 +1218,22 @@ and O8. Its process-watch question stays open (§10).
     (#1078 question 2).
 11. **Shadow length (§7).** At least seven days and ten intake decisions
     (recommended), or another bar.
+12. **Architects of architects (§1a, #1167).** One owner per repo, with
+    segment architects as depth-2 delegates on disjoint path scopes, intake
+    and landing kept by the owner (recommended). Or several owners per repo
+    with a landing owner (rejected in §1a).
+13. **Segment landing (§1a).** Per-segment integration branches merged once
+    per wave, or segment PRs straight into the owner's queue on `dev`. The
+    recommendation is to let #1167's dry run decide and to file O14 only
+    after it.
+14. **Standup (§7a).** Compiled by flk with no model call, weekdays 08:00
+    local, delivered to the notification log and a channel (recommended). Or
+    written by the owner in a daily episode (about 57k units a day).
+15. **Lift approval (§7b).** Each lift is an issue labelled `lift` in the
+    target repo, or an ADR-0023 decision when it is the owner's own repo
+    (recommended). Or one weekly batch for the operator to approve.
+16. **Miner scope (§7b).** Read only the transcripts of agents on the
+    owner's edges, under the profiles listed in its binding (recommended).
+    Or every session on the host, which is broader and crosses accounts.
+17. **Lift review budget (§7b).** At most one review a day per owner
+    (recommended), or a different cap.
