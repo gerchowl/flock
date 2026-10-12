@@ -46,7 +46,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit [--raw]] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  A one-row draft in the composer is moved aside and typed back after the submit; a multi-row or pasted-chip draft is refused with input_not_empty (exit 10).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Into an agent composer holding a draft it refuses with input_not_empty (exit 10) before typing; --raw (only with --no-submit) types anyway. Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
 
 pub(super) const AGENT_HISTORY_USAGE: &str =
     "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
@@ -918,14 +918,21 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// A send submits unless `--no-submit` says otherwise (#995). `--submit`, the
-/// old opt-in, is still accepted and changes nothing.
+/// old opt-in, is still accepted and changes nothing. `--raw` lets a
+/// `--no-submit` type onto a composer draft (#1162), and is refused with a
+/// submit, whose guard is the point of submitting through flock.
 fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     let mut words = args;
     let mut submit = true;
+    let mut raw = false;
     let mut flag = |word: &str| match word {
         "--submit" => true,
         "--no-submit" => {
             submit = false;
+            true
+        }
+        "--raw" => {
+            raw = true;
             true
         }
         _ => false,
@@ -942,13 +949,14 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     while !literal && text.first().is_some_and(|word| flag(word)) {
         text = &text[1..];
     }
-    if text.is_empty() {
+    if text.is_empty() || (raw && submit) {
         return None;
     }
     Some(AgentSendParams {
         target,
         text: text.join(" "),
         submit,
+        raw,
     })
 }
 
@@ -1253,6 +1261,14 @@ mod tests {
         assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
         assert!(super::parse_agent_send_args(&["worker".into(), "--no-submit".into()]).is_none());
         assert!(super::AGENT_SEND_USAGE.contains("--no-submit types only"));
+        let raw = parse(&["--no-submit", "--raw", "worker", "hello"]);
+        assert!(!raw.submit && raw.raw, "#1162: --raw types onto a draft");
+        assert!(!parse(&["--no-submit", "worker", "hello"]).raw);
+        assert!(
+            super::parse_agent_send_args(&["--raw".into(), "worker".into(), "hello".into()])
+                .is_none(),
+            "--raw with a submit is refused: the submit's guard is the point"
+        );
     }
 
     #[test]

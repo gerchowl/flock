@@ -248,7 +248,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "clear-field",
         "flk pane clear-field <key> [--pane <pane_id>]",
     ),
-    ("pane", "run", "flk pane run [--if-input-empty [--min-age-secs N] [--if-session ID]] <pane_id> <command>"),
+    ("pane", "run", super::pane::PANE_RUN_USAGE),
     ("peers", "status", "flk peers status [--json]"),
     ("peers", "summary", "flk peers summary [--json]"),
     (

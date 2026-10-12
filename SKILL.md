@@ -227,8 +227,9 @@ agent shows next.
 flk agent send worker "review the auth module"
 ```
 
-it needs an idle agent with an empty composer, presses Enter 120 ms after the
-paste, retries only that Enter once, and confirms that a turn started. a long
+it needs an idle agent with an empty composer (a one-row draft the operator
+left there is moved aside and typed back after your submit; a longer draft
+refuses with exit `10`), presses Enter 120 ms after the paste, retries only that Enter once, and confirms that a turn started. a long
 paste that the agent folds into a chip (`[Pasted text #1]`,
 `[Pasted Content 1099 chars]`) counts as the sent text. it prints json; branch
 on the exit code, and read `result.outcome` and `result.reason` for detail:
@@ -247,7 +248,10 @@ on the exit code, and read `result.outcome` and `result.reason` for detail:
   agent (`flk agent wait worker --status idle`) and send again.
 
 `--no-submit` types only, without Enter, and reports `delivered` or
-`unconfirmed` (exit 8). to message another agent rather than prompt it, use
+`unconfirmed` (exit 8). into an agent whose composer holds a draft it refuses
+with exit `10` (`input_not_empty`) and types nothing: flock never glues your
+text onto a human's half-typed message. `--raw` overrides that; an automated
+caller should not use it. to message another agent rather than prompt it, use
 `flk msg send` (see above): it lands in the agent's inbox and wakes it.
 
 ## type into a terminal or press keys
@@ -257,6 +261,9 @@ send text without pressing Enter, for shells and other non-agent terminals:
 ```bash
 flk pane send-text 1-1 "hello from claude"
 ```
+
+into an agent pane it refuses with exit `10` (`input_not_empty`) while the
+composer holds a draft, like `agent send --no-submit`.
 
 press real keys — answer a dialog, cancel, move a selection:
 
@@ -274,7 +281,10 @@ do not use `send-keys … Enter` to submit a prompt to an agent; use
 flk pane run 1-1 "echo hello"
 ```
 
-it confirms nothing, so it is for shells, not agents. the text and the Enter
+in a shell it confirms nothing. in an agent pane it is `agent send`: the same
+draft guard, outcome json and exit codes (`--raw` types onto whatever is
+there; do not use it from automation). to prompt an agent, say `agent send`.
+in a shell, the text and the Enter
 are deliberately separate writes with a short pause between them. a
 program reading raw stdin sees read boundaries, not keystrokes, and every agent
 tui uses those boundaries to tell typing from pasting — text and a carriage
@@ -499,7 +509,7 @@ flk agent result worker          # once #575 lands
 - `pane read --source recent-unwrapped` is useful when you want to inspect the same unwrapped transcript that `wait output --source recent` matches against.
 - `agent send` prints JSON with the submit outcome; unconfirmed exits 8 and abandoned exits 9.
 - `pane send-text` and `agent send --no-submit` print JSON with the delivery outcome and evidence level; unconfirmed delivery exits 8.
-- `pane send-keys` and `pane run` print nothing on success.
+- `pane send-keys` and `pane run` into a shell print nothing on success; `pane run` into an agent pane prints `agent send`'s json.
 - parse ids from `workspace create`, `tab create`, and `pane split` responses when you need new ids. `workspace create` returns `result.workspace`, `result.tab`, and `result.root_pane`. `tab create` returns `result.tab` and `result.root_pane`. for `pane split`, the new pane id is at `result.pane.pane_id`.
 - use `pane read` for current output that already exists. use `wait output` for future output you expect next.
 - `--no-focus` on split, tab create, and workspace create keeps your current terminal context focused.

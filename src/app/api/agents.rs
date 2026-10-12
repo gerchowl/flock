@@ -661,6 +661,16 @@ impl App {
                 true,
             );
         }
+        if let Some(reason) = (!params.raw)
+            .then(|| self.raw_text_refusal(resolved.ws_idx, resolved.pane_id))
+            .flatten()
+        {
+            return encode_error(
+                id,
+                reason,
+                crate::app::guarded_submit::raw_text_refusal_message(reason),
+            );
+        }
         self.begin_paste(
             id,
             resolved.ws_idx,

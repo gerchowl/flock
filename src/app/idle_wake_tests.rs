@@ -459,6 +459,7 @@ async fn operator_input_over_the_api_holds_the_wake_for_the_quiet_window() {
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::PaneSendText(PaneSendTextParams {
+            raw: false,
             pane_id: pane.clone(),
             text: "half a thought".into(),
         }),
@@ -541,6 +542,7 @@ async fn a_human_who_types_between_the_sentence_and_the_enter_gets_no_enter() {
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::PaneSendText(PaneSendTextParams {
+            raw: false,
             pane_id: pane.clone(),
             text: "x".into(),
         }),
@@ -1663,6 +1665,7 @@ async fn plain_paste_reports_interrupted_observation_without_extra_input() {
         let response = app.handle_api_request(Request {
             id: "paste".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                raw: false,
                 pane_id: pane.clone(),
                 text: "hello".into(),
             }),
@@ -1703,12 +1706,14 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
         };
         let method = if agent_send {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                raw: false,
                 target: pane,
                 text: "hello".into(),
                 submit: false,
             })
         } else {
             Method::PaneSendText(PaneSendTextParams {
+                raw: false,
                 pane_id: pane,
                 text: "hello".into(),
             })
@@ -1763,6 +1768,7 @@ async fn plain_paste_observes_folded_and_busy_composers_after_dispatch() {
         let response = app.handle_api_request(Request {
             id: "paste".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                raw: false,
                 pane_id: pane,
                 text: "hello world".into(),
             }),
@@ -1794,6 +1800,7 @@ async fn plain_paste_streaming_output_does_not_confirm_an_unchanged_composer() {
     let response = app.handle_api_request(Request {
         id: "streaming".into(),
         method: Method::PaneSendText(PaneSendTextParams {
+            raw: false,
             pane_id: pane,
             text: "hello".into(),
         }),
@@ -1842,6 +1849,7 @@ async fn plain_paste_waits_for_late_chip_before_using_screen_only_evidence() {
         let response = app.handle_api_request(Request {
             id: "late-paint".into(),
             method: Method::PaneSendText(PaneSendTextParams {
+                raw: false,
                 pane_id: pane,
                 text: "long brief".into(),
             }),
