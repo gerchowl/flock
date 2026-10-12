@@ -2202,7 +2202,7 @@ async fn agent_records_carry_the_state_object_from_the_detector() {
     assert_eq!(state["phase"], "settling");
     assert_eq!(
         (&state["background"], &state["attention"]),
-        (&"unknown".into(), &"unknown".into())
+        (&"unknown".into(), &"none".into())
     );
     assert_eq!(
         (&state["lifecycle"], &state["source"]["turn"]),

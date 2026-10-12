@@ -270,6 +270,7 @@ fn run_feed(out: &SharedOut, opts: &ChannelOptions) -> Result<(), String> {
     let request = Request {
         id: format!("mcp:channel:{}", super::next_call_seq()),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after: None,
             subscriptions: vec![Subscription::MsgQueued { pane: pane.clone() }],
         }),
     };

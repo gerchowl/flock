@@ -457,6 +457,71 @@ mod tests {
         assert!(matches!(flock.calls.borrow()[0], Method::AgentList(_)));
     }
 
+    /// #960: the MCP tool and `flk delegate list` send the same request for
+    /// the same scope and return the same rows for the same answer.
+    #[test]
+    fn flock_delegate_list_and_the_cli_return_the_same_rows() {
+        let row = crate::api::schema::DelegateRow {
+            architect: "agent_lead".into(),
+            delegate: "agent_worker".into(),
+            name: Some("bunny-614".into()),
+            via: crate::api::schema::DelegationVia::Start,
+            state: "closed, not merged".into(),
+            label: Some("#614".into()),
+            harness: Some("claude".into()),
+            agent_status: Some(crate::api::schema::AgentStatus::Idle),
+            status_age_secs: Some(12),
+            edge_age_secs: 300,
+            workspace_id: "w2".into(),
+            pane_id: Some("2:p1".into()),
+            worktree: None,
+            branch: Some("feat/614".into()),
+            repo: None,
+            pr: Some(crate::api::schema::PrInfo {
+                number: 624,
+                state: "closed".into(),
+            }),
+        };
+        let raw =
+            json!({"id": "mcp:1", "result": {"type": "delegate_list", "delegates": [row.clone()]}});
+        for (cli, mcp) in [
+            (
+                vec!["--all", "--branch", "feat/614"],
+                json!({"architect": "all", "branch": "feat/614"}),
+            ),
+            (vec!["--mine"], json!({})),
+            (
+                vec!["--architect", "agent_lead"],
+                json!({"architect": "agent_lead"}),
+            ),
+        ] {
+            let flock = MockApi::ok(raw.clone());
+            let result = route(
+                "tools/call",
+                json!({"name": "flock_delegate_list", "arguments": mcp}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap();
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let mcp_result: Value = serde_json::from_str(text).unwrap();
+            let mcp_rows = crate::cli::delegate_list::rows(&mcp_result).expect("mcp rows");
+            let cli_rows =
+                crate::cli::delegate_list::rows(&crate::cli::delegate_list::json_output(&raw))
+                    .expect("cli rows");
+            assert_eq!(mcp_rows, cli_rows);
+            assert_eq!(cli_rows, std::slice::from_ref(&row));
+
+            let words: Vec<String> = cli.iter().map(|word| word.to_string()).collect();
+            let (params, _) = crate::cli::delegate_list::parse_list_args(&words).unwrap();
+            assert_eq!(
+                serde_json::to_value(&flock.calls.borrow()[0]).unwrap(),
+                serde_json::to_value(Method::DelegateList(params)).unwrap(),
+                "{cli:?}"
+            );
+        }
+    }
+
     #[test]
     fn flock_msg_status_routes_correlation_and_preserves_attempt_evidence() {
         let payload = json!({"type": "msg_status", "correlation_id": "mail-1", "state": "queued",

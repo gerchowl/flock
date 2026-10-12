@@ -235,6 +235,7 @@ pub(super) fn wait_for_ready(
     let subscribe = Request {
         id: "cli:agent:ready".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after: None,
             subscriptions: vec![
                 Subscription::PaneAgentStatusChanged {
                     pane_id: pane_id.to_owned(),

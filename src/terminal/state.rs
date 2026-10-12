@@ -206,6 +206,8 @@ pub struct TerminalState {
     /// Background tasks the detector last counted on screen (#1022), `None`
     /// when the agent's screen does not show them.
     pub background_tasks: Option<u32>,
+    /// What the detector's last `Blocked` screen asked of a human (#1023).
+    pub needs_human: Option<crate::api::agent_state::HumanReason>,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -354,6 +356,7 @@ impl TerminalState {
             live_activity: None,
             settled_with_background_shells: false,
             background_tasks: None,
+            needs_human: None,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -1057,6 +1060,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
         self.background_tasks = None;
+        self.needs_human = None;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
@@ -1320,6 +1324,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
         self.background_tasks = None;
+        self.needs_human = None;
         self.stale_hook_idle_since = None;
         self.state = AgentState::Unknown;
         self.state_changed_at = None;
@@ -1378,6 +1383,7 @@ impl TerminalState {
         self.live_activity = None;
         self.settled_with_background_shells = false;
         self.background_tasks = None;
+        self.needs_human = None;
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
@@ -2510,6 +2516,7 @@ mod tests {
                 visible_working: false,
                 settled_with_background_shells: false,
                 background_tasks: None,
+                needs_human: None,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2537,6 +2544,7 @@ mod tests {
                 visible_working: false,
                 settled_with_background_shells: false,
                 background_tasks: None,
+                needs_human: None,
             },
             false,
             now + std::time::Duration::from_millis(100),

@@ -128,6 +128,7 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.stash_show`, `pane.stash_restore`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.restart`, `agent.lineage` |
+| Delegate | `delegate.list` |
 | Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
@@ -261,6 +262,8 @@ An explicit kill, or a permanent pane close/exit without a resumable session, re
 ```
 
 `checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
+
+`delegate.list` (`architect`: `self` by default, `all`, or an agent id; optional `branch` and `repo`) returns `delegates`, one row per open `agent_delegated` edge: `architect`, `delegate`, `name`, `via`, `state`, `label`, `harness`, `agent_status`, `status_age_secs`, `edge_age_secs`, `workspace_id`, `pane_id`, `worktree`, `branch`, `repo`, and `pr` (`number`, `state`) from the PR poller's cache. `state` is `live`, `hibernated, awaiting merge`, `gone`, `gone, worktree retained`, `orphaned`, or `closed, not merged`. It is answered from cached state only, with no git or `gh` call. `self` is resolved from the caller's process ancestry; a caller in no agent pane gets `no_caller_pane`.
 
 `agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone.
 
@@ -556,6 +559,8 @@ Subscribe to events when you need a long-lived stream:
 ```
 
 The first response acknowledges the subscription. Later lines are pushed events.
+
+A subscription starts at the moment of subscribing: it streams events that happen after it attached, never a replay of what the server already holds. Pass `"after": <seq>` next to `subscriptions` to start from a cursor instead. If the server no longer holds events that far back, the first line is `{"event":"lagged","data":{"skipped_to":<seq>}}` and the stream resumes after `skipped_to`, so a consumer that falls behind learns it rather than missing events silently. A cursor past the newest event is refused with `cursor_ahead`. Use `events.read` when the consumer must see every durable event from a cursor.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 

@@ -1,4 +1,5 @@
 use super::super::{has_confirmation_prompt, has_selection_prompt, AgentState};
+use crate::api::agent_state::HumanReason;
 
 /// Claude Code detection. The most complex — it has a structured prompt box UI.
 ///
@@ -42,12 +43,19 @@ pub(super) fn detect_structural(content: &str) -> Option<AgentState> {
         return Some(AgentState::Idle);
     }
 
-    if has_live_blocked_form(content) || has_folder_trust_dialog(content) {
+    if has_live_blocked_form(content)
+        || has_folder_trust_dialog(content)
+        || has_login_dialog(content)
+    {
         return Some(AgentState::Blocked);
     }
 
     if has_working_chrome(content) {
         return Some(AgentState::Working);
+    }
+
+    if has_provider_limit(content) {
+        return Some(AgentState::Blocked);
     }
 
     if !has_prompt_box(content) && has_claude_blocked_prompt(content, &lower) {
@@ -65,6 +73,8 @@ pub(super) fn has_visible_blocker(content: &str) -> bool {
     let lower = content.to_lowercase();
     has_live_blocked_form(content)
         || has_folder_trust_dialog(content)
+        || has_login_dialog(content)
+        || has_provider_limit(content)
         || lower.contains("do you want to proceed?")
             && has_claude_yes_no_choice(content)
             && (lower.contains("bash command")
@@ -212,14 +222,114 @@ fn has_claude_blocked_prompt(content: &str, lower_content: &str) -> bool {
 /// The match is scoped to the dialog's own BOX, which is what keeps quoted text
 /// from reading as a dialog. See [`trust_dialog_box`] for why the frame and not
 /// the bottom of the screen.
+///
+/// 2.1.296 draws the first-start dialog under a `──` rule instead of in a
+/// frame, ending on its own confirm footer (#1023). A prompt box drawn after
+/// it would own the last rule, so the region after the last rule is the live
+/// dialog there.
 pub(in crate::detect) fn has_folder_trust_dialog(content: &str) -> bool {
-    let Some(box_text) = trust_dialog_box(content) else {
-        return false;
-    };
-    let flat = flat_words(&box_text);
-    TRUST_DIALOGS
+    let after_rule = Some(flat_words(content_after_last_horizontal_rule(content)))
+        .filter(|flat| flat.ends_with("enter to confirm esc to cancel"));
+    trust_dialog_box(content)
+        .map(|box_text| flat_words(&box_text))
+        .into_iter()
+        .chain(after_rule)
+        .any(|flat| {
+            TRUST_DIALOGS
+                .iter()
+                .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
+        })
+}
+
+/// Claude's login method picker, or its question whether to use an API key
+/// found in the environment, each as the live tail (2.1.296, #1023).
+fn has_login_dialog(content: &str) -> bool {
+    let tail = flat_words(&bottom_non_empty_lines(content, 12).join("\n"));
+    (tail.contains("select login method") && tail.contains("claude account with subscription"))
+        || (tail.contains("detected a custom api key")
+            && tail.contains("do you want to use this api key"))
+}
+
+/// Claude's own usage-limit chrome (2.1.296, #1023): the warning in the
+/// footer under the prompt box while it waits to continue, the
+/// `/rate-limit-options` menu, or a last turn that ended on the limit
+/// notice, which is all a stopped wait leaves on screen. Turn-scoped, so a
+/// later turn that went through clears it.
+pub(in crate::detect) fn has_provider_limit(content: &str) -> bool {
+    let lines: Vec<&str> = content.lines().collect();
+    let footer = claude_prompt_box_top_border_index(&lines).and_then(|top| {
+        let bottom = lines[top + 1..]
+            .iter()
+            .position(|line| is_horizontal_rule(line))?;
+        Some(&lines[top + 2 + bottom..])
+    });
+    if footer.is_some_and(|footer| {
+        footer.iter().any(|line| {
+            line.trim_start()
+                .starts_with("\u{26a0} Usage limit reached")
+        })
+    }) {
+        return true;
+    }
+    let tail = flat_words(&bottom_non_empty_lines(content, 8).join("\n"));
+    if tail.contains("what do you want to do")
+        && tail.contains("limit to reset")
+        && tail.ends_with("enter to confirm esc to cancel")
+    {
+        return true;
+    }
+    let above: Vec<&str> = content_above_prompt_box(content).lines().collect();
+    let turn = above
         .iter()
-        .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
+        .rposition(|line| line.starts_with("\u{276f} "))
+        .map_or(&above[..0], |echo| &above[echo + 1..]);
+    turn.iter().any(|line| {
+        line.trim_start()
+            .strip_prefix('\u{23bf}')
+            .is_some_and(|notice| {
+                notice.trim_start().starts_with("You've hit your ")
+                    && notice.contains(" \u{b7} resets ")
+            })
+    })
+}
+
+/// What a blocked Claude screen asks of a human (#1023). Checked in order of
+/// specificity: the dialogs that own the whole pane, then the interview, then
+/// a tool permission. A prompt none of them names is a `dialog`.
+pub(in crate::detect) fn needs_human(content: &str) -> HumanReason {
+    let tail = bottom_non_empty_lines(content, 16)
+        .join("\n")
+        .to_lowercase();
+    if has_folder_trust_dialog(content) {
+        HumanReason::Trust
+    } else if has_login_dialog(content) {
+        HumanReason::Login
+    } else if [
+        "type something.",
+        "chat about this",
+        "review your answers",
+        "skip interview and plan immediately",
+    ]
+    .iter()
+    .any(|marker| tail.contains(marker))
+    {
+        HumanReason::Question
+    } else if [
+        "do you want to proceed?",
+        "do you want to make this edit",
+        "do you want to create",
+        "waiting for permission",
+        "do you want to allow this connection?",
+        "tab to amend",
+        "ctrl+e to explain",
+    ]
+    .iter()
+    .any(|marker| tail.contains(marker))
+    {
+        HumanReason::Permission
+    } else {
+        HumanReason::Dialog
+    }
 }
 
 /// The region between the last box frame on the pane and its bottom border, or

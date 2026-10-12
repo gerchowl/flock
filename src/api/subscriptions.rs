@@ -94,8 +94,9 @@ pub(super) struct ActiveEventSubscription {
 }
 
 /// A pane's inbox feed (#438). Hub-driven like [`ActiveEventSubscription`],
-/// filtered to one kind AND one recipient, and started at the hub's current
-/// sequence so it reports only mail that arrives after it attached.
+/// filtered to one kind AND one recipient, and started at the request's
+/// `after`, or at the hub's current sequence, so by default it reports only
+/// mail that arrives after it attached.
 pub(super) struct ActiveMsgQueuedSubscription {
     pane: String,
     last_sequence: u64,
@@ -113,81 +114,82 @@ impl ActiveSubscription {
         subscription: Subscription,
         request_id: &str,
         index: usize,
+        start: u64,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Result<Self, ErrorResponse> {
         match subscription {
             Subscription::MeshRoutesChanged {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::MeshRoutesChanged,
-                last_sequence: event_hub.current_sequence(),
+                last_sequence: start,
             })),
             Subscription::MeshOutboundPending {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::MeshOutboundPending,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceUpdated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceUpdated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabRenamed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneMoved {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneMoved,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneExited,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneAgentDetected,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::MsgQueued { pane } => Ok(Self::MsgQueued(ActiveMsgQueuedSubscription {
                 pane,
-                last_sequence: event_hub.current_sequence(),
+                last_sequence: start,
             })),
             Subscription::PaneOutputMatched {
                 pane_id,
@@ -287,9 +289,20 @@ impl ActiveSubscription {
     }
 }
 
+/// The stream line for a subscriber the ring left behind (#1030): it
+/// resumes after `skipped_to`, and everything before that is gone.
+fn lagged(last_sequence: &mut u64, skipped_to: u64) -> Option<serde_json::Value> {
+    *last_sequence = skipped_to;
+    Some(serde_json::json!({"event": "lagged", "data": {"skipped_to": skipped_to}}))
+}
+
 impl ActiveEventSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let (skipped_to, events) = event_hub.events_since(self.last_sequence);
+        if let Some(skipped_to) = skipped_to {
+            return lagged(&mut self.last_sequence, skipped_to);
+        }
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event == self.event_kind {
                 return serde_json::to_value(event).ok();
@@ -313,7 +326,11 @@ impl ActiveSubscription {
 
 impl ActiveMsgQueuedSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let (skipped_to, events) = event_hub.events_since(self.last_sequence);
+        if let Some(skipped_to) = skipped_to {
+            return lagged(&mut self.last_sequence, skipped_to);
+        }
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event != crate::api::schema::EventKind::MessageQueued {
                 continue;

@@ -1,6 +1,6 @@
 #![expect(
     clippy::print_stdout,
-    reason = "the stop nudge is written to stdout as the agent-facing hook contract"
+    reason = "the stop nudge and the delegate table are written to stdout as the agent-facing hook contract"
 )]
 //! `flk hook <agent> <action>` — the single-source-of-truth agent hook body.
 //!
@@ -15,7 +15,8 @@
 //! Contract carried over verbatim from the shims: a hook must NEVER block or
 //! fail the parent agent. Every socket error is swallowed; a malformed payload
 //! degrades to a no-op. The only stdout this ever writes is Claude's
-//! `decision:block` nudge on Stop.
+//! `decision:block` nudge on Stop, and an architect's delegate table after a
+//! compaction or resume (#962).
 //!
 //! Testability: each action plans a [`HookOutcome`] (the `pane.report_*`
 //! methods to send + any stdout) as a pure function of the parsed input. The
@@ -27,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    Method, PaneAgentState, PaneReleaseAgentParams, PaneReportAgentParams,
+    DelegateListParams, Method, PaneAgentState, PaneReleaseAgentParams, PaneReportAgentParams,
     PaneReportAgentSessionParams, PaneReportPromptParams, PaneReportRecapParams,
     PaneReportReplyParams, Request,
 };
@@ -136,6 +137,10 @@ enum Action {
     /// not).
     State(PaneAgentState),
     Release,
+    /// opencode's `experimental.session.compacting` plugin hook: print the
+    /// delegate table as plain text for the plugin to add to the compaction
+    /// context (#962).
+    Compacting,
 }
 
 impl Action {
@@ -149,6 +154,7 @@ impl Action {
             "idle" => Some(Self::State(PaneAgentState::Idle)),
             "blocked" => Some(Self::State(PaneAgentState::Blocked)),
             "release" => Some(Self::Release),
+            "compacting" => Some(Self::Compacting),
             _ => None,
         }
     }
@@ -174,14 +180,14 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         // stdout, like `flk --help`: the request was honoured, so this is the
         // command's output and can be redirected or paged.
         println!(
-            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release>"
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting>"
         );
         return Ok(0);
     }
 
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release>"
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting>"
         );
         return Ok(2);
     };
@@ -247,7 +253,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // The account profile the session is running under (g-fleet's claude-auth):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
-    let outcome = plan(
+    let mut outcome = plan(
         agent,
         action,
         &input,
@@ -256,6 +262,13 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         pending_messages,
         config_dir.as_deref(),
     );
+    // ADR-0027 §4: the architect's delegate table comes back as hook output,
+    // never typed into the pane, so armed and unarmed compactions alike get it.
+    if let Some(shape) = delegate_table_shape(agent, action, &input, &hook_event_name) {
+        if let Some(table) = own_delegate_table() {
+            outcome.stdout = Some(table_stdout(shape, &table));
+        }
+    }
     emit(outcome);
     Ok(0)
 }
@@ -287,7 +300,78 @@ fn plan(
         Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
         Action::State(state) => plan_state(agent, state, input, pane_id),
         Action::Release => plan_release(agent, input, pane_id),
+        Action::Compacting => HookOutcome::default(),
     }
+}
+
+/// How a delegate table is handed back to the harness (#962).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableShape {
+    /// Claude Code and Codex: SessionStart `hookSpecificOutput.additionalContext`.
+    /// Both parse the same object, and Codex rejects unknown fields, so it
+    /// carries nothing else.
+    SessionStartContext,
+    /// opencode's compaction hook: the plugin appends stdout to the context.
+    PlainText,
+}
+
+/// Whether this invocation hands the agent its delegate table back, and in
+/// which shape. Only a session that lost or is reloading its context gets
+/// it: `compact` and `resume`. A fresh `startup` or `clear` has no prior
+/// work to recover, and a harness without one of these hooks gets nothing
+/// here (its architect calls `flock_delegate_list` itself).
+fn delegate_table_shape(
+    agent: Agent,
+    action: Action,
+    input: &serde_json::Value,
+    hook_event_name: &str,
+) -> Option<TableShape> {
+    match (agent, action) {
+        (Agent::Claude | Agent::Codex, Action::Session)
+            if hook_event_name == "SessionStart"
+                && matches!(
+                    str_field(input, "source").as_deref(),
+                    Some("compact" | "resume")
+                ) =>
+        {
+            Some(TableShape::SessionStartContext)
+        }
+        (Agent::Opencode, Action::Compacting) => Some(TableShape::PlainText),
+        _ => None,
+    }
+}
+
+fn table_stdout(shape: TableShape, table: &str) -> String {
+    match shape {
+        TableShape::SessionStartContext => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": table,
+            }
+        })
+        .to_string(),
+        TableShape::PlainText => table.trim_end().to_string(),
+    }
+}
+
+/// The calling agent's own delegate table, from `delegate.list` with
+/// `architect: self`. The server resolves `self` from this process's
+/// ancestry, so the hook names no agent and cannot ask for another's.
+/// `None` on no edges and on any failure: a hook never blocks its agent.
+fn own_delegate_table() -> Option<String> {
+    let request = Request {
+        id: format!("flock:hook:{}", seq()),
+        method: Method::DelegateList(DelegateListParams {
+            architect: "self".to_string(),
+            branch: None,
+            repo: None,
+        }),
+    };
+    let response = ApiClient::local()
+        .request_value_with_timeout(&request, HOOK_TIMEOUT)
+        .ok()?;
+    let rows = super::delegate_list::rows(response.get("result")?).ok()?;
+    super::delegate_list::session_table(&rows, super::delegate_list::SESSION_TABLE_ROWS)
 }
 
 /// Copilot's event vocabulary and inference order match its installed hook.
@@ -1376,6 +1460,55 @@ mod tests {
     }
 
     // --- session ---------------------------------------------------------
+
+    #[test]
+    fn only_a_compacted_or_resumed_session_asks_for_its_delegate_table() {
+        let shape = |agent, action, source: &str, event: &str| {
+            let input = json!({"hook_event_name": event, "session_id": "s", "source": source});
+            delegate_table_shape(agent, action, &input, event)
+        };
+        let start = Some(TableShape::SessionStartContext);
+        for source in ["compact", "resume"] {
+            assert_eq!(
+                shape(Agent::Claude, Action::Session, source, "SessionStart"),
+                start
+            );
+            assert_eq!(
+                shape(Agent::Codex, Action::Session, source, "SessionStart"),
+                start
+            );
+        }
+        for source in ["startup", "clear"] {
+            assert_eq!(
+                shape(Agent::Claude, Action::Session, source, "SessionStart"),
+                None
+            );
+        }
+        assert_eq!(
+            shape(Agent::Claude, Action::Session, "compact", "SessionEnd"),
+            None
+        );
+        assert_eq!(
+            shape(Agent::Kimi, Action::Session, "compact", "SessionStart"),
+            None
+        );
+        assert_eq!(
+            shape(Agent::Opencode, Action::Compacting, "", ""),
+            Some(TableShape::PlainText)
+        );
+        assert_eq!(shape(Agent::Claude, Action::Compacting, "", ""), None);
+    }
+
+    #[test]
+    fn the_session_start_table_is_exactly_the_shape_claude_and_codex_parse() {
+        let out: serde_json::Value =
+            serde_json::from_str(&table_stdout(TableShape::SessionStartContext, "t\n")).unwrap();
+        assert_eq!(
+            out,
+            json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "t\n"}})
+        );
+        assert_eq!(table_stdout(TableShape::PlainText, "t\n"), "t");
+    }
 
     #[test]
     fn session_reports_id_and_forwards_source_only_on_sessionstart() {
