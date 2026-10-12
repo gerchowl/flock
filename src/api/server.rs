@@ -1605,6 +1605,43 @@ mod tests {
         }
     }
 
+    /// #1030: mail queued while the mesh wake subscription was down still
+    /// wakes it, because it resubscribes with `after: 0` and the push is
+    /// still in the ring.
+    #[test]
+    fn a_wake_subscription_resuming_from_zero_sees_mail_queued_while_it_was_down() {
+        let event_hub = EventHub::default();
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::MeshOutboundPending,
+            data: crate::api::schema::EventData::MeshOutboundPending {},
+        });
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(
+            client,
+            r#"{{"id":"relay-wake","method":"events.subscribe","params":{{"subscriptions":[{{"type":"mesh.outbound_pending"}}],"after":0}}}}"#
+        )
+        .unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
+        let thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(next()["result"]["type"], "subscription_started");
+        assert_eq!(next()["event"], "mesh_outbound_pending");
+        running.store(false, Ordering::Relaxed);
+        assert!(thread.join().unwrap().is_ok());
+    }
+
     #[test]
     fn subscriptions_stop_when_server_shuts_down() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();

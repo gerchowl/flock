@@ -744,7 +744,16 @@ pub(super) fn settled_wait(
     settle_ms: u64,
     timeout_ms: Option<u64>,
 ) -> std::io::Result<SettledOutcome> {
-    settled_wait_observed(verb, target, after, settle_ms, timeout_ms, &mut |_| false)
+    let due = std::cell::Cell::new(None);
+    settled_wait_observed(
+        verb,
+        target,
+        after,
+        settle_ms,
+        timeout_ms,
+        &due,
+        &mut |_| false,
+    )
 }
 
 pub(super) fn settled_wait_observed(
@@ -753,6 +762,7 @@ pub(super) fn settled_wait_observed(
     after: Option<&str>,
     settle_ms: u64,
     timeout_ms: Option<u64>,
+    due: &std::cell::Cell<Option<Instant>>,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let client = ApiClient::local();
@@ -766,6 +776,7 @@ pub(super) fn settled_wait_observed(
         timeout_ms,
         UNREACHABLE_LIMIT,
         SLOW_LIMIT,
+        due,
         observer,
     )
 }
@@ -799,11 +810,14 @@ fn settled_core(
         timeout_ms,
         unreachable_window,
         slow_window,
+        &std::cell::Cell::new(None),
         &mut |_| false,
     )
 }
 
 // The transport recovery and cursor checks are the same for every caller.
+// `due` is when the observer next needs a sample whatever the agent does,
+// which no event will report.
 fn settled_core_observed(
     requests: &mut dyn PinnedRequests,
     verb: &str,
@@ -813,6 +827,7 @@ fn settled_core_observed(
     timeout_ms: Option<u64>,
     unreachable_window: Duration,
     slow_window: Duration,
+    due: &std::cell::Cell<Option<Instant>>,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let now = Instant::now();
@@ -962,7 +977,7 @@ fn settled_core_observed(
             Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
             Err(PinnedFailure::Fatal(reason)) => return Ok(SettledOutcome::Error(reason)),
         }
-        pause(requests, &wait, deadline, &mut cursor);
+        pause(requests, &wait, deadline, due.get(), &mut cursor);
     }
 }
 
@@ -991,14 +1006,15 @@ fn event_cursor(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) ->
 /// Wait for the next reason to sample (#1030).
 ///
 /// With a cursor, the server holds one `events.read` until an event names the
-/// agent's terminal or pane, the dwell in progress is due, or [`RESAMPLE`]
-/// passes, so a quiet agent costs a request per state change rather than five
+/// agent's terminal or pane, the dwell in progress or the observer's `due` is
+/// reached, or [`RESAMPLE`] passes, so a quiet agent costs a request per state change rather than five
 /// a second. A refused read (a restarted server, or a handoff to an older one)
 /// drops back to the poll for the rest of the wait.
 fn pause(
     requests: &mut dyn PinnedRequests,
     wait: &SettledWait,
     deadline: Option<Instant>,
+    due: Option<Instant>,
     cursor: &mut Option<u64>,
 ) {
     let Some(after) = *cursor else {
@@ -1006,6 +1022,7 @@ fn pause(
     };
     let now = Instant::now();
     let span = wait.dwell_left(now).unwrap_or(RESAMPLE).min(RESAMPLE);
+    let span = due.map_or(span, |due| span.min(due.saturating_duration_since(now)));
     // The hold and the read both end by the deadline: a frozen server must
     // not keep the wait past it.
     let left = deadline.map(|deadline| deadline.saturating_duration_since(now));
@@ -3113,11 +3130,12 @@ mod tests {
     }
 
     /// #1030: a transport on a server with `events.read`. Every read but the
-    /// head probe is answered from `woken`: `true` is an event about the agent,
-    /// `false` a hold that ran its whole span with nothing to report.
+    /// head probe is answered from `woken`: `Some(true)` is an event about the
+    /// agent, `Some(false)` a hold that ran its whole span with nothing to
+    /// report, and `None` a server that never answered.
     struct Evented {
         records: std::collections::VecDeque<&'static str>,
-        woken: std::collections::VecDeque<bool>,
+        woken: std::collections::VecDeque<Option<bool>>,
         agent_gets: usize,
         /// (after, subjects, wait) of each read after the head probe.
         reads: Vec<(u64, Vec<String>, Duration)>,
@@ -3167,8 +3185,10 @@ mod tests {
             }
             let subjects = subjects.iter().map(|subject| subject.to_string()).collect();
             self.reads.push((after, subjects, wait));
-            if !self.woken.pop_front().expect("a scripted read") {
-                std::thread::sleep(wait);
+            match self.woken.pop_front().expect("a scripted read") {
+                None => return Err(Unanswered::Slow),
+                Some(false) => std::thread::sleep(wait),
+                Some(true) => {}
             }
             Ok(serde_json::json!({"result": {"events": [], "next_after": after + 1}}))
         }
@@ -3182,7 +3202,7 @@ mod tests {
     fn an_evented_wait_samples_once_per_change() {
         let mut requests = Evented {
             records: ["0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
-            woken: [true, false].into(),
+            woken: [Some(true), Some(false)].into(),
             agent_gets: 0,
             reads: Vec::new(),
         };
@@ -3217,6 +3237,40 @@ mod tests {
         assert_eq!(*idle, RESAMPLE, "nothing is due while it works");
         assert!(*dwell <= Duration::from_millis(600), "{dwell:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// #1121: a held read the server never answers is not an answer. The wait
+    /// samples again from the same cursor and settles only on what the agent
+    /// record says.
+    #[test]
+    fn an_unanswered_read_is_resampled_never_an_outcome() {
+        let mut requests = Evented {
+            records: ["0:1:1:w", "0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
+            woken: [None, Some(true), Some(false)].into(),
+            agent_gets: 0,
+            reads: Vec::new(),
+        };
+        let outcome = settled_core(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            300,
+            Some(30_000),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, SettledOutcome::Settled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(requests.agent_gets, 4);
+        let afters: Vec<u64> = requests.reads.iter().map(|(after, _, _)| *after).collect();
+        assert_eq!(afters, [40, 40, 41], "the unanswered read keeps its cursor");
     }
 
     /// #1030 skew: a server below `events.read`'s protocol is never sent one.
