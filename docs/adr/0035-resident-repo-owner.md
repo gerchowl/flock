@@ -1281,7 +1281,9 @@ is the first owned repo, in shadow mode, before anything is switched off.
   - no GitHub write: no O4 comment, label, file or close. A raw `gh` write
     is refused only by layer one, so before O19a is live on the host this
     holds only for a cooperative owner (§6.3 point 6). The shadow report
-    lists any GitHub write that O3a sees from the owner's identity;
+    lists GitHub writes in the repo that O3a sees and that no flk verb or
+    operator act accounts for, since before O19a they cannot be attributed
+    to the owner;
   - no `owner.request` sent;
   - no `flk land`, and `flk/land-gate` is never posted.
 
