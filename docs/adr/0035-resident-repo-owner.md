@@ -5,23 +5,30 @@
 - Issues: #1172 (the spike this records). Subsumes and orders the spikes
   #1073 (cron agents), #1074 (event triggers and hook/script surface) and
   #1078 (watch surface and cross-repo blocking); §5 answers them. Composes with
-  #1160 (harness hooks and question routing), which another spike is writing
-  in parallel as its own ADR. This record references that ADR's decisions and
-  makes none of its own about hook mechanics or question routing. Answers
+  ADR-0034 (#1160, harness hooks and question routing, Proposed on PR #1174
+  at `210d1285`). This record takes ADR-0034's question routing as decided
+  there, and asks for one amendment to its §1 hook set (§6.3). Answers
   #1167 (architects of architects) for its identity, intake and protocol
   parts (§1a); its dry run stays #1167's.
 - Revised: 2026-10-12, round 2. Adds the owner's daily standup and
   transcript-driven improvement (§7a, §7b, owner addition on #1172) and
   two-level coordination inside one repo (§1a, #1167).
+- Revised: 2026-10-12, round 3, after a fresh review. Safety boundaries are
+  now server-side (§6.3): a gate status check that only flk's own GitHub App
+  can post, behind a recorded review (§6.4). Authority moves out of the repo
+  into the binding (§6.2), so the owner cannot raise its own limits. Shadow
+  mode covers the whole owner, and O11a and O11b come before it (§7, §9). Triggers in
+  issue bodies cannot reach the new actions (§5). The request chain is
+  derived by the server (§4). The ADR asks for amendments to ADR-0027 §1a,
+  ADR-0014 §5 and ADR-0034 §1 (§11). Numbers and slice sizes are
+  re-estimated.
 - Builds on: ADR-0004 (per-repo `.flk.toml`), ADR-0005 (durable log), ADR-0006
   (addressing), ADR-0014 (agent spawn ceiling, operator boundary), ADR-0018 /
   ADR-0026 (mail intent and custody), ADR-0023 (decision records), ADR-0027
   (delegate edges), ADR-0028 (events, waits, wakes, channels), ADR-0029 (CLI
   contract), ADR-0030 / ADR-0031 (goal supervision and storage), ADR-0032
   (compiled context), ADR-0033 (forked AX reviews).
-- Numbering: 0034 is left to the #1160 ADR (`plover-1160`, started first, no
-  PR open when this was written). If that ADR takes another number, this one
-  is renumbered before acceptance.
+- Numbering: 0034 is the #1160 ADR (PR #1174).
 - Decision owner: operator.
 - Implemented: none. The slices (§9) are not filed. The owner reviews this ADR
   before any slicing.
@@ -203,11 +210,29 @@ author field. §2 decides how instead.
   home node over mesh custody (ADR-0026, §4). Moving an owner is an operator
   act (`flk owner move`), which re-binds on the new node and reassigns the
   edges (ADR-0027 §1a).
-- **The owner keeps one `AgentId` for life.** Its edges, goal, intake
-  decisions and cursors all key on it. A new session is a restart of the same
-  agent record. Restart already keeps `terminal.agent_id`
-  (`src/app/agent_restart.rs:1144`). Restarting into a *new* session instead
-  of resuming is new work (slice O2).
+- **The owner keeps one `AgentId` for life, across sessions, profiles and
+  harnesses.** Its edges, goal, intake decisions and cursors all key on it. A
+  new session is a restart of the same agent record. Restart already keeps
+  `terminal.agent_id` (`src/app/agent_restart.rs:1144`). Restarting into a
+  *new* session, possibly under another profile or harness, is new work
+  (slice O2). **This amends ADR-0027 §1a.** That section says a harness
+  takeover is "a new agent with a new id" whose edges are orphaned until an
+  operator `reassign`. For a **bound** owner or segment architect, a harness
+  or profile change is instead a restart of the same record, authorised in
+  advance by the operator's binding (its profile ladder), so its edges stay
+  live. Unbound architects keep ADR-0027 §1a unchanged. (Owner question 19.)
+- **Harnesses (`bind --harness`).** Claude Code, Codex and opencode may all
+  be bound, because the hibernated wake is harness-neutral: it starts a fresh
+  session whose first message is the compiled context with the digest
+  (point 2 below). Only the *alive, idle, parked* state needs flk's idle wake,
+  and that wake is Claude-only today (`src/app/idle_wake.rs:20`, "pitfall 8":
+  the sentence names a tool only Claude's integration is assumed to have).
+  So a non-Claude owner is **never kept alive parked**. It is hibernated as
+  soon as its turn ends, with the status handshake, and every wake is a fresh
+  episode. That lasts until ADR-0028 E6 (#1032) extends the idle wake to its
+  harness. The cost is that a Codex or opencode owner pays a fresh compiled
+  start (about 57k units, §8) on every wake, where Claude often pays a warm
+  continue.
 - **Episodes.** The owner lives in episodes. An episode is one harness
   session, from a wake until it hibernates:
   1. **Hibernated** (the resting state): no process, no tokens. Events
@@ -227,7 +252,11 @@ author field. §2 decides how instead.
      alive, parked, at zero token cost.
   4. **Hibernate when warmth is gone.** After `warm_ttl` with no call, the
      owner is asked once for its end-of-episode status (ADR-0030 §6's
-     `GoalStatusSet` handshake, bounded wait) and is then hibernated. Keeping
+     `GoalStatusSet` handshake, bounded wait) and is then hibernated. That
+     status turn is a real model turn on a warm prefix, about 0.1·P plus the
+     status written. It is the same kind of cost as the forced end-of-turn
+     recap measured in #1166, where a skipped recap costs a whole extra turn.
+     §8 counts one such turn per episode. Keeping
      the process after the cache has expired buys nothing: the next wake would
      pay a cold prefix either way, and a fresh compiled episode is smaller
      than a resumed long transcript.
@@ -244,9 +273,21 @@ author field. §2 decides how instead.
   because no transcript has to move. The binding records which profile each
   episode used, which closes the gap #1010 hit, where no record said which
   account a session ran under.
-- **Idle cost is zero by construction.** A hibernated owner has no process.
-  flk does every poll (§5). Nothing runs on the model until an event the
-  owner has not handled passes the wake classes of §2.
+- **Idle cost is zero when nothing is due.** A hibernated owner has no
+  process, and flk does every poll (§5) without a model. A day costs zero
+  model tokens when all of these hold; each one is a deliberate wake:
+  - no event passed the wake classes of §2;
+  - no cron rule routed to the owner fired, such as a nightly triage (§5);
+  - no deferred intake record reached its re-triage date (§3);
+  - no registered wait reached its deadline (ADR-0028 §5: every park has
+    one, and expiry is a wake);
+  - no episode ended, because ending one costs the status turn (point 4);
+  - no lift review fired (§7b).
+
+  The local transcript miner (§7b) and the standup (§7a) run inside the flk
+  server as cron actions. They use CPU and disk, never the model. The
+  rotation in point 5 is the other cost a quiet owner can hit: when the next
+  wake comes, it pays a cold start (§8).
 
 **Alternatives rejected.**
 
@@ -266,8 +307,9 @@ author field. §2 decides how instead.
   than an hour apart in busy periods, this pays a cold compiled start (about
   57k units, below) each time, where a warm continue costs a fraction of that.
 - *Binding from the repo's own `.flk.toml`.* A checkout path, a profile and a
-  node are machine facts (ADR-0004 keeps those out of the committed layer).
-  Policy is the committed part, and §3 reads it from there.
+  node are machine facts (ADR-0004 keeps those out of the committed layer),
+  and authority (caps, gates, budgets) must not live where the owner can
+  merge (§6.2). Only behaviour that grants no authority is committed (§3).
 
 **Cost.** Owner memory must be fully external: anything that was not
 recorded (goal status, intake decision, ADR-0023 decision, note) is gone at
@@ -294,7 +336,20 @@ themselves architects.**
   episodes, as every edge does (ADR-0027 §1). The depth is owner → segment →
   builder, which is the depth-2 ceiling ADR-0014 §5 already sets for
   agent-initiated spawns (`max_spawn_depth = 2`, `src/spawn/mod.rs:213`). No
-  third level exists.
+  third level of *working* agents exists.
+- **AX review forks of builders under a segment sit at depth 3.** ADR-0033
+  reviews a builder by forking it at its `DONE:` (AX8). Under a segment
+  architect, that fork would be the fourth agent in the lineage (owner →
+  segment → builder → fork), so ADR-0014 §5's depth limit refuses it.
+  **Recommended: amend ADR-0014 §5 so depth counts only agents that can
+  spawn.** An `ax:` in-place fork cannot spawn: AX3 removes its spawn and
+  write tools (`--disallowedTools` plus the command-allowlist hook), and it
+  has no worktree and is reaped on exit (ADR-0033 §3). It still counts
+  against fanout and `max_concurrent_agents`. Depth exists to stop recursive
+  spawning, which a fork that cannot spawn cannot do. Rejected: reviewing
+  depth-3 builders with ADR-0033's compiled reviewer (AX9). It would work
+  without an amendment, but it loses the lived context that is the reason
+  ADR-0033 §1 prefers a fork. (Owner question 20.)
 - **Intake stays with the owner.** Every subject still goes through the
   owner's intake (§3). An accepted subject gains one more state,
   `assigned { segment }`, decided by the owner from the paths it touches. A
@@ -309,7 +364,7 @@ themselves architects.**
   their own, and the owner receives the segment's **wave reports**. A wave
   report is a `GoalStatusSet` on the segment's sub-goal (ADR-0030 §6), so it
   is a durable fact and not a chat message. Questions go up to the owner by
-  #1160's routing, and only the owner asks the operator. Downward, the owner
+  ADR-0034's routing (§2, §5 there), and only the owner asks the operator. Downward, the owner
   uses `delegate send`. Segment architects do not message each other. A
   change to an interface between segments is an ADR or contract issue that
   the owner decides and lands first, and the segments merge it down. That is
@@ -377,8 +432,10 @@ for the owner's triage.
     it matches one, and the buffer drops it. Author cannot do this job
     (Measurements: everything is `gerchowl`). A raw `gh` write made by the
     owner outside flk carries no record and comes back as an outside event.
-    The role text therefore forbids raw `gh` writes, and #1160's tool-use
-    hook can deny them in the owner's pane.
+    The role text therefore forbids raw `gh` writes. The defence-in-depth
+    hook of §6.3 (layer two) denies the common forms in the owner's pane. A
+    missed echo costs at most one wasted wake. It is never a safety problem,
+    because safety does not rest on echo detection (§6.3, layer one).
   - *Handled subjects are filtered.* An intake decision (§3), a review
     verdict on a PR head SHA, or a request answer (§4) marks the subject
     handled up to that fact's `seq`. A later event on the same subject
@@ -395,7 +452,7 @@ for the owner's triage.
 
   | Class | Events | Hibernated owner | Busy owner |
   | --- | --- | --- | --- |
-  | **now** | operator or channel mail; `needs_reply` / `blocking` mail and owner requests addressed to it (ADR-0018); an answer to its question; its delegate `needs_human` / `blocked` / `limit_reached` (and, through #1160, a delegate's question); `pr.ci_completed` failure on the default branch; a registered wait opening (ADR-0028 §5, so wake follows the wait) | wake at once | next boundary, flagged urgent |
+  | **now** | operator or channel mail; `needs_reply` / `blocking` mail and owner requests addressed to it (ADR-0018); an answer to its question; its delegate `needs_human` / `blocked` / `limit_reached` (and, through #1160, a delegate's question); `pr.ci_completed` failure on the default branch; a registered wait opening (ADR-0028 §5, so wake follows the wait) | wake at once | at its next turn boundary, flagged urgent |
   | **batch** | a new issue or PR not authored by the owner; delegate `finished` / `gone`; `pr.ci_completed` and `pr.merged` on its delegates' PRs; new comments on open subjects; `cron.fired` routed to it | wake when the window closes: `batch_window` 15 min while it has a delegate in flight, `idle_batch_window` 2 h when it has none; or at once when the batch reaches `[digest] max_lines` (12, ADR-0028 §6) | next boundary |
   | **digest** | `fyi` mail; label or milestone changes by others; phases of agents that are not its delegates; releases of other repos it does not watch | never wakes, rides along in the next digest | next boundary |
   | **drop** | `actor: self` echoes; facts on subjects it has closed out | dropped | dropped |
@@ -411,7 +468,20 @@ for the owner's triage.
   | --- | --- |
   | hibernated | an episode starts (§1); the digest is part of layer 4 of the compiled context, which is the first user message for a fresh session, or one guarded fixed sentence ("digest ready, call `flock_owner_digest`") for a warm continue |
   | alive, idle, parked | the guarded idle wake (#850 lease, draft stash; ADR-0028 §5) with the fixed sentence |
-  | alive, mid-turn | at the turn boundary through the Stop hook's nudge, which already carries mail counts (`src/cli/hook.rs:222-235`). *now* items may also arrive mid-turn as hook output (`additionalContext`) if #1160's hook ADR adopts tool-use hooks for injection; this ADR depends on that decision and does not make it |
+  | alive, mid-turn | **at the next turn boundary**, through the Stop hook's nudge, which already carries mail counts (`src/cli/hook.rs:222-235`). Nothing reaches a turn in progress. |
+
+  **"Delivered while busy" means "delivered at the next turn boundary".**
+  No mid-turn mechanism exists. ADR-0034 §1 installs no catch-all
+  `tool.before` and wires `tool.after` only for the question tools, so
+  nothing can add context in the middle of a turn. This ADR does not ask for
+  one. A mid-turn injection on every tool call would cost a hook process per
+  call. It would also put fleet chatter into the owner's reasoning while it
+  works, which the scarce-context lesson of the architect skill argues
+  against. The worst-case latency of a *now* item for a busy owner is the
+  length of its current turn, bounded by `max_episode_turns` (§6.5) and by
+  ADR-0030's stop ladder. If that proves too slow, a narrow `tool.after`
+  injection for *now* items only is the follow-up. It would be its own
+  amendment to ADR-0034 §1 and is not requested here (owner question 22).
 
   The body is always pulled (`flock_owner_digest`, or `events.read` from the
   owner's cursor). It is never pushed into the composer.
@@ -464,7 +534,8 @@ exists for the cases where that matters.
   record and re-issued on rotation (ADR-0031 §4). That record, not GitHub, is
   the source of truth.
 - **Rules (the policy).**
-  - **Auto-accept** applies only to an operator-authored issue that implements
+  - **Auto-accept** (its scope is authority, so it is set in the binding,
+    §6.2) applies only to an operator-authored issue that implements
     a decided design. It must name an Accepted ADR's slice or a decided issue,
     as every slice issue filed today does ("Slice E7 of #1001, specified in
     ADR-0028 §2"). The second case is an operator bug report with a
@@ -492,13 +563,18 @@ exists for the cases where that matters.
     loosened gate).
   - **Duplicate** requires a search first. That is ADR-0033 §6's
     search-first rule: comment on the existing issue, never open a second one.
-- **Untrusted text stays data.** An issue or comment body from anyone but the
-  operator is quoted in the digest as data, size-capped, with control bytes
-  refused, as ADR-0014 §4 decides for spawn prompts. It never becomes a brief
-  verbatim: the owner writes every brief itself (ADR-0033 §7 template). An
-  external author's issue is never auto-accepted, never triggers a spawn
-  directly, and runs no code from its body. `issue_guard` enforces the same
-  author gate for its trigger blocks (`src/checks/issue_guard.rs:26-35`).
+- **All GitHub text is data, whoever the author field names.** An issue or
+  comment body is quoted in the digest as data, size-capped, with control
+  bytes refused, as ADR-0014 §4 decides for spawn prompts. That holds even
+  when GitHub names `gerchowl` as the author, because any agent with the
+  operator's `gh` token writes as `gerchowl` (Measurements). Only text that
+  flk itself recorded as the operator's is trusted: a filing through
+  `flk issue drop --file-it` (ADR-0015) or an operator channel message. A
+  body never becomes a brief verbatim: the owner writes every brief itself
+  (ADR-0033 §7 template). No GitHub text is auto-accepted, starts a spawn or
+  runs code. `issue_guard`'s author check (`src/checks/issue_guard.rs:26-35`)
+  has the same weakness, which is why §5 keeps every new action out of its
+  reach.
 - **Merges of outside PRs** are never the owner's to make alone. An outside
   PR gets a review and an intake verdict, and the merge is an operator gate
   (§6).
@@ -513,17 +589,22 @@ exists for the cases where that matters.
   O4 writes, so their echoes are dropped. The labels are a view: if one is
   edited by hand on GitHub, the next fold restores it and reports the drift in
   the digest. It is not an override.
-- **Where policy lives.** The policy is a committed `[owner]` section in the
-  repo's `.flk.toml` (ADR-0004): wake classes, windows, intake rules, merge
-  grant (§6), labels. Per ADR-0004 decisions 4–5, flk reads it from the
-  default branch's committed blob, never from a worktree or a PR branch, so a
-  PR cannot change the policy that judges it. A policy change is a reviewed
-  PR like any other doc. The `policy_version` (blob id) is recorded on every
-  decision.
-- **Dry run first.** For each repo, intake starts with `mode = "shadow"`:
-  decisions are recorded but nothing is posted. After ten shadow decisions
-  agree with the operator's own triage, the operator switches the repo to
-  `live`. This copies ADR-0033 owner decision 1.
+- **Where policy lives: behaviour in the repo, authority in the binding.**
+  The committed `[owner]` section in the repo's `.flk.toml` (ADR-0004)
+  holds only behaviour that grants nothing: the wake class table, windows,
+  label names, standup time and spike and decline wording. Everything that
+  grants or limits authority lives in the binding (§6.2), set only by
+  operator verbs. That covers the auto-accept scope, merge and release gates,
+  caps and budgets. Even the behaviour part is **adopted** by the operator,
+  not by a merge. Per ADR-0004 decisions 4–5, flk reads the default branch's
+  committed blob, never a worktree or a PR branch. When that blob changes,
+  flk keeps running on the adopted `policy_version` and puts the diff in the
+  operator's notifications until `flk owner policy adopt <blob>` (§6.2). The
+  adopted `policy_version` is recorded on every decision.
+- **Shadow first.** Every newly bound owner starts in whole-owner shadow
+  mode (§7): it records every decision it would make, intake included, and
+  writes nothing. Live intake is switched on with the rest of the owner, by
+  the operator.
 
 **Alternatives rejected.**
 
@@ -560,7 +641,8 @@ cost is intended.
 
   ```text
   owner.request  { request_id, from_repo, to_repo, kind: change | question | unblock,
-                   summary, links[], acceptance?, needed_by?, chain: [request_id…] }
+                   summary, links[], acceptance?, needed_by? }
+                 // chain: [request_id…] is added by the server (below), never by the sender
   owner.response { request_id, verdict: accepted { issue } | declined { reason }
                    | clarify { question } | blocked_on { ref } | done { evidence } }
   ```
@@ -590,14 +672,28 @@ cost is intended.
     starts an agent, writes, merges or labels in the target. The target's
     answer can only report decisions about the target.
   - Questions to the human: each owner is the root of its own delegation tree
-    and may ask the operator about its own repo, by #1160's routing. An owner
+    and may ask the operator about its own repo, by ADR-0034's routing. An owner
     never relays another owner's question to the operator. A question about
     repo B is B's owner's to ask.
 - **Loops and storms.**
-  - *Chains.* Every request carries the `chain` of requests that caused it.
-    The server refuses a request whose chain already contains the target repo
-    (`request_cycle`, exit 13), or whose chain is longer than `[owner]
-    max_request_depth` (default 3).
+  - *Chains are derived by the server, never supplied by the sender.* A
+    sender could leave out its own history and dodge cycle detection, so any
+    `chain` field in the request is ignored. The server keeps, per owner, the
+    set of **open inbound requests** it holds (received and not yet answered
+    `done` or `declined`). When an owner sends a request, the server stamps
+    its chain as the union of the chains of all those inbound requests, plus
+    the requests themselves. It refuses the request if that chain already
+    contains the target repo (`request_cycle`, exit 13) or is longer than
+    `[owner] max_request_depth` (default 3).
+
+    **Cost:** the union is conservative. An unrelated outbound request sent
+    while an inbound one is open inherits that request's chain, and it can be
+    refused as a cycle that is not causally real. Nothing narrows that
+    without trusting the sender again. A false refusal therefore becomes an
+    ADR-0023 decision for the operator, who may allow it once with
+    `flk owner request --allow-cycle`, an operator verb, rather than being
+    silently dropped. Rejected: trust the sender's chain, which a cycle can
+    simply omit.
   - *Blocked-on cycles.* Watches form a graph between repos. When a new
     `blocked_on` or watch closes a cycle (A waits on B, B on A), the server
     refuses to park the second wait, files an ADR-0023 decision for the
@@ -668,9 +764,11 @@ remaining questions are listed in §10.
   - **Scripts.** `[[checks.script]]` may print JSON lines that become durable
     `source.<name>.*` events (operator-configured programs only, as today).
 - **Rules route; they do not run work.** A rule is `when <event matcher> [if
-  <predicate over fields>] do <action>`, declared in host config by the
-  operator, or in the repo's `.flk.toml [[owner.rules]]` for actions on that
-  repo's own owner. The closed action set (`ActionSpec`,
+  <predicate over fields>] do <action>`. Rules with any of the new actions
+  are declared only in the operator's host config or the binding (§6.2). A
+  repo's `.flk.toml [[owner.rules]]` may declare only `RouteToOwner` for its
+  own owner, and like the rest of that section it takes effect only after
+  operator adoption (§3). The closed action set (`ActionSpec`,
   `src/checks/config.rs:273`) gains:
   - **`RouteToOwner { repo, class }`**: put the event in that owner's buffer
     under a wake class (§2). This is the default for every event about an
@@ -691,6 +789,30 @@ remaining questions are listed in §10.
   Existing `Notify`, `Event` and `WriteDigest` stay. Every firing emits
   `trigger.fired { rule, subject, action, outcome }`. `--dry-run` per rule
   records what it would have done.
+- **No text on GitHub can choose an action.** `issue_guard` today dispatches
+  `flk-trigger` blocks from issue bodies whose author is the configured owner
+  (`src/checks/issue_guard.rs:26-35`), and allows only `Notify`
+  (`:204-206`). By this ADR's own measurement, an author of `gerchowl`
+  proves nothing: any agent or script holding the operator's `gh` token
+  writes as `gerchowl`. So:
+  - **Recommended:** `RouteToOwner`, `WakeAgent`, `ForkReview` and
+    `SpawnAgent` are **never available to `issue_guard` or to any action
+    named in GitHub text**. `issue_guard`'s action allowlist stays `Notify`,
+    as today, and a test pins it. A rule can still *match*
+    GitHub events (a `when issue.opened` written by the operator in host
+    config), because then the operator chose the action and GitHub only
+    supplies the subject. The event's text reaches the owner only as data
+    (§3).
+  - **Rejected:**
+    - *Signed trigger blocks* (a signature in the issue body checked against
+      an operator key). That would work, but it adds key management for a
+      path the operator's own host config already covers without one.
+    - *A label applied by a trusted actor.* The timeline's `LabeledEvent`
+      actor is again `gerchowl` for every agent, so the label proves nothing.
+    - *Trust authorship once agents have their own identity* (§6.3 point
+      1). An agent identity makes `flk-agent[bot]` text recognisable, but
+      it does not make operator-authored text an instruction. The operator
+      starts actions from host config, not from issue bodies.
 - **Is a scheduled or triggered run a goal or a delegate?** (#1073 and #1074,
   owner addition.) For an owned repo it is **neither a new agent nor a bare
   spawn**. It is a wake of the resident owner, whose standing goal (ADR-0030)
@@ -729,80 +851,261 @@ decided here (§10). Until they are, an owner waits on a long local command
 through the harness's own background mechanism plus `flk events wait`, which
 E5 attributes (ADR-0028 §4).
 
-### 6. Safety and cost limits: caps on two levels, a wake budget enforced by flk, provider limits respected, one kill switch, and human gates enforced at the verb and the hook
+### 6. Safety and cost limits: authority lives in the binding, a merge needs a status only flk's own GitHub App can post after a recorded review, agents never hold the operator's admin token, and hooks are defence in depth
 
-**Recommended.**
+A rule the owner can bypass is not a limit. This section therefore names, for
+every limit, the point that enforces it, and says plainly where that point is
+cooperative rather than a boundary.
 
-- **Caps.**
-  - `[owner] max_delegates` per owner (default 4, today's cap in STATUS.md
-    and the skill §0b.4) counts live edges plus their reported subagents. It
-    is enforced at `delegate start` for an attested owner caller, with an
-    `at_owner_capacity` refusal that carries current, limit and retry
-    (ADR-0014 §8).
-  - The host wall stays `[fleet] max_concurrent_agents` (8,
-    `src/spawn/mod.rs:212`) and now counts owners too.
-  - Heavy-build slots are #822's.
-- **Budgets.**
-  - **Wakes.** `[owner] max_wakes_per_day` (default 48, above the measured
-    busy-day 38). flk counts wakes deterministically. Past the budget, only
-    *now*-class operator and channel mail wakes the owner, everything else
-    keeps batching, and the operator gets a notification (ADR-0016).
-  - **Episode length.** `[owner] max_episode_turns` (default 60). Reaching it
-    ends the episode with a status handshake and starts a fresh one at the
-    next wake. It never loops.
-  - **Tokens.** Slice O13 records per-episode usage from the harness
-    transcript into `OwnerEpisodeEnded { turns, input, output, cache_read,
-    cache_created }`. A token budget per day (`[owner] max_units_per_day`)
-    becomes enforceable after that slice, not before. The wake budget is the
-    limit until then.
-- **Provider limits.** `limit_reached` defers wakes (§1). A profile ladder is
-  operator configuration in the binding, never an owner's choice. An owner
-  may not log in, change profiles or touch credentials (skill §0b, "never
-  improvise credential workarounds").
-- **Kill switch.** `flk fleet pause` (exists) also stops owner wakes and
-  episode starts. Events keep being recorded and batched, so nothing is lost
-  across a pause. `flk owner pause|resume <repo>|--all` pauses owners alone.
-  `flk owner stop <repo>` ends the current episode with a status handshake,
-  hibernates the owner and disables wakes until `resume`. These are operator
-  verbs.
-- **Human gates.** From the repo's `.flk.toml [owner.gates]`, defaults
-  matching today's GOAL.md:
+#### 6.1 Caps
 
-  | Action | Default |
-  | --- | --- |
-  | merge a delegate PR into the integration branch | `after_review_and_green` (GOAL.md line 44: reviewer approval and green CI) |
-  | merge an outside PR | `ask` |
-  | release (`just release`, tags) | `ask` |
-  | deploy, host applies, server handoff, stop or restart | `never` (GOAL.md Rollout and Policy; owner decision "no applies") |
-  | close an external author's issue as declined | `ask` until shadow mode ends, then `allowed` with a reason |
-  | push to `main` or the integration branch directly, `--admin`, `--force` | `never` |
+- `max_delegates` per owner (default 4, today's cap in STATUS.md and the
+  skill §0b.4) counts the owner's whole live subtree. That includes segment
+  architects and their builders (§1a) and the subagents they report. It is
+  enforced at `delegate start` for an attested owner caller, with an
+  `at_owner_capacity` refusal that carries current, limit and retry
+  (ADR-0014 §8).
+- The host wall stays `[fleet] max_concurrent_agents` (8,
+  `src/spawn/mod.rs:212`) and now counts owners too.
+- Heavy-build slots are #822's.
 
-  Enforcement comes at two points, because a prompt alone is not
-  enforcement:
-  - (a) the flk verbs that perform gated actions (`flk land` from #694, and
-    `flk owner release`) check the gate and, for `ask`, raise an ADR-0023
-    decision and park on its answer;
-  - (b) #1160's tool-use hook surface denies the raw equivalents (`gh pr
-    merge`, `gh release`, `just release`, `flk server …`) in an owner's or
-    delegate's pane with a message naming the flk verb.
+#### 6.2 Authority lives in the binding, never in the repo
 
-  GitHub's own ruleset, where only the release App moves `main` (AGENTS.md),
-  is the outer wall.
+The owner can merge into `dev`. Anything read from `dev` can therefore be
+rewritten by the owner, including its own caps and gates. **Recommended:**
 
-**Alternatives rejected.**
+- **Every value that grants or limits authority is binding state**, set by
+  operator verbs and recorded as a durable `OwnerLimitsSet { repo, caps,
+  budgets, gates, auto_accept, deny_commands, by }` event. This covers
+  `max_delegates`, the wake, turn and token budgets, the merge, release and
+  close gates, the auto-accept scope (§3), the defence-in-depth deny list
+  (§6.3) and rules with actions (§5). The verb is `flk owner limits
+  set|show <repo>`. `set` is refused for an attested agent caller (the
+  ADR-0014 boundary), and `show` is readable over MCP. The server never
+  reloads these values from a file that an agent running as the same Unix
+  user could edit. Host config may carry defaults that `bind` copies once.
+- **The repo's `[owner]` section holds behaviour only** (§3), and the
+  operator adopts it: `flk owner policy adopt <blob>`. A merged change does
+  nothing until it is adopted. The operator sees the diff in a notification
+  and in the standup (§7a).
+- **Every authority change is loud.** Each `OwnerLimitsSet` and adoption
+  files an operator notification (ADR-0016), posts to any channel binding
+  that subscribes (ADR-0028 §8), and is listed in the next standup.
+
+**Rejected.**
+
+- *A CODEOWNERS file plus a ruleset path rule on `.flk.toml`, with flk
+  refusing owner-authored changes.* A code-owner review has to come from an
+  account other than the PR's author, and on this fleet the operator and
+  every agent write as one account (Measurements). Requiring it would block
+  every PR, the operator's own included. "Refuse owner-authored changes"
+  needs the authorship that is missing today (§6.3 creates it for agents,
+  but the rule would still sit in the repo the owner merges into).
+- *Caps and gates in the host config file.* That is better than the repo,
+  but agents run as the operator's Unix user, and a file the server reloads
+  is a file an agent can edit. Server state written only through attested
+  operator verbs closes that path.
+
+**Cost and residual gap.** Every change to policy or limits is an operator
+act, so the owner cannot tune itself, by design. ADR-0014 defines "operator"
+as "no pane in the caller's ancestry", and ADR-0027 §1a records the known gap
+that a detached child (`setsid`) attests as the operator. Such a child could
+call `limits set`. This ADR does not close that gap, which is ADR-0014's. It
+bounds it: every authority change is loud (above), and layer one of §6.3
+still requires a recorded review at the PR head, which a raised limit does
+not forge.
+
+#### 6.3 Enforcement: layer one is server-side, layer two is hooks
+
+**Where `dev` stands today.** `dev` requires five status checks from the
+GitHub Actions app, strict (`gh api repos/gerchowl/flock/branches/dev/protection`:
+`check (macos-15)`, `check (ubuntu-latest)`, `conventional-commits`,
+`flake check`, `tracker hosts`, all `app_id 15368`). `main` has the ruleset
+"main: releases only" (AGENTS.md: only the release App moves it). There is
+no CODEOWNERS file. So anyone holding the operator's token can `gh pr merge`
+any green PR into `dev` today. Neither a prompt nor a flk verb can stop a raw
+`gh` call. ADR-0034 §1 installs no catch-all `tool.before`, and ADR-0034 §7
+says its hooks are "not a security boundary".
+
+**Layer one, recommended: GitHub refuses what flk has not cleared.**
+
+1. **Agents never hold the operator's admin token.** Owners, segment
+   architects and their delegates get a **scoped agent identity**: a
+   `flk-agent` GitHub App installed on the operator's repos, with
+   `contents`, `pull_requests` and `issues` write, `checks` and `actions`
+   read, and no `administration`, no `actions` write (so no workflow
+   dispatch) and no deployment approval. The flk server holds the App key in
+   its own state and mints short-lived installation tokens into agent panes
+   through a git credential helper and `GH_TOKEN`. The operator's own `gh`
+   stays untouched. ADR-0014 §3 already starts spawned agents from
+   `env_clear()` plus an allowlist, so the operator's ambient token is not
+   inherited. As a side effect, agent writes are authored by
+   `flk-agent[bot]`, which gives GitHub authorship a meaning again
+   (Measurements). It does not tell the owner from its delegates, so O4's
+   node ids stay.
+2. **A gate status only flk can post.** A second App, `flk-gate`, holds only
+   `statuses` / `checks` write. The flk server posts `flk/land-gate` on a PR
+   head SHA only when all of these hold:
+   - a `ReviewRecorded` approve exists at exactly that SHA (§6.4);
+   - the binding's merge gate is met (`after_review_and_green` adds green
+     required CI; `ask` adds the operator's answer to an ADR-0023
+     decision);
+   - the owner is neither paused nor in shadow (§7).
+3. **`dev` requires `flk/land-gate` from that App.** GitHub's required
+   status checks name their source app, as `dev`'s five checks already do
+   with `app_id 15368`. A merge by any token, the operator's or an agent's,
+   is then refused until the gate is green at the head. A status forged with
+   any other token does not count.
+4. **Releases wait for a human in GitHub.** `promote.yml`, which `just
+   release` dispatches (AGENTS.md, Release Channels), runs in a GitHub
+   Environment `release` with the operator as required reviewer. Point 1
+   already keeps agents from dispatching it. The environment covers a
+   dispatch from anywhere else.
+5. **Detection catches bypasses.** A `pr.merged` into `dev` (O3a) whose merged
+   head SHA has no `flk/land-gate` success from the server raises an
+   `owner.incident`, pauses that repo's owner automatically (§6.5) and
+   notifies the operator. This catches an admin merge, a bypassed rule, or a
+   repo where layer one could not be configured.
+
+**Where layer one cannot be configured.** A private repo on a plan without
+branch protection returns 403 on the protection APIs (#1167, owner comment of
+2026-10-12). There, nothing server-side can refuse a merge by a token with
+`contents` write. Such a repo **cannot grant the owner merge authority**: its
+merge gate is forced to `ask`, the flk verbs and layer two are the only
+checks, and point 5's detection plus auto-pause is the compensating control.
+`flk owner bind` reports which layer-one points the repo supports, and so
+does the standup.
+
+**Layer two, defence in depth, owned by this ADR.** A `tool.before` entry on
+the shell tool only (Claude `PreToolUse` matcher `Bash`, and the Codex and
+opencode equivalents ADR-0034's inventory lists), installed **only** in the
+panes of bound owners, segment architects and their delegates. It denies the
+binding's `deny_commands`: `gh pr merge`, `gh release`, `gh api` writes to
+protection or rulesets, `just release`, `flk server …`, and raw `gh issue|pr
+comment|edit|close` for owners (O4's verbs exist for those). The deny message
+names the flk verb to use instead.
+
+- **This needs an amendment to ADR-0034 §1**, which states "Nothing installs
+  a catch-all `tool.before`". This entry is not catch-all (shell tool only,
+  role-scoped panes only), but it runs on every shell call in those panes.
+  Its cost is one `flk hook` process per shell call: about 10 ms outside a
+  pane (ADR-0034 §1, measured), plus one socket round trip inside one. It
+  goes through ADR-0034's `hook.decide` with verdicts `pass` / `deny`, so it
+  adds no second hook mechanism. (Owner question 21.)
+- **It is not a boundary, and is not presented as one** (ADR-0034 §7). Shell
+  aliasing, `python -c`, `curl` or a script all evade a command matcher. It
+  exists to turn an honest mistake into a clear refusal before layer one has
+  to refuse it.
+
+**Rejected.**
+
+- *Hooks as the enforcement.* ADR-0034 §7 says they are not a boundary, and
+  a matcher on command text can always be evaded.
+- *flk verbs as the enforcement.* `gh` is on every agent's PATH, so a verb
+  is a convenience, not a gate.
+- *Keep the operator's token in agent panes and rely on detection alone.*
+  An admin token can edit the protection that layer one rests on, and it
+  can approve the release environment as the operator. Detection after the
+  fact cannot undo a release.
+
+**Cost.** This is the largest new cost in the ADR:
+- two GitHub Apps to provision and install, per account and organisation;
+- a credential helper and token refresh in the server (installation tokens
+  live one hour);
+- a required check whose outage blocks every merge. `flk/land-gate`
+  therefore reports `pending` with its reason rather than failing silently,
+  and the operator keeps admin as the break-glass, which detection then
+  records;
+- some fleet repos are private without branch protection, and there the
+  owner simply has no merge grant.
+
+#### 6.4 A review is a recorded fact at a head SHA
+
+Today a review is a PR comment that ends `VERDICT: approve`, and the 7-day
+sample holds **zero** GitHub review events (Measurements). A comment proves
+nothing about who wrote it. GitHub's own review cannot serve either: GitHub
+refuses an approval from a PR's author, and with one shared account (or with
+the bot identity of §6.3 point 1 doing both pushing and reviewing) every
+author and reviewer is the same identity. **Recommended:**
+
+- **`ReviewRecorded { repo, pr, head_sha, reviewer: AgentId, edge_label,
+  architect: AgentId, verdict: approve | blockers | nits, brief_sha256,
+  findings_ref, by: agent | operator }`** is a durable event, written by `flk
+  review record` (MCP `flock_review_record`) and attested to its caller. It
+  is valid only if all of these hold:
+  - the reviewer holds an edge from the PR's owner labelled `review:<pr>`
+    (ADR-0027 label);
+  - the reviewer is not the delegate whose edge owns the PR's branch, and
+    not any agent with a `delegate send` to that builder in the round (the
+    builder and anyone steering it do not review it);
+  - `head_sha` equals the PR head that the poller holds at the moment of
+    recording.
+
+  The findings text is a file served as an MCP resource (ADR-0017), and a
+  human-readable PR comment is posted through O4. The comment is a view,
+  not the record. The operator may record a review too (`by: operator`).
+- **`flk land` requires an `approve` at the current head.** A new push moves
+  the head, the recorded approval no longer matches, and `flk/land-gate`
+  goes back to `pending` (§6.3). The `nits` verdict counts as approve.
+  `blockers` never does.
+- **Rejected:** *GitHub PR reviews* (self-approval is refused on one
+  identity, and the reviewer and author would be one bot); *parsing
+  `VERDICT:` comments* (any token can write one).
+- **Cost:** reviewers must call one verb. A reviewer outside flk (a human
+  on github.com) is recorded by the operator with `flk review record --by
+  operator`.
+
+#### 6.5 Budgets, provider limits, kill switch
+
+- **Wakes.** `max_wakes_per_day` (default 48, above the measured busy-day
+  38). flk counts wakes deterministically. Past the budget, only *now*-class
+  operator and channel mail wakes the owner, everything else keeps batching,
+  and the operator gets a notification (ADR-0016).
+- **Episode length.** `max_episode_turns` (default 60). Reaching it ends the
+  episode with a status handshake, and the next wake starts a fresh one. It
+  never loops.
+- **Tokens.** Slice O13 records per-episode usage from the harness transcript
+  into `OwnerEpisodeEnded { turns, input, output, cache_read, cache_created
+  }`. A token budget per day (`max_units_per_day`) becomes enforceable after
+  that slice, not before. The wake budget is the limit until then.
+- **Provider limits and logins.** `limit_reached` defers wakes (§1). An
+  expired harness login reads `needs_human{login}` or `blocked{auth}`
+  (ADR-0028 §1; `HumanReason::Login`, `src/api/agent_state.rs:85`). One
+  happened on 2026-10-12, when a locked keychain logged a Claude profile out
+  (g-fleet#452, STATUS.md "Environment"). An episode that fails to start for
+  that reason is not retried in a loop. The owner is marked
+  `blocked{auth}`, the operator is told with the exact `! <login>` command,
+  and the standup lists it (§7a). A profile ladder is operator configuration
+  in the binding, never an owner's choice. An owner may not log in, change
+  profiles or touch credentials (skill §0b).
+- **Kill switch.** `flk fleet pause` (exists, `src/app/fleet_pause.rs`) also
+  stops owner wakes and episode starts. Events keep being recorded and
+  batched, so nothing is lost across a pause. `flk owner pause|resume
+  <repo>|--all` pauses owners alone. `flk owner stop <repo>` ends the current
+  episode with a status handshake, hibernates the owner and disables wakes
+  until `resume`. All of these are operator verbs. An incident (§6.3 point
+  5) triggers `pause` automatically.
+
+#### 6.6 Human gates, and what enforces each
+
+| Action | Default (binding) | Enforced by |
+| --- | --- | --- |
+| merge a delegate PR into `dev` | `after_review_and_green` (GOAL.md line 44) | layer one: `flk/land-gate` after `ReviewRecorded` approve at head plus green CI; detection |
+| merge an outside PR | `ask` | layer one: gate waits for the operator's answer; detection |
+| release (`just release`, tags) | `ask` | layer one: the agent identity cannot dispatch; the `release` environment needs the operator |
+| change protection, rulesets, Apps | `never` | layer one: the agent identity has no `administration` |
+| deploy, host applies, server handoff, stop or restart | `never` (GOAL.md Rollout and Policy) | not GitHub: agents hold no host credentials beyond their pane, and `flk server` verbs are denied by layer two. **Cooperative only**: among the API handlers, only `agents.rs`, `delegates.rs`, `worktrees.rs` and `spawn.rs` consult `spawn_caller()` today, so nothing refuses a server lifecycle verb from an agent, and `flk server live-handoff` is client-side (`src/cli/server.rs`). Refusing attested agent callers is part of O11. A process signal stays outside any verb |
+| close an external author's issue as declined | `allowed` with a reason, after shadow | O4 verbs; reversible |
+| push to `main` or `dev` directly, `--admin`, `--force` | `never` | layer one: `main` ruleset and `dev` protection; no `administration` on the agent identity |
+
+**Alternatives rejected for §6 as a whole.**
 
 - *A budget in tokens only.* No token data exists in flk yet
-  (`src/costs/mod.rs`). A budget nobody can measure is not a limit. The wake
-  budget is enforceable now.
-- *Gates in the prompt.* The role text states them, but the field has shown
-  agents working around rules under pressure (skill §0b's credential
-  example). The verb and hook layers make them hold.
+  (`src/costs/mod.rs`). A budget nobody can measure is not a limit.
+- *Gates in the prompt.* The field has shown agents working around rules
+  under pressure (skill §0b's credential example).
 - *No per-owner cap, host cap only.* One busy owner would starve every other
-  repo on the host. That is ADR-0014 §5's argument against a flat counter.
-
-**Cost.** The hook enforcement depends on #1160's slices, and on the
-harnesses #1160 covers. A harness without a deny hook falls back to the
-verb gate plus GitHub's ruleset.
+  repo on the host (ADR-0014 §5's argument).
 
 ### 7. Migration: `.fleet/` and the architect skill retire piece by piece into the owner, behind the checkpoints of ADR-0030 §8, after a shadow run
 
@@ -811,20 +1114,20 @@ is the first owned repo, in shadow mode, before anything is switched off.
 
 | Today | Becomes | Slice | Retires when |
 | --- | --- | --- | --- |
-| `supervisor.py` status loop, `[fleet]` lines | owner buffer and digest (§2) on E3 events | O5, #961, E3 #1027, E6 #1032 | O5 live |
-| `supervisor.py` CI watcher (watcher-s1 around `gh pr checks --watch`) | `pr.ci_completed` (shipped, #1020) into the owner's buffer | O5 | O5 live |
+| `supervisor.py` status loop, `[fleet]` lines | owner buffer and digest (§2) on E3 events | O5a, O5b, #961, E3 #1027, E6 #1032 | O5b live |
+| `supervisor.py` CI watcher (watcher-s1 around `gh pr checks --watch`) | `pr.ci_completed` (shipped, #1020) into the owner's buffer | O5a | O5b live |
 | `supervisor.py` reap on merge, issue hold | ADR-0027 reap (#968), hold = edge stays open until the issue's intake record is `done` | #968, O6 | #968 live |
 | `supervisor.py` `goal_check` per delegate | delegate goals (ADR-0030 §5, G1/G2) | #1034, #1035 | G2 live |
 | `supervisor.py` ctx scrape and three-phase `/compact` | episode rotation at the band (§1), status handshake (ADR-0030 §6) | O2, G5 #884 | O2 live |
-| `supervisor.py` 30 min untriaged-issue reminder | intake records (§3) from `issue.opened` | O3, O6 | O6 live (shadow) |
-| `landbatches.sh`, `batch.sh` (`sleep 60` over `gh pr checks`) | `flk land` (#694) behind the merge gate (§6), driven by `pr.*` events | #694, O11 | #694 live |
+| `supervisor.py` 30 min untriaged-issue reminder | intake records (§3) from `issue.opened` | O3a, O6 | O6 live (shadow) |
+| `landbatches.sh`, `batch.sh` (`sleep 60` over `gh pr checks`) | `flk land` (#694) behind the merge gate (§6), driven by `pr.*` events | #694, O18, O19b | #694 live |
 | `GOAL.md` | goal record (ADR-0030) plus `.flk.toml [owner]` policy and gates | G1, O0, O6 | O6 live |
 | `STATUS.md`, `HANDOFF.md`, `CONTINUE.md` | compiled layers 3–5 (ADR-0032 §1), episode status | X3, X4, X6, O2 | X10 (ADR-0032) |
 | `tasks.json`, `triage.json` | intake records plus goal subtasks | O6, G1 | O6 live |
 | `agents.json` | `delegate.list` (shipped, #960) | — | already |
 | `spawn-claude.sh` dialog scraping | `delegate start` (exists) and #1116 | — | per ADR-0030 §8 |
 | skill §0 preflight and arm | `flk owner bind` (O1) and the owner role text | O1, O12 | O12 |
-| skill §3 "observe through events" and background waits | wake classes; the owner never waits in a loop | O5 | O5 live |
+| skill §3 "observe through events" and background waits | wake classes; the owner never waits in a loop | O5a, O5b | O5b live |
 | skill §6 friction filing | ADR-0033 AX reviews and filing policy, plus lift proposals (§7b) | AX1–AX7, O16, O17 | per ADR-0033 |
 | `.fleet/briefs/_traps.md` pasted into every brief | the repo traps file compiled into layer 2 (ADR-0032 owner decision 3), kept current by lift proposals (§7b) | ADR-0032 X1, O17 | X1 live and the rules merged into the traps file |
 | STATUS.md "Next action" and hand-written progress reports to the operator | the daily standup (§7a) | O15 | O15 live |
@@ -836,12 +1139,32 @@ is the first owned repo, in shadow mode, before anything is switched off.
   loses everything flk now does (preflight scripts, supervisor, HANDOFF,
   compaction mechanics) and keeps judgement: waves, briefs, review, the
   quality bar, intake rules and the protocol of §4.
-- **Shadow run.** O12 binds `gerchowl/flock` with intake in `shadow` mode
-  while the hand-built supervisor keeps running. For at least seven days the
-  owner's recorded decisions and digests are compared against what the
-  architect actually did: agreement on triage, wakes per day, missed events.
-  The supervisor stops only after the operator reviews that comparison. Then
-  the pieces retire in the order of the table.
+- **Shadow covers the whole owner, not only intake.** A bound owner starts
+  with `mode = shadow` in its binding. In shadow it is woken and runs
+  episodes as it would live, but every **outward act is replaced by a
+  record of the intent** (`OwnerWouldAct { action, subject, args }`):
+  - no `delegate start` and no `agent.spawn`;
+  - no GitHub write: no O4 comment, label, file or close;
+  - no `owner.request` sent;
+  - no `flk land`, and `flk/land-gate` is never posted.
+
+  It may read, record intake decisions as `shadow`, and register waits. The
+  server enforces this, refusing those verbs for a shadow owner with
+  `owner_in_shadow` (exit 13), not the role text. That makes shadow safe to
+  run before anything is trusted. **O11a and O11b (limits, gates, pause and the
+  refusals above) ship before O12 (the shadow run)**, so the first owner
+  ever bound already runs under enforced limits.
+- **Shadow run.** O12 binds `gerchowl/flock` in whole-owner shadow while the
+  hand-built supervisor keeps running. For at least seven days and ten
+  intake decisions, the owner's recorded intents are compared against what
+  the architect and operator actually did: triage agreement, delegates it
+  would have started, wakes per day, missed events. The supervisor stops
+  only after the operator reviews that comparison and switches the binding
+  to `live` (`flk owner limits set <repo> --mode live`, an operator verb).
+  Then the pieces retire in the order of the table. A narrower intake-only
+  shadow was rejected: it would put an owner that can start delegates and
+  write to GitHub live before any of its other judgement had been compared.
+  (Owner question 23.)
 - **Rollout.** As always: release, then a g-fleet "Roll out flock vX" issue.
   No owner applies anything to a host.
 
@@ -862,10 +1185,10 @@ is the first owned repo, in shadow mode, before anything is switched off.
 
   | Heading | Source |
   | --- | --- |
-  | achieved | `pr.merged`, `issue.closed{completed}`, `release.published` in the window (O3, #1020); reaped edges (`DelegateReaped`, ADR-0027 §5); intake records that reached `done` (§3) |
+  | achieved | `pr.merged`, `issue.closed{completed}`, `release.published` in the window (O3a, O3b, #1020); reaped edges (`DelegateReaped`, ADR-0027 §5); intake records that reached `done` (§3) |
   | planned | the goal record's open subtasks and wave structure (ADR-0030 §1); intake records in `accepted`, `planned` and `assigned` (§3, §1a); queued start intents (ADR-0027 §6) |
-  | pending | PRs awaiting review or landing (`delegate.list` joined with the poller's PR state, ADR-0027 §2); open ADR-0023 decisions and gate requests for the operator (§6); open `owner.request`s both ways (§4); open watches (§5) |
-  | blockers | delegates or owner in `needs_human`, `blocked` or `limit_reached` (ADR-0028 §1); red default branch (`branch.ci_completed`); expired wait deadlines; blocked-on cycles (§4); wake budget exhausted (§6) |
+  | pending | PRs awaiting review or landing (`delegate.list` joined with the poller's PR state, ADR-0027 §2, and `ReviewRecorded` at head, §6.4); unadopted policy changes (§6.2); open ADR-0023 decisions and gate requests for the operator (§6); open `owner.request`s both ways (§4); open watches (§5) |
+  | blockers | **logins**: an owner or delegate in `needs_human{login}` or `blocked{auth}`, or an episode that failed to start because a harness is logged out (§6.5; the 2026-10-12 case is g-fleet#452), with the exact command for the operator; **limits**: `limit_reached` with its reset time; delegates or owner in `needs_human` or other `blocked` (ADR-0028 §1); red default branch (`branch.ci_completed`); expired wait deadlines; blocked-on cycles (§4); wake budget exhausted, incidents and layer-one points the repo lacks (§6) |
   | experiences | AX review records in the window, with their metrics and the issues they filed or commented on (`AxReviewRecorded`, ADR-0033 §5); friction issues filed by the owner or its delegates (O4 `OwnerActed` with action `file`) |
   | wishes | open lift proposals awaiting approval (§7b), and the top Q8 answer ("which single change would have saved the most turns", ADR-0033 §2) of the last AX review |
 
@@ -880,7 +1203,8 @@ is the first owned repo, in shadow mode, before anything is switched off.
   not woken to produce it.
 - **Scheduled through §5.** A `[[checks.cron]]` entry with a new closed
   action `Standup { repo, deliver: [notification, channel:<binding>, file] }`
-  (slice O15). The default is weekdays 08:00 local, set in the repo's
+  (slice O15). The default is every day at 08:00 local (the owner asked for a *daily*
+  standup, not a weekday one), set in the repo's
   `.flk.toml [owner.standup]`.
 - **Delivered, never typed.** The standup is filed as an operator
   notification (ADR-0016), posted to a channel binding that subscribes to the
@@ -1019,15 +1343,17 @@ ones.
 | Hibernated, fresh compiled episode (cold) | ≈ 57k | ADR-0032: compiled architect resume, cold, 58.1k Haiku / 56.5k Opus, one turn |
 | Hibernated, fresh episode with layer 1 warm (another owner or episode used it within the TTL) | ≈ 42k | ADR-0032: warm 42.3k / 42.2k |
 | Alive, warm continue, prefix P tokens | ≈ 0.1·P + 2·(digest tokens) | prefix read from cache. For P = 60k and a 1.5k-token digest: about 9k |
+| End of an episode: the status turn before hibernate or rotation (§1 point 4) | ≈ 0.1·P plus the status written, about 5k–9k | one warm turn; the same kind of cost as the forced recap turn of #1166 |
 | Today: one `[fleet]` delivery into a 100k–300k-token live context | ≈ 10k–30k for the first call, then 4.5 calls median before the first action at a 55k–64k prefix after a resume | ADR-0032 Context |
 
 **Per day:**
 
 | Scenario | Wakes | Estimate |
 | --- | --- | --- |
-| Idle (no events) | 0 | **0 tokens**: no process, flk polls |
-| Quiet (intake only, under 20 events, 2 h window) | 2–12 | 2–12 cold episodes ≈ 0.1–0.7M units (≈ $0.5–3) |
-| Busy, as measured (15 min window while delegates are in flight) | ≈ 38 | if two thirds land inside the warm TTL: 25 × 9k + 13 × 57k ≈ 1.0M units (≈ $4.4) |
+| Idle: no events, no routed cron, no re-triage due, no wait deadline, no lift review (§1, "Idle cost is zero when nothing is due") | 0 | **0 model tokens**: no process, flk polls, the miner and standup run in the server on CPU |
+| Quiet (intake only, under 20 events, 2 h window) | 2–12 | each wake is its own episode: 2–12 × (57k cold start + about 7k status turn) ≈ 0.13–0.77M units (≈ $0.55–3.3) |
+| Busy, as measured (15 min window while delegates are in flight) | ≈ 38 | if two thirds land inside the warm TTL: 25 × 9k + 13 × 57k = 966k units, plus 13 episode-end status turns × about 7k ≈ 91k, ≈ 1.06M units (≈ $4.55; ≈ $4.15 without the status turns) |
+| Busy, non-Claude owner (§1: never kept alive parked until E6) | ≈ 38 | 38 × (57k + 7k) ≈ 2.4M units (≈ $10.5) |
 | Today's shape on the same day | 72 deliveries into a live 100k–300k-token context | 72 × 10k–30k ≈ 0.7–2.2M units for first calls alone (≈ $3–9), plus self-compactions and resumes, and the session never idles to zero |
 
 **Additions from §1a, §7a and §7b:**
@@ -1045,13 +1371,17 @@ builder's first message. Moving them into the cached layer 2 (ADR-0032 §3)
 turns that creation into a cache read. At about 1.5 KB (the size of
 `_traps.md`, roughly 400 tokens) created at 2 units a token (800 units) against
 read at 0.1 (40 units), that saves about 760 units per builder, so one
-≈ 77k-unit review pays back after about 100 builder starts. That is weeks at this fleet's measured rate of 303
-PRs a week. The larger saving is the rounds the rules prevent, such as
+≈ 77k-unit review pays back after about 100 builder starts. At this
+fleet's measured rate of 303 PRs a week (about 43 a day, each with at least
+one builder start), that is 2–3 days. The larger saving is the rounds the rules prevent, such as
 #1161's two stalls, which this ADR does not try to price.
 
 What these figures support:
 
-- The idle claim is structural, not estimated: no process exists.
+- The idle claim is structural, not estimated: no process exists. It holds
+  for days when nothing is due. Every scheduled item that does fall due (a
+  routed cron, a re-triage date, a wait deadline, a lift review) is a
+  deliberate, counted wake.
 - The busy-day saving is modest and uncertain. It depends on the warm share
   and on how much context a working episode builds up. The robust gains are
   the zero cost of idle and quiet hours (more than 40 % of clock hours had no
@@ -1066,7 +1396,10 @@ What these figures support:
 ### 9. Slices
 
 Sizes are estimated production lines (docs and tests excluded), each at most
-about 400 for the first PR. "Skew" follows ADR-0028 §3a: new methods are
+about 400 for the first PR. Round 3 re-estimated them against the code they
+extend: the PR poller's query, fold and emit path (`src/pr_poll.rs`, the
+`src/app/api.rs` round handling), the #961 buffer, and the mail path. That
+split O3, O5, O8, O11 and O19. "Skew" follows ADR-0028 §3a: new methods are
 gated by #868 (exit 78 against an older server). New persisted kinds rely on
 #1058's reader skip, which shipped in v2.0.0. Mesh `VERSION` stays 5: owner
 mail rides the existing mail frames with additive fields, and a peer without
@@ -1074,42 +1407,58 @@ the fields treats the typed block as plain text.
 
 | # | Slice | Size | Depends on | Replaces / extends | Skew | Acceptance |
 | --- | --- | --- | --- | --- | --- | --- |
-| O0 | Minimal `.flk.toml` reader per ADR-0004 decisions 4–5: default-branch committed blob from the common dir, `[owner]` section only, `policy_version` = blob id | ~250 | — | ADR-0004 (first code) | client-free, server-internal | A policy edited in a worktree or on a PR branch is not read; a merged change moves `policy_version`; a missing file yields defaults and a `missing` note |
-| O1 | Owner binding: `flk owner bind|unbind|list|show` (operator verbs; agent callers refused), `OwnerBound` / `OwnerUnbound` kinds, fold, re-issue on start and rotation, MCP `flock_owner_show` (read) | ~300 | — | new; extends ADR-0027 §1a (edges under a stable owner) | new methods, gated; new kinds | Bind, restart the server, force rotations past `MAX_ROTATED`: the binding survives; an attested agent calling `bind` gets exit 13 |
-| O2 | Episodes: wake = warm continue or fresh compiled session on the same `AgentId`; hibernate after `warm_ttl` with the status handshake; rotation at the band instead of compaction; profile ladder; `limit_reached` deferral; per-episode profile recorded | ~380 | O1, ADR-0032 X1/X3/X4 (#1079 …), G1 #1034, #1070 | ADR-0027 §1a takeover (made ordinary); #1010 profile record | server-internal plus a restart variant | Fake harness: two wakes 10 min apart continue one session; a wake after `warm_ttl` starts a fresh session whose first message holds the digest; `AgentId` and edges unchanged across episodes |
-| O3 | Repo poller: the PR poller's query extended to issues, comments, labels, default-branch checks and releases for bound and watched repos; `rateLimit` pacing with a reserve; durable `issue.*`, `pr.opened`, `branch.ci_completed`, `release.published`; home-node only; `issue_guard` fed from it | ~400 | O1 | #1020 (extends), #1074 sources, #1077 data source; issue_guard's own `gh issue list` | new kinds | Fake GraphQL: one request per tick for N repos; a new issue emits one `issue.opened`, a restart re-emits nothing; under the reserve the interval stretches and health reads `degraded` |
-| O4 | Owner GitHub writes and echo suppression: `flk owner comment|label|file|close` record `OwnerActed { gh_node_id }`; the poller tags `actor: self` | ~250 | O3 | — | new methods, gated | An owner's comment comes back from the poller as `actor: self` and is dropped from the buffer; the same text posted by raw `gh` is not |
-| O5 | Owner buffer and wake classes: per-owner filter over the generalised #961 buffer, class table from `.flk.toml`, two windows, `max_lines` flush, `OwnerDigestDelivered` cursor, `flock_owner_digest`; hibernated owner woken through O2 | ~400 | O0, O2, O3, #961, E3 #1027, E6 #1032 | #961 (generalises) | new kinds and verb | A recorded 24 h event fixture yields wakes within ±10 % of the windowed count in §8; a *now* event wakes a hibernated owner within one injection; a crash before acting re-delivers the same `through_seq` |
-| O6 | Intake state machine: `IntakeDecided` kinds, fold, auto-accept and spike rules from policy, `flk owner intake list|decide` (operator override), label and comment projection through O4, shadow mode | ~400 | O0, O4, O5 | `.fleet` triage reminder, `triage.json`; #1074's "labelled issue starts an agent" (replaced) | new kinds and verbs | Fixture issues: a slice issue of an Accepted ADR filed by an operator verb is auto-accepted; an external feature request is declined with the Discussions reason; shadow mode posts nothing; a label edited by hand is restored and reported |
+| O0 | Minimal `.flk.toml` reader per ADR-0004 decisions 4–5: default-branch committed blob from the common dir, `[owner]` behaviour keys only, `policy_version` = blob id, and **adoption**: a new blob takes effect only after `flk owner policy adopt` (operator verb) | ~280 | — | ADR-0004 (first code) | server-internal plus one gated verb | A policy edited in a worktree or on a PR branch is not read; a merged change is reported and **not** applied until adopted; an attested agent calling `adopt` exits 13 |
+| O1 | Owner binding: `flk owner bind\|unbind\|list\|show` (operator verbs; agent callers refused), `OwnerBound` / `OwnerUnbound` kinds, fold, re-issue on start and rotation, MCP `flock_owner_show` (read); `bind` reports which layer-one points (§6.3) the repo supports | ~320 | — | new; extends ADR-0027 §1a | new methods, gated; new kinds | Bind, restart the server, force rotations past `MAX_ROTATED`: the binding survives; an attested agent calling `bind` gets exit 13 |
+| O2 | Episodes: wake = warm continue or fresh compiled session on the same `AgentId`, including across a profile or harness change (the ADR-0027 §1a amendment); status turn, then hibernate after `warm_ttl`; rotation at the band instead of compaction; non-Claude owners never kept alive parked; profile ladder; `limit_reached` and `blocked{auth}` deferral; per-episode profile recorded | ~400 | O1, ADR-0032 X1/X3/X4 (#1079 …), G1 #1034, #1070 | ADR-0027 §1a (amends); #1010 profile record | server-internal plus a restart variant | Fake harness: two wakes 10 min apart continue one session; a wake after `warm_ttl` starts a fresh session whose first message holds the digest; a harness switch keeps `AgentId` and live edges; a logged-out start is `blocked{auth}`, not retried |
+| O3a | Repo poller, issues: the PR poller's GraphQL query extended with issues and PRs updated since a cursor (comments, labels) for bound and watched repos; durable `issue.opened\|closed{reason}\|reopened\|labelled\|commented`, `pr.opened`; seeded so a restart re-emits nothing | ~350 | O1 | #1020 (extends), #1074 sources | new kinds | Fake GraphQL: one request per tick for N repos; a new issue emits one `issue.opened`; a restart re-emits nothing |
+| O3b | Repo poller, the rest: default-branch check suites (`branch.ci_completed`), releases (`release.published`), `rateLimit` pacing with a reserve and `degraded` health, home-node-only polling, `issue_guard` fed from the poller | ~300 | O3a | #1077 data source; issue_guard's own `gh issue list` | new kinds | Under the reserve the interval stretches and health reads `degraded`; a non-home node issues no query for the repo; `issue_guard` makes no `gh` call of its own |
+| O4 | Owner GitHub writes and echo suppression: `flk owner comment\|label\|file\|close` record `OwnerActed { gh_node_id }`; the poller tags `actor: self` | ~250 | O3a | — | new methods, gated | An owner's comment comes back as `actor: self` and is dropped; the same text posted by raw `gh` is not |
+| O5a | Owner buffer: per-owner filter over the generalised #961 buffer, wake-class table from adopted policy, the two windows, `max_lines` flush, handled-subject filter, `OwnerDigestDelivered` cursor | ~350 | O0, O3a, #961, E3 #1027 | #961 (generalises) | new kinds | A recorded 24 h fixture yields wakes within ±10 % of §8's windowed count; a crash before acting re-delivers the same `through_seq` |
+| O5b | Delivery: `flock_owner_digest`; hibernated wake through O2 with the digest in layer 4; idle-parked wake through E6; *now* class at the next turn boundary | ~250 | O5a, O2, E6 #1032 | — | new verb | A *now* event wakes a hibernated owner and its first message holds the digest; a busy owner gets it at its next boundary and not before |
+| O6 | Intake state machine: `IntakeDecided` kinds, fold, auto-accept scope from the binding, spike rules, `flk owner intake list\|decide` (operator override), label and comment projection through O4, `shadow` decisions | ~400 | O0, O1, O4, O5a | `.fleet` triage reminder, `triage.json`; #1074's "labelled issue starts an agent" (replaced) | new kinds and verbs | Fixture issues: an operator-filed slice issue is auto-accepted; an external feature request is declined with the Discussions reason; GitHub text authored as `gerchowl` but not filed through flk is not auto-accepted; a hand-edited label is restored and reported |
 | O7 | `owner:<repo>` target: ADR-0006 extension, resolution through O1, mesh routing to the home node, `no_owner` refusal | ~250 | O1 | ADR-0006 (extends) | additive target; old server: exit 78 | A send to `owner:x/y` on a non-home node arrives at the home node's owner; an unbound repo exits 4 with the hint |
-| O8 | Owner requests: `owner.request` / `owner.response` blocks, request fold, `chain` depth and cycle refusals, per-pair cap, `flk owner request|respond|requests` | ~400 | O7, O6 | new | additive message fields; mesh VERSION unchanged | A→B accepted yields an issue filed by B; a request whose chain contains the target exits 13 `request_cycle`; a sixth open request to one pair is refused |
-| O9 | Watch sources on the wait registry: `issue:` / `pr:` in any repo at fix levels, composites, deadline; the poller follows watched subjects; `watch.fired`; blocked-on cycle detection raising an ADR-0023 decision | ~400 | E5 #1031, E6 #1032, O3 | #1078 (core) | new predicate kinds on `wait.park`, gated | A parks on `issue:x/y#3 released`; closing as not-planned does not fire it; a release containing the fix does, waking A with the evidence; A↔B blocked-on is refused with a decision filed |
-| O10 | Trigger rules: `when/if/do` over events, cron as a source, actions `RouteToOwner`, `WakeAgent`, `ForkReview`, `SpawnAgent` (unowned repos, operator rules only, idempotent per `(rule, subject)`), `trigger.fired`, `--dry-run` | ~400 | O5, ADR-0014 spawn | #1073 (actions), #1074 (rules), `ActionSpec` (extends) | config and new kinds | A nightly cron routed to an owner wakes it once with a `cron.fired` line; `SpawnAgent` in an owned repo is refused; the same subject never spawns twice |
-| O11 | Safety: `max_delegates` at `delegate start` for an owner caller, `max_wakes_per_day`, `max_episode_turns`, `flk owner pause|resume|stop`, fleet pause covering owners, gate checks in `flk land` (#694) and `flk owner release` raising ADR-0023 decisions | ~350 | O1, O5, #694, #1160 slices (hook deny) | #822 (per-owner part) | new verbs, gated | A fifth `delegate start` exits with `at_owner_capacity`; past the wake budget only operator mail wakes; `fleet pause` stops a wake and keeps the events; a merge under `ask` parks on a decision |
-| O12 | Shadow run on `gerchowl/flock` and migration: owner role text (from the architect skill), the `.fleet` mapping of §7 in docs, `flk owner shadow-report` comparing owner decisions with the operator's triage | ~150 | O1–O6 | `.fleet/` (retires per §7), architect skill | — | Seven days of shadow decisions and wake counts are reported, and the operator's go is recorded before the supervisor stops |
-| O13 | Episode usage: per-episode tokens from the harness transcript into `OwnerEpisodeEnded`; `[owner] max_units_per_day` enforced | ~300 | O2 | `src/costs` (adds tokens) | new kind | A fake transcript with known usage yields the exact units; past the budget behaves as the wake budget does |
-| O14 | Segment architects (§1a): `SegmentAssigned` kind and fold, disjoint `scope_paths` (`scope_overlap` refusal), the `assigned { segment }` intake state with path-based routing, depth limit owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, segment wave reports as `GoalStatusSet` lines in the owner's buffer | ~350 | O5, O6, O11, G1 #1034, #1160 routing; **after #1167's dry run** decides integration branches vs direct queue | #1167 (flk primitives part) | new kinds and verb, gated | Two segments with overlapping paths: the second is refused; an issue touching segment A's paths is routed to A; a segment architect parked on its builders reads `waiting_on_event` and parks the owner; a third-level `delegate start` is refused |
-| O15 | Daily standup (§7a): `flk owner standup [--since]` fold over records, bounded markdown and JSON, `Standup` cron action delivering to the notification log, a channel binding and a file; `owner.standup` kind; `unattributed: n` gap line | ~350 | O3, O5, O6; ADR-0033 AX4b for experiences; E8 #1037 for channel delivery | `WriteDigest` (extends); STATUS.md progress reports | new action and kind | A fixture day of records yields all six headings with the right items and no model call; nothing is typed into any pane; a channel reply reaches the owner as `needs_reply` mail |
-| O16 | Transcript miner (§7b stage 1): `flk ax mine` ported from `scripts/research/toolchain_survey.py` (Claude, Codex, opencode readers), edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised); `_traps.md` detection | client-side read; new MCP resource | A fixture transcript set yields the expected fingerprints and counts; no output text and no `$HOME` path or hostname appears in the JSON; sessions outside the owner's edges are not read |
-| O17 | Lift reviews (§7b stage 2): trigger kind `lift` with thresholds, `docs/ax/rubric-lifts.md` (`ax-lifts/1`), compiled-reviewer path, target routing (own repo → intake, owned repo → `owner.request`, otherwise an issue), dry run first, `[ax] lift_reviews_per_day` | ~300 | O16, AX6a, AX7, AX9, O6, O8 | — | config, existing AX kinds | Mined fixture over the threshold fires one review, which records candidates and files nothing in dry run; a lift for claude-config becomes an issue candidate there and never a change; a second review the same day is `suppressed` |
+| O8a | Owner requests: `owner.request` / `owner.response` blocks, request fold, `flk owner request\|respond\|requests`, target files the accepted issue | ~330 | O7, O6 | new | additive message fields; mesh VERSION unchanged | A→B accepted yields an issue filed by B; a `done` closes the request record on both sides |
+| O8b | Request safety: **server-derived chains** (union of open inbound requests; any sender `chain` ignored), depth and `request_cycle` refusals, `--allow-cycle` operator override, per-pair cap, duplicate folding | ~280 | O8a | new | server-internal | A request that omits its history is still refused as a cycle; a sixth open request to one pair is refused; the operator can allow one refused request |
+| O9 | Watch sources on the wait registry: `issue:` / `pr:` in any repo at fix levels, composites, deadline; the poller follows watched subjects; `watch.fired`; blocked-on cycle detection raising an ADR-0023 decision | ~400 | E5 #1031, E6 #1032, O3a | #1078 (core) | new predicate kinds on `wait.park`, gated | A parks on `issue:x/y#3 released`; closing as not-planned does not fire it; a release containing the fix does; A↔B blocked-on is refused with a decision filed |
+| O10 | Trigger rules: `when/if/do` over events, cron as a source, actions `RouteToOwner`, `WakeAgent`, `ForkReview`, `SpawnAgent` (unowned repos, operator rules only, idempotent per `(rule, subject)`), `trigger.fired`, `--dry-run`; **`issue_guard`'s allowlist pinned to `Notify` by a test**; repo rules limited to `RouteToOwner` | ~400 | O5a, O0, ADR-0014 spawn | #1073 (actions), #1074 (rules), `ActionSpec` (extends) | config and new kinds | A nightly cron routed to an owner wakes it once; `SpawnAgent` in an owned repo is refused; a `flk-trigger` block naming any new action is refused; a repo rule with `SpawnAgent` is rejected at adoption |
+| O11a | Authority in the binding: `OwnerLimitsSet`, `flk owner limits set\|show` (operator verb), caps (`max_delegates` over the subtree, `at_owner_capacity`), wake and turn budgets, `flk owner pause\|resume\|stop`, fleet pause covering owners, **whole-owner shadow** (`owner_in_shadow` refusals for delegate start, spawn, O4 writes, requests and land), loud notifications for every change | ~380 | O1, O5a | #822 (per-owner part) | new verbs, gated | A fifth `delegate start` exits `at_owner_capacity`; a shadow owner's `delegate start` and O4 write exit 13 and record `OwnerWouldAct`; an attested agent calling `limits set` exits 13 and the attempt is notified |
+| O11b | Server lifecycle verbs refuse attested agent callers (`server` handoff, stop, restart paths over the socket); incident record type `owner.incident` with automatic `pause` | ~200 | O11a | — | gated | An attested agent caller asking for a server lifecycle action exits 13; an incident pauses its owner |
+| O12 | Shadow run on `gerchowl/flock` and migration: owner role text (from the architect skill), the `.fleet` mapping of §7 in docs, `flk owner shadow-report` comparing recorded intents (intake, starts, requests, merges) with what the architect and operator did | ~200 | **O11a, O11b**, O1–O6 | `.fleet/` (retires per §7), architect skill | — | Seven days and ten intake decisions of shadow intents are reported, and the operator's switch to `live` is recorded before the supervisor stops |
+| O13 | Episode usage: per-episode tokens from the harness transcript into `OwnerEpisodeEnded`; `max_units_per_day` enforced | ~300 | O2 | `src/costs` (adds tokens) | new kind | A fake transcript with known usage yields the exact units; past the budget behaves as the wake budget does |
+| O14 | Segment architects (§1a): `SegmentAssigned`, disjoint `scope_paths` (`scope_overlap`), `assigned { segment }` intake routing, depth owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, wave reports as `GoalStatusSet` lines | ~350 | O5a, O6, O11a, G1 #1034, ADR-0034 Q3/Q7, O21; **after #1167's dry run** | #1167 (flk primitives part) | new kinds and verb, gated | Overlapping scopes are refused; an issue in segment A's paths routes to A; a parked segment architect parks the owner; a third-level working `delegate start` is refused |
+| O15 | Daily standup (§7a): `flk owner standup [--since]` fold, bounded markdown and JSON, `Standup` cron action (daily by default) delivering to the notification log, a channel binding and a file; login and limit blockers with the operator command; `owner.standup` kind; `unattributed: n` | ~350 | O3a, O5a, O6, O18; ADR-0033 AX4b; E8 #1037 for channels | `WriteDigest` (extends); STATUS.md progress reports | new action and kind | A fixture day yields all six headings with no model call; a logged-out delegate appears under blockers with its login command; nothing is typed into any pane |
+| O16 | Transcript miner (§7b stage 1): `flk ax mine`, run by a server cron action, ported from `scripts/research/toolchain_survey.py`, edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised) | client-side read; new MCP resource | Fixture transcripts yield the expected fingerprints; no output text, `$HOME` path or hostname appears; sessions outside the owner's edges are not read |
+| O17 | Lift reviews (§7b stage 2): trigger kind `lift`, `docs/ax/rubric-lifts.md` (`ax-lifts/1`), compiled-reviewer path, target routing, dry run first, `[ax] lift_reviews_per_day`, cooldown for declined lifts | ~300 | O16, AX6a, AX7, AX9, O6, O8a | — | config, existing AX kinds | One review per threshold crossing, nothing filed in dry run; a claude-config lift is only ever an issue candidate; a second review the same day is `suppressed` |
+| O18 | Recorded review (§6.4): `ReviewRecorded`, `flk review record` / MCP `flock_review_record`, validity (reviewer edge `review:<pr>`, not the builder, head SHA matches the poller), `--by operator`; `flk land` (#694) requires an approve at the current head | ~300 | O3a, ADR-0027 edges, #694 | `VERDICT:` comments (replaced as the record) | new kind and verb, gated | A review recorded by the builder is refused; an approve at an old SHA does not let `flk land` proceed; a new push resets the gate |
+| O19a | Agent identity (§6.3 point 1): `flk-agent` App installation tokens minted by the server, git credential helper and `GH_TOKEN` in agent panes, refresh; the operator's token never stamped into agent panes | ~350 | O1, ADR-0014 §3 env allowlist | — | server and pane env | An owner pane's `gh api user` reports the bot; an attempt to edit branch protection from it is refused by GitHub (fixture or sandbox repo); the token rotates before expiry |
+| O19b | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
+| O20 | Defence-in-depth hook (§6.3 layer two): shell-tool `tool.before` entry in owner, segment and delegate panes only, `hook.decide` deny from the binding's `deny_commands` | ~200 | ADR-0034 Q2 (`hook.decide`), the §11 amendment to ADR-0034 §1, O11a | ADR-0034 §1 (amends) | integration version bump | `gh pr merge` in an owner pane is denied with the `flk land` hint; no entry exists in an operator's own pane; a non-shell tool spawns no hook process |
+| O21 | ADR-0014 §5 amendment: depth counts only spawn-capable agents; `ax:` in-place forks are exempt from depth but count toward fanout and capacity | ~80 | ADR-0033 AX3 | ADR-0014 §5 (amends) | server-internal | A builder under a segment architect is forked for its AX review; a spawn-capable agent at that depth is still refused |
 
-**Order.** O0, O1 → O3 → O4 → (E3, E5, E6, #961 from ADR-0028 and ADR-0027) →
-O2 (after G1 and ADR-0032 X1/X3/X4) → O5 → O6 → O12 (shadow starts) → O7 →
-O8 → O9 → O10 → O11 (after #694 and #1160's hook slices) → O13. O15
-(standup) follows O6, because it needs intake and goal records to say
-anything. O16 (miner) has no dependency on the owner and can start at any
-time. O17 follows O16 and ADR-0033's AX6a, AX7 and AX9. O14 (segments) waits
-for #1167's dry run and for O11. O12 can start
-as soon as O6 runs in shadow mode. Shadow needs neither cross-repo traffic
-(O7–O9) nor live gates (O11).
+**Order.**
+1. **Foundations:** O0, O1 → O3a → O3b → O4.
+2. **The ADR-0028 and ADR-0027 prerequisites:** E3 #1027, E5 #1031, E6 #1032 and #961.
+3. **Episodes and intake:** O2, after G1 and ADR-0032 X1/X3/X4 → O5a → O5b → O6.
+4. **Limits before any owner runs:** O11a → O11b.
+5. **Shadow:** O12 starts on gerchowl/flock.
+6. **Before the owner goes `live` with any merge grant:** O18 → O19a → O19b. That is layer one. Without it, the merge gate stays `ask` (§6.3). O20 may land at any point after ADR-0034 Q2.
+7. **Then:** O7 → O8a → O8b → O9 → O10 → O13.
+
+Also:
+- O15 (standup) follows O6 and O18.
+- O16 (miner) has no dependency on the owner and can start at any time.
+- O17 follows O16 and ADR-0033's AX6a, AX7 and AX9.
+- O21 follows AX3.
+- O14 (segments) waits for #1167's dry run, O11a and O21.
 
 **What the three spikes become.** #1073: O10 plus `cron.fired` routing. Its
 "singleton architect per repo" question is answered by the binding (O1).
-#1074: O3, O4, O6 and O10. Its `RunScript` question goes to #503. #1078: O9
-and O8. Its process-watch question stays open (§10). #1167: its identity,
-intake and protocol questions are answered by §1a and become O14. Its dry run
-(hierarchy against artifact-coordinated peers, integration branches against
-a direct queue) stays #1167's and gates O14.
+#1074: O3a, O3b, O4, O6 and O10. Its `RunScript` question goes to #503, and
+its "labelled issue starts an agent" is replaced by intake (§3, §5). #1078:
+O9, O8a and O8b. Its process-watch question stays open (§10). #1167: its
+identity, intake and protocol questions are answered by §1a and become O14
+and O21. Its dry run (hierarchy against artifact-coordinated peers,
+integration branches against a direct queue) stays #1167's and gates O14.
 
 ## Consequences
 
@@ -1125,11 +1474,26 @@ a direct queue) stays #1167's and gates O14.
   refusals and parked watches, not a human relaying messages.
 - The hand-built `.fleet/` layer and most of the architect skill's mechanics
   retire. The skill keeps the judgement.
-- New durable kinds: `OwnerBound`, `OwnerUnbound`, `OwnerActed`,
-  `OwnerDigestDelivered`, `IntakeDecided`, `OwnerEpisodeEnded`, `issue.*`,
+- New durable kinds: `OwnerBound`, `OwnerUnbound`, `OwnerLimitsSet`,
+  `OwnerActed`, `OwnerWouldAct`, `OwnerDigestDelivered`, `IntakeDecided`,
+  `OwnerEpisodeEnded`, `ReviewRecorded`, `owner.incident`, `issue.*`,
   `pr.opened`, `branch.ci_completed`, `release.published`, `watch.fired`,
   `trigger.fired`, `SegmentAssigned`, `owner.standup`, and the owner request
   fold events. All are additive.
+- **A review becomes a recorded fact** (`ReviewRecorded`: who, verdict, head
+  SHA), and `flk land` and the `flk/land-gate` status require an approve at
+  the current head. `VERDICT:` comments stay as a human-readable view only.
+- **Merges into `dev` are refused by GitHub unless flk cleared them**
+  (`flk/land-gate` from flk's own App, required on `dev`). Agents work under
+  a scoped `flk-agent` identity without admin rights, and the operator's
+  token never enters an agent pane. Two GitHub Apps and a credential helper
+  are new operational cost. A repo without branch protection cannot grant
+  an owner merge authority.
+- **The owner cannot raise its own limits.** Authority is binding state set
+  by operator verbs. The repo's `[owner]` section holds behaviour only and
+  takes effect on operator adoption.
+- **Text on GitHub never chooses an action.** `issue_guard` stays
+  `Notify`-only. Agent-starting actions exist only in operator-written rules.
 
 - The operator gets one standup a day from flk, at zero model cost, instead of
   reconstructing progress from STATUS.md.
@@ -1142,8 +1506,16 @@ a direct queue) stays #1167's and gates O14.
 ## Risks
 
 - **Echo leaks.** A write the owner makes outside the O4 verbs comes back as
-  an outside event. Bounded to one wasted wake per write. #1160's hook can
-  deny raw `gh` writes in owner panes.
+  an outside event. Bounded to one wasted wake per write. The layer-two hook
+  (§6.3) denies the common raw forms. Safety never rests on echo detection.
+- **The gate as a single point of failure.** If flk is down, `flk/land-gate`
+  is never posted and nothing merges into `dev`. That is the intended
+  failure direction. The operator's admin token is the break-glass, and
+  detection records its use (§6.3 point 5).
+- **ADR-0014's operator-attestation gap** (a detached child attests as the
+  operator) lets a determined agent call operator verbs, including `limits
+  set`. Every such change is loud (§6.2), and layer one still needs a
+  recorded review at the head. Closing the gap itself is ADR-0014's work.
 - **Fresh-episode amnesia.** Anything not recorded is lost at rotation. The
   status handshake is mandatory before every hibernate and rotation, and the
   shadow run measures what was missed.
@@ -1175,13 +1547,20 @@ a direct queue) stays #1167's and gates O14.
   (ADR-0031's method), including a parked owner that emits nothing for longer
   than the retention.
 - **A replay fixture of 24 h** built from `.fleet/supervisor.log` and the
-  `gh` event timestamps used in §8, fed through O3's fake GraphQL and O5's
+  `gh` event timestamps used in §8, fed through O3a's fake GraphQL and O5a's
   buffer. It asserts the wake count per window and that no wake-worthy event
   is dropped.
 - **Intake table tests**, one case per rule in §3, first match wins, plus
   the shadow-mode no-write check against a fake `gh`.
-- **Two-node mesh test** for O7 and O8: request, accept, issue filed by the
-  target, watch fires, `done`. Plus the cycle refusal.
+- **Two-node mesh test** for O7, O8a and O8b: request, accept, issue filed by the
+  target, watch fires, `done`. Plus the cycle refusal for a request whose
+  sender omitted its history.
+- **Sandbox GitHub repo for layer one** (O19b): the required `flk/land-gate`
+  from the gate App, a merge refused without a recorded approve, accepted
+  with one, refused again after a new push. A status forged with another
+  token does not count. An admin merge raises an incident.
+- **Shadow refusals** (O11a): a table test over every outward verb for a
+  shadow owner (exit 13 plus an `OwnerWouldAct` record).
 - **Isolated flk probe** (`tests/probes/`, sandboxed `XDG_CONFIG_HOME`,
   `FLOCK_*` unset) with a throwaway Claude owner: hibernate, wake by a fake
   `issue.opened`, and assert the first turn holds the digest and that no
@@ -1197,12 +1576,12 @@ a direct queue) stays #1167's and gates O14.
 3. **Windows (§2).** 15 min while delegates are in flight and 2 h when none
    are (recommended, from the measured 38 versus 150 wakes a day). Or one
    fixed window.
-4. **Auto-accept scope (§3).** Only operator-filed slice issues of Accepted
-   ADRs and operator bug reports with a reproduction (recommended). Or wider,
-   for example every operator-filed issue.
-5. **Merge grant (§6).** The owner may merge delegate PRs after a fresh
-   review and green CI, as GOAL.md grants today (recommended). Or `ask` for
-   every merge.
+4. **Auto-accept scope (§3, set in the binding).** Only operator-filed slice
+   issues of Accepted ADRs and operator bug reports with a reproduction,
+   where "operator-filed" means filed through flk (recommended). Or wider.
+5. **Merge grant (§6.6).** After a recorded review and green CI, enforced by
+   `flk/land-gate`, as GOAL.md grants today (recommended). Or `ask` for every
+   merge.
 6. **Who files accepted cross-repo requests (§4).** The target owner, in its
    own tracker (recommended). Or the requester.
 7. **Webhooks (§5).** Out for now, polling only (recommended). Or a relay
@@ -1212,23 +1591,27 @@ a direct queue) stays #1167's and gates O14.
 9. **The three spikes.** Close #1073, #1074 and #1078 as answered by this
    ADR, with their open remainders (process watches, `RunScript`, webhooks)
    kept as follow-up issues (recommended).
-10. **Process watches (§5).** Keep using the harness's background mechanism
-    with E5 attribution, or bring watcher-s1's semantics into the server.
-    Not decided here: it needs its own measurement of handoff survival
-    (#1078 question 2).
+10. **Process watches (§5).** Recommended: keep the harness's background
+    mechanism with E5 attribution (ADR-0028 §4), and bring watcher-s1's
+    semantics into the server only if a follow-up measurement shows waits
+    lost across a live handoff (#1078 question 2). Alternative: build them
+    into the server now.
 11. **Shadow length (§7).** At least seven days and ten intake decisions
     (recommended), or another bar.
 12. **Architects of architects (§1a, #1167).** One owner per repo, with
     segment architects as depth-2 delegates on disjoint path scopes, intake
     and landing kept by the owner (recommended). Or several owners per repo
     with a landing owner (rejected in §1a).
-13. **Segment landing (§1a).** Per-segment integration branches merged once
-    per wave, or segment PRs straight into the owner's queue on `dev`. The
-    recommendation is to let #1167's dry run decide and to file O14 only
-    after it.
-14. **Standup (§7a).** Compiled by flk with no model call, weekdays 08:00
-    local, delivered to the notification log and a channel (recommended). Or
-    written by the owner in a daily episode (about 57k units a day).
+13. **Segment landing (§1a).** Recommended default: segment PRs go straight
+    into the owner's landing on `dev`, with no `dev-part*` branches. Layer
+    one (§6.3) protects `dev` only, and #1167 reports that integration
+    branches on a private repo without protection have none. #1167's dry run
+    may overturn this with measurements (owner load per PR against drift).
+    Alternative: per-segment integration branches merged once per wave.
+14. **Standup (§7a).** Compiled by flk with no model call, **daily** at
+    08:00 local, delivered to the notification log and a channel
+    (recommended). Or written by the owner in a daily episode (about 57k
+    units a day).
 15. **Lift approval (§7b).** Each lift is an issue labelled `lift` in the
     target repo, or an ADR-0023 decision when it is the owner's own repo
     (recommended). Or one weekly batch for the operator to approve.
@@ -1237,3 +1620,47 @@ a direct queue) stays #1167's and gates O14.
     Or every session on the host, which is broader and crosses accounts.
 17. **Lift review budget (§7b).** At most one review a day per owner
     (recommended), or a different cap.
+18. **The owner merging its own policy (§6.2).** The owner may merge a
+    change to the repo's `[owner]` behaviour section like any doc, but it
+    takes effect only when the operator adopts it, and authority is never in
+    the repo (recommended). Alternative: forbid owner PRs that touch
+    `.flk.toml` at all, which needs authorship flk does not have for every
+    write.
+19. **ADR-0027 §1a amendment (§1).** A bound owner keeps its `AgentId`, and
+    its edges stay live, across a harness or profile change authorised by
+    its binding (recommended). Or keep §1a as written: a new id and an
+    operator `reassign` on every switch.
+20. **ADR-0014 §5 amendment (§1a).** Depth counts only spawn-capable agents,
+    so `ax:` in-place forks of depth-2 builders are allowed (recommended).
+    Or review those builders through the compiled reviewer only.
+21. **ADR-0034 §1 amendment (§6.3).** A role-scoped shell-tool `tool.before`
+    for owner, segment and delegate panes, as defence in depth (recommended).
+    Or no layer two, relying on layer one alone.
+22. **Mid-turn delivery (§2).** None: *now* items reach a busy owner at its
+    next turn boundary (recommended). Or a later narrow `tool.after`
+    injection for *now* items, as its own ADR-0034 amendment.
+23. **Shadow width (§7).** Whole owner: no delegate start, no GitHub write,
+    no request, no merge, with every intent recorded (recommended). Or
+    intake-only shadow.
+24. **Agent identity (§6.3 point 1).** A `flk-agent` GitHub App for every
+    agent, with the operator's admin token kept out of agent panes
+    (recommended). Or keep agents on the operator's token, which leaves
+    layer one bypassable by any agent.
+
+## 11. Amendments this ADR asks for
+
+Each needs the owner's acceptance together with this ADR.
+
+- **ADR-0027 §1a** (§1, question 19): a harness or profile change of a bound
+  owner or segment architect is a restart of the same agent record, so its
+  edges stay live. Unbound architects keep §1a.
+- **ADR-0014 §5** (§1a, question 20): the depth limit counts spawn-capable
+  agents only. `ax:` in-place forks count toward fanout and capacity, not
+  depth.
+- **ADR-0034 §1** (§6.3, question 21): "Nothing installs a catch-all
+  `tool.before`" gains an exception: a shell-tool entry, in the panes of
+  bound owners, segment architects and their delegates only, deciding
+  through `hook.decide` from the binding's `deny_commands`. ADR-0034 §7's
+  "not a security boundary" applies to it unchanged.
+- **ADR-0028 §8a / ADR-0018** are unchanged. Owner mail uses existing
+  intents.
