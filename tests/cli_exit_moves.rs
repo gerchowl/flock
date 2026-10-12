@@ -3,7 +3,8 @@
 //! names the old one on stderr, and leaves stdout to the result alone.
 //!
 //! The blocked settled wait (3 -> 6) is pinned against a real server in
-//! `agent_settled.rs`, and `not_started` (8 -> 11) in `delegate_verdict.rs`.
+//! `agent_settled.rs`, `not_started` (8 -> 11) in `delegate_verdict.rs`, and
+//! the delegate refusals (1 -> 10) in `delegate_claude.rs`.
 
 // Integration tests drive the compiled binary through raw Command; the
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
@@ -99,6 +100,25 @@ fn a_refusal_before_acting_exits_10_and_names_1() {
     assert_moved(&output, 10, 1);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not_settled"), "{stderr}");
+}
+
+/// `agent send` is send-like: the same refusal is 10.
+#[test]
+fn agent_send_refused_before_acting_exits_10() {
+    let (socket, _server) = scripted_server("send", refuse);
+    let output = flk(&socket, &["agent", "send", "worker", "hi"]);
+    assert_moved(&output, 10, 1);
+}
+
+/// A verb that is neither send-like nor guarded keeps exit 1 for a `later`
+/// refusal, with no notice: the move is scoped to those verbs (ADR-0029 §2).
+#[test]
+fn a_refusal_from_a_read_verb_keeps_exit_1() {
+    let (socket, _server) = scripted_server("read", refuse);
+    let output = flk(&socket, &["agent", "get", "worker"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stderr.contains("note: exit code"), "{stderr}");
 }
 
 /// An error that is not a refusal keeps exit 1 and prints no notice.

@@ -949,7 +949,7 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: {AGENT_SEND_USAGE}");
         return Ok(2);
     };
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:agent:send".into(),
         method: Method::AgentSend(params),
     })?)

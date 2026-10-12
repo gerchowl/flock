@@ -640,9 +640,10 @@ fn codex_delegate_startup_update_dialog_refuses_without_typing() {
     );
     let status = exited_within(&mut child, WITHIN).expect("update dialog refusal");
     let out = finish(child);
+    // Rolled back with nothing typed: a refusal, 10 since #1025 (was 1).
     assert_eq!(
         status.code(),
-        Some(1),
+        Some(10),
         "{} / {}",
         stdout(&out),
         stderr(&out)

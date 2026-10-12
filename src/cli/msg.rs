@@ -266,14 +266,14 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         }),
     })?;
     if !await_reply {
-        return super::print_response(&response);
+        return super::print_send_response(&response);
     }
     // #576 `--await`: the send's own result goes to stderr, so stdout is the
     // answer alone — what a harness hands back when this ran as a background
     // task.
     eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     if response.get("error").is_some() {
-        return Ok(super::error_exit(&response));
+        return Ok(super::error_exit(&response, true));
     }
     let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
@@ -530,7 +530,7 @@ fn msg_reply(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{USAGE}");
         return Ok(2);
     }
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:msg:reply".into(),
         method: Method::MsgReply(MsgReplyParams {
             correlation_id: positional[0].clone(),
