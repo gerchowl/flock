@@ -1045,9 +1045,6 @@ impl App {
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.
         let restored = this.event_hub.persisted_events_after(0);
-        // ADR-0028 §2 (#1027): a restart must not repeat a phase it announced.
-        this.agent_phases
-            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
         this.state
             .notifications
             .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
@@ -1315,6 +1312,9 @@ impl App {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        // ADR-0028 §2: mirrored from the headless server's `run` (#25).
+        let restored = self.event_hub.persisted_events_after(0);
+        self.begin_agent_phases(&restored);
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;

@@ -19,15 +19,20 @@
 //! end the window already covered, so it must hold for the window itself.
 //!
 //! `settling` and `unknown` are not supervisor phases: they never become a
-//! candidate and never interrupt one. An agent that leaves the local agent
-//! table (`agent.list`) is `gone` at once: there is no agent left to flip
-//! back.
+//! candidate and never interrupt one. An agent is `gone` at once, since
+//! there is no agent left to flip back, when no pane carries its id any more,
+//! or when this server read it as an agent and its pane stopped being one
+//! (it left `agent.list`).
 //!
-//! Restarts and live handoffs. The last phase the log announced for each
-//! agent is seeded at start, so it is not repeated. Restore and handoff
-//! adoption finish before the server loop runs, so the first tick reads
-//! every agent and announces `gone` for each seeded agent that did not come
-//! back, such as one stopped with the server and not restored.
+//! Restarts and live handoffs. `begin_agent_phases` runs where the server
+//! loop starts: restore or handoff import has re-created every pane by then,
+//! and on a handoff the exporting server has stopped writing the log. It
+//! seeds the last phase the log announced for each agent, so that phase is
+//! not repeated, and announces `gone` for a seeded agent no pane carries.
+//! A restored agent whose detection has not reported yet (a hand-launched
+//! one is not in `agent.list` until it does) is never `gone` for that: its
+//! pane still holds its id, so it keeps its seeded phase and emits nothing
+//! until it is read again.
 //!
 //! Known limits. An agent whose last announcement rotated out of the log is
 //! announced again with `from: unknown`. Codex and opencode read their
@@ -62,6 +67,9 @@ struct Tracked {
     /// When this agent's state must be read again with no event: the close
     /// of its candidate's window, or the end of its `settling` turn.
     due: Option<Instant>,
+    /// Whether this server has read the agent's state, rather than only
+    /// seeded it from the log.
+    observed: bool,
 }
 
 /// What happened since the last tick. Written from `emit_event`, which only
@@ -135,6 +143,7 @@ impl AgentPhaseTracker {
                     since: now,
                     state: event.state.clone(),
                     due: None,
+                    observed: false,
                 },
             );
         }
@@ -212,9 +221,11 @@ impl AgentPhaseTracker {
                 since: now,
                 state: sample.state.clone(),
                 due: None,
+                observed: true,
             });
         tracked.pane = sample.pane;
         tracked.due = None;
+        tracked.observed = true;
         if is_supervisor_phase(phase) {
             if phase != tracked.candidate {
                 tracked.candidate = phase;
@@ -244,13 +255,22 @@ impl AgentPhaseTracker {
         announce(&sample.agent_id, tracked, phase, held)
     }
 
-    /// Announce `gone` for every tracked agent not in `present`.
-    pub(crate) fn retain_present(&mut self, present: &HashSet<String>) -> Vec<EventEnvelope> {
+    /// Announce `gone` for every tracked agent no pane carries (`on_panes`),
+    /// and for every agent this server read that left `agent.list`
+    /// (`listed`). An agent only seeded from the log is judged by its pane
+    /// alone: detection not having reported yet is not an absence.
+    pub(crate) fn retain_present(
+        &mut self,
+        on_panes: &HashSet<String>,
+        listed: &HashSet<String>,
+    ) -> Vec<EventEnvelope> {
         let gone: Vec<String> = self
             .agents
-            .keys()
-            .filter(|agent_id| !present.contains(*agent_id))
-            .cloned()
+            .iter()
+            .filter(|(agent_id, tracked)| {
+                !on_panes.contains(*agent_id) || (tracked.observed && !listed.contains(*agent_id))
+            })
+            .map(|(agent_id, _)| agent_id.clone())
             .collect();
         let mut events = Vec::new();
         for agent_id in gone {
@@ -321,7 +341,7 @@ impl super::App {
         let Some(work) = self.agent_phases.take_work(now) else {
             return;
         };
-        let local = self.local_agent_panes();
+        let (local, on_panes) = self.local_agent_panes();
         let panes: Vec<(usize, crate::layout::PaneId)> = match work {
             Work::All => local.iter().map(|(_, at)| *at).collect(),
             Work::Panes(panes) => panes
@@ -344,29 +364,58 @@ impl super::App {
             };
             events.extend(self.agent_phases.observe(now, SETTLE, sample));
         }
-        let present = local.into_iter().map(|(agent_id, _)| agent_id).collect();
-        events.extend(self.agent_phases.retain_present(&present));
+        let listed = local.into_iter().map(|(agent_id, _)| agent_id).collect();
+        events.extend(self.agent_phases.retain_present(&on_panes, &listed));
         for event in events {
             self.emit_event(event);
         }
     }
 
-    /// Every local agent's id and pane, from the terminal table alone.
-    fn local_agent_panes(&self) -> Vec<(String, (usize, crate::layout::PaneId))> {
-        let mut agents = Vec::new();
+    /// Once per start, where the server loop begins: seed the last announced
+    /// phases from the final log `restored`, and announce `gone` for each
+    /// seeded agent no restored pane carries.
+    pub(crate) fn begin_agent_phases(
+        &mut self,
+        restored: &[(u64, u64, crate::api::schema::EventEnvelope)],
+    ) {
+        self.agent_phases
+            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
+        let (_, on_panes) = self.local_agent_panes();
+        for event in self.agent_phases.retain_present(&on_panes, &on_panes) {
+            self.emit_event(event);
+        }
+    }
+
+    /// Every listed local agent's id and pane, and the agent id of every
+    /// pane's terminal whether or not it reads as an agent yet, from the
+    /// terminal table alone.
+    #[allow(clippy::type_complexity)]
+    fn local_agent_panes(
+        &self,
+    ) -> (
+        Vec<(String, (usize, crate::layout::PaneId))>,
+        HashSet<String>,
+    ) {
+        let mut listed = Vec::new();
+        let mut on_panes = HashSet::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             for tab in &ws.tabs {
                 for pane_id in tab.layout.pane_ids() {
-                    let terminal = ws
+                    let Some(terminal) = ws
                         .pane_state(pane_id)
-                        .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id));
-                    if let Some(terminal) = terminal.filter(|t| t.is_agent_terminal()) {
-                        agents.push((terminal.agent_id.to_string(), (ws_idx, pane_id)));
+                        .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                    else {
+                        continue;
+                    };
+                    let agent_id = terminal.agent_id.to_string();
+                    if terminal.is_agent_terminal() {
+                        listed.push((agent_id.clone(), (ws_idx, pane_id)));
                     }
+                    on_panes.insert(agent_id);
                 }
             }
         }
-        agents
+        (listed, on_panes)
     }
 
     /// Note a detector or hook report on a pane, before it is applied.
@@ -449,7 +498,7 @@ mod tests {
             let now = start + Duration::from_secs(*at);
             out.extend(kinds(match phase {
                 Some(phase) => tracker.observe(now, WIN, sample(*phase)),
-                None => tracker.retain_present(&HashSet::new()),
+                None => tracker.retain_present(&HashSet::new(), &HashSet::new()),
             }));
         }
         out
@@ -607,17 +656,19 @@ mod tests {
         let mut lost = AgentPhaseTracker::default();
         lost.seed_from_events(log.iter());
         assert_eq!(
-            kinds(lost.retain_present(&HashSet::new())),
+            kinds(lost.retain_present(&HashSet::new(), &HashSet::new())),
             [
                 (EventKind::AgentPhaseChanged, Finished, Gone),
                 (EventKind::AgentGone, Finished, Gone)
             ]
         );
         // An agent the log saw go is not seeded: one by that id starts fresh.
-        log.extend(before.retain_present(&HashSet::new()));
+        log.extend(before.retain_present(&HashSet::new(), &HashSet::new()));
         let mut again = AgentPhaseTracker::default();
         again.seed_from_events(log.iter());
-        assert!(again.retain_present(&HashSet::new()).is_empty());
+        assert!(again
+            .retain_present(&HashSet::new(), &HashSet::new())
+            .is_empty());
         assert_eq!(again.observe(start, WIN, sample(Finished)).len(), 1);
     }
 
@@ -644,34 +695,70 @@ mod tests {
         status_at(app, state, Instant::now());
     }
 
-    fn app_on(hub: crate::api::EventHub, with_agent_pane: bool) -> crate::app::App {
+    /// An idle turn that ended long ago, so `phase` reads `finished`.
+    fn settled_idle(app: &mut crate::app::App) {
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        status_at(app, crate::detect::AgentState::Idle, long_ago);
+    }
+
+    /// A server on `hub`, with one shell pane when `pane_for` names the agent
+    /// id its terminal carries (a restored or imported pane), started the
+    /// way `run` starts it: with the log as it is now.
+    fn server(hub: &crate::api::EventHub, pane_for: Option<&str>) -> crate::app::App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = crate::app::App::new(&crate::config::Config::default(), true, None, rx, hub);
-        if with_agent_pane {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            hub.clone(),
+        );
+        if let Some(agent_id) = pane_for {
             app.state.workspaces = vec![crate::workspace::Workspace::test_new("phases")];
             app.state.ensure_test_terminals();
+            for terminal in app.state.terminals.values_mut() {
+                terminal.agent_id = crate::terminal::AgentId::from_persisted(agent_id.to_string());
+            }
         }
+        app.begin_agent_phases(&hub.persisted_events_after(0));
         app
     }
 
-    fn read(hub: &crate::api::EventHub, kind: EventKind) -> Vec<(u64, EventEnvelope)> {
-        hub.read(0, 100, |envelope| envelope.event == kind).events
+    fn temp_log(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("flock-phases-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("event-log.jsonl")
+    }
+
+    /// The derived kinds in the log file as written, in order. Read from the
+    /// file, not a hub, so two servers sharing a log in a handoff test are
+    /// both counted.
+    fn logged(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).ok()?;
+                let kind = value["envelope"]["event"].as_str()?.to_string();
+                kind.starts_with("agent.").then_some(kind)
+            })
+            .collect()
+    }
+
+    fn count(log: &std::path::Path, kind: &str) -> usize {
+        logged(log).iter().filter(|logged| *logged == kind).count()
     }
 
     /// ADR-0028 §10 E3: real detector status changes, through the server's
     /// `PaneAgentStatusChanged`, end at exactly one durable
-    /// `agent.phase_changed` that `events.read`'s kind filter serves. A
-    /// restarted server on the same log does not repeat it, and announces
-    /// `agent.gone` once when the agent did not come back.
+    /// `agent.phase_changed` that `events.read`'s kind filter serves, and a
+    /// restarted server does not repeat it.
     #[tokio::test]
     async fn a_real_status_sequence_settles_into_one_durable_phase_change() {
         use crate::detect::AgentState as S;
-        let log = std::env::temp_dir()
-            .join(format!("flock-phases-{}", std::process::id()))
-            .join("event-log.jsonl");
-        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        let log = temp_log("sequence");
         let hub = crate::api::EventHub::with_persistence(log.clone());
-        let mut app = app_on(hub.clone(), true);
+        let mut app = server(&hub, Some("agent_seq"));
         let start = Instant::now();
         let tick = |app: &mut crate::app::App, secs: u64| {
             app.tick_agent_phases(start + Duration::from_secs(secs));
@@ -690,45 +777,123 @@ mod tests {
         status(&mut app, S::Working);
         tick(&mut app, 40);
         tick(&mut app, 60);
-        assert!(read(&hub, EventKind::PaneAgentStatusChanged).len() >= 5);
-        let changes = read(&hub, EventKind::AgentPhaseChanged);
+        let read = |kind: EventKind| hub.read(0, 100, |envelope| envelope.event == kind).events;
+        assert!(read(EventKind::PaneAgentStatusChanged).len() >= 5);
+        let changes = read(EventKind::AgentPhaseChanged);
         assert_eq!(changes.len(), 1, "{changes:?}");
         let EventData::AgentPhaseChanged(event) = &changes[0].1.data else {
             panic!("{changes:?}");
         };
         assert_eq!((event.from, event.to), (Phase::Unknown, Phase::Working));
-        assert!(read(&hub, EventKind::AgentNeedsHuman).is_empty());
+        assert!(read(EventKind::AgentNeedsHuman).is_empty());
 
-        // A restart restores the agent's id with its session.
-        let agent_id = app
-            .state
-            .terminals
-            .values()
-            .next()
-            .unwrap()
-            .agent_id
-            .clone();
         let restarted = crate::api::EventHub::with_persistence(log.clone());
-        let mut app = app_on(restarted.clone(), true);
-        for terminal in app.state.terminals.values_mut() {
-            terminal.agent_id = agent_id.clone();
-        }
+        let mut app = server(&restarted, Some("agent_seq"));
+        tick(&mut app, 100);
         status(&mut app, S::Working);
         tick(&mut app, 100);
         tick(&mut app, 130);
-        assert_eq!(read(&restarted, EventKind::AgentPhaseChanged).len(), 1);
-        assert!(read(&restarted, EventKind::AgentGone).is_empty());
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
 
-        // The next start restores no pane for it: it is gone, once.
-        let emptied = crate::api::EventHub::with_persistence(log.clone());
-        let mut app = app_on(emptied.clone(), false);
-        tick(&mut app, 200);
-        tick(&mut app, 300);
-        assert_eq!(read(&emptied, EventKind::AgentGone).len(), 1);
-        let restarted = crate::api::EventHub::with_persistence(log.clone());
-        let mut app = app_on(restarted.clone(), false);
-        tick(&mut app, 400);
-        assert_eq!(read(&restarted, EventKind::AgentGone).len(), 1);
+    /// A hand-launched agent has no name and no launch argv, so after a
+    /// handoff it is not in `agent.list` until its detector reports again.
+    /// Its pane carries its id the whole time: it is not gone, and its
+    /// unchanged phase is not announced again.
+    #[tokio::test]
+    async fn a_hand_launched_agent_survives_a_handoff_without_gone() {
+        let log = temp_log("hand-launched");
+        let exporter = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&exporter, Some("agent_hand"));
+        settled_idle(&mut app);
+        let now = Instant::now();
+        app.tick_agent_phases(now);
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+
+        let importer = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&importer, Some("agent_hand"));
+        let terminal = app.state.terminals.values().next().unwrap();
+        assert!(!terminal.is_agent_terminal(), "detection has not reported");
+        app.tick_agent_phases(now);
+        // Something else closes: a rescan, while detection is still silent.
+        app.emit_event(EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "w9".into(),
+            },
+        });
+        app.tick_agent_phases(now + Duration::from_secs(1));
+        settled_idle(&mut app);
+        app.tick_agent_phases(now + Duration::from_secs(2));
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// An agent the log announced that no restored pane carries is gone,
+    /// once, and a later start does not announce it again.
+    #[tokio::test]
+    async fn a_seeded_agent_whose_pane_is_absent_gets_one_gone() {
+        let log = temp_log("absent");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_lost"));
+        settled_idle(&mut app);
+        let now = Instant::now();
+        app.tick_agent_phases(now);
+
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, None);
+        app.tick_agent_phases(now);
+        app.tick_agent_phases(now + Duration::from_secs(30));
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, None);
+        app.tick_agent_phases(now);
+        assert_eq!(
+            logged(&log),
+            ["agent.phase_changed", "agent.phase_changed", "agent.gone"]
+        );
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// In a live handoff the importing server is built while the exporter
+    /// still writes the log. Seeding where the loop starts reads the
+    /// exporter's last announcement, so the importer does not repeat it.
+    #[tokio::test]
+    async fn seeding_after_the_exporters_final_write_does_not_repeat_it() {
+        use crate::detect::AgentState as S;
+        let log = temp_log("final-write");
+        let exporter_hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut exporter = server(&exporter_hub, Some("agent_moving"));
+        settled_idle(&mut exporter);
+        let start = Instant::now();
+        exporter.tick_agent_phases(start);
+
+        // The importer's App exists before the exporter's last write.
+        let importer_hub = crate::api::EventHub::with_persistence(log.clone());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut importer = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            importer_hub.clone(),
+        );
+        importer.state.workspaces = vec![crate::workspace::Workspace::test_new("phases")];
+        importer.state.ensure_test_terminals();
+        for terminal in importer.state.terminals.values_mut() {
+            terminal.agent_id =
+                crate::terminal::AgentId::from_persisted("agent_moving".to_string());
+        }
+        status(&mut exporter, S::Working);
+        exporter.tick_agent_phases(start);
+        exporter.tick_agent_phases(start + Duration::from_secs(20));
+        assert_eq!(count(&log, "agent.phase_changed"), 2);
+
+        importer.begin_agent_phases(&importer_hub.persisted_events_after(0));
+        status(&mut importer, S::Working);
+        importer.tick_agent_phases(start + Duration::from_secs(30));
+        importer.tick_agent_phases(start + Duration::from_secs(50));
+        assert_eq!(count(&log, "agent.phase_changed"), 2, "{:?}", logged(&log));
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
@@ -736,17 +901,14 @@ mod tests {
     /// to wake: the tracker adds no loop deadline.
     #[tokio::test]
     async fn an_idle_server_with_settled_agents_has_no_loop_deadline() {
-        let mut app = app_on(crate::api::EventHub::default(), true);
+        let hub = crate::api::EventHub::default();
+        let mut app = server(&hub, Some("agent_idle"));
+        settled_idle(&mut app);
         let now = Instant::now();
-        status_at(
-            &mut app,
-            crate::detect::AgentState::Idle,
-            now - Duration::from_secs(60),
-        );
         app.tick_agent_phases(now);
         assert_eq!(app.agent_phases.next_deadline(now), None);
-        let changes = read(&app.event_hub, EventKind::AgentPhaseChanged);
-        assert_eq!(changes.len(), 1, "{changes:?}");
+        let changes = hub.read(0, 100, |e| e.event == EventKind::AgentPhaseChanged);
+        assert_eq!(changes.events.len(), 1);
         app.tick_agent_phases(now + Duration::from_secs(60));
         assert_eq!(app.agent_phases.next_deadline(now), None);
     }

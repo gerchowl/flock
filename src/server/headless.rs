@@ -507,7 +507,12 @@ impl HeadlessServer {
         // `App::new` because only now is the session restored (the live
         // records openness is checked against) and, on a handoff, the
         // exporting server done writing the log being folded.
-        self.app.reissue_open_delegations();
+        // ADR-0028 §2 (#1027): the derived agent events seed from the same
+        // final log, and decide which seeded agents are gone, at the same
+        // point: every restored or imported pane exists by now.
+        let restored = self.app.event_hub.persisted_events_after(0);
+        self.app.reissue_open_delegations(&restored);
+        self.app.begin_agent_phases(&restored);
 
         let mut needs_render = true;
         let mut needs_full_render = true;

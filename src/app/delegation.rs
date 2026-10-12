@@ -230,9 +230,14 @@ impl App {
     /// Run from the server loop rather than from `App::new`, so a live
     /// handoff folds the log only after the exporting server has stopped
     /// writing to it.
-    pub(crate) fn reissue_open_delegations(&mut self) {
+    ///
+    /// `restored` is the durable log, read by the caller once for every
+    /// fold that runs at this point.
+    pub(crate) fn reissue_open_delegations(
+        &mut self,
+        restored: &[(u64, u64, crate::api::schema::EventEnvelope)],
+    ) {
         let mut index = DelegationIndex::default();
-        let restored = self.event_hub.persisted_events_after(0);
         index.fold(
             restored
                 .iter()
@@ -550,7 +555,8 @@ pub(crate) mod handler_tests {
             .expect("terminal")
             .agent_id = crate::terminal::AgentId::from_persisted(kept.clone());
 
-        app.reissue_open_delegations();
+        let restored = app.event_hub.persisted_events_after(0);
+        app.reissue_open_delegations(&restored);
 
         let reissued: Vec<_> = persisted_edges(&hub)
             .into_iter()

@@ -577,7 +577,7 @@ The server derives four durable kinds from each local agent's `state` (the one `
 | `agent.phase_changed` | the agent's `phase` settled into a different supervisor phase |
 | `agent.needs_human` | that phase is `needs_human` |
 | `agent.limit_reached` | that phase is `limit_reached` |
-| `agent.gone` | the agent left this server's `agent.list`, for example because its pane closed |
+| `agent.gone` | no pane carries the agent any more, or a pane this server read as an agent stopped being one (it left `agent.list`) |
 
 All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent.needs_human`, `agent.limit_reached` and `agent.gone` repeat the `agent.phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent.phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
 
@@ -585,7 +585,7 @@ A phase is announced only once it has held for the server's settle window: 20 s,
 
 The server does not poll for these. It re-reads an agent's `state` when the detector or a hook reports a change on its pane or a pane lifecycle event fires, and otherwise only when a pending phase's window closes. Codex and opencode count background jobs from the process tree, which raises no event, so a job ending while nothing else on the pane changes is seen at the pane's next change ([#1163](https://github.com/gerchowl/flock/issues/1163)).
 
-`from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. An agent the log announced that is not back once the server has restored its session (it was closed while the server was down, or not restored) is announced `gone` when the server starts. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
+`from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
 
 ## Reading panes
 
