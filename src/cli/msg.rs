@@ -106,7 +106,7 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
         from_agent: None,
         await_reply: false,
         timeout_ms: None,
-        json: false,
+        json: super::output::json(),
         positional: Vec::new(),
     };
     let mut index = 0;
@@ -271,10 +271,11 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     // #576 `--await`: the send's own result goes to stderr, so stdout is the
     // answer alone — what a harness hands back when this ran as a background
     // task.
-    eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     if response.get("error").is_some() {
-        return Ok(super::error_exit(&response, true));
+        let exit_code = super::error_exit(&response, true);
+        return Ok(super::output::error(&response, exit_code));
     }
+    eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
         return Ok(1);
@@ -312,7 +313,7 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
     let mut correlation_id = None;
     let mut timeout_ms = None;
     let mut reference = None;
-    let mut json = false;
+    let mut json = super::output::json();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -387,8 +388,7 @@ fn await_reply_for(
         }),
     })?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let result = &response["result"];
     let outcome = result["outcome"].as_str().unwrap_or_default();

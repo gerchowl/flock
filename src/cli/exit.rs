@@ -240,8 +240,8 @@ pub(crate) mod tests {
     /// pin only prints a reminder to lower it, so a branch that removes some
     /// does not break the others in flight.
     const GRANDFATHERED_BARE_CLI_RETURNS: &[(&str, usize)] = &[
-        ("src/cli.rs", 72),
-        ("src/cli/agent.rs", 60),
+        ("src/cli.rs", 68),
+        ("src/cli/agent.rs", 57),
         ("src/cli/checks.rs", 8),
         ("src/cli/delegate.rs", 5),
         ("src/cli/digest.rs", 6),
@@ -251,9 +251,9 @@ pub(crate) mod tests {
         ("src/cli/issue.rs", 16),
         ("src/cli/lineage.rs", 4),
         ("src/cli/mcp.rs", 3),
-        ("src/cli/msg.rs", 28),
+        ("src/cli/msg.rs", 26),
         ("src/cli/notification.rs", 12),
-        ("src/cli/pane.rs", 74),
+        ("src/cli/pane.rs", 73),
         ("src/cli/peers.rs", 16),
         ("src/cli/preflight.rs", 1),
         ("src/cli/ready.rs", 1),
@@ -262,7 +262,7 @@ pub(crate) mod tests {
         ("src/cli/status.rs", 7),
         ("src/cli/tab.rs", 16),
         ("src/cli/workspace.rs", 14),
-        ("src/cli/worktree.rs", 39),
+        ("src/cli/worktree.rs", 38),
     ];
 
     #[test]

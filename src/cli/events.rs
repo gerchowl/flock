@@ -56,7 +56,10 @@ fn parse_kind(raw: &str) -> Result<EventKind, String> {
 }
 
 fn parse_flags(args: &[String], allowed: &[&str]) -> Result<Flags, String> {
-    let mut flags = Flags::default();
+    let mut flags = Flags {
+        json: super::output::json(),
+        ..Flags::default()
+    };
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
