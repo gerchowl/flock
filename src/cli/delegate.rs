@@ -126,7 +126,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 10 brief refused before typing (was 1), 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -3744,6 +3744,7 @@ fn delegate_wait_for_ready(
     let subscribe = Request {
         id: "cli:delegate:ready".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after: None,
             subscriptions: vec![
                 Subscription::PaneAgentStatusChanged {
                     pane_id: pane_id.to_owned(),
@@ -4652,7 +4653,16 @@ enum Outcome {
     Stalled,
     NotStarted,
     Timeout,
+    /// The server stopped answering for [`UNANSWERED_LIMIT`] inside the reply
+    /// grace. Not a verdict on the agent, which may well still be working
+    /// (#1121).
+    ServerUnavailable,
 }
+
+/// How long the reply grace keeps asking a server that does not answer, when
+/// no `--timeout` bounds it. The settle core's slow window, for the same
+/// reason: a server under load is still there (#910), a frozen one is not.
+const UNANSWERED_LIMIT: Duration = Duration::from_secs(300);
 
 impl Outcome {
     fn as_str(self) -> &'static str {
@@ -4667,6 +4677,7 @@ impl Outcome {
             Self::Stalled => "stalled",
             Self::NotStarted => "not_started",
             Self::Timeout => "timeout",
+            Self::ServerUnavailable => "server_unavailable",
         }
     }
 
@@ -4680,6 +4691,7 @@ impl Outcome {
             Self::NotStarted => crate::cli::exit::moved(exit::NOT_STARTED),
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
+            Self::ServerUnavailable => crate::cli::exit::RECONNECT_GAVE_UP,
         }
     }
 }
@@ -4697,6 +4709,9 @@ enum ResultPoll {
     /// The store has no reply yet, no session to read one from, or a reply from
     /// an earlier turn. All three mean the same thing to a caller: not now.
     NotYet,
+    /// The request timed out before the deadline: the server did not answer,
+    /// so nothing is known about the reply (#1121).
+    Unanswered,
     /// The agent is gone.
     Gone,
     /// The server refused for a reason that is not "not yet".
@@ -4727,6 +4742,8 @@ enum Grace {
     /// that reads `Grace::Timeout` cannot confuse "no reply yet" with "clock
     /// ran out mid-poll" (K5).
     Timeout,
+    /// The server did not answer for [`UNANSWERED_LIMIT`].
+    Unavailable,
 }
 
 /// What a settled outcome means for the delegate.
@@ -4835,6 +4852,9 @@ impl Await<'_> {
         );
         loop {
             let mut not_started = false;
+            // When the screen checks next need a sample: no event reports
+            // silence, so an evented wait must not hold past it (#1030).
+            let due = std::cell::Cell::new(None);
             let remaining = self.remaining_timeout_ms();
             let settled = super::settled::settled_wait_observed(
                 "delegate",
@@ -4845,6 +4865,7 @@ impl Await<'_> {
                 after.as_deref(),
                 self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
                 remaining,
+                &due,
                 &mut |sample| {
                     let Some(super::settled::Sample::Record {
                         status,
@@ -4854,6 +4875,9 @@ impl Await<'_> {
                     else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
+                        // Nothing is timing after a gap: a stale due would
+                        // make an evented wait resample at once.
+                        due.set(None);
                         return false;
                     };
                     let Some((screen, unfaint)) =
@@ -4861,6 +4885,9 @@ impl Await<'_> {
                     else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
+                        // Nothing is timing after a gap: a stale due would
+                        // make an evented wait resample at once.
+                        due.set(None);
                         return false;
                     };
                     if start_watch.observe_unfaint(
@@ -4879,7 +4906,14 @@ impl Await<'_> {
                         crate::api::schema::AgentStatus::Unknown => "unknown",
                         _ => "idle",
                     };
-                    monitor.observe(status, &screen, Instant::now())
+                    let stalled = monitor.observe(status, &screen, Instant::now());
+                    due.set(
+                        [monitor.due(), start_watch.due()]
+                            .into_iter()
+                            .flatten()
+                            .min(),
+                    );
+                    stalled
                 },
             )?;
 
@@ -5017,6 +5051,10 @@ impl Await<'_> {
                     outcome: Outcome::Timeout,
                     info: None,
                 },
+                Grace::Unavailable => SettledDecision::Report {
+                    outcome: Outcome::ServerUnavailable,
+                    info: None,
+                },
                 Grace::Exhausted => SettledDecision::Report {
                     outcome: if self
                         .deadline
@@ -5040,22 +5078,38 @@ impl Await<'_> {
     /// ordinary — the harness clears its spinner first — so a grace that
     /// reported `no_result` the instant the agent went idle would call every
     /// normal turn a failure. How long that gap is, is the harness's row.
+    ///
+    /// The grace is time the server spent ANSWERING "not yet". A poll the
+    /// server never answered says nothing about the reply, so it stops the
+    /// clock rather than spending it: a stalled server must not turn a
+    /// working agent into `no_result` (#1121). The wait keeps asking until
+    /// the server answers, the deadline passes (124), or it has not answered
+    /// for [`UNANSWERED_LIMIT`] (`server_unavailable`).
     fn await_reply(&self, settled_cursor: &str) -> Grace {
         let grace = self.harness.result_grace;
-        let grace_end = match self.deadline {
-            Some(deadline) => deadline.min(Instant::now() + grace),
-            None => Instant::now() + grace,
-        };
+        let bound = |end: Instant| self.deadline.map_or(end, |deadline| deadline.min(end));
+        let mut grace_end = bound(Instant::now() + grace);
+        let mut unanswered_since: Option<Instant> = None;
         loop {
             if Instant::now() >= grace_end {
                 return Grace::Exhausted;
             }
+            let asked = Instant::now();
             match self.poll_result() {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
                 ResultPoll::Gone => return Grace::Gone,
                 ResultPoll::Refused(reason) => return Grace::Refused(reason),
                 ResultPoll::Timeout => return Grace::Timeout,
-                ResultPoll::NotYet => {}
+                ResultPoll::Unanswered => {
+                    let since = *unanswered_since.get_or_insert(asked);
+                    if since.elapsed() >= UNANSWERED_LIMIT {
+                        return Grace::Unavailable;
+                    }
+                    grace_end = bound(grace_end + asked.elapsed() + RESULT_POLL);
+                    sleep_bounded(grace_end, RESULT_POLL);
+                    continue;
+                }
+                ResultPoll::NotYet => unanswered_since = None,
             }
             // The agent took another turn, so the reply that answers THIS round
             // is not the next one to land. Settle again instead. A transport
@@ -5146,7 +5200,7 @@ impl Await<'_> {
             Ok(response) => response,
             Err(err) => match await_failure(&err, self.deadline, Instant::now()) {
                 AwaitFailure::Timeout => return ResultPoll::Timeout,
-                AwaitFailure::NotYet => return ResultPoll::NotYet,
+                AwaitFailure::NotYet => return ResultPoll::Unanswered,
                 AwaitFailure::Fail(reason) => return ResultPoll::Refused(reason),
             },
         };

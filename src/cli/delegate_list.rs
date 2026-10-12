@@ -123,6 +123,35 @@ pub(crate) fn render(rows: &[DelegateRow]) -> String {
     out
 }
 
+/// The rows a session-start table shows before it points at the full list.
+/// Small enough that the table fits Codex's default `additionalContextLimit`.
+pub(crate) const SESSION_TABLE_ROWS: usize = 10;
+
+/// The delegate table an architect gets back after a compaction or resume
+/// (#962, ADR-0027 §4): its own edges, at most `max_rows` of them, then a
+/// tail naming how many more there are. `None` when it has no edges, so a
+/// session with nothing to recover gets no extra context at all.
+pub(crate) fn session_table(rows: &[DelegateRow], max_rows: usize) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "Your open delegates ({} edge{}, from `flk delegate list --mine`):\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+    for row in rows.iter().take(max_rows) {
+        out.push_str(&format!("  {}\n", row_line(row)));
+    }
+    if rows.len() > max_rows {
+        out.push_str(&format!(
+            "  +{} more: flk delegate list --mine\n",
+            rows.len() - max_rows
+        ));
+    }
+    Some(out)
+}
+
 fn row_line(row: &DelegateRow) -> String {
     let mut fields = vec![
         row.name.clone().unwrap_or_else(|| row.delegate.clone()),
@@ -228,5 +257,27 @@ mod tests {
              architect agent_sub\n\
              \x20 agent_leaf  gone  edge 1m\n"
         );
+    }
+
+    #[test]
+    fn the_session_table_is_absent_without_edges_and_bounded_with_a_tail() {
+        assert_eq!(session_table(&[], 3), None);
+        let two = [row("a", "d1", "live"), row("a", "d2", "gone")];
+        assert_eq!(
+            session_table(&two, 3).as_deref(),
+            Some(
+                "Your open delegates (2 edges, from `flk delegate list --mine`):\n\
+                 \x20 d1  live  edge 1m\n\
+                 \x20 d2  gone  edge 1m\n"
+            )
+        );
+        let five: Vec<_> = (1..=5)
+            .map(|n| row("a", &format!("d{n}"), "live"))
+            .collect();
+        let table = session_table(&five, 3).unwrap();
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 1 + 3 + 1, "{table}");
+        assert_eq!(lines[3], "  d3  live  edge 1m");
+        assert_eq!(lines[4], "  +2 more: flk delegate list --mine");
     }
 }
