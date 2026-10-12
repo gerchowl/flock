@@ -184,7 +184,7 @@ pub(crate) mod tests {
     /// does not break the others in flight.
     const GRANDFATHERED_BARE_CLI_RETURNS: &[(&str, usize)] = &[
         ("src/cli.rs", 72),
-        ("src/cli/agent.rs", 61),
+        ("src/cli/agent.rs", 60),
         ("src/cli/checks.rs", 8),
         ("src/cli/delegate.rs", 5),
         ("src/cli/digest.rs", 6),
