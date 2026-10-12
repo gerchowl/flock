@@ -184,8 +184,12 @@ pub struct App {
     pub(crate) delegations: delegation::DelegationIndex,
     /// ADR-0030 §1: goals by `AgentId`, folded in the same start pass.
     pub(crate) goals: goals::GoalIndex,
-    /// The `EventHub::rotations` value the open goals were last re-issued at.
-    pub(crate) goal_rotations_seen: u64,
+    /// ADR-0035 §6.2: adopted owner policy versions by repo, folded in the
+    /// same start pass.
+    pub(crate) owner_policies: crate::owner_policy::OwnerPolicyIndex,
+    /// The `EventHub::rotations` value the open goals and adopted policies
+    /// were last re-issued at.
+    pub(crate) record_rotations_seen: u64,
     mesh_store_retry_at: Option<Instant>,
     mesh_store_recovering: bool,
     /// Mail requests that arrived while the recovery worker was still
@@ -1001,7 +1005,8 @@ impl App {
             pending_agent_removals: Default::default(),
             delegations: Default::default(),
             goals: Default::default(),
-            goal_rotations_seen: 0,
+            owner_policies: Default::default(),
+            record_rotations_seen: 0,
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
             recovery_parked: Vec::new(),

@@ -578,6 +578,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MeshDeliver(_) => "mesh.deliver",
         Method::MeshCollect(_) => "mesh.collect",
         Method::PeersEnrollReset(_) => "peers.enroll_reset",
+        Method::OwnerPolicyShow(_) => "owner.policy.show",
+        Method::OwnerPolicyAdopt(_) => "owner.policy.adopt",
         Method::PeersEnrollment(_) => "peers.enrollment",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneMove(_) => "pane.move",
