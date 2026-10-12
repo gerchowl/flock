@@ -650,6 +650,37 @@ when nobody is watching the pane. `--status done` matches exactly `done`. The
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
 
+### Registered waits
+
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses. There are two ways to open one:
+
+- **A held `events.read`.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`.
+- **`wait.park`.** Opens a wait and returns at once, so the agent can end its turn.
+
+```json
+{"id":"p1","method":"wait.park","params":{"kinds":["pr.ci_completed"],"subjects":["agent_atlas_7"],"deadline_ms":1800000}}
+```
+
+```json
+{"id":"p1","result":{"type":"wait_parked","wait_id":"w_1760342400000_1","agent_id":"agent_atlas_3","deadline":1760344200000}}
+```
+
+`kinds` and `subjects` are the `events.read` filter and say what the wait is for. `deadline_ms` is mandatory and relative. The wait starts at the server's newest durable event.
+
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`:
+
+```json
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": {"kinds": ["pr.ci_completed"], "subjects": ["agent_atlas_7"], "after": 412}, "since": 1760342400000, "deadline": 1760344200000}}
+```
+
+It reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
+
+A wait still open at its deadline is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }` (`since` and `deadline` in Unix ms). A held read is closed when it returns, so it expires only if that close never reached the server.
+
+**Failure modes.** `wait.park` from a process in no agent pane is refused with `no_caller_pane`: there is no agent to put the wait on. A `deadline_ms` of 0 or a kind that is not durable is refused with `invalid_params`. A held read from outside an agent pane is served as before and records no wait. `wait.park` is new in protocol 29 and counts as state-changing for the skew gate (#868): against an older server `flk wait park` exits 78 with `server_version_gap` before it is sent.
+
+**Known limits.** A park ends at its deadline only: opening it when a matching event lands, and waking the agent, is #1032. Open parks are held in memory, so a server restart or live handoff drops them (#1240). A wait whose agent left stays until its deadline.
+
 ## The turn cursor
 
 Local `pane_info` and `agent_info` records carry a `turn_cursor`:

@@ -6,6 +6,10 @@
 //! than what is retained, and `next_after` to resume from. With `wait_ms`
 //! the request is held on the event hub's condvar until a matching event
 //! lands, like `msg.wait_reply`, never by a client-side poll.
+//!
+//! A held read is a registered wait (ADR-0028 §5, #1031): while it is held,
+//! the App records it against the attested caller, which is what makes an
+//! agent running `flk events wait` read `waiting_on_event`.
 
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
@@ -13,11 +17,65 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, EventEnvelope, EventGap, EventsReadParams, ResponseResult,
-    SequencedEvent, SuccessResponse, EVENTS_READ_DEFAULT_LIMIT, EVENTS_READ_MAX_LIMIT,
+    ErrorBody, ErrorResponse, EventEnvelope, EventGap, EventsReadParams, Method, Request,
+    ResponseResult, SequencedEvent, SuccessResponse, WaitPredicate, EVENTS_READ_DEFAULT_LIMIT,
+    EVENTS_READ_MAX_LIMIT,
 };
 use crate::api::server::{should_stop_connection, CONNECTION_POLL_INTERVAL};
-use crate::api::EventHub;
+use crate::api::{ApiRequestMessage, ApiRequestSender, EventHub};
+
+/// A held read's open wait in the App's registry, released on drop so that
+/// every way out of the hold (an answer, the deadline, a hang-up, an error)
+/// closes it.
+struct HeldWait<'a> {
+    api_tx: &'a ApiRequestSender,
+    wait_id: Option<String>,
+}
+
+impl<'a> HeldWait<'a> {
+    /// Register the hold. The App attests the caller from `peer_pid` and
+    /// records nothing when it runs in no agent pane.
+    fn open(
+        api_tx: &'a ApiRequestSender,
+        peer_pid: Option<u32>,
+        predicate: WaitPredicate,
+        hold: Duration,
+    ) -> Self {
+        let hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX);
+        let response = super::server::dispatch_to_app_with_timeout(
+            Request {
+                id: "events.read:hold".into(),
+                method: Method::WaitHold(predicate, hold_ms),
+            },
+            api_tx,
+            None,
+            peer_pid,
+        );
+        let wait_id = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|value| value["result"]["wait_id"].as_str().map(str::to_owned));
+        Self { api_tx, wait_id }
+    }
+}
+
+impl Drop for HeldWait<'_> {
+    fn drop(&mut self) {
+        let Some(wait_id) = self.wait_id.take() else {
+            return;
+        };
+        // Nobody reads the answer: the release cannot fail in a way the
+        // reader could act on.
+        let (respond_to, _) = std::sync::mpsc::channel();
+        let _ = self.api_tx.send(ApiRequestMessage {
+            request: Request {
+                id: "events.read:release".into(),
+                method: Method::WaitRelease(wait_id),
+            },
+            respond_to,
+            peer_pid: None,
+        });
+    }
+}
 
 fn encode(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| {
@@ -54,6 +112,8 @@ pub(super) fn read_events(
     stream: &mut UnixStream,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    api_tx: &ApiRequestSender,
+    peer_pid: Option<u32>,
 ) -> std::io::Result<Option<String>> {
     if let Some(kind) = params.kinds.iter().find(|kind| !kind.is_persisted()) {
         return Ok(Some(refuse(
@@ -91,6 +151,7 @@ pub(super) fn read_events(
             && matches_subject(envelope, &params.subjects)
     };
     let mut after = params.after;
+    let mut held: Option<HeldWait> = None;
     loop {
         let read = event_hub.read(after, limit, keep);
         let found = !read.events.is_empty() || read.gap.is_some();
@@ -110,6 +171,14 @@ pub(super) fn read_events(
         }
         // Nothing matched up to here: skip it rather than rescan it.
         after = read.scanned;
+        if held.is_none() {
+            let predicate = WaitPredicate {
+                kinds: params.kinds.clone(),
+                subjects: params.subjects.clone(),
+                after: params.after,
+            };
+            held = Some(HeldWait::open(api_tx, peer_pid, predicate, wait));
+        }
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }

@@ -338,6 +338,8 @@ fn handle_connection(
                 &mut stream,
                 event_hub,
                 running,
+                api_tx,
+                peer_pid,
             )?
             else {
                 crate::logging::api_request_completed(
@@ -607,6 +609,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsWait(_) => "events.wait",
         Method::EventsRead(_) => "events.read",
         Method::ChannelHello(_) => "channel.hello",
+        Method::WaitPark(_) => "wait.park",
+        Method::WaitHold(..) => "wait.hold",
+        Method::WaitRelease(_) => "wait.release",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
@@ -1435,7 +1440,23 @@ mod tests {
     }
 
     fn events_read(event_hub: &EventHub, params: &str) -> serde_json::Value {
-        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        events_read_seen(event_hub, params).0
+    }
+
+    /// One `events.read`, with an App that answers a hold as an agent's
+    /// and records what the read asked of it.
+    fn events_read_seen(event_hub: &EventHub, params: &str) -> (serde_json::Value, Vec<Method>) {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                let _ = message
+                    .respond_to
+                    .send(r#"{"id":"","result":{"type":"wait_held","wait_id":"w_1"}}"#.into());
+                seen.push(message.request.method);
+            }
+            seen
+        });
         let (mut client, server) = UnixStream::pair().unwrap();
         writeln!(
             client,
@@ -1452,7 +1473,36 @@ mod tests {
             &Mutex::default(),
         )
         .unwrap();
-        serde_json::from_str(&read_line(&mut client)).unwrap()
+        drop(api_tx);
+        let response = serde_json::from_str(&read_line(&mut client)).unwrap();
+        (response, app.join().unwrap())
+    }
+
+    /// #1031: a held read is a registered wait for exactly as long as it is
+    /// held. A read answered at once registers nothing.
+    #[test]
+    fn a_held_events_read_registers_its_wait_and_releases_it() {
+        let event_hub = EventHub::default();
+        event_hub.push(queued_for("ws_1:p1", "c1"));
+        let (_, seen) = events_read_seen(&event_hub, r#"{"wait_ms":10000}"#);
+        assert!(seen.is_empty(), "a read with an answer holds nothing");
+        let (timed_out, seen) = events_read_seen(
+            &event_hub,
+            r#"{"after":1,"kinds":["message_queued"],"subjects":["ws_1:p2"],"wait_ms":50}"#,
+        );
+        assert_eq!(timed_out["result"]["events"], serde_json::json!([]));
+        let predicate = crate::api::schema::WaitPredicate {
+            kinds: vec![crate::api::schema::EventKind::MessageQueued],
+            subjects: vec!["ws_1:p2".into()],
+            after: 1,
+        };
+        assert_eq!(
+            seen,
+            [
+                Method::WaitHold(predicate, 50),
+                Method::WaitRelease("w_1".into())
+            ]
+        );
     }
 
     /// #1028: `events.read` filters by subject and holds the request on the

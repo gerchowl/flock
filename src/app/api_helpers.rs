@@ -90,7 +90,7 @@ pub(super) fn pane_agent_status(
 /// nothing could. `screen_attention` is what the screen says a `blocked`
 /// agent waits on (#1023): without it, `blocked` is a prompt of unknown kind,
 /// as a hook reports it. A visible prompt is not a turn fact, so it reads
-/// `turn: unknown`.
+/// `turn: unknown`. `waiting` is the agent's oldest registered wait (#1031).
 pub(super) fn agent_state(
     status: crate::api::schema::AgentStatus,
     authority: crate::terminal::StateAuthority,
@@ -98,9 +98,11 @@ pub(super) fn agent_state(
     held_ms: Option<u64>,
     background: Option<(u32, crate::api::agent_state::StateSource)>,
     screen_attention: Option<crate::api::agent_state::Attention>,
+    waiting: crate::api::agent_state::Waiting,
 ) -> crate::api::agent_state::AgentState {
     use crate::api::agent_state::{
         AgentState, Attention, Background, HumanReason, Lifecycle, StateSource, StateSources, Turn,
+        Waiting,
     };
     use crate::api::schema::AgentStatus;
     let (turn, lifecycle) = match status {
@@ -134,13 +136,14 @@ pub(super) fn agent_state(
         turn: (turn != Turn::Unknown).then_some(turn_source),
         background: background.map(|(_, source)| source),
         attention: attention_source,
+        waiting: (waiting != Waiting::Unknown).then_some(StateSource::WaitRegistry),
     };
     AgentState::derive(
         turn,
         Background::from_count(background.map(|(count, _)| count)),
         attention,
         lifecycle,
-        false,
+        waiting,
         held_ms,
         source,
     )
@@ -223,7 +226,7 @@ pub(super) fn normalize_custom_status(status: Option<String>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::encode_api_text;
-    use crate::api::agent_state::{Phase, StateSource, Turn, SETTLE_MS};
+    use crate::api::agent_state::{Phase, StateSource, Turn, Waiting, SETTLE_MS};
     use crate::detect::Agent;
     use crate::terminal::{StateAuthority, TerminalRuntime};
 
@@ -304,6 +307,7 @@ mod tests {
             Some(held),
             background,
             attention,
+            Waiting::None,
         )
     }
 
@@ -393,6 +397,7 @@ mod tests {
             Some(1),
             None,
             None,
+            Waiting::None,
         );
         assert_eq!(
             (state.attention, state.phase, state.source.attention),
@@ -404,7 +409,15 @@ mod tests {
                 Some(StateSource::Hook)
             )
         );
-        let idle = super::agent_state(S::Idle, StateAuthority::Screen, None, Some(1), None, None);
+        let idle = super::agent_state(
+            S::Idle,
+            StateAuthority::Screen,
+            None,
+            Some(1),
+            None,
+            None,
+            Waiting::None,
+        );
         assert_eq!(idle.attention, Attention::None);
         let gone = super::agent_state(
             S::Offline,
@@ -413,6 +426,7 @@ mod tests {
             Some(1),
             None,
             None,
+            Waiting::None,
         );
         assert_eq!(
             (gone.attention, gone.source.attention),
@@ -424,7 +438,9 @@ mod tests {
     fn lifecycle_outranks_turn_and_each_axis_names_its_source() {
         use crate::api::schema::AgentStatus as S;
         use StateAuthority as By;
-        let state = |status, by, agent| super::agent_state(status, by, agent, Some(1), None, None);
+        let state = |status, by, agent| {
+            super::agent_state(status, by, agent, Some(1), None, None, Waiting::None)
+        };
         let hibernated = state(S::Hibernated, By::Screen, None);
         assert_eq!(
             (hibernated.phase, hibernated.source.turn),

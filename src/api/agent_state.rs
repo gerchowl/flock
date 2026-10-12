@@ -8,7 +8,8 @@
 //!
 //! `turn` and `lifecycle` come from today's detectors, `background` from
 //! Claude's footer counter or the pane's process tree (#1022), `attention`
-//! from the detector's `blocked` split by what the screen shows (#1023).
+//! from the detector's `blocked` split by what the screen shows (#1023),
+//! `waiting` from the server's wait registry (#1031).
 //! `finished` is never inferred from an unknown background.
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -100,6 +101,27 @@ pub enum BlockedReason {
     Unknown,
 }
 
+/// A registered wait the agent holds open (ADR-0028 §5): `"none"`,
+/// `{"on": {"wait_id": …, "predicate": {…}, "since": …, "deadline": …}}`
+/// or `"unknown"` on the wire. `since` and `deadline` are Unix ms. With
+/// several waits open, the oldest is reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Waiting {
+    None,
+    On {
+        wait_id: String,
+        #[serde(default, deserialize_with = "or_unknown")]
+        predicate: crate::api::schema::WaitPredicate,
+        #[serde(default, deserialize_with = "or_unknown")]
+        since: u64,
+        #[serde(default, deserialize_with = "or_unknown")]
+        deadline: u64,
+    },
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
@@ -137,6 +159,7 @@ pub enum StateSource {
     Hook,
     Plugin,
     ProcessTree,
+    WaitRegistry,
     #[default]
     Unknown,
 }
@@ -164,6 +187,12 @@ pub struct StateSources {
         skip_serializing_if = "Option::is_none"
     )]
     pub attention: Option<StateSource>,
+    #[serde(
+        default,
+        deserialize_with = "or_unknown",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub waiting: Option<StateSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +207,8 @@ pub struct AgentState {
     pub background: Background,
     #[serde(default, deserialize_with = "or_unknown")]
     pub attention: Attention,
+    #[serde(default, deserialize_with = "or_unknown")]
+    pub waiting: Waiting,
     #[serde(default, deserialize_with = "or_unknown")]
     pub lifecycle: Lifecycle,
     #[serde(default, deserialize_with = "or_unknown")]
@@ -204,6 +235,7 @@ impl AgentState {
             turn: Turn::Unknown,
             background: Background::Unknown,
             attention: Attention::Unknown,
+            waiting: Waiting::Unknown,
             lifecycle: Lifecycle::Unknown,
             phase: Phase::Unknown,
             held_ms: None,
@@ -218,10 +250,11 @@ impl AgentState {
         background: Background,
         attention: Attention,
         lifecycle: Lifecycle,
-        wait_open: bool,
+        waiting: Waiting,
         turn_held_ms: Option<u64>,
         source: StateSources,
     ) -> Self {
+        let wait_open = matches!(waiting, Waiting::On { .. });
         let settled = turn == Turn::Idle && turn_held_ms.is_some_and(|ms| ms >= SETTLE_MS);
         let phase = match (lifecycle, attention) {
             (Lifecycle::Gone, _) => Phase::Gone,
@@ -254,6 +287,7 @@ impl AgentState {
             turn,
             background,
             attention,
+            waiting,
             lifecycle,
             phase,
             held_ms,
@@ -299,6 +333,15 @@ mod tests {
         reason: HumanReason::Permission,
     };
 
+    fn on() -> Waiting {
+        Waiting::On {
+            wait_id: "w_1".into(),
+            predicate: Default::default(),
+            since: 1,
+            deadline: 2,
+        }
+    }
+
     /// Drift lock on the ADR-0028 §1 phase table, one row per phase in the
     /// ADR's order. Each row's inputs also satisfy the rows below it, so a
     /// derivation that tested them in another order fails here. Changing
@@ -325,8 +368,9 @@ mod tests {
     #[test]
     fn phase_derivation_matches_the_adr_table() {
         for (want, life, att, turn, bg, wait, held) in TABLE {
+            let waiting = if wait { on() } else { Waiting::None };
             let state =
-                AgentState::derive(turn, bg, att, life, wait, Some(held), Default::default());
+                AgentState::derive(turn, bg, att, life, waiting, Some(held), Default::default());
             assert_eq!(serde_json::to_value(state.phase).unwrap(), want, "{want}");
         }
         let settled = AgentState::derive(
@@ -334,7 +378,7 @@ mod tests {
             B::Unknown,
             A::Unknown,
             L::Live,
-            false,
+            Waiting::None,
             Some(SETTLE_MS + 1_500),
             Default::default(),
         );
@@ -343,6 +387,35 @@ mod tests {
             Some(1_500),
             "a settled phase holds from the window's close"
         );
+    }
+
+    #[test]
+    fn waiting_wire_shape_and_a_reshaped_future_read_leniently() {
+        assert_eq!(serde_json::to_value(Waiting::None).unwrap(), "none");
+        assert_eq!(
+            serde_json::to_value(on()).unwrap(),
+            serde_json::json!({"on": {"wait_id": "w_1", "predicate": {"after": 0},
+                "since": 1, "deadline": 2}})
+        );
+        let state: AgentState = serde_json::from_str(
+            r#"{"waiting":{"on":{"wait_id":"w_9","predicate":{"until":"pr:7"},"since":"x"}},
+                "source":{"waiting":"wait_registry"}}"#,
+        )
+        .unwrap();
+        let Waiting::On {
+            wait_id,
+            predicate,
+            since,
+            ..
+        } = state.waiting
+        else {
+            panic!("an open wait keeps its variant");
+        };
+        assert_eq!((wait_id.as_str(), since), ("w_9", 0));
+        assert_eq!(predicate, Default::default());
+        assert_eq!(state.source.waiting, Some(StateSource::WaitRegistry));
+        let state: AgentState = serde_json::from_str(r#"{"waiting":"parked"}"#).unwrap();
+        assert_eq!(state.waiting, Waiting::Unknown);
     }
 
     #[test]

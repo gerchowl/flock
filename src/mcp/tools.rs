@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
     EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
-    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
+    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WaitParkParams, WorktreeKillParams,
+    WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -430,6 +431,20 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_events_read,
             build: build_events_read,
         },
+        Tool {
+            name: "flock_wait_park",
+            description: "Park yourself on a registered wait (ADR-0028 §5) and \
+                          return at once, so you can end your turn: until \
+                          `deadline_ms` passes you read `waiting_on_event`, and \
+                          a supervisor treats you as parked, not stalled. The \
+                          wait names the events you wait for, as in \
+                          `flock_events_read` (`kinds`, `subjects`). Returns the \
+                          `wait_id` and the deadline (Unix ms). Refusals: \
+                          `no_caller_pane` (not called from an agent pane), \
+                          `invalid_params` (no deadline, a non-durable kind).",
+            input_schema: schema_wait_park,
+            build: build_wait_park,
+        },
     ]
 }
 
@@ -688,6 +703,19 @@ fn schema_events_read() -> Value {
             "limit": {"type": "integer", "minimum": 1, "description": "At most this many events (default 256)."},
             "wait_ms": {"type": "integer", "minimum": 0, "description": "Hold the call until a matching event lands, in ms (capped at 540000). Blocks this MCP session."},
         },
+        "additionalProperties": false,
+    })
+}
+
+fn schema_wait_park() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kinds": {"type": "array", "items": {"type": "string"}, "description": "Durable event kinds the wait is for, e.g. `pr.ci_completed`."},
+            "subjects": {"type": "array", "items": {"type": "string"}, "description": "Ids an event's data must carry as a top-level value."},
+            "deadline_ms": {"type": "integer", "minimum": 1, "description": "How long the wait stays open, in ms. Mandatory."},
+        },
+        "required": ["deadline_ms"],
         "additionalProperties": false,
     })
 }
@@ -1092,6 +1120,12 @@ fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
 
 /// Ceiling of `flock_events_read`'s hold, below the 600 s MCP tool timeout.
 const MCP_EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+
+fn build_wait_park(args: Value) -> Result<Method, McpError> {
+    let params: WaitParkParams = serde_json::from_value(args)
+        .map_err(|err| McpError::invalid_params(format!("invalid wait.park arguments: {err}")))?;
+    Ok(Method::WaitPark(params))
+}
 
 fn build_events_read(args: Value) -> Result<Method, McpError> {
     let mut params: EventsReadParams = serde_json::from_value(args)
@@ -1597,8 +1631,24 @@ mod tests {
                 "flock_agent_history",
                 "flock_agent_result",
                 "flock_events_read",
+                "flock_wait_park",
             ]
         );
+    }
+
+    #[test]
+    fn wait_park_needs_a_deadline() {
+        let Method::WaitPark(params) = build_wait_park(json!({
+            "kinds": ["pr.ci_completed"], "subjects": ["agent_d1"], "deadline_ms": 600_000
+        }))
+        .unwrap() else {
+            panic!("expected wait.park");
+        };
+        assert_eq!(
+            (params.subjects, params.deadline_ms),
+            (vec!["agent_d1".into()], 600_000)
+        );
+        assert!(build_wait_park(json!({"kinds": ["pr.ci_completed"]})).is_err());
     }
 
     /// The schema is generated from the enum, so the caller-visible set of

@@ -47,6 +47,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod waits;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -222,6 +223,8 @@ pub struct App {
     pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// Open registered waits per agent (ADR-0028 §5, #1031).
+    pub(crate) waits: waits::WaitRegistry,
     /// When the next armed self-compaction needs looking at (#540): the Enter
     /// of a typed write, a settle that lifts, or the timeout. `None` when
     /// nothing is armed anywhere, which is the state the loop is quiet in.
@@ -984,6 +987,7 @@ impl App {
             active_submissions: Default::default(),
             kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            waits: Default::default(),
             self_compact_deadline: None,
             restarts: Default::default(),
             event_hub,

@@ -1484,6 +1484,11 @@ impl App {
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
+            Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
+            Method::WaitHold(predicate, hold_ms) => {
+                return self.handle_wait_hold(request.id, predicate, hold_ms)
+            }
+            Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),

@@ -219,6 +219,18 @@ pub enum Method {
     EventsRead(EventsReadParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
+    /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
+    /// return at once, so the agent can end its turn.
+    #[serde(rename = "wait.park")]
+    WaitPark(WaitParkParams),
+    /// In-process only: a held `events.read` registers its blocking wait
+    /// against the attested caller. Never on the wire, so no client can open
+    /// or close a wait it does not hold.
+    #[serde(skip)]
+    WaitHold(WaitPredicate, u64),
+    /// In-process only: the held `events.read` returned.
+    #[serde(skip)]
+    WaitRelease(String),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -373,7 +385,9 @@ impl Method {
             | Self::PaneWaitForOutput(_)
             | Self::ChecksList(_)
             | Self::DigestRender(_)
-            | Self::FleetStatus(_) => false,
+            | Self::FleetStatus(_)
+            | Self::WaitHold(..)
+            | Self::WaitRelease(_) => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)
@@ -407,6 +421,7 @@ impl Method {
             | Self::PaneMove(_)
             | Self::PaneRename(_)
             | Self::ChannelHello(_)
+            | Self::WaitPark(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2107,6 +2122,30 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
+/// What a registered wait waits for (ADR-0028 §5): the `events.read`
+/// filter, from the cursor the wait started at. A park and a held read share
+/// it, so `state.waiting` reads the same for both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitPredicate {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<EventKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(default)]
+    pub after: u64,
+}
+
+/// `wait.park` (ADR-0028 §5, #1031). `deadline_ms` is relative and
+/// mandatory: a park that never opens still ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitParkParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<EventKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    pub deadline_ms: u64,
+}
+
 /// `channel.hello` (ADR-0028 §8, #1037): a channel adapter's first call,
 /// proving it holds the binding's capability token. Gated as state-changing
 /// (#868) so an adapter refuses to start against a server without it.
@@ -2356,6 +2395,10 @@ pub enum EventKind {
     PrMerged,
     #[serde(rename = "pr.closed")]
     PrClosed,
+    /// ADR-0028 §5 (#1031): a registered wait reached its deadline while
+    /// still open. Emitted once, and the wait is gone.
+    #[serde(rename = "wait.expired")]
+    WaitExpired,
 }
 
 impl EventKind {
@@ -2420,7 +2463,8 @@ impl EventKind {
             | Self::FileHandedOver
             | Self::PrCiCompleted
             | Self::PrMerged
-            | Self::PrClosed => true,
+            | Self::PrClosed
+            | Self::WaitExpired => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -2843,6 +2887,17 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// `wait.park`: the wait now open and when it expires (Unix ms).
+    WaitParked {
+        wait_id: String,
+        agent_id: String,
+        deadline: u64,
+    },
+    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// is no agent and nothing was recorded.
+    WaitHeld {
+        wait_id: Option<String>,
     },
     /// `channel.hello`: the binding the token unlocked, never the token.
     ChannelHello {
@@ -4096,6 +4151,15 @@ pub enum EventData {
         pr: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
+    },
+    /// #1031: `since` and `deadline` are Unix ms.
+    #[serde(rename = "wait.expired")]
+    WaitExpired {
+        wait_id: String,
+        agent_id: String,
+        predicate: WaitPredicate,
+        since: u64,
+        deadline: u64,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
