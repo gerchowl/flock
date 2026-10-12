@@ -935,7 +935,9 @@ fn settled_core_observed(
     // Taken before the first sample, so nothing that lands after it is missed.
     let mut cursor = event_cursor(requests, deadline);
     loop {
-        match sample_pinned(requests, &wait, deadline) {
+        let sampled = sample_pinned(requests, &wait, deadline);
+        let answered = sampled.is_ok();
+        match sampled {
             Ok(sample) => {
                 // The server answered, so the run of failures this wait was
                 // surviving is over however long it had lasted.
@@ -977,7 +979,14 @@ fn settled_core_observed(
             Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
             Err(PinnedFailure::Fatal(reason)) => return Ok(SettledOutcome::Error(reason)),
         }
-        pause(requests, &wait, deadline, due.get(), &mut cursor);
+        // After a failed sample, the old poll's pace: a server mid-handoff
+        // refuses at once, and a long poll or a dwell already due would
+        // otherwise turn the retry into a tight loop.
+        if answered {
+            pause(requests, &wait, deadline, due.get(), &mut cursor);
+        } else {
+            sleep_bounded(deadline);
+        }
     }
 }
 
@@ -3141,6 +3150,10 @@ mod tests {
             _timeout: Duration,
         ) -> Result<serde_json::Value, Unanswered> {
             self.agent_gets += 1;
+            // `down` is a server that went away and stays away.
+            if self.records.front() == Some(&"down") {
+                return Err(Unanswered::Unreachable);
+            }
             let cursor = self.records.pop_front().expect("a record per sample");
             let status = if cursor.ends_with('w') {
                 "working"
@@ -3180,6 +3193,9 @@ mod tests {
             }
             let subjects = subjects.iter().map(|subject| subject.to_string()).collect();
             self.reads.push((after, subjects, wait));
+            if self.records.front() == Some(&"down") && self.woken.is_empty() {
+                return Err(Unanswered::Unreachable);
+            }
             match self.woken.pop_front().expect("a scripted read") {
                 None => return Err(Unanswered::Slow),
                 Some(false) => std::thread::sleep(wait),
@@ -3266,6 +3282,42 @@ mod tests {
         assert_eq!(requests.agent_gets, 4);
         let afters: Vec<u64> = requests.reads.iter().map(|(after, _, _)| *after).collect();
         assert_eq!(afters, [40, 40, 41], "the unanswered read keeps its cursor");
+    }
+
+    /// #1030: a server that goes away once the dwell has started, as in a
+    /// handoff, is retried at the old poll's pace. The dwell is due and the
+    /// observer's `due` is stale and past, so a wait that resampled at once
+    /// on a zero span would spin on the refused socket.
+    #[test]
+    fn a_server_gone_mid_dwell_is_retried_at_the_poll_pace() {
+        let mut requests = Evented {
+            records: ["0:1:2:i", "down"].into(),
+            woken: [Some(false)].into(),
+            agent_gets: 0,
+            reads: Vec::new(),
+        };
+        let due = std::cell::Cell::new(Some(Instant::now()));
+        let started = Instant::now();
+        let outcome = settled_core_observed(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            300,
+            Some(1_500),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+            &due,
+            &mut |_| false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SettledOutcome::TimedOut), "{outcome:?}");
+        let made = requests.agent_gets + requests.reads.len();
+        // 1.5 s at one sample per 200 ms is about 8; a spin makes thousands.
+        assert!(made <= 15, "{made} requests in {:?}", started.elapsed());
     }
 
     /// #1030 skew: a server below `events.read`'s protocol is never sent one.

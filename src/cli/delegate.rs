@@ -4775,6 +4775,9 @@ impl Await<'_> {
                     else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
+                        // Nothing is timing after a gap: a stale due would
+                        // make an evented wait resample at once.
+                        due.set(None);
                         return false;
                     };
                     let Some((screen, unfaint)) =
@@ -4782,6 +4785,9 @@ impl Await<'_> {
                     else {
                         monitor.interrupted(Instant::now());
                         start_watch.interrupted();
+                        // Nothing is timing after a gap: a stale due would
+                        // make an evented wait resample at once.
+                        due.set(None);
                         return false;
                     };
                     if start_watch.observe_unfaint(
