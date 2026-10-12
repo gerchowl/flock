@@ -270,7 +270,7 @@ pub fn lenient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Agen
 }
 
 /// One field read on its own: anything it cannot parse is its `unknown`.
-fn or_unknown<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn or_unknown<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
