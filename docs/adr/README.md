@@ -43,7 +43,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0031](0031-goal-state-storage.md) | Goal state is a fold over the durable event log, held in memory, folded once per start and re-issued on every rotation | Proposed |
 | [0032](0032-compiled-agent-context.md) | An agent's starting context is compiled in five layers, most stable first, and the stable layers ride the harness's cached system prompt | Accepted |
 | [0033](0033-forked-ax-reviews-and-brief-template.md) | Agent-experience reviews are answered by a fork of the warm agent against a versioned rubric, recorded as events, filed only after a search; briefs put acceptance and size first | Accepted |
-| [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Proposed |
+| [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other

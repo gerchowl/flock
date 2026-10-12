@@ -1,7 +1,10 @@
 # ADR 0035 — A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail
 
-- Status: Proposed
-- Date: 2026-10-12
+- Status: Accepted
+- Date: 2026-10-12 (accepted 2026-10-13)
+- Scope of acceptance: the decisions in this record, with all 24 owner
+  questions (§10) decided as recommended and the amendments in §11, as the
+  operator recorded on #1172 on 2026-10-13. Acceptance claims no code.
 - Issues: #1172 (the spike this records). Subsumes and orders the spikes
   #1073 (cron agents), #1074 (event triggers and hook/script surface) and
   #1078 (watch surface and cross-repo blocking); §5 answers them. Composes with
@@ -48,8 +51,8 @@
   mechanism: command gate, mid-turn notices, question routing).
 - Numbering: 0034 is the #1160 ADR (PR #1174).
 - Decision owner: operator.
-- Implemented: none. The slices (§9) are not filed. The owner reviews this ADR
-  before any slicing.
+- Implemented: none. The slices (§9) were filed on acceptance; the issue
+  numbers are in §9's table and on #1172.
 
 ## Context
 
@@ -1106,19 +1109,21 @@ call (n = 40), and no tokens on `pass`. ADR-0034 §1a calls it defence in
 depth and says nothing may rely on it for safety. This ADR agrees and owns
 only the **policy**:
 
-- **Rows.** ADR-0034's roles are `delegate` (live parent edge), `owner`
-  (bound) and `root`. A segment architect (§1a) has a parent edge, so it
-  takes the `delegate` rows. It never merges or releases, which the owner
-  does, so it needs no rows of its own. Defaults:
+- **Rows.** ADR-0034's gate roles (§1a at `b1c486e0`) are `delegate` (a
+  live parent edge), `owner` (bound, §1) and `segment` (a segment architect,
+  §1a). Operator-started roots have no role and are never gated. A segment
+  architect gets its own column. Its rows equal the delegate's except that it
+  may not merge into its own integration branch either, because the owner
+  lands every segment (§1a). Defaults:
 
-  | Command prefix | owner | delegate | Reason names |
-  | --- | --- | --- | --- |
-  | `gh pr merge` | deny | deny | `flk land` (§6.4) |
-  | `gh release`, `just release`, `gh workflow run` | deny | deny | `flk owner release`; releases wait for the operator (§6.6) |
-  | `gh ruleset`, `gh repo edit`, `gh api` with a protection or rulesets path | deny | deny | operator only (§6.6) |
-  | `git push --force`, `git push -f`, `git push origin dev`, `git push origin main` | deny | deny | push your branch and open a PR |
-  | `flk server`, `flk fleet`, `flk owner limits`, `flk owner policy` | deny | deny | operator verbs (§6.2, §6.5) |
-  | `gh issue comment\|edit\|close`, `gh pr comment\|edit\|close`, `gh label` | deny | pass | `flk owner comment\|label\|close` (O4) |
+  | Command prefix | owner | segment | delegate | Reason names |
+  | --- | --- | --- | --- | --- |
+  | `gh pr merge` | deny | deny | deny | `flk land` (§6.4); segments hand reviewed PRs to the owner |
+  | `gh release`, `just release`, `gh workflow run` | deny | deny | deny | `flk owner release`; releases wait for the operator (§6.6) |
+  | `gh ruleset`, `gh repo edit`, `gh api` with a protection or rulesets path | deny | deny | deny | operator only (§6.6) |
+  | `git push --force`, `git push -f`, `git push origin dev`, `git push origin main` | deny | deny | deny | push your branch and open a PR |
+  | `flk server`, `flk fleet`, `flk owner limits`, `flk owner policy` | deny | deny | deny | operator verbs (§6.2, §6.5) |
+  | `gh issue comment\|edit\|close`, `gh pr comment\|edit\|close`, `gh label` | deny | pass | pass | `flk owner comment\|label\|close` (O4) |
 
   Argv-prefix matching cannot see a `gh api` method or path inside flags in
   every spelling. That is the evasion ADR-0034 §1a lists, and layer one does
@@ -1616,10 +1621,10 @@ the fields treats the typed block as plain text.
 | O16 | Transcript miner (§7b stage 1): `flk ax mine`, run by a server cron action, ported from `scripts/research/toolchain_survey.py`, edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised) | client-side read; new MCP resource | Fixture transcripts yield the expected fingerprints; no output text, `$HOME` path or hostname appears; sessions outside the owner's edges are not read |
 | O17 | Lift reviews (§7b stage 2): trigger kind `lift` fired by unprocessed `ax/1` Q10 `tools_missed` / Q11 `discovery_gaps` answers (primary) or a miner fingerprint over threshold; `docs/ax/rubric-lifts.md` (`ax-lifts/1`); compiled-reviewer path; target routing (help/docs, skill or CLAUDE.md line, error-message or gate-reason wording, flk issue); dry run first; `[ax] lift_reviews_per_day`; cooldown; `LiftLanded` and `LiftOutcome` from `flk ax report` trends after `lift_check_reviews` | ~380 | O16, AX1 #1091 (rubric with Q9–Q11), AX4b #1095 (trends), AX6a, AX7, AX9, O6, O8a | — | config; new kinds `LiftLanded`, `LiftOutcome` | A recorded review naming a missed `flk events wait` yields one lift candidate targeting `flk agent wait --help`, with the miner's substitute count attached; nothing is filed in dry run; after a landed lift and ten later reviews with no further mention, the outcome is `moved`; a claude-config lift is only ever an issue candidate |
 | O18 | Recorded review (§6.4): `ReviewRecorded`, `flk review record` / MCP `flock_review_record`, validity (reviewer edge `review:<pr>`, not the builder, head SHA matches the poller), `--by operator`; `flk land` (#694) requires an approve at the current head | ~300 | O3a, ADR-0027 edges, #694 | `VERDICT:` comments (replaced as the record) | new kind and verb, gated | A review recorded by the builder is refused; an approve at an old SHA does not let `flk land` proceed; a new push resets the gate |
-| O19a | **Agent Unix user** (§6.3 point 1, #1177): `flk agent-exec` launcher run as `flk-agent` through a one-binary sudoers rule (systemd `User=` on NixOS); socket group access; uid attestation (`getpeereid` / `SO_PEERCRED`), so a `flk-agent` caller is never the operator; agent-side clone per repo and worktrees from it with a shared read group; `flk owner bind` self-test; host user and sudoers declared in g-fleet (an issue there, operator-applied) | ~380 | O1, O11a, a g-fleet host change | ADR-0014 operator attestation (amends, §11) | server-internal; a host without the user reports "cooperative only" | **From an agent pane:** reading the operator's `~/.config/gh/hosts.yml` fails with permission denied; `security find-internet-password -s github.com` finds nothing in the operator's keychain; `gh auth status` shows no operator login; a `setsid` child calling `flk owner limits set` exits 13; the agent's worktree commits and pushes through its own clone |
+| O19a | **Agent Unix user** (§6.3 point 1, #1177): `flk agent-exec` launcher run as `flk-agent` through a one-binary sudoers rule (systemd `User=` on NixOS); socket group access; uid attestation (`getpeereid` / `SO_PEERCRED`), so a `flk-agent` caller is never the operator; agent-side clone per repo and worktrees from it with a shared read group; `flk owner bind` self-test; host user and sudoers declared in g-fleet (an issue there, operator-applied) | ~380 | O1, O11a, a g-fleet host change | ADR-0014 operator attestation (amends, §11) | server-internal; a host without the user reports "cooperative only" | The self-test fails unless `flk-agent` is **not in group `staff`** (the operator's home is `drwxr-x---` with group `staff`, and `~/.config` is 755) and a **scan finds no credential file readable by `flk-agent`** under the operator's home (`~/.config/gh`, `~/.ssh`, `~/.netrc`, `~/.git-credentials`, the Claude and Codex profile dirs, `~/Library/Keychains`). **From an agent pane:** reading the operator's `~/.config/gh/hosts.yml` fails with permission denied; `security find-internet-password -s github.com <operator home>/Library/Keychains/login.keychain-db` fails (naming the path, because a bare lookup as `flk-agent` searches only its own keychains); reading the `flk-agent` App key in the operator's flk state dir fails; `gh auth status` shows no operator login; a `setsid` child calling `flk owner limits set` exits 13; the agent's worktree commits and pushes through its own clone |
 | O19b | **Agent GitHub identity:** `flk-agent` App installation tokens minted by the operator's server (key never readable by `flk-agent`), git credential helper and `GH_TOKEN` in agent processes, refresh before expiry, per-repo `actions` write only when the binding grants it | ~300 | O19a | — | server and process env | From an agent pane, `gh api user` shows `flk-agent[bot]`; `gh api -X PUT …/branches/dev/protection` is refused by GitHub (403); `gh workflow run promote.yml` is refused; the token rotates before expiry |
 | O19c | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O19b, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
-| O20 | Command-gate rows (§6.3 layer two): the default `owner` and `delegate` rows, seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
+| O20 | Command-gate rows (§6.3 layer two): the default `owner`, `segment` and `delegate` rows (ADR-0034 §1a roles), seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane and a segment pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's or segment's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
 | O21 | ADR-0014 §5 amendment: depth counts only spawn-capable agents; `ax:` in-place forks are exempt from depth but count toward fanout and capacity | ~80 | ADR-0033 AX3 | ADR-0014 §5 (amends) | server-internal | A builder under a segment architect is forked for its AX review; a spawn-capable agent at that depth is still refused |
 
 **Order.**
@@ -1766,7 +1771,11 @@ integration branches against a direct queue) stays #1167's and gates O14.
   `issue.opened`, and assert the first turn holds the digest and that no
   `.fleet` file or pane read happens.
 
-## 10. Open questions for the owner
+## 10. Owner decisions
+
+Decided by the operator on 2026-10-13 (#1172): **every question below was
+accepted as recommended.** Each keeps its recommendation and the
+alternative it was weighed against.
 
 1. **Identity (§1).** One owner per repo fleet-wide, on a statically named
    home node with no failover (recommended). Or one per host.
@@ -1865,9 +1874,10 @@ integration branches against a direct queue) stays #1167's and gates O14.
       hold only for cooperative agents there (§6.3 point 6), and no owner on
       that host gets a merge grant.
 
-## 11. Amendments this ADR asks for
+## 11. Amendments, accepted with this ADR (2026-10-13)
 
-Each needs the owner's acceptance together with this ADR.
+All were accepted together with this ADR. Each amended ADR keeps its other
+decisions.
 
 - **ADR-0027 §1a** (§1, question 19): a harness or profile change of a bound
   owner or segment architect is a restart of the same agent record, so its
@@ -1878,9 +1888,7 @@ Each needs the owner's acceptance together with this ADR.
 - **ADR-0033 §2** (§7b): the `ax/1` rubric, which ADR-0033 lists as Q1–Q8,
   gains Q9 `tools_helped`, Q10 `tools_missed` and Q11 `discovery_gaps` on
   both the architect and builder sides (owner addition, 2026-10-12, #1091
-  comment). There is no version bump, because AX1 has not shipped. ADR-0033
-  is Accepted, so this is an amendment and needs the owner's acceptance like
-  the others.
+  comment). There is no version bump, because AX1 has not shipped.
 - **ADR-0014, the operator boundary** (§6.3 point 1, question 24): once O19a
   is live on a host, "operator" means a caller running as the operator's
   uid with no pane in its ancestry. A caller running as `flk-agent` is never
@@ -1891,5 +1899,9 @@ Each needs the owner's acceptance together with this ADR.
   supplies only their policy: the gate rows (§6.3) and which items are
   pointed at mid-turn (§2). The round-3 request to amend ADR-0034 §1 is
   withdrawn.
+- **ADR-0030: none.** The owner reuses §6's pre-compaction status handshake
+  unchanged, as its end-of-episode status turn (§1 point 4), and its stops
+  go through §2's ladder with no new rung. Episode rotation replaces
+  compaction for bound owners only. It changes no rung and no other agent.
 - **ADR-0028 §8a / ADR-0018** are unchanged. Owner mail uses existing
   intents.
