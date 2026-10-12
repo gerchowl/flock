@@ -281,10 +281,11 @@ do not use `send-keys … Enter` to submit a prompt to an agent; use
 flk pane run 1-1 "echo hello"
 ```
 
-in a shell it confirms nothing. in an agent pane it is `agent send`: the same
-draft guard, outcome json and exit codes (`--raw` types onto whatever is
-there; do not use it from automation). to prompt an agent, say `agent send`.
-in a shell, the text and the Enter
+it confirms nothing and needs no idle agent. into an agent pane whose
+composer holds a draft it refuses with exit `10` (`input_not_empty`) and
+presses no Enter (`--raw` types onto whatever is there; do not use it from
+automation). to prompt an agent and know the turn started, use `agent send`.
+the text and the Enter
 are deliberately separate writes with a short pause between them. a
 program reading raw stdin sees read boundaries, not keystrokes, and every agent
 tui uses those boundaries to tell typing from pasting — text and a carriage
@@ -509,7 +510,7 @@ flk agent result worker          # once #575 lands
 - `pane read --source recent-unwrapped` is useful when you want to inspect the same unwrapped transcript that `wait output --source recent` matches against.
 - `agent send` prints JSON with the submit outcome; unconfirmed exits 8 and abandoned exits 9.
 - `pane send-text` and `agent send --no-submit` print JSON with the delivery outcome and evidence level; unconfirmed delivery exits 8.
-- `pane send-keys` and `pane run` into a shell print nothing on success; `pane run` into an agent pane prints `agent send`'s json.
+- `pane send-keys` and `pane run` print nothing on success; a refused `pane run` exits 10.
 - parse ids from `workspace create`, `tab create`, and `pane split` responses when you need new ids. `workspace create` returns `result.workspace`, `result.tab`, and `result.root_pane`. `tab create` returns `result.tab` and `result.root_pane`. for `pane split`, the new pane id is at `result.pane.pane_id`.
 - use `pane read` for current output that already exists. use `wait output` for future output you expect next.
 - `--no-focus` on split, tab create, and workspace create keeps your current terminal context focused.

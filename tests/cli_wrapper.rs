@@ -1017,10 +1017,6 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
                     if answer_protocol_check(&mut stream, &line) {
                         continue;
                     }
-                    // A shell pane: `pane run` keeps typing into it (#1162).
-                    if answer_pane_get(&mut stream, &line, None) {
-                        continue;
-                    }
                     stream
                         .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
                         .unwrap();
@@ -1080,30 +1076,17 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     cleanup_test_base(&base);
 }
 
-/// Answer `pane.get` with a pane whose agent label is `agent`, as `pane run`
-/// asks before it picks its route (#1162).
-fn answer_pane_get(stream: &mut UnixStream, line: &str, agent: Option<&str>) -> bool {
-    let request: serde_json::Value = serde_json::from_str(line).unwrap();
-    if request["method"] != "pane.get" {
-        return false;
-    }
-    let response = serde_json::json!({
-        "id": request["id"],
-        "result": {"type": "pane_info", "pane": {"pane_id": "1-1", "agent": agent}},
-    });
-    writeln!(stream, "{response}").unwrap();
-    stream.flush().unwrap();
-    true
-}
-
-/// Run `flk pane run` against a fake server whose pane hosts `agent`, and
-/// return the requests after its `pane.get`, which stays unanswered by them.
-fn pane_run_requests(args: &[&str], agent: Option<&str>) -> (bool, Vec<serde_json::Value>) {
+/// Run `flk pane run` against a fake server that answers `pane.send_input`
+/// with `typed` and anything else with ok. Returns the exit code and the
+/// requests, in order.
+fn pane_run_requests(
+    args: &[&str],
+    typed: serde_json::Value,
+) -> (Option<i32>, Vec<serde_json::Value>) {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("flock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
-    let agent = agent.map(str::to_owned);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = done.clone();
     let server = thread::spawn(move || {
@@ -1114,18 +1097,17 @@ fn pane_run_requests(args: &[&str], agent: Option<&str>) -> (bool, Vec<serde_jso
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let line = read_request_line(&stream);
-                    if answer_protocol_check(&mut stream, &line)
-                        || answer_pane_get(&mut stream, &line, agent.as_deref())
-                    {
+                    if answer_protocol_check(&mut stream, &line) {
                         continue;
                     }
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    writeln!(
-                        stream,
-                        "{}",
-                        serde_json::json!({"id": request["id"], "result": {"type": "ok"}})
-                    )
-                    .unwrap();
+                    let mut response = if request["method"] == "pane.send_input" {
+                        typed.clone()
+                    } else {
+                        serde_json::json!({"result": {"type": "ok"}})
+                    };
+                    response["id"] = request["id"].clone();
+                    writeln!(stream, "{response}").unwrap();
                     requests.push(request);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1142,51 +1124,56 @@ fn pane_run_requests(args: &[&str], agent: Option<&str>) -> (bool, Vec<serde_jso
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     let requests = server.join().unwrap();
     cleanup_test_base(&base);
-    (run.status.success(), requests)
+    (run.status.code(), requests)
 }
 
-/// #1162: `pane run` into an agent pane submits through the guard that moves
-/// a one-row draft aside and refuses any other, instead of typing onto it.
-#[test]
-fn pane_run_into_an_agent_pane_takes_the_guarded_submit() {
-    let (ok, requests) = pane_run_requests(&["1-1", "echo hello"], Some("claude"));
-    assert!(ok);
-    assert_eq!(requests.len(), 1, "{requests:?}");
-    assert_eq!(requests[0]["method"], "agent.send");
-    assert_eq!(requests[0]["params"]["target"], "1-1");
-    assert_eq!(requests[0]["params"]["text"], "echo hello");
-    assert_eq!(requests[0]["params"]["submit"], true);
-    assert!(requests[0]["params"].get("raw").is_none());
+fn methods(requests: &[serde_json::Value]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap())
+        .collect()
 }
 
-/// #1162: `--raw` keeps the old typing in any pane, and says so to the server
-/// so its draft refusal stands aside. Without it, a shell pane's typed step
-/// carries no `raw` and the server's guard applies.
+/// #1162: into an agent pane with an empty composer, `pane run` is what it
+/// always was: type, settle, Enter, exit 0. No idle requirement, no turn
+/// confirmation, no extra request.
 #[test]
-fn pane_run_raw_types_in_any_pane_and_a_shell_pane_is_typed_into() {
-    for (args, agent, raw) in [
-        (&["--raw", "1-1", "echo hello"][..], Some("claude"), true),
-        (&["1-1", "echo hello"][..], None, false),
-    ] {
-        let (ok, requests) = pane_run_requests(args, agent);
-        assert!(ok, "{args:?}");
-        let methods: Vec<_> = requests.iter().map(|r| r["method"].clone()).collect();
-        assert_eq!(
-            methods,
-            [
-                serde_json::json!("pane.send_input"),
-                serde_json::json!("pane.send_keys")
-            ],
-            "{args:?}"
-        );
-        assert_eq!(requests[0]["params"]["text"], "echo hello");
-        assert_eq!(
-            requests[0]["params"].get("raw").is_some(),
-            raw,
-            "{args:?}: {}",
-            requests[0]
-        );
-    }
+fn pane_run_into_an_empty_agent_composer_types_and_presses_enter_as_before() {
+    let (code, requests) = pane_run_requests(
+        &["1-1", "/compact"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(requests[0]["params"]["text"], "/compact");
+    assert!(
+        requests[0]["params"].get("raw").is_none(),
+        "the server's draft check applies: {}",
+        requests[0]
+    );
+    assert_eq!(requests[1]["params"]["keys"], serde_json::json!(["Enter"]));
+}
+
+/// #1162: a draft refusal ends `pane run` with exit 10 before its Enter, so
+/// nothing the operator typed is submitted.
+#[test]
+fn pane_run_refused_onto_a_draft_exits_10_and_presses_no_enter() {
+    let refused = serde_json::json!({"error": {"code": "input_not_empty", "message": "draft"}});
+    let (code, requests) = pane_run_requests(&["1-1", "echo hello"], refused);
+    assert_eq!(code, Some(10));
+    assert_eq!(methods(&requests), ["pane.send_input"]);
+}
+
+/// #1162: `--raw` tells the server to type onto whatever is there.
+#[test]
+fn pane_run_raw_asks_the_server_to_type_anyway() {
+    let (code, requests) = pane_run_requests(
+        &["--raw", "1-1", "echo hello"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(requests[0]["params"]["raw"], true);
 }
 
 #[test]

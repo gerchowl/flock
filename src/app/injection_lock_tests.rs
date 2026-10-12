@@ -823,7 +823,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
             }),
         ),
         (
-            "pane run (typed step)",
+            "pane run",
             Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
                 pane_id: pane.into(),
                 text: "note".into(),
@@ -932,8 +932,9 @@ async fn typing_verbs_refuse_a_pane_an_injection_holds() {
     }
 }
 
-/// `flk pane run` into an agent pane takes `agent.send` with `submit` (#1162):
-/// a one-row draft moves aside and comes back, a multi-row draft refuses.
+/// `agent send` into an agent pane (#1162): a one-row draft moves aside and
+/// comes back, a multi-row draft refuses before typing. `pane run` keeps its
+/// typing and refuses any draft instead (`typing_verbs_…`).
 #[tokio::test]
 async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
     for harness in [&CLAUDE, &CODEX, &OPENCODE] {

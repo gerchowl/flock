@@ -121,7 +121,7 @@ const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent na
 pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text [--raw] <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
-pub(super) const PANE_RUN_USAGE: &str = "flk pane run [--raw | --if-input-empty [--min-age-secs N] [--if-session ID]] <target> <command>\n  Into an agent pane, run submits as flk agent send does: it needs an idle agent, moves a one-row composer draft aside and types it back after the submit, and refuses any other draft with input_not_empty (exit 10). Into a shell pane it types the command and presses Enter.\n  --raw types and presses Enter in any pane, even onto a draft. --if-input-empty is the guarded submit that refuses every draft.";
+pub(super) const PANE_RUN_USAGE: &str = "flk pane run [--raw | --if-input-empty [--min-age-secs N] [--if-session ID]] <target> <command>\n  Types the command, waits 120 ms and presses Enter. It confirms nothing and needs no idle agent.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  --if-input-empty is the guarded submit that also requires an idle agent. To submit a prompt and confirm the turn, use flk agent send.";
 pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -806,42 +806,6 @@ fn parse_guarded_pane_run(
     }))
 }
 
-/// How `flk pane run` delivers its text (#1162).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneRunRoute {
-    /// The guarded submit `agent send` makes: an idle agent, a one-row draft
-    /// moved aside and typed back (#850), any other draft refused.
-    Guarded,
-    /// Type, settle, Enter. The server still refuses a draft it can see
-    /// unless the caller passed `--raw`.
-    Typed,
-}
-
-/// A pane hosting a harness flock can read is an agent pane, and gets the
-/// guarded route unless `--raw` asks for typing. A shell keeps the typing
-/// it has always had.
-fn pane_run_route(agent_label: Option<&str>, raw: bool) -> PaneRunRoute {
-    match agent_label.and_then(crate::detect::parse_agent_label) {
-        Some(_) if !raw => PaneRunRoute::Guarded,
-        _ => PaneRunRoute::Typed,
-    }
-}
-
-/// The agent label `pane.get` reports for `pane_id`, if any. A failed lookup
-/// reads as no agent: the typed route then reports the server's refusal.
-fn pane_agent_label(pane_id: &str) -> std::io::Result<Option<String>> {
-    let response = super::send_request(&Request {
-        id: "cli:pane:run:get".into(),
-        method: Method::PaneGet(PaneTarget {
-            pane_id: pane_id.to_owned(),
-        }),
-    })?;
-    Ok(response
-        .pointer("/result/pane/agent")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned))
-}
-
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     let (raw, args) = take_raw(args);
     if args.len() < 2 {
@@ -870,19 +834,10 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     }
     let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    let label = pane_agent_label(&pane_id)?;
-    match pane_run_route(label.as_deref(), false) {
-        PaneRunRoute::Guarded => super::print_send_response(&super::send_request(&Request {
-            id: "cli:pane:run".into(),
-            method: Method::AgentSend(crate::api::schema::AgentSendParams {
-                target: pane_id,
-                text,
-                submit: true,
-                raw: false,
-            }),
-        })?),
-        PaneRunRoute::Typed => submit_sequence(&pane_id, &text, false),
-    }
+    // The same type, settle, Enter in every pane. In an agent pane the server
+    // refuses the typed step before writing when the composer holds a draft
+    // (#1162), and then no Enter is sent.
+    submit_sequence(&pane_id, &text, false)
 }
 
 /// Type `text` into `pane_id` and press Enter, as the same two separate writes
@@ -1889,22 +1844,6 @@ mod tests {
         }
         let args = ["1-1", "--if-input-empty", "--if-status", "working", "hello"].map(String::from);
         assert!(super::parse_guarded_pane_run(&args).is_err());
-    }
-
-    /// #1162: an agent pane takes the guarded submit, a shell or an unknown
-    /// harness keeps typing, and `--raw` types everywhere.
-    #[test]
-    fn pane_run_routes_agent_panes_through_the_guard() {
-        use super::{pane_run_route, PaneRunRoute};
-        for agent in ["claude", "codex", "opencode"] {
-            assert_eq!(pane_run_route(Some(agent), false), PaneRunRoute::Guarded);
-            assert_eq!(pane_run_route(Some(agent), true), PaneRunRoute::Typed);
-        }
-        assert_eq!(pane_run_route(None, false), PaneRunRoute::Typed);
-        assert_eq!(
-            pane_run_route(Some("some-unknown-tool"), false),
-            PaneRunRoute::Typed
-        );
     }
 
     #[test]
