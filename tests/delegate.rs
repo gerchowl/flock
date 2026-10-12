@@ -2023,6 +2023,64 @@ fn a19_failed_worktree_start_removes_its_checkout() {
     );
 }
 
+/// #938: with `--keep-on-failure`, a worktree start whose agent never came up
+/// keeps its checkout and its record for inspection instead of removing
+/// them, and `reap` removes what was kept.
+#[test]
+fn a19_keep_on_failure_keeps_the_checkout_of_a_failed_worktree_start() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    fs::write(server.base.join("die"), "").unwrap();
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w2",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/p938-kept",
+            "--ready-timeout",
+            "3000",
+            "--keep-on-failure",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN).expect("start gives up");
+    let out = finish(child);
+    let message = stderr(&out);
+    assert_eq!(status.code(), Some(1), "{message}");
+    assert!(
+        message.contains("kept for inspection (--keep-on-failure)"),
+        "{message}"
+    );
+    let entry = |server: &Server| {
+        walk(&server.base.join("state"))
+            .iter()
+            .any(|p| p.ends_with("w2.json"))
+    };
+    assert!(entry(&server), "the record stays: {message}");
+    assert!(
+        !walk(&server.base.join("wt")).is_empty(),
+        "the checkout stays: {message}"
+    );
+
+    let reaped = cli(&server, &["delegate", "reap", "w2", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
+    let leftovers = walk(&server.base.join("wt"));
+    assert!(
+        leftovers.is_empty(),
+        "reap removes the checkout: {leftovers:?}"
+    );
+    assert!(!entry(&server), "reap removes the record");
+}
+
 /// A process exists before its first screen paint, so that alone is not ready.
 #[test]
 fn a20_start_waits_for_the_first_screen_paint() {
