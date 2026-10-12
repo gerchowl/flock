@@ -487,6 +487,15 @@ Wait for the answer to a message you sent:
 flk wait reply <correlation_id> [--timeout MS] [--reference JSON] [--json]
 ```
 
+Read or wait on the durable event log from a cursor you hold:
+
+```bash
+flk events read [--after CURSOR] [--kinds K1,K2] [--subject ID]... [--limit N] [--json]
+flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR
+```
+
+`events read` prints one JSON line per event (`seq`, `event`, `data`), oldest first, and `next_after: N` on stderr; resume with `--after N` and dedupe on `seq`. `--json` prints the whole reply. A `gap` on stderr means the cursor is older than what the server still retains. `--kinds` takes durable kind names (`message_queued`, or `message.queued`); `--subject` matches an id the event's data carries as a top-level value (a pane, workspace, agent or message id). `events wait` prints the first matching event after `--after` (default: now) and exits 0, or exits 124 at `--timeout` (`500ms`, `5s`, `2m`). The wait is held on the server, not polled. Against a server without `events.read` both exit 78. Prefer `events wait` over a loop around `agent get`.
+
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after `msg send --intent needs-reply`: it prints the reply body to stdout and metadata to stderr, or the full result with `--json`. A sender outside any pane can wait for its held answer. `msg send --await` sends and uses the same waiter and exit codes:
 
 | Exit | Reply-wait outcome |
@@ -700,6 +709,7 @@ Exposed tools:
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. Optional `instructions` steers what the summary keeps (`/compact <instructions>`; `instructions: true` in the answer confirms they were stored). `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
 | `flock_msg_wait_reply` | `msg.wait_reply` | Block until a message you sent is answered: `outcome` `replied`/`deferred`/`expired`/`timeout`, with the answer in `reply`. Holds the MCP session for up to `timeout_ms` (default 60 s, at most 10 min); run `flk wait reply <id>` as a background task to wait longer. `flock_msg_send` with `await: true` returns the id and that command. |
+| `flock_events_read` | `events.read` | Durable events with `seq > after`, filtered by `kinds` and `subjects`; resume from `next_after`. `wait_ms` holds the call until a matching event lands, capped at 9 min (below the MCP tool timeout); run `flk events wait` as a background task to wait longer. Read-only. |
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |

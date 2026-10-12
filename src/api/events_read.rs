@@ -65,15 +65,19 @@ pub(super) fn read_events(
     if params.after > event_hub.current_sequence() {
         // Suggest the durable head: a later sequence may belong to an
         // ephemeral event that a restart hands out again.
+        // `data.head` is the structured form a client resumes from (#1029).
         let head = event_hub.durable_sequence();
-        return Ok(Some(refuse(
-            request_id,
-            "cursor_ahead",
-            format!(
-                "cursor {} is past this server's newest event {head}; read from 0 or {head}",
-                params.after
-            ),
-        )));
+        return Ok(Some(encode(&serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": "cursor_ahead",
+                "message": format!(
+                    "cursor {} is past this server's newest event {head}; read from 0 or {head}",
+                    params.after
+                ),
+                "data": {"head": head},
+            },
+        }))));
     }
     let limit = params
         .limit
