@@ -984,9 +984,8 @@ fn settled_core_observed(
 /// The newest durable event, where an event-driven wait starts reading, or
 /// `None` to poll: the server predates `events.read`, or did not say.
 ///
-/// The server names its head when it refuses a cursor past it, which keeps
-/// this a read of what is already on the wire (`data.head` once #1029 adds
-/// it, the end of the message before that).
+/// The server names its head when it refuses a cursor past it: `data.head`
+/// since #1029, the end of the message on a server from before that.
 fn event_cursor(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) -> Option<u64> {
     if requests.protocol()? < EVENTS_READ_PROTOCOL {
         return None;
@@ -994,13 +993,7 @@ fn event_cursor(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) ->
     let refusal = requests
         .events_read(u64::MAX, &[], Duration::ZERO, request_timeout(deadline)?)
         .ok()?;
-    let error = refusal.get("error")?;
-    if error["code"] != "cursor_ahead" {
-        return None;
-    }
-    error["data"]["head"]
-        .as_u64()
-        .or_else(|| error["message"].as_str()?.rsplit(' ').next()?.parse().ok())
+    super::events::cursor_ahead_head(&refusal)
 }
 
 /// Wait for the next reason to sample (#1030).
@@ -3180,7 +3173,9 @@ mod tests {
         ) -> Result<serde_json::Value, Unanswered> {
             if after == u64::MAX {
                 return Ok(response(
-                    r#"{"error":{"code":"cursor_ahead","message":"cursor 18446744073709551615 is past this server's newest event 40; read from 0 or 40"}}"#,
+                    // `data.head` wins over the message, which only an
+                    // older server's client has to read.
+                    r#"{"error":{"code":"cursor_ahead","message":"cursor 18446744073709551615 is past this server's newest event 7; read from 0 or 7","data":{"head":40}}}"#,
                 ));
             }
             let subjects = subjects.iter().map(|subject| subject.to_string()).collect();
