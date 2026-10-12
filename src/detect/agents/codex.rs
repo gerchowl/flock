@@ -1,17 +1,22 @@
 use super::super::{has_confirmation_prompt, has_interrupt_pattern, AgentState};
+use crate::api::agent_state::HumanReason;
 
 pub(super) fn detect(content: &str) -> AgentState {
     let lower = content.to_lowercase();
 
     // Strong blocked patterns are structural Codex UI chrome, so they can win
     // even when the prompt region is visible.
-    if has_codex_strong_blocked_prompt(&lower) {
+    if has_codex_strong_blocked_prompt(&lower) || has_codex_login(content) {
         return AgentState::Blocked;
     }
 
     // Working
     if has_codex_slow_model_notice(content) || has_codex_working_status_at_current_prompt(content) {
         return AgentState::Working;
+    }
+
+    if has_provider_limit(content) {
+        return AgentState::Blocked;
     }
 
     // Idle
@@ -37,6 +42,55 @@ pub(super) fn detect(content: &str) -> AgentState {
 pub(super) fn has_visible_blocker(content: &str) -> bool {
     let lower = content.to_lowercase();
     has_codex_strong_blocked_prompt(&lower)
+        || has_codex_login(content)
+        || has_provider_limit(content)
+}
+
+/// The turn that ended right above the live composer ended on Codex's
+/// usage-limit error (0.160.1, #1023). A later turn owns that spot.
+pub(in crate::detect) fn has_provider_limit(content: &str) -> bool {
+    codex_last_block_marker_before_current_prompt(content).is_some_and(|line| {
+        line.trim_start()
+            .to_lowercase()
+            .replace('\u{2019}', "'")
+            .starts_with("\u{25a0} you've hit your usage limit")
+    })
+}
+
+/// Codex's sign-in picker, the whole live tail of a logged-out start.
+fn has_codex_login(content: &str) -> bool {
+    let bottom = bottom_non_empty_lines(content, 16);
+    bottom
+        .last()
+        .is_some_and(|line| line.trim() == "Press enter to continue")
+        && bottom
+            .iter()
+            .any(|line| line.trim_start().ends_with("1. Sign in with ChatGPT"))
+        && bottom
+            .iter()
+            .any(|line| line.trim_start().starts_with("3. Provide your own API key"))
+}
+
+/// What a blocked Codex screen asks of a human (#1023), read from the same
+/// controls that made it blocked. A prompt none of them names is a `dialog`.
+pub(in crate::detect) fn needs_human(content: &str) -> HumanReason {
+    let lower = bottom_non_empty_lines(content, 24)
+        .join("\n")
+        .to_lowercase();
+    if has_codex_folder_trust(&lower) || has_codex_hook_review(&lower) {
+        HumanReason::Trust
+    } else if has_codex_login(content) {
+        HumanReason::Login
+    } else if lower.contains("enter to submit answer") || lower.contains("enter to submit all") {
+        HumanReason::Question
+    } else if lower.contains("would you like to run the following command?")
+        || lower.contains("would you like to make the following edits?")
+        || lower.contains("allow command?")
+    {
+        HumanReason::Permission
+    } else {
+        HumanReason::Dialog
+    }
 }
 
 pub(super) fn has_prompt(content: &str) -> bool {

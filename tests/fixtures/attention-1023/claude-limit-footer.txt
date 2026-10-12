@@ -1,0 +1,22 @@
+
+⏺ Usage limit reached · continuing
+  automatically at 5:41am · esc to cancel
+
+✻ Churned for 0s · done 2:24 AM
+
+❯ LIMIT please
+
+⏺ Usage limit reached again · continuing
+  automatically at 5:41am · esc to cancel
+  ⎿  You've hit your session limit · resets 5:41am
+     (Europe/Zurich)
+
+✻ Cogitated for 0s · done 2:24 AM
+
+──────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────
+  ⚠ Usage limit reached · limit resets 5:41am
+    Continuing automatically at 5:41am · esc to
+    cancel
+  ⏸ manual mode on · ? for shortcuts · ← for agents

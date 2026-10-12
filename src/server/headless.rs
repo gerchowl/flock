@@ -5582,6 +5582,7 @@ next_tab = ""
                 visible_working: false,
                 settled_with_background_shells: false,
                 background_tasks: None,
+                needs_human: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -8459,6 +8460,7 @@ next_tab = ""
             visible_working: false,
             settled_with_background_shells: false,
             background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: Instant::now(),
         });
@@ -8524,6 +8526,7 @@ next_tab = ""
             visible_working: false,
             settled_with_background_shells: false,
             background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: Instant::now(),
         });

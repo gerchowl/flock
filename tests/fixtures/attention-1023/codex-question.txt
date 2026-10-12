@@ -1,0 +1,21 @@
+› ASK now
+
+  Worked for <1s • 02:28
+
+• Model changed to gpt-fake medium for Plan mode.
+
+
+› ASK plan
+
+
+
+  Question 1/1 (1 unanswered)
+  Which colour should the probe use?
+
+  › 1. Red (Recommended)  A red probe
+    2. Blue               A blue probe
+    3. None of the above  Optionally, add details in
+                          notes (tab)
+
+  tab to add notes | enter to submit answer
+  esc to interrupt
