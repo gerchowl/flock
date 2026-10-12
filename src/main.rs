@@ -547,6 +547,7 @@ fn run() -> io::Result<()> {
         println!("       flk delegate <subcommand> ...");
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
+        println!("       flk events <read|wait> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
@@ -616,6 +617,10 @@ fn run() -> io::Result<()> {
             (
                 "flk wait <subcommand>",
                 "Blocking wait helpers over the socket API",
+            ),
+            (
+                "flk events <read|wait>",
+                "Read or wait on the durable event log from a cursor",
             ),
             (
                 "flk session <subcommand>",

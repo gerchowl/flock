@@ -46,7 +46,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Send pastes text (bracketed when enabled) without submitting. Use pane send-keys for control keys (Enter, C-c, Esc). --submit requires a fresh idle agent and empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry).\n  Use -- before the target to send text beginning with --submit literally.\n  Plain send observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). --submit reports accepted, observed_accepted, unconfirmed (exit 8) or abandoned (exit 9).";
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Use pane send-keys for control keys (Enter, C-c, Esc).\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
 
 pub(super) const AGENT_HISTORY_USAGE: &str =
     "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
@@ -917,11 +917,20 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// A send submits unless `--no-submit` says otherwise (#995). `--submit`, the
+/// old opt-in, is still accepted and changes nothing.
 fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     let mut words = args;
-    let mut submit = false;
-    if words.first().is_some_and(|word| word == "--submit") {
-        submit = true;
+    let mut submit = true;
+    let mut flag = |word: &str| match word {
+        "--submit" => true,
+        "--no-submit" => {
+            submit = false;
+            true
+        }
+        _ => false,
+    };
+    while words.first().is_some_and(|word| flag(word)) {
         words = &words[1..];
     }
     let literal = words.first().is_some_and(|word| word == "--");
@@ -930,8 +939,7 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     }
     let target = words.first()?.clone();
     let mut text = &words[1..];
-    if !literal && text.first().is_some_and(|word| word == "--submit") {
-        submit = true;
+    while !literal && text.first().is_some_and(|word| flag(word)) {
         text = &text[1..];
     }
     if text.is_empty() {
@@ -947,7 +955,7 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
 fn agent_send(args: &[String]) -> std::io::Result<i32> {
     let Some(params) = parse_agent_send_args(args) else {
         eprintln!("usage: {AGENT_SEND_USAGE}");
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     };
     super::print_send_response(&super::send_request(&Request {
         id: "cli:agent:send".into(),
@@ -1186,7 +1194,7 @@ fn print_agent_help() {
     eprintln!("    pass --workspace/--tab/--cwd, or --active, instead of being placed at random;");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send types without submitting; use agent send --submit to type and send Enter"
+        "  agent send types and submits with a confirmed Enter; agent send --no-submit only types"
     );
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
@@ -1207,7 +1215,7 @@ mod tests {
     use super::{parse_agent_start_flags, AGENT_START_USAGE};
 
     #[test]
-    fn agent_send_preserves_raw_text_and_parses_explicit_submit() {
+    fn agent_send_submits_by_default_and_no_submit_types_only() {
         let parse = |words: &[&str]| {
             super::parse_agent_send_args(
                 &words
@@ -1217,24 +1225,34 @@ mod tests {
             )
             .expect("valid send")
         };
-        let raw = parse(&["worker", "hello\nworld", "--submit"]);
-        assert!(!raw.submit);
-        assert_eq!(raw.text, "hello\nworld --submit");
+        let plain = parse(&["worker", "hello"]);
+        assert!(plain.submit, "a plain send submits (#995)");
+        let raw = parse(&["worker", "hello\nworld", "--no-submit"]);
+        assert!(raw.submit);
+        assert_eq!(raw.text, "hello\nworld --no-submit");
+        for words in [
+            vec!["--no-submit", "worker", "hello"],
+            vec!["worker", "--no-submit", "hello"],
+        ] {
+            let parsed = parse(&words);
+            assert!(!parsed.submit);
+            assert_eq!(parsed.target, "worker");
+            assert_eq!(parsed.text, "hello");
+        }
         for words in [
             vec!["--submit", "worker", "hello"],
             vec!["worker", "--submit", "hello"],
         ] {
             let parsed = parse(&words);
-            assert!(parsed.submit);
-            assert_eq!(parsed.target, "worker");
+            assert!(parsed.submit, "--submit stays an accepted alias");
             assert_eq!(parsed.text, "hello");
         }
-        let literal = parse(&["--", "worker", "--submit", "hello"]);
-        assert!(!literal.submit);
-        assert_eq!(literal.text, "--submit hello");
+        let literal = parse(&["--", "worker", "--no-submit", "hello"]);
+        assert!(literal.submit);
+        assert_eq!(literal.text, "--no-submit hello");
         assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
-        assert!(super::parse_agent_send_args(&["worker".into(), "--submit".into()]).is_none());
-        assert!(super::AGENT_SEND_USAGE.contains("without submitting"));
+        assert!(super::parse_agent_send_args(&["worker".into(), "--no-submit".into()]).is_none());
+        assert!(super::AGENT_SEND_USAGE.contains("--no-submit types only"));
     }
 
     #[test]

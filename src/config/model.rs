@@ -1127,7 +1127,7 @@ impl PeerConfig {
 
 /// `[ui.injection_lock]` (#850): while flock types a guarded injection into a
 /// pane, the operator's keystrokes for that pane are held and replayed after
-/// it, and `agent send --submit` or an inbox wake moves a one-row draft aside
+/// it, and `agent send` or an inbox wake moves a one-row draft aside
 /// and types it back. Off restores the earlier behaviour: keystrokes go
 /// straight through and a draft refuses the injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
