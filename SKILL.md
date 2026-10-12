@@ -241,10 +241,10 @@ on the exit code, and read `result.outcome` and `result.reason` for detail:
   or you will submit it twice.
 - `9` — `abandoned`: something changed before the Enter (operator input, a
   dialog). nothing was submitted and the composer is untouched; send again.
-- refused before typing anything (`not_settled`, `input_not_empty`,
+- `10` — refused before typing anything (`not_settled`, `input_not_empty`,
   `operator_active`, `injection_pending`, …): nothing changed. the error json
-  on stderr names the code. this exits `1` today and `10` once #1025 lands.
-  wait for the agent (`flk agent wait worker --status idle`) and send again.
+  on stderr names the code (it was exit `1` before #1025). wait for the
+  agent (`flk agent wait worker --status idle`) and send again.
 
 `--no-submit` types only, without Enter, and reports `delivered` or
 `unconfirmed` (exit 8). to message another agent rather than prompt it, use

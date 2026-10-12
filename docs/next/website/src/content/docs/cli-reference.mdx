@@ -429,7 +429,8 @@ Send outcome codes (`agent send`, `pane send-text`, and guarded `pane run`):
 | `0` | `delivered`, `accepted`, or `observed_accepted` |
 | `8` | `unconfirmed`: delivery or acceptance could not be confirmed. Reason `typed_not_submitted` means the sent text is still in the composer: inspect or clear it before retrying |
 | `9` | `abandoned`: guarded submission stopped because its preconditions changed |
-| `1` | API or transport failure, or a refusal before anything was typed (`not_settled`, `input_not_empty`, `operator_active`, `injection_pending`, …; the code is in the error JSON). Nothing changed, so send again once the condition clears. Refusals move to their own code, `10`, with #1025 |
+| `10` | refused before anything was typed (`not_settled`, `input_not_empty`, `operator_active`, `injection_pending`, …; the code is in the error JSON). Nothing changed, so send again once the condition clears (`1` before #1025) |
+| `1` | API or transport failure |
 | `2` | Invalid arguments |
 
 Failure JSON remains on stderr. Guarded results include the delivery `attempt` evidence and `reason`. MCP `flock_pane_submit` uses the same numeric error codes 8 and 9, with the outcome as the error message and the complete result in error `data`. Raw paste tools remain unexposed via MCP.
