@@ -694,6 +694,7 @@ pub(super) fn run_delegate_command(args: &[String]) -> io::Result<i32> {
         "result" => delegate_result(&args[1..]),
         "status" => delegate_status(&args[1..]),
         "reap" => delegate_reap(&args[1..]),
+        "list" => super::delegate_list::delegate_list(&args[1..]),
         "help" | "--help" | "-h" => {
             print_delegate_help();
             Ok(0)
@@ -713,6 +714,7 @@ fn print_delegate_help() {
     eprintln!("  {RESULT_USAGE}");
     eprintln!("  {STATUS_USAGE}");
     eprintln!("  {REAP_USAGE}");
+    eprintln!("  {}", super::delegate_list::LIST_USAGE);
 }
 
 /// A usage error: the line on stderr, exit 2, and nothing created.

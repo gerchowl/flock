@@ -1244,6 +1244,7 @@ impl App {
                     .state_changed_at
                     .map(|changed| changed.elapsed().as_millis() as u64),
                 self.agent_background(terminal, pane.agent_status),
+                super::api_helpers::screen_attention(provider_wait, terminal.needs_human),
             )),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {

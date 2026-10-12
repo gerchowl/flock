@@ -7,9 +7,9 @@
 //! table, which is part of the contract and drift-locked by the tests below.
 //!
 //! `turn` and `lifecycle` come from today's detectors, `background` from
-//! Claude's footer counter or the pane's process tree (#1022). `attention`
-//! stays `unknown` until E1c (#1023). `finished` is never inferred from an
-//! unknown background.
+//! Claude's footer counter or the pane's process tree (#1022), `attention`
+//! from the detector's `blocked` split by what the screen shows (#1023).
+//! `finished` is never inferred from an unknown background.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -50,15 +50,52 @@ impl Background {
     }
 }
 
-/// This slice emits only `unknown` here. The other values exist so the phase
-/// table can be derived and locked whole; E1c gives them their reasons.
+/// Whether the agent waits on someone (ADR-0028 §1): `"none"`,
+/// `{"needs_human": {"reason": …}}`, `{"blocked": {"reason": …,
+/// "retry_after_ms"?: N}}` or `"unknown"` on the wire. A reason this build
+/// does not know reads as `unknown` and keeps its variant (§3a).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
     None,
-    NeedsHuman,
+    /// A prompt at the pane that a human answers: today's `blocked`.
+    NeedsHuman {
+        #[serde(default, deserialize_with = "or_unknown")]
+        reason: HumanReason,
+    },
+    /// A state no quick answer at the pane resolves.
+    Blocked {
+        #[serde(default, deserialize_with = "or_unknown")]
+        reason: BlockedReason,
+        #[serde(
+            default,
+            deserialize_with = "or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        retry_after_ms: Option<u64>,
+    },
+    #[default]
+    Unknown,
+}
+
+/// What a `needs_human` prompt asks for. `unknown` is a prompt whose kind
+/// its source cannot name: a hook report, or a harness without matchers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanReason {
+    Question,
+    Permission,
+    Dialog,
+    Trust,
+    Login,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReason {
     ProviderLimit,
-    Blocked,
     #[default]
     Unknown,
 }
@@ -190,9 +227,15 @@ impl AgentState {
             (Lifecycle::Gone, _) => Phase::Gone,
             (Lifecycle::Hibernated, _) => Phase::Hibernated,
             (Lifecycle::Offline, _) => Phase::Offline,
-            (_, Attention::ProviderLimit) => Phase::LimitReached,
-            (_, Attention::Blocked) => Phase::Blocked,
-            (_, Attention::NeedsHuman) => Phase::NeedsHuman,
+            (
+                _,
+                Attention::Blocked {
+                    reason: BlockedReason::ProviderLimit,
+                    ..
+                },
+            ) => Phase::LimitReached,
+            (_, Attention::Blocked { .. }) => Phase::Blocked,
+            (_, Attention::NeedsHuman { .. }) => Phase::NeedsHuman,
             _ if turn == Turn::Working => Phase::Working,
             _ if settled && wait_open => Phase::WaitingOnEvent,
             _ if settled && matches!(background, Background::Running { .. }) => {
@@ -244,6 +287,17 @@ mod tests {
     use Lifecycle as L;
 
     const RUN: B = B::Running { count: 1 };
+    const LIMIT: A = A::Blocked {
+        reason: BlockedReason::ProviderLimit,
+        retry_after_ms: None,
+    };
+    const BLOCKED: A = A::Blocked {
+        reason: BlockedReason::Unknown,
+        retry_after_ms: None,
+    };
+    const HUMAN: A = A::NeedsHuman {
+        reason: HumanReason::Permission,
+    };
 
     /// Drift lock on the ADR-0028 §1 phase table, one row per phase in the
     /// ADR's order. Each row's inputs also satisfy the rows below it, so a
@@ -251,12 +305,12 @@ mod tests {
     /// this table is a contract change: update the ADR and its supervisors.
     #[rustfmt::skip]
     const TABLE: [(&str, L, A, Turn, B, bool, u64); 14] = [
-        ("gone", L::Gone, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
-        ("hibernated", L::Hibernated, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
-        ("offline", L::Offline, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
-        ("limit_reached", L::Live, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
-        ("blocked", L::Live, A::Blocked, Turn::Working, RUN, true, SETTLE_MS),
-        ("needs_human", L::Live, A::NeedsHuman, Turn::Working, RUN, true, SETTLE_MS),
+        ("gone", L::Gone, LIMIT, Turn::Working, RUN, true, SETTLE_MS),
+        ("hibernated", L::Hibernated, LIMIT, Turn::Working, RUN, true, SETTLE_MS),
+        ("offline", L::Offline, LIMIT, Turn::Working, RUN, true, SETTLE_MS),
+        ("limit_reached", L::Live, LIMIT, Turn::Working, RUN, true, SETTLE_MS),
+        ("blocked", L::Live, BLOCKED, Turn::Working, RUN, true, SETTLE_MS),
+        ("needs_human", L::Live, HUMAN, Turn::Working, RUN, true, SETTLE_MS),
         ("working", L::Live, A::None, Turn::Working, RUN, true, SETTLE_MS),
         ("waiting_on_event", L::Live, A::None, Turn::Idle, RUN, true, SETTLE_MS),
         ("finished_with_background", L::Live, A::None, Turn::Idle, RUN, false, SETTLE_MS),
@@ -337,5 +391,39 @@ mod tests {
         .unwrap();
         assert_eq!(state.background, B::Unknown);
         assert_eq!(state.source.background, Some(StateSource::ProcessTree));
+    }
+
+    #[test]
+    fn attention_wire_shape_and_an_unknown_reason_keep_their_variant() {
+        let wire = |a: A| serde_json::to_value(a).unwrap();
+        assert_eq!(wire(A::None), "none");
+        assert_eq!(
+            wire(HUMAN),
+            serde_json::json!({"needs_human": {"reason": "permission"}})
+        );
+        assert_eq!(
+            wire(A::Blocked {
+                reason: BlockedReason::ProviderLimit,
+                retry_after_ms: Some(1_500)
+            }),
+            serde_json::json!({"blocked": {"reason": "provider_limit", "retry_after_ms": 1_500}})
+        );
+        let state: AgentState = serde_json::from_str(
+            r#"{"attention":{"needs_human":{"reason":"captcha"}},"source":{"attention":"screen"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            state.attention,
+            A::NeedsHuman {
+                reason: HumanReason::Unknown
+            }
+        );
+        let state: AgentState = serde_json::from_str(
+            r#"{"attention":{"blocked":{"reason":"provider_limit","retry_after_ms":"soon"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.attention, LIMIT);
+        let state: AgentState = serde_json::from_str(r#"{"attention":"stalled"}"#).unwrap();
+        assert_eq!(state.attention, A::Unknown);
     }
 }

@@ -1,0 +1,45 @@
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Sonnet 5.5 · API Usage Billing
+ ▝▝   ▝▝   /fixture/attention-1023/repo
+
+
+❯ PERM please
+
+⏺ Bash(touch probe-1023.txt)
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Sonnet 5.5 · API Usage Billing
+ ▝▝   ▝▝   /fixture/attention-1023/repo
+
+
+❯ PERM please
+
+⏺ Bash(touch probe-1023.txt)
+  ⎿  Done
+
+⏺ ok
+
+⏺ Ran 3 stop hooks (ctrl+o to expand)
+  ⎿  Stop hook error: End your turn with a
+  single sentinel line: `※ recap: <current
+  state>. Next: <one concrete step>.` Then
+  stop.
+
+⏺ ok
+
+✻ Brewed for 1s · done 2:22 AM
+
+❯ ASK please
+────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour should the probe use?
+
+❯ 1. Red
+     A red probe
+  2. Blue
+     A blue probe
+  3. Type something.
+────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

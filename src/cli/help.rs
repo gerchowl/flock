@@ -92,6 +92,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("delegate", "result", super::delegate::RESULT_USAGE),
     ("delegate", "status", super::delegate::STATUS_USAGE),
     ("delegate", "reap", super::delegate::REAP_USAGE),
+    ("delegate", "list", super::delegate_list::LIST_USAGE),
     (
         "worktree",
         "list",
@@ -601,7 +602,10 @@ mod tests {
             "worktree" => include_str!("worktree.rs"),
             "tab" => include_str!("tab.rs"),
             "notification" => include_str!("notification.rs"),
-            "delegate" => include_str!("delegate.rs"),
+            "delegate" => concat!(
+                include_str!("delegate.rs"),
+                include_str!("delegate_list.rs")
+            ),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
             "mcp" => include_str!("mcp.rs"),
