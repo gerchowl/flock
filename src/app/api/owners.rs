@@ -118,7 +118,7 @@ fn not_bound(id: String, repo: &str) -> String {
     encode_error(
         id,
         "not_found",
-        format!("no owner is bound to {repo:?} on this node; see `flk owner list`"),
+        format!("no owner is bound to {repo:?} on this node; `owner.list` shows the bindings here"),
     )
 }
 

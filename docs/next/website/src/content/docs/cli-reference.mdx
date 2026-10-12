@@ -543,21 +543,6 @@ flk adapter hello <binding> [--token-file PATH]
 
 Prints the `channel.hello` reply (binding, owner node, target, scopes) and exits 0. Exits 1 with `channel_unauthorized` (unknown binding or wrong token) or `channel_not_owner`, and 78 against a server without `channel.hello`. The token is read from the binding's token file unless `--token-file` names another one. See [Channel adapters](/socket-api/#channel-adapters).
 
-Bind a repo to its resident owner (ADR-0035 §1), end the binding, or read the bindings:
-
-```bash
-flk owner bind <owner/repo> --checkout PATH --harness <claude|codex|opencode> [--model MODEL] [--profile NAME]...
-flk owner unbind <owner/repo>
-flk owner list
-flk owner show <owner/repo>
-```
-
-The binding is server state on the node that runs `bind`, which becomes the owner's home node. `bind` mints the owner's `agent_id`. Binding a bound repo again changes its checkout, harness, model and profiles and keeps the `agent_id`, because an owner keeps one id for life. `--checkout` must be a git checkout on that node; a relative path is resolved against the current directory. `--profile` may repeat, first choice first. Each verb prints the server's reply as JSON.
-
-After a successful bind, `bind` adds `layer_one` to the reply: one entry per layer-one point of ADR-0035 §6.3, read from GitHub with `gh api` and never changed. `state` is `in_place`, `missing`, `unavailable` (GitHub refuses branch protection on the repo's plan, so the merge gate stays `ask`), `unknown` (the read failed, with `gh`'s error as `detail`) or `not_built` (the flk side ships in a later slice, named in `detail`). The points are `agent_user`, `gate_app`, `required_gate_check` (the default branch requires `flk/land-gate`, through branch protection or a ruleset), `release_environment` (an environment `release` with a required reviewer) and `bypass_detection`.
-
-`bind` and `unbind` are operator verbs. Called from an agent's pane, or relayed from a mesh peer, they exit 13 with `operator_only` and change nothing. A child an agent detaches with `setsid` still attests as the operator until agents run as their own user (#1208). `unbind` and `show` exit 4 with `not_found` for a repo with no binding on this node. Against a server without `owner.*` (protocol below 30), `bind` and `unbind` exit 78 before sending.
-
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after `msg send --intent needs-reply`: it prints the reply body to stdout and metadata to stderr, or the full result with `--json`. A sender outside any pane can wait for its held answer. `msg send --await` sends and uses the same waiter and exit codes:
 
 | Exit | Reply-wait outcome |

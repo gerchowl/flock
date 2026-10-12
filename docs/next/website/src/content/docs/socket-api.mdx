@@ -623,7 +623,7 @@ A repo's resident owner (ADR-0035 §1) is a **binding**, not a session: server s
 
 The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`) and `owner_unbound` (`repo`). The server folds them once per start, in the same log read as delegation edges and goals, and emits every binding again as `owner_bound` with `reissued: true` on every start and after every log rotation, so an owner that stays quiet cannot rotate out. A server older than 2.0.0 quarantines a log that holds these kinds; servers from 2.0.0 skip them.
 
-**Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo, until owner addresses resolve over the mesh (#1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
+**Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo, (#1234, after owner addresses resolve over the mesh, #1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
 
 ## Reading panes
 

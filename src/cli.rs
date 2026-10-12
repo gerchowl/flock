@@ -34,7 +34,6 @@ mod mcp;
 mod msg;
 mod notification;
 pub(crate) mod output;
-mod owner;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
@@ -217,7 +216,6 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "digest" => digest::run_digest_command(&args[2..])?,
         "events" => events::run_events_command(&args[2..])?,
         "adapter" => adapter::run_adapter_command(&args[2..])?,
-        "owner" => owner::run_owner_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,

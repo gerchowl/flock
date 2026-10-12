@@ -9,8 +9,8 @@
 //! owner that stays quiet for weeks cannot rotate out.
 //!
 //! Known limits: the fold is per node, so "one owner per repo fleet-wide" is
-//! not enforced across nodes until owner addressing resolves bindings over
-//! the mesh (O7, #1212); and the binding records no policy reference until
+//! not enforced across nodes yet (#1234, after O7 #1212 resolves owner
+//! addresses over the mesh); and the binding records no policy reference until
 //! adoption exists (O0, #1195).
 
 use std::collections::BTreeMap;
