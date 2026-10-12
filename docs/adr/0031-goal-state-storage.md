@@ -137,9 +137,21 @@ SQLite with `fullfsync=ON` costs the same 4–5 ms as the fold's append.
     quarantining the log, #1020) being in a *released* binary. Without it, a
     server older than G1 that reads a log holding `Goal*` events quarantines the
     active file, for example after a downgrade or a handoff to an older binary.
-    #1058 is still open in batch #1066 and is planned to ship in v1.3.0. G1
-    must not ship to the fleet before the release carrying #1058 is the
-    oldest running version.
+    #1058 shipped in v2.0.0, so every server sharing a log must be 2.0.0 or
+    newer before a goal is armed. G1 must not ship to the fleet before 2.0.0
+    is the oldest running version.
+    **Downgrade recovery.** A 1.x server that meets a `Goal*` line in the
+    active file renames that file to `event-log.corrupt.jsonl` and starts a
+    fresh `event-log.jsonl`, numbering above the highest sequence it could
+    salvage. A rotated file holding a goal line is left on disk but dropped
+    from that server's view. Nothing is deleted, so the operator recovers
+    the goals by, with every server on the log stopped: upgrading them to
+    2.0.0 or newer, copying `event-log.corrupt.jsonl` aside (a second
+    quarantine would overwrite it), putting its lines in front of the fresh
+    `event-log.jsonl`, and removing it. The next start folds the goals back
+    and re-issues them. The steps are in the socket API docs next to the
+    goal kinds; `a_log_a_1x_server_quarantined_is_recovered_by_prepending_it`
+    checks them.
   - **G2 (#1035), G5 (#884):** rungs and the pre-compaction `GoalStatusSet`
     handshake read the in-memory record only.
   - **G3a (#885), G3b (#1036):** the breaker, `degraded` state and

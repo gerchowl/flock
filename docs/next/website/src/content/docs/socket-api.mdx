@@ -168,6 +168,15 @@ When `agent.start`, `agent.spawn` or `agent.fork` succeeds and the caller's proc
 
 An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. There are no goal methods yet: `goal.*` verbs, the CLI and the MCP tools follow (#1155, #1156).
 
+If a 1.x server did run against such a log, it renamed the active file to `event-log.corrupt.jsonl` in the server's data directory (`~/.config/flock`, or `~/.config/flock/sessions/<name>` for a named session) and started a fresh `event-log.jsonl`, numbering above the events it set aside. A rotated file (`event-log.1.jsonl` to `event-log.4.jsonl`) holding a goal event is not renamed, only skipped by that server. Nothing is deleted, so the goals can be recovered:
+
+1. Stop every server that uses the log, and upgrade each to 2.0.0 or newer.
+2. Copy `event-log.corrupt.jsonl` somewhere safe. A second quarantine would overwrite it.
+3. Put its lines in front of the fresh file, then remove it: `cat event-log.corrupt.jsonl event-log.jsonl > event-log.merged && mv event-log.merged event-log.jsonl && rm event-log.corrupt.jsonl`. If the quarantined file does not end in a newline, drop its last, partial line first.
+4. Start the server. It reads every event back, folds the goals and re-issues each open one.
+
+Events the 1.x server wrote in between are kept, after the recovered ones.
+
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```

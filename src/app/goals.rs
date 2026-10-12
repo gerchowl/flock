@@ -399,6 +399,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
 
+    /// Each start re-issues every open goal exactly once, so a second
+    /// restart in a row adds one more copy per open goal, not one per copy
+    /// already in the log. A met goal is not re-issued.
+    #[tokio::test]
+    async fn two_restarts_in_a_row_each_reissue_one_copy_per_open_goal() {
+        const MET: &str = "agent_met";
+        let log = temp_log("goal-two-restarts");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        for envelope in open_script() {
+            app.record_goal_event(envelope);
+        }
+        app.record_goal_event(armed("agent_second"));
+        app.record_goal_event(armed(MET));
+        app.record_goal_event(event(
+            EventKind::GoalMet,
+            EventData::GoalMet {
+                agent_id: MET.into(),
+            },
+        ));
+        shutdown(app);
+
+        let reissued = |hub: &EventHub, agent: &str| {
+            goal_events(hub)
+                .iter()
+                .filter(|data| {
+                    matches!(
+                        data,
+                        EventData::GoalArmed {
+                            agent_id,
+                            reissued: true,
+                            ..
+                        } if agent_id == agent
+                    )
+                })
+                .count()
+        };
+        for restart in 1..=2 {
+            let hub = EventHub::with_persistence(log.clone());
+            let mut app = app_on(hub.clone());
+            app.reissue_open_records();
+            assert_eq!(reissued(&hub, AGENT), restart, "restart {restart}");
+            assert_eq!(reissued(&hub, "agent_second"), restart, "restart {restart}");
+            assert_eq!(reissued(&hub, MET), 0, "a met goal is closed");
+            assert_eq!(app.goals.get(AGENT), Some(&expected_open_record()));
+            shutdown(app);
+        }
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// ADR-0031's acceptance probe, pane move: moving an agent's pane into
+    /// another workspace re-scopes its pane id but keeps its `AgentId`, so
+    /// the goal stays with it, writes nothing, and refolds after a restart.
+    #[tokio::test]
+    async fn a_pane_move_keeps_the_goal_with_its_agent() {
+        let log = temp_log("goal-pane-move");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let agent = caller_is_an_agent(&mut app);
+        app.record_goal_event(armed(&agent));
+        let record = app.goals.get(&agent).cloned().expect("armed");
+        let written = goal_events(&hub).len();
+
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.pane_info(0, pane).expect("pane info").pane_id;
+        let tab_id = app.public_tab_id(1, 0).expect("target tab");
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneMove(crate::api::schema::PaneMoveParams {
+                pane_id: pane_id.clone(),
+                destination: crate::api::schema::PaneMoveDestination::Tab {
+                    tab_id,
+                    target_pane_id: None,
+                    split: crate::api::schema::SplitDirection::Right,
+                    ratio: None,
+                },
+                focus: false,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).expect("json");
+        let moved = &response["result"]["move_result"]["pane"];
+        assert_ne!(moved["pane_id"], serde_json::json!(pane_id), "{response}");
+        let terminal = app
+            .state
+            .terminals
+            .iter()
+            .find(|(id, _)| serde_json::json!(id.to_string()) == moved["terminal_id"])
+            .map(|(_, terminal)| terminal.agent_id.to_string());
+        assert_eq!(
+            terminal,
+            Some(agent.clone()),
+            "the moved pane is the same agent"
+        );
+
+        assert_eq!(app.goals.get(&agent), Some(&record));
+        assert_eq!(
+            goal_events(&hub).len(),
+            written,
+            "a move writes no goal event"
+        );
+        shutdown(app);
+
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        app.reissue_open_records();
+        assert_eq!(app.goals.get(&agent), Some(&record));
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
     /// ADR-0031 §4: a goal that writes nothing (parked) outlives more
     /// rotations than the log keeps files, because each rotation re-issues it.
     #[tokio::test]
