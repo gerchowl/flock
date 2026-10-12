@@ -6,8 +6,11 @@
   #1073 (cron agents), #1074 (event triggers and hook/script surface) and
   #1078 (watch surface and cross-repo blocking); §5 answers them. Composes with
   ADR-0034 (#1160, harness hooks and question routing, Proposed on PR #1174
-  at `210d1285`). This record takes ADR-0034's question routing as decided
-  there, and asks for one amendment to its §1 hook set (§6.3). Answers
+  at `bed30fae`). The split between them: **ADR-0034 owns every hook
+  mechanism** (the shell command gate §1a, mid-turn delivery §1b, question
+  routing and `ask_operator` §2–§5). **ADR-0035 owns the policy** (the gate's
+  rows, which items are delivered mid-turn) **and the server-side boundary**
+  (§6.3–§6.4). This ADR asks ADR-0034 for no amendment. Answers
   #1167 (architects of architects) for its identity, intake and protocol
   parts (§1a); its dry run stays #1167's.
 - Revised: 2026-10-12, round 2. Adds the owner's daily standup and
@@ -19,15 +22,22 @@
   into the binding (§6.2), so the owner cannot raise its own limits. Shadow
   mode covers the whole owner, and O11a and O11b come before it (§7, §9). Triggers in
   issue bodies cannot reach the new actions (§5). The request chain is
-  derived by the server (§4). The ADR asks for amendments to ADR-0027 §1a,
-  ADR-0014 §5 and ADR-0034 §1 (§11). Numbers and slice sizes are
-  re-estimated.
+  derived by the server (§4). The ADR asks for amendments to ADR-0027 §1a
+  and ADR-0014 §5 (§11). Numbers and slice sizes are re-estimated.
+- Revised: 2026-10-13, round 4, alignment with ADR-0034 at `bed30fae`. Layer
+  two of §6.3 is now ADR-0034 §1a's command gate, with only the rows kept
+  here; the requested ADR-0034 §1 amendment is withdrawn. Mid-turn delivery
+  follows ADR-0034 §1b: Claude and Codex at the next gated shell call,
+  opencode at the turn boundary (§2). Owners and server-started agents are
+  `ask_operator` roots (§1, §3, §4, §5). `ax/1`'s Q9–Q11 are the primary
+  input of §7b. Slice dependencies name ADR-0034's Q-slices.
 - Builds on: ADR-0004 (per-repo `.flk.toml`), ADR-0005 (durable log), ADR-0006
   (addressing), ADR-0014 (agent spawn ceiling, operator boundary), ADR-0018 /
   ADR-0026 (mail intent and custody), ADR-0023 (decision records), ADR-0027
   (delegate edges), ADR-0028 (events, waits, wakes, channels), ADR-0029 (CLI
   contract), ADR-0030 / ADR-0031 (goal supervision and storage), ADR-0032
-  (compiled context), ADR-0033 (forked AX reviews).
+  (compiled context), ADR-0033 (forked AX reviews), ADR-0034 (hook
+  mechanism: command gate, mid-turn notices, question routing).
 - Numbering: 0034 is the #1160 ADR (PR #1174).
 - Decision owner: operator.
 - Implemented: none. The slices (§9) are not filed. The owner reviews this ADR
@@ -221,6 +231,17 @@ author field. §2 decides how instead.
   or profile change is instead a restart of the same record, authorised in
   advance by the operator's binding (its profile ladder), so its edges stay
   live. Unbound architects keep ADR-0027 §1a unchanged. (Owner question 19.)
+- **Questions: an owner is a root nobody watches.** Every owner episode is
+  started by the server (§1 point 2), so ADR-0034 §2 gives it `questions:
+  ask_operator`. A question from the owner, including a harness choice
+  dialog or a plan approval, is intercepted by ADR-0034's question hook and
+  becomes `question.ask` to the operator. It shows in `flk question list`,
+  the notification log and channel bindings (ADR-0028 §8a, E9c), and its
+  answer returns into the same tool call or wakes the owner. It never
+  becomes a dialog in a pane nobody is watching, which would wedge the
+  episode. The same holds for agents that cron or trigger rules start (§5).
+  Segment architects and builders are delegates (`route`), so their
+  questions go to the owner first (§1a).
 - **Harnesses (`bind --harness`).** Claude Code, Codex and opencode may all
   be bound, because the hibernated wake is harness-neutral: it starts a fresh
   session whose first message is the compiled context with the digest
@@ -468,20 +489,21 @@ for the owner's triage.
   | --- | --- |
   | hibernated | an episode starts (§1); the digest is part of layer 4 of the compiled context, which is the first user message for a fresh session, or one guarded fixed sentence ("digest ready, call `flock_owner_digest`") for a warm continue |
   | alive, idle, parked | the guarded idle wake (#850 lease, draft stash; ADR-0028 §5) with the fixed sentence |
-  | alive, mid-turn | **at the next turn boundary**, through the Stop hook's nudge, which already carries mail counts (`src/cli/hook.rs:222-235`). Nothing reaches a turn in progress. |
+  | alive, mid-turn, **Claude Code or Codex** | *now* items: a one-sentence pointer (`flk: 2 urgent items for you; call flock_owner_digest`) at the agent's **next gated shell call or question point**, as `additionalContext` through ADR-0034 §1b's `notice?` (measured working mid-turn on Claude 2.1.296 and Codex 0.160.1, P14–P17). Once per item. If no shell call or question comes first (a long edit sequence), it arrives at the turn boundary. *batch* and *digest* items: the turn boundary, through the Stop hook's nudge (`src/cli/hook.rs:222-235`) |
+  | alive, mid-turn, **opencode** | **at the next turn boundary** for every class. ADR-0034 §1b records opencode's mid-turn path as unverified until its slice Q14 measures it |
 
-  **"Delivered while busy" means "delivered at the next turn boundary".**
-  No mid-turn mechanism exists. ADR-0034 §1 installs no catch-all
-  `tool.before` and wires `tool.after` only for the question tools, so
-  nothing can add context in the middle of a turn. This ADR does not ask for
-  one. A mid-turn injection on every tool call would cost a hook process per
-  call. It would also put fleet chatter into the owner's reasoning while it
-  works, which the scarce-context lesson of the architect skill argues
-  against. The worst-case latency of a *now* item for a busy owner is the
-  length of its current turn, bounded by `max_episode_turns` (§6.5) and by
-  ADR-0030's stop ladder. If that proves too slow, a narrow `tool.after`
-  injection for *now* items only is the follow-up. It would be its own
-  amendment to ADR-0034 §1 and is not requested here (owner question 22).
+  **What "delivered while busy" means, per harness.** On Claude Code and
+  Codex, a *now* item reaches a busy owner as a pointer at its next shell
+  call (the §1a gate stamps `FLOCK_GATE` into owner panes, so every shell
+  call goes through `hook.decide`) or its next question point. Otherwise it
+  arrives at the turn boundary. On opencode, and in any pane without the
+  gate, it arrives at the turn boundary. The mechanism and its once-per-item
+  rule are ADR-0034's (§1b). **This ADR's policy:** only *now*-class items
+  are pointed at mid-turn; *batch* and *digest* items wait for the
+  boundary, so fleet chatter stays out of the owner's reasoning while it
+  works. The pointer names a tool and never carries a body; the owner pulls
+  the digest when it chooses. Cost: no extra hook calls (it rides on calls
+  the gate already makes) and one sentence per *now* item.
 
   The body is always pulled (`flock_owner_digest`, or `events.read` from the
   owner's cursor). It is never pushed into the composer.
@@ -554,7 +576,10 @@ exists for the cases where that matters.
   - **Clarify**: the owner cannot state the outcome in two sentences or name
     an acceptance test. The question goes to the author as a comment for an
     issue, as a `clarify` response for a request (§4), or to the operator as
-    an ADR-0023 decision record.
+    a structured question (`question.ask`, ADR-0034 §2: the owner is an
+    `ask_operator` root, §1), never as a dialog in its pane. Durable choices
+    the operator must own, such as a gate under `ask` or a cycle override,
+    are ADR-0023 decision records (§6).
   - **Decline**, always with a reason: outside the repo's vision (layer 2 of
     the compiled context); contradicts an Accepted ADR without proposing to
     supersede it; a feature request from an external contributor (routed to
@@ -672,9 +697,14 @@ cost is intended.
     starts an agent, writes, merges or labels in the target. The target's
     answer can only report decisions about the target.
   - Questions to the human: each owner is the root of its own delegation tree
-    and may ask the operator about its own repo, by ADR-0034's routing. An owner
-    never relays another owner's question to the operator. A question about
-    repo B is B's owner's to ask.
+    and asks the operator about its own repo only as an `ask_operator` root
+    (ADR-0034 §2). That means `question.ask` addressed to the operator,
+    visible in `flk question list`, the notification log and channels (E9c),
+    never a dialog in a pane nobody watches. Its delegates' questions reach
+    it by ADR-0034's `route`, and it escalates with `question.escalate`
+    (ADR-0034 Q9). An owner never relays another owner's question to the
+    operator. A question about repo B is B's owner's to ask, through its own
+    `ask_operator` path.
 - **Loops and storms.**
   - *Chains are derived by the server, never supplied by the sender.* A
     sender could leave out its own history and dodge cycle detection, so any
@@ -781,7 +811,10 @@ remaining questions are listed in §10.
     trigger engine (AX6a), which keeps its own rate limits.
   - **`SpawnAgent`**, operator-authored rules only, for repos **without** an
     owner (for example a nightly report job). It goes through `agent.spawn`
-    with its ceiling (ADR-0014 §5–§7) and a mandatory deadline, and is
+    with its ceiling (ADR-0014 §5–§7), a mandatory deadline and
+    `--unattended`, so the agent is an `ask_operator` root whose questions
+    reach the operator as `question.ask`, never a pane dialog (ADR-0034 §2).
+    It is
     idempotent per `(rule, subject)` so one issue never starts two agents. In
     an owned repo the owner decides what to start, so `SpawnAgent` is refused
     there.
@@ -924,8 +957,8 @@ GitHub Actions app, strict (`gh api repos/gerchowl/flock/branches/dev/protection
 "main: releases only" (AGENTS.md: only the release App moves it). There is
 no CODEOWNERS file. So anyone holding the operator's token can `gh pr merge`
 any green PR into `dev` today. Neither a prompt nor a flk verb can stop a raw
-`gh` call. ADR-0034 §1 installs no catch-all `tool.before`, and ADR-0034 §7
-says its hooks are "not a security boundary".
+`gh` call. ADR-0034's shell command gate (§1a) fails open and can be evaded,
+and ADR-0034 itself says nothing may rely on it for safety (§1a, §7).
 
 **Layer one, recommended: GitHub refuses what flk has not cleared.**
 
@@ -976,26 +1009,41 @@ checks, and point 5's detection plus auto-pause is the compensating control.
 `flk owner bind` reports which layer-one points the repo supports, and so
 does the standup.
 
-**Layer two, defence in depth, owned by this ADR.** A `tool.before` entry on
-the shell tool only (Claude `PreToolUse` matcher `Bash`, and the Codex and
-opencode equivalents ADR-0034's inventory lists), installed **only** in the
-panes of bound owners, segment architects and their delegates. It denies the
-binding's `deny_commands`: `gh pr merge`, `gh release`, `gh api` writes to
-protection or rulesets, `just release`, `flk server …`, and raw `gh issue|pr
-comment|edit|close` for owners (O4's verbs exist for those). The deny message
-names the flk verb to use instead.
+**Layer two, defence in depth: ADR-0034 §1a's command gate, with ADR-0035's
+rows.** ADR-0034 owns the mechanism (PR #1174 at `bed30fae`, §1a). It is a
+`tool.before` entry on the shell tool only (Claude `Bash`, Codex `Bash`,
+opencode `bash`), active in panes the server stamps with `FLOCK_GATE=1`. It
+matches the shell-parsed argv prefix of each simple command, decides through
+`hook.decide` from a role-keyed deny list held in server memory, and
+**fails open** on every harness. Measured cost: p50 16.8 ms per gated shell
+call (n = 40), and no tokens on `pass`. ADR-0034 §1a calls it defence in
+depth and says nothing may rely on it for safety. This ADR agrees and owns
+only the **policy**:
 
-- **This needs an amendment to ADR-0034 §1**, which states "Nothing installs
-  a catch-all `tool.before`". This entry is not catch-all (shell tool only,
-  role-scoped panes only), but it runs on every shell call in those panes.
-  Its cost is one `flk hook` process per shell call: about 10 ms outside a
-  pane (ADR-0034 §1, measured), plus one socket round trip inside one. It
-  goes through ADR-0034's `hook.decide` with verdicts `pass` / `deny`, so it
-  adds no second hook mechanism. (Owner question 21.)
-- **It is not a boundary, and is not presented as one** (ADR-0034 §7). Shell
-  aliasing, `python -c`, `curl` or a script all evade a command matcher. It
-  exists to turn an honest mistake into a clear refusal before layer one has
-  to refuse it.
+- **Rows.** ADR-0034's roles are `delegate` (live parent edge), `owner`
+  (bound) and `root`. A segment architect (§1a) has a parent edge, so it
+  takes the `delegate` rows. It never merges or releases, which the owner
+  does, so it needs no rows of its own. Defaults:
+
+  | Command prefix | owner | delegate | Reason names |
+  | --- | --- | --- | --- |
+  | `gh pr merge` | deny | deny | `flk land` (§6.4) |
+  | `gh release`, `just release`, `gh workflow run` | deny | deny | `flk owner release`; releases wait for the operator (§6.6) |
+  | `gh ruleset`, `gh repo edit`, `gh api` with a protection or rulesets path | deny | deny | operator only (§6.6) |
+  | `git push --force`, `git push -f`, `git push origin dev`, `git push origin main` | deny | deny | push your branch and open a PR |
+  | `flk server`, `flk fleet`, `flk owner limits`, `flk owner policy` | deny | deny | operator verbs (§6.2, §6.5) |
+  | `gh issue comment\|edit\|close`, `gh pr comment\|edit\|close`, `gh label` | deny | pass | `flk owner comment\|label\|close` (O4) |
+
+  Argv-prefix matching cannot see a `gh api` method or path inside flags in
+  every spelling. That is the evasion ADR-0034 §1a lists, and layer one does
+  not care about it: the agent identity has no `administration` permission.
+- **Where the rows live.** They live in the binding (`OwnerLimitsSet.deny_commands`,
+  §6.2) per role, seeded from the defaults above, and change only through
+  `flk owner limits set`. They are never read from `.flk.toml` on `dev`, so
+  an owner cannot merge its way out of its own deny list.
+- **Wording is policy too.** Every reason names the verb to use. A lift
+  (§7b) that finds agents missing a verb may propose a better reason
+  sentence. It lands as a binding change, by the operator.
 
 **Rejected.**
 
@@ -1232,11 +1280,29 @@ delegate's work that never produced an event (an unattested start, ADR-0027
 §8) is missing from it. The standup lists such gaps (`unattributed: n`)
 rather than hiding them.
 
-### 7b. Transcript-driven improvement: a local miner finds expensive patterns, ADR-0033's review engine turns them into lift proposals, and a human approves every lift
+### 7b. Transcript-driven improvement: the agents' own AX answers about missed tools come first, a local miner counts what they cost, ADR-0033's review engine turns both into lift proposals, `flk ax report` checks that a lift worked, and a human approves every lift
 
 **Recommended.**
 
-- **Two stages, so that a model only sees what a counter already found.**
+- **The primary input is what agents say they missed.** `ax/1` gained three
+  questions on both the architect and the builder rubric (owner, 2026-10-12,
+  #1091 comment, no version bump because AX1 has not shipped):
+  - **Q9 `tools_helped`**: which flk commands, MCP tools or skills helped, and
+    for which step;
+  - **Q10 `tools_missed`**: which *existing* capability would have helped,
+    where it applied, and what the agent did instead (manual reconstruction,
+    polling, a raw `gh`, `git` or `pane` command). The agent must confirm
+    the capability exists with `--help` or the docs before naming it;
+  - **Q11 `discovery_gaps`**: for each Q10 item, the place and the wording
+    that would have made the agent reach for it.
+
+  Every AX review (ADR-0033 §4: lifecycle, event and builder `DONE:`
+  triggers) records these in `AxReviewRecorded` (ADR-0033 §5) as metrics
+  plus answers. A Q10 item is a lift candidate by itself. It needs no
+  threshold from the miner, because an agent naming a missed capability is
+  direct evidence.
+- **The miner quantifies and finds what no one named.** It runs in two
+  stages, so that a model only sees what a counter already found.
   1. **Mine, with no model.** `flk ax mine --subject <owner> [--include
      delegates] --window <dur>` reads the local transcripts of the owner and
      of every agent on its edges in the window (Claude Code, Codex, opencode
@@ -1260,19 +1326,28 @@ rather than hiding them.
      records them (ADR-0032's `cache_usage.py` method). The output is one
      JSON file under `state_dir()/ax/`, served as an MCP resource (ADR-0017),
      like ADR-0033 §5's answers.
-  2. **Propose, through ADR-0033.** When the miner finds a fingerprint above
-     a threshold (default: seen in at least 3 sessions and 5 times, or more
-     than 50k tokens attributed in the window), it fires an ADR-0033 trigger
-     of a new kind, `lift`, with a versioned rubric `docs/ax/rubric-lifts.md`
+     For each Q10 item, the miner also counts the "what I did instead"
+     substitute (a raw `gh` sequence, a polling shape) across the window's
+     sessions, so a candidate carries both the agent's statement and how
+     often and how expensively the substitute actually ran.
+  2. **Propose, through ADR-0033.** A `lift` review fires when there is an
+     unprocessed Q10 or Q11 answer, or when the miner finds a fingerprint
+     above a threshold (default: seen in at least 3 sessions and 5 times, or
+     more than 50k tokens attributed in the window). It is an ADR-0033
+     trigger of a new kind, `lift`, with a versioned rubric `docs/ax/rubric-lifts.md`
      (`ax-lifts/1`). It runs through ADR-0033's trigger engine, rate limits,
      `AxReviewRecorded` event and filing policy (AX6a, AX4a, AX7), not
      through a parallel mechanism. The reviewer's state is the mined table,
      not one agent's warm context, so it uses ADR-0033's compiled-reviewer
      path (AX9) rather than a fork: the patterns span many sessions, and no
      single warm context holds them.
-- **What a lift proposal is.** One candidate per fingerprint, with a target
-  and the evidence (count, sessions, tokens, the command template, never
-  output text):
+- **What a lift proposal is.** One candidate per Q10 item or fingerprint,
+  with a target and the evidence: the Q10 and Q11 answers with their review
+  `run_id`, plus the miner's count, sessions, tokens and command template,
+  never output text. The Q11 answer chooses the target when there is one. A
+  missed tool becomes one of four things (#1091): a doc or `--help` change,
+  a skill or `CLAUDE.md` line, an error message that names the right verb,
+  or a flk issue when the capability does not exist.
 
   | Target | Example from this fleet | How it lands |
   | --- | --- | --- |
@@ -1280,8 +1355,22 @@ rather than hiding them.
   | a line in the repo's `AGENTS.md` / `CLAUDE.md`, or the repo traps file of ADR-0032 owner decision 3 (`docs/agents/traps.md`, compiled into layer 2) | the six pasted rules in Context: nextest, `nix develop` commits, the comment-prose gates, `FLOCK_SOCKET_PATH`, the size cap | as above; once merged, layer 2 carries them and briefs stop repeating them (ADR-0032 §5) |
   | a product fix | the paste-chip Enter (`supervisor.py:88-92`) is a symptom of #1162 / #950, not a rule to teach | a comment with the new evidence on the existing issue (ADR-0033 §6 search-first) |
   | a rule or skill in the general Claude config (claude-config) | a harness-level habit seen across repos | an issue in `gerchowl/claude-config`, never a change to it |
-  | a flk feature | a state agents rebuild by hand | an issue in `gerchowl/flock`, through that repo's owner if it has one (§4) |
+  | a `--help`, docs or MCP tool description change | Q10 "I polled `flk agent get`" with Q11 "`flk agent wait --help` never mentions `flk events wait`" | an issue in the repo that owns the text (`gerchowl/flock` for flk), through its owner if it has one (§4) |
+  | an error message that names the right verb | a refusal that tells the agent what not to do but not what to do | the same; ADR-0034 §1a's command-gate deny reasons already work this way (`merges go through flk land`), and their wording is ADR-0035's policy (§6.3) |
+  | a pointer at the moment of need | Q11 "a hint when I ran raw `gh pr checks` in a loop" | a gate row or a mid-turn notice under ADR-0034 §1a / §1b, set as policy in the binding (§6.2); never a new hook |
+  | a flk feature | a state agents rebuild by hand, or a Q10 item that turns out not to exist | an issue in `gerchowl/flock`, through that repo's owner if it has one (§4) |
 
+- **`flk ax report` checks that a lift worked.** AX4b trends
+  `tools_missed` and `discovery_gaps` per rubric version (#1091 comment).
+  Each landed lift records which Q10 capability or fingerprint it targets
+  (`LiftLanded { lift, targets, landed_at }`). After the next
+  `[ax] lift_check_reviews` reviews (default 10) of agents that started
+  after the lift, the report compares two things: how often that capability
+  is still named missed, and how often the miner still sees the substitute.
+  The result is recorded as `LiftOutcome { moved | unchanged | worse }`. A
+  lift that moved nothing is reported in the standup's *wishes* (§7a), and
+  the next lift for the same capability must target a different discovery
+  place. That stops the same unread help text from being rewritten forever.
 - **Humans approve, and the owner changes only its own repo.** Every lift is
   a proposal. In phase 1 it is recorded and nothing is filed (ADR-0033 owner
   decision 1). Afterwards it is filed under ADR-0033 §6's caps and
@@ -1409,30 +1498,30 @@ the fields treats the typed block as plain text.
 | --- | --- | --- | --- | --- | --- | --- |
 | O0 | Minimal `.flk.toml` reader per ADR-0004 decisions 4–5: default-branch committed blob from the common dir, `[owner]` behaviour keys only, `policy_version` = blob id, and **adoption**: a new blob takes effect only after `flk owner policy adopt` (operator verb) | ~280 | — | ADR-0004 (first code) | server-internal plus one gated verb | A policy edited in a worktree or on a PR branch is not read; a merged change is reported and **not** applied until adopted; an attested agent calling `adopt` exits 13 |
 | O1 | Owner binding: `flk owner bind\|unbind\|list\|show` (operator verbs; agent callers refused), `OwnerBound` / `OwnerUnbound` kinds, fold, re-issue on start and rotation, MCP `flock_owner_show` (read); `bind` reports which layer-one points (§6.3) the repo supports | ~320 | — | new; extends ADR-0027 §1a | new methods, gated; new kinds | Bind, restart the server, force rotations past `MAX_ROTATED`: the binding survives; an attested agent calling `bind` gets exit 13 |
-| O2 | Episodes: wake = warm continue or fresh compiled session on the same `AgentId`, including across a profile or harness change (the ADR-0027 §1a amendment); status turn, then hibernate after `warm_ttl`; rotation at the band instead of compaction; non-Claude owners never kept alive parked; profile ladder; `limit_reached` and `blocked{auth}` deferral; per-episode profile recorded | ~400 | O1, ADR-0032 X1/X3/X4 (#1079 …), G1 #1034, #1070 | ADR-0027 §1a (amends); #1010 profile record | server-internal plus a restart variant | Fake harness: two wakes 10 min apart continue one session; a wake after `warm_ttl` starts a fresh session whose first message holds the digest; a harness switch keeps `AgentId` and live edges; a logged-out start is `blocked{auth}`, not retried |
+| O2 | Episodes: wake = warm continue or fresh compiled session on the same `AgentId`, including across a profile or harness change (the ADR-0027 §1a amendment); status turn, then hibernate after `warm_ttl`; rotation at the band instead of compaction; non-Claude owners never kept alive parked; profile ladder; `limit_reached` and `blocked{auth}` deferral; per-episode profile recorded | ~400 | O1, ADR-0032 X1/X3/X4 (#1079 …), G1 #1034, #1070, ADR-0034 Q1 (`ask_operator` for server-started episodes) | ADR-0027 §1a (amends); #1010 profile record | server-internal plus a restart variant | Fake harness: two wakes 10 min apart continue one session; a wake after `warm_ttl` starts a fresh session whose first message holds the digest; a harness switch keeps `AgentId` and live edges; a logged-out start is `blocked{auth}`, not retried; a server-started episode reads `questions: ask_operator` |
 | O3a | Repo poller, issues: the PR poller's GraphQL query extended with issues and PRs updated since a cursor (comments, labels) for bound and watched repos; durable `issue.opened\|closed{reason}\|reopened\|labelled\|commented`, `pr.opened`; seeded so a restart re-emits nothing | ~350 | O1 | #1020 (extends), #1074 sources | new kinds | Fake GraphQL: one request per tick for N repos; a new issue emits one `issue.opened`; a restart re-emits nothing |
 | O3b | Repo poller, the rest: default-branch check suites (`branch.ci_completed`), releases (`release.published`), `rateLimit` pacing with a reserve and `degraded` health, home-node-only polling, `issue_guard` fed from the poller | ~300 | O3a | #1077 data source; issue_guard's own `gh issue list` | new kinds | Under the reserve the interval stretches and health reads `degraded`; a non-home node issues no query for the repo; `issue_guard` makes no `gh` call of its own |
 | O4 | Owner GitHub writes and echo suppression: `flk owner comment\|label\|file\|close` record `OwnerActed { gh_node_id }`; the poller tags `actor: self` | ~250 | O3a | — | new methods, gated | An owner's comment comes back as `actor: self` and is dropped; the same text posted by raw `gh` is not |
 | O5a | Owner buffer: per-owner filter over the generalised #961 buffer, wake-class table from adopted policy, the two windows, `max_lines` flush, handled-subject filter, `OwnerDigestDelivered` cursor | ~350 | O0, O3a, #961, E3 #1027 | #961 (generalises) | new kinds | A recorded 24 h fixture yields wakes within ±10 % of §8's windowed count; a crash before acting re-delivers the same `through_seq` |
-| O5b | Delivery: `flock_owner_digest`; hibernated wake through O2 with the digest in layer 4; idle-parked wake through E6; *now* class at the next turn boundary | ~250 | O5a, O2, E6 #1032 | — | new verb | A *now* event wakes a hibernated owner and its first message holds the digest; a busy owner gets it at its next boundary and not before |
+| O5b | Delivery: `flock_owner_digest`; hibernated wake through O2 with the digest in layer 4; idle-parked wake through E6; *now* items marked for ADR-0034 §1b's mid-turn `notice?` (Claude, Codex), everything else at the turn boundary | ~250 | O5a, O2, E6 #1032, ADR-0034 Q14 (notice) | — | new verb | A *now* event wakes a hibernated owner and its first message holds the digest; a busy Claude or Codex owner gets one pointer for a *now* item at its next shell call; *batch* items wait for the boundary; an opencode owner gets everything at the boundary |
 | O6 | Intake state machine: `IntakeDecided` kinds, fold, auto-accept scope from the binding, spike rules, `flk owner intake list\|decide` (operator override), label and comment projection through O4, `shadow` decisions | ~400 | O0, O1, O4, O5a | `.fleet` triage reminder, `triage.json`; #1074's "labelled issue starts an agent" (replaced) | new kinds and verbs | Fixture issues: an operator-filed slice issue is auto-accepted; an external feature request is declined with the Discussions reason; GitHub text authored as `gerchowl` but not filed through flk is not auto-accepted; a hand-edited label is restored and reported |
 | O7 | `owner:<repo>` target: ADR-0006 extension, resolution through O1, mesh routing to the home node, `no_owner` refusal | ~250 | O1 | ADR-0006 (extends) | additive target; old server: exit 78 | A send to `owner:x/y` on a non-home node arrives at the home node's owner; an unbound repo exits 4 with the hint |
 | O8a | Owner requests: `owner.request` / `owner.response` blocks, request fold, `flk owner request\|respond\|requests`, target files the accepted issue | ~330 | O7, O6 | new | additive message fields; mesh VERSION unchanged | A→B accepted yields an issue filed by B; a `done` closes the request record on both sides |
 | O8b | Request safety: **server-derived chains** (union of open inbound requests; any sender `chain` ignored), depth and `request_cycle` refusals, `--allow-cycle` operator override, per-pair cap, duplicate folding | ~280 | O8a | new | server-internal | A request that omits its history is still refused as a cycle; a sixth open request to one pair is refused; the operator can allow one refused request |
 | O9 | Watch sources on the wait registry: `issue:` / `pr:` in any repo at fix levels, composites, deadline; the poller follows watched subjects; `watch.fired`; blocked-on cycle detection raising an ADR-0023 decision | ~400 | E5 #1031, E6 #1032, O3a | #1078 (core) | new predicate kinds on `wait.park`, gated | A parks on `issue:x/y#3 released`; closing as not-planned does not fire it; a release containing the fix does; A↔B blocked-on is refused with a decision filed |
-| O10 | Trigger rules: `when/if/do` over events, cron as a source, actions `RouteToOwner`, `WakeAgent`, `ForkReview`, `SpawnAgent` (unowned repos, operator rules only, idempotent per `(rule, subject)`), `trigger.fired`, `--dry-run`; **`issue_guard`'s allowlist pinned to `Notify` by a test**; repo rules limited to `RouteToOwner` | ~400 | O5a, O0, ADR-0014 spawn | #1073 (actions), #1074 (rules), `ActionSpec` (extends) | config and new kinds | A nightly cron routed to an owner wakes it once; `SpawnAgent` in an owned repo is refused; a `flk-trigger` block naming any new action is refused; a repo rule with `SpawnAgent` is rejected at adoption |
-| O11a | Authority in the binding: `OwnerLimitsSet`, `flk owner limits set\|show` (operator verb), caps (`max_delegates` over the subtree, `at_owner_capacity`), wake and turn budgets, `flk owner pause\|resume\|stop`, fleet pause covering owners, **whole-owner shadow** (`owner_in_shadow` refusals for delegate start, spawn, O4 writes, requests and land), loud notifications for every change | ~380 | O1, O5a | #822 (per-owner part) | new verbs, gated | A fifth `delegate start` exits `at_owner_capacity`; a shadow owner's `delegate start` and O4 write exit 13 and record `OwnerWouldAct`; an attested agent calling `limits set` exits 13 and the attempt is notified |
+| O10 | Trigger rules: `when/if/do` over events, cron as a source, actions `RouteToOwner`, `WakeAgent`, `ForkReview`, `SpawnAgent` (unowned repos, operator rules only, idempotent per `(rule, subject)`), `trigger.fired`, `--dry-run`; **`issue_guard`'s allowlist pinned to `Notify` by a test**; repo rules limited to `RouteToOwner` | ~400 | O5a, O0, ADR-0014 spawn, ADR-0034 Q1 (`--unattended` → `ask_operator` for cron- and trigger-started agents) | #1073 (actions), #1074 (rules), `ActionSpec` (extends) | config and new kinds | A nightly cron routed to an owner wakes it once; `SpawnAgent` in an owned repo is refused; a `flk-trigger` block naming any new action is refused; a repo rule with `SpawnAgent` is rejected at adoption |
+| O11a | Authority in the binding: `OwnerLimitsSet`, `flk owner limits set\|show` (operator verb), caps (`max_delegates` over the subtree, `at_owner_capacity`), wake and turn budgets, `flk owner pause\|resume\|stop`, fleet pause covering owners, **whole-owner shadow** (`owner_in_shadow` refusals for delegate start, spawn, O4 writes, requests and land), loud notifications for every change; `deny_commands` per role as binding state (the rows are O20) | ~380 | O1, O5a | #822 (per-owner part) | new verbs, gated | A fifth `delegate start` exits `at_owner_capacity`; a shadow owner's `delegate start` and O4 write exit 13 and record `OwnerWouldAct`; an attested agent calling `limits set` exits 13 and the attempt is notified |
 | O11b | Server lifecycle verbs refuse attested agent callers (`server` handoff, stop, restart paths over the socket); incident record type `owner.incident` with automatic `pause` | ~200 | O11a | — | gated | An attested agent caller asking for a server lifecycle action exits 13; an incident pauses its owner |
 | O12 | Shadow run on `gerchowl/flock` and migration: owner role text (from the architect skill), the `.fleet` mapping of §7 in docs, `flk owner shadow-report` comparing recorded intents (intake, starts, requests, merges) with what the architect and operator did | ~200 | **O11a, O11b**, O1–O6 | `.fleet/` (retires per §7), architect skill | — | Seven days and ten intake decisions of shadow intents are reported, and the operator's switch to `live` is recorded before the supervisor stops |
 | O13 | Episode usage: per-episode tokens from the harness transcript into `OwnerEpisodeEnded`; `max_units_per_day` enforced | ~300 | O2 | `src/costs` (adds tokens) | new kind | A fake transcript with known usage yields the exact units; past the budget behaves as the wake budget does |
-| O14 | Segment architects (§1a): `SegmentAssigned`, disjoint `scope_paths` (`scope_overlap`), `assigned { segment }` intake routing, depth owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, wave reports as `GoalStatusSet` lines | ~350 | O5a, O6, O11a, G1 #1034, ADR-0034 Q3/Q7, O21; **after #1167's dry run** | #1167 (flk primitives part) | new kinds and verb, gated | Overlapping scopes are refused; an issue in segment A's paths routes to A; a parked segment architect parks the owner; a third-level working `delegate start` is refused |
+| O14 | Segment architects (§1a): `SegmentAssigned`, disjoint `scope_paths` (`scope_overlap`), `assigned { segment }` intake routing, depth owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, wave reports as `GoalStatusSet` lines | ~350 | O5a, O6, O11a, G1 #1034, ADR-0034 Q1, Q4 and Q9 (segment questions route to the owner, the owner escalates), O21; **after #1167's dry run** | #1167 (flk primitives part) | new kinds and verb, gated | Overlapping scopes are refused; an issue in segment A's paths routes to A; a parked segment architect parks the owner; a third-level working `delegate start` is refused |
 | O15 | Daily standup (§7a): `flk owner standup [--since]` fold, bounded markdown and JSON, `Standup` cron action (daily by default) delivering to the notification log, a channel binding and a file; login and limit blockers with the operator command; `owner.standup` kind; `unattributed: n` | ~350 | O3a, O5a, O6, O18; ADR-0033 AX4b; E8 #1037 for channels | `WriteDigest` (extends); STATUS.md progress reports | new action and kind | A fixture day yields all six headings with no model call; a logged-out delegate appears under blockers with its login command; nothing is typed into any pane |
 | O16 | Transcript miner (§7b stage 1): `flk ax mine`, run by a server cron action, ported from `scripts/research/toolchain_survey.py`, edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised) | client-side read; new MCP resource | Fixture transcripts yield the expected fingerprints; no output text, `$HOME` path or hostname appears; sessions outside the owner's edges are not read |
-| O17 | Lift reviews (§7b stage 2): trigger kind `lift`, `docs/ax/rubric-lifts.md` (`ax-lifts/1`), compiled-reviewer path, target routing, dry run first, `[ax] lift_reviews_per_day`, cooldown for declined lifts | ~300 | O16, AX6a, AX7, AX9, O6, O8a | — | config, existing AX kinds | One review per threshold crossing, nothing filed in dry run; a claude-config lift is only ever an issue candidate; a second review the same day is `suppressed` |
+| O17 | Lift reviews (§7b stage 2): trigger kind `lift` fired by unprocessed `ax/1` Q10 `tools_missed` / Q11 `discovery_gaps` answers (primary) or a miner fingerprint over threshold; `docs/ax/rubric-lifts.md` (`ax-lifts/1`); compiled-reviewer path; target routing (help/docs, skill or CLAUDE.md line, error-message or gate-reason wording, flk issue); dry run first; `[ax] lift_reviews_per_day`; cooldown; `LiftLanded` and `LiftOutcome` from `flk ax report` trends after `lift_check_reviews` | ~380 | O16, AX1 #1091 (rubric with Q9–Q11), AX4b #1095 (trends), AX6a, AX7, AX9, O6, O8a | — | config; new kinds `LiftLanded`, `LiftOutcome` | A recorded review naming a missed `flk events wait` yields one lift candidate targeting `flk agent wait --help`, with the miner's substitute count attached; nothing is filed in dry run; after a landed lift and ten later reviews with no further mention, the outcome is `moved`; a claude-config lift is only ever an issue candidate |
 | O18 | Recorded review (§6.4): `ReviewRecorded`, `flk review record` / MCP `flock_review_record`, validity (reviewer edge `review:<pr>`, not the builder, head SHA matches the poller), `--by operator`; `flk land` (#694) requires an approve at the current head | ~300 | O3a, ADR-0027 edges, #694 | `VERDICT:` comments (replaced as the record) | new kind and verb, gated | A review recorded by the builder is refused; an approve at an old SHA does not let `flk land` proceed; a new push resets the gate |
 | O19a | Agent identity (§6.3 point 1): `flk-agent` App installation tokens minted by the server, git credential helper and `GH_TOKEN` in agent panes, refresh; the operator's token never stamped into agent panes | ~350 | O1, ADR-0014 §3 env allowlist | — | server and pane env | An owner pane's `gh api user` reports the bot; an attempt to edit branch protection from it is refused by GitHub (fixture or sandbox repo); the token rotates before expiry |
 | O19b | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
-| O20 | Defence-in-depth hook (§6.3 layer two): shell-tool `tool.before` entry in owner, segment and delegate panes only, `hook.decide` deny from the binding's `deny_commands` | ~200 | ADR-0034 Q2 (`hook.decide`), the §11 amendment to ADR-0034 §1, O11a | ADR-0034 §1 (amends) | integration version bump | `gh pr merge` in an owner pane is denied with the `flk land` hint; no entry exists in an operator's own pane; a non-shell tool spawns no hook process |
+| O20 | Command-gate rows (§6.3 layer two): the default `owner` and `delegate` rows, seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
 | O21 | ADR-0014 §5 amendment: depth counts only spawn-capable agents; `ax:` in-place forks are exempt from depth but count toward fanout and capacity | ~80 | ADR-0033 AX3 | ADR-0014 §5 (amends) | server-internal | A builder under a segment architect is forked for its AX review; a spawn-capable agent at that depth is still refused |
 
 **Order.**
@@ -1441,7 +1530,7 @@ the fields treats the typed block as plain text.
 3. **Episodes and intake:** O2, after G1 and ADR-0032 X1/X3/X4 → O5a → O5b → O6.
 4. **Limits before any owner runs:** O11a → O11b.
 5. **Shadow:** O12 starts on gerchowl/flock.
-6. **Before the owner goes `live` with any merge grant:** O18 → O19a → O19b. That is layer one. Without it, the merge gate stays `ask` (§6.3). O20 may land at any point after ADR-0034 Q2.
+6. **Before the owner goes `live` with any merge grant:** O18 → O19a → O19b. That is layer one. Without it, the merge gate stays `ask` (§6.3). O20 may land at any point after ADR-0034 Q3 and O11a.
 7. **Then:** O7 → O8a → O8b → O9 → O10 → O13.
 
 Also:
@@ -1476,7 +1565,8 @@ integration branches against a direct queue) stays #1167's and gates O14.
   retire. The skill keeps the judgement.
 - New durable kinds: `OwnerBound`, `OwnerUnbound`, `OwnerLimitsSet`,
   `OwnerActed`, `OwnerWouldAct`, `OwnerDigestDelivered`, `IntakeDecided`,
-  `OwnerEpisodeEnded`, `ReviewRecorded`, `owner.incident`, `issue.*`,
+  `OwnerEpisodeEnded`, `ReviewRecorded`, `owner.incident`, `LiftLanded`,
+  `LiftOutcome`, `issue.*`,
   `pr.opened`, `branch.ci_completed`, `release.published`, `watch.fired`,
   `trigger.fired`, `SegmentAssigned`, `owner.standup`, and the owner request
   fold events. All are additive.
@@ -1633,12 +1723,16 @@ integration branches against a direct queue) stays #1167's and gates O14.
 20. **ADR-0014 §5 amendment (§1a).** Depth counts only spawn-capable agents,
     so `ax:` in-place forks of depth-2 builders are allowed (recommended).
     Or review those builders through the compiled reviewer only.
-21. **ADR-0034 §1 amendment (§6.3).** A role-scoped shell-tool `tool.before`
-    for owner, segment and delegate panes, as defence in depth (recommended).
-    Or no layer two, relying on layer one alone.
-22. **Mid-turn delivery (§2).** None: *now* items reach a busy owner at its
-    next turn boundary (recommended). Or a later narrow `tool.after`
-    injection for *now* items, as its own ADR-0034 amendment.
+21. **Command-gate rows (§6.3 layer two).** The default rows in §6.3 for
+    `owner` and `delegate` on ADR-0034 §1a's gate, held in the binding
+    (recommended). Or owner rows only, leaving delegates ungated until
+    layer one stops them. (Round 4: the earlier request for an ADR-0034 §1
+    amendment is withdrawn, because ADR-0034 §1a now provides the gate.)
+22. **Mid-turn policy (§2).** Only *now*-class items get ADR-0034 §1b's
+    mid-turn pointer, on Claude and Codex (recommended). Or *batch* items
+    too, which would interrupt the owner's work more often for items that
+    can wait. (Round 4: the mechanism question is answered by ADR-0034 §1b,
+    so this asks only for the policy.)
 23. **Shadow width (§7).** Whole owner: no delegate start, no GitHub write,
     no request, no merge, with every intent recorded (recommended). Or
     intake-only shadow.
@@ -1657,10 +1751,10 @@ Each needs the owner's acceptance together with this ADR.
 - **ADR-0014 §5** (§1a, question 20): the depth limit counts spawn-capable
   agents only. `ax:` in-place forks count toward fanout and capacity, not
   depth.
-- **ADR-0034 §1** (§6.3, question 21): "Nothing installs a catch-all
-  `tool.before`" gains an exception: a shell-tool entry, in the panes of
-  bound owners, segment architects and their delegates only, deciding
-  through `hook.decide` from the binding's `deny_commands`. ADR-0034 §7's
-  "not a security boundary" applies to it unchanged.
+- **ADR-0034: none.** This ADR uses ADR-0034's command gate (§1a), mid-turn
+  notice (§1b) and `ask_operator` routing (§2–§5) as decided there, and
+  supplies only their policy: the gate rows (§6.3) and which items are
+  pointed at mid-turn (§2). The round-3 request to amend ADR-0034 §1 is
+  withdrawn.
 - **ADR-0028 §8a / ADR-0018** are unchanged. Owner mail uses existing
   intents.
