@@ -374,7 +374,13 @@ fn still_running_task_count(line: &str) -> u32 {
     else {
         return 0;
     };
-    let words: Vec<&str> = segment
+    named_task_count(segment)
+}
+
+/// Sum of the `N shell(s)` / `N monitor(s)` / `N (local) agent(s)` counts in
+/// lowercased text.
+fn named_task_count(lower_text: &str) -> u32 {
+    let words: Vec<&str> = lower_text
         .split_whitespace()
         .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|word| !word.is_empty() && *word != "local")
@@ -390,6 +396,33 @@ fn still_running_task_count(line: &str) -> u32 {
             .then_some(count)
         })
         .sum()
+}
+
+/// Background tasks Claude says are running (#1022): the counter in the
+/// footer below the prompt box (`⏵⏵ bypass permissions on · 2 shells`), or
+/// the `still running` suffix of a done-marked line that ends the transcript.
+/// Both name the same tasks, so the larger reading wins. A narrow pane wraps
+/// the done line, and the footer drops its `↓ to manage` hint, so neither is
+/// required. `None` without a prompt box: an unreadable footer is not an
+/// empty one.
+pub(in crate::detect) fn background_task_count(content: &str) -> Option<u32> {
+    let lines: Vec<&str> = content.lines().collect();
+    let top_border = claude_prompt_box_top_border_index(&lines)?;
+    if !has_prompt_box(content) {
+        return None;
+    }
+    let footer = lines[top_border + 1..]
+        .iter()
+        .skip_while(|line| !is_horizontal_rule(line))
+        .skip(1)
+        .map(|line| named_task_count(&line.to_ascii_lowercase()))
+        .max()
+        .unwrap_or(0);
+    let above = content_above_prompt_box(content);
+    let done_line = last_non_empty_line(above)
+        .filter(|line| has_turn_done_marker(line))
+        .map_or(0, still_running_task_count);
+    Some(footer.max(done_line))
 }
 
 fn is_background_agent_wait_line(line: &str) -> bool {
@@ -639,6 +672,38 @@ fn transcript_control_tail(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured from a throwaway Claude in an isolated flk (#1022): the
+    /// footer counts the `run_in_background` shells after the turn, across a
+    /// later turn that started none, and drops the counter once they exit. A
+    /// 52-column pane wraps the done line, so only the footer can say.
+    #[test]
+    fn captured_footers_count_background_tasks() {
+        macro_rules! fixture {
+            ($name:literal) => {
+                include_str!(concat!(
+                    "../../../tests/fixtures/claude-background-1022/",
+                    $name,
+                    ".txt"
+                ))
+            };
+        }
+        for (screen, count) in [
+            (fixture!("one-shell"), 1),
+            (fixture!("two-shells"), 2),
+            (fixture!("later-turn-two-shells"), 2),
+            (fixture!("narrow-wrapped"), 1),
+            (fixture!("none"), 0),
+        ] {
+            assert_eq!(background_task_count(screen), Some(count), "{screen}");
+        }
+        assert!(!settled_with_background_shells(fixture!("narrow-wrapped")));
+        let trust = "Quick safety check\n\u{276f} No, exit\n  Yes, I trust this folder\n";
+        assert_eq!(background_task_count(trust), None, "no footer to read");
+        let monitor =
+            prompt_box_below("x") + "  \u{23f5}\u{23f5} auto mode on \u{b7} 2 shells, 1 monitor\n";
+        assert_eq!(background_task_count(&monitor), Some(3));
+    }
 
     #[test]
     fn a_spinner_follows_the_echoed_prompt_past_a_notice() {

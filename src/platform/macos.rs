@@ -860,6 +860,12 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The session a process belongs to, or `None` once it is gone.
+pub fn process_session_id(pid: u32) -> Option<i32> {
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    (session > 0).then_some(session)
+}
+
 /// The short command name, as `ps` prints it under `COMM`.
 pub fn process_name(pid: u32) -> Option<String> {
     comm_from_bsdinfo(&process_bsdinfo(pid)?)
