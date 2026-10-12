@@ -203,6 +203,9 @@ pub struct TerminalState {
     /// and `agent.result` so a supervisor on the socket can tell that settle
     /// from one with nothing left running without reading the screen.
     pub settled_with_background_shells: bool,
+    /// Background tasks the detector last counted on screen (#1022), `None`
+    /// when the agent's screen does not show them.
+    pub background_tasks: Option<u32>,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -350,6 +353,7 @@ impl TerminalState {
             state_changed_at: None,
             live_activity: None,
             settled_with_background_shells: false,
+            background_tasks: None,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -1052,6 +1056,7 @@ impl TerminalState {
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
@@ -1314,6 +1319,7 @@ impl TerminalState {
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
         self.stale_hook_idle_since = None;
         self.state = AgentState::Unknown;
         self.state_changed_at = None;
@@ -1371,6 +1377,7 @@ impl TerminalState {
         self.stale_hook_idle_since = None;
         self.live_activity = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
@@ -2502,6 +2509,7 @@ mod tests {
                 visible_idle: false,
                 visible_working: false,
                 settled_with_background_shells: false,
+                background_tasks: None,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2528,6 +2536,7 @@ mod tests {
                 visible_idle: true,
                 visible_working: false,
                 settled_with_background_shells: false,
+                background_tasks: None,
             },
             false,
             now + std::time::Duration::from_millis(100),

@@ -85,15 +85,17 @@ pub(super) fn pane_agent_status(
     }
 }
 
-/// The ADR-0028 `state` object (#1019) from today's detectors. `turn` and
-/// `lifecycle` only: `background` and `attention` stay `unknown` until E1b
-/// and E1c, and a visible prompt (`blocked`) is not a turn fact, so it reads
-/// `turn: unknown` until E1c maps it to `needs_human`.
+/// The ADR-0028 `state` object (#1019) from today's detectors. `background`
+/// is a task count and the source that counted it (#1022), `None` when
+/// nothing could. `attention` stays `unknown` until E1c, and a visible prompt
+/// (`blocked`) is not a turn fact, so it reads `turn: unknown` until E1c maps
+/// it to `needs_human`.
 pub(super) fn agent_state(
     status: crate::api::schema::AgentStatus,
     authority: crate::terminal::StateAuthority,
     agent: Option<crate::detect::Agent>,
     held_ms: Option<u64>,
+    background: Option<(u32, crate::api::agent_state::StateSource)>,
 ) -> crate::api::agent_state::AgentState {
     use crate::api::agent_state::{
         AgentState, Attention, Background, Lifecycle, StateSource, StateSources, Turn,
@@ -115,11 +117,12 @@ pub(super) fn agent_state(
     };
     let source = StateSources {
         turn: (turn != Turn::Unknown).then_some(turn_source),
+        background: background.map(|(_, source)| source),
         ..StateSources::default()
     };
     AgentState::derive(
         turn,
-        Background::Unknown,
+        Background::from_count(background.map(|(count, _)| count)),
         Attention::Unknown,
         lifecycle,
         false,
@@ -213,13 +216,25 @@ mod tests {
             include_str!("../../tests/fixtures/codex-submit-721/inline-working.txt");
         let codex_idle = include_str!("../../tests/fixtures/codex-submit-721/inline-idle.txt");
         let codex_trust = include_str!("../../tests/fixtures/codex/folder-trust.txt");
-        // Settled idle stays `unknown` (background is unknown until E1b),
-        // and a visible prompt is attention, not a turn fact, until E1c.
+        let one_shell = include_str!("../../tests/fixtures/claude-background-1022/one-shell.txt");
+        let two_shells = include_str!("../../tests/fixtures/claude-background-1022/two-shells.txt");
+        let later_turn =
+            include_str!("../../tests/fixtures/claude-background-1022/later-turn-two-shells.txt");
+        let none = include_str!("../../tests/fixtures/claude-background-1022/none.txt");
+        // Claude's footer fills `background`, so a settled Claude is
+        // `finished` or `finished_with_background` (#1022). Codex's screen
+        // cannot say: its background comes from the process tree, so a
+        // screen alone leaves it `unknown`. A visible prompt is attention,
+        // not a turn fact, until E1c.
         #[rustfmt::skip]
         let cases = [
             (Agent::Claude, claude_working.as_str(), 3_000, Turn::Working, Phase::Working),
             (Agent::Claude, &claude_idle, 3_000, Turn::Idle, Phase::Settling),
-            (Agent::Claude, &claude_idle, SETTLE_MS, Turn::Idle, Phase::Unknown),
+            (Agent::Claude, &claude_idle, SETTLE_MS, Turn::Idle, Phase::Finished),
+            (Agent::Claude, one_shell, SETTLE_MS, Turn::Idle, Phase::FinishedWithBackground),
+            (Agent::Claude, two_shells, SETTLE_MS, Turn::Idle, Phase::FinishedWithBackground),
+            (Agent::Claude, later_turn, SETTLE_MS, Turn::Idle, Phase::FinishedWithBackground),
+            (Agent::Claude, none, SETTLE_MS, Turn::Idle, Phase::Finished),
             (Agent::Claude, claude_trust, 3_000, Turn::Unknown, Phase::Unknown),
             (Agent::Codex, codex_working, 3_000, Turn::Working, Phase::Working),
             (Agent::Codex, codex_idle, 3_000, Turn::Idle, Phase::Settling),
@@ -227,9 +242,18 @@ mod tests {
             (Agent::Codex, codex_trust, 3_000, Turn::Unknown, Phase::Unknown),
         ];
         for (agent, screen, held, turn, phase) in cases {
-            let detected = crate::detect::detect_state(Some(agent), screen);
-            let status = super::pane_agent_status(detected, true);
-            let state = super::agent_state(status, StateAuthority::Screen, Some(agent), Some(held));
+            let detection = crate::detect::detect_agent(Some(agent), screen);
+            let status = super::pane_agent_status(detection.state, true);
+            let background = detection
+                .background_tasks
+                .map(|count| (count, StateSource::Screen));
+            let state = super::agent_state(
+                status,
+                StateAuthority::Screen,
+                Some(agent),
+                Some(held),
+                background,
+            );
             assert_eq!(
                 (state.turn, state.phase),
                 (turn, phase),
@@ -242,7 +266,7 @@ mod tests {
     fn lifecycle_outranks_turn_and_each_axis_names_its_source() {
         use crate::api::schema::AgentStatus as S;
         use StateAuthority as By;
-        let state = |status, by, agent| super::agent_state(status, by, agent, Some(1));
+        let state = |status, by, agent| super::agent_state(status, by, agent, Some(1), None);
         let hibernated = state(S::Hibernated, By::Screen, None);
         assert_eq!(
             (hibernated.phase, hibernated.source.turn),

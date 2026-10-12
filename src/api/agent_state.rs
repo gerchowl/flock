@@ -6,10 +6,10 @@
 //! `phase` is derived from the axes in one fixed order, the ADR's phase
 //! table, which is part of the contract and drift-locked by the tests below.
 //!
-//! This slice fills `turn` and `lifecycle` from today's detectors only.
-//! `background` and `attention` are always `unknown` until E1b (#1022) and
-//! E1c (#1023), so `finished` cannot be reached yet: it is never inferred
-//! from an unknown background.
+//! `turn` and `lifecycle` come from today's detectors, `background` from
+//! Claude's footer counter or the pane's process tree (#1022). `attention`
+//! stays `unknown` until E1c (#1023). `finished` is never inferred from an
+//! unknown background.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -26,18 +26,32 @@ pub enum Turn {
     Unknown,
 }
 
-/// This slice emits only `unknown` here and for [`Attention`]. The other
-/// values exist so the phase table can be derived and locked whole; E1b and
-/// E1c give them their ADR payloads (`running { count, … }`, reasons).
+/// Work the agent left running outside its turn: `"none"`,
+/// `{"running": {"count": N}}` or `"unknown"` on the wire (ADR-0028 §1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Background {
     None,
-    Running,
+    Running {
+        count: u32,
+    },
     #[default]
     Unknown,
 }
 
+impl Background {
+    /// A count of background tasks, where `None` is "not observable".
+    pub fn from_count(count: Option<u32>) -> Self {
+        match count {
+            Some(0) => Self::None,
+            Some(count) => Self::Running { count },
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// This slice emits only `unknown` here. The other values exist so the phase
+/// table can be derived and locked whole; E1c gives them their reasons.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
@@ -85,6 +99,7 @@ pub enum StateSource {
     Screen,
     Hook,
     Plugin,
+    ProcessTree,
     #[default]
     Unknown,
 }
@@ -180,7 +195,9 @@ impl AgentState {
             (_, Attention::NeedsHuman) => Phase::NeedsHuman,
             _ if turn == Turn::Working => Phase::Working,
             _ if settled && wait_open => Phase::WaitingOnEvent,
-            _ if settled && background == Background::Running => Phase::FinishedWithBackground,
+            _ if settled && matches!(background, Background::Running { .. }) => {
+                Phase::FinishedWithBackground
+            }
             _ if settled && background == Background::None => Phase::Finished,
             _ if turn == Turn::Idle && !settled && turn_held_ms.is_some() => Phase::Settling,
             _ => Phase::Unknown,
@@ -226,22 +243,25 @@ mod tests {
     use Background as B;
     use Lifecycle as L;
 
+    const RUN: B = B::Running { count: 1 };
+
     /// Drift lock on the ADR-0028 §1 phase table, one row per phase in the
     /// ADR's order. Each row's inputs also satisfy the rows below it, so a
     /// derivation that tested them in another order fails here. Changing
     /// this table is a contract change: update the ADR and its supervisors.
     #[rustfmt::skip]
-    const TABLE: [(&str, L, A, Turn, B, bool, u64); 13] = [
-        ("gone", L::Gone, A::ProviderLimit, Turn::Working, B::Running, true, SETTLE_MS),
-        ("hibernated", L::Hibernated, A::ProviderLimit, Turn::Working, B::Running, true, SETTLE_MS),
-        ("offline", L::Offline, A::ProviderLimit, Turn::Working, B::Running, true, SETTLE_MS),
-        ("limit_reached", L::Live, A::ProviderLimit, Turn::Working, B::Running, true, SETTLE_MS),
-        ("blocked", L::Live, A::Blocked, Turn::Working, B::Running, true, SETTLE_MS),
-        ("needs_human", L::Live, A::NeedsHuman, Turn::Working, B::Running, true, SETTLE_MS),
-        ("working", L::Live, A::None, Turn::Working, B::Running, true, SETTLE_MS),
-        ("waiting_on_event", L::Live, A::None, Turn::Idle, B::Running, true, SETTLE_MS),
-        ("finished_with_background", L::Live, A::None, Turn::Idle, B::Running, false, SETTLE_MS),
+    const TABLE: [(&str, L, A, Turn, B, bool, u64); 14] = [
+        ("gone", L::Gone, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
+        ("hibernated", L::Hibernated, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
+        ("offline", L::Offline, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
+        ("limit_reached", L::Live, A::ProviderLimit, Turn::Working, RUN, true, SETTLE_MS),
+        ("blocked", L::Live, A::Blocked, Turn::Working, RUN, true, SETTLE_MS),
+        ("needs_human", L::Live, A::NeedsHuman, Turn::Working, RUN, true, SETTLE_MS),
+        ("working", L::Live, A::None, Turn::Working, RUN, true, SETTLE_MS),
+        ("waiting_on_event", L::Live, A::None, Turn::Idle, RUN, true, SETTLE_MS),
+        ("finished_with_background", L::Live, A::None, Turn::Idle, RUN, false, SETTLE_MS),
         ("finished", L::Live, A::None, Turn::Idle, B::None, false, SETTLE_MS),
+        ("settling", L::Live, A::None, Turn::Idle, RUN, true, SETTLE_MS - 1),
         ("settling", L::Live, A::None, Turn::Idle, B::None, true, SETTLE_MS - 1),
         ("unknown", L::Live, A::None, Turn::Unknown, B::None, false, SETTLE_MS),
         // `finished` is never inferred from an unknown background.
@@ -292,7 +312,7 @@ mod tests {
         );
         assert_eq!(
             (future.background, future.attention),
-            (B::Unknown, A::Unknown)
+            (B::Running { count: 2 }, A::Unknown)
         );
         assert_eq!((future.phase, future.held_ms), (Phase::Unknown, None));
         assert_eq!(future.source.turn, Some(StateSource::Hook));
@@ -300,5 +320,22 @@ mod tests {
             future.source.background, None,
             "an unreadable source is no source"
         );
+    }
+
+    #[test]
+    fn background_wire_shape_and_its_reshaped_future_read_leniently() {
+        let wire = |bg: B| serde_json::to_value(bg).unwrap();
+        assert_eq!(wire(B::from_count(Some(0))), "none");
+        assert_eq!(wire(B::from_count(None)), "unknown");
+        assert_eq!(
+            wire(B::from_count(Some(2))),
+            serde_json::json!({"running": {"count": 2}})
+        );
+        let state: AgentState = serde_json::from_str(
+            r#"{"turn":"idle","background":{"running":{"count":"two"}},"source":{"background":"process_tree"}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.background, B::Unknown);
+        assert_eq!(state.source.background, Some(StateSource::ProcessTree));
     }
 }

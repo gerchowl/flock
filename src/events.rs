@@ -105,6 +105,8 @@ pub enum AppEvent {
         visible_working: bool,
         /// A Claude turn ended with background shells still running (#922).
         settled_with_background_shells: bool,
+        /// Background tasks the screen counts (#1022), `None` when it cannot.
+        background_tasks: Option<u32>,
         process_exited: bool,
         observed_at: Instant,
     },

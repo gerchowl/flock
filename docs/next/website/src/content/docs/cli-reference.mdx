@@ -306,7 +306,7 @@ flk pane send-keys <pane_id> <key> [key ...]
 flk pane run <target> <command>
 ```
 
-`pane send-text` reports the same observed delivery result and exit codes as plain `agent send` (see below).
+`pane send-text` reports the same observed delivery result and exit codes as `agent send --no-submit` (see below).
 
 `pane send-text` uses bracketed paste when the terminal enables it and does not send Enter. Terminals without bracketed paste receive the text bytes directly. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys; control bytes passed to `send-text` are pasted as text when bracketed paste is enabled.
 
@@ -383,7 +383,7 @@ flk agent get <target>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]
 flk agent result <target> [--max-chars N] [--offset N]
-flk agent send [--submit] <target> <text>
+flk agent send [--no-submit] <target> <text>
 flk agent rename <target> <name>|--clear
 flk agent focus <target>
 flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]
@@ -409,21 +409,21 @@ Agent targets can be terminal IDs, unique agent names, detected or reported agen
 
 `pane run <pane_id> --if-input-empty [--min-age-secs N] [--if-session ID] <text>` uses the same server-side guard. It refuses a draft with `input_not_empty`; a harness's own hint in an empty box, such as Codex's `Ask Codex to do anything` or any suggestion Claude paints faint into its box, is not a draft, while typed text of any shape is. It refuses an unsettled status with `not_settled`, and a different session with `session_mismatch`. The guard and paste are serialized in the server, avoiding a client read-then-send race. Ordinary `pane run` retains its shell command behavior. Socket clients can call `pane.submit` with `pane_id`, `text`, optional `if_session`, and `min_age_secs`; MCP clients use `flock_pane_submit` with the same fields. `delegate start` and `delegate send` also use this guard. An unconfirmed delegate submission preserves its workspace and new round cursor, so `delegate wait` can observe a later accepted turn without sending the brief again.
 
-`agent send --submit` moves a one-row draft aside and types it back after the submit, under the [injection lock](./configuration.mdx#injection-lock). While flock types, the pane's own input is held and replayed afterwards. A draft flock could not put back exactly is kept: `flk pane stash show <pane_id>` prints the kept drafts, one per line, and `flk pane stash restore <pane_id>` types the oldest one into the pane's empty composer. Add `--json` for the raw response. A restore refuses `input_not_empty` or `injection_pending` and keeps the draft.
+`agent send` moves a one-row draft aside and types it back after the submit, under the [injection lock](./configuration.mdx#injection-lock). While flock types, the pane's own input is held and replayed afterwards. A draft flock could not put back exactly is kept: `flk pane stash show <pane_id>` prints the kept drafts, one per line, and `flk pane stash restore <pane_id>` types the oldest one into the pane's empty composer. Add `--json` for the raw response. A restore refuses `input_not_empty` or `injection_pending` and keeps the draft.
 
 Send outcome codes (`agent send`, `pane send-text`, and guarded `pane run`):
 
 | Code | Outcome |
 | --- | --- |
 | `0` | `delivered`, `accepted`, or `observed_accepted` |
-| `8` | `unconfirmed`: delivery or acceptance could not be confirmed |
+| `8` | `unconfirmed`: delivery or acceptance could not be confirmed. Reason `typed_not_submitted` means the sent text is still in the composer: inspect or clear it before retrying |
 | `9` | `abandoned`: guarded submission stopped because its preconditions changed |
 | `1` | API or transport failure |
 | `2` | Invalid arguments |
 
 Failure JSON remains on stderr. Guarded results include the delivery `attempt` evidence and `reason`. MCP `flock_pane_submit` uses the same numeric error codes 8 and 9, with the outcome as the error message and the complete result in error `data`. Raw paste tools remain unexposed via MCP.
 
-`agent read` reads the resolved terminal stream. `agent send` pastes text to that stream **without submitting**, using bracketed paste when the terminal enables it so punctuation such as `!` stays literal input. Use `agent send --submit <target> <text>` to type terminal input (bracketed paste when enabled), require a fresh idle agent with a recognized empty composer, wait 120 ms, and send a negotiated Enter key event. The server observes acceptance for 2 seconds and retries **only Enter, once**, if the exact prompt remains in the composer and no operator input, dialog or execution change intervened. It then observes for another 2 seconds. Codex 0.160.1 is supported in both its default alternate-screen mode and `--no-alt-screen` mode. Unknown composers and paste chips cannot authorize a retry. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys instead of embedding control bytes in the text. Use `agent send -- <target> <text>` for literal text beginning with `--submit`. Plain send observes the unscrolled composer (or newly visible text for ordinary terminals) for up to 2 seconds and reports `delivered` or `unconfirmed`, with a reason and before/after SHA-256 screen digests. Confirmation only reads the screen and never sends keys. Evidence `level` is `text_matched` when the changed region contains the pasted text, `composer_changed` when a recognized editor changed (including folded paste chips), or `screen_changed` for a weaker screen-only observation without a matching composer change. Plain paste supports busy editors and existing drafts. Repeated input is compared against the changed region, and whitespace is normalized across wrapped rows. A recognized composer that stays unchanged remains unconfirmed even while output streams elsewhere. `screen_changed` is the weakest evidence and is returned only at the two-second deadline, allowing late text or chips to provide stronger evidence first. A ticking clock or `tail -f` output can produce this level without proving that input reached the application. Retained rows shifted by scrolling cannot count as newly matched text. An unchanged screen remains unconfirmed. Operator input, an execution change, or pane disappearance interrupts observation with a specific `unconfirmed` reason. These observation levels never authorize a guarded-submit retry. Initial missing-runtime errors retain `agent_not_found` / `pane_not_found`; disappearance during observation reports `unconfirmed` with reason `pane_gone`. `--submit` reports `accepted` (matching prompt hook), `observed_accepted` (a new working entry), `unconfirmed`, or `abandoned`; the last two exit 8 and 9 respectively and leave the composer untouched. Acceptance does not mark inbox messages read. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
+`agent read` reads the resolved terminal stream. `agent send <target> <text>` **submits by default** (#995): it types terminal input (bracketed paste when enabled, so punctuation such as `!` stays literal input), requires a fresh idle agent with a recognized empty composer, waits 120 ms, and sends a negotiated Enter key event. The server observes acceptance for 2 seconds and retries **only Enter, once**, if the exact prompt, or the harness's folded paste chip in its place (Claude Code's `[Pasted text #N]`, Codex's `[Pasted Content …]`), remains in the composer and no operator input, dialog or execution change intervened. It then observes for another 2 seconds. Codex 0.160.1 is supported in both its default alternate-screen mode and `--no-alt-screen` mode. Unknown composers, and a chip next to other text, cannot authorize a retry. Embedded paste delimiters are removed when bracketed paste is enabled. Use `pane send-keys <pane_id> Enter`, `C-c`, or `Esc` for control keys instead of embedding control bytes in the text. Use `agent send -- <target> <text>` for literal text beginning with `--submit` or `--no-submit`. `--no-submit` types only, without Enter: it observes the unscrolled composer (or newly visible text for ordinary terminals) for up to 2 seconds and reports `delivered` or `unconfirmed`, with a reason and before/after SHA-256 screen digests. Confirmation only reads the screen and never sends keys. Evidence `level` is `text_matched` when the changed region contains the pasted text, `composer_changed` when a recognized editor changed (including folded paste chips), or `screen_changed` for a weaker screen-only observation without a matching composer change. A `--no-submit` paste supports busy editors and existing drafts. Repeated input is compared against the changed region, and whitespace is normalized across wrapped rows. A recognized composer that stays unchanged remains unconfirmed even while output streams elsewhere. `screen_changed` is the weakest evidence and is returned only at the two-second deadline, allowing late text or chips to provide stronger evidence first. A ticking clock or `tail -f` output can produce this level without proving that input reached the application. Retained rows shifted by scrolling cannot count as newly matched text. An unchanged screen remains unconfirmed. Operator input, an execution change, or pane disappearance interrupts observation with a specific `unconfirmed` reason. These observation levels never authorize a guarded-submit retry. Initial missing-runtime errors retain `agent_not_found` / `pane_not_found`; disappearance during observation reports `unconfirmed` with reason `pane_gone`. A submitting send reports `accepted` (matching prompt hook), `observed_accepted` (a new working entry), `unconfirmed`, or `abandoned`; the last two exit 8 and 9 respectively. `unconfirmed` with reason `typed_not_submitted` means both Enters went out, no turn started, and the composer still shows the text or its paste chip; any other `unconfirmed` reason leaves the composer state unknown. `abandoned` leaves the composer untouched. `--submit`, the old opt-in, is still accepted and changes nothing. Acceptance does not mark inbox messages read. `agent get`, `agent focus`, `agent wait`, and `agent attach` require the resolved terminal to have agent identity. `agent rename` can assign that identity.
 
 Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for ordinary terminals, servers, tests, shells, or low-level terminal control. Use `pane run` when you want to submit a command with Enter.
 
@@ -487,6 +487,15 @@ Wait for the answer to a message you sent:
 flk wait reply <correlation_id> [--timeout MS] [--reference JSON] [--json]
 ```
 
+Read or wait on the durable event log from a cursor you hold:
+
+```bash
+flk events read [--after CURSOR] [--kinds K1,K2] [--subject ID]... [--limit N] [--json]
+flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR
+```
+
+`events read` prints one JSON line per event (`seq`, `event`, `data`), oldest first, and `next_after: N` on stderr; resume with `--after N` and dedupe on `seq`. `--json` prints the whole reply. A `gap` on stderr means the cursor is older than what the server still retains. `--kinds` takes durable kind names (`message_queued`, or `message.queued`); `--subject` matches an id the event's data carries as a top-level value (a pane, workspace, agent or message id). `events wait` prints the first matching event after `--after` (default: now) and exits 0, or exits 124 at `--timeout` (`500ms`, `5s`, `2m`). The wait is held on the server, not polled. Against a server without `events.read` both exit 78. Prefer `events wait` over a loop around `agent get`.
+
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after `msg send --intent needs-reply`: it prints the reply body to stdout and metadata to stderr, or the full result with `--json`. A sender outside any pane can wait for its held answer. `msg send --await` sends and uses the same waiter and exit codes:
 
 | Exit | Reply-wait outcome |
@@ -517,7 +526,7 @@ Both wait verbs take the same seven statuses and mean the same things by them. `
 
 ```bash
 c=$(flk agent get worker | jq -r .result.agent.turn_cursor)   # capture BEFORE prompting
-flk agent send --submit worker "..."
+flk agent send worker "..."
 flk agent wait worker --status settled --after "$c" --timeout 3600000
 ```
 
@@ -700,6 +709,7 @@ Exposed tools:
 | `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. Optional `instructions` steers what the summary keeps (`/compact <instructions>`; `instructions: true` in the answer confirms they were stored). `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
 | `flock_msg_wait_reply` | `msg.wait_reply` | Block until a message you sent is answered: `outcome` `replied`/`deferred`/`expired`/`timeout`, with the answer in `reply`. Holds the MCP session for up to `timeout_ms` (default 60 s, at most 10 min); run `flk wait reply <id>` as a background task to wait longer. `flock_msg_send` with `await: true` returns the id and that command. |
+| `flock_events_read` | `events.read` | Durable events with `seq > after`, filtered by `kinds` and `subjects`; resume from `next_after`. `wait_ms` holds the call until a matching event lands, capped at 9 min (below the MCP tool timeout); run `flk events wait` as a background task to wait longer. Read-only. |
 | `flock_msg_mute` | `msg.mute` | Stop being nudged about new mail for a bounded window (max 30 min; `0` clears). Suppresses the nudge only — messages keep arriving. Not silent: each `needs_reply` sender is told once, automatically, that you deferred, with your optional `reason` and the time the mute lifts. |
 | `flock_pane_read` | `pane.read` | Read-only, like `agent.read`. |
 | `flock_worktree_list` | `worktree.list` | Feeds the fork-vs-message decision. |
