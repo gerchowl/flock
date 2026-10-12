@@ -1559,12 +1559,8 @@ impl App {
         create.creating = true;
         create.error = None;
 
-        let command = crate::worktree::build_worktree_add_new_branch_command(
-            &create.source_checkout_path,
-            &create.checkout_path,
-            &create.branch,
-            &create.base,
-        );
+        let source_checkout_path = create.source_checkout_path.clone();
+        let branch = create.branch.clone();
         let parent_dir = create
             .checkout_path
             .parent()
@@ -1578,6 +1574,18 @@ impl App {
         let base = create.base.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
+            // Off the UI thread: the base is refreshed from its remote first,
+            // the same as `delegate start` and `worktree create` (#938).
+            let fresh = crate::worktree::resolve_fresh_base(&source_checkout_path, &base);
+            if let Some(note) = &fresh.note {
+                crate::logging::worktree_base_note(&base, note);
+            }
+            let command = crate::worktree::build_worktree_add_new_branch_command(
+                &source_checkout_path,
+                &path,
+                &branch,
+                &fresh.base,
+            );
             let result = if let Some(parent_dir) = parent_dir {
                 std::fs::create_dir_all(&parent_dir)
                     .map_err(|err| err.to_string())
@@ -2604,6 +2612,86 @@ mod tests {
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// #938: the dialog's base is refreshed from its remote on the worker, the
+    /// same as `delegate start` and `worktree create`: a local default branch
+    /// that never pulled does not decide what the new worktree starts from.
+    #[test]
+    fn start_worktree_add_refreshes_a_stale_base_from_its_remote() {
+        let rev = |dir: &std::path::Path, rev: &str| {
+            let out = std::process::Command::new("git")
+                .args(["-C", &dir.display().to_string(), "rev-parse", rev])
+                .output()
+                .expect("rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo = create_committed_repo("app-worktree-add-fresh-repo");
+        let origin = unique_temp_path("app-worktree-add-fresh-origin");
+        let other = unique_temp_path("app-worktree-add-fresh-other");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--quiet", "--bare"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        let default = crate::worktree::checkout_branch_name(&repo).expect("a branch");
+        run_git(&repo, &["push", "--quiet", "origin", &default]);
+        run_git(
+            &repo,
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&other, &["config", "user.name", "Flock Test"]);
+        run_git(
+            &other,
+            &["commit", "--quiet", "--allow-empty", "-m", "landed"],
+        );
+        run_git(&other, &["push", "--quiet", "origin", &default]);
+        let landed = rev(&other, "HEAD");
+
+        let worktree_root = unique_temp_path("app-worktree-add-fresh-root");
+        let branch = "worktree/app-fresh";
+        let checkout =
+            crate::worktree::default_checkout_path(&worktree_root, "flock", "repo-key", branch);
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
+            branch_parent: None,
+            source_workspace_id: "source".into(),
+            source_checkout_path: repo.clone(),
+            source_existing_membership: None,
+            source_repo_root: repo.clone(),
+            repo_key: "repo-key".into(),
+            repo_name: "flock".into(),
+            branch: branch.into(),
+            base: default.clone(),
+            checkout_path: checkout.clone(),
+            branch_input: crate::app::line_editor::LineEditor::new(branch),
+            seed: crate::app::line_editor::LineEditor::default(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
+            error: None,
+            creating: false,
+        });
+
+        app.start_worktree_add();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeAddFinished(result) => assert_eq!(result.result, Ok(())),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(rev(&checkout, "HEAD"), landed);
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        for dir in [&worktree_root, &repo, &origin, &other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
