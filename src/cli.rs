@@ -13,6 +13,7 @@ use crate::api::schema::{
     SplitDirection, Subscription,
 };
 
+mod adapter;
 mod agent;
 mod checks;
 mod compatibility;
@@ -176,6 +177,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
         "events" => events::run_events_command(&args[2..])?,
+        "adapter" => adapter::run_adapter_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,

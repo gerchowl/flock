@@ -568,6 +568,36 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 
 Use `events.wait` when you want one matching event and then a response.
 
+## Channel adapters
+
+An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
+
+**Start-up.** Before an adapter touches its chat, it calls `channel.hello` and starts only when that succeeds:
+
+```json
+{"id":"a1","method":"channel.hello","params":{"binding":"phone","token":"<contents of phone.token>"}}
+```
+
+```json
+{"id":"a1","result":{"type":"channel_hello","binding":"phone","owner_node":"atlas","target":"agent:agent_atlas_1","scopes":["notify","reply"]}}
+```
+
+`flk adapter hello <binding> [--token-file PATH]` does the same from a shell. It reads the token from the binding's token file unless `--token-file` names another one, prints the reply, and returns the exit codes below. An adapter that shells out to it gets the version check for free.
+
+**Version check.** `channel.hello` is new in protocol 29 and counts as state-changing for the skew gate (#868). `flk adapter hello` sends `ping` first, and against an older server exits 78 with `server_version_gap` without sending the hello. An adapter that speaks the socket directly must do the same: send `ping`, and refuse to start unless `protocol` is 29 or higher. An older server answers `channel.hello` itself with `invalid_request` ("unknown variant"), which an adapter must also treat as "this server has no channel support".
+
+**Failure modes.** Each one is a refusal from the [error-code registry](#response-shapes), and the adapter must not start:
+
+| Code | Exit | Meaning | Fix |
+| --- | --- | --- | --- |
+| `channel_unauthorized` | 1 | No binding by that name on this server, or the token does not match the issued one. The two cases share one answer, so a wrong guess learns nothing. | Use the binding's current token file. After a rotation, the old token is refused. |
+| `channel_not_owner` | 1 | The binding exists, but its `owner_node` is a different node. | Run the adapter on the owner node, or move the binding by changing `owner_node`. |
+| `server_version_gap` | 78 | The server is older than protocol 29. | Hand the server off with `flk server live-handoff`, or restart it. |
+
+Both channel codes are in the `never` retry class: sending the same hello again cannot succeed until the config or the token changes. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`). The token itself never appears in a log, an event or a response.
+
+**Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.

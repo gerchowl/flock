@@ -809,6 +809,33 @@ Turning `channel_push` off with a config reload stops pushes at once, because ea
 read_max_wait_ms = 540000   # default, 9 minutes
 ```
 
+## Channel bindings
+
+A binding connects one external channel to flk (ADR-0028 §8). The adapter that serves it is described under [Channel adapters](/socket-api/#channel-adapters). Declare each binding as a `[[channels]]` entry:
+
+```toml
+[[channels]]
+name = "phone"                    # [A-Za-z0-9_-], at most 64 characters, unique
+owner_node = "atlas"              # the one node that serves this binding
+target = "agent:agent_atlas_1"    # "fleet", "repo:<name>" or "agent:<id>"
+scopes = ["notify", "reply"]      # any of notify, send_to_agent, reply
+```
+
+| Key | Meaning |
+| --- | --- |
+| `name` | Names the binding, its token file and, in a later release, the inbound sender `channel:<name>/<user>`. |
+| `owner_node` | Compared with this node's `name`, or with the host name when `name` is unset. Only the owner issues the token and accepts the adapter. There is no failover: when the owner is offline, the channel is quiet. To move a binding, change `owner_node`. |
+| `target` | What the binding is about: the whole fleet, one repo or one agent. |
+| `scopes` | What the adapter may do: `notify` (receive events), `send_to_agent` (mail an agent), `reply` (answer an agent's question). This release reports scopes in `channel.hello`. Enforcement arrives with the inbound and outbound methods. |
+
+An entry with an invalid name, no `owner_node` or a duplicate name is dropped with a diagnostic, and the rest of the config still applies. Unknown keys in an entry make the whole `channels` section invalid, and a reload keeps the previous bindings.
+
+**Tokens.** At startup and on every config reload, the owner node issues a token for each binding it owns that has none yet. Each token is 32 random bytes, hex-encoded, written to `<data dir>/channel-tokens/<name>.token` with mode 0600 in a 0700 directory. The data dir is the directory that holds `config.toml` and the flock logs. Give the adapter that file, or the path to it. The server reads the file on every check, so:
+
+- to **revoke** a binding, delete its token file, and the next hello is refused;
+- to **rotate**, delete the file and run `flk server reload-config`, which issues a new token;
+- removing a binding from config refuses its adapter at the next hello, but the token file stays until you delete it.
+
 ## Environment variables
 
 | Variable | Purpose |

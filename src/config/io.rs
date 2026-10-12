@@ -8,6 +8,7 @@ use super::{
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
+    "channels",
     "checks",
     "events",
     "experimental",
@@ -688,12 +689,21 @@ fn load_live_config_from_table(
         &mut invalid_sections,
         |section| config.events = section,
     );
+    load_live_section(
+        &table,
+        "channels",
+        "channels config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.channels = section,
+    );
     // #397: canonicalise the declared agent names and merge them over the
     // compiled default, so a fleet declaring one agent does not un-declare the
     // rest. Runs whether or not a `[spawn.env]` was present — it is a no-op on
     // the default table.
     diagnostics.extend(config.spawn.env.normalize());
     validate_peers(&mut config.peers, &mut diagnostics);
+    crate::channels::validate(&mut config.channels, &mut diagnostics);
 
     Ok(LoadedConfig {
         config,

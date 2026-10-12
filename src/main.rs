@@ -31,6 +31,7 @@ mod agent_transcript;
 mod api;
 mod app;
 mod build_info;
+mod channels;
 mod checks;
 mod checksum;
 mod cli;
@@ -548,6 +549,7 @@ fn run() -> io::Result<()> {
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
+        println!("       flk adapter hello <binding> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
@@ -621,6 +623,10 @@ fn run() -> io::Result<()> {
             (
                 "flk events <read|wait>",
                 "Read or wait on the durable event log from a cursor",
+            ),
+            (
+                "flk adapter hello <binding>",
+                "Check a channel adapter's binding token before it starts",
             ),
             (
                 "flk session <subcommand>",

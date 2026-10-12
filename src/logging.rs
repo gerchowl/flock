@@ -475,6 +475,40 @@ pub(crate) fn idle_wake_suppressed(pane: &str, reason: &str) {
     );
 }
 
+/// A channel adapter's `channel.hello` (#1037): the binding as presented and,
+/// when refused, why. Never the token.
+pub(crate) fn channel_hello(binding: &str, refused: Option<&'static str>) {
+    match refused {
+        None => tracing::info!(
+            event = "channel.hello.accepted",
+            subsystem = "channel",
+            outcome = "ok",
+            binding,
+            "channel adapter accepted"
+        ),
+        Some(reason) => tracing::warn!(
+            event = "channel.hello.refused",
+            subsystem = "channel",
+            outcome = "refused",
+            binding,
+            reason,
+            "channel adapter refused"
+        ),
+    }
+}
+
+/// A binding's capability token could not be issued (#1037).
+pub(crate) fn channel_token_issue_failed(binding: &str, err: &str) {
+    tracing::warn!(
+        event = "channel.token.issue_failed",
+        subsystem = "channel",
+        outcome = "failed",
+        binding,
+        err,
+        "channel token not issued"
+    );
+}
+
 /// The wake sentence was typed; its Enter follows one gap later.
 pub(crate) fn idle_wake_typed(pane: &str, count: usize) {
     tracing::debug!(

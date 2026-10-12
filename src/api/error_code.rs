@@ -68,6 +68,8 @@ error_codes! {
         AlreadyHibernated = "already_hibernated",
         AmbiguousWorktreeBranch = "ambiguous_worktree_branch",
         AtLineageDepth = "at_lineage_depth",
+        ChannelNotOwner = "channel_not_owner",
+        ChannelUnauthorized = "channel_unauthorized",
         CheckNotFound = "check_not_found",
         CursorAhead = "cursor_ahead",
         DirtyWorktreeRequiresForce = "dirty_worktree_requires_force",
@@ -249,7 +251,7 @@ mod tests {
             })
             .collect();
         let expected: Vec<(&str, String)> = [
-            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth check_not_found cursor_ahead dirty_worktree_requires_force handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch pane_gone pane_not_found prompt_control_bytes prompt_empty prompt_too_long recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode workspace_not_found worktree_not_found"),
+            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch pane_gone pane_not_found prompt_control_bytes prompt_empty prompt_too_long recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode workspace_not_found worktree_not_found"),
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
             ("yes", "timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit fleet_paused handoff_undrained injection_pending input_not_empty mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_unconfirmed unknown_composer"),
@@ -261,7 +263,7 @@ mod tests {
         .map(|(class, codes)| (class, codes.to_string()))
         .collect();
         assert_eq!(actual, expected);
-        assert_eq!(ErrorCode::ALL.len(), 156);
+        assert_eq!(ErrorCode::ALL.len(), 158);
     }
 
     #[test]
