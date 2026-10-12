@@ -51,8 +51,10 @@
   mechanism: command gate, mid-turn notices, question routing).
 - Numbering: 0034 is the #1160 ADR (PR #1174).
 - Decision owner: operator.
-- Implemented: none. The slices (§9) were filed on acceptance; the issue
-  numbers are in §9's table and on #1172.
+- Implemented: none. Slices (§9) filed 2026-10-13: O0 #1195, O1 #1196, O2 #1200, O3a #1197, O3b #1198, O4 #1199, O5a #1201, O5b #1202, O6 #1203, O7 #1212, O8a #1213, O8b #1214, O9 #1215, O10 #1216, O11a #1204, O11b #1205, O12 #1206, O13 #1217, O14 #1222, O15 #1218, O16 #1219, O17 #1220, O18 #1207, O19a #1208, O19b #1209, O19c #1210, O20 #1211, O21 #1221. Follow-ups
+  for the remainders of the closed spikes: #1223 (process watches), #1224
+  (file and mesh-peer sources), #1225 (webhooks), #1226 (`RunScript`, under
+  #503), #1227 (missed cron fires, quiet hours).
 
 ## Context
 
@@ -1626,6 +1628,8 @@ the fields treats the typed block as plain text.
 | O19c | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O19b, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
 | O20 | Command-gate rows (§6.3 layer two): the default `owner`, `segment` and `delegate` rows (ADR-0034 §1a roles), seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane and a segment pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's or segment's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
 | O21 | ADR-0014 §5 amendment: depth counts only spawn-capable agents; `ax:` in-place forks are exempt from depth but count toward fanout and capacity | ~80 | ADR-0033 AX3 | ADR-0014 §5 (amends) | server-internal | A builder under a segment architect is forked for its AX review; a spawn-capable agent at that depth is still refused |
+
+**Filed 2026-10-13:** O0 #1195, O1 #1196, O2 #1200, O3a #1197, O3b #1198, O4 #1199, O5a #1201, O5b #1202, O6 #1203, O7 #1212, O8a #1213, O8b #1214, O9 #1215, O10 #1216, O11a #1204, O11b #1205, O12 #1206, O13 #1217, O14 #1222, O15 #1218, O16 #1219, O17 #1220, O18 #1207, O19a #1208, O19b #1209, O19c #1210, O20 #1211, O21 #1221.
 
 **Order.**
 1. **Foundations:** O0, O1 → O3a → O3b → O4.
