@@ -74,6 +74,17 @@ pub struct WorktreeKillAllResult {
     pub force_recovered: Vec<String>,
 }
 
+/// One successful PR-poll round: the per-workspace badges, plus each PR it saw
+/// for the `pr.*` events (#1020).
+#[derive(Debug, Default)]
+pub struct PrPollRound {
+    pub states: Vec<(String, Option<crate::worktree::PrStateInfo>)>,
+    pub observed: Vec<crate::pr_poll::PrObservation>,
+    /// The `pr.*` events already logged, read by the worker while the ledger
+    /// is unseeded (the first round after a start).
+    pub seed: Option<Vec<crate::api::schema::EventEnvelope>>,
+}
+
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -124,12 +135,7 @@ pub enum AppEvent {
     /// (no token, transport down, GraphQL error) and must not be confused with
     /// a successful round that simply found no PRs — the first means the data
     /// is stale, the second means it is accurate and empty.
-    PrStatesUpdated(
-        Result<
-            Vec<(String, Option<crate::worktree::PrStateInfo>)>,
-            crate::pr_poll::PrPollErrorKind,
-        >,
-    ),
+    PrStatesUpdated(Result<PrPollRound, crate::pr_poll::PrPollErrorKind>),
     /// The issue-drop repository directory finished enumerating (#371).
     ///
     /// Carries the ranked list or the classified failure. A failure is not

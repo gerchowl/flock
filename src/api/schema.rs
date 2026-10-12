@@ -2329,10 +2329,22 @@ pub enum EventKind {
     /// `AgentLimitReached` and `AgentGone` repeat the `AgentPhaseChanged` that
     /// entered that phase as a kind of their own, for notification routing.
     /// See `EventData::AgentPhaseChanged`.
+    #[serde(rename = "agent.phase_changed")]
     AgentPhaseChanged,
+    #[serde(rename = "agent.needs_human")]
     AgentNeedsHuman,
+    #[serde(rename = "agent.limit_reached")]
     AgentLimitReached,
+    #[serde(rename = "agent.gone")]
     AgentGone,
+    /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
+    /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted,
+    #[serde(rename = "pr.merged")]
+    PrMerged,
+    #[serde(rename = "pr.closed")]
+    PrClosed,
 }
 
 impl EventKind {
@@ -2389,7 +2401,10 @@ impl EventKind {
             | Self::AgentPhaseChanged
             | Self::AgentNeedsHuman
             | Self::AgentLimitReached
-            | Self::AgentGone => true,
+            | Self::AgentGone
+            | Self::PrCiCompleted
+            | Self::PrMerged
+            | Self::PrClosed => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -3939,12 +3954,43 @@ pub enum EventData {
         received_at_ms: u64,
     },
     /// ADR-0028 §2 (#1027): a settled phase transition. Every
-    /// `agent_needs_human`, `agent_limit_reached` and `agent_gone` carries the
-    /// same payload as the `agent_phase_changed` it accompanies.
+    /// `agent.needs_human`, `agent.limit_reached` and `agent.gone` carries the
+    /// same payload as the `agent.phase_changed` it accompanies.
+    #[serde(rename = "agent.phase_changed")]
     AgentPhaseChanged(AgentPhaseEvent),
+    #[serde(rename = "agent.needs_human")]
     AgentNeedsHuman(AgentPhaseEvent),
+    #[serde(rename = "agent.limit_reached")]
     AgentLimitReached(AgentPhaseEvent),
+    #[serde(rename = "agent.gone")]
     AgentGone(AgentPhaseEvent),
+    /// #1020: every check on `head_sha` has concluded. `conclusion` is the
+    /// rollup (`success`, `failure`, `error`).
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted {
+        repo: String,
+        branch: String,
+        pr: u64,
+        head_sha: String,
+        conclusion: String,
+        failed_checks: Vec<String>,
+    },
+    #[serde(rename = "pr.merged")]
+    PrMerged {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    #[serde(rename = "pr.closed")]
+    PrClosed {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
     AgentForked {

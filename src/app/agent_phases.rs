@@ -1,5 +1,5 @@
-//! Derived supervisor events (ADR-0028 §2, #1027): `agent_phase_changed`,
-//! and `agent_needs_human`, `agent_limit_reached`, `agent_gone` as kinds of
+//! Derived supervisor events (ADR-0028 §2, #1027): `agent.phase_changed`,
+//! and `agent.needs_human`, `agent.limit_reached`, `agent.gone` as kinds of
 //! their own, computed once in the server from each local agent's `state`.
 //!
 //! The server samples every local agent's `state` (the one `agent.get`
@@ -163,7 +163,7 @@ impl AgentPhaseTracker {
     }
 }
 
-/// The `agent_phase_changed` for a settled phase, followed by the kind of
+/// The `agent.phase_changed` for a settled phase, followed by the kind of
 /// its own that `needs_human`, `limit_reached` and `gone` also carry.
 fn announce(
     agent_id: &str,
@@ -377,7 +377,7 @@ mod tests {
 
     /// ADR-0028 §10 E3: real detector status changes, through the server's
     /// `PaneAgentStatusChanged` and the loop's sample, end at exactly one
-    /// durable `agent_phase_changed` that `events.read`'s kind filter serves,
+    /// durable `agent.phase_changed` that `events.read`'s kind filter serves,
     /// and a restarted server on the same log does not repeat it.
     #[tokio::test]
     async fn a_real_status_sequence_settles_into_one_durable_phase_change() {

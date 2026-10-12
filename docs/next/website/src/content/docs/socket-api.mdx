@@ -574,12 +574,12 @@ The server derives four durable kinds from each local agent's `state` (the one `
 
 | Kind | Emitted when |
 | --- | --- |
-| `agent_phase_changed` | the agent's `phase` settled into a different supervisor phase |
-| `agent_needs_human` | that phase is `needs_human` |
-| `agent_limit_reached` | that phase is `limit_reached` |
-| `agent_gone` | the agent left this server's `agent.list`, for example because its pane closed |
+| `agent.phase_changed` | the agent's `phase` settled into a different supervisor phase |
+| `agent.needs_human` | that phase is `needs_human` |
+| `agent.limit_reached` | that phase is `limit_reached` |
+| `agent.gone` | the agent left this server's `agent.list`, for example because its pane closed |
 
-All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent_needs_human`, `agent_limit_reached` and `agent_gone` repeat the `agent_phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent_phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
+All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent.needs_human`, `agent.limit_reached` and `agent.gone` repeat the `agent.phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent.phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
 
 A phase is announced only once it has held for the server's settle window, 20 s: a prompt answered or a turn that ends within the window emits nothing. `finished`, `finished_with_background` and `waiting_on_event` already include the window, since the idle turn must hold that long before `phase` reads them, so they are announced as soon as the server sees them. `settling` and `unknown` are never announced. `gone` is announced at once. The server samples agent state once a second, so an event lands up to a second after its window closes.
 
