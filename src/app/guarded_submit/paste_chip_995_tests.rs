@@ -53,3 +53,24 @@ fn only_exact_chips_stand_in_for_the_text() {
     }
     assert!(!is_paste_chip(Agent::OpenCode, "[Pasted text #1]"));
 }
+
+/// The styled capture of the same screen strips to the same lone chip row,
+/// so the chip check does not depend on the plain-text read.
+#[test]
+fn ansi_captures_strip_to_the_same_chip_row() {
+    for (agent, screen, chip) in [
+        (
+            Agent::Claude,
+            include_str!("../../../tests/fixtures/paste-chip-995/claude-chip.ansi"),
+            "[Pasted text #1]",
+        ),
+        (
+            Agent::Codex,
+            include_str!("../../../tests/fixtures/paste-chip-995/codex-chip.ansi"),
+            "[Pasted Content 1099 chars]",
+        ),
+    ] {
+        let text = crate::control_bytes::strip(screen);
+        assert_eq!(editor(agent, &text), vec![chip.to_string()]);
+    }
+}
