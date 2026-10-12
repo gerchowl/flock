@@ -1,7 +1,9 @@
 pub mod agent_state;
 pub mod client;
 pub(crate) mod compatibility;
+pub(crate) mod error_code;
 mod event_hub;
+mod events_read;
 mod reply_wait;
 pub mod schema;
 mod server;

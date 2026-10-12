@@ -2636,7 +2636,13 @@ fn agent_commands_work() {
 
     let sent = run_cli(
         &socket_path,
-        &["agent", "send", "worker", "echo cli-agent-ok\n"],
+        &[
+            "agent",
+            "send",
+            "--no-submit",
+            "worker",
+            "echo cli-agent-ok\n",
+        ],
     );
     assert!(sent.status.success());
 

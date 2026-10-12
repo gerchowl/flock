@@ -20,6 +20,7 @@ mod delegate;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;
+mod events;
 pub(crate) mod exit;
 mod fleet;
 mod help;
@@ -173,6 +174,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "preflight" => preflight::run_preflight_command(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
+        "events" => events::run_events_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
@@ -1130,6 +1132,55 @@ pub(super) fn normalize_pane_id(value: &str) -> String {
     value.to_string()
 }
 
+/// A pane verb's target as a pane id (ADR-0029 §5). `self` is the calling
+/// pane, and a public pane id passes through. Anything else (an agent name,
+/// a terminal id, a fleet agent id) is pre-resolved through `agent.get`,
+/// which servers answered long before their pane verbs took names, so a new
+/// client names agents against an old server too. When that fails the target
+/// goes on as typed and the verb's own refusal names the expected shapes.
+///
+/// An agent whose name is shaped like a pane id (`w1:p2`, `p_3`, `1-2`) is
+/// not pre-resolved: the id goes as typed, so against an old server it means
+/// the pane, and only a new server falls back to the name.
+pub(super) fn resolve_pane_arg(value: &str) -> String {
+    // The server resolves `self` by ancestry; the env saves it a lookup.
+    if value == "self" {
+        return std::env::var("FLOCK_PANE_ID").unwrap_or_else(|_| value.to_string());
+    }
+    if is_public_pane_id(value) {
+        return value.to_string();
+    }
+    send_request(&Request {
+        id: "cli:target:resolve".into(),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: value.to_string(),
+        }),
+    })
+    .ok()
+    .and_then(|response| {
+        response["result"]["agent"]["pane_id"]
+            .as_str()
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| value.to_string())
+}
+
+/// `<workspace>:p<number>`, `p_<…>` or the legacy `<ws>-<n>`: needs no round
+/// trip to resolve.
+fn is_public_pane_id(value: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    value.starts_with("p_")
+        || value.rsplit_once(":p").is_some_and(|(ws, number)| {
+            !ws.is_empty()
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        || value.rsplit_once('-').is_some_and(|(ws, number)| {
+            let ws = ws.strip_prefix("w_").or(ws.strip_prefix('w')).unwrap_or(ws);
+            digits(ws) && digits(number)
+        })
+}
+
 pub(super) fn parse_split_direction(value: &str) -> std::io::Result<SplitDirection> {
     match value {
         "right" => Ok(SplitDirection::Right),
@@ -1519,6 +1570,23 @@ mod config_check_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_public_pane_ids_skip_the_target_round_trip() {
+        for id in ["w3:p2", "w_1:p1a", "p_7", "p_1_2", "1-1", "w_2-3", "w2-3"] {
+            assert!(super::is_public_pane_id(id), "{id}");
+        }
+        for target in [
+            "reviewer",
+            "worker-2",
+            "agent_atlas_6f21c4",
+            "w3:p",
+            ":p2",
+            "a:pb-c",
+        ] {
+            assert!(!super::is_public_pane_id(target), "{target}");
+        }
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

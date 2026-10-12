@@ -331,6 +331,37 @@ fn handle_connection(
             }
             result
         }
+        Method::EventsRead(params) => {
+            let Some(response) = super::events_read::read_events(
+                request_id.clone(),
+                params,
+                &mut stream,
+                event_hub,
+                running,
+            )?
+            else {
+                crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "client_disconnected",
+                    changes_ui,
+                );
+                return Ok(());
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         Method::PaneWaitForOutput(params) => {
             let Some(response) =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?
@@ -573,6 +604,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneClose(_) => "pane.close",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
+        Method::EventsRead(_) => "events.read",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
@@ -1377,6 +1409,63 @@ mod tests {
                 body: "hello".into(),
             },
         }
+    }
+
+    fn events_read(event_hub: &EventHub, params: &str) -> serde_json::Value {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(
+            client,
+            r#"{{"id":"r","method":"events.read","params":{params}}}"#
+        )
+        .unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(
+            server,
+            &api_tx,
+            event_hub,
+            &running,
+            None,
+            &Mutex::default(),
+        )
+        .unwrap();
+        serde_json::from_str(&read_line(&mut client)).unwrap()
+    }
+
+    /// #1028: `events.read` filters by subject and holds the request on the
+    /// hub until a matching event lands, skipping ones that do not match.
+    #[test]
+    fn events_read_long_polls_for_a_matching_subject() {
+        let event_hub = EventHub::default();
+        event_hub.push(queued_for("ws_1:p1", "c1"));
+        let now = events_read(&event_hub, r#"{"kinds":["message_queued"]}"#);
+        assert_eq!(now["result"]["events"][0]["seq"], 1);
+        assert_eq!(now["result"]["events"][0]["data"]["correlation_id"], "c1");
+        assert_eq!(now["result"]["next_after"], 1);
+
+        let pusher = event_hub.clone();
+        let started = std::time::Instant::now();
+        let push = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            pusher.push(queued_for("ws_1:p3", "c2"));
+            pusher.push(queued_for("ws_1:p2", "c3"));
+        });
+        let waited = events_read(
+            &event_hub,
+            r#"{"after":1,"subjects":["ws_1:p2"],"wait_ms":10000}"#,
+        );
+        push.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let events = waited["result"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{waited}");
+        assert_eq!(events[0]["seq"], 3);
+        assert_eq!(waited["result"]["next_after"], 3);
+
+        let ephemeral = events_read(&event_hub, r#"{"kinds":["pane_output_changed"]}"#);
+        assert_eq!(ephemeral["error"]["code"], "invalid_params");
+        let ahead = events_read(&event_hub, r#"{"after":9}"#);
+        assert_eq!(ahead["error"]["code"], "cursor_ahead");
+        assert_eq!(ahead["error"]["data"]["head"], 3, "{ahead}");
     }
 
     /// #438: the inbox feed reports only its own pane's mail, only mail that

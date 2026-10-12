@@ -793,6 +793,53 @@ async fn guarded_submit_retries_only_enter_once_and_reports_unconfirmed() {
     }
 }
 
+/// Claude folds a long paste into a chip, so the composer never matches the
+/// sent text (#995). The chip still authorizes the Enter and its one retry,
+/// and a chip left after both is `typed_not_submitted`, not success.
+#[tokio::test]
+async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    let text = "long brief ".repeat(100);
+    let chip = include_str!("../../tests/fixtures/paste-chip-995/claude-chip.txt");
+    let fixture = format!("\x1b[2J\x1b[H{}", chip.replace('\n', "\r\n"));
+    for (after, outcome) in [
+        (fixture.clone(), Outcome::Unconfirmed("typed_not_submitted")),
+        (
+            String::from_utf8(claude_screen("")).unwrap(),
+            Outcome::Unconfirmed("confirm_timeout"),
+        ),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, &text, None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app).test_process_pty_bytes(fixture.as_bytes());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()], "the chip gets Enter");
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()], "and one retry");
+        runtime(&app).test_process_pty_bytes(after.as_bytes());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
+            Some(outcome)
+        );
+        assert!(drain(&mut pty).is_empty(), "no third Enter");
+    }
+}
+
 #[tokio::test]
 async fn guarded_submit_never_retypes_when_composer_clears_or_dialog_appears() {
     use super::super::guarded_submit::Outcome;

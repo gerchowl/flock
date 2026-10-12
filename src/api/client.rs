@@ -512,6 +512,49 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// #1028: a server from before `events.read` rejects it as an unknown
+    /// variant, and the client reports the version gap (exit 78), not that.
+    #[test]
+    fn events_read_against_an_older_server_is_a_version_gap() {
+        let path = std::env::temp_dir().join(format!("f1028-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            for reply in [
+                serde_json::json!({"code": "invalid_request",
+                    "message": "invalid request: unknown variant `events.read`"}),
+                serde_json::json!({"type": "pong", "version": "1.2.0", "protocol": 27}),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: Request = read_json_line(&mut reader).unwrap();
+                let key = if reply["code"].is_string() {
+                    "error"
+                } else {
+                    "result"
+                };
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::json!({"id": request.id, key: reply})
+                )
+                .unwrap();
+            }
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let response = client
+            .request_value(&Request {
+                id: "read".into(),
+                method: Method::EventsRead(Default::default()),
+            })
+            .unwrap();
+        assert_eq!(
+            response["error"]["code"],
+            super::super::compatibility::ERROR_CODE
+        );
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// A fake server for #910 that takes exactly `connections` connections,
     /// reads each request, and leaves the first `stalls` of them unanswered so
     /// the client's read times out with `EAGAIN`, the way a server under load
