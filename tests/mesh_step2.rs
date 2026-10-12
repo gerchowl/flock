@@ -666,9 +666,10 @@ fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
     let started = Instant::now();
     fleet::wait_until("sender CLI receives routed outcome", DEADLINE, || {
         let output = operator(c.fleet.node("nodea"), &["msg", "status", "question"]);
-        // Terminal no-answer states exit non-zero by design (3 or 4).
+        // Terminal no-answer states exit non-zero by design: 3, or 13 for a
+        // refusal (4 before #1025).
         assert!(
-            matches!(output.status.code(), Some(0 | 3 | 4)),
+            matches!(output.status.code(), Some(0 | 3 | 13)),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );

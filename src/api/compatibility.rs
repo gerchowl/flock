@@ -8,8 +8,8 @@ use serde_json::Value;
 use super::client::ApiClient;
 use super::schema::{Method, PingParams, Request};
 
-pub const EXIT_CODE: i32 = 78;
-pub const ERROR_CODE: &str = "server_version_gap";
+pub const EXIT_CODE: i32 = crate::cli::exit::PROTOCOL_GAP;
+pub const ERROR_CODE: &str = super::error_code::ErrorCode::ServerVersionGap.as_str();
 
 #[derive(Clone)]
 pub struct ServerVersion {

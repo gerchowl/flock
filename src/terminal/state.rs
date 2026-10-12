@@ -203,6 +203,11 @@ pub struct TerminalState {
     /// and `agent.result` so a supervisor on the socket can tell that settle
     /// from one with nothing left running without reading the screen.
     pub settled_with_background_shells: bool,
+    /// Background tasks the detector last counted on screen (#1022), `None`
+    /// when the agent's screen does not show them.
+    pub background_tasks: Option<u32>,
+    /// What the detector's last `Blocked` screen asked of a human (#1023).
+    pub needs_human: Option<crate::api::agent_state::HumanReason>,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -253,6 +258,11 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub launch_env: Vec<(String, String)>,
+    /// The agent session whose profile selector was last read into
+    /// `launch_env` (#1010), so a hook that reports on every state change
+    /// reads the process environment once per session, not once per report.
+    /// Ephemeral: `launch_env` is what persists.
+    pub(crate) profile_env_session: Option<String>,
     pub restart_in_progress: bool,
     pub restart_stopped: bool,
     pub(crate) restart_confirmation_pid: Option<u32>,
@@ -345,6 +355,8 @@ impl TerminalState {
             state_changed_at: None,
             live_activity: None,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -364,6 +376,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             launch_env: Vec::new(),
+            profile_env_session: None,
             restart_in_progress: false,
             restart_stopped: false,
             restart_confirmation_pid: None,
@@ -727,6 +740,11 @@ impl TerminalState {
         })
     }
 
+    /// Which authority decided the current `state` (#309).
+    pub fn last_state_authority(&self) -> StateAuthority {
+        self.last_state_authority
+    }
+
     pub(crate) fn submission_session_id(&self) -> Option<String> {
         self.current_session_identity_for_persistence()
             .map(|(_, _, _, value)| value)
@@ -1041,6 +1059,8 @@ impl TerminalState {
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
@@ -1303,6 +1323,8 @@ impl TerminalState {
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
         self.stale_hook_idle_since = None;
         self.state = AgentState::Unknown;
         self.state_changed_at = None;
@@ -1360,6 +1382,8 @@ impl TerminalState {
         self.stale_hook_idle_since = None;
         self.live_activity = None;
         self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
@@ -2491,6 +2515,8 @@ mod tests {
                 visible_idle: false,
                 visible_working: false,
                 settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2517,6 +2543,8 @@ mod tests {
                 visible_idle: true,
                 visible_working: false,
                 settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
             },
             false,
             now + std::time::Duration::from_millis(100),

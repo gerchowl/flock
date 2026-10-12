@@ -38,6 +38,9 @@ pub(crate) struct DelegationEdge {
     pub(crate) repo: Option<String>,
     pub(crate) label: Option<String>,
     pub(crate) state: EdgeState,
+    /// When the edge was first recorded, in Unix ms. A re-issued copy keeps
+    /// the original's time while the original is still in the log.
+    pub(crate) since_ms: u64,
 }
 
 impl DelegationEdge {
@@ -69,9 +72,9 @@ pub(crate) struct DelegationIndex {
 impl DelegationIndex {
     /// Fold the durable log. A re-issued copy refreshes an edge's fields but
     /// never revives it: gone is sticky, because an `AgentId` never comes
-    /// back once it is retired.
-    pub(crate) fn fold<'a>(&mut self, events: impl IntoIterator<Item = &'a EventEnvelope>) {
-        for envelope in events {
+    /// back once it is retired. Each event comes with its log timestamp.
+    pub(crate) fn fold<'a>(&mut self, events: impl IntoIterator<Item = (u64, &'a EventEnvelope)>) {
+        for (ts_ms, envelope) in events {
             match &envelope.data {
                 EventData::AgentDelegated {
                     architect,
@@ -84,10 +87,10 @@ impl DelegationIndex {
                     label,
                     reissued: _,
                 } => {
-                    let state = self
+                    let (state, since_ms) = self
                         .edges
                         .get(delegate)
-                        .map_or(EdgeState::Live, |edge| edge.state);
+                        .map_or((EdgeState::Live, ts_ms), |edge| (edge.state, edge.since_ms));
                     self.edges.insert(
                         delegate.clone(),
                         DelegationEdge {
@@ -100,6 +103,7 @@ impl DelegationIndex {
                             repo: repo.clone(),
                             label: label.clone(),
                             state,
+                            since_ms,
                         },
                     );
                 }
@@ -140,6 +144,11 @@ impl DelegationIndex {
             edge.state == EdgeState::Live || edge.worktree.as_deref().is_some_and(worktree_exists)
         });
         self.edges.values().collect()
+    }
+
+    /// Every open edge, ordered by delegate.
+    pub(crate) fn edges(&self) -> impl Iterator<Item = &DelegationEdge> {
+        self.edges.values()
     }
 
     /// Open edges whose architect is `architect`.
@@ -207,6 +216,7 @@ impl App {
                 .map(|label| label.trim().to_string())
                 .filter(|label| !label.is_empty()),
             state: EdgeState::Live,
+            since_ms: super::notifications::now_ms(),
         };
         self.emit_event(edge.event(false));
         self.delegations.insert(edge);
@@ -223,7 +233,11 @@ impl App {
     pub(crate) fn reissue_open_delegations(&mut self) {
         let mut index = DelegationIndex::default();
         let restored = self.event_hub.persisted_events_after(0);
-        index.fold(restored.iter().map(|(_, _, envelope)| envelope));
+        index.fold(
+            restored
+                .iter()
+                .map(|(_, ts_ms, envelope)| (*ts_ms, envelope)),
+        );
         let live: HashSet<String> = self
             .state
             .terminals
@@ -257,6 +271,7 @@ mod tests {
             repo: Some("/repo/.git".into()),
             label: Some("#614".into()),
             state: EdgeState::Live,
+            since_ms: 0,
         }
         .event(false)
     }
@@ -272,6 +287,10 @@ mod tests {
         }
     }
 
+    fn stamped(events: &[EventEnvelope]) -> impl Iterator<Item = (u64, &EventEnvelope)> {
+        events.iter().map(|envelope| (0, envelope))
+    }
+
     fn live(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
     }
@@ -279,7 +298,10 @@ mod tests {
     #[test]
     fn the_fold_builds_an_architect_to_edges_index() {
         let mut index = DelegationIndex::default();
-        index.fold(&[edge("arch", "d1", None), edge("arch", "d2", None)]);
+        index.fold(stamped(&[
+            edge("arch", "d1", None),
+            edge("arch", "d2", None),
+        ]));
         let delegates: Vec<_> = index
             .edges_of("arch")
             .into_iter()
@@ -299,21 +321,25 @@ mod tests {
         if let EventData::AgentDelegated { reissued: flag, .. } = &mut reissued.data {
             *flag = true;
         }
-        index.fold(&[edge("arch", "d1", Some("/wt/d1")), removed("d1"), reissued]);
+        index.fold(stamped(&[
+            edge("arch", "d1", Some("/wt/d1")),
+            removed("d1"),
+            reissued,
+        ]));
         assert_eq!(index.get("d1").map(|e| e.state), Some(EdgeState::Gone));
     }
 
     #[test]
     fn a_gone_edge_stays_open_while_its_worktree_exists_and_closes_when_it_owns_nothing() {
         let mut index = DelegationIndex::default();
-        index.fold(&[
+        index.fold(stamped(&[
             edge("arch", "kept", Some("/wt/kept")),
             removed("kept"),
             edge("arch", "bare", None),
             removed("bare"),
             edge("arch", "reaped", Some("/wt/reaped")),
             removed("reaped"),
-        ]);
+        ]));
         let open: Vec<_> = index
             .reconcile(&live(&[]), &|path| path == "/wt/kept")
             .into_iter()
@@ -327,11 +353,11 @@ mod tests {
     #[test]
     fn a_delegate_missing_from_the_live_records_is_gone_without_a_logged_removal() {
         let mut index = DelegationIndex::default();
-        index.fold(&[
+        index.fold(stamped(&[
             edge("arch", "alive", None),
             edge("arch", "lost", None),
             edge("arch", "lost-kept", Some("/wt/lost-kept")),
-        ]);
+        ]));
         let open: Vec<_> = index
             .reconcile(&live(&["alive"]), &|path| path == "/wt/lost-kept")
             .into_iter()
@@ -352,7 +378,7 @@ mod tests {
 /// feature has never run"). The ancestry walk itself is `spawn_caller()`'s and
 /// is driven for real: this process stands in as the pane's child.
 #[cfg(test)]
-mod handler_tests {
+pub(crate) mod handler_tests {
     use std::path::PathBuf;
 
     use crate::api::schema::{
@@ -362,7 +388,7 @@ mod handler_tests {
     use crate::api::EventHub;
     use crate::app::App;
 
-    fn temp_log(name: &str) -> PathBuf {
+    pub(crate) fn temp_log(name: &str) -> PathBuf {
         std::env::temp_dir()
             .join(format!(
                 "flock-delegation-{name}-{}-{:?}",
@@ -372,7 +398,7 @@ mod handler_tests {
             .join("event-log.jsonl")
     }
 
-    fn app_on(hub: EventHub) -> App {
+    pub(crate) fn app_on(hub: EventHub) -> App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(&crate::config::Config::default(), true, None, rx, hub);
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("architect")];
@@ -382,7 +408,7 @@ mod handler_tests {
     }
 
     /// Make workspace 0's pane an agent this process is running inside.
-    fn caller_is_an_agent(app: &mut App) -> String {
+    pub(crate) fn caller_is_an_agent(app: &mut App) -> String {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
             .expect("workspace has a pane");
@@ -399,7 +425,7 @@ mod handler_tests {
         agent_id
     }
 
-    fn start(app: &mut App, label: Option<&str>) -> (String, Option<String>) {
+    pub(crate) fn start(app: &mut App, label: Option<&str>) -> (String, Option<String>) {
         let name = format!("worker-{}", app.state.terminals.len());
         let response = app.handle_api_request(Request {
             id: "req".into(),
@@ -444,7 +470,7 @@ mod handler_tests {
             .collect()
     }
 
-    fn shutdown(mut app: App) {
+    pub(crate) fn shutdown(mut app: App) {
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();

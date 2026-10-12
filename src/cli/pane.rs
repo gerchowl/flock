@@ -76,29 +76,29 @@ fn pane_list(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane get <pane_id>");
+        eprintln!("usage: flk pane get <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flk pane get <pane_id>");
+        eprintln!("usage: flk pane get <target>");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:get".into(),
         method: Method::PaneGet(PaneTarget {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
         }),
     })?)
 }
 
 fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <target> <label>|--clear");
         return Ok(2);
     };
     if args.len() < 2 {
-        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <target> <label>|--clear");
         return Ok(2);
     }
     let label = if args.len() == 2 && args[1] == "--clear" {
@@ -110,7 +110,7 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:rename".into(),
         method: Method::PaneRename(PaneRenameParams {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
             label,
         }),
     })?)
@@ -120,7 +120,7 @@ const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent na
 
 pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
-pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  Use pane send-keys for control keys (Enter, C-c, Esc).";
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
 pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -129,7 +129,7 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let pane_id = super::resolve_pane_arg(raw_pane_id);
     let mut source = ReadSource::Recent;
     let mut lines = None;
     let mut format = ReadFormat::Text;
@@ -203,12 +203,12 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
 fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!(
-            "usage: flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
+            "usage: flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
         );
         return Ok(2);
     };
 
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let pane_id = super::resolve_pane_arg(raw_pane_id);
     let mut direction = None;
     let mut cwd = None;
     let mut focus = false;
@@ -271,7 +271,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_move(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_pane_move_args(args) {
+    let mut params = match parse_pane_move_args(args) {
         Ok(params) => params,
         Err(message) => {
             eprintln!("{message}");
@@ -279,6 +279,14 @@ fn pane_move(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    params.pane_id = super::resolve_pane_arg(&params.pane_id);
+    if let PaneMoveDestination::Tab {
+        target_pane_id: Some(target),
+        ..
+    } = &mut params.destination
+    {
+        *target = super::resolve_pane_arg(target);
+    }
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:move".into(),
         method: Method::PaneMove(params),
@@ -430,7 +438,7 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
 }
 
 fn pane_move_usage() -> String {
-    "usage: flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+    "usage: flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
         .into()
 }
 
@@ -457,7 +465,7 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:close".into(),
         method: Method::PaneClose(PaneTarget {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
         }),
     })?)
 }
@@ -477,7 +485,7 @@ fn pane_stash(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let target = PaneTarget {
-        pane_id: super::normalize_pane_id(raw_pane_id),
+        pane_id: super::resolve_pane_arg(raw_pane_id),
     };
     let method = match verb {
         "show" => Method::PaneStashShow(target),
@@ -491,6 +499,9 @@ fn pane_stash(args: &[String]) -> std::io::Result<i32> {
         id: format!("cli:pane:stash:{verb}"),
         method,
     })?;
+    if response.get("error").is_some() && verb == "restore" {
+        return super::print_send_response(&response);
+    }
     if json || response.get("error").is_some() {
         return super::print_response(&response);
     }
@@ -511,9 +522,9 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:pane:send-text".into(),
         method: Method::PaneSendText(PaneSendTextParams { pane_id, text }),
     })?)
@@ -525,7 +536,7 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let keys = args[1..].to_vec();
     super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
 }
@@ -782,19 +793,22 @@ fn parse_guarded_pane_run(
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flk pane run <pane_id> <command>");
+        eprintln!("usage: flk pane run <target> <command>");
         return Ok(2);
     }
 
     match parse_guarded_pane_run(args) {
-        Ok(Some(params)) => return super::send_ok_request(Method::PaneSubmit(params)),
+        Ok(Some(mut params)) => {
+            params.pane_id = super::resolve_pane_arg(&params.pane_id);
+            return super::send_guarded_request(Method::PaneSubmit(params));
+        }
         Err(reason) => {
             eprintln!("pane run: {reason}");
             return Ok(2);
         }
         Ok(None) => (),
     }
-    let pane_id = super::normalize_pane_id(&args[0]);
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
     submit_sequence(&pane_id, &text)
 }
@@ -1531,24 +1545,24 @@ fn pane_help_text() -> String {
     use std::fmt::Write as _;
     let _ = writeln!(out, "flk pane commands:");
     let _ = writeln!(out, "  flk pane list [--workspace <workspace_id>]");
-    let _ = writeln!(out, "  flk pane get <pane_id>");
-    let _ = writeln!(out, "  flk pane rename <pane_id> <label>|--clear");
+    let _ = writeln!(out, "  flk pane get <target>");
+    let _ = writeln!(out, "  flk pane rename <target> <label>|--clear");
     let _ = writeln!(out, "  flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
-        "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
+        "  flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
+        "  flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
+        "  flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+        "  flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(out, "  flk pane close <target>");
     let _ = writeln!(out, "  {PANE_STASH_USAGE}");
@@ -1577,7 +1591,7 @@ fn pane_help_text() -> String {
         "  flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
     );
     let _ = writeln!(out, "  flk pane clear-field <key> [--pane <pane_id>]");
-    let _ = writeln!(out, "  flk pane run <pane_id> <command>");
+    let _ = writeln!(out, "  flk pane run <target> <command>");
     let _ = writeln!(out);
     let _ = writeln!(
         out,

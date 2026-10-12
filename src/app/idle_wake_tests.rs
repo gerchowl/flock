@@ -756,35 +756,138 @@ async fn under_channel_push_a_turn_the_push_started_is_never_typed_over() {
 #[tokio::test]
 async fn guarded_submit_retries_only_enter_once_and_reports_unconfirmed() {
     use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
-    let Rig {
-        mut app,
-        pane,
-        mut pty,
-    } = rig();
-    claude_idle_for(&mut app, settled());
-    let now = Instant::now();
-    let mut attempt = app
-        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
-        .unwrap();
-    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
-    runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
-    assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
-    assert!(drain(&mut pty).is_empty());
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-        None
-    );
-    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
-        None
-    );
-    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
-    assert_eq!(
-        app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
-        Some(Outcome::Unconfirmed("confirm_timeout"))
-    );
-    assert!(drain(&mut pty).is_empty());
+    // (composer after the retried Enter, reason): text still there means
+    // the composer swallowed Enter (#1018), an emptied one proves nothing.
+    for (after, reason) in [("hello", "typed_not_submitted"), ("", "confirm_timeout")] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+        assert!(drain(&mut pty).is_empty());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+        runtime(&app).test_process_pty_bytes(&claude_screen(after));
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
+            Some(Outcome::Unconfirmed(reason))
+        );
+        assert_eq!(attempt.evidence.reason.as_deref(), Some(reason));
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+/// Claude folds a long paste into a chip, so the composer never matches the
+/// sent text (#995). The chip still authorizes the Enter and its one retry,
+/// and a chip left after both is `typed_not_submitted`, not success.
+#[tokio::test]
+async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    let text = "long brief ".repeat(100);
+    let chip = include_str!("../../tests/fixtures/paste-chip-995/claude-chip.txt");
+    let fixture = format!("\x1b[2J\x1b[H{}", chip.replace('\n', "\r\n"));
+    for (after, outcome) in [
+        (fixture.clone(), Outcome::Unconfirmed("typed_not_submitted")),
+        (
+            String::from_utf8(claude_screen("")).unwrap(),
+            Outcome::Unconfirmed("confirm_timeout"),
+        ),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, &text, None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app).test_process_pty_bytes(fixture.as_bytes());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()], "the chip gets Enter");
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW),
+            None
+        );
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()], "and one retry");
+        runtime(&app).test_process_pty_bytes(after.as_bytes());
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP + CONFIRM_WINDOW * 2),
+            Some(outcome)
+        );
+        assert!(drain(&mut pty).is_empty(), "no third Enter");
+    }
+}
+
+/// A 16-column pane shows only the wrapped tail of a long message (#1122).
+/// That tail gets the Enter and its one retry like a paste chip. A tail that
+/// does not end the sent text gets no Enter, and neither does a fully visible
+/// editor holding only the end of a text short enough to fit in it: nothing
+/// scrolled off, so the start was lost, not clipped.
+#[tokio::test]
+async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    let sent = "Please review the pull request for the narrow pane fix and report back \
+        with findings, then check https://github.com/gerchowl/flock/pull/1120 for the \
+        follow-up discussion about guarded submit confirmation on wrapped composers.";
+    let narrow = include_str!("../../tests/fixtures/wrapped-composer-1126/claude-16-cols.txt");
+    let lines: Vec<&str> = narrow.lines().collect();
+    let unclipped = [&lines[..2], &["\u{276f} delta", "  epsilon"], &lines[17..]]
+        .concat()
+        .join("\n");
+    let other = sent.replace("composers.", "panes.");
+    let not_visible = Outcome::Unconfirmed("owned_composer_not_visible");
+    for (screen, text, enters, outcome) in [
+        (narrow, sent, 2, Outcome::Unconfirmed("typed_not_submitted")),
+        (narrow, other.as_str(), 0, not_visible),
+        (unclipped.as_str(), "gamma delta epsilon", 0, not_visible),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app).resize(40, 16, 0, 0);
+        let fixture = format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n"));
+        runtime(&app).test_process_pty_bytes(fixture.as_bytes());
+        let mut at = now + GAP;
+        let mut result = app.advance_guarded_submit(&pane, &mut attempt, at);
+        let mut sent_enters = drain(&mut pty).len();
+        while result.is_none() {
+            at += CONFIRM_WINDOW;
+            result = app.advance_guarded_submit(&pane, &mut attempt, at);
+            sent_enters += drain(&mut pty).len();
+        }
+        assert_eq!(sent_enters, enters, "{text}");
+        assert_eq!(result, Some(outcome), "{text}");
+    }
 }
 
 #[tokio::test]
@@ -1226,7 +1329,7 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
     let attempts = app.delivery_attempts();
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].state, "unconfirmed");
-    assert_eq!(attempts[0].reason.as_deref(), Some("confirm_timeout"));
+    assert_eq!(attempts[0].reason.as_deref(), Some("typed_not_submitted"));
     assert!(attempts[0].retried);
     assert_eq!(app.mailboxes.queued_len(&pane), 1);
     let status = |app: &mut App| -> serde_json::Value {
@@ -1306,7 +1409,7 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
     assert!(digest
         .yellow
         .iter()
-        .any(|row| row.summary.contains("confirm_timeout")
+        .any(|row| row.summary.contains("typed_not_submitted")
             && row.context.contains(&("pane".into(), pane.clone()))));
     assert_eq!(app.mailboxes.queued_len(&pane), 0);
     std::fs::remove_file(log).unwrap();
@@ -2087,3 +2190,46 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
 
 #[path = "injection_lock_tests.rs"]
 mod injection_lock_tests;
+
+/// #1019 from the socket: `agent.get` and `agent.list` carry the `state`
+/// a real detector report produces, and the local `fleet` row repeats it.
+#[tokio::test]
+async fn agent_records_carry_the_state_object_from_the_detector() {
+    let call = |app: &mut App, method| -> serde_json::Value {
+        let id = "state".to_string();
+        serde_json::from_str(&app.handle_api_request(Request { id, method })).unwrap()
+    };
+    let Rig { mut app, pane, .. } = rig();
+    claude_idle_for(&mut app, Duration::from_secs(3));
+    let target = crate::api::schema::AgentTarget { target: pane };
+    let state = &call(&mut app, Method::AgentGet(target))["result"]["agent"]["state"];
+    assert_eq!(state["turn"], "idle");
+    assert_eq!(state["phase"], "settling");
+    assert_eq!(
+        (&state["background"], &state["attention"]),
+        (&"unknown".into(), &"none".into())
+    );
+    assert_eq!(
+        (&state["lifecycle"], &state["source"]["turn"]),
+        (&"live".into(), &"screen".into())
+    );
+    assert!(state["held_ms"].as_u64().unwrap() >= 3_000);
+    // The idle start only moves on a change, so the settled case is a fresh pane.
+    let Rig { mut app, .. } = rig();
+    claude_idle_for(&mut app, settled());
+    let list = call(
+        &mut app,
+        Method::AgentList(crate::api::schema::EmptyParams {}),
+    );
+    let agent = &list["result"]["agents"][0];
+    assert_eq!(
+        (&agent["agent_status"], &agent["state"]["phase"]),
+        (&"idle".into(), &"unknown".into())
+    );
+    let held = agent["state"]["held_ms"].as_u64().unwrap();
+    assert!(
+        (10_000..settled().as_millis() as u64).contains(&held),
+        "{held}"
+    );
+    assert_eq!(list["result"]["fleet"][0]["state"], agent["state"]);
+}

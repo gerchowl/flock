@@ -151,7 +151,8 @@ state {
   turn:       working | idle | unknown         // is the harness mid-turn?
   background: none | running { count, oldest_age_s, source } | unknown
   attention:  none
-            | needs_human { reason: question | permission | dialog | trust | login }
+            | needs_human { reason: question | permission | dialog | trust | login
+                                    | unknown }
             | blocked     { reason: provider_limit | auth | resume_failed | crashed,
                             retry_after_ms? }
   waiting:    none | on { wait_id, predicate, since }    // §5, registered waits
@@ -168,9 +169,9 @@ and the order is part of the contract:
 | --- | --- |
 | `gone` | lifecycle `gone` |
 | `hibernated` / `offline` | the lifecycle value |
-| `limit_reached` | attention `blocked{provider_limit}` (carries `retry_after_ms` when the harness shows one) |
-| `blocked` | any other attention `blocked` |
-| `needs_human` | attention `needs_human` |
+| `limit_reached` | attention `blocked{provider_limit}` (carries `retry_after_ms` when the harness shows one), whatever `turn` and `background` say |
+| `blocked` | any other attention `blocked`, whatever `turn` and `background` say |
+| `needs_human` | attention `needs_human`, whatever `turn` and `background` say |
 | `working` | turn `working` |
 | `waiting_on_event` | turn `idle`, held ≥ settle, and a registered wait is open |
 | `finished_with_background` | turn `idle`, held ≥ settle, background `running`, no wait registered |
@@ -200,8 +201,8 @@ Rules:
   | --- | --- | --- | --- |
   | turn | screen detector, Stop / UserPromptSubmit hooks | screen detector | plugin `session.status` |
   | background | screen footer ("N shells"), process tree | process tree (#663) | process tree |
-  | needs_human | screen (permission / question / trust dialogs) | screen (approval, trust dialogs) | plugin + screen |
-  | provider_limit | screen (to add) | screen (to add) | `detect/provider_limit.rs` |
+  | needs_human | screen (permission / question / trust / login dialogs) | screen (approval, question, trust, login) | plugin + screen |
+  | provider_limit | screen (limit footer, `/rate-limit-options` menu, last turn's limit notice) | screen (last turn's usage-limit error) | `detect/provider_limit.rs` |
 
   A harness that cannot provide an axis reports `unknown` for it, and
   `phase` falls back accordingly. `finished` is never inferred from an
@@ -209,6 +210,18 @@ Rules:
 - **Today's `blocked` splits.** The detector's `blocked` (a visible permission
   or question prompt) becomes `needs_human`. `blocked` is reserved for states
   no answer from a human at the pane resolves quickly (limits, auth, crashes).
+  `agent_status` keeps reporting `blocked` for both, and a quota screen the
+  harness draws over an idle prompt box reads `blocked` there too.
+- **Attention outranks turn and background** (#1023). A prompt drawn over a
+  running turn is `needs_human`, not `working`, and a limit hit with a
+  background shell alive is `limit_reached`, not `finished_with_background`.
+  While attention is set, `turn` reads `unknown` (a visible prompt is not a
+  turn fact) and `background` keeps its own value for when it clears. A limit is scoped to the turn that hit it: the first
+  later turn that runs clears it, so a stale notice in scrollback never holds
+  `limit_reached`. A `blocked` report whose source cannot name the prompt (a
+  hook, a harness without matchers) is `needs_human{unknown}`, sourced to
+  that hook. Neither Claude nor Codex shows a duration to the reset, only a
+  wall-clock time, so their `retry_after_ms` is absent.
 
 ### 2. Supervisor events are derived facts, persisted once, in the existing log
 

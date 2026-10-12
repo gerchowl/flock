@@ -56,11 +56,31 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
         };
     }
 
-    let provider_limit = (agent == Agent::OpenCode && state == AgentState::Blocked)
-        .then(|| super::provider_limit::opencode(screen_content))
+    // Claude and Codex show a reset clock, never a duration (#1023).
+    let limit = |hit: bool| {
+        hit.then_some(super::provider_limit::ProviderLimit {
+            retry_after_ms: None,
+        })
+    };
+    let provider_limit = (state == AgentState::Blocked)
+        .then(|| match agent {
+            Agent::OpenCode => super::provider_limit::opencode(screen_content),
+            Agent::Claude => limit(claude_code::has_provider_limit(screen_content)),
+            Agent::Codex => limit(codex::has_provider_limit(screen_content)),
+            _ => None,
+        })
+        .flatten();
+    let needs_human = (state == AgentState::Blocked && provider_limit.is_none())
+        .then(|| match agent {
+            Agent::Claude => Some(claude_code::needs_human(screen_content)),
+            Agent::Codex => Some(codex::needs_human(screen_content)),
+            _ => None,
+        })
         .flatten();
     let activity = if agent == Agent::Claude && state == AgentState::Working {
         claude_code::live_activity_text(screen_content)
@@ -79,6 +99,10 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         settled_with_background_shells: agent == Agent::Claude
             && state == AgentState::Idle
             && claude_code::settled_with_background_shells(screen_content),
+        background_tasks: (agent == Agent::Claude)
+            .then(|| claude_code::background_task_count(screen_content))
+            .flatten(),
+        needs_human,
     }
 }
 

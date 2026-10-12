@@ -43,6 +43,11 @@ impl StartWatch {
         STARTUP_ALLOWANCE.saturating_add(settle)
     }
 
+    /// When a sample could next find the turn never started.
+    pub(super) fn due(&self) -> Option<Instant> {
+        self.empty_since.map(|since| since + self.window)
+    }
+
     pub(super) fn interrupted(&mut self) {
         self.empty_since = None;
         self.contents = None;

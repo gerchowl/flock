@@ -17,9 +17,12 @@ mod agent;
 mod checks;
 mod compatibility;
 mod delegate;
+pub(crate) mod delegate_list;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;
+mod events;
+pub(crate) mod exit;
 mod fleet;
 mod help;
 mod hook;
@@ -172,6 +175,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "preflight" => preflight::run_preflight_command(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
+        "events" => events::run_events_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
@@ -347,12 +351,11 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-/// Exit codes for `flk config check`. The split between "loaded with warnings"
-/// and "did not load" is what makes the command usable as a deploy gate: a
-/// deprecation rename should not block a rollout, a config that leaves the
-/// session running on defaults should (#240).
-const CONFIG_CHECK_ADVISORY: i32 = 1;
-const CONFIG_CHECK_PARSE_FAILURE: i32 = 2;
+// Exit codes for `flk config check`. The split between "loaded with warnings"
+// and "did not load" is what makes the command usable as a deploy gate: a
+// deprecation rename should not block a rollout, a config that leaves the
+// session running on defaults should (#240).
+use exit::{CONFIG_CHECK_ADVISORY, CONFIG_CHECK_PARSE_FAILURE};
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
     let mut json = false;
@@ -1006,6 +1009,7 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
             Request {
                 id: "cli:wait:agent-status".into(),
                 method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                    after: None,
                     // `idle` is "ready for input", so it watches `done` too.
                     // Without the pair this verb hung on every unattended
                     // agent — an agent nobody is looking at goes quiet as
@@ -1061,6 +1065,16 @@ pub(super) fn wait_for_agent_change(
 }
 
 pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, false)
+}
+
+/// [`print_response`] for a send-like or guarded verb, where a refusal that
+/// changed nothing exits `REFUSED` (ADR-0029 §2, #1025).
+pub(crate) fn print_send_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, true)
+}
+
+fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io::Result<i32> {
     if let Some(code) = response
         .get("result")
         .and_then(crate::api::effect_exit_code)
@@ -1070,14 +1084,44 @@ pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i3
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(response, send_like));
     }
 
     println!("{}", serde_json::to_string(response).unwrap());
     Ok(0)
 }
 
+/// The exit status for an error response. Only a send-like or guarded verb
+/// maps a refusal to `REFUSED`; every other verb keeps `FAILURE`.
+pub(crate) fn error_exit(response: &serde_json::Value, send_like: bool) -> i32 {
+    match response["error"]["code"].as_str() {
+        Some(code) if send_like => refusal_exit(code),
+        _ => exit::FAILURE,
+    }
+}
+
+/// A send-like or guarded verb's exit for a server refusal: `REFUSED` for an
+/// error whose retry class is `later` (refused before acting, nothing
+/// changed), which names its old code on stderr (#1025), else `FAILURE`.
+pub(crate) fn refusal_exit(code: &str) -> i32 {
+    let later = crate::api::error_code::ErrorCode::from_code(code)
+        .is_some_and(|code| code.retry() == exit::Retry::Later);
+    if later {
+        return exit::moved(exit::REFUSED);
+    }
+    exit::FAILURE
+}
+
 pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, false)
+}
+
+/// [`send_ok_request`] for a guarded verb.
+pub(super) fn send_guarded_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, true)
+}
+
+fn send_ok_request_for(method: Method, send_like: bool) -> std::io::Result<i32> {
     let response = send_request(&Request {
         id: "cli:request".into(),
         method,
@@ -1092,7 +1136,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(&response, send_like));
     }
 
     Ok(0)
@@ -1128,6 +1172,55 @@ pub(super) fn normalize_tab_id(value: &str) -> String {
 
 pub(super) fn normalize_pane_id(value: &str) -> String {
     value.to_string()
+}
+
+/// A pane verb's target as a pane id (ADR-0029 §5). `self` is the calling
+/// pane, and a public pane id passes through. Anything else (an agent name,
+/// a terminal id, a fleet agent id) is pre-resolved through `agent.get`,
+/// which servers answered long before their pane verbs took names, so a new
+/// client names agents against an old server too. When that fails the target
+/// goes on as typed and the verb's own refusal names the expected shapes.
+///
+/// An agent whose name is shaped like a pane id (`w1:p2`, `p_3`, `1-2`) is
+/// not pre-resolved: the id goes as typed, so against an old server it means
+/// the pane, and only a new server falls back to the name.
+pub(super) fn resolve_pane_arg(value: &str) -> String {
+    // The server resolves `self` by ancestry; the env saves it a lookup.
+    if value == "self" {
+        return std::env::var("FLOCK_PANE_ID").unwrap_or_else(|_| value.to_string());
+    }
+    if is_public_pane_id(value) {
+        return value.to_string();
+    }
+    send_request(&Request {
+        id: "cli:target:resolve".into(),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: value.to_string(),
+        }),
+    })
+    .ok()
+    .and_then(|response| {
+        response["result"]["agent"]["pane_id"]
+            .as_str()
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| value.to_string())
+}
+
+/// `<workspace>:p<number>`, `p_<…>` or the legacy `<ws>-<n>`: needs no round
+/// trip to resolve.
+fn is_public_pane_id(value: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    value.starts_with("p_")
+        || value.rsplit_once(":p").is_some_and(|(ws, number)| {
+            !ws.is_empty()
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        || value.rsplit_once('-').is_some_and(|(ws, number)| {
+            let ws = ws.strip_prefix("w_").or(ws.strip_prefix('w')).unwrap_or(ws);
+            digits(ws) && digits(number)
+        })
 }
 
 pub(super) fn parse_split_direction(value: &str) -> std::io::Result<SplitDirection> {
@@ -1519,6 +1612,23 @@ mod config_check_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_public_pane_ids_skip_the_target_round_trip() {
+        for id in ["w3:p2", "w_1:p1a", "p_7", "p_1_2", "1-1", "w_2-3", "w2-3"] {
+            assert!(super::is_public_pane_id(id), "{id}");
+        }
+        for target in [
+            "reviewer",
+            "worker-2",
+            "agent_atlas_6f21c4",
+            "w3:p",
+            ":p2",
+            "a:pb-c",
+        ] {
+            assert!(!super::is_public_pane_id(target), "{target}");
+        }
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

@@ -35,7 +35,7 @@ pub(crate) enum Severity {
 impl Severity {
     fn exit_code(self) -> i32 {
         match self {
-            Severity::Ok => 0,
+            Severity::Ok => super::exit::SUCCESS,
             Severity::Advisory => super::CONFIG_CHECK_ADVISORY,
             Severity::Blocking => super::CONFIG_CHECK_PARSE_FAILURE,
         }

@@ -35,13 +35,32 @@ pub(crate) enum TerminalTargetError {
     },
 }
 
+/// The target shapes every pane or agent verb accepts, named in a refusal's
+/// `data.expected` so the caller's next call can be right (ADR-0029 §5).
+pub(crate) const PANE_TARGET_EXPECTED: &[&str] = &[
+    "pane id (w1:p2)",
+    "terminal id",
+    "unique agent name or label",
+    "agent id (agent_<host>_<suffix>) of an agent on this server",
+    "self (the caller's own pane)",
+];
+
 impl App {
-    // Staged for #00f: current pane APIs stay pane-targeted while agent APIs will call this.
-    #[allow(dead_code)]
+    /// The one target resolver (ADR-0029 §5): `self`, terminal id, pane id,
+    /// agent id, then unique agent name or label.
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
+        // `self` is the API caller's own pane, from its process ancestry.
+        if target == "self" {
+            return self
+                .caller_pane()
+                .and_then(|(ws_idx, pane_id)| self.terminal_target_for_pane(ws_idx, pane_id))
+                .ok_or_else(|| TerminalTargetError::NotFound {
+                    target: target.to_string(),
+                });
+        }
         let terminal_matches: Vec<_> = self
             .terminal_targets()
             .into_iter()
@@ -55,6 +74,25 @@ impl App {
             if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
                 return Ok(resolved);
             }
+        }
+
+        // The agent id is the one address that survives a restart (#1010):
+        // terminal ids are re-minted and pane ids are placements, so an
+        // operator holding only `agent list` output from before a restart
+        // can still reach the agent by it.
+        let agent_id_matches: Vec<_> = self
+            .terminal_targets()
+            .into_iter()
+            .filter(|candidate| {
+                self.state
+                    .terminals
+                    .values()
+                    .find(|terminal| terminal.id.to_string() == candidate.terminal_id)
+                    .is_some_and(|terminal| terminal.agent_id.to_string() == target)
+            })
+            .collect();
+        if let Some(resolved) = self.single_terminal_match(target, agent_id_matches)? {
+            return Ok(resolved);
         }
 
         let name_matches: Vec<_> = self
@@ -166,5 +204,64 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
         })
+    }
+
+    /// [`Self::resolve_terminal_target`] for verbs that act on a placement:
+    /// an unknown target is `pane_not_found`, an ambiguous one keeps the
+    /// agent refusal with its candidate list.
+    pub(crate) fn resolve_pane_target(
+        &self,
+        target: &str,
+    ) -> Result<(usize, crate::layout::PaneId), crate::api::schema::ErrorBody> {
+        self.resolve_terminal_target(target)
+            .map(|resolved| (resolved.ws_idx, resolved.pane_id))
+            .map_err(|error| match error {
+                TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: format!(
+                        "pane {target} not found; expected a {}",
+                        PANE_TARGET_EXPECTED.join(", a ")
+                    ),
+                },
+                error => self.agent_target_error_body(error),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_one_pane() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("main"));
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    #[test]
+    fn an_agent_id_resolves_to_its_pane() {
+        // #1010: the agent id is the address that survives a restart.
+        let app = app_with_one_pane();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.workspaces[0].terminal_id(pane_id).unwrap();
+        let agent_id = app.state.terminals[terminal].agent_id.to_string();
+
+        let resolved = app.resolve_terminal_target(&agent_id).unwrap();
+        assert_eq!(resolved.pane_id, pane_id);
+        assert_eq!(resolved.terminal_id, terminal.to_string());
+        assert!(matches!(
+            app.resolve_terminal_target("agent_nowhere_0000"),
+            Err(TerminalTargetError::NotFound { .. })
+        ));
     }
 }

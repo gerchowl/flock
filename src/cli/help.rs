@@ -92,6 +92,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("delegate", "result", super::delegate::RESULT_USAGE),
     ("delegate", "status", super::delegate::STATUS_USAGE),
     ("delegate", "reap", super::delegate::REAP_USAGE),
+    ("delegate", "list", super::delegate_list::LIST_USAGE),
     (
         "worktree",
         "list",
@@ -152,7 +153,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "read",
         "flk notification read <notification-id> | --all",
     ),
-    ("agent", "list", "flk agent list"),
+    ("agent", "list", "flk agent list [--resumable]"),
     ("agent", "get", "flk agent get <target>"),
     (
         "agent",
@@ -166,8 +167,8 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("agent", "attach", "flk agent attach <target> [--takeover]"),
     ("agent", "start", super::agent::AGENT_START_USAGE),
     ("agent", "fork", super::agent::AGENT_FORK_USAGE),
-    ("agent", "hibernate", "flk agent hibernate <target>"),
-    ("agent", "resume", "flk agent resume <target>"),
+    ("agent", "hibernate", "flk agent hibernate <target>|--all"),
+    ("agent", "resume", "flk agent resume <target>|--all"),
     ("agent", "restart", super::agent::AGENT_RESTART_USAGE),
     ("agent", "history", super::agent::AGENT_HISTORY_USAGE),
     ("agent", "result", super::agent::AGENT_RESULT_USAGE),
@@ -192,8 +193,8 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("mcp", "serve", "flk mcp serve"),
     ("terminal", "attach", "flk terminal attach <terminal_id> [--takeover]"),
     ("pane", "list", "flk pane list [--workspace <workspace_id>]"),
-    ("pane", "get", "flk pane get <pane_id>"),
-    ("pane", "rename", "flk pane rename <pane_id> <label>|--clear"),
+    ("pane", "get", "flk pane get <target>"),
+    ("pane", "rename", "flk pane rename <target> <label>|--clear"),
     (
         "pane",
         "read",
@@ -202,12 +203,12 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "split",
-        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
+        "flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
     ),
     (
         "pane",
         "move",
-        "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
+        "flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
     ("pane", "close", super::pane::PANE_CLOSE_USAGE),
     ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),
@@ -304,6 +305,8 @@ const VERBS: &[(&str, &str, &str)] = &[
         "flk integration manifest <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli> [--json]",
     ),
     ("integration", "verify", "flk integration verify"),
+    ("events", "read", super::events::READ_USAGE),
+    ("events", "wait", super::events::WAIT_USAGE),
     ("checks", "list", "flk checks list"),
     ("checks", "ack", "flk checks ack <name>"),
     ("checks", "run", "flk checks run <name>"),
@@ -599,7 +602,10 @@ mod tests {
             "worktree" => include_str!("worktree.rs"),
             "tab" => include_str!("tab.rs"),
             "notification" => include_str!("notification.rs"),
-            "delegate" => include_str!("delegate.rs"),
+            "delegate" => concat!(
+                include_str!("delegate.rs"),
+                include_str!("delegate_list.rs")
+            ),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
             "mcp" => include_str!("mcp.rs"),
@@ -610,6 +616,7 @@ mod tests {
             "integration" => include_str!("integration.rs"),
             "checks" => include_str!("checks.rs"),
             "fleet" => include_str!("fleet.rs"),
+            "events" => include_str!("events.rs"),
             // These six live inline in the dispatcher itself.
             "config" | "channel" | "terminal" | "wait" | "session" | "hook" => {
                 include_str!("../cli.rs")

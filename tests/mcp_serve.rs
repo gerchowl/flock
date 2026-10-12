@@ -406,6 +406,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_agent_read",
             "flock_agent_fork",
             "flock_agent_lineage",
+            "flock_delegate_list",
             "flock_msg_send",
             "flock_msg_reply",
             "flock_msg_list",
@@ -422,6 +423,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_agent_start",
             "flock_agent_history",
             "flock_agent_result",
+            "flock_events_read",
         ]
     );
     for tool in tools {
@@ -461,6 +463,149 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
 
     mcp.shutdown();
     drop(server);
+    cleanup_test_base(&base);
+}
+
+/// `flk` against the isolated server, outside any pane.
+fn flk(config_home: &Path, runtime_dir: &Path, socket_path: &Path, args: &[&str]) -> Value {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .args(args)
+        .env("FLOCK_SOCKET_PATH", socket_path)
+        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_PANE_ID")
+        .output()
+        .expect("run flk");
+    // A refusal prints on stderr.
+    let stream = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    let text = String::from_utf8_lossy(stream);
+    serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("flk {args:?}: {e}: {text}"))
+}
+
+/// #1021 acceptance: a pane-id-only verb takes an agent name, and
+/// `flock_msg_send` takes a bare string target.
+#[test]
+fn pane_get_takes_an_agent_name_and_msg_send_a_bare_string_target() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let server = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let run = |args: &[&str]| flk(&config_home, &runtime_dir, &socket_path, args);
+
+    run(&["workspace", "create", "--cwd", base.to_str().unwrap()]);
+    let list = run(&["pane", "list"]);
+    let pane = list["result"]["panes"][0]["pane_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no pane in {list}"))
+        .to_string();
+    run(&["agent", "rename", &pane, "reviewer"]);
+    let got = run(&["pane", "get", "reviewer"]);
+    assert_eq!(got["result"]["pane"]["pane_id"], pane.as_str(), "{got}");
+
+    let missing = run(&["pane", "get", "w9:p9"]);
+    assert_eq!(missing["error"]["code"], "pane_not_found", "{missing}");
+    assert!(missing["error"]["data"]["expected"].is_array(), "{missing}");
+
+    let mut mcp = McpClient::spawn(&socket_path);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}},
+    }));
+    mcp.recv(Duration::from_secs(5));
+    mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "flock_msg_send", "arguments": {
+            "to": pane, "body": "hello by bare id", "intent": "fyi",
+        }},
+    }));
+    let sent = mcp.recv(Duration::from_secs(5));
+    assert!(sent["error"].is_null(), "{sent}");
+    assert!(sent.to_string().contains("msg_queued"), "{sent}");
+    mcp.shutdown();
+
+    let inbox = run(&["msg", "list", "--pane", &pane]);
+    let queued = &inbox["result"]["messages"][0];
+    assert_eq!(queued["preview"], "hello by bare id", "{inbox}");
+    assert_eq!(queued["to_pane"], pane.as_str(), "{inbox}");
+
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+/// #1021 skew: against a server whose `pane.get` takes a pane id only, a new
+/// client resolves the agent name through `agent.get` first.
+#[test]
+fn pane_get_pre_resolves_an_agent_name_against_an_old_server() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let seen = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
+    let log = seen.clone();
+    let old_server = thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let params = &request["params"];
+            let response = match request["method"].as_str().unwrap() {
+                "agent.get" if params["target"] == "reviewer" => json!({"result": {
+                    "type": "agent_info", "agent": {"pane_id": "w1:p1"},
+                }}),
+                "pane.get" if params["pane_id"] == "w1:p1" => json!({"result": {
+                    "type": "pane_info", "pane": {"pane_id": "w1:p1"},
+                }}),
+                _ => json!({"error": {"code": "pane_not_found", "message": "pane id only"}}),
+            };
+            let done = request["method"] == "pane.get";
+            log.lock().unwrap().push(request);
+            let mut response = response;
+            response["id"] = json!("x");
+            writeln!(stream, "{response}").unwrap();
+            if done {
+                return;
+            }
+        }
+    });
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, value) in
+        support::environment::isolated_env(&base.join("config"), &base.join("runtime"))
+    {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .args(["pane", "get", "reviewer"])
+        .env("FLOCK_SOCKET_PATH", &socket_path)
+        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+        .env_remove("FLOCK_PANE_ID")
+        .output()
+        .expect("run flk");
+    old_server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"w1:p1\""), "{stdout}");
+    let seen = seen.lock().unwrap();
+    let methods: Vec<_> = seen.iter().map(|r| r["method"].clone()).collect();
+    assert!(
+        methods.ends_with(&[json!("agent.get"), json!("pane.get")]),
+        "{methods:?}"
+    );
     cleanup_test_base(&base);
 }
 

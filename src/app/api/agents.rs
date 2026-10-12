@@ -134,6 +134,18 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        // `self` is the caller's own agent, attested from its process
+        // ancestry (#1010). `agent hibernate --all` asks for it so an agent
+        // running the loop does not park itself halfway through.
+        if target.target == "self" {
+            let agent = self
+                .parse_pane_id_or_peer("", self.current_api_peer_pid)
+                .and_then(|(ws_idx, pane_id)| self.agent_info(ws_idx, pane_id));
+            return match agent {
+                Some(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+                None => agent_not_found(id, "self"),
+            };
+        }
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -1164,6 +1176,7 @@ mod tests {
     /// produced the way a live pane produces it, not set by hand.
     #[test]
     fn settled_with_background_shells_reaches_agent_get_and_agent_result() {
+        use crate::api::agent_state::SETTLE_MS;
         use crate::detect::{Agent, AgentState};
         use crate::events::AppEvent;
 
@@ -1193,6 +1206,8 @@ mod tests {
                 visible_blocker: detection.visible_blocker,
                 visible_idle: detection.visible_idle,
                 visible_working: detection.visible_working,
+                background_tasks: detection.background_tasks,
+                needs_human: detection.needs_human,
                 settled_with_background_shells: detection.settled_with_background_shells,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
@@ -1212,10 +1227,38 @@ mod tests {
             serde_json::from_str(&result(app, &target, None, None)).expect("agent.result json")
         };
 
+        // #1022: the same screen fills the `background` axis, and once the
+        // idle turn has held past the settle window the phase says so.
+        let settle = |app: &mut App| {
+            let terminal_id = focused_terminal_id(app);
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state_changed_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(SETTLE_MS + 1_000));
+        };
+        let axis = |agent: &serde_json::Value| {
+            let state = &agent["result"]["agent"]["state"];
+            (
+                state["turn"].clone(),
+                state["background"].clone(),
+                state["source"]["background"].clone(),
+                state["phase"].clone(),
+            )
+        };
         assert_eq!(publish(&mut app, settled), AgentState::Idle);
+        settle(&mut app);
         let agent = get(&mut app);
         assert_eq!(
             agent["result"]["agent"]["settled_with_background_shells"], true,
+            "{agent}"
+        );
+        assert_eq!(
+            axis(&agent),
+            (
+                "idle".into(),
+                serde_json::json!({"running": {"count": 1}}),
+                "screen".into(),
+                "finished_with_background".into()
+            ),
             "{agent}"
         );
         let reply = read_result(&mut app);
@@ -1235,7 +1278,18 @@ mod tests {
             "  \u{23f5}\u{23f5} bypass permissions on\n",
         );
         assert_eq!(publish(&mut app, plain), AgentState::Idle);
+        settle(&mut app);
         let agent = get(&mut app);
+        assert_eq!(
+            axis(&agent),
+            (
+                "idle".into(),
+                "none".into(),
+                "screen".into(),
+                "finished".into()
+            ),
+            "{agent}"
+        );
         assert!(
             agent["result"]["agent"]
                 .get("settled_with_background_shells")

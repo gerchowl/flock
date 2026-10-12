@@ -46,7 +46,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--submit] <target> <text>\n  Send pastes text (bracketed when enabled) without submitting. Use pane send-keys for control keys (Enter, C-c, Esc). --submit requires a fresh idle agent and empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry).\n  Use -- before the target to send text beginning with --submit literally.\n  Plain send observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). --submit reports accepted, observed_accepted, unconfirmed (exit 8) or abandoned (exit 9).";
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
 
 pub(super) const AGENT_HISTORY_USAGE: &str =
     "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
@@ -79,7 +79,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           {\"status\":\"settled\"|\"blocked\"|\"gone\",\"pane_id\":…,\"agent_status\":…,\n",
     "            \"turn_cursor\":…,\"held_ms\":N}\n",
     "           a gone line adds \"reason\":\"closed\"|\"hibernated\"|\"restarted\".\n",
-    "  exit 0 settled · 3 blocked · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
+    "  exit 0 settled · 6 blocked (was 3) · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
     "           · 1 every other error, including a server unreachable for 30 s when no --timeout\n",
     "           was given. A timeout is 1 for the non-settled statuses above.\n",
     "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
@@ -380,16 +380,16 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-/// `flk agent hibernate <target>` — park the agent pane (#175 C3).
+/// `flk agent hibernate <target>|--all` — park the agent pane (#175 C3).
 /// Mirrors the socket verb; refusals surface with the wire's code+message.
 fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent hibernate <target>");
+    let usage = "usage: flk agent hibernate <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent hibernate <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Hibernate);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:hibernate".into(),
@@ -399,16 +399,16 @@ fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-/// `flk agent resume <target>` — spawn the hibernated pane's argv back
+/// `flk agent resume <target>|--all` — spawn the hibernated pane's argv back
 /// into the same terminal (#175 C3).
 fn agent_resume(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent resume <target>");
+    let usage = "usage: flk agent resume <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent resume <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Resume);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:resume".into(),
@@ -416,6 +416,139 @@ fn agent_resume(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
         }),
     })?)
+}
+
+/// The two halves of the operator's restart path (#1010): park every agent
+/// before a server stop, bring every parked one back after the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkVerb {
+    Hibernate,
+    Resume,
+}
+
+impl BulkVerb {
+    fn done(self) -> &'static str {
+        match self {
+            Self::Hibernate => "hibernated",
+            Self::Resume => "resumed",
+        }
+    }
+
+    /// Whether this agent is one the verb applies to. Hibernate takes every
+    /// running agent with a resumable session; one without a session is
+    /// reported as skipped rather than refused one by one, because the
+    /// server would refuse to park it (it could never come back).
+    fn applies(self, agent: &serde_json::Value) -> Result<(), &'static str> {
+        let resumable = is_resumable(agent);
+        match self {
+            Self::Hibernate if resumable => Err("already_parked"),
+            Self::Hibernate if agent.get("agent_session").is_none() => Err("no_resumable_session"),
+            Self::Hibernate => Ok(()),
+            Self::Resume if resumable => Ok(()),
+            Self::Resume => Err("not_resumable"),
+        }
+    }
+
+    fn request(self, target: String) -> Request {
+        match self {
+            Self::Hibernate => Request {
+                id: "cli:agent:hibernate".into(),
+                method: Method::AgentHibernate(AgentTarget { target }),
+            },
+            Self::Resume => Request {
+                id: "cli:agent:resume".into(),
+                method: Method::AgentResume(AgentTarget { target }),
+            },
+        }
+    }
+}
+
+/// `resumable` from a current server; `hibernated` status from one that
+/// predates the field.
+fn is_resumable(agent: &serde_json::Value) -> bool {
+    agent
+        .get("resumable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || agent
+            .get("agent_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("hibernated")
+}
+
+fn local_agents(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response
+        .pointer("/result/agents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Apply `verb` to every local agent it fits, by agent id, and report each
+/// one: `{"results":[{agent_id,name,pane_id,outcome,code?,message?}]}`.
+/// Exit 1 when any agent the verb applied to failed, so a rollout script
+/// can tell "everything came back" from "something did not".
+fn agent_bulk(verb: BulkVerb) -> std::io::Result<i32> {
+    let listed = super::send_request(&Request {
+        id: "cli:agent:list".into(),
+        method: Method::AgentList(EmptyParams::default()),
+    })?;
+    if listed.get("error").is_some() {
+        return super::print_response(&listed);
+    }
+    // The caller's own agent, when it runs in a pane. Hibernating it would
+    // kill this very process mid-loop: the rest of the fleet stays running and
+    // no summary or exit code ever arrives. A server that predates `self`
+    // answers not-found, and then nothing is skipped.
+    let caller = super::send_request(&Request {
+        id: "cli:agent:self".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: "self".into(),
+        }),
+    })?
+    .pointer("/result/agent/agent_id")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_string);
+    let mut results = Vec::new();
+    let mut failed = false;
+    for agent in local_agents(&listed) {
+        let Some(agent_id) = agent.get("agent_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut row = serde_json::json!({
+            "agent_id": agent_id,
+            "name": agent.get("name"),
+            "pane_id": agent.get("pane_id"),
+        });
+        let applies = if caller.as_deref() == Some(agent_id) {
+            Err("caller")
+        } else {
+            verb.applies(&agent)
+        };
+        match applies {
+            Err(reason) => {
+                row["outcome"] = "skipped".into();
+                row["code"] = reason.into();
+            }
+            Ok(()) => {
+                let response = super::send_request(&verb.request(agent_id.to_string()))?;
+                if let Some(error) = response.get("error") {
+                    failed = true;
+                    row["outcome"] = "failed".into();
+                    row["code"] = error.get("code").cloned().unwrap_or_default();
+                    row["message"] = error.get("message").cloned().unwrap_or_default();
+                } else {
+                    row["outcome"] = verb.done().into();
+                    if let Some(pane) = response.pointer("/result/agent/pane_id") {
+                        row["pane_id"] = pane.clone();
+                    }
+                }
+            }
+        }
+        results.push(row);
+    }
+    println!("{}", serde_json::json!({ "results": results }));
+    Ok(i32::from(failed))
 }
 
 fn parse_agent_restart(args: &[String]) -> Result<crate::api::schema::AgentRestartParams, String> {
@@ -472,22 +605,45 @@ fn agent_restart(args: &[String]) -> std::io::Result<i32> {
         // A terminal newline in a handoff file is not part of the prompt.
         params.continue_with = Some(body.trim_end_matches(['\r', '\n']).to_string());
     }
-    super::print_response(&super::send_request(&Request {
+    // Guarded: a busy, rate-limited or drafted agent is refused before
+    // anything restarts, so that refusal exits 10 (#1025).
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:agent:restart".into(),
         method: Method::AgentRestart(params),
     })?)
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: flk agent list");
-        return Ok(2);
-    }
+    let resumable = match args {
+        [] => false,
+        [flag] if flag == "--resumable" => true,
+        _ => {
+            eprintln!("usage: flk agent list [--resumable]");
+            return Ok(2);
+        }
+    };
 
-    super::print_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:agent:list".into(),
         method: Method::AgentList(EmptyParams::default()),
-    })?)
+    })?;
+    // #1010: after a restart, the agents `agent resume --all` would bring
+    // back. Local agents only: a fleet row is another server's to resume.
+    if resumable {
+        if let Some(agents) = response
+            .pointer_mut("/result/agents")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            agents.retain(is_resumable);
+        }
+        if let Some(result) = response
+            .get_mut("result")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            result.insert("fleet".into(), serde_json::Value::Array(Vec::new()));
+        }
+    }
+    super::print_response(&response)
 }
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
@@ -722,6 +878,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         Request {
             id: "cli:agent:wait".into(),
             method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                after: None,
                 subscriptions,
             }),
         },
@@ -763,11 +920,20 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// A send submits unless `--no-submit` says otherwise (#995). `--submit`, the
+/// old opt-in, is still accepted and changes nothing.
 fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     let mut words = args;
-    let mut submit = false;
-    if words.first().is_some_and(|word| word == "--submit") {
-        submit = true;
+    let mut submit = true;
+    let mut flag = |word: &str| match word {
+        "--submit" => true,
+        "--no-submit" => {
+            submit = false;
+            true
+        }
+        _ => false,
+    };
+    while words.first().is_some_and(|word| flag(word)) {
         words = &words[1..];
     }
     let literal = words.first().is_some_and(|word| word == "--");
@@ -776,8 +942,7 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     }
     let target = words.first()?.clone();
     let mut text = &words[1..];
-    if !literal && text.first().is_some_and(|word| word == "--submit") {
-        submit = true;
+    while !literal && text.first().is_some_and(|word| flag(word)) {
         text = &text[1..];
     }
     if text.is_empty() {
@@ -793,9 +958,9 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
 fn agent_send(args: &[String]) -> std::io::Result<i32> {
     let Some(params) = parse_agent_send_args(args) else {
         eprintln!("usage: {AGENT_SEND_USAGE}");
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     };
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:agent:send".into(),
         method: Method::AgentSend(params),
     })?)
@@ -977,7 +1142,7 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
 
 fn print_agent_help() {
     eprintln!("flk agent commands:");
-    eprintln!("  flk agent list");
+    eprintln!("  flk agent list [--resumable]");
     eprintln!("  flk agent get <target>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  {AGENT_HISTORY_USAGE}");
@@ -995,8 +1160,14 @@ fn print_agent_help() {
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
     eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
-    eprintln!("  flk agent hibernate <target>");
-    eprintln!("  flk agent resume <target>");
+    eprintln!("  flk agent hibernate <target>|--all");
+    eprintln!("  flk agent resume <target>|--all");
+    eprintln!(
+        "    --all: every local agent; before a planned server stop hibernate --all, after the"
+    );
+    eprintln!(
+        "    start list --resumable and resume --all. Reports each agent; exit 1 if any failed"
+    );
     eprintln!("  {AGENT_RESTART_USAGE}");
     eprintln!("  --workspace/--tab replace an untouched lone root shell, otherwise open a new tab");
     eprintln!("    (a sibling space in workspace tab mode). Only --split splits a pane.");
@@ -1026,7 +1197,7 @@ fn print_agent_help() {
     eprintln!("    pass --workspace/--tab/--cwd, or --active, instead of being placed at random;");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send types without submitting; use agent send --submit to type and send Enter"
+        "  agent send types and submits with a confirmed Enter; agent send --no-submit only types"
     );
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
@@ -1047,7 +1218,7 @@ mod tests {
     use super::{parse_agent_start_flags, AGENT_START_USAGE};
 
     #[test]
-    fn agent_send_preserves_raw_text_and_parses_explicit_submit() {
+    fn agent_send_submits_by_default_and_no_submit_types_only() {
         let parse = |words: &[&str]| {
             super::parse_agent_send_args(
                 &words
@@ -1057,24 +1228,34 @@ mod tests {
             )
             .expect("valid send")
         };
-        let raw = parse(&["worker", "hello\nworld", "--submit"]);
-        assert!(!raw.submit);
-        assert_eq!(raw.text, "hello\nworld --submit");
+        let plain = parse(&["worker", "hello"]);
+        assert!(plain.submit, "a plain send submits (#995)");
+        let raw = parse(&["worker", "hello\nworld", "--no-submit"]);
+        assert!(raw.submit);
+        assert_eq!(raw.text, "hello\nworld --no-submit");
+        for words in [
+            vec!["--no-submit", "worker", "hello"],
+            vec!["worker", "--no-submit", "hello"],
+        ] {
+            let parsed = parse(&words);
+            assert!(!parsed.submit);
+            assert_eq!(parsed.target, "worker");
+            assert_eq!(parsed.text, "hello");
+        }
         for words in [
             vec!["--submit", "worker", "hello"],
             vec!["worker", "--submit", "hello"],
         ] {
             let parsed = parse(&words);
-            assert!(parsed.submit);
-            assert_eq!(parsed.target, "worker");
+            assert!(parsed.submit, "--submit stays an accepted alias");
             assert_eq!(parsed.text, "hello");
         }
-        let literal = parse(&["--", "worker", "--submit", "hello"]);
-        assert!(!literal.submit);
-        assert_eq!(literal.text, "--submit hello");
+        let literal = parse(&["--", "worker", "--no-submit", "hello"]);
+        assert!(literal.submit);
+        assert_eq!(literal.text, "--no-submit hello");
         assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
-        assert!(super::parse_agent_send_args(&["worker".into(), "--submit".into()]).is_none());
-        assert!(super::AGENT_SEND_USAGE.contains("without submitting"));
+        assert!(super::parse_agent_send_args(&["worker".into(), "--no-submit".into()]).is_none());
+        assert!(super::AGENT_SEND_USAGE.contains("--no-submit types only"));
     }
 
     #[test]

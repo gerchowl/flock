@@ -559,6 +559,22 @@ impl Default for WebSectionConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct EventsConfig {
+    /// The longest an `events.read` with `wait_ms` is held, in ms
+    /// (ADR-0028 owner decision 3). Default: 540000.
+    pub read_max_wait_ms: u64,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            read_max_wait_ms: crate::api::schema::EVENTS_READ_MAX_WAIT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct SystemOneConfig {
     pub urls: Vec<String>,
     /// Sized for clef-flash on the fleet endpoint (#714): an uncached 4 KB tail with the
@@ -665,6 +681,8 @@ pub struct Config {
     /// `[spawn]` — what a spawned child's environment is made of (#397).
     pub spawn: super::SpawnConfig,
     pub msg: MsgConfig,
+    /// `[events]` — the `events.read` socket method (ADR-0028 §3).
+    pub events: EventsConfig,
     pub systemone: SystemOneConfig,
     pub peers: Vec<PeerConfig>,
 }
@@ -1109,7 +1127,7 @@ impl PeerConfig {
 
 /// `[ui.injection_lock]` (#850): while flock types a guarded injection into a
 /// pane, the operator's keystrokes for that pane are held and replayed after
-/// it, and `agent send --submit` or an inbox wake moves a one-row draft aside
+/// it, and `agent send` or an inbox wake moves a one-row draft aside
 /// and types it back. Off restores the earlier behaviour: keystrokes go
 /// straight through and a draft refuses the injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

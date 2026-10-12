@@ -26,9 +26,9 @@
 use serde_json::{json, Value};
 
 use crate::api::schema::{
-    AgentForkParams, AgentReadParams, AgentTarget, EmptyParams, LineageParams, MessageTarget,
-    Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams, ReadFormat, ReadSource,
-    WorktreeKillParams, WorktreeListParams,
+    AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
+    EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
+    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -60,7 +60,8 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_agent_list",
             description: "List agents, and the fleet directory. `agents` is \
                           this server's own panes in full — each record \
-                          carries `seen` and `status_age_secs`, and the ones \
+                          carries `seen`, `status_age_secs` and `state` \
+                          (as on `flock_agent_get`), and the ones \
                           in `blocked` status need attention. `fleet` is \
                           every agent addressable from here INCLUDING other \
                           hosts, each row carrying `agent_id`, `host` and \
@@ -77,7 +78,10 @@ pub(super) fn table() -> &'static [Tool] {
                           `settled_with_background_shells: true` on an \
                           `idle`/`done` agent means its turn ended while \
                           shells or agents it started are still running; \
-                          the field is absent otherwise.",
+                          the field is absent otherwise. `state` carries \
+                          `turn`, `lifecycle`, a derived `phase` to branch \
+                          on, `held_ms` and a per-axis `source`; a server \
+                          without it means read `agent_status`.",
             input_schema: schema_target_only,
             build: build_agent_get,
         },
@@ -118,6 +122,24 @@ pub(super) fn table() -> &'static [Tool] {
                           survives after the panes are gone.",
             input_schema: schema_target_only,
             build: build_agent_lineage,
+        },
+        Tool {
+            name: "flock_delegate_list",
+            description: "List the delegates an architect started, read-only. \
+                          The workflow it serves: start a delegate (`flk \
+                          delegate start`), read its digest, review its PR, \
+                          merge, then reap its worktree. Each row is one \
+                          architect -> delegate edge with the delegate's \
+                          `agent_status`, harness, pane, branch, the PR \
+                          poller's cached `pr`, `edge_age_secs` and \
+                          `status_age_secs`, and a `state`: `live`, \
+                          `hibernated, awaiting merge`, `gone`, `gone, \
+                          worktree retained`, `orphaned`, or `closed, not \
+                          merged`. `architect` is `self` (default: you), \
+                          `all`, or an agent id; `branch` returns the edge \
+                          that owns that branch.",
+            input_schema: schema_delegate_list,
+            build: build_delegate_list,
         },
         Tool {
             name: "flock_msg_send",
@@ -391,6 +413,23 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_agent_result,
             build: build_agent_result,
         },
+        Tool {
+            name: "flock_events_read",
+            description: "Read the server's durable event log from a cursor \
+                          you hold (ADR-0028): every event with `seq > after`, \
+                          oldest first, filtered by `kinds` and `subjects` (a \
+                          pane, workspace, agent or message id in the event's \
+                          data). Resume from `next_after`, dedupe on `seq`. A \
+                          `gap` means the cursor is older than what is \
+                          retained. With `wait_ms` the call BLOCKS this MCP \
+                          session until a matching event lands (at most 9 \
+                          min); to wait longer, run `flk events wait` as a \
+                          background task. Use it instead of polling \
+                          `flock_agent_get`. Refusals: `invalid_params` (a \
+                          non-durable kind), `cursor_ahead`.",
+            input_schema: schema_events_read,
+            build: build_events_read,
+        },
     ]
 }
 
@@ -501,6 +540,27 @@ fn schema_no_args() -> Value {
     })
 }
 
+fn schema_delegate_list() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "architect": {
+                "type": "string",
+                "description": "`self` (default), `all`, or an architect's agent id.",
+            },
+            "branch": {
+                "type": "string",
+                "description": "Only the edge whose delegate works on this branch.",
+            },
+            "repo": {
+                "type": "string",
+                "description": "Only edges in this repository (the edge's repo key).",
+            },
+        },
+        "additionalProperties": false,
+    })
+}
+
 fn schema_target_only() -> Value {
     json!({
         "type": "object",
@@ -565,8 +625,9 @@ fn schema_msg_send() -> Value {
         "type": "object",
         "properties": {
             "to": {
-                "type": "object",
-                "description": "Message recipient, one of three shapes. \
+                "type": ["object", "string"],
+                "description": "Message recipient: a bare string such as `\"w3:p2\"`, an agent name or an agent id, or one of three objects. \
+                                A bare agent id is sent as the `agent` shape, anything else as the `pane` shape. \
                                 `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` is the ONLY shape that reaches another host — \
                                 `agent_id` is fleet-global and restart-stable. \
                                 `{\"type\":\"pane\",\"pane\":\"<pane>\"}` addresses a pane on THIS server only. \
@@ -613,6 +674,20 @@ fn schema_msg_send() -> Value {
             },
         },
         "required": ["to", "body", "intent"],
+        "additionalProperties": false,
+    })
+}
+
+fn schema_events_read() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "after": {"type": "integer", "minimum": 0, "description": "Return events with `seq` above this; 0 reads from the oldest retained."},
+            "kinds": {"type": "array", "items": {"type": "string"}, "description": "Durable event kinds, e.g. `message_queued`; empty means all."},
+            "subjects": {"type": "array", "items": {"type": "string"}, "description": "Ids an event's data must carry as a top-level value."},
+            "limit": {"type": "integer", "minimum": 1, "description": "At most this many events (default 256)."},
+            "wait_ms": {"type": "integer", "minimum": 0, "description": "Hold the call until a matching event lands, in ms (capped at 540000). Blocks this MCP session."},
+        },
         "additionalProperties": false,
     })
 }
@@ -827,6 +902,14 @@ fn build_agent_lineage(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn build_delegate_list(args: Value) -> Result<Method, McpError> {
+    Ok(Method::DelegateList(DelegateListParams {
+        architect: optional_string(&args, "architect")?.unwrap_or_else(|| "self".into()),
+        branch: optional_string(&args, "branch")?,
+        repo: optional_string(&args, "repo")?,
+    }))
+}
+
 fn build_agent_read(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentRead(AgentReadParams {
         target: required_string(&args, "target")?,
@@ -924,14 +1007,35 @@ fn build_agent_result(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+/// `to` as typed by the model: a bare string (ADR-0029 §5) or the tagged
+/// object. The string becomes the structured target here, so the wire keeps
+/// one shape and an older server accepts it unchanged.
+fn message_target(to: Value) -> Result<MessageTarget, McpError> {
+    if let Value::String(target) = to {
+        return Ok(if crate::terminal::AgentId::is_well_formed(&target) {
+            MessageTarget::Agent { agent: target }
+        } else {
+            MessageTarget::Pane { pane: target }
+        });
+    }
+    serde_json::from_value(to).map_err(|e| McpError {
+        data: Some(json!({ "expected": [
+            "a pane id, terminal id, agent name or agent id as a string",
+            {"type": "pane", "pane": "<pane>"},
+            {"type": "repo_pane", "repo": "<repo>", "pane": "<pane>"},
+            {"type": "agent", "agent": "<agent_id>"},
+        ]})),
+        ..McpError::invalid_params(format!("invalid `to`: {e}"))
+    })
+}
+
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
     // MCP sender identity comes from the server's process ancestry.
     let to_value = args
         .get("to")
         .cloned()
         .ok_or_else(|| McpError::invalid_params("missing `to`"))?;
-    let to: MessageTarget = serde_json::from_value(to_value)
-        .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
+    let to = message_target(to_value)?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
         to,
@@ -984,6 +1088,16 @@ fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
             ),
         },
     ))
+}
+
+/// Ceiling of `flock_events_read`'s hold, below the 600 s MCP tool timeout.
+const MCP_EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+
+fn build_events_read(args: Value) -> Result<Method, McpError> {
+    let mut params: EventsReadParams = serde_json::from_value(args)
+        .map_err(|err| McpError::invalid_params(format!("invalid events.read arguments: {err}")))?;
+    params.wait_ms = params.wait_ms.map(|ms| ms.min(MCP_EVENTS_READ_MAX_WAIT_MS));
+    Ok(Method::EventsRead(params))
 }
 
 /// `word` as one POSIX shell word: as-is when it is plainly safe, single-quoted
@@ -1436,6 +1550,22 @@ mod tests {
         assert_eq!(params.self_submit_confirmed, Some(false));
     }
 
+    /// #1029: the hold stays below the MCP tool timeout, and a kind the
+    /// server does not know is refused before the call goes out.
+    #[test]
+    fn events_read_caps_its_hold_below_the_tool_timeout() {
+        let Method::EventsRead(params) = build_events_read(json!({
+            "after": 4, "kinds": ["message_queued"], "subjects": ["ws_1:p1"], "wait_ms": 3_600_000
+        }))
+        .unwrap() else {
+            panic!("expected events.read");
+        };
+        assert_eq!(params.after, 4);
+        assert_eq!(params.subjects, ["ws_1:p1"]);
+        assert_eq!(params.wait_ms, Some(MCP_EVENTS_READ_MAX_WAIT_MS));
+        assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
+    }
+
     #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
@@ -1449,6 +1579,7 @@ mod tests {
                 "flock_agent_read",
                 "flock_agent_fork",
                 "flock_agent_lineage",
+                "flock_delegate_list",
                 "flock_msg_send",
                 "flock_msg_reply",
                 "flock_msg_list",
@@ -1465,6 +1596,7 @@ mod tests {
                 "flock_agent_start",
                 "flock_agent_history",
                 "flock_agent_result",
+                "flock_events_read",
             ]
         );
     }
@@ -2130,6 +2262,44 @@ mod tests {
             MessageTarget::Agent { agent } => assert_eq!(agent, "agent_atlas_6f21c4"),
             other => panic!("expected agent target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_msg_send_accepts_a_bare_string_target() {
+        let to = |target: &str| {
+            let method =
+                build_msg_send(json!({"to": target, "body": "x", "intent": "fyi"})).unwrap();
+            let Method::MsgSend(params) = method else {
+                panic!("expected MsgSend");
+            };
+            params.to
+        };
+        assert_eq!(
+            to("w3:p2"),
+            MessageTarget::Pane {
+                pane: "w3:p2".into()
+            }
+        );
+        assert_eq!(
+            to("reviewer"),
+            MessageTarget::Pane {
+                pane: "reviewer".into()
+            }
+        );
+        assert_eq!(
+            to("agent_atlas_6f21c4"),
+            MessageTarget::Agent {
+                agent: "agent_atlas_6f21c4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn build_msg_send_refuses_a_wrong_shape_with_the_expected_ones() {
+        let err = build_msg_send(json!({"to": 7, "body": "x", "intent": "fyi"})).unwrap_err();
+        assert_eq!(err.code, -32602);
+        let expected = err.data.unwrap()["expected"].as_array().unwrap().len();
+        assert_eq!(expected, 4);
     }
 
     #[test]

@@ -331,6 +331,37 @@ fn handle_connection(
             }
             result
         }
+        Method::EventsRead(params) => {
+            let Some(response) = super::events_read::read_events(
+                request_id.clone(),
+                params,
+                &mut stream,
+                event_hub,
+                running,
+            )?
+            else {
+                crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    "client_disconnected",
+                    changes_ui,
+                );
+                return Ok(());
+            };
+            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         Method::PaneWaitForOutput(params) => {
             let Some(response) =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?
@@ -533,6 +564,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentResume(_) => "agent.resume",
         Method::AgentRestart(_) => "agent.restart",
         Method::AgentLineage(_) => "agent.lineage",
+        Method::DelegateList(_) => "delegate.list",
         Method::MsgSend(_) => "msg.send",
         Method::MsgReply(_) => "msg.reply",
         Method::MsgList(_) => "msg.list",
@@ -573,6 +605,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneClose(_) => "pane.close",
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
+        Method::EventsRead(_) => "events.read",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
@@ -657,21 +690,42 @@ fn stream_subscriptions(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    // ADR-0028 §3 (#1030): from the caller's cursor, else from now. A
+    // cursor past the newest event is refused, as `events.read` refuses it,
+    // rather than streaming nothing until the hub catches up to it.
+    let head = event_hub.current_sequence();
+    let start = params.after.unwrap_or(head);
+    if start > head {
+        let refusal = ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "cursor_ahead".into(),
+                message: format!("cursor {start} is past this server's newest event {head}"),
+            },
+        };
+        return write_json_line_allow_disconnect(&mut stream, &refusal);
+    }
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
-        let active =
-            match ActiveSubscription::new(subscription, &request_id, index, api_tx, event_hub) {
-                Ok(active) => active,
-                Err(response) => {
-                    if let Err(err) = write_json_line(&mut stream, &response) {
-                        if is_connection_closed_error(&err) {
-                            return Ok(());
-                        }
-                        return Err(err);
+        let active = match ActiveSubscription::new(
+            subscription,
+            &request_id,
+            index,
+            start,
+            api_tx,
+            event_hub,
+        ) {
+            Ok(active) => active,
+            Err(response) => {
+                if let Err(err) = write_json_line(&mut stream, &response) {
+                    if is_connection_closed_error(&err) {
+                        return Ok(());
                     }
-                    return Ok(());
+                    return Err(err);
                 }
-            };
+                return Ok(());
+            }
+        };
         subscriptions.push(active);
     }
 
@@ -1379,6 +1433,63 @@ mod tests {
         }
     }
 
+    fn events_read(event_hub: &EventHub, params: &str) -> serde_json::Value {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(
+            client,
+            r#"{{"id":"r","method":"events.read","params":{params}}}"#
+        )
+        .unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(
+            server,
+            &api_tx,
+            event_hub,
+            &running,
+            None,
+            &Mutex::default(),
+        )
+        .unwrap();
+        serde_json::from_str(&read_line(&mut client)).unwrap()
+    }
+
+    /// #1028: `events.read` filters by subject and holds the request on the
+    /// hub until a matching event lands, skipping ones that do not match.
+    #[test]
+    fn events_read_long_polls_for_a_matching_subject() {
+        let event_hub = EventHub::default();
+        event_hub.push(queued_for("ws_1:p1", "c1"));
+        let now = events_read(&event_hub, r#"{"kinds":["message_queued"]}"#);
+        assert_eq!(now["result"]["events"][0]["seq"], 1);
+        assert_eq!(now["result"]["events"][0]["data"]["correlation_id"], "c1");
+        assert_eq!(now["result"]["next_after"], 1);
+
+        let pusher = event_hub.clone();
+        let started = std::time::Instant::now();
+        let push = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            pusher.push(queued_for("ws_1:p3", "c2"));
+            pusher.push(queued_for("ws_1:p2", "c3"));
+        });
+        let waited = events_read(
+            &event_hub,
+            r#"{"after":1,"subjects":["ws_1:p2"],"wait_ms":10000}"#,
+        );
+        push.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let events = waited["result"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{waited}");
+        assert_eq!(events[0]["seq"], 3);
+        assert_eq!(waited["result"]["next_after"], 3);
+
+        let ephemeral = events_read(&event_hub, r#"{"kinds":["pane_output_changed"]}"#);
+        assert_eq!(ephemeral["error"]["code"], "invalid_params");
+        let ahead = events_read(&event_hub, r#"{"after":9}"#);
+        assert_eq!(ahead["error"]["code"], "cursor_ahead");
+        assert_eq!(ahead["error"]["data"]["head"], 3, "{ahead}");
+    }
+
     /// #438: the inbox feed reports only its own pane's mail, only mail that
     /// arrived after it attached, and a burst in full.
     #[test]
@@ -1436,6 +1547,101 @@ mod tests {
 
         running.store(false, Ordering::Relaxed);
         assert!(server_thread.join().unwrap().is_ok());
+    }
+
+    /// #1030 (ADR-0028 §3): a subscription without `after` starts at now; one
+    /// whose cursor the ring has passed is told `lagged` before the events it
+    /// still can have; one past the newest event is refused.
+    #[test]
+    fn a_subscription_starts_at_now_or_its_cursor_and_reports_lag() {
+        let event_hub = EventHub::default();
+        event_hub.set_ring_cap(2);
+        for correlation in ["c1", "c2", "c3"] {
+            event_hub.push(queued_for("ws_1:p1", correlation));
+        }
+        let subscribe = |after: &str| {
+            let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            writeln!(
+                client,
+                r#"{{"id":"s","method":"events.subscribe","params":{{"subscriptions":[{{"type":"msg.queued","pane":"ws_1:p1"}}]{after}}}}}"#
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
+            let thread = std::thread::spawn(move || {
+                handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+            });
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            (BufReader::new(client), running, thread)
+        };
+        let next = |reader: &mut BufReader<UnixStream>| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+
+        // The ring holds c2 and c3, so c1 is gone.
+        let (mut behind, behind_running, behind_thread) = subscribe(r#","after":0"#);
+        assert_eq!(next(&mut behind)["result"]["type"], "subscription_started");
+        let lagged = next(&mut behind);
+        assert_eq!(lagged["event"], "lagged", "{lagged}");
+        assert_eq!(lagged["data"]["skipped_to"], 1);
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c2");
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c3");
+
+        let (mut now, now_running, now_thread) = subscribe("");
+        assert_eq!(next(&mut now)["result"]["type"], "subscription_started");
+        event_hub.push(queued_for("ws_1:p1", "c4"));
+        assert_eq!(next(&mut now)["data"]["correlation_id"], "c4", "no replay");
+        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c4");
+
+        let (mut ahead, _, ahead_thread) = subscribe(r#","after":99"#);
+        assert_eq!(next(&mut ahead)["error"]["code"], "cursor_ahead");
+        assert!(ahead_thread.join().unwrap().is_ok());
+        for (running, thread) in [(now_running, now_thread), (behind_running, behind_thread)] {
+            running.store(false, Ordering::Relaxed);
+            assert!(thread.join().unwrap().is_ok());
+        }
+    }
+
+    /// #1030: mail queued while the mesh wake subscription was down still
+    /// wakes it, because it resubscribes with `after: 0` and the push is
+    /// still in the ring.
+    #[test]
+    fn a_wake_subscription_resuming_from_zero_sees_mail_queued_while_it_was_down() {
+        let event_hub = EventHub::default();
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::MeshOutboundPending,
+            data: crate::api::schema::EventData::MeshOutboundPending {},
+        });
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(
+            client,
+            r#"{{"id":"relay-wake","method":"events.subscribe","params":{{"subscriptions":[{{"type":"mesh.outbound_pending"}}],"after":0}}}}"#
+        )
+        .unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
+        let thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(client);
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(next()["result"]["type"], "subscription_started");
+        assert_eq!(next()["event"], "mesh_outbound_pending");
+        running.store(false, Ordering::Relaxed);
+        assert!(thread.join().unwrap().is_ok());
     }
 
     #[test]

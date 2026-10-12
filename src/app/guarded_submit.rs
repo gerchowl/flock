@@ -269,6 +269,66 @@ fn editor_shows(agent: Agent, runtime: &crate::terminal::TerminalRuntime, text: 
     })
 }
 
+/// Claude Code folds a long paste into one `[Pasted text #N]` row (with
+/// ` +M lines` for several lines), and Codex into `[Pasted Content]` (with
+/// ` <n> chars`), so the editor never shows the sent text itself (#995).
+fn is_paste_chip(agent: Agent, row: &str) -> bool {
+    let digits = |word: &str| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+    let Some(inner) = row.strip_prefix('[').and_then(|row| row.strip_suffix(']')) else {
+        return false;
+    };
+    match agent {
+        Agent::Claude => inner.strip_prefix("Pasted text #").is_some_and(|rest| {
+            let (number, lines) = rest.split_once(" +").unwrap_or((rest, ""));
+            digits(number) && (lines.is_empty() || lines.strip_suffix(" lines").is_some_and(digits))
+        }),
+        Agent::Codex => inner.strip_prefix("Pasted Content").is_some_and(|rest| {
+            rest.is_empty()
+                || rest
+                    .strip_prefix(' ')
+                    .and_then(|rest| rest.strip_suffix(" chars"))
+                    .is_some_and(digits)
+        }),
+        _ => false,
+    }
+}
+
+/// The editor holds exactly one paste chip and nothing else.
+fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> bool {
+    editor_rows(agent, runtime)
+        .is_some_and(|rows| matches!(rows.as_slice(), [row] if is_paste_chip(agent, row)))
+}
+
+/// A pane too narrow for the message shows only the editor's last rows, wrapped
+/// at spaces or mid-word (#1122). Those rows, wraps removed, must end the sent
+/// text. Whitespace is dropped on both sides because a wrap at a space keeps it
+/// on neither row.
+///
+/// The editor must also be clipped: the sent text cannot fit in the visible
+/// rows at `row_width` columns each, so its start scrolled off. A fully visible
+/// editor that holds only the end of the text lost the start, and stays Other.
+fn matches_wrapped_tail(rows: &[&str], text: &str, row_width: usize) -> bool {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let tail = squash(&rows.concat());
+    rows.len() > 1
+        && !tail.is_empty()
+        && text.trim().chars().count() > rows.len() * row_width
+        && squash(text).ends_with(&tail)
+}
+
+fn editor_shows_wrapped_tail(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> bool {
+    // Each editor row loses at least the two-column prompt or indent.
+    let row_width = usize::from(runtime.current_size().1.saturating_sub(2));
+    editor_rows(agent, runtime).is_some_and(|rows| {
+        let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+        matches_wrapped_tail(&rows, text, row_width)
+    })
+}
+
 /// A draft flock can move aside and put back exactly: one editor row, with
 /// no paste or image chip whose contents the screen does not show. Several
 /// rows are refused because the screen cannot tell a typed newline from the
@@ -326,8 +386,12 @@ impl App {
         mut params: PaneSubmitParams,
         stash: bool,
     ) -> String {
-        let Some((ws, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return encode_error(id, "pane_gone", "pane_gone");
+        let (ws, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) if error.code == "pane_not_found" => {
+                return encode_error(id, "pane_gone", "pane_gone")
+            }
+            Err(error) => return encode_error(id, &error.code, error.message),
         };
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
             return encode_error(id, "pane_gone", "pane_gone");
@@ -471,7 +535,9 @@ impl App {
         };
         if runtime.try_send_flock_authored(Bytes::from(first)).is_err() {
             // Nothing reached the pane, so a draft is still where it was.
-            runtime.end_injection_lease(&evidence.attempt_id);
+            if !runtime.end_injection_lease(&evidence.attempt_id) {
+                evidence.held_input_not_written = true;
+            }
             abandon(evidence, "write_failed");
             return Err("write_failed");
         }
@@ -615,7 +681,21 @@ impl App {
             return None;
         }
         if attempt.sent && attempt.retried {
-            return Some(Outcome::Unconfirmed("confirm_timeout"));
+            // Both Enters went out and no turn started. If the composer still
+            // holds the sent text, it swallowed the key and the caller must
+            // clear it before retrying (ADR-0029 §1).
+            // A folded paste chip stands in for the text it folded (#995), and
+            // a wrapped tail for the text above it (#1122).
+            let typed = terminal.effective_known_agent().is_some_and(|agent| {
+                editor_shows(agent, runtime, &reported_text)
+                    || editor_shows_paste_chip(agent, runtime)
+                    || editor_shows_wrapped_tail(agent, runtime, &reported_text)
+            });
+            return Some(Outcome::Unconfirmed(if typed {
+                "typed_not_submitted"
+            } else {
+                "confirm_timeout"
+            }));
         }
         if let Some(reason) = terminal.guarded_submit_blocker(
             now,
@@ -634,7 +714,15 @@ impl App {
         let editor = runtime_composer(agent, runtime, &attempt.text);
         // The first Enter may precede the child's paste repaint. An unchanged
         // empty editor remains safe, but only exact owned text permits a retry.
-        if editor != Composer::Owned && (attempt.sent || editor != Composer::Empty) {
+        // The composer read empty before the paste and no operator input came
+        // since, so a lone paste chip in the idle editor is the text flock
+        // typed, folded by the harness (#995). The same holds for the wrapped
+        // tail a narrow pane leaves visible of a long message (#1122).
+        let owned = editor == Composer::Owned
+            || (editor == Composer::Other
+                && (editor_shows_paste_chip(agent, runtime)
+                    || editor_shows_wrapped_tail(agent, runtime, &reported_text)));
+        if !owned && (attempt.sent || editor != Composer::Empty) {
             // A partial paste repaint may omit the footer or still show only
             // part of our text. Wait for ownership before the first Enter.
             if !attempt.sent && now < attempt.deadline {
@@ -822,7 +910,11 @@ impl App {
             attempt.evidence.draft = Some(verdict.into());
         }
         if let Some((_, runtime)) = target {
-            runtime.end_injection_lease(&attempt.evidence.attempt_id);
+            // #1011 review: a pane that refuses the replay loses the operator's
+            // held keystrokes, and the attempt's outcome says so.
+            if !runtime.end_injection_lease(&attempt.evidence.attempt_id) {
+                attempt.evidence.held_input_not_written = true;
+            }
         }
     }
 
@@ -847,7 +939,9 @@ impl App {
         let mut ended = 0;
         for runtime in self.pane_runtimes() {
             ended += usize::from(runtime.expire_injection_lease(now));
-            runtime.drain_held_input();
+            // A refusal is logged per pane where it happens. No attempt is
+            // left to carry it here: the lease past its bound has no owner.
+            let _ = runtime.drain_held_input();
         }
         self.surface_kept_drafts();
         ended > 0
@@ -880,7 +974,7 @@ impl App {
         self.surface_kept_drafts();
         for runtime in self.pane_runtimes() {
             runtime.end_all_injection_leases();
-            runtime.drain_held_input();
+            let _ = runtime.drain_held_input();
         }
     }
 
@@ -956,6 +1050,7 @@ fn new_evidence(
         finished_at_ms: None,
         retried: false,
         draft: None,
+        held_input_not_written: false,
     }
 }
 
@@ -1199,3 +1294,11 @@ mod tests {
 #[cfg(test)]
 #[path = "guarded_submit/codex_721_tests.rs"]
 mod codex_721_tests;
+
+#[cfg(test)]
+#[path = "guarded_submit/paste_chip_995_tests.rs"]
+mod paste_chip_995_tests;
+
+#[cfg(test)]
+#[path = "guarded_submit/wrapped_tail_1122_tests.rs"]
+mod wrapped_tail_1122_tests;

@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_profile;
 pub(crate) mod agent_removal;
 pub(crate) mod agent_restart;
 mod agent_resume;
@@ -21,6 +22,7 @@ pub(crate) mod self_compact;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
+mod background_jobs;
 pub(crate) mod config_io;
 mod creation;
 pub(crate) mod delegation;
@@ -1760,6 +1762,10 @@ impl App {
         }
         if !invalid_section("worktrees") {
             self.state.config.worktrees = config.worktrees.clone();
+        }
+        if !invalid_section("events") {
+            self.event_hub
+                .set_read_max_wait_ms(config.events.read_max_wait_ms);
         }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
@@ -5937,6 +5943,8 @@ sidebar_pane_gap = 99
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -5965,6 +5973,8 @@ sidebar_pane_gap = 99
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

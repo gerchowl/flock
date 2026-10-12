@@ -50,3 +50,8 @@ to time wakes (idle, mid-turn, with a harness background task), and it reads an
 `event-log.jsonl` or a System One endpoint for the volume and judge-latency
 figures in ADR-0028 and ADR-0030. It refuses to run the pane probes without
 `--sandbox`. `python3 -I tests/probes/agent_wake.py --help` lists the setup.
+
+`fork_cache.py` is the runbook behind ADR-0033's fork-cost figures: its
+docstring is the setup (an isolated flk, a warm throwaway Claude session, a
+fork through `agent.fork` or in place), and `usage <session id>` prints the
+cache read and creation tokens of every turn from the Claude transcript.

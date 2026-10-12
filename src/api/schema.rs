@@ -125,6 +125,10 @@ pub enum Method {
     AgentRestart(AgentRestartParams),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
+    /// #960 (ADR-0027 §2): an architect's delegates, from the edge index
+    /// joined with cached state only.
+    #[serde(rename = "delegate.list")]
+    DelegateList(DelegateListParams),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSendParams),
     #[serde(rename = "msg.reply")]
@@ -211,6 +215,8 @@ pub enum Method {
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]
     EventsWait(EventsWaitParams),
+    #[serde(rename = "events.read")]
+    EventsRead(EventsReadParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -293,6 +299,7 @@ impl Method {
                 | Self::AgentHistory(_)
                 | Self::AgentResult(_)
                 | Self::AgentLineage(_)
+                | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
                 | Self::PeersEnrollment(_)
@@ -339,6 +346,7 @@ impl Method {
             | Self::AgentHistory(_)
             | Self::AgentResult(_)
             | Self::AgentLineage(_)
+            | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
             | Self::MsgStatus(_)
@@ -359,6 +367,7 @@ impl Method {
             | Self::PaneStashShow(_)
             | Self::EventsSubscribe(_)
             | Self::EventsWait(_)
+            | Self::EventsRead(_)
             | Self::PaneWaitForOutput(_)
             | Self::ChecksList(_)
             | Self::DigestRender(_)
@@ -1173,6 +1182,60 @@ pub struct LineageNode {
     pub branch: Option<String>,
 }
 
+/// `delegate.list` (#960, ADR-0027 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateListParams {
+    /// `self` (the attested caller), `all`, or an architect's agent id.
+    #[serde(default = "delegate_list_self")]
+    pub architect: String,
+    /// Only the edge whose delegate works on this branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Only edges in this repository (the edge's repo key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+fn delegate_list_self() -> String {
+    "self".to_string()
+}
+
+/// One architect -> delegate edge joined with what the server has cached
+/// about the delegate. Nothing here costs a git or `gh` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRow {
+    pub architect: String,
+    pub delegate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub via: DelegationVia,
+    /// `live` | `hibernated, awaiting merge` | `gone` |
+    /// `gone, worktree retained` | `orphaned` | `closed, not merged`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The harness, when the delegate is still an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
+    pub edge_age_secs: u64,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The PR poller's cached answer for the branch, never a live read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrInfo>,
+}
+
 /// Does the sender want an answer (#280, R4 of #213)?
 ///
 /// Stamped by the SENDER, never inferred by the receiver — the same principle
@@ -1497,6 +1560,11 @@ pub struct DeliveryAttempt {
     /// `kept` (left in the pane's stash for `flk pane stash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// Operator keystrokes held for this injection (#850) could not be
+    /// replayed because the pane refused them (a closed pane or a writer
+    /// accepting zero bytes, #1011). They are lost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_input_not_written: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1750,6 +1818,28 @@ pub struct ServerLiveHandoffParams {
     pub expected_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Hand off even when a pane's queued input will not drain, dropping and
+    /// reporting what was pending per pane (#981, #1011). Opt-in: without it a
+    /// stuck pane fails the handoff and the error names it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_undrained: bool,
+}
+
+/// A pane whose queued PTY input did not drain before a live handoff (#981).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndrainedPane {
+    /// The public pane id (`wX:pN`), or the internal number when the pane has
+    /// no public id.
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending_bytes: usize,
+    /// The pane's writer kept accepting zero bytes, rather than the drain
+    /// simply running out of time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1921,6 +2011,11 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
+    /// from now, never a replay of the ring. A cursor older than the ring
+    /// gets a `lagged { skipped_to }` line first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1987,6 +2082,49 @@ pub enum Subscription {
     MsgQueued { pane: String },
 }
 
+/// `events.read` (ADR-0028 §3): every durable event with `seq > after`,
+/// served from the ring and then from the rotated log files on disk.
+/// Delivery is at-least-once, so consumers dedupe on `seq`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsReadParams {
+    #[serde(default)]
+    pub after: u64,
+    /// Durable kinds only; empty means every durable kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<EventKind>,
+    /// Matches an event whose data carries one of these as a top-level
+    /// string value (a pane, workspace, agent or message id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Hold the request until a matching event arrives, at most
+    /// `[events] read_max_wait_ms`. Absent or 0 answers at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
+pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
+pub const EVENTS_READ_MAX_LIMIT: u32 = 4096;
+
+/// Sequences this server no longer retains, both ends inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventGap {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub envelope: EventEnvelope,
+}
+
+/// The ADR-0028 successor is `events.read`. This variant still has no
+/// handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsWaitParams {
     pub match_event: EventMatch,
@@ -2613,6 +2751,9 @@ pub enum ResponseResult {
     Lineage {
         chain: Vec<LineageEdge>,
     },
+    DelegateList {
+        delegates: Vec<DelegateRow>,
+    },
     MsgQueued {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_key: Option<crate::mesh::key::MessageKey>,
@@ -2661,6 +2802,14 @@ pub enum ResponseResult {
         /// message's own delivery; this is what came back.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
+    },
+    /// `events.read`: a `gap` first when the cursor is older than what is
+    /// retained, then the events, then the cursor to resume from.
+    EventsRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gap: Option<EventGap>,
+        events: Vec<SequencedEvent>,
+        next_after: u64,
     },
     /// #576: how a `msg.wait_reply` ended.
     MsgReplyAwaited {
@@ -2801,6 +2950,11 @@ pub enum ResponseResult {
         run_id: String,
         dry_run: bool,
         results: Vec<RevertRepoResult>,
+    },
+    /// A live handoff that went ahead under `--skip-undrained` and dropped the
+    /// listed panes' pending input. A handoff that dropped nothing answers `Ok`.
+    LiveHandoff {
+        skipped_undrained: Vec<UndrainedPane>,
     },
     Ok {},
 }
@@ -3032,6 +3186,15 @@ pub struct FleetAgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub status: AgentStatus,
+    /// The agent's `state` (#1019). A local row carries the full record's
+    /// value. A remote row is all `unknown`: the mesh summary carries no
+    /// state, and the mesh protocol is unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<crate::api::agent_state::AgentState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3050,6 +3213,16 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// The cross-harness state (ADR-0028 §1, #1019): orthogonal axes with a
+    /// per-axis `source`, and the derived `phase` supervisors branch on.
+    /// Additive: absent from older servers, and a client reads a missing or
+    /// unparseable value as absent, so it falls back to `agent_status`.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<crate::api::agent_state::AgentState>,
     /// The agent is `idle`/`done` because its turn ended (Claude's
     /// `done <time>` marker) while background shells or agents it started are
     /// still running (#922). Carried from the server's own screen detector,
@@ -3114,6 +3287,14 @@ pub struct AgentInfo {
     /// summaries, and on servers predating #553.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_cursor: Option<String>,
+    /// The agent has a resume plan and no running process (#1010): it was
+    /// hibernated, or a restart restored it and its deferred resume has not
+    /// launched yet. `agent resume` brings it back either way.
+    ///
+    /// Additive and optional, so it needed no protocol bump: omitted when
+    /// false, and an older server never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumable: bool,
     pub revision: u64,
 }
 
@@ -5011,6 +5192,7 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            state: None,
             settled_with_background_shells: false,
             blocked_reason: None,
             retry_after_ms: None,
@@ -5027,6 +5209,7 @@ mod tests {
             status_age_secs: None,
             run_id: None,
             turn_cursor: Some("term_1:0:3:9:w".into()),
+            resumable: false,
             revision: 4,
         }
     }

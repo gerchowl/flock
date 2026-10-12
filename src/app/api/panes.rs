@@ -14,29 +14,13 @@ use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
     normalize_reported_agent_label, sanitize_reported_prompt,
 };
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_with_data, encode_success};
 
 impl App {
-    pub(super) fn resolve_pane_target(
-        &self,
-        target: &str,
-    ) -> Result<(usize, crate::layout::PaneId), crate::api::schema::ErrorBody> {
-        self.resolve_terminal_target(target)
-            .map(|resolved| (resolved.ws_idx, resolved.pane_id))
-            .map_err(|error| match error {
-                crate::app::terminal_targets::TerminalTargetError::NotFound { target } => {
-                    crate::api::schema::ErrorBody {
-                        code: "pane_not_found".into(),
-                        message: format!("pane {target} not found"),
-                    }
-                }
-                error => self.agent_target_error_body(error),
-            })
-    }
-
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
-        let Some((ws_idx, target_pane_id)) = self.parse_pane_id(&params.target_pane_id) else {
-            return pane_not_found(id, &params.target_pane_id);
+        let (ws_idx, target_pane_id) = match self.resolve_pane_target(&params.target_pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let (rows, cols) = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
@@ -128,8 +112,9 @@ impl App {
             destination,
             focus,
         } = params;
-        let Some((source_ws_idx, source_pane_id)) = self.parse_pane_id(&pane_id) else {
-            return pane_not_found(id, &pane_id);
+        let (source_ws_idx, source_pane_id) = match self.resolve_pane_target(&pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(source_tab_idx) =
             self.state.workspaces[source_ws_idx].find_tab_index_for_pane(source_pane_id)
@@ -197,11 +182,12 @@ impl App {
                 }
                 let target_pane_id = match target_pane_id {
                     Some(raw) => {
-                        let Some((pane_ws_idx, pane_id)) = self.parse_pane_id(&raw) else {
-                            return encode_error(
+                        let Ok((pane_ws_idx, pane_id)) = self.resolve_pane_target(&raw) else {
+                            return encode_error_with_data(
                                 id,
                                 "target_pane_not_found",
                                 format!("target pane {raw} not found"),
+                                expected_targets(),
                             );
                         };
                         let pane_tab_idx =
@@ -539,8 +525,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_get(&mut self, id: String, target: PaneTarget) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return pane_not_found(id, &target.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&target.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
             return pane_not_found(id, &target.pane_id);
@@ -550,8 +537,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_rename(&mut self, id: String, params: PaneRenameParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(terminal_id) = self
             .state
@@ -578,7 +566,7 @@ impl App {
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
         let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
-            Err(error) => return encode_error(id, &error.code, error.message),
+            Err(error) => return target_refusal(id, error),
         };
         // Echo back the canonical public id so a request that used the legacy
         // `<ws>-<n>` form still reads the new-style `<ws>:p<n>` in the result.
@@ -660,6 +648,7 @@ impl App {
             params.agent_session_path,
         );
         let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref,
@@ -673,6 +662,9 @@ impl App {
 
         if native_identity {
             self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -782,6 +774,7 @@ impl App {
             params.agent_session_path,
         );
         let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref,
@@ -793,6 +786,9 @@ impl App {
 
         if native_identity {
             self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -1018,7 +1014,7 @@ impl App {
     ) -> String {
         let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
-            Err(error) => return encode_error(id, &error.code, error.message),
+            Err(error) => return target_refusal(id, error),
         };
         let public = self
             .public_pane_id(ws_idx, pane_id)
@@ -1038,8 +1034,9 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1278,7 +1275,7 @@ impl App {
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
         let (ws_idx, pane_id) = match self.resolve_pane_target(&target.pane_id) {
             Ok(target) => target,
-            Err(error) => return encode_error(id, &error.code, error.message),
+            Err(error) => return target_refusal(id, error),
         };
         // Capture the canonical public pane id BEFORE close (closing drops
         // the public-number mapping, so emitting the event afterwards using
@@ -1334,7 +1331,7 @@ impl App {
     ) -> String {
         let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
-            Err(error) => return encode_error(id, &error.code, error.message),
+            Err(error) => return target_refusal(id, error),
         };
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             let public = self
@@ -1424,6 +1421,19 @@ fn normalize_state_labels(
         })
         .filter_map(Result::transpose)
         .collect()
+}
+
+/// A target refusal; an unknown target names the accepted shapes in
+/// `data.expected` (ADR-0029 §5).
+fn target_refusal(id: String, error: crate::api::schema::ErrorBody) -> String {
+    if error.code == "pane_not_found" {
+        return encode_error_with_data(id, &error.code, error.message, expected_targets());
+    }
+    encode_error(id, &error.code, error.message)
+}
+
+fn expected_targets() -> serde_json::Value {
+    serde_json::json!({ "expected": crate::app::terminal_targets::PANE_TARGET_EXPECTED })
 }
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
@@ -1521,6 +1531,77 @@ mod tests {
             app.state.workspaces[0].terminal_id(other),
             Some(&other_terminal)
         );
+    }
+
+    #[test]
+    fn pane_only_verbs_resolve_agent_name_and_fleet_agent_id() {
+        let (mut app, terminal_id, public) = app_with_terminal();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.agent_name = Some("reviewer".into());
+        let agent_id = terminal.agent_id.to_string();
+        for target in ["reviewer".to_string(), agent_id, terminal_id.to_string()] {
+            let get = app.handle_pane_get(
+                "get".into(),
+                PaneTarget {
+                    pane_id: target.clone(),
+                },
+            );
+            let get: serde_json::Value = serde_json::from_str(&get).unwrap();
+            assert_eq!(
+                get["result"]["pane"]["pane_id"],
+                public.as_str(),
+                "{target}"
+            );
+            let rename = app.handle_pane_rename(
+                "rename".into(),
+                PaneRenameParams {
+                    pane_id: target.clone(),
+                    label: Some("lbl".into()),
+                },
+            );
+            assert!(rename.contains("\"result\""), "{target}: {rename}");
+        }
+    }
+
+    #[test]
+    fn self_resolves_to_the_callers_pane_by_ancestry() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let get = |app: &mut App| {
+            let response = app.handle_pane_get(
+                "get".into(),
+                PaneTarget {
+                    pane_id: "self".into(),
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
+        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        app.current_api_peer_pid = Some(std::process::id());
+        assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
+    }
+
+    #[test]
+    fn unknown_pane_target_names_the_expected_shapes() {
+        let (mut app, _, _) = app_with_terminal();
+        let response = app.handle_pane_get(
+            "get".into(),
+            PaneTarget {
+                pane_id: "nobody".into(),
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "pane_not_found");
+        let expected = response["error"]["data"]["expected"].as_array().unwrap();
+        assert_eq!(
+            expected.len(),
+            crate::app::terminal_targets::PANE_TARGET_EXPECTED.len()
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected a pane id"));
     }
 
     #[test]

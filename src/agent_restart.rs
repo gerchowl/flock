@@ -236,6 +236,7 @@ pub(crate) fn resume_launch(
                 "--add-dir"
                     | "--allowedTools"
                     | "--allowed-tools"
+                    | "--betas"
                     | "--disallowedTools"
                     | "--disallowed-tools"
                     | "--mcp-config"
@@ -305,7 +306,19 @@ pub(crate) fn resume_launch(
                 | "--dangerously-load-development-channels"
                 | "--channels"
                 | "--effort"
-        ) || arg == "-c" && session.agent == "codex";
+        ) || arg == "-c" && session.agent == "codex"
+            || session.agent == "claude"
+                && matches!(
+                    arg.as_str(),
+                    "--autocompact"
+                        | "--debug-file"
+                        | "--fallback-model"
+                        | "--name"
+                        | "-n"
+                        | "--plugin-url"
+                        | "--remote-control-session-name-prefix"
+                        | "--system-prompt-snapshot"
+                );
         let boolean = matches!(
             arg.as_str(),
             "--dangerously-skip-permissions"
@@ -325,6 +338,15 @@ pub(crate) fn resume_launch(
                 | "--no-extensions"
                 | "--no-skills"
                 | "--no-prompt-templates"
+                | "--exclude-dynamic-system-prompt-sections"
+                | "--ax-screen-reader"
+                | "--bare"
+                | "--brief"
+                | "--chrome"
+                | "--no-chrome"
+                | "--ide"
+                | "--restricted"
+                | "--safe-mode"
         );
         if arg.contains('=') || boolean {
             plan.argv.push(arg.clone());
@@ -466,6 +488,54 @@ mod tests {
         .map(String::from);
         let result = resume_launch(&session, &args).unwrap();
         assert!(result.argv.ends_with(&args[1..]));
+    }
+
+    #[test]
+    fn restart_launch_keeps_current_claude_flags() {
+        let session = PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: AgentSessionRef::id("same").unwrap(),
+        };
+        let cases: &[&[&str]] = &[
+            &["--exclude-dynamic-system-prompt-sections"],
+            &["--ax-screen-reader"],
+            &["--bare"],
+            &["--brief"],
+            &["--chrome"],
+            &["--no-chrome"],
+            &["--ide"],
+            &["--restricted"],
+            &["--safe-mode"],
+            &["--autocompact", "auto"],
+            &["--debug-file", "/tmp/debug.log"],
+            &["--fallback-model", "sonnet"],
+            &["--name", "worker"],
+            &["-n", "worker"],
+            &["--plugin-url", "https://example.invalid/p.zip"],
+            &["--remote-control-session-name-prefix", "sage"],
+            &["--system-prompt-snapshot", "off"],
+            &["--betas", "first", "second"],
+        ];
+        for flag in cases {
+            let mut args = vec!["claude".to_string()];
+            args.extend(flag.iter().map(|s| s.to_string()));
+            args.extend(["--model".into(), "fixture".into()]);
+            let result = resume_launch(&session, &args)
+                .unwrap_or_else(|err| panic!("{flag:?} refused: {err}"));
+            assert!(result.argv.ends_with(&args[1..]), "{flag:?} dropped");
+        }
+    }
+
+    #[test]
+    fn restart_launch_scopes_claude_only_short_name_flag() {
+        let session = PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: AgentSessionRef::id("same").unwrap(),
+        };
+        let err = resume_launch(&session, &["codex".into(), "-n".into(), "x".into()]).unwrap_err();
+        assert!(err.contains("unknown option arity"), "{err}");
     }
 
     #[test]

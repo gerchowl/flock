@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 mod agents;
 mod checks;
+mod delegates;
 mod digest;
 mod edges;
 mod fleet;
@@ -1479,6 +1480,7 @@ impl App {
             Method::AgentResume(target) => return self.handle_agent_resume(request.id, target),
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
+            Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
@@ -2613,6 +2615,8 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2626,6 +2630,8 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2695,6 +2701,8 @@ mod tests {
                 visible_idle: false,
                 visible_working: false,
                 settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -2825,6 +2833,8 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2849,6 +2859,8 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

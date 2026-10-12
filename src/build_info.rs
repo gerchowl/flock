@@ -22,6 +22,16 @@ pub fn commit() -> Option<&'static str> {
 }
 
 pub fn version() -> String {
+    // Debug builds only: lets integration tests run servers that report
+    // different versions from one build (#958).
+    if cfg!(debug_assertions) {
+        if let Some(version) = std::env::var("FLOCK_TEST_BUILD_VERSION")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return version;
+        }
+    }
     match channel() {
         "stable" => BASE_VERSION.to_string(),
         channel => match build_id() {

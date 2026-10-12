@@ -1,0 +1,9 @@
+  ⎿  Stop hook error: End your turn with a single sentinel line: `※ recap: <current state>. Next: <one concrete step>.` Then stop.
+⏺ ※ recap: Two background sleeps are running (900s as bevpnmyma, 901s as b3b1c5pt9); no code changes were made. Next: wait for both completion notifications and report when they finish.
+✻ Cogitated for 2s · done 1:27 AM · 2 shells still running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep future transcripts
+  Haiku 5.5 · ~/work master · ctx ░░░░░░░ 4% · 5h ▓░░░░ 17% · 7d ░░░░░ 4%
+  ⏵⏵ bypass permissions on · 2 shells

@@ -310,7 +310,10 @@ fn server_lifecycle_verbs_are_never_refused_for_skew() {
         let (output, methods) = run(args, Some("0.9.0"), None, false);
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(!stderr.contains("is incompatible with client"), "{stderr}");
-        assert_eq!(methods, [method], "{args:?}");
+        // live-handoff reads the server's version before and after (#958), so
+        // its status pings are not a skew gate.
+        let verbs: Vec<_> = methods.iter().filter(|sent| *sent != "ping").collect();
+        assert_eq!(verbs, [method], "{args:?} sent {methods:?}");
     }
 }
 
@@ -513,4 +516,32 @@ fn an_existing_ping_warns_once_for_an_older_server() {
             .count(),
         1
     );
+}
+
+/// #1029: both events verbs answer an older server's unknown `events.read`
+/// with the version gap (exit 78), the wait included before it waits.
+#[test]
+fn events_verbs_report_the_version_gap_against_an_older_server() {
+    for args in [
+        &["events", "read"][..],
+        &[
+            "events",
+            "wait",
+            "--kinds",
+            "pane_exited",
+            "--timeout",
+            "5s",
+        ],
+    ] {
+        let (output, methods) = run(
+            args,
+            Some("1.2.0"),
+            Some(
+                serde_json::json!({"code":"invalid_request", "message":"unknown variant `events.read`"}),
+            ),
+            false,
+        );
+        assert_gap(output, "1.2.0");
+        assert_eq!(methods, ["events.read", "ping"], "{args:?}");
+    }
 }

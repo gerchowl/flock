@@ -26,7 +26,7 @@
 use std::time::{Duration, Instant};
 
 use crate::api::client::{ApiClient, ApiClientError};
-use crate::api::schema::{AgentStatus, Method, Request};
+use crate::api::schema::{AgentStatus, EventsReadParams, Method, Request};
 use crate::api::schema::{AgentTarget, PaneTarget};
 
 /// How long a reported `idle`/`done` must be HELD, with no transition at all,
@@ -40,6 +40,16 @@ pub(super) const DEFAULT_SETTLE_MS: u64 = 5_000;
 /// Cheap (one small `agent.get`), and short relative to the settle window so a
 /// transition is observed within a fraction of the dwell it resets.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// `events.read` first shipped in protocol 28 (#1028). A server at or above
+/// it wakes the wait on events; an older one is polled every
+/// [`POLL_INTERVAL`] as before (#1030).
+const EVENTS_READ_PROTOCOL: u32 = 28;
+
+/// The longest an event-driven wait goes without a sample. Status changes
+/// wake it at once; this bounds what no event reports, such as the
+/// delegate's screen-silence and never-started checks.
+const RESAMPLE: Duration = Duration::from_secs(10);
 
 /// Cap on any single request during the wait.
 ///
@@ -74,15 +84,15 @@ const SLOW_LIMIT: Duration = Duration::from_secs(300);
 /// four outcomes apart without parsing prose: it settled, it needs a human, the
 /// pane went away, or it ran out of time.
 pub(super) mod exit {
-    // `pub(crate)` rather than `pub(super)`: #578's `flk delegate` reports the
-    // same four outcomes with the same codes, and a delegate that answered
-    // `blocked` with a code of its own would send a supervisor to a different
-    // remedy for the same signal. The codes themselves are unchanged, and 5 and
-    // 6 (the delegate's own) deliberately live in `cli::delegate` instead.
-    pub(crate) const SETTLED: i32 = 0;
-    pub(crate) const BLOCKED: i32 = 3;
-    pub(crate) const GONE: i32 = 4;
-    pub(crate) const TIMEOUT: i32 = 124;
+    // `pub(crate)` rather than `pub(super)`: #578's `flk delegate` reports
+    // gone and timeout with the same codes. A blocked agent is 6 here, as it
+    // is for `delegate wait` (`AGENT_BLOCKED`), and was 3 before #1025. The
+    // delegate's 3 is a BLOCKED reply, a different signal kept in
+    // `cli::delegate`.
+    pub(crate) const SETTLED: i32 = crate::cli::exit::SUCCESS;
+    pub(crate) const BLOCKED: i32 = crate::cli::exit::WAIT_BLOCKED;
+    pub(crate) const GONE: i32 = crate::cli::exit::GONE;
+    pub(crate) const TIMEOUT: i32 = crate::cli::exit::TIMEOUT;
 }
 
 /// What a `--status` value means. CLI-only: `Settled` has no server-side
@@ -247,13 +257,13 @@ impl SettledOutcome {
     /// below is the mapping those verbs had before the split.
     fn exit_code(&self) -> i32 {
         match self {
-            Self::Stalled { .. } => 7,
+            Self::Stalled { .. } => crate::cli::exit::STALLED,
             Self::Settled { .. } => exit::SETTLED,
-            Self::Blocked { .. } => exit::BLOCKED,
+            Self::Blocked { .. } => crate::cli::exit::moved(exit::BLOCKED),
             Self::Gone { .. } => exit::GONE,
-            Self::Refused(_) => 2,
+            Self::Refused(_) => crate::cli::exit::USAGE,
             Self::TimedOut => exit::TIMEOUT,
-            Self::ServerRefused(_) | Self::Error(_) => 1,
+            Self::ServerRefused(_) | Self::Error(_) => crate::cli::exit::FAILURE,
         }
     }
 }
@@ -483,6 +493,15 @@ impl SettledWait {
 
     pub(super) fn pinned_terminal(&self) -> &str {
         &self.pinned_terminal
+    }
+
+    /// What is left of the dwell in progress: the next sample that can settle.
+    pub(super) fn dwell_left(&self, now: Instant) -> Option<Duration> {
+        let (_, _, since) = self.anchor?;
+        Some(
+            self.settle
+                .saturating_sub(now.saturating_duration_since(since)),
+        )
     }
 
     /// The pane the last record named, for the pinned fallback lookup.
@@ -725,7 +744,16 @@ pub(super) fn settled_wait(
     settle_ms: u64,
     timeout_ms: Option<u64>,
 ) -> std::io::Result<SettledOutcome> {
-    settled_wait_observed(verb, target, after, settle_ms, timeout_ms, &mut |_| false)
+    let due = std::cell::Cell::new(None);
+    settled_wait_observed(
+        verb,
+        target,
+        after,
+        settle_ms,
+        timeout_ms,
+        &due,
+        &mut |_| false,
+    )
 }
 
 pub(super) fn settled_wait_observed(
@@ -734,6 +762,7 @@ pub(super) fn settled_wait_observed(
     after: Option<&str>,
     settle_ms: u64,
     timeout_ms: Option<u64>,
+    due: &std::cell::Cell<Option<Instant>>,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let client = ApiClient::local();
@@ -747,6 +776,7 @@ pub(super) fn settled_wait_observed(
         timeout_ms,
         UNREACHABLE_LIMIT,
         SLOW_LIMIT,
+        due,
         observer,
     )
 }
@@ -780,11 +810,14 @@ fn settled_core(
         timeout_ms,
         unreachable_window,
         slow_window,
+        &std::cell::Cell::new(None),
         &mut |_| false,
     )
 }
 
 // The transport recovery and cursor checks are the same for every caller.
+// `due` is when the observer next needs a sample whatever the agent does,
+// which no event will report.
 fn settled_core_observed(
     requests: &mut dyn PinnedRequests,
     verb: &str,
@@ -794,6 +827,7 @@ fn settled_core_observed(
     timeout_ms: Option<u64>,
     unreachable_window: Duration,
     slow_window: Duration,
+    due: &std::cell::Cell<Option<Instant>>,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
     let now = Instant::now();
@@ -898,8 +932,12 @@ fn settled_core_observed(
         }
     };
 
+    // Taken before the first sample, so nothing that lands after it is missed.
+    let mut cursor = event_cursor(requests, deadline);
     loop {
-        match sample_pinned(requests, &wait, deadline) {
+        let sampled = sample_pinned(requests, &wait, deadline);
+        let answered = sampled.is_ok();
+        match sampled {
             Ok(sample) => {
                 // The server answered, so the run of failures this wait was
                 // surviving is over however long it had lasted.
@@ -941,7 +979,77 @@ fn settled_core_observed(
             Err(PinnedFailure::TimedOut) => return Ok(SettledOutcome::TimedOut),
             Err(PinnedFailure::Fatal(reason)) => return Ok(SettledOutcome::Error(reason)),
         }
-        sleep_bounded(deadline);
+        // After a failed sample, the old poll's pace: a server mid-handoff
+        // refuses at once, and a long poll or a dwell already due would
+        // otherwise turn the retry into a tight loop.
+        if answered {
+            pause(requests, &wait, deadline, due.get(), &mut cursor);
+        } else {
+            sleep_bounded(deadline);
+        }
+    }
+}
+
+/// The newest durable event, where an event-driven wait starts reading, or
+/// `None` to poll: the server predates `events.read`, or did not say.
+///
+/// The server names its head when it refuses a cursor past it: `data.head`
+/// since #1029, the end of the message on a server from before that.
+fn event_cursor(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) -> Option<u64> {
+    if requests.protocol()? < EVENTS_READ_PROTOCOL {
+        return None;
+    }
+    let refusal = requests
+        .events_read(u64::MAX, &[], Duration::ZERO, request_timeout(deadline)?)
+        .ok()?;
+    super::events::cursor_ahead_head(&refusal)
+}
+
+/// Wait for the next reason to sample (#1030).
+///
+/// With a cursor, the server holds one `events.read` until an event names the
+/// agent's terminal or pane, the dwell in progress or the observer's `due` is
+/// reached, or [`RESAMPLE`] passes, so a quiet agent costs a request per state change rather than five
+/// a second. A refused read (a restarted server, or a handoff to an older one)
+/// drops back to the poll for the rest of the wait.
+fn pause(
+    requests: &mut dyn PinnedRequests,
+    wait: &SettledWait,
+    deadline: Option<Instant>,
+    due: Option<Instant>,
+    cursor: &mut Option<u64>,
+) {
+    let Some(after) = *cursor else {
+        return sleep_bounded(deadline);
+    };
+    let now = Instant::now();
+    let span = wait.dwell_left(now).unwrap_or(RESAMPLE).min(RESAMPLE);
+    let span = due.map_or(span, |due| span.min(due.saturating_duration_since(now)));
+    // The hold and the read both end by the deadline: a frozen server must
+    // not keep the wait past it.
+    let left = deadline.map(|deadline| deadline.saturating_duration_since(now));
+    let span = left.map_or(span, |left| span.min(left));
+    if span.is_zero() {
+        return;
+    }
+    let timeout = left.map_or(span + REQUEST_TIMEOUT, |left| {
+        (span + REQUEST_TIMEOUT).min(left)
+    });
+    let subjects: Vec<&str> = [Some(wait.pinned_terminal()), wait.last_pane_id()]
+        .into_iter()
+        .flatten()
+        .collect();
+    match requests.events_read(after, &subjects, span, timeout) {
+        Ok(reply) => {
+            *cursor = reply
+                .pointer("/result/next_after")
+                .and_then(serde_json::Value::as_u64);
+            if cursor.is_none() {
+                sleep_bounded(deadline);
+            }
+        }
+        // Not an answer: the next sample meets the same server and counts it.
+        Err(_) => sleep_bounded(deadline),
     }
 }
 
@@ -1224,6 +1332,23 @@ trait PinnedRequests {
         pane_id: &str,
         timeout: Duration,
     ) -> Result<serde_json::Value, Unanswered>;
+
+    /// The server's protocol, from the probe this invocation caches. `None`
+    /// keeps the poll.
+    fn protocol(&mut self) -> Option<u32> {
+        None
+    }
+
+    /// `events.read` past `after` about `subjects`, held up to `wait`.
+    fn events_read(
+        &mut self,
+        _after: u64,
+        _subjects: &[&str],
+        _wait: Duration,
+        _timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered> {
+        Err(Unanswered::Unreachable)
+    }
 }
 
 /// Why a request came back without an answer.
@@ -1286,6 +1411,36 @@ impl PinnedRequests for SocketRequests<'_> {
                     id: "cli:settled:pane-get".into(),
                     method: Method::PaneGet(PaneTarget {
                         pane_id: pane_id.to_string(),
+                    }),
+                },
+                timeout,
+            )
+            .map_err(|err| Unanswered::of(&err))
+    }
+
+    fn protocol(&mut self) -> Option<u32> {
+        crate::api::compatibility::server_version(self.client).map(|server| server.protocol)
+    }
+
+    fn events_read(
+        &mut self,
+        after: u64,
+        subjects: &[&str],
+        wait: Duration,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Unanswered> {
+        // Rounded up, so a read due at the end of a dwell never returns just
+        // before it and costs a second round trip.
+        let wait_ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+        self.client
+            .request_value_with_timeout(
+                &Request {
+                    id: "cli:settled:events-read".into(),
+                    method: Method::EventsRead(EventsReadParams {
+                        after,
+                        subjects: subjects.iter().map(|subject| subject.to_string()).collect(),
+                        wait_ms: Some(wait_ms),
+                        ..Default::default()
                     }),
                 },
                 timeout,
@@ -2974,5 +3129,268 @@ mod tests {
             "nothing was sent: {:?}",
             requests.granted
         );
+    }
+
+    /// #1030: a transport on a server with `events.read`. Every read but the
+    /// head probe is answered from `woken`: `Some(true)` is an event about the
+    /// agent, `Some(false)` a hold that ran its whole span with nothing to
+    /// report, and `None` a server that never answered.
+    struct Evented {
+        records: std::collections::VecDeque<&'static str>,
+        woken: std::collections::VecDeque<Option<bool>>,
+        agent_gets: usize,
+        /// (after, subjects, wait) of each read after the head probe.
+        reads: Vec<(u64, Vec<String>, Duration)>,
+    }
+
+    impl PinnedRequests for Evented {
+        fn agent_get(
+            &mut self,
+            _terminal_id: &str,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, Unanswered> {
+            self.agent_gets += 1;
+            // `down` is a server that went away and stays away.
+            if self.records.front() == Some(&"down") {
+                return Err(Unanswered::Unreachable);
+            }
+            let cursor = self.records.pop_front().expect("a record per sample");
+            let status = if cursor.ends_with('w') {
+                "working"
+            } else {
+                "idle"
+            };
+            Ok(serde_json::json!({"result": {"agent": {"pane_id": "w1:p1",
+                "terminal_id": TERM, "agent_status": status,
+                "turn_cursor": format!("{TERM}:{cursor}")}}}))
+        }
+
+        fn pane_get(
+            &mut self,
+            _pane_id: &str,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, Unanswered> {
+            panic!("the agent answers, so the pane fallback is never asked")
+        }
+
+        fn protocol(&mut self) -> Option<u32> {
+            Some(EVENTS_READ_PROTOCOL)
+        }
+
+        fn events_read(
+            &mut self,
+            after: u64,
+            subjects: &[&str],
+            wait: Duration,
+            _timeout: Duration,
+        ) -> Result<serde_json::Value, Unanswered> {
+            if after == u64::MAX {
+                return Ok(response(
+                    // `data.head` wins over the message, which only an
+                    // older server's client has to read.
+                    r#"{"error":{"code":"cursor_ahead","message":"cursor 18446744073709551615 is past this server's newest event 7; read from 0 or 7","data":{"head":40}}}"#,
+                ));
+            }
+            let subjects = subjects.iter().map(|subject| subject.to_string()).collect();
+            self.reads.push((after, subjects, wait));
+            if self.records.front() == Some(&"down") && self.woken.is_empty() {
+                return Err(Unanswered::Unreachable);
+            }
+            match self.woken.pop_front().expect("a scripted read") {
+                None => return Err(Unanswered::Slow),
+                Some(false) => std::thread::sleep(wait),
+                Some(true) => {}
+            }
+            Ok(serde_json::json!({"result": {"events": [], "next_after": after + 1}}))
+        }
+    }
+
+    /// #1030: on a server with `events.read` the wait samples once per event
+    /// and once when the dwell is due, instead of every 200 ms. The reads
+    /// resume from the server's head and then from each reply's cursor, and
+    /// name the pinned terminal and its pane.
+    #[test]
+    fn an_evented_wait_samples_once_per_change() {
+        let mut requests = Evented {
+            records: ["0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
+            woken: [Some(true), Some(false)].into(),
+            agent_gets: 0,
+            reads: Vec::new(),
+        };
+        let started = Instant::now();
+        let outcome = settled_core(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            600,
+            Some(30_000),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, SettledOutcome::Settled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            requests.agent_gets, 3,
+            "one sample per change, one at the dwell"
+        );
+        let [(first, subjects, idle), (second, _, dwell)] = requests.reads.as_slice() else {
+            panic!("two held reads, got {:?}", requests.reads);
+        };
+        assert_eq!((*first, *second), (40, 41));
+        assert_eq!(subjects, &[TERM.to_string(), "w1:p1".to_string()]);
+        assert_eq!(*idle, RESAMPLE, "nothing is due while it works");
+        assert!(*dwell <= Duration::from_millis(600), "{dwell:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// #1121: a held read the server never answers is not an answer. The wait
+    /// samples again from the same cursor and settles only on what the agent
+    /// record says.
+    #[test]
+    fn an_unanswered_read_is_resampled_never_an_outcome() {
+        let mut requests = Evented {
+            records: ["0:1:1:w", "0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
+            woken: [None, Some(true), Some(false)].into(),
+            agent_gets: 0,
+            reads: Vec::new(),
+        };
+        let outcome = settled_core(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            300,
+            Some(30_000),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, SettledOutcome::Settled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(requests.agent_gets, 4);
+        let afters: Vec<u64> = requests.reads.iter().map(|(after, _, _)| *after).collect();
+        assert_eq!(afters, [40, 40, 41], "the unanswered read keeps its cursor");
+    }
+
+    /// #1030: a server that goes away once the dwell has started, as in a
+    /// handoff, is retried at the old poll's pace. The dwell is due and the
+    /// observer's `due` is stale and past, so a wait that resampled at once
+    /// on a zero span would spin on the refused socket.
+    #[test]
+    fn a_server_gone_mid_dwell_is_retried_at_the_poll_pace() {
+        let mut requests = Evented {
+            records: ["0:1:2:i", "down"].into(),
+            woken: [Some(false)].into(),
+            agent_gets: 0,
+            reads: Vec::new(),
+        };
+        let due = std::cell::Cell::new(Some(Instant::now()));
+        let started = Instant::now();
+        let outcome = settled_core_observed(
+            &mut requests,
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            300,
+            Some(1_500),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+            &due,
+            &mut |_| false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SettledOutcome::TimedOut), "{outcome:?}");
+        let made = requests.agent_gets + requests.reads.len();
+        // 1.5 s at one sample per 200 ms is about 8; a spin makes thousands.
+        assert!(made <= 15, "{made} requests in {:?}", started.elapsed());
+    }
+
+    /// #1030 skew: a server below `events.read`'s protocol is never sent one.
+    /// The wait polls it every 200 ms, as it always has. A stub socket stands
+    /// in for the older server.
+    #[test]
+    fn an_older_server_is_polled_and_never_sent_events_read() {
+        use std::io::{BufRead, BufReader, Write};
+        let path = std::env::temp_dir().join(format!("f1030-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            for stream in listener.incoming() {
+                let mut reader = BufReader::new(stream.unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap_or("stop").to_string();
+                let result = match method.as_str() {
+                    "ping" => {
+                        serde_json::json!({"type": "pong", "version": "1.2.0", "protocol": 27})
+                    }
+                    "agent.get" => serde_json::json!({"agent": {"pane_id": "w1:p1",
+                        "terminal_id": TERM, "agent_status": "idle",
+                        "turn_cursor": format!("{TERM}:0:1:2:i")}}),
+                    _ => break,
+                };
+                methods.push(method);
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::json!({"id": request["id"], "result": result})
+                )
+                .unwrap();
+            }
+            methods
+        });
+        let client = ApiClient::for_target(crate::api::client::ConnectionTarget::SocketPath(
+            path.clone(),
+        ));
+        let started = Instant::now();
+        let outcome = settled_core(
+            &mut SocketRequests { client: &client },
+            "agent wait",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: TERM.into(),
+                pane_id: "w1:p1".into(),
+            }),
+            None,
+            500,
+            Some(30_000),
+            UNREACHABLE_LIMIT,
+            SLOW_LIMIT,
+        )
+        .unwrap();
+        let held = started.elapsed();
+        std::os::unix::net::UnixStream::connect(&path)
+            .and_then(|mut stop| writeln!(stop, "{{}}"))
+            .unwrap();
+        let methods = server.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            matches!(outcome, SettledOutcome::Settled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(methods[0], "ping", "{methods:?}");
+        assert!(
+            methods[1..].iter().all(|method| method == "agent.get"),
+            "{methods:?}"
+        );
+        // A 500 ms dwell sampled every 200 ms: at least the first sample, two
+        // polls inside the dwell and the one that ends it.
+        assert!(methods.len() > 3, "{methods:?} in {held:?}");
     }
 }

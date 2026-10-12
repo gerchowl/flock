@@ -266,14 +266,14 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         }),
     })?;
     if !await_reply {
-        return super::print_response(&response);
+        return super::print_send_response(&response);
     }
     // #576 `--await`: the send's own result goes to stderr, so stdout is the
     // answer alone — what a harness hands back when this ran as a background
     // task.
     eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     if response.get("error").is_some() {
-        return Ok(1);
+        return Ok(super::error_exit(&response, true));
     }
     let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
@@ -283,14 +283,14 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// `flk wait reply` exit status (#576): an answer arrived.
-const EXIT_REPLIED: i32 = 0;
+const EXIT_REPLIED: i32 = super::exit::SUCCESS;
 /// No answer is coming: the recipient is muted (its deferral is printed), or
 /// the message was dropped unread.
-const EXIT_NO_ANSWER: i32 = 3;
+const EXIT_NO_ANSWER: i32 = super::exit::NO_ANSWER;
 /// The receiver refused custody of the message; the reason is printed.
-const EXIT_REFUSED: i32 = 4;
+const EXIT_REFUSED: i32 = super::exit::MSG_REFUSED;
 /// The wait ran out first. The coreutils `timeout` convention.
-const EXIT_TIMEOUT: i32 = 124;
+const EXIT_TIMEOUT: i32 = super::exit::TIMEOUT;
 
 fn exit_for(outcome: &str) -> i32 {
     match outcome {
@@ -300,9 +300,9 @@ fn exit_for(outcome: &str) -> i32 {
         | "recipient_gone"
         | "outcome_retention_elapsed"
         | "undeliverable" => EXIT_NO_ANSWER,
-        "refused" => EXIT_REFUSED,
+        "refused" => super::exit::moved(EXIT_REFUSED),
         "timeout" => EXIT_TIMEOUT,
-        _ => 1,
+        _ => super::exit::FAILURE,
     }
 }
 
@@ -530,7 +530,7 @@ fn msg_reply(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{USAGE}");
         return Ok(2);
     }
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:msg:reply".into(),
         method: Method::MsgReply(MsgReplyParams {
             correlation_id: positional[0].clone(),
@@ -636,7 +636,7 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
 /// no-answer wait, everything still live or settled-good exits 0.
 fn status_exit(state: Option<&str>) -> i32 {
     match state {
-        Some("refused") => EXIT_REFUSED,
+        Some("refused") => super::exit::moved(EXIT_REFUSED),
         Some(
             "expired"
             | "recipient_gone"
@@ -644,7 +644,7 @@ fn status_exit(state: Option<&str>) -> i32 {
             | "collect_failed"
             | "undeliverable",
         ) => EXIT_NO_ANSWER,
-        _ => 0,
+        _ => super::exit::SUCCESS,
     }
 }
 
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(super::exit_for("recipient_gone"), 3);
         assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
         assert_eq!(super::exit_for("undeliverable"), 3);
-        assert_eq!(super::exit_for("refused"), 4);
+        assert_eq!(super::exit_for("refused"), 13);
     }
 
     #[test]
@@ -872,7 +872,7 @@ mod tests {
         ] {
             assert_eq!(super::status_exit(Some(state)), 3, "{state}");
         }
-        assert_eq!(super::status_exit(Some("refused")), 4);
+        assert_eq!(super::status_exit(Some("refused")), 13);
     }
 
     #[test]

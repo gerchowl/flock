@@ -128,18 +128,37 @@ pub fn restart_after_update_guidance(stop_command: &str, attach_command: Option<
 pub fn active_restart_after_update_guidance() -> String {
     if !explicit_session_requested() {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
-            return restart_after_update_guidance(
-                &format!(
-                    "{}={} flk server stop",
-                    crate::api::SOCKET_PATH_ENV_VAR,
-                    socket_path
-                ),
-                None,
+            let prefix = format!("{}={socket_path} ", crate::api::SOCKET_PATH_ENV_VAR);
+            return format!(
+                "{}\n\n{}",
+                live_handoff_after_update_guidance(&format!("{prefix}flk server live-handoff")),
+                restart_after_update_guidance(&format!("{prefix}flk server stop"), None)
             );
         }
     }
 
-    restart_after_update_guidance(&local_stop_command(), Some(&local_attach_command()))
+    format!(
+        "{}\n\n{}",
+        live_handoff_after_update_guidance(&local_live_handoff_command()),
+        restart_after_update_guidance(&local_stop_command(), Some(&local_attach_command()))
+    )
+}
+
+pub fn local_live_handoff_command() -> String {
+    match active_name() {
+        Some(name) => format!("flk --session {name} server live-handoff"),
+        None => "flk server live-handoff".to_string(),
+    }
+}
+
+/// #958: the pane-preserving way onto the new version. A client from before
+/// #958 handed off to the old server's own binary, which on a versioned install
+/// (Nix) is the old version again, so the explicit `--import-exe` form is the
+/// one that works whichever client runs it.
+pub fn live_handoff_after_update_guidance(handoff_command: &str) -> String {
+    format!(
+        "Hand off to the new version and keep every pane:\nRun `{handoff_command}`.\nIf the server stays on the old version, run `{handoff_command} --import-exe \"$(readlink -f \"$(command -v flk)\")\"`."
+    )
 }
 
 pub fn explicit_session_requested() -> bool {
@@ -833,7 +852,7 @@ mod tests {
 
         assert_eq!(
             active_restart_after_update_guidance(),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server stop`, then restart Flock with the same socket override."
+            "Hand off to the new version and keep every pane:\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server live-handoff`.\nIf the server stays on the old version, run `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server live-handoff --import-exe \"$(readlink -f \"$(command -v flk)\")\"`.\n\nStop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server stop`, then restart Flock with the same socket override."
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
