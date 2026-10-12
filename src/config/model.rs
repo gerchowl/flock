@@ -683,6 +683,8 @@ pub struct Config {
     pub msg: MsgConfig,
     /// `[events]` — the `events.read` socket method (ADR-0028 §3).
     pub events: EventsConfig,
+    /// `[[channels]]` — external channel bindings (ADR-0028 §8, #1037).
+    pub channels: Vec<crate::channels::ChannelBinding>,
     pub systemone: SystemOneConfig,
     pub peers: Vec<PeerConfig>,
 }

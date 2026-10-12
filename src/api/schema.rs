@@ -217,6 +217,8 @@ pub enum Method {
     EventsWait(EventsWaitParams),
     #[serde(rename = "events.read")]
     EventsRead(EventsReadParams),
+    #[serde(rename = "channel.hello")]
+    ChannelHello(ChannelHelloParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -404,6 +406,7 @@ impl Method {
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
+            | Self::ChannelHello(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2104,6 +2107,15 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
+/// `channel.hello` (ADR-0028 §8, #1037): a channel adapter's first call,
+/// proving it holds the binding's capability token. Gated as state-changing
+/// (#868) so an adapter refuses to start against a server without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHelloParams {
+    pub binding: String,
+    pub token: crate::channels::ChannelToken,
+}
+
 /// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
 pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
 pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
@@ -2810,6 +2822,13 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// `channel.hello`: the binding the token unlocked, never the token.
+    ChannelHello {
+        binding: String,
+        owner_node: String,
+        target: crate::channels::ChannelTarget,
+        scopes: Vec<crate::channels::ChannelScope>,
     },
     /// #576: how a `msg.wait_reply` ended.
     MsgReplyAwaited {
