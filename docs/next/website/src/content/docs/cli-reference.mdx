@@ -9,6 +9,17 @@ Most commands print JSON responses. Use them from scripts when you want determin
 
 When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
 
+## Exit codes
+
+`flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
+
+| Case | Old | New |
+| --- | --- | --- |
+| refused before acting, nothing changed (`not_settled`, `input_not_empty`, `operator_active`, any error whose retry class is `later`) | `1` | `10` |
+| `agent wait` / `wait agent-status --status settled`: the agent is blocked on a dialog | `3` | `6` |
+| `delegate` awaits: `not_started` | `8` | `11` |
+| `wait reply`, `msg send --await`, `msg status`: the receiver refused the message | `4` | `13` |
+
 ## Launch and status
 
 ```bash
@@ -443,7 +454,7 @@ The stop-hook mail nudge names `flock_msg_read` and, if the MCP tool is unavaila
 
 Mesh `msg.status` reports `queued` (origin custody awaiting transport, or waiting unread in an inbox on this server, with `detail` saying which), `custody` (transferred custody), `delivered` (durable import into another node's inbox, still unread), `read`, `held` (answer awaiting return), `collected` (answer transferred to its origin), `undeliverable` (a forwarding hub could not deliver it), `expired`, or `outcome_retention_elapsed`. Refusals, undeliverable messages and collection failures include `detail`. `reply` contains the best imported answer independently of the original message state. Queries do not commit store changes. Read receipts return over authenticated collection, including the hub's collection exchange with a spoke.
 
-A status result includes a signed `reference`. Retain it and pass it as `reference` to socket/MCP status or reply-wait calls, or as `--reference JSON` to `flk msg status` and `flk wait reply`, to query an exact message after outcome cleanup. A correlation alone cannot distinguish an unknown message from one whose retention elapsed. Status by correlation only answers for messages this node sent; a correlation another node reused for its own mail never stands in. `msg status` exits 0 for known nonfailure states, 3 for expiry, an undeliverable message, removal, elapsed retention or collection failure, 4 when the receiver refused the message, and 1 for API errors.
+A status result includes a signed `reference`. Retain it and pass it as `reference` to socket/MCP status or reply-wait calls, or as `--reference JSON` to `flk msg status` and `flk wait reply`, to query an exact message after outcome cleanup. A correlation alone cannot distinguish an unknown message from one whose retention elapsed. Status by correlation only answers for messages this node sent; a correlation another node reused for its own mail never stands in. `msg status` exits 0 for known nonfailure states, 3 for expiry, an undeliverable message, removal, elapsed retention or collection failure, 13 when the receiver refused the message (4 before #1025), and 1 for API errors.
 
 `replyable` means a reply can be routed: a same-host sender pane, a sender agent the directory can resolve, or a durable mesh return binding. `msg.read` and the MCP channel push compute it the same way. `reply_contract` says which promise that is: `durable_return_binding` survives the sender being offline; `best_effort_local_or_directory` depends on the sender still being reachable.
 
@@ -493,7 +504,7 @@ Use `wait output` for normal commands and servers. Use `wait agent-status` for c
 | --- | --- |
 | `0` | `replied` |
 | `3` | `deferred`, `expired`, `undeliverable`, `recipient_gone`, or `outcome_retention_elapsed` |
-| `4` | `refused`; `detail` gives the reason |
+| `13` | `refused`; `detail` gives the reason (4 before #1025) |
 | `124` | `timeout`; accepted mail continues retrying |
 | `1` | API or transport error |
 
@@ -533,7 +544,7 @@ On success `settled` prints one JSON object on stdout:
 {"status":"settled","pane_id":"1-1","agent_status":"idle","turn_cursor":"term_1f2e3:0:2:7:i","held_ms":5003}
 ```
 
-`flk wait agent-status <pane> --status settled` is the same signal with the same result line — a supervisor can use whichever verb fits the command it already has. Exit codes for `--status settled`: **0** settled · **3** blocked (a human has to look) · **4** gone, with `"reason":"closed"|"hibernated"|"restarted"` on the line · **124** timeout · **2** a usage error or a refused cursor · **1** any other error. The non-settled statuses keep their historical codes, including `1` for a timeout.
+`flk wait agent-status <pane> --status settled` is the same signal with the same result line — a supervisor can use whichever verb fits the command it already has. Exit codes for `--status settled`: **0** settled · **6** blocked (a human has to look; 3 before #1025) · **4** gone, with `"reason":"closed"|"hibernated"|"restarted"` on the line · **124** timeout · **2** a usage error or a refused cursor · **1** any other error. The non-settled statuses keep their historical codes, including `1` for a timeout.
 
 `--after` and `--settle` mean nothing without `--status settled`, and a non-numeric `--settle` or `--timeout` is a usage error: all of these exit `2` before any request is sent, so a typo does not cost you the wait.
 
@@ -568,7 +579,7 @@ A Codex that is still starting can swallow the typed brief: the composer stays e
 
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
-Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **8** `not_started` (continuously idle with an empty composer for the startup window and no new turn since the submit cursor) · **78** server protocol mismatch · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7, 8 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
+Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **11** `not_started` (8 before #1025; continuously idle with an empty composer for the startup window and no new turn since the submit cursor) · **78** server protocol mismatch · **124** the timeout · **2** a usage error, or a name that is not a delegate · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7, 11 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
 
 Write the brief so the agent ends its reply on a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line: that line is the whole result contract, and a good reply ending on anything else is `no_sentinel` (exit 5). A trailing `※ recap` line after it is fine.
 

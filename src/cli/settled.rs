@@ -74,11 +74,11 @@ const SLOW_LIMIT: Duration = Duration::from_secs(300);
 /// four outcomes apart without parsing prose: it settled, it needs a human, the
 /// pane went away, or it ran out of time.
 pub(super) mod exit {
-    // `pub(crate)` rather than `pub(super)`: #578's `flk delegate` reports the
-    // same four outcomes with the same codes, and a delegate that answered
-    // `blocked` with a code of its own would send a supervisor to a different
-    // remedy for the same signal. The codes themselves are unchanged, and 5 and
-    // 6 (the delegate's own) deliberately live in `cli::delegate` instead.
+    // `pub(crate)` rather than `pub(super)`: #578's `flk delegate` reports
+    // gone and timeout with the same codes. A blocked agent is 6 here, as it
+    // is for `delegate wait` (`AGENT_BLOCKED`), and was 3 before #1025. The
+    // delegate's 3 is a BLOCKED reply, a different signal kept in
+    // `cli::delegate`.
     pub(crate) const SETTLED: i32 = crate::cli::exit::SUCCESS;
     pub(crate) const BLOCKED: i32 = crate::cli::exit::WAIT_BLOCKED;
     pub(crate) const GONE: i32 = crate::cli::exit::GONE;
@@ -249,7 +249,7 @@ impl SettledOutcome {
         match self {
             Self::Stalled { .. } => crate::cli::exit::STALLED,
             Self::Settled { .. } => exit::SETTLED,
-            Self::Blocked { .. } => exit::BLOCKED,
+            Self::Blocked { .. } => crate::cli::exit::moved(exit::BLOCKED),
             Self::Gone { .. } => exit::GONE,
             Self::Refused(_) => crate::cli::exit::USAGE,
             Self::TimedOut => exit::TIMEOUT,

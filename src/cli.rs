@@ -1070,11 +1070,24 @@ pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i3
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(response));
     }
 
     println!("{}", serde_json::to_string(response).unwrap());
     Ok(0)
+}
+
+/// The exit status for an error response: `REFUSED` for a refusal that
+/// changed nothing, which names its old code on stderr (#1025), else `FAILURE`.
+pub(crate) fn error_exit(response: &serde_json::Value) -> i32 {
+    let refused = response["error"]["code"]
+        .as_str()
+        .and_then(crate::api::error_code::ErrorCode::from_code)
+        .is_some_and(|code| code.exit() == exit::REFUSED);
+    if refused {
+        return exit::moved(exit::REFUSED);
+    }
+    exit::FAILURE
 }
 
 pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
@@ -1092,7 +1105,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
     }
     if response.get("error").is_some() {
         eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(error_exit(&response));
     }
 
     Ok(0)

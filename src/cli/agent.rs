@@ -79,7 +79,7 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           {\"status\":\"settled\"|\"blocked\"|\"gone\",\"pane_id\":…,\"agent_status\":…,\n",
     "            \"turn_cursor\":…,\"held_ms\":N}\n",
     "           a gone line adds \"reason\":\"closed\"|\"hibernated\"|\"restarted\".\n",
-    "  exit 0 settled · 3 blocked · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
+    "  exit 0 settled · 6 blocked (was 3) · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
     "           · 1 every other error, including a server unreachable for 30 s when no --timeout\n",
     "           was given. A timeout is 1 for the non-settled statuses above.\n",
     "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",

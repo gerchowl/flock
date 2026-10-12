@@ -273,7 +273,7 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     // task.
     eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     if response.get("error").is_some() {
-        return Ok(1);
+        return Ok(super::error_exit(&response));
     }
     let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
@@ -300,7 +300,7 @@ fn exit_for(outcome: &str) -> i32 {
         | "recipient_gone"
         | "outcome_retention_elapsed"
         | "undeliverable" => EXIT_NO_ANSWER,
-        "refused" => EXIT_REFUSED,
+        "refused" => super::exit::moved(EXIT_REFUSED),
         "timeout" => EXIT_TIMEOUT,
         _ => super::exit::FAILURE,
     }
@@ -636,7 +636,7 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
 /// no-answer wait, everything still live or settled-good exits 0.
 fn status_exit(state: Option<&str>) -> i32 {
     match state {
-        Some("refused") => EXIT_REFUSED,
+        Some("refused") => super::exit::moved(EXIT_REFUSED),
         Some(
             "expired"
             | "recipient_gone"
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(super::exit_for("recipient_gone"), 3);
         assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
         assert_eq!(super::exit_for("undeliverable"), 3);
-        assert_eq!(super::exit_for("refused"), 4);
+        assert_eq!(super::exit_for("refused"), 13);
     }
 
     #[test]
@@ -872,7 +872,7 @@ mod tests {
         ] {
             assert_eq!(super::status_exit(Some(state)), 3, "{state}");
         }
-        assert_eq!(super::status_exit(Some("refused")), 4);
+        assert_eq!(super::status_exit(Some("refused")), 13);
     }
 
     #[test]

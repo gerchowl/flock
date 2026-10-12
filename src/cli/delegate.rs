@@ -125,7 +125,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 8 not started, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -357,10 +357,10 @@ fn without_retries<T>(work: impl FnOnce() -> T) -> T {
 
 /// `delegate`'s own exit codes.
 ///
-/// `0`/`3`/`4`/`124` are `settled::exit`, shared with the two wait verbs so a
-/// supervisor reading one exit code reads it the same way. `5` and `6` are the
-/// delegate's own and live here rather than in `settled`, because nothing else
-/// means them.
+/// `4`/`124` are `settled::exit`, shared with the two wait verbs so a
+/// supervisor reading one exit code reads it the same way, and so is `6`: a
+/// blocked agent, which the waits returned as 3 before #1025. The rest are the
+/// delegate's own and live here rather than in `settled`.
 mod exit {
     /// A finished reply, `no_result`, or an unfinished one under `result`.
     pub(super) const OK: i32 = crate::cli::exit::SUCCESS;
@@ -368,6 +368,8 @@ mod exit {
     pub(super) const USAGE: i32 = crate::cli::exit::USAGE;
     /// A held `blocked` — the agent is sitting on a prompt a human must answer.
     pub(super) const AGENT_BLOCKED: i32 = crate::cli::exit::AGENT_BLOCKED;
+    /// A reply whose sentinel is `BLOCKED:`, the agent's own "not now".
+    pub(super) const REPLY_BLOCKED: i32 = crate::cli::exit::REPLY_BLOCKED;
     /// A finished reply with no `DONE:` / `BLOCKED:` / `VERDICT:` line, or a
     /// settle with no reply at all inside the grace.
     pub(super) const NO_SENTINEL: i32 = crate::cli::exit::NO_SENTINEL;
@@ -4573,11 +4575,11 @@ impl Outcome {
     fn exit_code(self) -> i32 {
         match self {
             Self::Done | Self::Verdict => exit::OK,
-            Self::Blocked => super::settled::exit::BLOCKED,
+            Self::Blocked => exit::REPLY_BLOCKED,
             Self::Gone => super::settled::exit::GONE,
             Self::NoSentinel | Self::NoResult => exit::NO_SENTINEL,
             Self::Stalled => exit::STALLED,
-            Self::NotStarted => exit::NOT_STARTED,
+            Self::NotStarted => crate::cli::exit::moved(exit::NOT_STARTED),
             Self::AgentBlocked => exit::AGENT_BLOCKED,
             Self::Timeout => super::settled::exit::TIMEOUT,
         }
@@ -5378,7 +5380,7 @@ mod tests {
         let working = Cursor::parse("term_fixture:0:3:8:w").unwrap();
         assert!(!idle_without_new_turn(&working, &before, AgentStatus::Idle));
         assert_eq!(Outcome::NotStarted.as_str(), "not_started");
-        assert_eq!(Outcome::NotStarted.exit_code(), 8);
+        assert_eq!(Outcome::NotStarted.exit_code(), 11);
     }
 
     #[test]
