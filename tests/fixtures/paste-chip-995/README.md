@@ -17,3 +17,7 @@ flk pane read <pane> --source recent --format ansi
 The sandbox directory was replaced with `/fixture/paste-chip`, and the Claude
 status line's host and profile with `host` and `profile:fixture`. Nothing else
 was edited.
+
+The `.txt` captures drive the composer and guarded-submit tests. The `.ansi`
+captures are checked to strip to the same chip row
+(`ansi_captures_strip_to_the_same_chip_row`).
