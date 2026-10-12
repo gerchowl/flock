@@ -840,6 +840,51 @@ async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
     }
 }
 
+/// A 16-column pane shows only the wrapped tail of a long message (#1122).
+/// That tail gets the Enter and its one retry like a paste chip, and a tail
+/// that does not end the sent text gets no Enter at all.
+#[tokio::test]
+async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
+    use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
+    let sent = "Please review the pull request for the narrow pane fix and report back \
+        with findings, then check https://github.com/gerchowl/flock/pull/1120 for the \
+        follow-up discussion about guarded submit confirmation on wrapped composers.";
+    let narrow = include_str!("../../tests/fixtures/wrapped-composer-1126/claude-16-cols.txt");
+    let fixture = format!("\x1b[2J\x1b[H{}", narrow.replace('\n', "\r\n"));
+    let other = sent.replace("composers.", "panes.");
+    for (text, enters, outcome) in [
+        (sent, 2, Outcome::Unconfirmed("typed_not_submitted")),
+        (
+            other.as_str(),
+            0,
+            Outcome::Unconfirmed("owned_composer_not_visible"),
+        ),
+    ] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        runtime(&app).test_process_pty_bytes(fixture.as_bytes());
+        let mut at = now + GAP;
+        let mut result = app.advance_guarded_submit(&pane, &mut attempt, at);
+        let mut sent_enters = drain(&mut pty).len();
+        while result.is_none() {
+            at += CONFIRM_WINDOW;
+            result = app.advance_guarded_submit(&pane, &mut attempt, at);
+            sent_enters += drain(&mut pty).len();
+        }
+        assert_eq!(sent_enters, enters, "{text}");
+        assert_eq!(result, Some(outcome), "{text}");
+    }
+}
+
 #[tokio::test]
 async fn guarded_submit_never_retypes_when_composer_clears_or_dialog_appears() {
     use super::super::guarded_submit::Outcome;
