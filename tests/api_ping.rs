@@ -2683,12 +2683,18 @@ with log.open('w') as out:
             .collect()
     };
     assert_eq!(bytes(&read_log()), b"\x1b[200~Ship it!\nworld!\x1b[201~");
-    let plain_cli = run_flk(&socket_path, &["agent", "send", pane, "cli!"]);
+    let plain_cli = run_flk(
+        &socket_path,
+        &["agent", "send", "--no-submit", pane, "cli!"],
+    );
     assert!(plain_cli.status.success());
     let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
     assert!(pane_cli.status.success());
-    for command in [["agent", "send"], ["pane", "send-text"]] {
-        let failed = run_flk(&socket_path, &[command[0], command[1], pane, "NOECHO"]);
+    for command in [
+        &["agent", "send", "--no-submit"][..],
+        &["pane", "send-text"],
+    ] {
+        let failed = run_flk(&socket_path, &[command, &[pane, "NOECHO"]].concat());
         assert_eq!(failed.status.code(), Some(8));
         let response: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
         assert_eq!(response["result"]["outcome"], "unconfirmed");
@@ -2710,11 +2716,15 @@ with log.open('w') as out:
         submitted.get("error").is_some(),
         "unknown composers must refuse: {submitted}"
     );
-    let cli = run_flk(
-        &socket_path,
+    // A plain send is the guarded submit now (#995), and `--submit` is its
+    // alias: both refuse an unknown composer before typing.
+    for args in [
+        &["agent", "send", pane, "cli prompt"][..],
         &["agent", "send", "--submit", pane, "cli prompt"],
-    );
-    assert!(!cli.status.success(), "unknown composers must refuse");
+    ] {
+        let cli = run_flk(&socket_path, args);
+        assert!(!cli.status.success(), "unknown composers must refuse");
+    }
     let expected =
         b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~NOECHO\x1b[201~\x1b[200~NOECHO\x1b[201~";
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3005,7 +3015,8 @@ with log.open('w') as out:
         let cli = thread::spawn(move || {
             run_flk(
                 &cli_socket,
-                &["agent", "send", "--submit", &cli_pane, "failure prompt"],
+                // The default send submits (#995).
+                &["agent", "send", &cli_pane, "failure prompt"],
             )
         });
         if esc {
