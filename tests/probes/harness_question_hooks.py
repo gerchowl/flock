@@ -1,31 +1,52 @@
 #!/usr/bin/env python3
-"""Re-measure what each harness lets a hook do with a question tool (ADR-0034).
+"""Re-measure the harness hook facts ADR-0034 rests on.
 
-ADR-0034's mechanism choice rests on six facts about the installed harnesses.
-Each one is a probe here, so a harness upgrade can be re-checked in a minute
-instead of re-argued:
+ADR-0034's mechanism choices rest on what the installed harnesses let a hook
+do. Each fact is a probe here, so a harness upgrade can be re-checked in a few
+minutes instead of re-argued.
 
-  claude-answer    a PreToolUse hook answers AskUserQuestion through
-                   `updatedInput.answers`; no dialog is drawn and the model
-                   receives the hook's answer
-  claude-disallow  `--disallowedTools AskUserQuestion` removes the tool from an
-                   interactive session
-  claude-timeout   a PreToolUse hook that times out falls through to the
-                   dialog (fail open)
-  claude-onfailure the same hook with `"onFailure": "block"` blocks the call
-                   instead (Claude Code 2.1.295 and later)
-  codex-deny       a Codex PreToolUse deny reaches the model as the tool's
-                   error text
-  codex-question   Codex offers `request_user_input` in default mode, and its
-                   call passes through PreToolUse with structured questions
+Claude Code (interactive, in a private tmux server):
 
-Nothing here talks to flk. Every harness runs with the inherited FLOCK_*
-variables removed, so a probe started from inside a flk pane can never reach the
-live server, and Claude runs inside a private tmux server (`tmux -L`), never the
-operator's. Claude's interactive probes need `--cwd` to be a folder Claude
-already trusts (a flk-created worktree is pre-trusted, #605), because an
-untrusted folder holds every settings hook back behind the trust dialog. Each
-probe costs one short model turn (Claude on `--claude-model`, default haiku).
+  claude-answer       a PreToolUse hook answers AskUserQuestion through
+                      `updatedInput.answers`; no dialog, the model gets it
+  claude-disallow     `--disallowedTools AskUserQuestion` removes the tool
+  claude-timeout      a hook that times out lets the dialog through (fail open)
+  claude-onfailure    the same hook with `"onFailure": "block"` blocks instead
+  claude-missing      a hook whose command does not exist, with
+                      `"onFailure": "block"`, blocks the call
+  claude-exitplan     a PreToolUse hook approves ExitPlanMode with `allow` plus
+                      `updatedInput`; no plan-approval dialog is drawn
+  claude-midturn      PostToolUse `additionalContext` reaches the model between
+                      two tool calls of the same turn
+  claude-midturn-pre  the same through PreToolUse `additionalContext`
+
+Codex (`codex exec`):
+
+  codex-deny          a PreToolUse deny reaches the model as the tool's error
+  codex-question      `request_user_input` is offered in default mode and its
+                      call passes through PreToolUse with structured questions
+  codex-midturn       PostToolUse `additionalContext` reaches the model between
+                      two tool calls of the same turn
+  codex-midturn-pre   the same through PreToolUse `additionalContext`
+  codex-crash         a PreToolUse hook exiting 1 lets the tool run (fail open)
+  codex-garbage       a PreToolUse hook printing non-JSON lets the tool run
+  codex-missing       a PreToolUse hook whose command does not exist lets the
+                      tool run
+  codex-timeout       a PreToolUse hook that times out lets the tool run
+
+Safety. Nothing here talks to flk: every inherited FLOCK_* variable is
+removed, so a probe started from inside a flk pane can never reach the live
+server. Claude runs in a private tmux server (`tmux -L`), never the operator's,
+with `--strict-mcp-config` (no MCP servers) and `--tools` limited to what the
+probe needs. Its interactive probes need `--cwd` to be a folder Claude already
+trusts (a flk-created worktree is pre-trusted, #605), because an untrusted
+folder holds every settings hook back behind the trust dialog. Claude cannot
+be isolated from the operator's profile without a fresh login, so it uses the
+active profile, and the tool list is what bounds it. Codex runs against a
+throwaway CODEX_HOME holding only a copy of `auth.json` and a minimal
+`config.toml` (workspace-write sandbox, no MCP servers, no hooks but the
+probe's), deleted on exit, from a scratch directory. Each probe costs one short
+model turn (Claude on `--claude-model`, default haiku).
 
     python3 -I tests/probes/harness_question_hooks.py --cwd <trusted dir> [probe ...]
 """
@@ -41,8 +62,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 TMUX_SERVER = "flk-adr0034-probe"
+DENY_REASON = "PROBE-DENY: ask your architect via flk instead"
+CODEWORD = "PELICAN-7731"
 
 ANSWER_HOOK = r"""
 import json, sys
@@ -53,7 +77,12 @@ print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
       "permissionDecision": "allow", "updatedInput": ti}}))
 """
 
-DENY_REASON = "PROBE-DENY: ask your architect via flk instead"
+APPROVE_PLAN_HOOK = r"""
+import json, sys
+d = json.load(sys.stdin)
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+      "permissionDecision": "allow", "updatedInput": d.get("tool_input", {})}}))
+"""
 
 
 def scrubbed_vars() -> list[str]:
@@ -61,12 +90,10 @@ def scrubbed_vars() -> list[str]:
     return sorted(k for k in os.environ if k.startswith("FLOCK_")) + ["TMUX"]
 
 
-def clean_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k not in scrubbed_vars()}
-
-
-# A Claude turn is over when the dialog is drawn or the turn's footer shows.
-TURN_OVER = ("Enter to select", "Worked for", "Sautéed for", "done ")
+def clean_env(**extra: str) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in scrubbed_vars()}
+    env.update(extra)
+    return env
 
 
 def tmux(*args: str) -> str:
@@ -87,19 +114,33 @@ def wait_for(predicate, timeout_s: float) -> str:
     return screen
 
 
-def claude_turn(cwd: str, model: str, extra: list[str], prompt: str, wait_s: float) -> str:
-    """One interactive Claude turn in a private tmux server; returns the screen."""
-    command = " ".join(shlex.quote(a) for a in ["claude", "--model", model, *extra])
+def dialog_open(screen: str) -> bool:
+    return "Enter to select" in screen or "Would you like to proceed" in screen
+
+
+def turn_over(screen: str) -> bool:
+    """The turn ended: a dialog is drawn, or the spinner line reads `✻ <verb> for <n>s`."""
+    if dialog_open(screen):
+        return True
+    return any(line.lstrip().startswith("✻ ") and " for " in line for line in screen.splitlines())
+
+
+def claude_turn(cwd: str, model: str, extra: list[str], prompt: str, timeout_s: float = 90) -> str:
+    """One interactive Claude turn in a private tmux server; returns the final screen."""
+    argv = ["claude", "--model", model, "--strict-mcp-config", *extra]
+    command = " ".join(shlex.quote(a) for a in argv)
     env_prefix = "env " + " ".join(f"-u {k}" for k in scrubbed_vars())
     tmux("kill-server")
-    tmux("new-session", "-d", "-s", "p", "-x", "160", "-y", "45", "-c", cwd, f"{env_prefix} {command}")
+    tmux("new-session", "-d", "-s", "p", "-x", "160", "-y", "50", "-c", cwd, f"{env_prefix} {command}")
     wait_for(lambda screen: "❯" in screen, 30)
+    # The composer is drawn before the session accepts input (plan mode is slower).
+    time.sleep(6)
     tmux("send-keys", "-t", "p", "-l", prompt)
     time.sleep(0.5)
     tmux("send-keys", "-t", "p", "Enter")
-    wait_for(lambda screen: any(m in screen for m in TURN_OVER), wait_s)
+    wait_for(turn_over, timeout_s)
     time.sleep(2)
-    screen = tmux("capture-pane", "-p", "-t", "p")
+    screen = tmux("capture-pane", "-p", "-t", "p", "-S", "-200")
     tmux("kill-server")
     return screen
 
@@ -109,108 +150,199 @@ def reply_lines(screen: str) -> list[str]:
     return [line.strip().lstrip("⏺").strip() for line in screen.splitlines() if line.strip().startswith("⏺")]
 
 
-def settings_file(scratch: str, name: str, hook: dict) -> str:
+def settings_file(scratch: str, name: str, event: str, matcher: str, hook: dict) -> str:
     path = os.path.join(scratch, f"{name}.json")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"hooks": {"PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook]}]}}, fh)
+        json.dump({"hooks": {event: [{"matcher": matcher, "hooks": [hook]}]}}, fh)
+    return path
+
+
+def script(scratch: str, name: str, body: str) -> str:
+    path = os.path.join(scratch, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
     return path
 
 
 ASK = (
     'Use the AskUserQuestion tool exactly once to ask me "Which color?" with options '
     "red and blue. If it fails or is blocked, quote the error text verbatim. Then reply "
-    "with only the answer you received. Use no other tool."
+    "with only the answer you received."
 )
+ASK_TOOLS = ["--tools", "AskUserQuestion"]
 
 
-def probe_claude_answer(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
-    hook_py = os.path.join(scratch, "answer_hook.py")
-    with open(hook_py, "w", encoding="utf-8") as fh:
-        fh.write(ANSWER_HOOK)
+def probe_claude_answer(a, scratch):
+    hook = script(scratch, "answer_hook.py", ANSWER_HOOK)
     settings = settings_file(
-        scratch, "answer", {"type": "command", "command": f"python3 -I {hook_py}", "timeout": 30}
+        scratch, "answer", "PreToolUse", "AskUserQuestion",
+        {"type": "command", "command": f"python3 -I {hook}", "timeout": 30},
     )
-    screen = claude_turn(a.cwd, a.claude_model, ["--settings", settings], ASK, 60)
-    ok = "Which color? → red" in screen and "Enter to select" not in screen
-    return ok, screen
+    screen = claude_turn(a.cwd, a.claude_model, [*ASK_TOOLS, "--settings", settings], ASK)
+    return "Which color? → red" in screen and not dialog_open(screen), screen
 
 
-def probe_claude_disallow(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
+def probe_claude_disallow(a, scratch):
     prompt = (
         "Is a tool named AskUserQuestion in your tool list? Answer YES or NO first. If YES, "
-        'use it once to ask "Which color?" with options red and blue. Use no other tool.'
+        'use it once to ask "Which color?" with options red and blue.'
     )
-    screen = claude_turn(a.cwd, a.claude_model, ["--disallowedTools", "AskUserQuestion"], prompt, 60)
-    ok = "Enter to select" not in screen and any(line.startswith("NO") for line in reply_lines(screen))
+    screen = claude_turn(a.cwd, a.claude_model, ["--disallowedTools", "AskUserQuestion"], prompt)
+    ok = not dialog_open(screen) and any(line.startswith("NO") for line in reply_lines(screen))
     return ok, screen
 
 
-def probe_claude_timeout(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
-    settings = settings_file(scratch, "timeout", {"type": "command", "command": "sleep 15", "timeout": 5})
-    screen = claude_turn(a.cwd, a.claude_model, ["--settings", settings], ASK, 60)
-    return "Enter to select" in screen, screen
-
-
-def probe_claude_onfailure(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
+def probe_claude_timeout(a, scratch):
     settings = settings_file(
-        scratch,
-        "onfailure",
+        scratch, "timeout", "PreToolUse", "AskUserQuestion",
+        {"type": "command", "command": "sleep 15", "timeout": 5},
+    )
+    screen = claude_turn(a.cwd, a.claude_model, [*ASK_TOOLS, "--settings", settings], ASK)
+    return dialog_open(screen), screen
+
+
+def probe_claude_onfailure(a, scratch):
+    settings = settings_file(
+        scratch, "onfailure", "PreToolUse", "AskUserQuestion",
         {"type": "command", "command": "sleep 15", "timeout": 5, "onFailure": "block"},
     )
-    screen = claude_turn(a.cwd, a.claude_model, ["--settings", settings], ASK, 60)
-    ok = "timed out; blocking" in screen and "Enter to select" not in screen
+    screen = claude_turn(a.cwd, a.claude_model, [*ASK_TOOLS, "--settings", settings], ASK)
+    return "timed out; blocking" in screen and not dialog_open(screen), screen
+
+
+def probe_claude_missing(a, scratch):
+    missing = os.path.join(scratch, "no-such-hook")
+    settings = settings_file(
+        scratch, "missing", "PreToolUse", "AskUserQuestion",
+        {"type": "command", "command": missing, "timeout": 10, "onFailure": "block"},
+    )
+    screen = claude_turn(a.cwd, a.claude_model, [*ASK_TOOLS, "--settings", settings], ASK)
+    return "hook error" in screen and not dialog_open(screen), screen
+
+
+def probe_claude_exitplan(a, scratch):
+    hook = script(scratch, "plan_hook.py", APPROVE_PLAN_HOOK)
+    settings = settings_file(
+        scratch, "plan", "PreToolUse", "ExitPlanMode",
+        {"type": "command", "command": f"python3 -I {hook}", "timeout": 30},
+    )
+    prompt = (
+        "Plan a one-step change: print the word hello. Keep the plan to one line, then call "
+        "ExitPlanMode to ask me to approve it. After it returns, say APPROVED if the plan "
+        "was approved or REJECTED otherwise, and do nothing else."
+    )
+    screen = claude_turn(
+        a.cwd, a.claude_model,
+        ["--permission-mode", "plan", "--tools", "ExitPlanMode,Write,Read", "--settings", settings],
+        prompt, 120,
+    )
+    ok = not dialog_open(screen) and any("APPROVED" in line for line in reply_lines(screen))
     return ok, screen
 
 
-def codex_exec(scratch: str, prompt: str) -> tuple[str, list[dict]]:
+def claude_midturn(a, scratch, event: str):
+    body = json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"The codeword is {CODEWORD}."}})
+    hook = script(scratch, f"midturn-{event}.sh", f"#!/bin/sh\ncat >/dev/null\nprintf '%s' {shlex.quote(body)}\n")
+    settings = settings_file(
+        scratch, f"midturn-{event}", event, "Bash", {"type": "command", "command": hook, "timeout": 10},
+    )
+    prompt = (
+        "Run the Bash command `echo one`. Then, before doing anything else, write the line "
+        "CODEWORD=<the codeword you were given after that command, or none>. Then run "
+        "`echo two`, and stop."
+    )
+    screen = claude_turn(
+        a.cwd, a.claude_model, ["--tools", "Bash", "--allowedTools", "Bash(echo:*)", "--settings", settings], prompt
+    )
+    return any(f"CODEWORD={CODEWORD}" in line for line in reply_lines(screen)), screen
+
+
+def probe_claude_midturn(a, scratch):
+    return claude_midturn(a, scratch, "PostToolUse")
+
+
+def probe_claude_midturn_pre(a, scratch):
+    return claude_midturn(a, scratch, "PreToolUse")
+
+
+def make_codex_home(scratch: str) -> Path:
+    """A throwaway CODEX_HOME: a copy of auth.json, a minimal config, no MCP servers, no hooks."""
+    home = Path(scratch) / "codex-home"
+    if home.exists():
+        return home
+    home.mkdir(mode=0o700)
+    source = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    auth = source / "auth.json"
+    if auth.is_file():
+        shutil.copy2(auth, home / "auth.json")
+        os.chmod(home / "auth.json", 0o600)
+    model = ""
+    config = source / "config.toml"
+    if config.is_file():
+        for line in config.read_text(encoding="utf-8").splitlines():
+            if line.replace(" ", "").startswith("model="):
+                model = line + "\n"
+                break
+    (home / "config.toml").write_text(
+        model + 'approval_policy = "never"\nsandbox_mode = "workspace-write"\n', encoding="utf-8"
+    )
+    return home
+
+
+def codex_exec(scratch: str, event: str, hook_command: str, prompt: str, timeout: int | None = None):
+    home = make_codex_home(scratch)
     log = os.path.join(scratch, "codex-hook.log")
-    hook = os.path.join(scratch, "deny_hook.sh")
-    with open(hook, "w", encoding="utf-8") as fh:
-        fh.write(
-            "#!/bin/sh\n"
-            f"cat >> {shlex.quote(log)}\n"
-            f"echo >> {shlex.quote(log)}\n"
-            "printf '%s' '"
-            + json.dumps(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": DENY_REASON,
-                    }
-                }
-            )
-            + "'\n"
-        )
-    os.chmod(hook, 0o755)
     open(log, "w", encoding="utf-8").close()
-    hooks = f'hooks.PreToolUse=[{{matcher=".*",hooks=[{{type="command",command="{hook}"}}]}}]'
+    timeout_part = f",timeout={timeout}" if timeout else ""
+    hooks = f'hooks.{event}=[{{matcher=".*",hooks=[{{type="command",command="{hook_command}"{timeout_part}}}]}}]'
+    work = Path(scratch) / "codex-work"
+    work.mkdir(exist_ok=True)
     out = subprocess.run(
-        ["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-hook-trust", "-c", hooks, prompt],
-        cwd=scratch,
-        env=clean_env(),
+        ["codex", "exec", "--skip-git-repo-check", "-s", "workspace-write",
+         "--dangerously-bypass-hook-trust", "-c", hooks, prompt],
+        cwd=work,
+        env=clean_env(CODEX_HOME=str(home)),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        timeout=240,
+        timeout=300,
         check=False,
     )
     with open(log, encoding="utf-8") as fh:
-        calls = [json.loads(line) for line in fh if line.strip()]
+        calls = [json.loads(line) for line in fh if line.strip().startswith("{")]
     return out.stdout + out.stderr, calls
 
 
-def probe_codex_deny(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
-    text, calls = codex_exec(
-        scratch, "Run the shell command `echo hi` exactly once. If it is blocked, quote the error text verbatim."
-    )
-    ok = any(c.get("hook_event_name") == "PreToolUse" for c in calls) and DENY_REASON in text
-    return ok, text
+def logging_hook(scratch: str, name: str, tail: str) -> str:
+    log = os.path.join(scratch, "codex-hook.log")
+    return script(scratch, name, f"#!/bin/sh\ncat >> {shlex.quote(log)}\necho >> {shlex.quote(log)}\n{tail}\n")
 
 
-def probe_codex_question(a: argparse.Namespace, scratch: str) -> tuple[bool, str]:
+DENY_JSON = json.dumps(
+    {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": DENY_REASON}}
+)
+ECHO_PROMPT = (
+    "Run the shell command `echo PROBE-RAN` exactly once. If it is blocked, quote the error text "
+    "verbatim. Do not retry."
+)
+
+
+def ran(text: str) -> bool:
+    """The probe command's own output reached the transcript (the tool really ran)."""
+    return "PROBE-RAN" in text.replace("echo PROBE-RAN", "")
+
+
+def probe_codex_deny(a, scratch):
+    hook = logging_hook(scratch, "deny.sh", f"printf '%s' {shlex.quote(DENY_JSON)}")
+    text, calls = codex_exec(scratch, "PreToolUse", hook, ECHO_PROMPT)
+    return bool(calls) and DENY_REASON in text and not ran(text), text
+
+
+def probe_codex_question(a, scratch):
+    hook = logging_hook(scratch, "deny.sh", f"printf '%s' {shlex.quote(DENY_JSON)}")
     text, calls = codex_exec(
-        scratch,
+        scratch, "PreToolUse", hook,
         'Call the request_user_input tool exactly once to ask me "Which color?" with options red '
         "and blue. If it is blocked or unavailable, quote the exact error text verbatim. Use no other tool.",
     )
@@ -219,13 +351,65 @@ def probe_codex_question(a: argparse.Namespace, scratch: str) -> tuple[bool, str
     return ok, text + "\n" + json.dumps(seen, indent=1)
 
 
+def codex_midturn(scratch, event: str):
+    body = json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"The codeword is {CODEWORD}."}})
+    hook = logging_hook(scratch, f"midturn-{event}.sh", f"printf '%s' {shlex.quote(body)}")
+    text, _ = codex_exec(
+        scratch, event, hook,
+        "Run the shell command `echo one`. Then, before running anything else, write the line "
+        "CODEWORD=<the codeword you were given after that command, or none>. Then run `echo two`, and stop.",
+    )
+    return f"CODEWORD={CODEWORD}" in text, text
+
+
+def probe_codex_midturn(a, scratch):
+    return codex_midturn(scratch, "PostToolUse")
+
+
+def probe_codex_midturn_pre(a, scratch):
+    return codex_midturn(scratch, "PreToolUse")
+
+
+def failing_probe(scratch: str, name: str, tail: str, timeout: int | None = None):
+    hook = logging_hook(scratch, name, tail)
+    text, calls = codex_exec(scratch, "PreToolUse", hook, ECHO_PROMPT, timeout)
+    return bool(calls) and ran(text), text
+
+
+def probe_codex_crash(a, scratch):
+    return failing_probe(scratch, "crash.sh", "echo boom >&2\nexit 1")
+
+
+def probe_codex_garbage(a, scratch):
+    return failing_probe(scratch, "garbage.sh", "printf 'not json at all'")
+
+
+def probe_codex_missing(a, scratch):
+    text, _ = codex_exec(scratch, "PreToolUse", os.path.join(scratch, "no-such-hook"), ECHO_PROMPT)
+    return ran(text), text
+
+
+def probe_codex_timeout(a, scratch):
+    return failing_probe(scratch, "slow.sh", "sleep 20", timeout=3)
+
+
 PROBES = {
     "claude-answer": probe_claude_answer,
     "claude-disallow": probe_claude_disallow,
     "claude-timeout": probe_claude_timeout,
     "claude-onfailure": probe_claude_onfailure,
+    "claude-missing": probe_claude_missing,
+    "claude-exitplan": probe_claude_exitplan,
+    "claude-midturn": probe_claude_midturn,
+    "claude-midturn-pre": probe_claude_midturn_pre,
     "codex-deny": probe_codex_deny,
     "codex-question": probe_codex_question,
+    "codex-midturn": probe_codex_midturn,
+    "codex-midturn-pre": probe_codex_midturn_pre,
+    "codex-crash": probe_codex_crash,
+    "codex-garbage": probe_codex_garbage,
+    "codex-missing": probe_codex_missing,
+    "codex-timeout": probe_codex_timeout,
 }
 
 
@@ -252,7 +436,7 @@ def main() -> int:
         for name in a.probes or list(PROBES):
             ok, evidence = PROBES[name](a, scratch)
             failed += not ok
-            print(f"{'PASS' if ok else 'FAIL'}  {name}")
+            print(f"{'PASS' if ok else 'FAIL'}  {name}", flush=True)
             if a.verbose or not ok:
                 lines = [line for line in evidence.splitlines() if line.strip()]
                 print("\n".join("    " + line for line in lines[-30:]))

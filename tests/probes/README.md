@@ -56,11 +56,15 @@ docstring is the setup (an isolated flk, a warm throwaway Claude session, a
 fork through `agent.fork` or in place), and `usage <session id>` prints the
 cache read and creation tokens of every turn from the Claude transcript.
 
-`harness_question_hooks.py` re-measures the six harness facts ADR-0034's
-question routing rests on: a Claude `PreToolUse` hook answering
-`AskUserQuestion`, `--disallowedTools`, a hook timeout failing open, and
-`onFailure: "block"` failing closed; a Codex deny and Codex's
-`request_user_input` reaching `PreToolUse`. It talks to no flk at all: it
-unsets `FLOCK_*`, runs Claude in a private `tmux -L` server, and needs `--cwd`
-to be a folder Claude already trusts. Re-run it on every harness version the
-fleet pins.
+`harness_question_hooks.py` re-measures the harness facts ADR-0034 rests on.
+For Claude these are: a `PreToolUse` hook answering `AskUserQuestion` and
+approving `ExitPlanMode`, `--disallowedTools`, failures falling open by
+default and `onFailure: "block"` closing them, and mid-turn
+`additionalContext`. For Codex they are: a deny, `request_user_input` reaching
+`PreToolUse`, mid-turn `additionalContext`, and a crashing, garbled, missing
+or slow hook failing open. It talks to no flk at all: it unsets every
+`FLOCK_*` variable, runs Claude in a private `tmux -L` server with no MCP
+servers and a minimal `--tools` list, and runs Codex against a throwaway
+`CODEX_HOME` (a copy of `auth.json`, deleted on exit) under
+`workspace-write`. `--cwd` must be a folder Claude already trusts. Re-run it
+on every harness version the fleet pins.
