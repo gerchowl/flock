@@ -66,6 +66,9 @@ struct PersistentLog {
     active_events: u64,
     /// Bytes written to the active file since open/rotation.
     active_bytes: u64,
+    /// Rotations since open. A read outside the lock compares it before and
+    /// after, because a rotation in between renames the files it is reading.
+    rotations: u64,
 }
 
 /// Rotation policy (ADR-0005): rotate the active file past either bound,
@@ -92,6 +95,7 @@ impl PersistentLog {
             // is not worth it — the byte bound covers a restarted file.
             active_events: 0,
             active_bytes,
+            rotations: 0,
         })
     }
 
@@ -131,6 +135,7 @@ impl PersistentLog {
             .open(&self.path)?;
         self.active_events = 0;
         self.active_bytes = 0;
+        self.rotations += 1;
         Ok(())
     }
 }
@@ -652,24 +657,48 @@ impl EventHub {
         #[cfg(test)]
         self.cold_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Ok(state) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let Some(log) = state.log.as_ref() else {
-            return Vec::new();
+        // Parse outside `inner`: a cold read covers up to six files, and
+        // `push` on the App loop must not queue behind it. Only the file
+        // names and the rotation count are taken under the lock. A rotation
+        // during the read renames files under it, so the read is retried, and
+        // the last attempt holds the lock throughout.
+        let rotations = |hub: &Self| {
+            hub.inner
+                .lock()
+                .ok()
+                .and_then(|state| state.log.as_ref().map(|log| log.rotations))
         };
         let mut restored: Vec<PersistedEvent> = Vec::new();
-        for index in (1..=MAX_ROTATED).rev() {
-            match read_log_file(&log.rotated_path(index)) {
-                Ok((events, _)) => restored.extend(events),
-                Err(err) => crate::logging::event_log_corrupt(&err),
+        for attempt in 0..3 {
+            let Ok(state) = self.inner.lock() else {
+                return Vec::new();
+            };
+            let Some(log) = state.log.as_ref() else {
+                return Vec::new();
+            };
+            let before = log.rotations;
+            let mut paths: Vec<PathBuf> = (1..=MAX_ROTATED)
+                .rev()
+                .map(|index| log.rotated_path(index))
+                .collect();
+            paths.push(log.path.clone());
+            let held = (attempt == 2).then_some(state);
+            restored.clear();
+            for path in &paths {
+                match read_log_file(path) {
+                    Ok((events, _)) => restored.extend(events),
+                    Err(err) => crate::logging::event_log_corrupt(&err),
+                }
+            }
+            if held.is_some() {
+                break;
+            }
+            if rotations(self) == Some(before) {
+                break;
             }
         }
-        match read_log_file(&log.path) {
-            Ok((events, _)) => restored.extend(events),
-            Err(err) => crate::logging::event_log_corrupt(&err),
-        }
         restored.sort_by_key(|event| event.seq);
+        restored.dedup_by_key(|event| event.seq);
         restored
             .into_iter()
             .filter(|event| event.seq > sequence)
