@@ -1179,6 +1179,34 @@ impl App {
         Ok((ws_idx, result.0, result.1.pane_id))
     }
 
+    /// The `background` axis's count and source (ADR-0028 §1, #1022).
+    /// Claude counts its tasks on screen. Codex and opencode do not, so their
+    /// pane's process tree is read, and only once the turn is idle: during a
+    /// turn the phase is `working` whatever runs, and the walk lists every
+    /// process on the host.
+    fn agent_background(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        status: crate::api::schema::AgentStatus,
+    ) -> Option<(u32, crate::api::agent_state::StateSource)> {
+        use crate::api::agent_state::StateSource;
+        use crate::api::schema::AgentStatus;
+        use crate::detect::Agent;
+        match terminal.effective_known_agent()? {
+            Agent::Claude => Some((terminal.background_tasks?, StateSource::Screen)),
+            Agent::Codex | Agent::OpenCode
+                if matches!(status, AgentStatus::Idle | AgentStatus::Done) =>
+            {
+                let root = self.terminal_runtimes.get(&terminal.id)?.child_pid()?;
+                Some((
+                    super::background_jobs::pane_background_jobs(root)?,
+                    StateSource::ProcessTree,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
@@ -1215,6 +1243,7 @@ impl App {
                 terminal
                     .state_changed_at
                     .map(|changed| changed.elapsed().as_millis() as u64),
+                self.agent_background(terminal, pane.agent_status),
             )),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {

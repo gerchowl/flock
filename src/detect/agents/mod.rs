@@ -56,6 +56,7 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             visible_idle: false,
             visible_working: false,
             settled_with_background_shells: false,
+            background_tasks: None,
         };
     }
 
@@ -79,6 +80,9 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         settled_with_background_shells: agent == Agent::Claude
             && state == AgentState::Idle
             && claude_code::settled_with_background_shells(screen_content),
+        background_tasks: (agent == Agent::Claude)
+            .then(|| claude_code::background_task_count(screen_content))
+            .flatten(),
     }
 }
 
