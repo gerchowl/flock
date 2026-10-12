@@ -503,11 +503,12 @@ impl HeadlessServer {
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
 
-        // #959 / ADR-0031: edges and goals, once per server start, cold or
+        // #959 / ADR-0031 / ADR-0028 §2: edges, goals and the derived agent
+        // events' seed, from one log read, once per server start, cold or
         // handed off. Here rather than in `App::new` because only now is the
-        // session restored (the live records openness is checked against)
-        // and, on a handoff, the exporting server done writing the log being
-        // folded.
+        // session restored (the live records openness and agent presence are
+        // checked against) and, on a handoff, the exporting server done
+        // writing the log being folded.
         self.app.reissue_open_records();
 
         let mut needs_render = true;
@@ -3702,6 +3703,8 @@ impl HeadlessServer {
         self.app.tick_idle_wakes(now);
         // ADR-0028 §5: mirrored in the TUI runtime loop (#25).
         self.app.tick_waits(now);
+        // ADR-0028 §2: mirrored in the TUI runtime loop (#25).
+        self.app.tick_agent_phases(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
         // #850: mirrored in the TUI runtime loop (#25).

@@ -18,7 +18,9 @@
 //!
 //! A wait still open at its deadline is removed and announced once as a
 //! durable `wait.expired`. A held read is released when its request returns,
-//! so it expires only when that release never arrived.
+//! so it expires only when that release never arrived. Opening, closing and
+//! expiring a wait each mark the agent's pane for the derived phase events
+//! (ADR-0028 §2), so `agent.phase_changed` follows the wait.
 //!
 //! Known limits. Opening a park on its predicate, and the wake that follows,
 //! are E6 (#1032): until then a park ends at its deadline. The registry is
@@ -43,6 +45,8 @@ const HOLD_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenWait {
     pub(crate) agent_id: String,
+    /// The agent's pane when the wait opened, to mark for the phase events.
+    pane: crate::layout::PaneId,
     pub(crate) predicate: WaitPredicate,
     /// Unix ms.
     pub(crate) since: u64,
@@ -64,6 +68,7 @@ impl WaitRegistry {
     pub(crate) fn open(
         &mut self,
         agent_id: String,
+        pane: crate::layout::PaneId,
         predicate: WaitPredicate,
         hold: Duration,
         now: Instant,
@@ -77,6 +82,7 @@ impl WaitRegistry {
             wait_id.clone(),
             OpenWait {
                 agent_id,
+                pane,
                 predicate,
                 since: now_ms,
                 deadline,
@@ -131,7 +137,10 @@ impl App {
                 format!("{kind:?} is not durable; a wait matches durable kinds only"),
             );
         }
-        let SpawnCaller::Agent { agent_id, .. } = self.spawn_caller() else {
+        let SpawnCaller::Agent {
+            agent_id, pane_id, ..
+        } = self.spawn_caller()
+        else {
             return encode_error(
                 id,
                 "no_caller_pane",
@@ -145,7 +154,8 @@ impl App {
             after: self.event_hub.durable_sequence(),
         };
         let hold = Duration::from_millis(params.deadline_ms);
-        let Some((wait_id, deadline)) = self.open_wait(agent_id.clone(), predicate, hold) else {
+        let Some((wait_id, deadline)) = self.open_wait(agent_id.clone(), pane_id, predicate, hold)
+        else {
             return encode_error(id, "invalid_params", "wait.park deadline is out of range");
         };
         encode_success(
@@ -167,9 +177,12 @@ impl App {
         hold_ms: u64,
     ) -> String {
         let wait_id = match self.spawn_caller() {
-            SpawnCaller::Agent { agent_id, .. } => self
+            SpawnCaller::Agent {
+                agent_id, pane_id, ..
+            } => self
                 .open_wait(
                     agent_id,
+                    pane_id,
                     predicate,
                     Duration::from_millis(hold_ms).saturating_add(HOLD_GRACE),
                 )
@@ -181,29 +194,36 @@ impl App {
 
     /// The held `events.read` returned: its wait closes.
     pub(super) fn handle_wait_release(&mut self, id: String, wait_id: &str) -> String {
-        self.waits.close(wait_id);
+        if let Some(wait) = self.waits.close(wait_id) {
+            self.touch_agent_phase(wait.pane);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
     fn open_wait(
         &mut self,
         agent_id: String,
+        pane: crate::layout::PaneId,
         predicate: WaitPredicate,
         hold: Duration,
     ) -> Option<(String, u64)> {
-        self.waits.open(
+        let opened = self.waits.open(
             agent_id,
+            pane,
             predicate,
             hold,
             Instant::now(),
             super::notifications::now_ms(),
-        )
+        );
+        self.touch_agent_phase(pane);
+        opened
     }
 
     /// Announce and remove every wait whose deadline has passed. Mirrored in
     /// both server loops (#25).
     pub(crate) fn tick_waits(&mut self, now: Instant) {
         for (wait_id, wait) in self.waits.expire(now) {
+            self.touch_agent_phase(wait.pane);
             self.emit_event(EventEnvelope {
                 event: EventKind::WaitExpired,
                 data: EventData::WaitExpired {
@@ -343,6 +363,51 @@ mod tests {
         assert_eq!(waiting, "none");
     }
 
+    /// The derived phase events follow the wait (ADR-0028 §2): opening it
+    /// and closing it each mark the pane, and each phase is announced once it
+    /// has held for the settle window.
+    #[test]
+    fn the_derived_phase_events_follow_a_held_read() {
+        let (mut app, agent_id) = settled_claude_with_a_background_shell();
+        let announced = |app: &App| -> Vec<Phase> {
+            app.event_hub
+                .events_after(0)
+                .into_iter()
+                .filter_map(|(_, event)| match event.data {
+                    EventData::AgentPhaseChanged(change) if change.agent_id == agent_id => {
+                        Some(change.to)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let start = Instant::now();
+        let settle = Duration::from_millis(SETTLE_MS);
+        app.tick_agent_phases(start);
+        assert_eq!(announced(&app), [Phase::FinishedWithBackground]);
+
+        let held = call(&mut app, Method::WaitHold(WaitPredicate::default(), 60_000));
+        app.tick_agent_phases(start);
+        app.tick_agent_phases(start + settle);
+        assert_eq!(
+            announced(&app),
+            [Phase::FinishedWithBackground, Phase::WaitingOnEvent]
+        );
+
+        let wait_id = held["result"]["wait_id"].as_str().expect("a wait id");
+        call(&mut app, Method::WaitRelease(wait_id.into()));
+        app.tick_agent_phases(start + settle);
+        app.tick_agent_phases(start + settle * 2);
+        assert_eq!(
+            announced(&app),
+            [
+                Phase::FinishedWithBackground,
+                Phase::WaitingOnEvent,
+                Phase::FinishedWithBackground
+            ]
+        );
+    }
+
     /// Acceptance (#1031): a parked agent reads `waiting_on_event`.
     #[test]
     fn a_parked_agent_reads_waiting_on_event() {
@@ -426,11 +491,12 @@ mod tests {
         let mut registry = super::WaitRegistry::default();
         let now = Instant::now();
         let hold = Duration::from_secs(60);
+        let pane = crate::layout::PaneId::from_raw(1);
         let (first, _) = registry
-            .open("a".into(), WaitPredicate::default(), hold, now, 10)
+            .open("a".into(), pane, WaitPredicate::default(), hold, now, 10)
             .unwrap();
         registry
-            .open("a".into(), WaitPredicate::default(), hold, now, 20)
+            .open("a".into(), pane, WaitPredicate::default(), hold, now, 20)
             .unwrap();
         let Waiting::On { wait_id, .. } = registry.waiting("a") else {
             panic!("a wait is open");
