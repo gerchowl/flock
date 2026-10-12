@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_phases;
 mod agent_profile;
 pub(crate) mod agent_removal;
 pub(crate) mod agent_restart;
@@ -226,6 +227,8 @@ pub struct App {
     pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// Settled phase per local agent, for ADR-0028 §2's derived events.
+    pub(crate) agent_phases: agent_phases::AgentPhaseTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
     /// of a typed write, a settle that lifts, or the timeout. `None` when
     /// nothing is armed anywhere, which is the state the loop is quiet in.
@@ -988,6 +991,7 @@ impl App {
             active_submissions: Default::default(),
             kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            agent_phases: Default::default(),
             self_compact_deadline: None,
             restarts: Default::default(),
             event_hub,
@@ -1321,6 +1325,9 @@ impl App {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        // ADR-0028 §2: mirrored from the headless server's `run` (#25).
+        let restored = self.event_hub.persisted_events_after(0);
+        self.begin_agent_phases(&restored);
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;

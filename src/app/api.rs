@@ -724,6 +724,14 @@ impl App {
         {
             self.arm_transcript_read_for(*pane_id);
         }
+        // ADR-0028 §2: a detector or hook report may move an agent's state
+        // axes without a status change event (a background count, a prompt's
+        // kind), so it marks the pane for the derived events.
+        if let AppEvent::StateChanged { pane_id, .. }
+        | AppEvent::HookStateReported { pane_id, .. } = &ev
+        {
+            self.touch_agent_phase(*pane_id);
+        }
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
             self.refresh_new_flock_toast_context_for_update(update, &previous_toast);
@@ -1265,6 +1273,8 @@ impl App {
     }
 
     pub(super) fn emit_event(&self, event: crate::api::schema::EventEnvelope) {
+        // ADR-0028 §2: derived agent events fold on what the server emits.
+        self.agent_phases.touch_event(&event);
         self.event_hub.push(event);
     }
 

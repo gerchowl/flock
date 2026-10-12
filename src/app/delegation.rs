@@ -226,7 +226,8 @@ impl App {
     /// Once per server start: read the durable log once and fold the
     /// delegation edges, the goals (ADR-0031 §3) and the owner bindings
     /// (ADR-0035 §1) from it, re-issuing what is open so log rotation cannot
-    /// drop it.
+    /// drop it. The same read seeds the derived agent events (ADR-0028 §2,
+    /// #1027) and announces `gone` for an agent no restored pane carries.
     ///
     /// Run from the server loop rather than from `App::new`, so a live
     /// handoff folds the log only after the exporting server has stopped
@@ -238,6 +239,7 @@ impl App {
         self.reissue_open_delegations(&restored);
         self.reissue_open_goals(&restored);
         self.reissue_owner_bindings(&restored);
+        self.begin_agent_phases(&restored);
     }
 
     /// Server loop: when the log rotated since the last look, re-issue the
