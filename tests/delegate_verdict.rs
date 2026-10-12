@@ -1098,12 +1098,15 @@ fn delegate_idle_without_new_turn_reports_not_started_and_informs_s1() {
         )
         .output()
         .unwrap();
+    // 11 since #1025 (was 8), named on stderr for one release.
     assert_eq!(
         out.status.code(),
-        Some(8),
+        Some(11),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("note: exit code is now 11 (was 8); see CHANGELOG"));
     assert!(started.elapsed() >= Duration::from_secs(30));
     assert!(started.elapsed() < Duration::from_secs(40));
     let value = Pane::json(&out);

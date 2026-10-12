@@ -499,6 +499,9 @@ fn pane_stash(args: &[String]) -> std::io::Result<i32> {
         id: format!("cli:pane:stash:{verb}"),
         method,
     })?;
+    if response.get("error").is_some() && verb == "restore" {
+        return super::print_send_response(&response);
+    }
     if json || response.get("error").is_some() {
         return super::print_response(&response);
     }
@@ -521,7 +524,7 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:pane:send-text".into(),
         method: Method::PaneSendText(PaneSendTextParams { pane_id, text }),
     })?)
@@ -797,7 +800,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     match parse_guarded_pane_run(args) {
         Ok(Some(mut params)) => {
             params.pane_id = super::resolve_pane_arg(&params.pane_id);
-            return super::send_ok_request(Method::PaneSubmit(params));
+            return super::send_guarded_request(Method::PaneSubmit(params));
         }
         Err(reason) => {
             eprintln!("pane run: {reason}");
