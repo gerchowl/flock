@@ -303,10 +303,17 @@ fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRunt
 /// at spaces or mid-word (#1122). Those rows, wraps removed, must end the sent
 /// text. Whitespace is dropped on both sides because a wrap at a space keeps it
 /// on neither row.
-fn matches_wrapped_tail(rows: &[&str], text: &str) -> bool {
+///
+/// The editor must also be clipped: the sent text cannot fit in the visible
+/// rows at `row_width` columns each, so its start scrolled off. A fully visible
+/// editor that holds only the end of the text lost the start, and stays Other.
+fn matches_wrapped_tail(rows: &[&str], text: &str, row_width: usize) -> bool {
     let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let tail = squash(&rows.concat());
-    rows.len() > 1 && !tail.is_empty() && squash(text).ends_with(&tail)
+    rows.len() > 1
+        && !tail.is_empty()
+        && text.trim().chars().count() > rows.len() * row_width
+        && squash(text).ends_with(&tail)
 }
 
 fn editor_shows_wrapped_tail(
@@ -314,8 +321,11 @@ fn editor_shows_wrapped_tail(
     runtime: &crate::terminal::TerminalRuntime,
     text: &str,
 ) -> bool {
+    // Each editor row loses at least the two-column prompt or indent.
+    let row_width = usize::from(runtime.current_size().1.saturating_sub(2));
     editor_rows(agent, runtime).is_some_and(|rows| {
-        matches_wrapped_tail(&rows.iter().map(String::as_str).collect::<Vec<_>>(), text)
+        let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+        matches_wrapped_tail(&rows, text, row_width)
     })
 }
 

@@ -3379,6 +3379,11 @@ impl AppState {
     /// workspace was born about 14 columns wide. A detached server never lays
     /// out an unfocused workspace again, so that sliver stuck until a client
     /// attached, and guarded sends could not find the composer.
+    ///
+    /// Known limit: this does not subtract the agent header rows that
+    /// `carve_pane_header` (src/ui/panes.rs) takes from a laid-out pane, so a
+    /// background agent pane on a detached server can be a few rows taller
+    /// than its layout until the first render that resizes it.
     pub fn estimate_pane_size(&self) -> (u16, u16) {
         let area = self.view.terminal_area;
         if area.width > 2 && area.height > 2 {

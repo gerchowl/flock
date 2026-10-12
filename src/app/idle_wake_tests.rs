@@ -841,8 +841,10 @@ async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
 }
 
 /// A 16-column pane shows only the wrapped tail of a long message (#1122).
-/// That tail gets the Enter and its one retry like a paste chip, and a tail
-/// that does not end the sent text gets no Enter at all.
+/// That tail gets the Enter and its one retry like a paste chip. A tail that
+/// does not end the sent text gets no Enter, and neither does a fully visible
+/// editor holding only the end of a text short enough to fit in it: nothing
+/// scrolled off, so the start was lost, not clipped.
 #[tokio::test]
 async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
     use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
@@ -850,15 +852,16 @@ async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
         with findings, then check https://github.com/gerchowl/flock/pull/1120 for the \
         follow-up discussion about guarded submit confirmation on wrapped composers.";
     let narrow = include_str!("../../tests/fixtures/wrapped-composer-1126/claude-16-cols.txt");
-    let fixture = format!("\x1b[2J\x1b[H{}", narrow.replace('\n', "\r\n"));
+    let lines: Vec<&str> = narrow.lines().collect();
+    let unclipped = [&lines[..2], &["\u{276f} delta", "  epsilon"], &lines[17..]]
+        .concat()
+        .join("\n");
     let other = sent.replace("composers.", "panes.");
-    for (text, enters, outcome) in [
-        (sent, 2, Outcome::Unconfirmed("typed_not_submitted")),
-        (
-            other.as_str(),
-            0,
-            Outcome::Unconfirmed("owned_composer_not_visible"),
-        ),
+    let not_visible = Outcome::Unconfirmed("owned_composer_not_visible");
+    for (screen, text, enters, outcome) in [
+        (narrow, sent, 2, Outcome::Unconfirmed("typed_not_submitted")),
+        (narrow, other.as_str(), 0, not_visible),
+        (unclipped.as_str(), "gamma delta epsilon", 0, not_visible),
     ] {
         let Rig {
             mut app,
@@ -871,6 +874,8 @@ async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
             .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
             .unwrap();
         drain(&mut pty);
+        runtime(&app).resize(40, 16, 0, 0);
+        let fixture = format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n"));
         runtime(&app).test_process_pty_bytes(fixture.as_bytes());
         let mut at = now + GAP;
         let mut result = app.advance_guarded_submit(&pane, &mut attempt, at);
