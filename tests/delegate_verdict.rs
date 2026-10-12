@@ -129,7 +129,9 @@ impl Pane {
                     "agent.result" => {
                         json!({"result": {"finished": true, "at_ms": 2, "status": "done", "text": "DONE: recovered"}})
                     }
-                    "workspace.get" => {
+                    // #1030: no `ping` answer leaves the client without a
+                    // protocol, so it polls, which is what these tests count.
+                    "ping" | "workspace.get" => {
                         let _ = writeln!(
                             stream,
                             "{}",

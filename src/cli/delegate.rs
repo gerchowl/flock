@@ -3661,6 +3661,7 @@ fn delegate_wait_for_ready(
     let subscribe = Request {
         id: "cli:delegate:ready".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after: None,
             subscriptions: vec![
                 Subscription::PaneAgentStatusChanged {
                     pane_id: pane_id.to_owned(),

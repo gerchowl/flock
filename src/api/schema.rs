@@ -1951,6 +1951,11 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
+    /// from now, never a replay of the ring. A cursor older than the ring
+    /// gets a `lagged { skipped_to }` line first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
