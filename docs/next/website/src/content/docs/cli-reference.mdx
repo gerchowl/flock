@@ -560,6 +560,8 @@ flk delegate reap <name> [--force] [--json]
 flk delegate list [--mine | --architect <id> | --all] [--branch <b>] [--json]
 ```
 
+**After a compaction an architect gets its delegate table back without asking.** On a session start with `source` `compact` or `resume`, flock's own SessionStart hook asks the server for `delegate list --mine` and, when the agent has open edges, returns the table as hook output: at most 10 rows, then a `+k more: flk delegate list --mine` line. Nothing is typed into the pane, so an ordinary auto-compaction gets it as well as an armed self-compaction, whose continuation still arrives as before. Claude Code and Codex receive it as SessionStart `additionalContext`. opencode's plugin adds it to the compaction context through `experimental.session.compacting`. A harness with no session-start hook gets no table: its architect calls `flock_delegate_list` (or `flk delegate list --mine`) itself after a compaction.
+
 Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspace-write blocks the network, so a delegate that must `git push` or use `gh` needs `--sandbox danger-full-access`, deliberately chosen by the caller. `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access` for Codex only; opencode and Claude reject it with exit 2.
 
 `flk delegate` and `flk agent result` use capabilities first shipped in **0.9.0**. If a request fails because a capability is missing, they check the server version best-effort. A confirmed older server gets a diagnostic naming the required and running versions and `flk server live-handoff` or upgrade guidance. If the version is unknown or already 0.9.0 or newer, the original error is preserved.
