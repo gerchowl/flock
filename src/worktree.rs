@@ -468,6 +468,18 @@ fn run_command_capture_with_timeout(
     cwd: Option<&std::path::Path>,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
+    let output = network_command(program, args, cwd)
+        .output_traced_with_timeout(timeout)
+        .map_err(|err| err.to_string())?;
+    finished_output(program, output)
+}
+
+/// A git command that may reach the network: it never prompts for anything.
+fn network_command(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+) -> crate::process::TracedCommand {
     let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
@@ -477,10 +489,7 @@ fn run_command_capture_with_timeout(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command
-        .output_traced_with_timeout(timeout)
-        .map_err(|err| err.to_string())?;
-    finished_output(program, output)
+    command
 }
 
 /// Turn a finished child into this module's `Result<String, String>`: stderr on
@@ -993,8 +1002,17 @@ fn choose_base(local: Option<&str>, remote: Option<&str>, local_in_remote: bool)
 /// branch has commits of its own. An explicit `<remote>/<branch>` is fetched
 /// and kept as written. `HEAD`, a commit id, or any other revision is passed
 /// through untouched. A fetch that fails is reported and the refs already on
-/// disk decide, so an offline start still works.
+/// disk decide, so an offline start still works. A tag is never fetched: it
+/// resolves on disk, and the commit it names is reported (#938).
+///
+/// The one place a new worktree's base is chosen: `delegate start`,
+/// `worktree create` and the TUI's new-worktree dialog all call it.
 pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
+    resolve_fresh_base_within(repo, base, BASE_FETCH_TIMEOUT)
+}
+
+/// [`resolve_fresh_base`] with each network call bounded by `timeout`.
+fn resolve_fresh_base_within(repo: &Path, base: &str, timeout: std::time::Duration) -> FreshBase {
     let root = repo.display().to_string();
     let git = |args: &[&str]| {
         let mut full = vec!["-C", root.as_str()];
@@ -1009,26 +1027,36 @@ pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
             &format!("{rev}^{{commit}}"),
         ])
     };
-    let fetch = |remote: &str, branch: &str| {
-        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-        run_command_capture_with_timeout(
-            "git",
-            &[
-                "-C",
-                &root,
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--",
-                remote,
-                &refspec,
-            ],
-            None,
-            BASE_FETCH_TIMEOUT,
-        )
-        .err()
-        .filter(|err| !err.contains("couldn't find remote ref"))
-        .map(|err| format!("could not fetch {remote}/{branch}, using the refs on disk: {err}"))
+    // Ask the remote first: `ls-remote --exit-code` answers 2 for a branch it
+    // does not have, so that case is told apart by exit status rather than by
+    // git's (translated) error text, and an unreachable remote is waited on
+    // once rather than twice.
+    let fetch = |remote: &str, branch: &str| match remote_has_branch(&root, remote, branch, timeout)
+    {
+        Ok(false) => None,
+        Err(err) => Some(format!(
+            "could not reach {remote}, using the refs on disk: {err}"
+        )),
+        Ok(true) => {
+            let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+            run_command_capture_with_timeout(
+                "git",
+                &[
+                    "-C",
+                    &root,
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--",
+                    remote,
+                    &refspec,
+                ],
+                None,
+                timeout,
+            )
+            .err()
+            .map(|err| format!("could not fetch {remote}/{branch}, using the refs on disk: {err}"))
+        }
     };
     let as_written = |note: Option<String>| FreshBase {
         base: base.to_string(),
@@ -1051,6 +1079,9 @@ pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
     let branch_like =
         base != "HEAD" && git(&["check-ref-format", &format!("refs/heads/{base}")]).is_some();
     let local = commit(&format!("refs/heads/{base}"));
+    if local.is_none() && commit(&format!("refs/tags/{base}")).is_some() {
+        return as_written(None);
+    }
     let commit_id = (7..=40).contains(&base.len()) && base.chars().all(|c| c.is_ascii_hexdigit());
     if !branch_like || (local.is_none() && commit_id) {
         return as_written(None);
@@ -1077,7 +1108,7 @@ pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
     match choose_base(local.as_deref(), remote_sha.as_deref(), local_in_remote) {
         BaseChoice::Local => FreshBase {
             base: base.to_string(),
-            sha: local,
+            sha: local.or_else(|| commit(base)),
             note: fetch_note,
         },
         BaseChoice::Remote => FreshBase {
@@ -1100,6 +1131,37 @@ pub(crate) fn resolve_fresh_base(repo: &Path, base: &str) -> FreshBase {
                 )),
             ),
         },
+    }
+}
+
+/// Does `remote` have `branch`? `Ok(false)` only when git says so by exit
+/// status (`ls-remote --exit-code` exits 2 when nothing matched); an
+/// unreachable remote or a timeout is the `Err`.
+fn remote_has_branch(
+    root: &str,
+    remote: &str,
+    branch: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    let refname = format!("refs/heads/{branch}");
+    let output = network_command(
+        "git",
+        &[
+            "-C",
+            root,
+            "ls-remote",
+            "--exit-code",
+            "--",
+            remote,
+            &refname,
+        ],
+        None,
+    )
+    .output_traced_with_timeout(timeout)
+    .map_err(|err| err.to_string())?;
+    match output.status.code() {
+        Some(2) => Ok(false),
+        _ => finished_output("git", output).map(|_| true),
     }
 }
 
@@ -3012,6 +3074,100 @@ mod tests {
         );
 
         for dir in [&repo, &origin, &other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// #938: a tag resolves on disk. It is never fetched (the remote here
+    /// cannot be reached, which would leave a note) and its commit is reported.
+    #[test]
+    fn a_tag_base_is_not_fetched_and_reports_its_commit() {
+        let (repo, origin) = create_repo_with_bare_origin("fresh-base-tag");
+        run_git(&repo, &["tag", "v1.0"]);
+        let missing = unique_temp_path("fresh-base-tag-missing");
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &missing.display().to_string(),
+            ],
+        );
+
+        let fresh = resolve_fresh_base(&repo, "v1.0");
+        assert_eq!(fresh.base, "v1.0");
+        assert_eq!(fresh.sha, Some(head_of(&repo, "HEAD")));
+        assert_eq!(fresh.note, None, "{fresh:?}");
+
+        for dir in [&repo, &origin] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// #938: a remote that is not there is reported, and the local branch is
+    /// used as it stands.
+    #[test]
+    fn an_unreachable_remote_is_reported_and_the_disk_decides() {
+        let (repo, origin) = create_repo_with_bare_origin("fresh-base-unreachable");
+        let default = detect_default_branch(&repo).expect("default branch");
+        let missing = unique_temp_path("fresh-base-unreachable-missing");
+        run_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &missing.display().to_string(),
+            ],
+        );
+
+        let fresh = resolve_fresh_base(&repo, &default);
+        assert_eq!(fresh.base, default);
+        assert_eq!(fresh.sha, Some(head_of(&repo, "HEAD")));
+        assert!(
+            fresh
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("could not reach origin")),
+            "{fresh:?}"
+        );
+
+        for dir in [&repo, &origin] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// #938: a remote that never answers is given up on at the timeout. The
+    /// remote's upload-pack is a `sleep`, so the hang is deterministic.
+    #[test]
+    fn a_remote_that_hangs_is_bounded_by_the_timeout() {
+        let (repo, origin) = create_repo_with_bare_origin("fresh-base-hang");
+        let default = detect_default_branch(&repo).expect("default branch");
+        run_git(
+            &repo,
+            &["config", "remote.origin.uploadpack", "sleep 30; :"],
+        );
+
+        let started = std::time::Instant::now();
+        let fresh =
+            resolve_fresh_base_within(&repo, &default, std::time::Duration::from_millis(500));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fresh.base, default);
+        assert_eq!(fresh.sha, Some(head_of(&repo, "HEAD")));
+        assert!(
+            fresh
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("could not reach origin")),
+            "{fresh:?}"
+        );
+
+        for dir in [&repo, &origin] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
