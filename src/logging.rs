@@ -2651,6 +2651,17 @@ pub(crate) fn worktree_remove_started(workspace_id: &str, path: &str, force: boo
     );
 }
 
+pub(crate) fn worktree_base_note(base: &str, note: &str) {
+    tracing::warn!(
+        event = "worktree.add",
+        subsystem = "worktree",
+        outcome = "base_note",
+        base,
+        note,
+        "worktree base refreshed with a note"
+    );
+}
+
 pub(crate) fn worktree_add_completed(checkout_path: &str) {
     tracing::info!(
         event = "worktree.add",

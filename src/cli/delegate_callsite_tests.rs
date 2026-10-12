@@ -826,6 +826,18 @@ fn tail_block_keeps_the_last_twenty_lines_and_drops_the_blank_bottom() {
     assert_eq!(tail_block("d1", "\n   \n\n"), None);
 }
 
+/// #938: `data.pane_tail` holds exactly the lines the block prints, bare.
+#[test]
+fn tail_lines_are_the_printed_lines_without_the_bar() {
+    let mut screen: Vec<String> = (1..=25).map(|n| format!("line {n}  ")).collect();
+    screen.extend(std::iter::repeat_n(String::new(), 3));
+    let text = screen.join("\n");
+    let lines = tail_lines(&text);
+    assert_eq!(lines.len(), 20);
+    assert_eq!((lines[0], lines[19]), ("line 6", "line 25"));
+    assert!(tail_lines("\n  \n").is_empty());
+}
+
 /// `--keep-on-failure` is a start flag, and only that.
 #[test]
 fn keep_on_failure_is_a_start_flag() {

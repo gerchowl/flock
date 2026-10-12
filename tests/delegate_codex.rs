@@ -1315,3 +1315,75 @@ fn codex_delegate_worktree_base_is_refreshed_from_the_remote() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), landed);
 }
+
+/// #938: `flk worktree create --base` refreshes its base from the remote the
+/// same way `delegate start` does, and a tag base is used as written with its
+/// commit reported, without a fetch.
+#[test]
+fn worktree_create_base_is_refreshed_from_the_remote() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let origin = server.base.join("origin.git");
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["tag", "v1.0"]);
+    let other = server.base.join("other");
+    git(
+        &server.base,
+        &[
+            "clone",
+            "-q",
+            &origin.to_string_lossy(),
+            &other.to_string_lossy(),
+        ],
+    );
+    git(
+        &other,
+        &["commit", "-q", "--allow-empty", "-m", "merged elsewhere"],
+    );
+    git(&other, &["push", "-q", "origin", "main"]);
+    let rev = |dir: &Path, rev: &str| {
+        let out = Command::new("git")
+            .args(["-C", &dir.to_string_lossy(), "rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let landed = rev(&other, "HEAD");
+    let tagged = rev(&repo, "v1.0");
+    let repo_arg = repo.to_string_lossy().into_owned();
+
+    let fresh = cli(
+        &server,
+        &[
+            "worktree", "create", "--cwd", &repo_arg, "--branch", "wt/fresh", "--base", "main",
+        ],
+    );
+    assert!(fresh.status.success(), "{}", stderr(&fresh));
+    assert!(
+        stderr(&fresh).contains("is behind origin/main"),
+        "{}",
+        stderr(&fresh)
+    );
+    assert_eq!(rev(&repo, "wt/fresh"), landed);
+
+    let tag = cli(
+        &server,
+        &[
+            "worktree", "create", "--cwd", &repo_arg, "--branch", "wt/tag", "--base", "v1.0",
+        ],
+    );
+    assert!(tag.status.success(), "{}", stderr(&tag));
+    assert!(
+        stderr(&tag).contains(&format!("base v1.0 ({tagged})")),
+        "{}",
+        stderr(&tag)
+    );
+    assert_eq!(rev(&repo, "wt/tag"), tagged);
+}
