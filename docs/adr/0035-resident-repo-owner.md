@@ -24,6 +24,14 @@
   issue bodies cannot reach the new actions (§5). The request chain is
   derived by the server (§4). The ADR asks for amendments to ADR-0027 §1a
   and ADR-0014 §5 (§11). Numbers and slice sizes are re-estimated.
+- Revised: 2026-10-13, round 5 (final fix round). Agent identity is now a
+  real boundary (§6.3 point 1, #1177): agents run as a separate Unix user
+  with a scoped App identity. `env_clear()` alone was not a boundary,
+  because `gh`'s `hosts.yml` and the keychain are readable by the same uid.
+  Until O19a is live, the guarantees are stated as cooperative-only, and no
+  merge grant is given before it. O19 is split into O19a (Unix user), O19b
+  (App identity) and O19c (gate). The ADR-0033 rubric amendment and the
+  ADR-0014 uid amendment are listed in §11. `LiftOutcome` is called a trend.
 - Revised: 2026-10-13, round 4, alignment with ADR-0034 at `bed30fae`. Layer
   two of §6.3 is now ADR-0034 §1a's command gate, with only the rows kept
   here; the requested ADR-0034 §1 amendment is withdrawn. Mid-turn delivery
@@ -943,10 +951,11 @@ rewritten by the owner, including its own caps and gates. **Recommended:**
 act, so the owner cannot tune itself, by design. ADR-0014 defines "operator"
 as "no pane in the caller's ancestry", and ADR-0027 §1a records the known gap
 that a detached child (`setsid`) attests as the operator. Such a child could
-call `limits set`. This ADR does not close that gap, which is ADR-0014's. It
-bounds it: every authority change is loud (above), and layer one of §6.3
-still requires a recorded review at the PR head, which a raised limit does
-not forge.
+call `limits set`. Once O19a is live on a host, agents run as `flk-agent`
+and the server attests by uid, so that gap closes there (§6.3 point 1,
+amendment in §11). Before that it is bounded only: every authority change
+is loud (above), and layer one of §6.3 still requires a recorded review at
+the PR head, which a raised limit does not forge.
 
 #### 6.3 Enforcement: layer one is server-side, layer two is hooks
 
@@ -962,20 +971,81 @@ and ADR-0034 itself says nothing may rely on it for safety (§1a, §7).
 
 **Layer one, recommended: GitHub refuses what flk has not cleared.**
 
-1. **Agents never hold the operator's admin token.** Owners, segment
-   architects and their delegates get a **scoped agent identity**: a
-   `flk-agent` GitHub App installed on the operator's repos, with
-   `contents`, `pull_requests` and `issues` write, `checks` and `actions`
-   read, and no `administration`, no `actions` write (so no workflow
-   dispatch) and no deployment approval. The flk server holds the App key in
-   its own state and mints short-lived installation tokens into agent panes
-   through a git credential helper and `GH_TOKEN`. The operator's own `gh`
-   stays untouched. ADR-0014 §3 already starts spawned agents from
-   `env_clear()` plus an allowlist, so the operator's ambient token is not
-   inherited. As a side effect, agent writes are authored by
-   `flk-agent[bot]`, which gives GitHub authorship a meaning again
-   (Measurements). It does not tell the owner from its delegates, so O4's
-   node ids stay.
+1. **Agents run as a separate Unix user, so the operator's credentials are
+   out of their reach** (#1177). `env_clear()` (ADR-0014 §3) clears
+   environment variables only. `gh` keeps its login in
+   `~/.config/gh/hosts.yml`, and git keeps its credentials in the macOS
+   keychain (`osxkeychain`). Any process running as the operator's uid can
+   read both. That was verified from an agent pane with no `GH_TOKEN`: `gh
+   auth status` showed the operator logged in with `repo`, `workflow` and
+   `admin:org` (#1177). Today, then, any agent can edit `dev`'s protection,
+   dispatch `promote.yml` or approve a release environment as the operator,
+   and nothing else in this section holds against it. **Recommended:**
+   - **A dedicated agent user** (`flk-agent`, one per host) with its own
+     `HOME`, its own login keychain, and no read access to the operator's
+     `HOME`, keychain or `hosts.yml`. Every owner, segment architect, builder
+     and reviewer runs as that user. The operator's flk server keeps owning
+     the PTYs and the socket, and starts the agent process through one
+     narrow privileged launcher (`flk agent-exec`, a nix-store path allowed
+     by a `sudoers` rule for exactly that binary as `flk-agent`; on NixOS the
+     same rule or a systemd `User=` unit). The socket is group-accessible to
+     `flk-agent` so hooks and MCP keep working.
+   - **A scoped GitHub identity for that user**: a `flk-agent` GitHub App
+     installed on the operator's repos, with `contents`, `pull_requests` and
+     `issues` write and `checks` and `actions` read. It has no
+     `administration`, no `actions` write (so no workflow dispatch, unless
+     the binding grants it per repo) and cannot approve deployments. The App
+     key stays with the operator's flk server, outside the agent user's
+     reach. The server mints one-hour installation tokens and hands them to
+     the agent process through a git credential helper and `GH_TOKEN`. As a
+     side effect, agent writes are authored by `flk-agent[bot]`, which gives
+     GitHub authorship a meaning again (Measurements). It does not tell the
+     owner from its delegates, so O4's node ids stay.
+   - **Attestation by uid.** The server reads the peer's uid on its socket
+     (`getpeereid` / `SO_PEERCRED`). A caller running as `flk-agent` is
+     never the operator, whatever its process ancestry. That closes
+     ADR-0014's known gap (a detached `setsid` child attesting as the
+     operator, ADR-0027 §1a) for operator verbs like `limits set`.
+   - **Defence in depth for the operator's own token:** on macOS, the
+     operator's `gh` token and git credentials move into keychain items
+     whose access control requires user presence (Touch ID or password).
+     Even a process that does reach the operator's uid then cannot use them
+     silently. That is not the boundary; the separate uid is.
+
+   **Rejected.**
+   - *An isolated `HOME` for agents under the operator's uid* (a different
+     `XDG_CONFIG_HOME`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`). The agent can
+     still read the operator's real `~/.config/gh/hosts.yml` by absolute
+     path, and the macOS keychain answers any process of the same uid. Same
+     uid, no boundary.
+   - *A user-presence prompt alone.* It is a real barrier, but it breaks
+     everything unattended that runs as the operator (`landbatches.sh`-style
+     scripts, cron jobs, the release driver), and it leaves `hosts.yml`
+     tokens that `gh` stores in plain files.
+   - *Only the GitHub App, with agents still under the operator's uid.* The
+     App token would be used, but the operator's admin token would still sit
+     one `cat` away.
+
+   **Cost, honestly.**
+   - **Per host:** one more Unix user, declared in the host's nix-darwin or
+     NixOS config (g-fleet, operator-applied, never by an agent), a sudoers
+     rule for one binary, and its group membership.
+   - **Worktrees and git objects:** the agent user cannot write the
+     operator's checkout or its `.git`. Each repo therefore gets an agent-side
+     clone (`~flk-agent/repos/<owner>/<repo>`), with every agent worktree
+     cut from it, and the operator reads those through a shared group
+     (group-readable, setgid directories). That costs one more clone per repo
+     per host, and flk's worktree bookkeeping must know two roots.
+   - **Harness logins:** Claude Code and Codex logins live in the agent
+     user's own keychain and config. Each profile must be logged in once as
+     `flk-agent` (and again whenever a login expires, as on 2026-10-12,
+     g-fleet#452).
+   - **flk changes:** spawn-as-user, uid attestation, token minting, two
+     worktree roots. These are slices O19a and O19b below.
+   - **Migration:** existing delegates keep running as the operator until
+     they finish. New starts go to the agent user once O19a is live on that
+     host. A host without the agent user stays on today's cooperative model
+     and reports it (point 6).
 2. **A gate status only flk can post.** A second App, `flk-gate`, holds only
    `statuses` / `checks` write. The flk server posts `flk/land-gate` on a PR
    head SHA only when all of these hold:
@@ -999,6 +1069,22 @@ and ADR-0034 itself says nothing may rely on it for safety (§1a, §7).
    `owner.incident`, pauses that repo's owner automatically (§6.5) and
    notifies the operator. This catches an admin merge, a bypassed rule, or a
    repo where layer one could not be configured.
+
+6. **Until O19a is live on a host, these guarantees hold only for
+   cooperative agents there:**
+   - the merge gate behind owner question 5's grant (an agent with the
+     operator's token can merge with admin or edit the protection);
+   - the release gate (it can dispatch `promote.yml` and approve the
+     environment as the operator);
+   - shadow mode's "no GitHub write" for raw `gh` (§7: flk refuses its own
+     verbs, but not a raw `gh` call);
+   - every layer-two row (§6.3), which is cooperative anyway.
+
+   The server therefore **refuses a merge grant** (`limits set --merge
+   after_review_and_green`) for an owner whose host has not passed O19a's
+   self-test, and the binding and standup say "cooperative only" until it
+   has. Detection (point 5) still runs and still pauses the owner on a
+   bypass. It records the breach; it does not prevent it.
 
 **Where layer one cannot be configured.** A private repo on a plan without
 branch protection returns 403 on the protection APIs (#1167, owner comment of
@@ -1168,7 +1254,7 @@ is the first owned repo, in shadow mode, before anything is switched off.
 | `supervisor.py` `goal_check` per delegate | delegate goals (ADR-0030 §5, G1/G2) | #1034, #1035 | G2 live |
 | `supervisor.py` ctx scrape and three-phase `/compact` | episode rotation at the band (§1), status handshake (ADR-0030 §6) | O2, G5 #884 | O2 live |
 | `supervisor.py` 30 min untriaged-issue reminder | intake records (§3) from `issue.opened` | O3a, O6 | O6 live (shadow) |
-| `landbatches.sh`, `batch.sh` (`sleep 60` over `gh pr checks`) | `flk land` (#694) behind the merge gate (§6), driven by `pr.*` events | #694, O18, O19b | #694 live |
+| `landbatches.sh`, `batch.sh` (`sleep 60` over `gh pr checks`) | `flk land` (#694) behind the merge gate (§6), driven by `pr.*` events | #694, O18, O19c | #694 live |
 | `GOAL.md` | goal record (ADR-0030) plus `.flk.toml [owner]` policy and gates | G1, O0, O6 | O6 live |
 | `STATUS.md`, `HANDOFF.md`, `CONTINUE.md` | compiled layers 3–5 (ADR-0032 §1), episode status | X3, X4, X6, O2 | X10 (ADR-0032) |
 | `tasks.json`, `triage.json` | intake records plus goal subtasks | O6, G1 | O6 live |
@@ -1192,7 +1278,10 @@ is the first owned repo, in shadow mode, before anything is switched off.
   episodes as it would live, but every **outward act is replaced by a
   record of the intent** (`OwnerWouldAct { action, subject, args }`):
   - no `delegate start` and no `agent.spawn`;
-  - no GitHub write: no O4 comment, label, file or close;
+  - no GitHub write: no O4 comment, label, file or close. A raw `gh` write
+    is refused only by layer one, so before O19a is live on the host this
+    holds only for a cooperative owner (§6.3 point 6). The shadow report
+    lists any GitHub write that O3a sees from the owner's identity;
   - no `owner.request` sent;
   - no `flk land`, and `flk/land-gate` is never posted.
 
@@ -1367,7 +1456,13 @@ rather than hiding them.
   `[ax] lift_check_reviews` reviews (default 10) of agents that started
   after the lift, the report compares two things: how often that capability
   is still named missed, and how often the miner still sees the substitute.
-  The result is recorded as `LiftOutcome { moved | unchanged | worse }`. A
+  The result is recorded as `LiftOutcome { moved | unchanged | worse }`.
+  **This is a trend, not causal proof.** It compares agents started after
+  the lift with earlier ones, and anything else that changed in between can
+  move the numbers too: other lifts, a new harness version, different tasks.
+  `LiftOutcome` records the other lifts and harness changes that landed in
+  the same window, so a reader can see what confounds it, and the label is
+  only ever an input to the next decision. A
   lift that moved nothing is reported in the standup's *wishes* (§7a), and
   the next lift for the same capability must target a different discovery
   place. That stops the same unread help text from being rewritten forever.
@@ -1519,8 +1614,9 @@ the fields treats the typed block as plain text.
 | O16 | Transcript miner (§7b stage 1): `flk ax mine`, run by a server cron action, ported from `scripts/research/toolchain_survey.py`, edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised) | client-side read; new MCP resource | Fixture transcripts yield the expected fingerprints; no output text, `$HOME` path or hostname appears; sessions outside the owner's edges are not read |
 | O17 | Lift reviews (§7b stage 2): trigger kind `lift` fired by unprocessed `ax/1` Q10 `tools_missed` / Q11 `discovery_gaps` answers (primary) or a miner fingerprint over threshold; `docs/ax/rubric-lifts.md` (`ax-lifts/1`); compiled-reviewer path; target routing (help/docs, skill or CLAUDE.md line, error-message or gate-reason wording, flk issue); dry run first; `[ax] lift_reviews_per_day`; cooldown; `LiftLanded` and `LiftOutcome` from `flk ax report` trends after `lift_check_reviews` | ~380 | O16, AX1 #1091 (rubric with Q9–Q11), AX4b #1095 (trends), AX6a, AX7, AX9, O6, O8a | — | config; new kinds `LiftLanded`, `LiftOutcome` | A recorded review naming a missed `flk events wait` yields one lift candidate targeting `flk agent wait --help`, with the miner's substitute count attached; nothing is filed in dry run; after a landed lift and ten later reviews with no further mention, the outcome is `moved`; a claude-config lift is only ever an issue candidate |
 | O18 | Recorded review (§6.4): `ReviewRecorded`, `flk review record` / MCP `flock_review_record`, validity (reviewer edge `review:<pr>`, not the builder, head SHA matches the poller), `--by operator`; `flk land` (#694) requires an approve at the current head | ~300 | O3a, ADR-0027 edges, #694 | `VERDICT:` comments (replaced as the record) | new kind and verb, gated | A review recorded by the builder is refused; an approve at an old SHA does not let `flk land` proceed; a new push resets the gate |
-| O19a | Agent identity (§6.3 point 1): `flk-agent` App installation tokens minted by the server, git credential helper and `GH_TOKEN` in agent panes, refresh; the operator's token never stamped into agent panes | ~350 | O1, ADR-0014 §3 env allowlist | — | server and pane env | An owner pane's `gh api user` reports the bot; an attempt to edit branch protection from it is refused by GitHub (fixture or sandbox repo); the token rotates before expiry |
-| O19b | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
+| O19a | **Agent Unix user** (§6.3 point 1, #1177): `flk agent-exec` launcher run as `flk-agent` through a one-binary sudoers rule (systemd `User=` on NixOS); socket group access; uid attestation (`getpeereid` / `SO_PEERCRED`), so a `flk-agent` caller is never the operator; agent-side clone per repo and worktrees from it with a shared read group; `flk owner bind` self-test; host user and sudoers declared in g-fleet (an issue there, operator-applied) | ~380 | O1, O11a, a g-fleet host change | ADR-0014 operator attestation (amends, §11) | server-internal; a host without the user reports "cooperative only" | **From an agent pane:** reading the operator's `~/.config/gh/hosts.yml` fails with permission denied; `security find-internet-password -s github.com` finds nothing in the operator's keychain; `gh auth status` shows no operator login; a `setsid` child calling `flk owner limits set` exits 13; the agent's worktree commits and pushes through its own clone |
+| O19b | **Agent GitHub identity:** `flk-agent` App installation tokens minted by the operator's server (key never readable by `flk-agent`), git credential helper and `GH_TOKEN` in agent processes, refresh before expiry, per-repo `actions` write only when the binding grants it | ~300 | O19a | — | server and process env | From an agent pane, `gh api user` shows `flk-agent[bot]`; `gh api -X PUT …/branches/dev/protection` is refused by GitHub (403); `gh workflow run promote.yml` is refused; the token rotates before expiry |
+| O19c | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O19b, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
 | O20 | Command-gate rows (§6.3 layer two): the default `owner` and `delegate` rows, seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
 | O21 | ADR-0014 §5 amendment: depth counts only spawn-capable agents; `ax:` in-place forks are exempt from depth but count toward fanout and capacity | ~80 | ADR-0033 AX3 | ADR-0014 §5 (amends) | server-internal | A builder under a segment architect is forked for its AX review; a spawn-capable agent at that depth is still refused |
 
@@ -1530,7 +1626,7 @@ the fields treats the typed block as plain text.
 3. **Episodes and intake:** O2, after G1 and ADR-0032 X1/X3/X4 → O5a → O5b → O6.
 4. **Limits before any owner runs:** O11a → O11b.
 5. **Shadow:** O12 starts on gerchowl/flock.
-6. **Before the owner goes `live` with any merge grant:** O18 → O19a → O19b. That is layer one. Without it, the merge gate stays `ask` (§6.3). O20 may land at any point after ADR-0034 Q3 and O11a.
+6. **Before the owner goes `live` with any merge grant:** O18 → O19a → O19b → O19c. The server refuses the grant until the host passes O19a's self-test (§6.3 point 6). That is layer one. Without it, the merge gate stays `ask` (§6.3). O20 may land at any point after ADR-0034 Q3 and O11a.
 7. **Then:** O7 → O8a → O8b → O9 → O10 → O13.
 
 Also:
@@ -1579,6 +1675,12 @@ integration branches against a direct queue) stays #1167's and gates O14.
   token never enters an agent pane. Two GitHub Apps and a credential helper
   are new operational cost. A repo without branch protection cannot grant
   an owner merge authority.
+- **Agents stop running as the operator** (#1177). A separate `flk-agent`
+  Unix user and a scoped App identity make the merge, release and shadow
+  guarantees hold against a non-cooperative agent. They also give the
+  operator boundary a uid, closing ADR-0014's detached-child gap. Until O19a
+  is live on a host, those guarantees are cooperative only there, and no
+  owner there gets a merge grant.
 - **The owner cannot raise its own limits.** Authority is binding state set
   by operator verbs. The repo's `[owner]` section holds behaviour only and
   takes effect on operator adoption.
@@ -1604,8 +1706,14 @@ integration branches against a direct queue) stays #1167's and gates O14.
   detection records its use (§6.3 point 5).
 - **ADR-0014's operator-attestation gap** (a detached child attests as the
   operator) lets a determined agent call operator verbs, including `limits
-  set`. Every such change is loud (§6.2), and layer one still needs a
-  recorded review at the head. Closing the gap itself is ADR-0014's work.
+  set`, on a host where O19a is not yet live. There every such change is loud
+  (§6.2), and layer one still needs a recorded review at the head. O19a's
+  uid attestation closes it.
+- **Before O19a, agents hold the operator's credentials** (#1177). On such
+  a host the merge, release and shadow guarantees are cooperative only
+  (§6.3 point 6), and the server refuses a merge grant there. A host that
+  stays on the cooperative model is reported in the binding and the
+  standup.
 - **Fresh-episode amnesia.** Anything not recorded is lost at rotation. The
   status handshake is mandatory before every hibernate and rotation, and the
   shadow run measures what was missed.
@@ -1645,7 +1753,7 @@ integration branches against a direct queue) stays #1167's and gates O14.
 - **Two-node mesh test** for O7, O8a and O8b: request, accept, issue filed by the
   target, watch fires, `done`. Plus the cycle refusal for a request whose
   sender omitted its history.
-- **Sandbox GitHub repo for layer one** (O19b): the required `flk/land-gate`
+- **Sandbox GitHub repo for layer one** (O19c): the required `flk/land-gate`
   from the gate App, a merge refused without a recorded approve, accepted
   with one, refused again after a new push. A status forged with another
   token does not count. An admin merge raises an incident.
@@ -1736,10 +1844,24 @@ integration branches against a direct queue) stays #1167's and gates O14.
 23. **Shadow width (§7).** Whole owner: no delegate start, no GitHub write,
     no request, no merge, with every intent recorded (recommended). Or
     intake-only shadow.
-24. **Agent identity (§6.3 point 1).** A `flk-agent` GitHub App for every
-    agent, with the operator's admin token kept out of agent panes
-    (recommended). Or keep agents on the operator's token, which leaves
-    layer one bypassable by any agent.
+24. **Agent identity (§6.3 point 1, #1177).** Recommended: every owner,
+    segment architect, builder and reviewer runs as a **separate Unix user**
+    (`flk-agent`) with its own `HOME` and keychain and no access to the
+    operator's `hosts.yml` or keychain. It uses a scoped `flk-agent` GitHub
+    App identity (no admin, no workflow dispatch unless granted), and the
+    operator's own token sits behind a user-presence keychain prompt as
+    defence in depth.
+    - **Cost:** a host user per machine in g-fleet, a one-binary sudoers
+      rule, an agent-side clone per repo with a shared read group, harness
+      logins repeated as that user, flk spawn-as-user and uid attestation
+      (O19a, O19b), and a migration in which running delegates finish as
+      the operator.
+    - **Rejected:** an isolated `HOME` under the same uid (not a boundary);
+      a prompt-only scheme (breaks unattended scripts); the App alone under
+      the operator's uid (the admin token stays one `cat` away).
+    - Until O19a is live on a host, the merge, release and shadow guarantees
+      hold only for cooperative agents there (§6.3 point 6), and no owner on
+      that host gets a merge grant.
 
 ## 11. Amendments this ADR asks for
 
@@ -1751,6 +1873,17 @@ Each needs the owner's acceptance together with this ADR.
 - **ADR-0014 §5** (§1a, question 20): the depth limit counts spawn-capable
   agents only. `ax:` in-place forks count toward fanout and capacity, not
   depth.
+- **ADR-0033 §2** (§7b): the `ax/1` rubric, which ADR-0033 lists as Q1–Q8,
+  gains Q9 `tools_helped`, Q10 `tools_missed` and Q11 `discovery_gaps` on
+  both the architect and builder sides (owner addition, 2026-10-12, #1091
+  comment). There is no version bump, because AX1 has not shipped. ADR-0033
+  is Accepted, so this is an amendment and needs the owner's acceptance like
+  the others.
+- **ADR-0014, the operator boundary** (§6.3 point 1, question 24): once O19a
+  is live on a host, "operator" means a caller running as the operator's
+  uid with no pane in its ancestry. A caller running as `flk-agent` is never
+  the operator, which closes the detached-child gap that ADR-0027 §1a
+  records.
 - **ADR-0034: none.** This ADR uses ADR-0034's command gate (§1a), mid-turn
   notice (§1b) and `ask_operator` routing (§2–§5) as decided there, and
   supplies only their policy: the gate rows (§6.3) and which items are
