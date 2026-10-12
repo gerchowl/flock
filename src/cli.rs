@@ -21,6 +21,7 @@ pub(crate) mod delegate_list;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;
+mod events;
 pub(crate) mod exit;
 mod fleet;
 mod help;
@@ -174,6 +175,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "preflight" => preflight::run_preflight_command(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
+        "events" => events::run_events_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,

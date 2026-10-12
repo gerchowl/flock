@@ -1,0 +1,1 @@
+- The socket API's error codes come from one table, each with a retry class that says whether running the call again is safe (#1017). Codes and exit values are unchanged.

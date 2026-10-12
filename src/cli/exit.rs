@@ -178,12 +178,13 @@ pub(crate) mod tests {
     }
 
     /// Bare `Ok(<n>)` returns in the CLI that predate the registry, per file.
-    /// They all carry registered values. A count may only go down: lower it
-    /// when you replace one with a named code, and never raise it. A file
-    /// missing from this list may hold none.
+    /// They all carry registered values. A count above its pin fails, and so
+    /// does any bare return in a file missing from this list. A count below its
+    /// pin only prints a reminder to lower it, so a branch that removes some
+    /// does not break the others in flight.
     const GRANDFATHERED_BARE_CLI_RETURNS: &[(&str, usize)] = &[
         ("src/cli.rs", 72),
-        ("src/cli/agent.rs", 61),
+        ("src/cli/agent.rs", 60),
         ("src/cli/checks.rs", 8),
         ("src/cli/delegate.rs", 5),
         ("src/cli/digest.rs", 6),
@@ -248,15 +249,31 @@ pub(crate) mod tests {
             offences.is_empty(),
             "use a cli::exit constant: {offences:#?}"
         );
-        bare_cli_returns.sort();
-        let expected: Vec<(String, usize)> = GRANDFATHERED_BARE_CLI_RETURNS
-            .iter()
-            .map(|(path, count)| (path.to_string(), *count))
-            .collect();
-        assert_eq!(
-            bare_cli_returns, expected,
-            "bare Ok(<n>) exit returns per file in src/cli changed: use a cli::exit \
-             constant, and lower the grandfathered count when you remove one"
+        // Only a rise fails: a sibling change that removes a bare return must
+        // not break every other branch. A drop prints a reminder to lower the pin.
+        let mut grown = Vec::new();
+        for (path, count) in &bare_cli_returns {
+            let pinned = GRANDFATHERED_BARE_CLI_RETURNS
+                .iter()
+                .find(|(pinned_path, _)| pinned_path == path)
+                .map_or(0, |(_, pinned)| *pinned);
+            if *count > pinned {
+                grown.push(format!("{path}: {count} bare Ok(<n>), pinned {pinned}"));
+            } else if *count < pinned {
+                eprintln!(
+                    "reminder: {path} is down to {count} bare Ok(<n>), lower its pin from {pinned}"
+                );
+            }
+        }
+        for (path, pinned) in GRANDFATHERED_BARE_CLI_RETURNS {
+            if !bare_cli_returns.iter().any(|(p, _)| p == path) {
+                eprintln!("reminder: {path} has no bare Ok(<n>) left, drop its pin of {pinned}");
+            }
+        }
+        assert!(
+            grown.is_empty(),
+            "bare Ok(<n>) exit returns grew in src/cli: use a cli::exit constant \
+             instead: {grown:#?}"
         );
     }
 }

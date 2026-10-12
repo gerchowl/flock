@@ -26,9 +26,9 @@
 use serde_json::{json, Value};
 
 use crate::api::schema::{
-    AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams, LineageParams,
-    MessageTarget, Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams,
-    ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
+    AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
+    EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
+    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -413,6 +413,23 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_agent_result,
             build: build_agent_result,
         },
+        Tool {
+            name: "flock_events_read",
+            description: "Read the server's durable event log from a cursor \
+                          you hold (ADR-0028): every event with `seq > after`, \
+                          oldest first, filtered by `kinds` and `subjects` (a \
+                          pane, workspace, agent or message id in the event's \
+                          data). Resume from `next_after`, dedupe on `seq`. A \
+                          `gap` means the cursor is older than what is \
+                          retained. With `wait_ms` the call BLOCKS this MCP \
+                          session until a matching event lands (at most 9 \
+                          min); to wait longer, run `flk events wait` as a \
+                          background task. Use it instead of polling \
+                          `flock_agent_get`. Refusals: `invalid_params` (a \
+                          non-durable kind), `cursor_ahead`.",
+            input_schema: schema_events_read,
+            build: build_events_read,
+        },
     ]
 }
 
@@ -657,6 +674,20 @@ fn schema_msg_send() -> Value {
             },
         },
         "required": ["to", "body", "intent"],
+        "additionalProperties": false,
+    })
+}
+
+fn schema_events_read() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "after": {"type": "integer", "minimum": 0, "description": "Return events with `seq` above this; 0 reads from the oldest retained."},
+            "kinds": {"type": "array", "items": {"type": "string"}, "description": "Durable event kinds, e.g. `message_queued`; empty means all."},
+            "subjects": {"type": "array", "items": {"type": "string"}, "description": "Ids an event's data must carry as a top-level value."},
+            "limit": {"type": "integer", "minimum": 1, "description": "At most this many events (default 256)."},
+            "wait_ms": {"type": "integer", "minimum": 0, "description": "Hold the call until a matching event lands, in ms (capped at 540000). Blocks this MCP session."},
+        },
         "additionalProperties": false,
     })
 }
@@ -1057,6 +1088,16 @@ fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
             ),
         },
     ))
+}
+
+/// Ceiling of `flock_events_read`'s hold, below the 600 s MCP tool timeout.
+const MCP_EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+
+fn build_events_read(args: Value) -> Result<Method, McpError> {
+    let mut params: EventsReadParams = serde_json::from_value(args)
+        .map_err(|err| McpError::invalid_params(format!("invalid events.read arguments: {err}")))?;
+    params.wait_ms = params.wait_ms.map(|ms| ms.min(MCP_EVENTS_READ_MAX_WAIT_MS));
+    Ok(Method::EventsRead(params))
 }
 
 /// `word` as one POSIX shell word: as-is when it is plainly safe, single-quoted
@@ -1509,6 +1550,22 @@ mod tests {
         assert_eq!(params.self_submit_confirmed, Some(false));
     }
 
+    /// #1029: the hold stays below the MCP tool timeout, and a kind the
+    /// server does not know is refused before the call goes out.
+    #[test]
+    fn events_read_caps_its_hold_below_the_tool_timeout() {
+        let Method::EventsRead(params) = build_events_read(json!({
+            "after": 4, "kinds": ["message_queued"], "subjects": ["ws_1:p1"], "wait_ms": 3_600_000
+        }))
+        .unwrap() else {
+            panic!("expected events.read");
+        };
+        assert_eq!(params.after, 4);
+        assert_eq!(params.subjects, ["ws_1:p1"]);
+        assert_eq!(params.wait_ms, Some(MCP_EVENTS_READ_MAX_WAIT_MS));
+        assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
+    }
+
     #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
@@ -1539,6 +1596,7 @@ mod tests {
                 "flock_agent_start",
                 "flock_agent_history",
                 "flock_agent_result",
+                "flock_events_read",
             ]
         );
     }
