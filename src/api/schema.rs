@@ -217,6 +217,8 @@ pub enum Method {
     EventsWait(EventsWaitParams),
     #[serde(rename = "events.read")]
     EventsRead(EventsReadParams),
+    #[serde(rename = "channel.hello")]
+    ChannelHello(ChannelHelloParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -404,6 +406,7 @@ impl Method {
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
+            | Self::ChannelHello(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2104,6 +2107,15 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
+/// `channel.hello` (ADR-0028 §8, #1037): a channel adapter's first call,
+/// proving it holds the binding's capability token. Gated as state-changing
+/// (#868) so an adapter refuses to start against a server without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHelloParams {
+    pub binding: String,
+    pub token: crate::channels::ChannelToken,
+}
+
 /// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
 pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
 pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
@@ -2283,6 +2295,18 @@ pub enum EventKind {
     /// ADR-0018 §3: a muted recipient answered a waiting message with an
     /// automatic deferral. See `EventData::MessageDeferred`.
     MessageDeferred,
+    /// ADR-0030 §1 / ADR-0031: an agent's goal record. Every change to a
+    /// goal is one of these durable kinds, and the live record is their fold
+    /// (`app::goals::GoalIndex`). See the matching `EventData` variants.
+    GoalArmed,
+    GoalAmended,
+    GoalStatusSet,
+    GoalSubtaskChanged,
+    GoalVerdict,
+    GoalMet,
+    GoalPaused,
+    GoalResumed,
+    GoalDisarmed,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -2361,6 +2385,15 @@ impl EventKind {
             | Self::AgentRemoved
             | Self::AgentForked
             | Self::AgentDelegated
+            | Self::GoalArmed
+            | Self::GoalAmended
+            | Self::GoalStatusSet
+            | Self::GoalSubtaskChanged
+            | Self::GoalVerdict
+            | Self::GoalMet
+            | Self::GoalPaused
+            | Self::GoalResumed
+            | Self::GoalDisarmed
             | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
@@ -2810,6 +2843,13 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// `channel.hello`: the binding the token unlocked, never the token.
+    ChannelHello {
+        binding: String,
+        owner_node: String,
+        target: crate::channels::ChannelTarget,
+        scopes: Vec<crate::channels::ChannelScope>,
     },
     /// #576: how a `msg.wait_reply` ended.
     MsgReplyAwaited {
@@ -3432,6 +3472,65 @@ pub struct EventEnvelope {
     pub data: EventData,
 }
 
+/// An agent's goal as the server holds it (ADR-0030 §1). It is a fold over
+/// the `Goal*` events and keeps only what must survive a restart: verdict
+/// history stays in the log, the record keeps the latest verdict.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalRecord {
+    pub goal: String,
+    /// The frozen check commands of the done gate (rung 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks: Vec<GoalSubtask>,
+    /// Present while paused. `until_ms` absent means until resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<GoalPause>,
+    #[serde(default)]
+    pub met: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verdict: Option<GoalVerdictRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPause {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+}
+
+/// One checklist item. `owner` is the delegate `AgentId` working on it, which
+/// is what parks an architect on its edges (ADR-0030 §2, rung 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSubtask {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// A stop decision. Later slices add optional fields (judge scores, G3c),
+/// which an older reader ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalVerdictRecord {
+    pub decision: GoalDecision,
+    /// The ladder rung that decided (ADR-0030 §2, 1 to 8).
+    pub rung: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalDecision {
+    Allow,
+    Parked,
+    Block,
+}
+
 /// Which verb produced an `AgentDelegated` edge (#959).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3806,6 +3905,60 @@ pub enum EventData {
         label: Option<String>,
         #[serde(default)]
         reissued: bool,
+    },
+    /// ADR-0030 §1: a goal was armed for `agent_id` (an `AgentId`, never a
+    /// pane). `record` is the whole record: a fresh arm carries the goal and
+    /// its checks, and the copy re-issued on every server start and log
+    /// rotation (ADR-0031 §4, `reissued: true`) carries everything the fold
+    /// knew, so the fold replaces the record either way.
+    GoalArmed {
+        agent_id: String,
+        record: GoalRecord,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// The goal text and its frozen checks were replaced.
+    GoalAmended {
+        agent_id: String,
+        goal: String,
+        #[serde(default)]
+        checks: Vec<String>,
+    },
+    /// The agent recorded its current status (ADR-0030 §6).
+    GoalStatusSet {
+        agent_id: String,
+        status: String,
+    },
+    /// One checklist item was added or changed, keyed by `subtask.id`.
+    GoalSubtaskChanged {
+        agent_id: String,
+        subtask: GoalSubtask,
+    },
+    /// The server decided a stop (ADR-0030 §2). The record keeps the latest.
+    GoalVerdict {
+        agent_id: String,
+        verdict: GoalVerdictRecord,
+    },
+    /// The done gate passed. The record stays, marked met, and is no longer
+    /// re-issued.
+    GoalMet {
+        agent_id: String,
+    },
+    /// Stops are allowed until `until_ms` (Unix ms), or until `GoalResumed`
+    /// when absent.
+    GoalPaused {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<u64>,
+    },
+    GoalResumed {
+        agent_id: String,
+    },
+    /// The goal was stopped, or its agent was removed. The record is dropped.
+    GoalDisarmed {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AgentHibernated {
         pane_id: String,

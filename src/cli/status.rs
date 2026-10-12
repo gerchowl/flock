@@ -54,7 +54,7 @@ fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
     }
 
     match args.first().map(|arg| arg.as_str()) {
-        None => Some((StatusScope::Full, false)),
+        None => Some((StatusScope::Full, super::output::json())),
         Some("--json") if args.len() == 1 => Some((StatusScope::Full, true)),
         Some("server") => {
             parse_status_scope_args(args, StatusScope::Server, "flk status server [--json]")
@@ -75,7 +75,7 @@ fn parse_status_scope_args(
     usage: &str,
 ) -> Option<(StatusScope, bool)> {
     match args.get(1).map(|arg| arg.as_str()) {
-        None => Some((scope, false)),
+        None => Some((scope, super::output::json())),
         Some("--json") if args.len() == 2 => Some((scope, true)),
         _ => {
             eprintln!("usage: {usage}");

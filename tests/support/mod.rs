@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod fleet;
 pub mod process_table;
+pub mod scripted;
 pub mod timing;
 
 pub mod environment;
@@ -204,7 +205,7 @@ pub fn frame_message(payload: &[u8]) -> Vec<u8> {
 /// means a protocol bump touches one line rather than the dozen call sites
 /// that used to hardcode the number — which is how a bump used to fail a
 /// terminal-size test for reasons that had nothing to do with terminal sizes.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// The live-handoff refusal notice a server sends a connecting client while a
 /// live update is in flight (#38). A client that reads it opens its retry

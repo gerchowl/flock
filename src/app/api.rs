@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+mod channels;
 mod checks;
 mod delegates;
 mod digest;
@@ -1482,6 +1483,7 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),

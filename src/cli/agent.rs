@@ -691,8 +691,7 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 
     let response = resolve_agent_target(&target, "cli:agent:attach:resolve")?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let Some(terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
         eprintln!("agent attach failed: response did not include terminal_id");
@@ -815,8 +814,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     if ready {
         let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
         if response.get("error").is_some() {
-            eprintln!("{}", serde_json::to_string(&response).unwrap());
-            return Ok(1);
+            return Ok(super::output::error(&response, super::exit::FAILURE));
         }
         let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
             eprintln!("agent wait failed: response did not include pane_id");
@@ -848,8 +846,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 
     let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
         eprintln!("agent wait failed: response did not include pane_id");
