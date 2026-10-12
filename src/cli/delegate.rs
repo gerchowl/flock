@@ -801,6 +801,14 @@ struct Entry {
     agent_id: Option<String>,
 }
 
+impl Entry {
+    /// A start the server refused to give an agent, kept by
+    /// `--keep-on-failure` (#938): a workspace with no agent terminal.
+    fn never_started(&self) -> bool {
+        self.terminal_id.is_empty()
+    }
+}
+
 /// The directory holding this server's delegates: one file per name, under the
 /// process's own state dir.
 ///
@@ -2864,11 +2872,18 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             return Ok(emit_submit_gone(&entry, flags.json));
         }
         if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            eprintln!(
+            let reason = format!(
                 "delegate {name}: brief submission could not be confirmed: {reason}. \
                  Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
             );
-            print_pane_tail(name, &pane_id);
+            eprintln!("{reason}");
+            let text = read_pane_tail(&pane_id).unwrap_or_default();
+            if let Some(block) = tail_block(name, &text) {
+                eprint!("{block}");
+            }
+            if flags.json {
+                emit_start_failed(&entry, Some(&reason), true, &text);
+            }
             return Ok(1);
         }
         if matches!(reason, SubmitFailure::Refused(_)) {
@@ -2965,17 +2980,7 @@ fn fail_started(
             }
         };
     if flags.json && screen.is_none() && !entry.pane_id.is_empty() {
-        println!(
-            "{}",
-            serde_json::json!({
-                "name": name,
-                "outcome": "start_failed",
-                "reason": reason,
-                "kept": kept,
-                "pane_id": entry.pane_id,
-                "data": { "pane_tail": tail_lines(text) },
-            })
-        );
+        emit_start_failed(entry, reason, kept, text);
     }
     if kept {
         eprintln!(
@@ -2991,14 +2996,21 @@ fn fail_started(
     1
 }
 
-/// Print the agent pane's last lines on stderr, when the pane still answers.
-fn print_pane_tail(name: &str, pane_id: &str) {
-    if let Some(block) = read_pane_tail(pane_id)
-        .as_deref()
-        .and_then(|text| tail_block(name, text))
-    {
-        eprint!("{block}");
-    }
+/// The `start_failed` outcome `--json` prints for a start that failed once its
+/// agent existed: the reason, whether it was kept, and the pane's last lines
+/// as `data.pane_tail` (#938).
+fn emit_start_failed(entry: &Entry, reason: Option<&str>, kept: bool, pane_text: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "name": entry.name,
+            "outcome": "start_failed",
+            "reason": reason,
+            "kept": kept,
+            "pane_id": entry.pane_id,
+            "data": { "pane_tail": tail_lines(pane_text) },
+        })
+    );
 }
 
 /// One short, bounded read of the agent pane's recent buffer.
@@ -4198,7 +4210,9 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     };
     // `agent_record`, not `_opt`: an unreachable server is a FAILURE, never
     // a cheerful "unknown" at exit 0 (W13 / G5).
-    let record = if gone {
+    let record = if entry.never_started() {
+        serde_json::json!({ "agent_status": "not_started" })
+    } else if gone {
         serde_json::json!({ "agent_status": Outcome::Gone.as_str() })
     } else {
         match agent_record(&entry.terminal_id, None) {
@@ -4346,6 +4360,15 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
     let Some(entry) = read_entry(name) else {
         return Err(RequireFailure::NotDelegate);
     };
+    // A start the server refused to give an agent, kept by `--keep-on-failure`
+    // (#938): there is no terminal to ask about, and no agent to wait on.
+    if entry.never_started() {
+        eprintln!(
+            "delegate {name}: its agent never started (the server refused it); \
+             `flk delegate reap {name}` removes the kept workspace"
+        );
+        return Ok(Recorded::Gone(entry));
+    }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
     let terminal_id = entry.terminal_id.clone();

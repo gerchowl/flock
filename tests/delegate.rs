@@ -2081,6 +2081,95 @@ fn a19_keep_on_failure_keeps_the_checkout_of_a_failed_worktree_start() {
     assert!(!entry(&server), "reap removes the record");
 }
 
+/// #938: a start whose `agent.start` the server refuses (here a profile
+/// selector naming a directory that does not exist) keeps its workspace and
+/// checkout under `--keep-on-failure`. The kept delegate has no agent:
+/// `status` says `not_started`, `send` refuses as gone, and `reap` removes the
+/// workspace and the checkout.
+#[test]
+fn a19_keep_on_failure_keeps_a_worktree_whose_agent_the_server_refused() {
+    let server = start_server_with(false, "\n[spawn.env]\nopencode = [\"FLEET_PROFILE\"]\n");
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let repo_s = repo.to_string_lossy().into_owned();
+    let b = brief(&server, "task.md", "x\n");
+    let out = command(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "w3",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            &repo_s,
+            "--branch",
+            "feat/p938-refused",
+            "--keep-on-failure",
+            "--json",
+        ],
+    )
+    .env("FLEET_PROFILE", server.base.join("no-such-profile"))
+    .output()
+    .unwrap();
+    let message = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{message}");
+    assert!(message.contains("could not start the agent"), "{message}");
+    assert!(
+        message.contains("kept for inspection (--keep-on-failure)"),
+        "{message}"
+    );
+    assert!(
+        stdout(&out).is_empty(),
+        "a refused server call prints nothing on stdout"
+    );
+    assert!(read_lines(&server.base.join("argv.log")).is_empty());
+    assert!(
+        !walk(&server.base.join("wt")).is_empty(),
+        "the checkout stays: {message}"
+    );
+
+    let status = cli(&server, &["delegate", "status", "w3", "--json"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    assert_eq!(stdout_json(&status)["agent_status"], "not_started");
+    assert!(
+        stderr(&status).contains("its agent never started"),
+        "{}",
+        stderr(&status)
+    );
+
+    let send = cli(
+        &server,
+        &["delegate", "send", "w3", "--brief", &b, "--json"],
+    );
+    assert_ne!(send.status.code(), Some(0), "{}", stderr(&send));
+    assert_eq!(stdout_json(&send)["outcome"], "gone");
+    assert!(read_lines(&server.base.join("typed.log")).is_empty());
+
+    let reaped = cli(&server, &["delegate", "reap", "w3", "--json"]);
+    assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
+    // The kept workspace closes; the repository's parent workspace is left
+    // open, as for any reaped worktree delegate.
+    let reaped = stdout_json(&reaped);
+    assert_eq!(reaped["workspace_closed"], true, "{reaped}");
+    assert_eq!(reaped["checkout_removed"], true, "{reaped}");
+    let kept = reaped["workspace_id"].as_str().expect("workspace id");
+    assert!(
+        !workspaces(&server)
+            .iter()
+            .any(|ws| ws["workspace_id"] == kept),
+        "reap removes the kept workspace"
+    );
+    let leftovers = walk(&server.base.join("wt"));
+    assert!(
+        leftovers.is_empty(),
+        "reap removes the checkout: {leftovers:?}"
+    );
+    let after = cli(&server, &["delegate", "status", "w3"]);
+    assert_eq!(after.status.code(), Some(2), "{}", stderr(&after));
+}
+
 /// A process exists before its first screen paint, so that alone is not ready.
 #[test]
 fn a20_start_waits_for_the_first_screen_paint() {
@@ -2150,6 +2239,11 @@ fn opencode_start_fails_loudly_when_startup_discards_brief() {
         "{}",
         stderr(&out)
     );
+    // #938: the kept start is an outcome under `--json`, with the pane's lines.
+    let json = stdout_json(&out);
+    assert_eq!(json["outcome"], "start_failed", "{json}");
+    assert_eq!(json["kept"], true, "{json}");
+    assert!(json["data"]["pane_tail"].is_array(), "{json}");
     assert!(!server.base.join("typed.log").exists());
     assert_eq!(workspaces(&server).len(), before + 1);
     assert!(walk(&server.base.join("state"))
