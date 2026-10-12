@@ -1,0 +1,230 @@
+//! E2E (#1024): the error envelope of ADR-0029 §4 and the global `--format`
+//! of §3, through the real `flk` binary against a scripted socket. Under
+//! `--json` / `--format json` an error is one JSON document on stdout, with the
+//! retry class and exit status from the registries, and one human line on
+//! stderr. Without them nothing changes: stdout stays empty and stderr holds
+//! the one line it always held.
+
+// Integration tests drive the compiled binary through raw Command; the
+// TracedCommand funnel polices flock's own subprocesses, not the harness's.
+#![allow(clippy::disallowed_methods)]
+
+mod support;
+
+use std::path::PathBuf;
+use std::process::Output;
+
+use serde_json::{json, Value};
+use support::scripted::{flk, scripted_server};
+
+fn not_found(_: &str) -> Value {
+    json!({"error":{"code":"agent_not_found","message":"agent target nosuch not found"}})
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// stdout is exactly one JSON document (a trailing human line would fail to
+/// parse), the exit status is `exit`, and the envelope says the same.
+fn envelope(output: &Output, exit: i32) -> Value {
+    let stderr = stderr(output);
+    assert_eq!(output.status.code(), Some(exit), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout is not one JSON document ({err}): {stdout:?}"));
+    assert_eq!(value["error"]["exit"], exit, "{value}");
+    value
+}
+
+/// The human line under machine output: exactly one stderr line naming the
+/// code, besides any registered notice.
+fn one_human_line(output: &Output, code: &str) {
+    let stderr = stderr(output);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("note: exit code"))
+        .collect();
+    assert_eq!(lines.len(), 1, "stderr: {stderr}");
+    assert!(
+        lines[0].starts_with(&format!("error: {code}: ")),
+        "{stderr}"
+    );
+}
+
+/// The issue's acceptance: `flk agent get nosuch --json` parses, and exits with
+/// the code the registries assign `agent_not_found` on dev (1: the not-found
+/// mapping to 4 of ADR-0029 §2 is not in the registry yet).
+#[test]
+fn agent_get_nosuch_json_is_an_envelope_on_stdout() {
+    let (socket, _server) = scripted_server("envelope-agent", not_found);
+    let output = flk(&socket, &["agent", "get", "nosuch", "--json"]);
+    let value = envelope(&output, 1);
+    assert_eq!(
+        value["error"],
+        json!({"code": "agent_not_found", "message": "agent target nosuch not found",
+               "retry": "never", "exit": 1}),
+        "{value}"
+    );
+    assert_eq!(value["id"], "cli:agent:get");
+    one_human_line(&output, "agent_not_found");
+}
+
+/// Without machine output: nothing on stdout, and the one stderr line the
+/// verb always printed.
+#[test]
+fn plain_agent_get_nosuch_prints_one_line_on_stderr() {
+    let (socket, _server) = scripted_server("envelope-plain", not_found);
+    for args in [
+        &["agent", "get", "nosuch"][..],
+        &["agent", "get", "nosuch", "--format", "text"],
+    ] {
+        let output = flk(&socket, args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = stderr(&output);
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+        let line: Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(line["error"]["code"], "agent_not_found");
+        assert!(line["error"].get("exit").is_none(), "unchanged: {line}");
+    }
+}
+
+/// `--format json` is the same flag as `--json`, before or after the verb.
+#[test]
+fn format_json_is_global_in_any_position() {
+    let (socket, _server) = scripted_server("envelope-format", not_found);
+    for args in [
+        &["--format", "json", "agent", "get", "nosuch"][..],
+        &["agent", "get", "--format=json", "nosuch"],
+        &["--json", "agent", "get", "nosuch"],
+    ] {
+        let output = flk(&socket, args);
+        assert_eq!(envelope(&output, 1)["error"]["code"], "agent_not_found");
+    }
+    let bad = flk(&socket, &["agent", "get", "nosuch", "--format", "yaml"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(bad.stdout.is_empty());
+}
+
+/// `pane read` prints the bare `error` object without machine output; under
+/// `--json` it is the envelope, and its own `--format text` stays its own.
+#[test]
+fn pane_read_error_is_an_envelope() {
+    fn gone(_: &str) -> Value {
+        json!({"error":{"code":"pane_not_found","message":"no pane 9-9"}})
+    }
+    let (socket, _server) = scripted_server("envelope-pane", gone);
+    let output = flk(
+        &socket,
+        &["pane", "read", "9-9", "--format", "text", "--json"],
+    );
+    let value = envelope(&output, 1);
+    assert_eq!(value["error"]["code"], "pane_not_found");
+    assert_eq!(value["error"]["retry"], "never");
+    one_human_line(&output, "pane_not_found");
+
+    let plain = flk(&socket, &["pane", "read", "9-9"]);
+    assert!(plain.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&plain.stderr).unwrap(),
+        json!({"code": "pane_not_found", "message": "no pane 9-9"})
+    );
+}
+
+/// A guarded verb's refusal: exit 10 with the `later` class, the moved-code
+/// notice on stderr and never on stdout.
+#[test]
+fn a_guarded_pane_refusal_is_an_envelope_with_exit_10() {
+    fn refuse(_: &str) -> Value {
+        json!({"error":{"code":"not_settled","message":"agent is working"}})
+    }
+    let (socket, _server) = scripted_server("envelope-refused", refuse);
+    let output = flk(
+        &socket,
+        &["pane", "run", "1-1", "--if-input-empty", "hi", "--json"],
+    );
+    let value = envelope(&output, 10);
+    assert_eq!(value["error"]["retry"], "later");
+    one_human_line(&output, "not_settled");
+    assert!(stderr(&output).contains("note: exit code is now 10 (was 1)"));
+}
+
+/// `msg send` and its `--await` form: a refused send is the envelope.
+#[test]
+fn msg_send_error_is_an_envelope() {
+    fn unknown(_: &str) -> Value {
+        json!({"error":{"code":"msg_target_not_found","message":"no agent w9"}})
+    }
+    let (socket, _server) = scripted_server("envelope-msg", unknown);
+    for args in [
+        &["msg", "send", "w9", "hi", "--json"][..],
+        &[
+            "msg",
+            "send",
+            "w9",
+            "hi",
+            "--intent",
+            "needs-reply",
+            "--await",
+            "--json",
+        ],
+    ] {
+        let output = flk(&socket, args);
+        let value = envelope(&output, 1);
+        assert_eq!(value["error"]["code"], "msg_target_not_found", "{args:?}");
+        assert_eq!(value["error"]["retry"], "never", "{args:?}");
+        one_human_line(&output, "msg_target_not_found");
+    }
+}
+
+/// A delegate usage error (`not a delegate`) is `invalid_params`, exit 2.
+#[test]
+fn delegate_not_a_delegate_is_an_envelope() {
+    fn unused(_: &str) -> Value {
+        json!({"error":{"code":"internal_error","message":"unexpected call"}})
+    }
+    let (socket, _server) = scripted_server("envelope-delegate", unused);
+    let output = flk(&socket, &["delegate", "status", "nosuch", "--json"]);
+    let value = envelope(&output, 2);
+    assert_eq!(value["error"]["code"], "invalid_params");
+    assert_eq!(value["error"]["message"], "not a delegate: nosuch");
+    assert_eq!(value["error"]["retry"], "never");
+    one_human_line(&output, "invalid_params");
+
+    let plain = flk(&socket, &["delegate", "status", "nosuch"]);
+    assert_eq!(plain.status.code(), Some(2));
+    assert!(plain.stdout.is_empty());
+    assert_eq!(stderr(&plain).trim(), "not a delegate: nosuch");
+}
+
+/// No server at all: the io error is a `transport` envelope, exit 1.
+#[test]
+fn an_unreachable_server_is_a_transport_envelope() {
+    let socket = PathBuf::from(format!("/tmp/flk1024-none-{}.sock", std::process::id()));
+    let output = flk(&socket, &["agent", "get", "w1", "--json"]);
+    let value = envelope(&output, 1);
+    assert_eq!(value["error"]["code"], "transport", "{value}");
+    assert_eq!(value["error"]["retry"], "maybe");
+    one_human_line(&output, "transport");
+}
+
+/// An effect failure is a result: under `--json` it is the stdout document.
+#[test]
+fn an_unconfirmed_send_is_the_stdout_document_under_json() {
+    fn unconfirmed(_: &str) -> Value {
+        json!({"result":{"type":"pane_send","outcome":"unconfirmed","reason":"confirm_timeout"}})
+    }
+    let (socket, _server) = scripted_server("envelope-effect", unconfirmed);
+    let output = flk(
+        &socket,
+        &["agent", "send", "--no-submit", "w1", "hi", "--json"],
+    );
+    assert_eq!(output.status.code(), Some(8), "{}", stderr(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["outcome"], "unconfirmed");
+
+    let plain = flk(&socket, &["agent", "send", "--no-submit", "w1", "hi"]);
+    assert_eq!(plain.status.code(), Some(8));
+    assert!(plain.stdout.is_empty());
+}

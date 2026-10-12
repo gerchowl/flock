@@ -42,9 +42,8 @@ impl ErrorCode {
 
     /// The exit status a CLI call ending in this error returns. A send-like or
     /// guarded verb returns `REFUSED` instead for a `later` refusal, through
-    /// `cli::refusal_exit` (#1025). The error envelope (ADR-0029 C2) is the
-    /// first production reader.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `cli::refusal_exit` (#1025). MCP's `data.exit` reads it through
+    /// `cli::error_code_exit` (#1024).
     pub(crate) const fn exit(self) -> i32 {
         match self {
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,

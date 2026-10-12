@@ -27,7 +27,7 @@ pub(super) fn run_revert_run_command(args: &[String]) -> std::io::Result<i32> {
         return Ok(0);
     }
     let run_id = first.to_string();
-    let mut json = false;
+    let mut json = super::output::json();
     let mut dry_run = false;
     for arg in &args[1..] {
         match arg.as_str() {

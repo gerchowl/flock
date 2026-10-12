@@ -20,6 +20,25 @@ When an existing status ping, submission guard, or failed command reveals a diff
 | `delegate` awaits: `not_started` | `8` | `11` |
 | `wait reply`, `msg send --await`, `msg status`: the receiver refused the message | `4` | `13` |
 
+## Output format and the error envelope
+
+`--format json|text` is a global flag, and `--json` is its synonym (ADR-0029 §3). Either goes anywhere before a `--` (`flk --json agent get w1` and `flk agent get w1 --format json` are the same call). Each verb keeps its default: most print JSON, and the verbs with a text form (`delegate status`, `worktree list`, `msg send --await`, `wait reply`, `events read` and the others that documented `--json`) switch to JSON with either spelling. `--format text` selects a verb's text form where it has one; a verb that only prints JSON keeps printing it. `pane read` and `agent read` keep their own `--format text|ansi` for the screen they return, so after those verbs only `--format json` is the global flag. A value other than `json` or `text`, or `--json` with `--format text`, is a usage error (exit 2).
+
+Under `--format json` / `--json` an error prints on **stdout** as one JSON document, and a one-line human message (`error: <code>: <message>`) goes to stderr (ADR-0029 §4):
+
+```json
+{"id": "cli:agent:get", "error": {"code": "agent_not_found", "message": "…",
+ "retry": "never", "exit": 1, "data": {…}}}
+```
+
+`code` is the error-code registry's (`src/api/error_code.rs`), `retry` is that code's retry class (`never`, `maybe`, `yes`, `later`, `after_inspecting`, `after_human`, `after_handoff`; a code the registry does not know, such as an older server's, takes the class of its exit status), and `exit` is the status the command exits with. `data` is the server's, when it sent one. So `flk agent get nosuch --json | python3 -c 'import json,sys; json.load(sys.stdin)'` always has a document to read. A refusal a send-like or guarded verb exits 10 on says `"exit": 10, "retry": "later"`; a not-found code exits 1 for now (ADR-0029 §2 assigns 4; #1151). A client-side failure is an envelope too: no server socket is `transport`, a timed-out read `timeout`, anything else `internal_error`, all exit 1; the version-gap refusal is `server_version_gap`, exit 78; a `delegate` usage error such as `not a delegate: <name>` is `invalid_params`, exit 2. A send whose effect is uncertain or abandoned (exit 8 or 9) is a result, not an error: under `--json` its result object is the stdout document instead of going to stderr.
+
+Without `--format json` / `--json` nothing changes: an error is the one line on stderr it always was (the response JSON for most verbs), and stdout stays empty.
+
+Known limit: other usage errors (exit 2) and some verb-local text failures (most of `delegate`'s exit-1 failures, the `--status settled` waits) still print only on stderr under `--json`, leaving stdout empty (#1150).
+
+MCP tool errors carry the same `data.retry` and `data.exit` beside `data.refusal`, from the same registries: `exit` is what the matching CLI verb returns (10 for a `later` refusal of `flock_pane_submit`, `flock_msg_send`, `flock_msg_reply` or `flock_agent_restart`; 78 for `server_version_gap`; 2 for `not_exposed_via_mcp`; 1 for `transport_error`). An effect failure (MCP error code 8 or 9) adds `retry` and `exit` to the result it carries in `data`.
+
 ## Launch and status
 
 ```bash

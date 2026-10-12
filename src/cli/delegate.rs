@@ -723,8 +723,8 @@ fn print_delegate_help() {
 /// print on stdout — with or without `--json`, a caller piping stdout gets either
 /// the object it asked for or nothing at all, never a diagnostic.
 fn usage(reason: impl fmt::Display) -> i32 {
-    eprintln!("{reason}");
-    exit::USAGE
+    let code = crate::api::error_code::ErrorCode::InvalidParams;
+    super::output::failure(code, &reason.to_string(), exit::USAGE)
 }
 
 fn fail(reason: impl fmt::Display) -> i32 {
@@ -1031,7 +1031,10 @@ impl Verb {
 /// A flag the verb does not accept is a usage error rather than a value, so
 /// `--after` on `start` cannot be silently read as something else.
 fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
-    let mut flags = Parsed::default();
+    let mut flags = Parsed {
+        json: super::output::json(),
+        ..Parsed::default()
+    };
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();

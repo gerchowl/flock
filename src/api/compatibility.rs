@@ -75,6 +75,13 @@ pub fn observe_ping(client: &ApiClient, response: &Value) {
     }
 }
 
+/// Whether this invocation recorded a skew failure, so `end_cli` will turn a
+/// failing exit into [`EXIT_CODE`]. The error envelope reads it to carry the
+/// exit status the process will actually return.
+pub fn failure_pending() -> bool {
+    INVOCATION.with_borrow(|state| state.failure.is_some())
+}
+
 pub fn end_cli() -> Option<String> {
     INVOCATION.with_borrow_mut(|state| std::mem::take(state).failure)
 }
