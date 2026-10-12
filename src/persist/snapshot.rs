@@ -162,6 +162,10 @@ pub struct PaneSnapshot {
     /// reason — a forgotten parent means a forgotten fanout count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<String>,
+    /// The agent's question policy (#1179). A snapshot written before #1179
+    /// has none, and restores as `ask_human`: what those agents had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<crate::api::schema::QuestionPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,6 +520,11 @@ fn capture_tab(
                 run_id,
                 spawn_depth,
                 spawned_by,
+                questions: tab
+                    .panes
+                    .get(id)
+                    .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                    .map(|terminal| terminal.questions),
                 agent_session,
                 launch_argv,
                 launch_env: tab
@@ -717,6 +726,27 @@ mod tests {
         assert_eq!(persisted.run_id.as_deref(), Some("fork:deadbeef-1234-0"));
     }
 
+    /// #1179: the question policy goes into the snapshot and parses back.
+    #[test]
+    fn the_question_policy_survives_a_capture_and_a_parse() {
+        let mut state = state_with_workspaces(&["main"]);
+        let terminal_id = state.workspaces[0]
+            .terminal_id(state.workspaces[0].tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        state.terminals.get_mut(&terminal_id).unwrap().questions =
+            crate::api::schema::QuestionPolicy::Deny;
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        assert!(json.contains("\"questions\":\"deny\""), "{json}");
+        let parsed = parse_snapshot(&json).unwrap();
+        let pane = parsed.workspaces[0].tabs[0].panes.values().next().unwrap();
+        assert_eq!(
+            pane.questions,
+            Some(crate::api::schema::QuestionPolicy::Deny)
+        );
+    }
+
     /// A pane the operator started carries no run id, and must not gain a
     /// fabricated one on the way through the snapshot — `flk revert-run`
     /// offering to revert the operator's own work is the failure this
@@ -916,6 +946,7 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
@@ -934,6 +965,7 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
@@ -1618,6 +1650,7 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),
@@ -1638,6 +1671,7 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),

@@ -42,6 +42,7 @@ pub(crate) mod message_relay;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
 mod peer_checkout;
+pub(crate) mod questions;
 mod runtime;
 mod session;
 pub mod state;
@@ -4218,6 +4219,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4392,6 +4395,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4423,6 +4428,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4446,6 +4453,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4470,6 +4479,8 @@ sidebar_pane_gap = 99
                 here: true,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4563,6 +4574,8 @@ sidebar_pane_gap = 99
                         here: false,
                         focus: false,
                         argv: vec![crate::test_support::live_program()],
+                        questions: None,
+                        unattended: false,
                     },
                 ),
             });
@@ -5031,6 +5044,8 @@ sidebar_pane_gap = 99
             here: false,
             focus: false,
             argv: vec![crate::test_support::live_program()],
+            questions: None,
+            unattended: false,
         };
 
         // `--active`: names the focused space, so there is something to split.
@@ -5126,6 +5141,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5365,6 +5382,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5421,6 +5440,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: true,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

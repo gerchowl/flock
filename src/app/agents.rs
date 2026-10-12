@@ -495,6 +495,7 @@ impl App {
         &mut self,
         params: AgentStartParams,
         caller: &SpawnCaller,
+        questions: crate::api::schema::QuestionPolicy,
     ) -> Result<crate::api::schema::ResponseResult, AgentStartError> {
         let name = params.name.trim().to_string();
         if name.is_empty() {
@@ -527,6 +528,7 @@ impl App {
             .resolve_spawn_env(&argv, self.current_api_peer_pid, None)
             .map_err(AgentStartError::ProfileUnresolved)?;
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
+        let _questions_guard = crate::integration::set_pending_questions(questions);
 
         // #398: two PLACEMENTS named at once is refused rather than resolved.
         // Silently preferring one is how a caller ends up reasoning about a
@@ -803,6 +805,7 @@ impl App {
             return Err(AgentStartError::SpawnFailed("terminal disappeared".into()));
         };
         terminal.launch_env = spawn_env;
+        terminal.questions = questions;
         terminal.set_agent_name(name.clone());
         terminal.set_manual_label(name);
         self.state.mark_session_dirty();
@@ -1265,6 +1268,7 @@ impl App {
             seen: pane.seen,
             status_age_secs: pane.status_age_secs,
             run_id: terminal.run_id.clone(),
+            questions: Some(terminal.questions),
             turn_cursor: pane.turn_cursor,
             resumable: terminal.hibernated_resume_plan.is_some()
                 || (terminal.pending_agent_resume_plan.is_some()
@@ -1475,6 +1479,8 @@ mod tests {
                 // #178/#374: a start whose child is already gone is a failed
                 // start, so these need a pane that is still there afterwards.
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -1494,6 +1500,8 @@ mod tests {
                 here: false,
                 focus: false,
                 argv: vec![program.to_string()],
+                questions: None,
+                unattended: false,
             }),
         }
     }

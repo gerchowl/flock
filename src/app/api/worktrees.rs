@@ -258,6 +258,18 @@ impl App {
             }
         };
 
+        // #1179: before `git worktree add`, for the ceiling's reason.
+        let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
+            Ok(questions) => questions,
+            Err(refused) => {
+                return encode_error(
+                    id,
+                    crate::app::questions::WideningRefused::CODE,
+                    refused.message(),
+                )
+            }
+        };
+
         let session = self
             .state
             .workspaces
@@ -448,6 +460,7 @@ impl App {
         let _run_id_guard = crate::integration::set_pending_run_id(run_id.clone());
         self.pretrust_claude_worktree(&plan.argv, &checkout_path, &spawn_env);
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+        let _questions_guard = crate::integration::set_pending_questions(questions);
         let (ws_idx, spawned_pane) = match self.spawn_agent_workspace(
             checkout_path.clone(),
             rows,
@@ -479,6 +492,7 @@ impl App {
         // those commits without inferring from `cwd`. Stamped after a
         // successful spawn so a failed fork leaves no agent claiming a run.
         self.record_spawn_run_id(ws_idx, spawned_pane, &run_id);
+        self.record_questions(ws_idx, spawned_pane, questions);
         // #349: stamp the child's lineage so that it COUNTS. Without it a fork
         // child is invisible to the census, and an agent could alternate the
         // two verbs indefinitely — every fork child free, and the cap only
@@ -3920,6 +3934,8 @@ mod tests {
                 label: None,
                 pivot: Some("try the alternative on <branch>".into()),
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
@@ -4082,6 +4098,8 @@ mod tests {
                 label: None,
                 pivot: Some(String::new()),
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4304,6 +4322,8 @@ mod tests {
                 },
                 name: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
         let spawn_error =
@@ -4344,6 +4364,8 @@ mod tests {
                 label: None,
                 pivot: Some(String::new()),
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
@@ -4415,6 +4437,8 @@ mod tests {
                 label: None,
                 pivot: Some(String::new()),
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
@@ -4466,6 +4490,8 @@ mod tests {
                 label: None,
                 pivot: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
@@ -4508,6 +4534,8 @@ mod tests {
                 label: None,
                 pivot: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
@@ -4547,6 +4575,8 @@ mod tests {
                 label: None,
                 pivot: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
 
