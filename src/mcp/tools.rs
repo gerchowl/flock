@@ -26,9 +26,9 @@
 use serde_json::{json, Value};
 
 use crate::api::schema::{
-    AgentForkParams, AgentReadParams, AgentTarget, EmptyParams, LineageParams, MessageTarget,
-    Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams, ReadFormat, ReadSource,
-    WorktreeKillParams, WorktreeListParams,
+    AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams, LineageParams,
+    MessageTarget, Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams,
+    ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -122,6 +122,24 @@ pub(super) fn table() -> &'static [Tool] {
                           survives after the panes are gone.",
             input_schema: schema_target_only,
             build: build_agent_lineage,
+        },
+        Tool {
+            name: "flock_delegate_list",
+            description: "List the delegates an architect started, read-only. \
+                          The workflow it serves: start a delegate (`flk \
+                          delegate start`), read its digest, review its PR, \
+                          merge, then reap its worktree. Each row is one \
+                          architect -> delegate edge with the delegate's \
+                          `agent_status`, harness, pane, branch, the PR \
+                          poller's cached `pr`, `edge_age_secs` and \
+                          `status_age_secs`, and a `state`: `live`, \
+                          `hibernated, awaiting merge`, `gone`, `gone, \
+                          worktree retained`, `orphaned`, or `closed, not \
+                          merged`. `architect` is `self` (default: you), \
+                          `all`, or an agent id; `branch` returns the edge \
+                          that owns that branch.",
+            input_schema: schema_delegate_list,
+            build: build_delegate_list,
         },
         Tool {
             name: "flock_msg_send",
@@ -505,6 +523,27 @@ fn schema_no_args() -> Value {
     })
 }
 
+fn schema_delegate_list() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "architect": {
+                "type": "string",
+                "description": "`self` (default), `all`, or an architect's agent id.",
+            },
+            "branch": {
+                "type": "string",
+                "description": "Only the edge whose delegate works on this branch.",
+            },
+            "repo": {
+                "type": "string",
+                "description": "Only edges in this repository (the edge's repo key).",
+            },
+        },
+        "additionalProperties": false,
+    })
+}
+
 fn schema_target_only() -> Value {
     json!({
         "type": "object",
@@ -829,6 +868,14 @@ fn build_agent_get(args: Value) -> Result<Method, McpError> {
 fn build_agent_lineage(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentLineage(LineageParams {
         target: required_string(&args, "target")?,
+    }))
+}
+
+fn build_delegate_list(args: Value) -> Result<Method, McpError> {
+    Ok(Method::DelegateList(DelegateListParams {
+        architect: optional_string(&args, "architect")?.unwrap_or_else(|| "self".into()),
+        branch: optional_string(&args, "branch")?,
+        repo: optional_string(&args, "repo")?,
     }))
 }
 
@@ -1475,6 +1522,7 @@ mod tests {
                 "flock_agent_read",
                 "flock_agent_fork",
                 "flock_agent_lineage",
+                "flock_delegate_list",
                 "flock_msg_send",
                 "flock_msg_reply",
                 "flock_msg_list",

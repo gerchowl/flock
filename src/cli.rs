@@ -17,6 +17,7 @@ mod agent;
 mod checks;
 mod compatibility;
 mod delegate;
+pub(crate) mod delegate_list;
 mod delegate_s1;
 mod delegate_verdict;
 mod digest;

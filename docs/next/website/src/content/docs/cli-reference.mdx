@@ -548,6 +548,7 @@ flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silenc
 flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
 flk delegate reap <name> [--force] [--json]
+flk delegate list [--mine | --architect <id> | --all] [--branch <b>] [--json]
 ```
 
 Codex defaults to `--ask-for-approval never --sandbox workspace-write`. Workspace-write blocks the network, so a delegate that must `git push` or use `gh` needs `--sandbox danger-full-access`, deliberately chosen by the caller. `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access` for Codex only; opencode and Claude reject it with exit 2.
@@ -573,6 +574,8 @@ Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BL
 Write the brief so the agent ends its reply on a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line: that line is the whole result contract, and a good reply ending on anything else is `no_sentinel` (exit 5). A trailing `※ recap` line after it is fine.
 
 When `start` runs inside an agent's pane, the server records that agent as the delegate's architect (an `agent_delegated` event in the durable event log). `--label TEXT` is stored on that record and defaults to the delegate's name; against a server too old to store it, `start` says so on stderr and starts without it. A `start` whose process ancestry reaches no agent pane (the operator's own terminal, `ssh`, or a spawner that detached with `setsid` or `nohup`) records no architect and prints `delegate <name>: edge: none (unattested)` on stderr.
+
+`list` reads those records back from the server, grouped per architect: `--mine` (the default) is the agent whose pane runs the command, `--architect <id>` names one, and `--all` shows every architect, one block each. `--branch <b>` returns the edge that owns that branch. Each row carries the delegate's name, its edge state, `agent_status` and how long it has held it, harness, branch, the PR the poller last saw (number and state), the edge's age and its label. The state is `live`, `hibernated, awaiting merge` (hibernated with an open PR), `gone` (removed), `gone, worktree retained` (removed, its worktree still on disk), `orphaned` (its architect is gone), or `closed, not merged`, which a PR closed without merging shows whatever else holds, including a batch-landed `landed-in-batch` PR. Everything comes from state the server already holds, so `list` runs no git or `gh` command and the PR can lag GitHub by one poll. `--mine` from the operator's own terminal, which runs in no agent pane, fails with `no_caller_pane` and names `--all`. `--json` prints the verb's result as is, the same object MCP `flock_delegate_list` returns.
 
 A start that fails once its agent exists (readiness timed out, a startup dialog, a composer that refused the brief with `input_not_empty`) prints the agent pane's last 20 lines on stderr, each behind `  | `, read before anything is torn down, so a rolled-back start still shows what the agent was showing. It then rolls back the workspace and checkout as before. With `--keep-on-failure` it keeps them instead, with the agent and the delegate's record, and exits 1: `delegate status` reads it, `delegate send` types the brief once the composer is clear (a start refused before typing ran no round, so that is round 1), and `delegate reap` removes it. Every failure exits non-zero.
 
@@ -693,6 +696,7 @@ Exposed tools:
 | `flock_agent_result` | `agent.result` | The reply an agent's newest turn ended on — how a delegated task went — with `status`/`status_text` from a final `DONE:`/`BLOCKED:`/`VERDICT:` line and `finished` saying whether that turn is over. Paged by `offset`/`max_chars`. Claude and opencode; read-only. |
 | `flock_agent_fork` | `agent.fork` | Fork a Claude conversation into a new worktree+pane; `pivot` seeds the opening turn. |
 | `flock_agent_lineage` | `agent.lineage` | Fork ancestry chain, deepest first. |
+| `flock_delegate_list` | `delegate.list` | The delegates an architect started, the rows of `flk delegate list`. `architect` is `self` (default), `all` or an agent id; `branch` returns the owning edge. Read-only. |
 | `flock_msg_send` | `msg.send` | Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
 | `flock_msg_reply` | `msg.reply` | Uses the stored return binding; direct cross-host answers are held for origin collection. `intent` is optional here and defaults to `fyi`. A sender with no inbox gets the reply held for it (`state: "held"`). |
 | `flock_msg_list` | `msg.list` | Unread messages with local wake attempt evidence. |

@@ -564,6 +564,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentResume(_) => "agent.resume",
         Method::AgentRestart(_) => "agent.restart",
         Method::AgentLineage(_) => "agent.lineage",
+        Method::DelegateList(_) => "delegate.list",
         Method::MsgSend(_) => "msg.send",
         Method::MsgReply(_) => "msg.reply",
         Method::MsgList(_) => "msg.list",
