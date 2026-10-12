@@ -12,66 +12,8 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::process::Output;
-use std::thread;
-use std::time::{Duration, Instant};
-use support::environment::Command;
-
-/// A socket that answers every request with `answer(method)`, and the protocol
-/// check a state-changing verb sends first (#868) with this build's protocol.
-fn scripted_server(
-    name: &str,
-    answer: fn(&str) -> serde_json::Value,
-) -> (PathBuf, thread::JoinHandle<()>) {
-    let dir = std::env::temp_dir().join(format!("flk1025-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("s.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let handle = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            let Ok((mut stream, _)) = listener.accept() else {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            };
-            stream.set_nonblocking(false).unwrap();
-            let mut line = String::new();
-            if BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .is_err()
-            {
-                continue;
-            }
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let method = request["method"].as_str().unwrap_or_default();
-            let mut reply = if method == "ping" {
-                serde_json::json!({"result":{
-                    "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION
-                }})
-            } else {
-                answer(method)
-            };
-            reply["id"] = request["id"].clone();
-            let _ = writeln!(stream, "{reply}");
-        }
-    });
-    (socket, handle)
-}
-
-fn flk(socket: &PathBuf, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_flk"))
-        .args(args)
-        .env("FLOCK_SOCKET_PATH", socket)
-        .env_remove("FLOCK_CLIENT_SOCKET_PATH")
-        .env_remove("FLOCK_ENV")
-        .output()
-        .expect("flk should run")
-}
+use support::scripted::{flk, scripted_server};
 
 fn assert_moved(output: &Output, new: i32, old: i32) {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -88,7 +30,7 @@ fn assert_moved(output: &Output, new: i32, old: i32) {
     );
 }
 
-fn refuse(_: &str) -> serde_json::Value {
+fn refuse(_: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"error":{"code":"not_settled","message":"not_settled"}})
 }
 
@@ -114,7 +56,7 @@ fn agent_send_refused_before_acting_exits_10() {
 /// anything restarts, and that is 10 too.
 #[test]
 fn agent_restart_refused_before_acting_exits_10() {
-    fn busy(_: &str) -> serde_json::Value {
+    fn busy(_: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({"error":{"code":"restart_busy","message":"restart_busy"}})
     }
     let (socket, _server) = scripted_server("restart", busy);
@@ -136,7 +78,7 @@ fn a_refusal_from_a_read_verb_keeps_exit_1() {
 /// An error that is not a refusal keeps exit 1 and prints no notice.
 #[test]
 fn an_ordinary_error_keeps_exit_1_without_a_notice() {
-    fn missing(_: &str) -> serde_json::Value {
+    fn missing(_: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({"error":{"code":"pane_not_found","message":"no pane"}})
     }
     let (socket, _server) = scripted_server("missing", missing);
@@ -146,8 +88,8 @@ fn an_ordinary_error_keeps_exit_1_without_a_notice() {
     assert!(!stderr.contains("note: exit code"), "{stderr}");
 }
 
-fn refused_message(method: &str) -> serde_json::Value {
-    match method {
+fn refused_message(request: &serde_json::Value) -> serde_json::Value {
+    match request["method"].as_str().unwrap_or_default() {
         "msg.status" => serde_json::json!({"result":{
             "correlation_id":"q1025","state":"refused","detail":"msg_not_allowed"
         }}),

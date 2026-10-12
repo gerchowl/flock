@@ -15,6 +15,10 @@ use serde_json::{json, Value};
 /// `-32000` (implementation-defined server error — the bucket the design
 /// dedicates to flock refusals, tagged with `data.refusal = <flock code>`).
 /// Effect failures use CLI codes `8` and `9`, with the complete result in `data`.
+///
+/// Every tool error also carries `data.retry` and `data.exit` (ADR-0029 §2,
+/// #1024): the retry class and the exit status the CLI returns for the same
+/// failure, from `cli::exit` and `api::error_code`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct McpError {
     pub code: i32,
@@ -63,18 +67,19 @@ impl McpError {
         Self {
             code: -32000,
             message: format!("tool `{name}` is not exposed via MCP"),
-            data: Some(json!({ "refusal": "not_exposed_via_mcp" })),
+            data: Some(refusal("not_exposed_via_mcp", crate::cli::exit::USAGE)),
         }
     }
 
     /// Translate a flock `ErrorBody { code, message }` into an MCP refusal:
     /// the flock code lands in `data.refusal` so an agent can branch on it
-    /// (`unsupported_for_agent`, `no_agent_session`, …).
-    pub(super) fn from_flock_error(code: &str, message: &str) -> Self {
+    /// (`unsupported_for_agent`, `no_agent_session`, …). `exit` is what the
+    /// CLI exits with for it (`cli::error_code_exit`).
+    pub(super) fn from_flock_error(code: &str, message: &str, exit: i32) -> Self {
         Self {
             code: -32000,
             message: message.into(),
-            data: Some(json!({ "refusal": code })),
+            data: Some(refusal(code, exit)),
         }
     }
 
@@ -85,9 +90,17 @@ impl McpError {
         Self {
             code: -32000,
             message: err.to_string(),
-            data: Some(json!({ "refusal": "transport_error" })),
+            data: Some(refusal("transport_error", crate::cli::exit::FAILURE)),
         }
     }
+}
+
+/// `data` for a refusal: the code, its retry class and its exit status. A code
+/// the registry does not know (`transport_error`, `not_exposed_via_mcp`) takes
+/// the class of its exit status.
+pub(super) fn refusal(code: &str, exit: i32) -> Value {
+    let retry = crate::cli::output::retry_for(code, exit).as_str();
+    json!({ "refusal": code, "retry": retry, "exit": exit })
 }
 
 /// A decoded request or notification from stdin. Notifications have `id =

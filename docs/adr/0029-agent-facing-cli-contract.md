@@ -176,6 +176,9 @@ their meaning where they do not collide; collisions are resolved once:
   ```
 
   and a one-line human message goes to stderr. The exit code comes from §2.
+  `id` is the failed request's id; a failure the client finds before or
+  without a request (no server socket, a usage error) carries `"id": null`,
+  so the key is always present (#1024).
   Without machine output, errors are a human line on stderr, as for any CLI.
 - **Error codes are a registry**, an enum with `as_str()`, exit code and retry
   class, replacing the string literals. The full list is generated into the

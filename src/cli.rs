@@ -32,6 +32,7 @@ mod lineage;
 mod mcp;
 mod msg;
 mod notification;
+pub(crate) mod output;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
@@ -85,6 +86,28 @@ pub enum CommandOutcome {
 }
 
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
+    // ADR-0029 §3: the output flags are global, so they come off before any
+    // help lookup or verb parser reads argv.
+    let (args, format) = match output::take_global(args) {
+        Ok(taken) => taken,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return Ok(CommandOutcome::Handled(exit::USAGE));
+        }
+    };
+    output::set(format);
+    let outcome = run(&args);
+    // The envelope prints last, so its `exit` is the status the process
+    // returns, a skew failure's 78 included.
+    match &outcome {
+        Ok(CommandOutcome::Handled(code)) => output::finish(*code),
+        Err(_) => output::finish(exit::FAILURE),
+        Ok(CommandOutcome::NotCli) => {}
+    }
+    outcome
+}
+
+fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
@@ -135,13 +158,28 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             if let Err(error) = &outcome {
                 eprintln!("{error}");
             }
+            if output::json() && !output::envelope_pending() {
+                // §4: the skew error keeps exit 78 and gains the envelope.
+                let gap = crate::api::error_code::ErrorCode::ServerVersionGap;
+                let exit_code = output::failure(gap, &message, gap.exit());
+                return Ok(CommandOutcome::Handled(exit_code));
+            }
             eprintln!("{message}");
             return Ok(CommandOutcome::Handled(
                 crate::api::compatibility::EXIT_CODE,
             ));
         }
     }
-    outcome
+    match outcome {
+        // An io error ends the verb before it reported anything: under
+        // machine output it is still an envelope on stdout, exit 1.
+        Err(error) if output::json() && !output::envelope_pending() => {
+            let code = output::io_error_code(&error);
+            let exit_code = output::failure(code, &error.to_string(), exit::FAILURE);
+            Ok(CommandOutcome::Handled(exit_code))
+        }
+        outcome => outcome,
+    }
 }
 
 fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
@@ -358,7 +396,7 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
 use exit::{CONFIG_CHECK_ADVISORY, CONFIG_CHECK_PARSE_FAILURE};
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
-    let mut json = false;
+    let mut json = output::json();
     let mut explicit_path: Option<String> = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -895,8 +933,7 @@ fn wait_output(args: &[String]) -> std::io::Result<i32> {
     })?;
 
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(output::error(&response, exit::FAILURE));
     }
 
     println!("{}", serde_json::to_string(&response).unwrap());
@@ -1041,8 +1078,8 @@ pub(super) fn wait_for_agent_change(
         .map_err(api_client_error_to_io)?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
         if let ApiClientError::ErrorResponse(response) = err {
-            eprintln!("{}", serde_json::to_string(&response).unwrap());
-            return Ok(1);
+            let response = serde_json::to_value(&response).unwrap_or_default();
+            return Ok(output::error(&response, exit::FAILURE));
         }
         return Err(api_client_error_to_io(err));
     }
@@ -1079,12 +1116,10 @@ fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io:
         .get("result")
         .and_then(crate::api::effect_exit_code)
     {
-        eprintln!("{response}");
-        return Ok(code);
+        return Ok(output::effect(response, code));
     }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(response).unwrap());
-        return Ok(error_exit(response, send_like));
+        return Ok(output::error(response, error_exit(response, send_like)));
     }
 
     println!("{}", serde_json::to_string(response).unwrap());
@@ -1097,6 +1132,17 @@ pub(crate) fn error_exit(response: &serde_json::Value, send_like: bool) -> i32 {
     match response["error"]["code"].as_str() {
         Some(code) if send_like => refusal_exit(code),
         _ => exit::FAILURE,
+    }
+}
+
+/// The exit status a call ending in error `code` returns, with no stderr
+/// notice: `REFUSED` for a send-like or guarded call's `later` refusal, else
+/// what the error-code registry assigns. MCP reports it as `data.exit`.
+pub(crate) fn error_code_exit(code: &str, send_like: bool) -> i32 {
+    match crate::api::error_code::ErrorCode::from_code(code) {
+        Some(code) if send_like && code.retry() == exit::Retry::Later => exit::REFUSED,
+        Some(code) => code.exit(),
+        None => exit::FAILURE,
     }
 }
 
@@ -1131,12 +1177,10 @@ fn send_ok_request_for(method: Method, send_like: bool) -> std::io::Result<i32> 
         .get("result")
         .and_then(crate::api::effect_exit_code)
     {
-        eprintln!("{response}");
-        return Ok(code);
+        return Ok(output::effect(&response, code));
     }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(error_exit(&response, send_like));
+        return Ok(output::error(&response, error_exit(&response, send_like)));
     }
 
     Ok(0)
@@ -1281,7 +1325,7 @@ pub(super) fn parse_u64_flag(flag: &str, value: &str) -> std::io::Result<u64> {
 
 fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
     match args {
-        [] => Ok(false),
+        [] => Ok(output::json()),
         [flag] if flag == "--json" => Ok(true),
         _ => {
             eprintln!("{usage}");
@@ -1292,7 +1336,7 @@ fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
 
 fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), i32> {
     let mut name = None;
-    let mut json = false;
+    let mut json = output::json();
     for arg in args {
         if arg == "--json" {
             json = true;
@@ -1328,17 +1372,15 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
     }
 }
 
+/// Every caller exits `FAILURE` after it.
 fn print_session_error(code: &str, message: &str) {
-    eprintln!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message,
-            }
-        }))
-        .unwrap()
-    );
+    let response = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    output::error(&response, exit::FAILURE);
 }
 
 fn print_config_help() {

@@ -31,7 +31,7 @@ pub(crate) fn parse_list_args(args: &[String]) -> Result<(DelegateListParams, bo
         branch: None,
         repo: None,
     };
-    let mut json = false;
+    let mut json = super::output::json();
     let mut scope: Option<&str> = None;
     let mut index = 0;
     while index < args.len() {

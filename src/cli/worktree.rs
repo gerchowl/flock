@@ -79,7 +79,7 @@ fn worktree_unquarantine(args: &[String]) -> std::io::Result<i32> {
 fn worktree_list(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
     let mut cwd = None;
-    let mut json = false;
+    let mut json = super::output::json();
     let mut scan = false;
 
     let mut index = 0;
@@ -132,8 +132,7 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         return super::print_response(&response);
     }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     print_worktree_table(&response, scan);
     Ok(0)

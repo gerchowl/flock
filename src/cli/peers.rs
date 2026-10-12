@@ -187,7 +187,7 @@ struct LogsArgs {
 /// so the flag handling is testable without touching logs or ssh.
 fn parse_logs_args(args: &[String]) -> Result<LogsArgs, String> {
     let mut parsed = LogsArgs {
-        json: false,
+        json: super::output::json(),
         all: false,
         lines: DEFAULT_LOG_LINES,
     };
@@ -320,7 +320,7 @@ fn peers_summary(args: &[String]) -> std::io::Result<i32> {
 /// the classified reason, for how long, and whether a relay stream is held
 /// (#418). Read from `peers.summary`, the same report a hub serves the fleet.
 fn peers_status(args: &[String]) -> std::io::Result<i32> {
-    let mut json = false;
+    let mut json = super::output::json();
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,

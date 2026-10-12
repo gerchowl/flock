@@ -2244,11 +2244,13 @@ fn worktree_management_commands_work() {
         ],
     );
     assert_eq!(safe_remove.status.code(), Some(1));
-    let safe_remove_json: serde_json::Value = serde_json::from_slice(&safe_remove.stderr).unwrap();
+    // Under `--json` the error envelope is the stdout document (ADR-0029 §4).
+    let safe_remove_json: serde_json::Value = serde_json::from_slice(&safe_remove.stdout).unwrap();
     assert_eq!(
         safe_remove_json["error"]["code"],
         "dirty_worktree_requires_force"
     );
+    assert_eq!(safe_remove_json["error"]["exit"], 1);
     assert!(checkout.exists());
 
     let force_removed = run_cli_json(
