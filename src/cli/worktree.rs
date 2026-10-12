@@ -383,6 +383,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
         );
         return Ok(2);
     }
+    let base = match base {
+        Some(base) if !dry_run => Some(fresh_base(&workspace_id, &cwd, base)?),
+        base => base,
+    };
 
     super::print_response(&super::send_request(&Request {
         id: "cli:worktree:create".into(),
@@ -397,6 +401,41 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
             focus,
         }),
     })?)
+}
+
+/// Refresh `--base` from its remote before the server branches from it, as
+/// `delegate start` does (#938). The source checkout is the one the server
+/// itself would resolve, read from a dry run of the same request, and the
+/// fetch runs here so the server is never held on the network.
+fn fresh_base(
+    workspace_id: &Option<String>,
+    cwd: &Option<String>,
+    base: String,
+) -> std::io::Result<String> {
+    let plan = super::send_request(&Request {
+        id: "cli:worktree:create:plan".into(),
+        method: Method::WorktreeCreate(WorktreeCreateParams {
+            dry_run: true,
+            workspace_id: workspace_id.clone(),
+            cwd: cwd.clone(),
+            base: Some(base.clone()),
+            ..WorktreeCreateParams::default()
+        }),
+    })?;
+    let Some(source) = plan
+        .pointer("/result/plan/source_checkout_path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(base);
+    };
+    let fresh = crate::worktree::resolve_fresh_base(std::path::Path::new(source), &base);
+    if let Some(note) = &fresh.note {
+        eprintln!("worktree create: --base {base}: {note}");
+    }
+    if let Some(sha) = &fresh.sha {
+        eprintln!("worktree create: base {} ({sha})", fresh.base);
+    }
+    Ok(fresh.base)
 }
 
 fn worktree_open(args: &[String]) -> std::io::Result<i32> {

@@ -763,10 +763,18 @@ fn c2_claude_trust_dialog_is_refused_and_nothing_is_typed() {
         message.contains("delegate w1:"),
         "and names the delegate: {message}"
     );
+    // #938: under `--json` the one thing on stdout is the failure, with the
+    // dialog the agent was showing.
+    let json = stdout_json(&out);
+    assert_eq!(json["outcome"], "start_failed", "{json}");
+    assert_eq!(json["kept"], false, "{json}");
     assert!(
-        stdout(&out).is_empty(),
-        "a failure prints nothing on stdout: {:?}",
-        stdout(&out)
+        json["data"]["pane_tail"]
+            .as_array()
+            .is_some_and(|tail| tail.iter().any(|line| line
+                .as_str()
+                .is_some_and(|l| l.contains("Yes, I trust this folder")))),
+        "{json}"
     );
     assert!(
         typed(&server).is_empty(),
@@ -995,9 +1003,15 @@ fn keep_on_failure_keeps_a_refused_start_for_inspection() {
             && message.contains("flk delegate reap kept"),
         "{message}"
     );
+    // #938: `--json` carries the same lines, structured.
+    let json = stdout_json(&out);
+    assert_eq!(json["outcome"], "start_failed", "{json}");
+    assert_eq!(json["kept"], true, "{json}");
+    let tail = json["data"]["pane_tail"].as_array().expect("pane_tail");
     assert!(
-        stdout(&out).is_empty(),
-        "a failure prints nothing on stdout"
+        tail.iter()
+            .any(|line| line == "\u{276f} leftover suggestion"),
+        "{json}"
     );
     assert!(typed(&server).is_empty(), "nothing was typed");
     assert_eq!(workspaces(&server).len(), before + 1, "the workspace stays");
