@@ -115,8 +115,14 @@ fn resources_read<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpEr
 /// Send one flock method and unwrap its envelope. Shared by the tool and
 /// resource paths so a flock refusal translates identically on both.
 fn call_flock<F: FlockCall>(method: Method, flock: &F) -> Result<Value, McpError> {
+    // The verbs the CLI reports through `print_send_response`: their `later`
+    // refusals exit `REFUSED` there, so `data.exit` says 10 here too.
+    let send_like = matches!(
+        method,
+        Method::PaneSubmit(_) | Method::MsgSend(_) | Method::MsgReply(_) | Method::AgentRestart(_)
+    );
     let raw = flock.call(method).map_err(McpError::transport)?;
-    extract_flock_result(raw)
+    extract_flock_result(raw, send_like)
 }
 
 fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError> {
@@ -160,6 +166,7 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
             return Err(McpError::from_flock_error(
                 crate::api::compatibility::ERROR_CODE,
                 &message,
+                crate::api::compatibility::EXIT_CODE,
             ));
         }
     }
@@ -170,7 +177,10 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     let text = serde_json::to_string(&flock_result).map_err(|e| McpError {
         code: -32000,
         message: format!("failed to serialize flock result: {e}"),
-        data: Some(json!({ "refusal": "serialize_error" })),
+        data: Some(super::framing::refusal(
+            "serialize_error",
+            crate::cli::exit::FAILURE,
+        )),
     })?;
     Ok(json!({
         "content": [ { "type": "text", "text": text } ]
@@ -181,14 +191,15 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
 /// with either a `result` field (success) or an `error: {code, message}`
 /// field (failure). The failure branch translates to an MCP refusal so the
 /// flock error code lands in `data.refusal`.
-fn extract_flock_result(mut raw: Value) -> Result<Value, McpError> {
+fn extract_flock_result(mut raw: Value, send_like: bool) -> Result<Value, McpError> {
     if let Some(error) = raw.get("error") {
         let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("flock refused the request");
-        return Err(McpError::from_flock_error(code, message));
+        let exit = crate::cli::error_code_exit(code, send_like);
+        return Err(McpError::from_flock_error(code, message, exit));
     }
     // Take() rather than clone() — the raw envelope isn't needed again.
     let result = raw
@@ -196,10 +207,17 @@ fn extract_flock_result(mut raw: Value) -> Result<Value, McpError> {
         .map(Value::take)
         .unwrap_or(Value::Null);
     if let Some(code) = crate::api::effect_exit_code(&result) {
+        let message = result["outcome"].as_str().unwrap_or_default().to_owned();
+        let mut data = result;
+        if let Some(fields) = data.as_object_mut() {
+            let retry = crate::cli::output::exit_retry(code).as_str();
+            fields.insert("retry".into(), retry.into());
+            fields.insert("exit".into(), code.into());
+        }
         return Err(McpError {
             code,
-            message: result["outcome"].as_str().unwrap_or_default().to_owned(),
-            data: Some(result),
+            message,
+            data: Some(data),
         });
     }
     Ok(result)
@@ -264,7 +282,11 @@ mod tests {
                 let error = response.unwrap_err();
                 assert_eq!(error.code, code);
                 assert_eq!(error.message, outcome);
-                assert_eq!(error.data, Some(result));
+                let retry = if code == 8 { "after_inspecting" } else { "yes" };
+                let mut data = result.clone();
+                data["retry"] = json!(retry);
+                data["exit"] = json!(code);
+                assert_eq!(error.data, Some(data));
             }
         }
     }
@@ -287,7 +309,8 @@ mod tests {
         .expect_err("a dropped arming is not a success");
         assert_eq!(
             err.data,
-            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE}))
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
         );
         let calls = old.calls.borrow();
         assert_eq!(calls.len(), 2, "the arming, then its abort");
@@ -347,7 +370,8 @@ mod tests {
         .expect_err("a dropped arming is not a success");
         assert_eq!(
             err.data,
-            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE}))
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
         );
         assert!(
             err.message.contains("still armed") && err.message.contains("socket closed"),
@@ -680,6 +704,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(flock.calls.borrow().is_empty(), "refusal short-circuits");
+    }
+
+    /// ADR-0029 §2 (#1024): every tool error carries the retry class and the
+    /// exit status the CLI returns for the same failure.
+    #[test]
+    fn tool_errors_carry_retry_and_exit_from_the_registries() {
+        let call = |tool: &str, arguments: Value, code: &str| {
+            let flock = MockApi::ok(json!({"error": {"code": code, "message": "m"}}));
+            let request = json!({"name": tool, "arguments": arguments});
+            route("tools/call", request, &flock, &ChannelOptions::off())
+                .unwrap_err()
+                .data
+        };
+        let get = || json!({"target": "nosuch"});
+        let submit = || json!({"pane_id": "1-1", "text": "hello"});
+        assert_eq!(
+            call("flock_agent_get", get(), "agent_not_found"),
+            Some(json!({"refusal": "agent_not_found", "retry": "never", "exit": 1}))
+        );
+        // A `later` refusal exits 10 on a send-like tool, as `pane run` does,
+        // and 1 on a read, as `agent get` does.
+        assert_eq!(
+            call("flock_pane_submit", submit(), "not_settled"),
+            Some(json!({"refusal": "not_settled", "retry": "later", "exit": 10}))
+        );
+        assert_eq!(
+            call("flock_agent_get", get(), "not_settled"),
+            Some(json!({"refusal": "not_settled", "retry": "later", "exit": 1}))
+        );
+        assert_eq!(
+            call("flock_agent_get", get(), "server_version_gap"),
+            Some(json!({"refusal": "server_version_gap", "retry": "after_handoff", "exit": 78}))
+        );
+
+        struct Down;
+        impl FlockCall for Down {
+            fn call(&self, _: Method) -> Result<Value, ApiClientError> {
+                Err(ApiClientError::Io(std::io::ErrorKind::NotFound.into()))
+            }
+        }
+        let request = json!({"name": "flock_agent_get", "arguments": get()});
+        let err = route("tools/call", request, &Down, &ChannelOptions::off()).unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": "transport_error", "retry": "maybe", "exit": 1}))
+        );
+        let hidden = json!({"name": "pane.close", "arguments": {}});
+        let err = route("tools/call", hidden, &Down, &ChannelOptions::off()).unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": "not_exposed_via_mcp", "retry": "never", "exit": 2}))
+        );
     }
 
     #[test]

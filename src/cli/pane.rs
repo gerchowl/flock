@@ -190,8 +190,12 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
     })?;
 
     if let Some(error) = response.get("error") {
-        eprintln!("{}", serde_json::to_string(error).unwrap());
-        return Ok(1);
+        let line = serde_json::to_string(error).unwrap();
+        return Ok(super::output::error_as(
+            &response,
+            line,
+            super::exit::FAILURE,
+        ));
     }
 
     if let Some(text) = response["result"]["read"]["text"].as_str() {
@@ -475,7 +479,7 @@ pub(super) const PANE_STASH_USAGE: &str = "flk pane stash show|restore <pane_id>
 /// `flk pane stash show|restore` (#850). The drafts print one per line, so
 /// a kept draft can be read or copied as it was typed.
 fn pane_stash(args: &[String]) -> std::io::Result<i32> {
-    let json = args.iter().any(|arg| arg == "--json");
+    let json = super::output::json();
     let rest: Vec<_> = args.iter().filter(|arg| *arg != "--json").collect();
     let (verb, raw_pane_id) = match rest.as_slice() {
         [verb, pane] => (verb.as_str(), pane.as_str()),

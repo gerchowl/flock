@@ -494,6 +494,7 @@ flk agent result worker          # once #575 lands
 
 - `workspace list`, `workspace create`, `tab list`, `tab create`, `tab get`, `tab focus`, `tab rename`, `tab close`, `pane list`, `pane get`, `pane split`, `wait output`, and `wait agent-status` print json on success.
 - `pane read` prints text, not json.
+- add `--json` (or `--format json`) to any verb when you parse its output: an error then prints on stdout as `{"error": {"code", "message", "retry", "exit"}}` instead of leaving stdout empty, and `retry` says whether running it again is safe. without it, errors stay on stderr.
 - `pane read --format ansi` or `pane read --ansi` returns a rendered ANSI snapshot for TUI feedback loops.
 - `pane read --source recent-unwrapped` is useful when you want to inspect the same unwrapped transcript that `wait output --source recent` matches against.
 - `agent send` prints JSON with the submit outcome; unconfirmed exits 8 and abandoned exits 9.

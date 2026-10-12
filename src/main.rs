@@ -31,6 +31,7 @@ mod agent_transcript;
 mod api;
 mod app;
 mod build_info;
+mod channels;
 mod checks;
 mod checksum;
 mod cli;
@@ -106,14 +107,16 @@ mod worktree;
 /// (`status server` and `status client` do not), and hooks and the MCP server
 /// run on every agent turn and tool call, where the warning is noise and the
 /// config scan is wasted work (#860).
+///
+/// It reads argv after the global output flags come off (ADR-0029 §3), so
+/// `flk --format json status` is the full status, as `flk status --json` is.
 fn prints_removed_config_warnings(args: &[String]) -> bool {
+    let Ok((args, _)) = cli::output::take_global(args) else {
+        return true;
+    };
     match args.get(1).map(String::as_str) {
         Some("hook" | "mcp") => false,
-        Some("status") => match &args[2..] {
-            [] => false,
-            [flag] => flag != "--json",
-            _ => true,
-        },
+        Some("status") => args.len() > 2,
         Some("config") => args.get(2).map(String::as_str) != Some("check"),
         _ => true,
     }
@@ -548,6 +551,7 @@ fn run() -> io::Result<()> {
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
+        println!("       flk adapter hello <binding> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
@@ -621,6 +625,10 @@ fn run() -> io::Result<()> {
             (
                 "flk events <read|wait>",
                 "Read or wait on the durable event log from a cursor",
+            ),
+            (
+                "flk adapter hello <binding>",
+                "Check a channel adapter's binding token before it starts",
             ),
             (
                 "flk session <subcommand>",
@@ -875,6 +883,9 @@ mod tests {
         for quiet in [
             "flk status",
             "flk status --json",
+            "flk status --format json",
+            "flk --format=json status",
+            "flk --json config check",
             "flk hook stop",
             "flk mcp",
             "flk config check",
@@ -888,6 +899,7 @@ mod tests {
             "flk pane list",
             "flk status server",
             "flk status client --json",
+            "flk --format json status server",
         ] {
             assert!(prints_removed_config_warnings(&args(loud)), "{loud}");
         }
