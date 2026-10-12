@@ -503,11 +503,12 @@ impl HeadlessServer {
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
 
-        // #959: once per server start, cold or handed off. Here rather than in
-        // `App::new` because only now is the session restored (the live
-        // records openness is checked against) and, on a handoff, the
-        // exporting server done writing the log being folded.
-        self.app.reissue_open_delegations();
+        // #959 / ADR-0031: edges and goals, once per server start, cold or
+        // handed off. Here rather than in `App::new` because only now is the
+        // session restored (the live records openness is checked against)
+        // and, on a handoff, the exporting server done writing the log being
+        // folded.
+        self.app.reissue_open_records();
 
         let mut needs_render = true;
         let mut needs_full_render = true;
@@ -557,6 +558,7 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
+            self.app.reissue_goals_after_rotation();
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;

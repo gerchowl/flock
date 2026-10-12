@@ -11,7 +11,9 @@
 - Builds on: ADR-0027 (delegate edges), ADR-0028 (state vocabulary, events,
   registered waits, wake), ADR-0029 (exit and error contract).
 - Decision owner: operator.
-- Implemented: none. Slices (§7) filed 2026-10-11: G0 #1033, G1 #1034, G2 #1035, G3a #885, G3b #1036, G3c #886, G4 #882 + #883, G5 #884, G6 #965. The cross-ADR order is §8.
+- Implemented: G1a (#1034): the durable `Goal*` kinds, the in-memory record
+  and its re-issue on start and rotation (`src/app/goals.rs`). G1 was split
+  into G1a #1034, G1b #1155, G1c #1156 and G1d #1157 on 2026-10-12. Slices (§7) filed 2026-10-11: G0 #1033, G1 #1034, G2 #1035, G3a #885, G3b #1036, G3c #886, G4 #882 + #883, G5 #884, G6 #965. The cross-ADR order is §8.
 
 ## Context
 
@@ -79,9 +81,14 @@ agents stopping at once will hit that.
 The goal belongs to an agent (`AgentId`, never a pane; #573 owner decision 2)
 and lives in the server. It is recorded as durable events in the one log
 (`GoalArmed`, `GoalAmended`, `GoalStatusSet`, `GoalSubtaskChanged`,
-`GoalVerdict`, `GoalMet`, `GoalDisarmed`) and folded into a live record, the
-same pattern as lineage and ADR-0027's edges, with the same re-issue-on-start
-rule for open goals so rotation cannot drop one.
+`GoalVerdict`, `GoalMet`, `GoalPaused`, `GoalResumed`, `GoalDisarmed`) and
+folded into a live record, the same pattern as lineage and ADR-0027's edges,
+with the same re-issue-on-start rule for open goals so rotation cannot drop
+one.
+
+Amended 2026-10-12 (owner decision on #1034): pause and resume are recorded as
+two durable kinds of their own, `GoalPaused` (with an optional end time) and
+`GoalResumed`.
 
 That answers three #573 requirements at once: crash safety (every write is one
 appended event), versioned state (the owner's field report lost STATUS.md to
