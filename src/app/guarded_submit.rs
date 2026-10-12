@@ -299,6 +299,36 @@ fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRunt
         .is_some_and(|rows| matches!(rows.as_slice(), [row] if is_paste_chip(agent, row)))
 }
 
+/// A pane too narrow for the message shows only the editor's last rows, wrapped
+/// at spaces or mid-word (#1122). Those rows, wraps removed, must end the sent
+/// text. Whitespace is dropped on both sides because a wrap at a space keeps it
+/// on neither row.
+///
+/// The editor must also be clipped: the sent text cannot fit in the visible
+/// rows at `row_width` columns each, so its start scrolled off. A fully visible
+/// editor that holds only the end of the text lost the start, and stays Other.
+fn matches_wrapped_tail(rows: &[&str], text: &str, row_width: usize) -> bool {
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let tail = squash(&rows.concat());
+    rows.len() > 1
+        && !tail.is_empty()
+        && text.trim().chars().count() > rows.len() * row_width
+        && squash(text).ends_with(&tail)
+}
+
+fn editor_shows_wrapped_tail(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> bool {
+    // Each editor row loses at least the two-column prompt or indent.
+    let row_width = usize::from(runtime.current_size().1.saturating_sub(2));
+    editor_rows(agent, runtime).is_some_and(|rows| {
+        let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+        matches_wrapped_tail(&rows, text, row_width)
+    })
+}
+
 /// A draft flock can move aside and put back exactly: one editor row, with
 /// no paste or image chip whose contents the screen does not show. Several
 /// rows are refused because the screen cannot tell a typed newline from the
@@ -654,10 +684,12 @@ impl App {
             // Both Enters went out and no turn started. If the composer still
             // holds the sent text, it swallowed the key and the caller must
             // clear it before retrying (ADR-0029 §1).
-            // A folded paste chip stands in for the text it folded (#995).
+            // A folded paste chip stands in for the text it folded (#995), and
+            // a wrapped tail for the text above it (#1122).
             let typed = terminal.effective_known_agent().is_some_and(|agent| {
                 editor_shows(agent, runtime, &reported_text)
                     || editor_shows_paste_chip(agent, runtime)
+                    || editor_shows_wrapped_tail(agent, runtime, &reported_text)
             });
             return Some(Outcome::Unconfirmed(if typed {
                 "typed_not_submitted"
@@ -684,9 +716,12 @@ impl App {
         // empty editor remains safe, but only exact owned text permits a retry.
         // The composer read empty before the paste and no operator input came
         // since, so a lone paste chip in the idle editor is the text flock
-        // typed, folded by the harness (#995).
+        // typed, folded by the harness (#995). The same holds for the wrapped
+        // tail a narrow pane leaves visible of a long message (#1122).
         let owned = editor == Composer::Owned
-            || (editor == Composer::Other && editor_shows_paste_chip(agent, runtime));
+            || (editor == Composer::Other
+                && (editor_shows_paste_chip(agent, runtime)
+                    || editor_shows_wrapped_tail(agent, runtime, &reported_text)));
         if !owned && (attempt.sent || editor != Composer::Empty) {
             // A partial paste repaint may omit the footer or still show only
             // part of our text. Wait for ownership before the first Enter.
@@ -1263,3 +1298,7 @@ mod codex_721_tests;
 #[cfg(test)]
 #[path = "guarded_submit/paste_chip_995_tests.rs"]
 mod paste_chip_995_tests;
+
+#[cfg(test)]
+#[path = "guarded_submit/wrapped_tail_1122_tests.rs"]
+mod wrapped_tail_1122_tests;

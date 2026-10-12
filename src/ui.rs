@@ -924,6 +924,29 @@ mod tests {
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 80, 18));
     }
 
+    /// #1126: a split active workspace must not decide how wide a pane in a new
+    /// background workspace is born. The first visible pane here is about 14
+    /// columns, while a lone pane gets the whole terminal area minus its frame.
+    #[test]
+    fn new_pane_size_ignores_the_active_workspace_split() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("split");
+        ws.test_split(ratatui::layout::Direction::Horizontal);
+        ws.test_split(ratatui::layout::Direction::Horizontal);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 200, 50));
+        let first = app.view.pane_infos.first().expect("pane info").rect;
+        assert!(first.width < 100, "fixture must start split: {first:?}");
+
+        let area = app.view.terminal_area;
+        assert_eq!(app.estimate_pane_size(), (area.height - 2, area.width - 2));
+        assert!(area.width - 2 > 150);
+    }
+
     /// A desktop app with one workspace and `diagnostic` showing. Returns the app
     /// plus the area to render into; `terminal_area.y` is where the banner starts.
     fn app_with_config_diagnostic(diagnostic: &str) -> (crate::app::state::AppState, Rect) {

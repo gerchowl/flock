@@ -3371,9 +3371,23 @@ impl AppState {
         crate::config::terminal_key_matches_combo(key, (self.prefix_code, self.prefix_mods))
     }
 
+    /// Spawn size for a new pane: one framed pane filling the last laid-out
+    /// terminal area (#1126).
+    ///
+    /// This used to copy the first visible pane's rect, so with the active
+    /// workspace split three ways every pane started in a new background
+    /// workspace was born about 14 columns wide. A detached server never lays
+    /// out an unfocused workspace again, so that sliver stuck until a client
+    /// attached, and guarded sends could not find the composer.
+    ///
+    /// Known limit: this does not subtract the agent header rows that
+    /// `carve_pane_header` (src/ui/panes.rs) takes from a laid-out pane, so a
+    /// background agent pane on a detached server can be a few rows taller
+    /// than its layout until the first render that resizes it.
     pub fn estimate_pane_size(&self) -> (u16, u16) {
-        if let Some(info) = self.view.pane_infos.first() {
-            (info.rect.height, info.rect.width)
+        let area = self.view.terminal_area;
+        if area.width > 2 && area.height > 2 {
+            (area.height - 2, area.width - 2)
         } else {
             (24, 80)
         }
