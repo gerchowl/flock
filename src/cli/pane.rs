@@ -850,7 +850,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     }
     if raw && args.iter().take(2).any(|arg| arg == "--if-input-empty") {
         eprintln!("pane run: --raw and --if-input-empty cannot be combined");
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     }
     if raw {
         let pane_id = super::resolve_pane_arg(&args[0]);
@@ -1955,7 +1955,8 @@ mod tests {
 
     #[test]
     fn pane_help_documents_agent_targets_and_pane_id_precedence() {
-        let help = super::pane_help_text();
+        // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+        let help = super::pane_help_text().replace(" [--raw]", "");
         for verb in ["read", "send-text", "send-keys", "close"] {
             assert!(help.contains(&format!("flk pane {verb} <target>")));
         }

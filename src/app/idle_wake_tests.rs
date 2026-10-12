@@ -1730,24 +1730,28 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
 
 #[tokio::test]
 async fn plain_paste_observes_folded_and_busy_composers_after_dispatch() {
-    for (agent, before, after, level) in [
+    for (agent, before, after, level, raw) in [
         (
             Agent::Claude,
             "────\r\n❯ \r\n────",
             "────\r\n❯ [Pasted text #1 +20 lines]\r\n────",
             "composer_changed",
+            false,
         ),
         (
             Agent::Codex,
             "› \r\n? for shortcuts",
             "› [Pasted Content 4000 chars]\r\n? for shortcuts",
             "composer_changed",
+            false,
         ),
         (
             Agent::Claude,
             "Working (esc to interrupt)\r\n────\r\n❯ draft \r\n────",
             "Working (esc to interrupt)\r\n────\r\n❯ draft hello world\r\n────",
             "text_matched",
+            // Pasting onto a draft is refused unless the caller opts in (#1162).
+            true,
         ),
     ] {
         let Rig {
@@ -1768,7 +1772,7 @@ async fn plain_paste_observes_folded_and_busy_composers_after_dispatch() {
         let response = app.handle_api_request(Request {
             id: "paste".into(),
             method: Method::PaneSendText(PaneSendTextParams {
-                raw: false,
+                raw,
                 pane_id: pane,
                 text: "hello world".into(),
             }),

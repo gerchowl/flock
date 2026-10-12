@@ -415,7 +415,10 @@ mod tests {
     #[test]
     fn pane_verb_help_documents_targets_and_precedence() {
         for verb in ["read", "send-text", "send-keys", "close"] {
-            let usage = usage_for(&["pane", verb, "--help"]).unwrap();
+            // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+            let usage = usage_for(&["pane", verb, "--help"])
+                .unwrap()
+                .replace(" [--raw]", "");
             assert!(usage.contains(&format!("flk pane {verb} <target>")));
             assert!(usage.contains("pane id, terminal id, or unique agent name/label"));
             assert!(usage.contains("A pane id wins over a same-named agent"));
