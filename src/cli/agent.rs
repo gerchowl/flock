@@ -46,19 +46,19 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
-pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit [--raw]] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  A one-row draft in the composer is moved aside and typed back after the submit; a multi-row or pasted-chip draft is refused with input_not_empty (exit 10).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Into an agent composer holding a draft it refuses with input_not_empty (exit 10) before typing; --raw (only with --no-submit) types anyway. Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
 
 pub(super) const AGENT_HISTORY_USAGE: &str =
     "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
 
 pub(super) const AGENT_RESTART_USAGE: &str =
     "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
 
-pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]";
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--questions POLICY] [--unattended] [--dry-run]";
 
 pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "flk agent wait <target> --status <",
@@ -114,6 +114,8 @@ struct AgentStartFlags {
     focus: bool,
     wait_ready: bool,
     ready_timeout_ms: Option<u64>,
+    /// #1179: `--questions` and `--unattended`.
+    asked: super::questions::Asked,
 }
 
 /// Parse the flags before `--`. `separator` is the index of the terminator, so
@@ -188,6 +190,16 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.wait_ready = true;
                 index += 1;
             }
+            "--questions" => {
+                flags.asked.questions = Some(super::questions::parse_policy(
+                    args.get(index + 1).filter(|_| index + 1 < separator),
+                )?);
+                index += 2;
+            }
+            "--unattended" => {
+                flags.asked.unattended = true;
+                index += 1;
+            }
             "--ready-timeout" => {
                 let value = value_for("--ready-timeout")?;
                 flags.ready_timeout_ms = Some(
@@ -239,7 +251,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         focus,
         wait_ready,
         ready_timeout_ms,
+        asked,
     } = flags;
+    let asked = asked.gate(
+        &format!("agent start {name}"),
+        super::questions::server_takes_questions,
+    );
     // Resolved here rather than in the parser, which stays a pure function of
     // `args`: the server would read a relative `--cwd` against its own
     // directory (#898).
@@ -261,6 +278,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             here,
             focus,
             argv: args[separator + 1..].to_vec(),
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?;
     if dry_run || !wait_ready || response.get("error").is_some() {
@@ -298,6 +317,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     let mut pivot = None;
     let mut focus = false;
     let mut dry_run = false;
+    let mut asked = super::questions::Asked::default();
 
     let mut index = 1;
     while index < args.len() {
@@ -346,6 +366,20 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
                 pivot = Some(String::new());
                 index += 1;
             }
+            "--questions" => {
+                match super::questions::parse_policy(args.get(index + 1)) {
+                    Ok(policy) => asked.questions = Some(policy),
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return Ok(super::exit::USAGE);
+                    }
+                }
+                index += 2;
+            }
+            "--unattended" => {
+                asked.unattended = true;
+                index += 1;
+            }
             "--dry-run" => {
                 dry_run = true;
                 index += 1;
@@ -365,6 +399,10 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    let asked = asked.gate(
+        &format!("agent fork {target}"),
+        super::questions::server_takes_questions,
+    );
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:fork".into(),
         method: Method::AgentFork(AgentForkParams {
@@ -376,6 +414,8 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
             label,
             pivot,
             focus,
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?)
 }
@@ -918,14 +958,21 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// A send submits unless `--no-submit` says otherwise (#995). `--submit`, the
-/// old opt-in, is still accepted and changes nothing.
+/// old opt-in, is still accepted and changes nothing. `--raw` lets a
+/// `--no-submit` type onto a composer draft (#1162), and is refused with a
+/// submit, whose guard is the point of submitting through flock.
 fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     let mut words = args;
     let mut submit = true;
+    let mut raw = false;
     let mut flag = |word: &str| match word {
         "--submit" => true,
         "--no-submit" => {
             submit = false;
+            true
+        }
+        "--raw" => {
+            raw = true;
             true
         }
         _ => false,
@@ -942,13 +989,14 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
     while !literal && text.first().is_some_and(|word| flag(word)) {
         text = &text[1..];
     }
-    if text.is_empty() {
+    if text.is_empty() || (raw && submit) {
         return None;
     }
     Some(AgentSendParams {
         target,
         text: text.join(" "),
         submit,
+        raw,
     })
 }
 
@@ -1156,7 +1204,7 @@ fn print_agent_help() {
     eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
-    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
+    eprintln!("  {AGENT_FORK_USAGE}");
     eprintln!("  flk agent hibernate <target>|--all");
     eprintln!("  flk agent resume <target>|--all");
     eprintln!(
@@ -1253,6 +1301,14 @@ mod tests {
         assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
         assert!(super::parse_agent_send_args(&["worker".into(), "--no-submit".into()]).is_none());
         assert!(super::AGENT_SEND_USAGE.contains("--no-submit types only"));
+        let raw = parse(&["--no-submit", "--raw", "worker", "hello"]);
+        assert!(!raw.submit && raw.raw, "#1162: --raw types onto a draft");
+        assert!(!parse(&["--no-submit", "worker", "hello"]).raw);
+        assert!(
+            super::parse_agent_send_args(&["--raw".into(), "worker".into(), "hello".into()])
+                .is_none(),
+            "--raw with a submit is refused: the submit's guard is the point"
+        );
     }
 
     #[test]

@@ -223,20 +223,37 @@ impl App {
         format!("architect {architect}")
     }
 
-    /// Once per server start: read the durable log once and fold both the
-    /// delegation edges and the goals from it (ADR-0031 §3), re-issuing what
-    /// is open so log rotation cannot drop it. The same read seeds the
-    /// derived agent events (ADR-0028 §2, #1027) and announces `gone` for an
-    /// agent no restored pane carries.
+    /// Once per server start: read the durable log once and fold the
+    /// delegation edges, the goals (ADR-0031 §3) and the owner bindings
+    /// (ADR-0035 §1) from it, re-issuing what is open so log rotation cannot
+    /// drop it. The same read seeds the derived agent events (ADR-0028 §2,
+    /// #1027) and announces `gone` for an agent no restored pane carries.
     ///
     /// Run from the server loop rather than from `App::new`, so a live
     /// handoff folds the log only after the exporting server has stopped
     /// writing to it.
     pub(crate) fn reissue_open_records(&mut self) {
         let restored = self.event_hub.persisted_events_after(0);
+        // Read before the re-issues, so a rotation they cause re-issues again.
+        self.record_rotations_seen = self.event_hub.rotations();
         self.reissue_open_delegations(&restored);
         self.reissue_open_goals(&restored);
+        self.reissue_owner_bindings(&restored);
         self.begin_agent_phases(&restored);
+    }
+
+    /// Server loop: when the log rotated since the last look, re-issue the
+    /// open goals and the owner bindings from memory (ADR-0031 §4). A
+    /// rotation keeps the old active file as `.1`, so each record is on disk
+    /// until its copy lands.
+    pub(crate) fn reissue_records_after_rotation(&mut self) {
+        let rotations = self.event_hub.rotations();
+        if rotations == self.record_rotations_seen {
+            return;
+        }
+        self.record_rotations_seen = rotations;
+        self.emit_goal_reissues();
+        self.emit_owner_reissues();
     }
 
     /// Fold the edges, decide openness against the live agent records and
@@ -451,6 +468,8 @@ pub(crate) mod handler_tests {
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
                 label: label.map(str::to_string),
+                questions: None,
+                unattended: false,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).expect(&response);

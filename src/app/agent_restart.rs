@@ -922,6 +922,7 @@ impl App {
             .run_id
             .clone()
             .map(crate::integration::set_pending_run_id);
+        let _questions = crate::integration::set_pending_questions(terminal.questions);
         let _allowlist = terminal.spawned_by.as_ref().map(|_| {
             crate::integration::set_pending_spawn_allowlist(crate::spawn::allowlist::for_argv(
                 &plan.argv,

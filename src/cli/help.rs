@@ -248,7 +248,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "clear-field",
         "flk pane clear-field <key> [--pane <pane_id>]",
     ),
-    ("pane", "run", "flk pane run [--if-input-empty [--min-age-secs N] [--if-session ID]] <pane_id> <command>"),
+    ("pane", "run", super::pane::PANE_RUN_USAGE),
     ("peers", "status", "flk peers status [--json]"),
     ("peers", "summary", "flk peers summary [--json]"),
     (
@@ -415,7 +415,10 @@ mod tests {
     #[test]
     fn pane_verb_help_documents_targets_and_precedence() {
         for verb in ["read", "send-text", "send-keys", "close"] {
-            let usage = usage_for(&["pane", verb, "--help"]).unwrap();
+            // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+            let usage = usage_for(&["pane", verb, "--help"])
+                .unwrap()
+                .replace(" [--raw]", "");
             assert!(usage.contains(&format!("flk pane {verb} <target>")));
             assert!(usage.contains("pane id, terminal id, or unique agent name/label"));
             assert!(usage.contains("A pane id wins over a same-named agent"));
