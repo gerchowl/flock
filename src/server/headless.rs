@@ -1364,6 +1364,7 @@ impl HeadlessServer {
                 node_id: self.app.node_id.clone(),
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
+                agent_questions: true,
             }),
         )?;
 

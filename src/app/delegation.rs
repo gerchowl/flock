@@ -451,6 +451,8 @@ pub(crate) mod handler_tests {
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
                 label: label.map(str::to_string),
+                questions: None,
+                unattended: false,
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).expect(&response);
