@@ -48,7 +48,7 @@ impl ErrorCode {
         match self {
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,
             // ADR-0029 §2: code 13 covers the ADR-0014 boundary.
-            ErrorCode::OperatorOnly => exit::POLICY_REFUSED,
+            ErrorCode::OperatorOnly | ErrorCode::GoalCallerRefused => exit::POLICY_REFUSED,
             ErrorCode::QuestionsWideningRefused => exit::POLICY_REFUSED,
             _ => exit::FAILURE,
         }
@@ -281,7 +281,9 @@ mod tests {
         for code in ErrorCode::ALL {
             let want = match code {
                 ErrorCode::ServerVersionGap => 78,
-                ErrorCode::OperatorOnly | ErrorCode::QuestionsWideningRefused => 13,
+                ErrorCode::OperatorOnly
+                | ErrorCode::GoalCallerRefused
+                | ErrorCode::QuestionsWideningRefused => 13,
                 _ => 1,
             };
             assert_eq!(code.exit(), want, "{code:?}");

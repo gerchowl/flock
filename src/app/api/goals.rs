@@ -527,8 +527,8 @@ mod tests {
     }
 
     /// An agent that is not the target's supervisor changes nothing, an
-    /// unattested caller nothing either, and `self` needs an agent pane. Every refusal writes nothing, and status
-    /// stays open to every caller.
+    /// unattested caller nothing either, and `self` needs an agent pane.
+    /// Every refusal writes nothing, and status stays open to every caller.
     #[tokio::test]
     async fn writes_by_another_agent_or_an_unattested_caller_are_refused() {
         let log = temp_log("goal-verbs-refused");

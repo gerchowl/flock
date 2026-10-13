@@ -597,3 +597,17 @@ fn goal_writes_reach_a_current_server() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(methods, ["ping", "goal.stop"]);
 }
+
+/// A goal write the caller may not make is a policy refusal: exit 13, like
+/// `operator_only` (ADR-0030 §1 amendment of 2026-10-13, ADR-0029 §2).
+#[test]
+fn a_refused_goal_caller_exits_13() {
+    let (output, methods) = run(
+        &["goal", "stop", "--agent", "fixture"],
+        Some("current"),
+        Some(serde_json::json!({"code":"goal_caller_refused", "message":"not your goal"})),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(13));
+    assert_eq!(methods, ["ping", "goal.stop"]);
+}

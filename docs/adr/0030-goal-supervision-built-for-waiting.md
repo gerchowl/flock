@@ -100,20 +100,27 @@ two durable kinds of their own, `GoalPaused` (with an optional end time) and
 - The goal's **own agent** may arm its goal and set its status (ADR-0030 §6,
   `goal status set`, a later slice). It may **not** pause, resume or stop it:
   that would let it walk out of the done gate (rung 6) and the judge (rung 8).
-- **Pause, resume and stop**, and arming on another agent's behalf, are open
-  to the **operator** and to the agent's **supervisor**: the architect on its
-  `AgentDelegated` edge (ADR-0027), matched by restart-stable `AgentId`
-  (ADR-0028, #1013), never by pane, so an architect can stop a runaway
-  delegate after a restart too.
-- **Everyone else** is refused with `goal_caller_refused`, and so is a caller
-  the server cannot attest (no readable pid, or relayed from a mesh peer;
-  goals are per host, §7). Reading a goal (`goal.status`) stays open to every
-  caller.
-- `goal_caller_refused` takes the class `operator_only` has: retry `never`,
-  CLI exit 1 (`FAILURE`). The caller cannot fix it by retrying, and exit 13
-  (`POLICY_REFUSED`) is registered for the question-policy widening only.
-- Like `owner.bind`'s operator check, the agent check reads process ancestry
-  and is cooperative until uid attestation (ADR-0035 §6.3).
+- **Pause, resume and stop** are open to the **operator** and to the agent's
+  **supervisor**: the architect on its `AgentDelegated` edge (ADR-0027),
+  matched by restart-stable `AgentId` (ADR-0028, #1013), never by pane, so an
+  architect can stop a runaway delegate after a restart too.
+- **Everyone else** is refused with `goal_caller_refused`.
+
+Consequences recorded with the decision, not part of it:
+
+- Arming on another agent's behalf follows from §5 (a supervisor runs its
+  delegate under a goal, `delegate start --goal`): G1b lets the operator and
+  the supervisor arm, and refuses any other agent.
+- A caller the server cannot attest (no readable pid, or relayed from a mesh
+  peer; goals are per host, §7) is refused too. Reading a goal
+  (`goal.status`) stays open to every caller.
+- `goal_caller_refused` takes `operator_only`'s class: retry `never`, CLI
+  exit 13 (`POLICY_REFUSED`, ADR-0029 §2 "refused by policy or scope").
+- **Known gap:** the agent check reads process ancestry, as `owner.bind`'s
+  operator check does, so it is cooperative until uid attestation (O19a,
+  #1208, #1177; ADR-0035 §6.3). A child an agent detaches with `setsid` has
+  no agent pane in its ancestry and passes as the operator, so
+  `setsid flk goal stop` lets an agent out of its own goal until then.
 
 That answers three #573 requirements at once: crash safety (every write is one
 appended event), versioned state (the owner's field report lost STATUS.md to
