@@ -1207,6 +1207,35 @@ impl App {
         }
     }
 
+    /// The agent in a pane and its ADR-0028 `state`, as `agent.get` reports
+    /// it, without the rest of `pane_info`. `None` when the pane runs no agent.
+    pub(super) fn agent_state_of(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<(String, crate::api::agent_state::AgentState)> {
+        let pane_state = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
+        if !terminal.is_agent_terminal() {
+            return None;
+        }
+        let status = super::api_helpers::pane_agent_status_from_terminal(terminal, pane_state.seen);
+        let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
+        let state = super::api_helpers::agent_state(
+            status,
+            terminal.last_state_authority(),
+            terminal.effective_known_agent(),
+            terminal
+                .state_changed_at
+                .map(|changed| changed.elapsed().as_millis() as u64),
+            self.agent_background(terminal, status),
+            super::api_helpers::screen_attention(provider_wait, terminal.needs_human),
+        );
+        Some((terminal.agent_id.to_string(), state))
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
@@ -1236,16 +1265,7 @@ impl App {
                     pane.agent_status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
-            state: Some(super::api_helpers::agent_state(
-                pane.agent_status,
-                terminal.last_state_authority(),
-                terminal.effective_known_agent(),
-                terminal
-                    .state_changed_at
-                    .map(|changed| changed.elapsed().as_millis() as u64),
-                self.agent_background(terminal, pane.agent_status),
-                super::api_helpers::screen_attention(provider_wait, terminal.needs_human),
-            )),
+            state: self.agent_state_of(ws_idx, pane_id).map(|(_, state)| state),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {
                 Some("resume_failed".into())

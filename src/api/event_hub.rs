@@ -898,6 +898,87 @@ mod tests {
         cleanup(&path);
     }
 
+    /// #1027: the derived agent kinds are new to v2.0.0, whose reader skips
+    /// a line when `envelope.event` is a string it cannot type and `seq` is a
+    /// number (#1058). Every line this build writes for them has that shape,
+    /// under a name v2.0.0 does not know, and reads back whole here.
+    #[test]
+    fn the_derived_agent_kinds_are_lines_an_older_reader_skips() {
+        use crate::api::agent_state::{AgentState, Phase};
+        use crate::api::schema::{AgentPhaseEvent, EventData};
+        let path = temp_log("derived-agent-kinds");
+        let hub = EventHub::with_persistence(path.clone());
+        let event = AgentPhaseEvent {
+            agent_id: "agent_a".into(),
+            pane: "w1:p1".into(),
+            from: Phase::Working,
+            to: Phase::NeedsHuman,
+            state: AgentState::unknown(),
+            held_ms: 20_000,
+        };
+        let kinds = [
+            (
+                EventKind::AgentPhaseChanged,
+                EventData::AgentPhaseChanged(event.clone()),
+            ),
+            (
+                EventKind::AgentNeedsHuman,
+                EventData::AgentNeedsHuman(event.clone()),
+            ),
+            (
+                EventKind::AgentLimitReached,
+                EventData::AgentLimitReached(event.clone()),
+            ),
+            (EventKind::AgentGone, EventData::AgentGone(event)),
+        ];
+        for (kind, data) in kinds.clone() {
+            hub.push(EventEnvelope { event: kind, data });
+        }
+        drop(hub);
+        let names: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(value["seq"].is_u64(), "{line}");
+                value["envelope"]["event"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "agent.phase_changed",
+                "agent.needs_human",
+                "agent.limit_reached",
+                "agent.gone"
+            ]
+        );
+        // Kind names v2.0.0's `EventKind` has with the `agent_` prefix.
+        let known_to_v2_0_0 = [
+            "agent_forked",
+            "agent_delegated",
+            "agent_removed",
+            "agent_hibernated",
+            "agent_resumed_from_hibernation",
+            "agent_restart",
+        ];
+        assert!(names
+            .iter()
+            .all(|name| !known_to_v2_0_0.contains(&name.as_str())));
+        let restarted = EventHub::with_persistence(path.clone());
+        let back: Vec<EventEnvelope> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        let written: Vec<EventEnvelope> = kinds
+            .into_iter()
+            .map(|(event, data)| EventEnvelope { event, data })
+            .collect();
+        assert_eq!(back, written);
+        cleanup(&path);
+    }
+
     /// ADR-0028 §3a for the goal kinds (ADR-0030 §1): a reader that predates
     /// them must skip every `Goal*` line, not quarantine the log. This binary
     /// knows the kinds, so the older reader's view is made by renaming each

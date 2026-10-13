@@ -581,6 +581,25 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 
 Use `events.wait` when you want one matching event and then a response.
 
+### Supervisor events
+
+The server derives four durable kinds from each local agent's `state` (the one `agent.get` reports), so a supervisor reads facts instead of re-deriving them from `pane_agent_status_changed` (ADR-0028 §2):
+
+| Kind | Emitted when |
+| --- | --- |
+| `agent.phase_changed` | the agent's `phase` settled into a different supervisor phase |
+| `agent.needs_human` | that phase is `needs_human` |
+| `agent.limit_reached` | that phase is `limit_reached` |
+| `agent.gone` | no pane carries the agent any more, or a pane this server read as an agent stopped being one (it left `agent.list`) |
+
+All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent.needs_human`, `agent.limit_reached` and `agent.gone` repeat the `agent.phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent.phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
+
+A phase is announced only once it has held for the server's settle window: 20 s, a fixed server constant that is not configurable yet (`[events] settle_ms` is [#1152](https://github.com/gerchowl/flock/issues/1152)). A prompt answered or a turn that ends within the window emits nothing. The window is applied once. `finished`, `finished_with_background` and `waiting_on_event` already include it, because the idle turn must hold that long before `phase` reads them, so moving into one of them from a working, prompt or limit phase is announced as soon as the server sees it. A move between two of them, such as a background shell or a registered wait coming and going, must hold for the window itself. `settling` and `unknown` are never announced. `gone` is announced at once.
+
+The server does not poll for these. It re-reads an agent's `state` when the detector or a hook reports a change on its pane or a pane lifecycle event fires, and otherwise only when a pending phase's window closes. Codex and opencode count background jobs from the process tree, which raises no event, so a job ending while nothing else on the pane changes is seen at the pane's next change ([#1163](https://github.com/gerchowl/flock/issues/1163)).
+
+`from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
+
 ## Channel adapters
 
 An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
