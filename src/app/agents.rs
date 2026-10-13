@@ -461,6 +461,8 @@ impl App {
         let pane_id = tab.root_pane;
         let terminal_id = terminal.id.clone();
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        #[cfg(test)]
+        tests::wait_for_replacement_exit(pane_id);
         if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
             if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
                 runtime.shutdown();
@@ -1435,6 +1437,35 @@ enum StartPlacement {
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
 
+    thread_local! {
+        // Only the staged replacement uses this receiver. The existing shell
+        // retains its own event sender, so its events cannot satisfy the wait.
+        static REPLACEMENT_EXIT_EVENTS: std::cell::RefCell<
+            Option<tokio::sync::mpsc::Receiver<crate::events::AppEvent>>
+        > = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Synchronize the rollback fixture with the real watcher, not the 250 ms
+    /// liveness window. PaneDied is sent after the exit slot is recorded.
+    pub(super) fn wait_for_replacement_exit(pane_id: crate::layout::PaneId) {
+        let Some(mut events) = REPLACEMENT_EXIT_EVENTS.with(|slot| slot.borrow_mut().take()) else {
+            return;
+        };
+        // The API handler is synchronous and runs inside Tokio. Receive on an
+        // OS thread so blocking_recv runs outside the Tokio runtime.
+        std::thread::spawn(move || {
+            while let Some(event) = events.blocking_recv() {
+                if let crate::events::AppEvent::PaneDied { pane_id: died } = event {
+                    assert_eq!(died, pane_id, "wait for the staged replacement only");
+                    return;
+                }
+            }
+            panic!("replacement watcher closed without reporting its exit");
+        })
+        .join()
+        .expect("replacement watcher event");
+    }
+
     fn test_app() -> crate::app::App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::app::App::new(
@@ -1969,20 +2000,40 @@ mod tests {
     async fn agent_start_failed_replacement_keeps_shell() {
         let (mut app, workspace, pane) = created_root_shell().await;
         let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
-        for argv in [
-            vec![std::env::temp_dir()
-                .join("flock-818-missing-program")
-                .to_string_lossy()
-                .into_owned()],
-            vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+        for (argv, expected_error) in [
+            (
+                vec![std::env::temp_dir()
+                    .join("flock-818-missing-program")
+                    .to_string_lossy()
+                    .into_owned()],
+                "agent_start_failed",
+            ),
+            (
+                vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+                "agent_exited_at_start",
+            ),
         ] {
+            if expected_error == "agent_exited_at_start" {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                app.event_tx = tx;
+                REPLACEMENT_EXIT_EVENTS.with(|slot| *slot.borrow_mut() = Some(rx));
+            }
             let mut request = targeted_start_request(&workspace, None);
             if let Method::AgentStart(params) = &mut request.method {
                 params.argv = argv;
             }
             let raw = app.handle_api_request(request);
             let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            assert!(response.get("error").is_some(), "{response}");
+            assert_eq!(response["error"]["code"], expected_error, "{response}");
+            if expected_error == "agent_exited_at_start" {
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("17"),
+                    "{response}"
+                );
+            }
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
             assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
             assert!(!app
