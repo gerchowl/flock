@@ -593,9 +593,22 @@ async fn restart_waiting_agent_exit_cancels_immediately_and_allows_retry() {
         .unwrap()
         .try_send_bytes(bytes::Bytes::from_static(b"exit\r"))
         .unwrap();
-    wait_for_dead_runtime(&rig).await;
-    while let Ok(event) = rig.app.event_rx.try_recv() {
+    // The watcher publishes its exit slot before enqueueing PaneDied. Await
+    // the event that actually cancels the restart, including a delayed watcher.
+    let pane_id = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    loop {
+        let event = rig
+            .app
+            .event_rx
+            .recv()
+            .await
+            .expect("runtime event channel");
+        let died =
+            matches!(&event, crate::events::AppEvent::PaneDied { pane_id: id } if *id == pane_id);
         rig.app.handle_internal_event(event);
+        if died {
+            break;
+        }
     }
     assert!(has_phase(&rig, "restart_cancelled"));
     assert!(rig.app.state.agent_restarts.pending.is_empty());
