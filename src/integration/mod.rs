@@ -78,19 +78,23 @@ pub(crate) struct ClaudeQuestionHook {
 }
 
 impl ClaudeQuestionHook {
-    /// The entry for this machine: the live config, and `claude --version`.
-    pub(crate) fn detect() -> Self {
-        let version = crate::process::TracedCommand::new("claude", "integration")
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output_traced_with_timeout(std::time::Duration::from_secs(10))
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| claude_version(&String::from_utf8_lossy(&output.stdout)));
+    /// The entry for `human_tools` and the Claude Code `version` found on
+    /// this machine (`None`: not found, or unreadable).
+    pub(crate) fn new(human_tools: Vec<String>, version: Option<crate::update::Version>) -> Self {
         Self {
-            human_tools: crate::config::Config::load().config.questions.human_tools,
+            human_tools,
             on_failure_block: version.is_some_and(|version| version >= CLAUDE_ON_FAILURE_SINCE),
         }
+    }
+
+    /// For a CLI process: the config on disk, which is the only config it
+    /// has, and [`probe_claude_version`]. The server never calls this. It
+    /// passes its live config, and probes off its loop.
+    pub(crate) fn detect() -> Self {
+        Self::new(
+            crate::config::Config::load().config.questions.human_tools,
+            probe_claude_version(),
+        )
     }
 
     /// Only question tools, so no other tool call starts a process. Claude
@@ -128,8 +132,65 @@ impl ClaudeQuestionHook {
         if self.on_failure_block {
             "question hook: fails closed (onFailure: block)"
         } else {
-            "question hook: fails open on timeout (claude < 2.1.295, or its version unreadable)"
+            QUESTION_HOOK_FAILS_OPEN
         }
+    }
+}
+
+/// The installed Claude Code's version, from `claude --version` on PATH.
+/// Blocks for up to 10 s, so it must never run on the server's App loop: the
+/// server calls it from a worker thread (see `App::spawn_integration_install`).
+pub(crate) fn probe_claude_version() -> Option<crate::update::Version> {
+    crate::process::TracedCommand::new("claude", "integration")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output_traced_with_timeout(std::time::Duration::from_secs(10))
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| claude_version(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// What install and `flk integration status` say about a question entry
+/// without `onFailure` (ADR-0034 §4).
+pub(crate) const QUESTION_HOOK_FAILS_OPEN: &str =
+    "question hook: fails open on timeout (claude < 2.1.295, or its version unreadable at install)";
+
+/// ADR-0034 §4's status line for the installed Claude question entry: the
+/// fail-open note when the entry carries no `onFailure: "block"`. Nothing
+/// when it does, or when there is no entry (the drift check reports that).
+pub(crate) fn question_hook_notes(target: crate::api::schema::IntegrationTarget) -> Vec<String> {
+    if target != crate::api::schema::IntegrationTarget::Claude {
+        return Vec::new();
+    }
+    let Ok(dir) = claude_dir() else {
+        return Vec::new();
+    };
+    let quoted = shell_single_quote(&effective_claude_hook_path(&dir).display().to_string());
+    let command = format!("bash {quoted} question");
+    let Some(settings) = fs::read_to_string(dir.join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    else {
+        return Vec::new();
+    };
+    let hooks = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["hooks"].as_array())
+        .flatten()
+        .filter(|hook| hook["command"].as_str() == Some(command.as_str()));
+    let mut found = false;
+    for hook in hooks {
+        found = true;
+        if hook["onFailure"].as_str() == Some("block") {
+            return Vec::new();
+        }
+    }
+    if found {
+        vec![QUESTION_HOOK_FAILS_OPEN.to_string()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -642,15 +703,20 @@ fn take_pending_run_id() -> Option<String> {
     PENDING_RUN_ID.with(|slot| slot.borrow_mut().take())
 }
 
+/// Install `target`. `question` builds Claude's question entry, and is only
+/// called for Claude: a CLI passes [`ClaudeQuestionHook::detect`], and the
+/// server its live config with a version probed off its loop.
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
+    question: impl FnOnce() -> ClaudeQuestionHook,
 ) -> io::Result<Vec<String>> {
-    install_target_with_hook_trust(target, true)
+    install_target_with_hook_trust(target, true, question)
 }
 
 pub(crate) fn install_target_with_hook_trust(
     target: crate::api::schema::IntegrationTarget,
     trust_hooks: bool,
+    question: impl FnOnce() -> ClaudeQuestionHook,
 ) -> io::Result<Vec<String>> {
     // Codex hooks and MCP share a config file. Capture ownership before the
     // hook adapter can replace it, so MCP registration respects its owner.
@@ -679,7 +745,7 @@ pub(crate) fn install_target_with_hook_trust(
             messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
-            let question = ClaudeQuestionHook::detect();
+            let question = question();
             let installed = install_claude(&question)?;
             let mut messages = Vec::new();
             if installed.removed_legacy_hook {
@@ -4242,6 +4308,41 @@ mod tests {
         assert_eq!(at_least("1.9.999"), Some(false));
         assert_eq!(at_least("not a version"), None);
         assert_eq!(at_least(""), None);
+    }
+
+    /// ADR-0034 §4: `flk integration status` says when the installed question
+    /// entry fails open, and is silent once it carries `onFailure: "block"`.
+    #[test]
+    fn status_reports_a_question_entry_that_fails_open() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let claude = crate::api::schema::IntegrationTarget::Claude;
+
+        assert!(question_hook_notes(claude).is_empty(), "nothing installed");
+        install_claude(&ClaudeQuestionHook::new(
+            Vec::new(),
+            claude_version("2.1.294"),
+        ))
+        .unwrap();
+        assert_eq!(
+            question_hook_notes(claude),
+            [QUESTION_HOOK_FAILS_OPEN.to_string()]
+        );
+        assert!(QUESTION_HOOK_FAILS_OPEN
+            .starts_with("question hook: fails open on timeout (claude < 2.1.295"));
+        install_claude(&ClaudeQuestionHook::new(
+            Vec::new(),
+            claude_version("2.1.296"),
+        ))
+        .unwrap();
+        assert!(question_hook_notes(claude).is_empty());
+        assert!(question_hook_notes(crate::api::schema::IntegrationTarget::Codex).is_empty());
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     /// A reinstall rewrites the question entry rather than keeping a stale

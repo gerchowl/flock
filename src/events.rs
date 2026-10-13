@@ -292,6 +292,9 @@ pub enum AppEvent {
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(WorktreeRemoveResult),
     WorktreeKillGateFinished(WorktreeKillGateResult),
+    /// The settings screen's "install recommended integrations" finished on
+    /// a worker thread: one line per target.
+    IntegrationsInstalled(Vec<String>),
     /// A bounded collection job finished outside the app loop.
     MeshRoutesCompleted(Box<crate::app::MeshRoutesCompletion>),
     MeshStoreRecovered(Result<Vec<crate::app::RecoveredMessage>, String>),

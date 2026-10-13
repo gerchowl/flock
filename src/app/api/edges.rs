@@ -99,6 +99,10 @@ impl App {
             self.schedule_paste(paste, respond_to);
             return;
         }
+        if let Some(install) = self.pending_integration_install.take() {
+            self.spawn_integration_install(install, respond_to);
+            return;
+        }
         let _ = respond_to.send(response);
     }
     pub(crate) fn expire_relayed_entries(&mut self) {
