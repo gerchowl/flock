@@ -19,6 +19,7 @@ mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
+mod owner;
 mod owners;
 mod panes;
 pub(crate) mod peers;
@@ -1520,6 +1521,12 @@ impl App {
                 return self.handle_peers_enroll_reset(request.id, params)
             }
             Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
+            Method::OwnerPolicyShow(params) => {
+                return self.handle_owner_policy_show(request.id, params)
+            }
+            Method::OwnerPolicyAdopt(params) => {
+                return self.handle_owner_policy_adopt(request.id, params)
+            }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentResult(params) => return self.handle_agent_result(request.id, params),

@@ -844,7 +844,8 @@ An entry with an invalid name, no `owner_node` or a duplicate name is dropped wi
 **Tokens.** At startup and on every config reload, the owner node issues a token for each binding it owns that has no trusted token yet. Each token is 32 random bytes, hex-encoded (64 lowercase hex digits, no newline), written to `<data dir>/channel-tokens/<name>.token`. The data dir is the directory that holds `config.toml` and the flock logs. Give the adapter that file, or the path to it.
 
 - **Trusted files only.** The server trusts a token file only when it is a regular file (not a symlink), owned by the user running the server, with mode exactly 0600, holding a well-formed token. Any other file matches no hello. At the next startup or reload, a file that fails this trust check is replaced by a new token. The server logs `channel.token.reissued` with the binding and the reason, never the token. The reasons are `symlink`, `unreadable` (permission denied), `not_private` (wrong type, owner or mode) and `malformed` (including empty). A file that was readable by others is therefore rotated, not reused. Any other read failure (too many open files, an I/O error) is not a trust failure. The file is left untouched, issuing logs `channel.token.issue_failed`, and a hello answers `channel_token_unavailable`.
-- **Crash safety.** A token is written to a temp file in the same directory, flushed to disk, then hard-linked into place. A crash can leave a stray `.<random>.tmp` file, but never an empty or partial token under the binding's name. When a file is replaced, the old one is removed only after the new token is on disk. Each issue sweeps stray `.*.tmp` files out of `channel-tokens/`. Only regular files owned by the server's user are removed. Symlinks are never followed or removed.
+- **Crash safety.** A token is written to a temp file in the same directory and flushed to disk. A first token is then hard-linked into place, which never overwrites a token another server issued first. A file that fails the trust check is replaced by renaming the new token over it, so the name never goes missing. A crash can leave a stray `.<pid>-<random>.tmp` file, but never an empty or partial token under the binding's name. Each issue sweeps the temp files whose writing process has exited out of `channel-tokens/`, and keeps those of a running process: during a live handoff the old and new servers can issue at the same time. A temp file without a pid in its name, left by an older release, is swept at once. Only regular files owned by the server's user are removed. Symlinks are never followed or removed.
+- **Known limits.** If two servers find the same untrusted file at once, both replace it and the second token wins. An adapter that read the first one gets `channel_unauthorized` and must read the file again. The temp-file sweep assumes every server issuing into `channel-tokens/` runs on this host and sees the same process ids. With the data dir on a network share, or a server in a container, a sweep can remove another server's temp file, which then logs `channel.token.issue_failed` until the next reload. On a platform where flock cannot check whether a process is running, every temp file is swept at each issue.
 - **The directory.** `channel-tokens/` is created 0700. If it already exists and the server's user owns it, it is tightened back to 0700 on every issue. If another user owns it, the server issues nothing into it and logs `channel.token.issue_failed`. That binding then refuses every hello until the directory is fixed.
 
 The server reads the file on every check, so:
@@ -852,6 +853,39 @@ The server reads the file on every check, so:
 - to **revoke** a binding, delete its token file, and the next hello is refused;
 - to **rotate**, delete the file and run `flk server reload-config`, which issues a new token;
 - removing a binding from config refuses its adapter at the next hello, but the token file stays until you delete it.
+
+## Owner policy (`.flk.toml`)
+
+A repo's resident owner (ADR-0035) reads its behaviour from the `[owner]` section of the repo's committed `.flk.toml`. Only behaviour that grants nothing lives there. Authority (caps, budgets, merge and release gates, the auto-accept scope) is set by operator verbs and is never read from the repo (ADR-0035 §6.2).
+
+```toml
+[owner.standup]
+time = "09:00"
+
+[owner.wake]
+# the wake class table and its windows (ADR-0035 §2)
+```
+
+**Where it is read** (ADR-0004 decisions 4–5). flk reads `.flk.toml` as committed on the repo's default branch, through the git common dir. It never reads a worktree's checked-out or edited copy, a PR branch, or any other branch. The default branch is the one `origin/HEAD` names. Its remote-tracking ref `origin/<branch>` is read, which is what landed upstream as of the last fetch. The local branch is read only when there is no `origin` copy of it. `policy_version` is the blob id of that file.
+
+**Which keys apply.** This release reads `[owner.wake]` and `[owner.standup]`. Every other key in `[owner]` is ignored and listed as `ignored_keys`, and nothing outside `[owner]` is read. Later slices add keys as they give them a meaning. `[[owner.rules]]` waits for the trigger rules (#1216), which check its actions at adoption.
+
+**Adoption.** A merged change applies nothing by itself. The operator reads it and adopts it:
+
+```bash
+flk owner policy show [--repo PATH]                  # current, adopted, pending
+flk owner policy adopt <policy_version> [--repo PATH]  # or `none` for no .flk.toml
+```
+
+Until then the previously adopted version applies, and before any adoption nothing applies. `adopt` takes the version `show` reported and is refused with `owner_policy_changed` once the default branch has moved past it. The adoption is recorded as a durable `owner_policy_adopted` event. It survives restarts and log rotation.
+
+**Operator only.** `adopt` is refused with `operator_only` (exit 13) for a caller inside a flk pane, over a mesh relay, or whose pid the server cannot read. This is cooperative until agents run as their own Unix user (O19a, #1208, #1177): an agent's detached (`setsid`) child has no pane in its ancestry and passes (ADR-0035 §6.3 point 6).
+
+**Known limits.**
+
+- `origin/HEAD` is written at clone time and git never revises it. If the repo's default branch moved, run `git remote set-head origin --auto`. `show` reports the branch it read as `default_branch`.
+- A pending change is reported by `flk owner policy show`, not yet by a notification (#1239).
+- Repos are keyed by their canonical git common dir.
 
 ## Environment variables
 

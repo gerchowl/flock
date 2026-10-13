@@ -58,6 +58,14 @@ as `expected_node_id` to clear it and invalidate its enrollment. Source defaults
 to `configured`. Reset is refused when invoked from an agent pane or over
 MCP/relay; the operator's shell is the trust boundary.
 
+## Owner policy
+
+`owner.policy.show { "repo": "<path>" }` reports a repo's owner policy (ADR-0035 §6.2, [Owner policy](/configuration/#owner-policy-flktoml)). `repo` is any path inside the repo. The result (`type: "owner_policy"`) carries `repo` (the canonical git common dir, the repo key), `default_branch`, `git_ref` (the ref read), `current` (the `.flk.toml` blob id there, or null), `adopted` (absent until the first adoption, then `{ "policy_version": <blob id or null> }`), `pending` (`current` differs from the adopted version), `policy` (the behaviour keys that apply: the adopted version's, or `{}`), `ignored_keys` (the current version's `[owner]` keys this build does not read) and `current_error` when the current version cannot be parsed. It fails with `owner_policy_unreadable` when the path is not in a git repo or the repo has no default branch.
+
+`owner.policy.adopt { "repo": "<path>", "policy_version": "<blob id>" | null }` makes the current version apply. It answers the same result with `adopted_now` (`false` when that version was already adopted). It is refused with `operator_only` for an agent pane, a mesh relay or an unattested caller, with `owner_policy_changed` when `policy_version` is no longer the current one, and with `owner_policy_unreadable` when the current version is not valid TOML. `adopt` is state-changing for the protocol gate, so a newer CLI refuses it against an older server with exit 78. `operator_only` maps to exit 13 through the error-code registry, for the CLI and for MCP's `data.exit`.
+
+An adoption is the durable event `owner_policy_adopted { repo, policy_version, reissued }`. The latest one per repo applies. Every server start and every log rotation writes each repo's adoption again with `reissued: true`. A server older than 2.0.0 cannot read a log holding it; 2.0.0 and later skip the kind if they do not know it.
+
 ## Choose an integration layer
 
 | Layer | Use it for |
@@ -492,7 +500,17 @@ Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock
 }
 ```
 
-`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, while the newest transcript entry is not assistant text (the Stop hook's "settled" rule); for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet.
+`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, until the transcript records the turn's end, by the rules below; for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet. While a Claude turn is still going by that rule, the result carries `turn_open_at_ms`, when its prompt was written, and so does a `no_result` refusal as `data.turn_open_at_ms`: a supervisor can tell "this turn is still running" from "nothing was written" without trusting a screen that may read idle mid-turn. It is absent when the turn is over, when the prompt lies outside the 1 MiB read, or when its entry carries no time; older servers never send it.
+
+A Claude turn is over, read from the transcript Claude Code writes (2.1.28x–2.1.29x), when any of these holds:
+
+- a `turn_duration` entry follows the newest prompt: the ordinary end of a model turn, Stop-hook continuations included;
+- the newest message is Claude's own `No response requested.`, which closes a resumed session (after its hidden `Continue from where you left off.`) and some local commands, with no `turn_duration`;
+- the newest prompt is the `[Request interrupted by user…]` notice, which Claude writes instead of `turn_duration` after an interrupt;
+- the newest prompt is an entry the harness wrote (a local slash command or its output, such as `/compact`, `/model` or `/exit`; a `!` shell command or its output; a `<task-notification>`), and no assistant entry follows it. A local command never runs the model. A notification, or a custom slash command, that the model then answers reopens the turn with the model's first entry;
+- a compaction summary is the newest entry after the newest prompt.
+
+The last two are ambiguous for a notification or a command the model is about to answer, and for an automatic compaction inside a turn. They are read as over, because reading them as running would hold open a turn that may never run. Otherwise, in a transcript that holds any `turn_duration` entry, the turn is still running, even when the newest entry is assistant text: Claude writes a narration between two tool calls as text too. In a transcript without one (a one-shot session, or a first turn not yet over), the turn is over when the newest entry is assistant text.
 
 ## Reading a handed-over file
 
@@ -634,7 +652,7 @@ An external channel (a Telegram bot, a Slack app) reaches flk through an **adapt
 
 `channel_not_owner` is answered before the token is checked, so anyone who can reach the socket can learn which binding names exist on a node and which node owns each one. Tokens can't be learned this way. Socket access is already the trust boundary: the socket is private to the user running the server.
 
-`channel_unauthorized` and `channel_not_owner` are in the `never` retry class: sending the same hello again can't succeed until the config or the token changes. `channel_token_unavailable` is in the `later` class: nothing changed, so retry once the condition clears. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`). The token itself never appears in a log, an event or a response.
+`channel_unauthorized` and `channel_not_owner` are in the `never` retry class: sending the same hello again can't succeed until the config or the token changes. `channel_token_unavailable` is in the `later` class: nothing changed, so retry once the condition clears. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`, `token_unavailable`). The token itself never appears in a log, an event or a response.
 
 **Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
 
