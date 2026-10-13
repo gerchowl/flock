@@ -342,7 +342,11 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
 
 #[test]
 fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
-    let fleet = fleet::spawn("ts-kill", PAIR);
+    let fleet = fleet::spawn_with_startup_probe("ts-kill", PAIR, |fleet, name| {
+        if name == "nodeb" {
+            support::write_fake_gh(&fleet.base.join("bin"));
+        }
+    });
     let owner = fleet.node("nodeb");
     let checkout = owner.home.join("kill-checkout");
     let commit = support::environment::Command::new("git")
@@ -378,14 +382,14 @@ fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     discover(&fleet, &recipient);
     send(fleet.node("nodea"), &sender, &recipient, "kill-mail");
     state(fleet.node("nodea"), "kill-mail", "delivered");
-    // keep_branch: the fixture's origin is a github.com URL nobody can query,
-    // so the branch half is refused as `worktree_merge_unknown` (#1278). The
-    // tombstone comes from the checkout teardown, which is what this tests.
+    // Keep the branch: this assertion concerns checkout teardown and custody.
     api(
         owner,
         "worktree.kill",
         json!({"workspace_id":recipient["workspace_id"],"force":true,"keep_branch":true,"dry_run":false}),
     );
+    let gh_calls = fs::read_to_string(fleet.base.join("bin/gh.log")).unwrap();
+    assert!(gh_calls.contains("pr view tombstone-fixture"), "{gh_calls}");
     state(fleet.node("nodea"), "kill-mail", "recipient_gone");
     let reason: String = db(owner)
         .query_row(
