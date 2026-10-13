@@ -108,11 +108,11 @@ use serde::{Deserialize, Serialize};
 /// v28 adds the `events.read` socket method (#1028). An older server rejects
 /// it as an unknown variant, which the client normalizes to exit 78.
 /// v29 adds `channel.hello` (#1037). A channel adapter refuses to start below
-/// it, through the #868 skew gate. v29 also adds `wait.park` (#1031), gated
-/// the same way, in the same unreleased protocol.
+/// it, through the #868 skew gate.
 /// v30 adds `owner.bind`, `owner.unbind`, `owner.list` and `owner.show`
 /// (ADR-0035 §1, #1196). Bind and unbind are gated by #868, so an older
-/// server is never sent them.
+/// server is never sent them. v30 also adds `wait.park` (#1031), gated by
+/// #868.
 pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Refusal notice sent to clients while a live update handoff is in

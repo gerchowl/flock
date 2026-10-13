@@ -739,7 +739,7 @@ A held read reports its filter as `events after <seq> [kinds <k>,...] [subjects 
 | `peer_incompatible` | 1 | The delegate runs on another host. This server cannot observe it (ADR-0028 §3a); park on that host. |
 | `agent_not_found` | 1 | No agent or delegation edge on this server has that id. |
 | `no_caller_pane` | 1 | The caller runs in no agent pane, so there is no agent to put the wait on. |
-| `server_version_gap` | 78 | The server is older than protocol 29: `flk wait park` refuses before sending (#868). |
+| `server_version_gap` | 78 | The server speaks an older protocol than the client (for `wait.park`, below 30, so a v29 server too): `flk wait park` refuses before sending (#868). |
 
 A held read from outside an agent pane is served as before and records no wait.
 
