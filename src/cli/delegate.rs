@@ -79,7 +79,7 @@ pub(super) const START_USAGE: &str = concat!(
     "flk delegate start <name> --brief FILE (--cwd PATH | --worktree --branch B [--repo PATH] [--base REF])\n",
     "                     [--harness opencode|claude|codex] [--model M] [--sandbox MODE] [--await] [--timeout MS]\n",
     "                     [--settle MS] [--silence DURATION] [--ready-timeout MS] [--max-chars N]\n",
-    "                     [--keep-on-failure] [--label TEXT] [--json]\n",
+    "                     [--keep-on-failure] [--label TEXT] [--questions POLICY] [--unattended] [--json]\n",
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
@@ -104,6 +104,11 @@ pub(super) const START_USAGE: &str = concat!(
     "                      removes it\n",
     "  --label TEXT        recorded on the architect -> delegate edge, default the delegate's name;\n",
     "                      a start from outside an agent pane prints `edge: none (unattested)`\n",
+    "  --questions POLICY  where the delegate's questions go: route (the default from an agent pane),\n",
+    "                      deny, ask_human (the default from the operator) or ask_operator\n",
+    "  --unattended        nobody watches the pane: the default becomes ask_operator. A policy that\n",
+    "                      reaches a human, and --unattended, are operator verbs: an agent asking is\n",
+    "                      refused with exit 13 before anything is created\n",
     "  a failed start prints the agent pane's last lines (`data.pane_tail` under --json)\n",
     "  the brief must ask for a final line `DONE: ...`, `BLOCKED: ...` or `VERDICT: ...`; a reply\n",
     "  ending on none of them is no_sentinel (exit 5); `flk delegate wait` lists every exit code\n",
@@ -947,6 +952,7 @@ struct StartFlags {
     model: Option<String>,
     sandbox: Option<String>,
     label: Option<String>,
+    asked: super::questions::Asked,
     await_result: bool,
     timeout_ms: Option<u64>,
     settle_ms: Option<u64>,
@@ -1020,7 +1026,7 @@ impl Verb {
             | "--sandbox" => self == Self::Start,
             "--after" => self == Self::Wait,
             "--force" => self == Self::Reap,
-            "--keep-on-failure" | "--label" => self == Self::Start,
+            "--keep-on-failure" | "--label" | "--questions" | "--unattended" => self == Self::Start,
             _ => false,
         }
     }
@@ -1073,6 +1079,14 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             "--keep-on-failure" => {
                 flags.keep_on_failure = true;
                 index += 1;
+            }
+            "--unattended" => {
+                flags.asked.unattended = true;
+                index += 1;
+            }
+            "--questions" => {
+                flags.asked.questions =
+                    Some(super::questions::parse_policy(Some(&value(&mut index)?))?)
             }
             "--timeout" => flags.timeout_ms = Some(number(flag, &value(&mut index)?)?),
             "--silence" => {
@@ -1131,6 +1145,7 @@ struct Parsed {
     model: Option<String>,
     sandbox: Option<String>,
     label: Option<String>,
+    asked: super::questions::Asked,
     after: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
@@ -1155,6 +1170,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
         model: flags.model.clone(),
         sandbox: flags.sandbox.clone(),
         label: flags.label.clone(),
+        asked: flags.asked,
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
         settle_ms: flags.settle_ms,
@@ -2724,6 +2740,14 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         }
     }
 
+    let pong = ping();
+    let asked = flags.asked.gate(&format!("delegate {name}"), || {
+        pong.as_ref()
+            .is_some_and(super::questions::advertises_questions)
+    });
+    if let Some(refused) = refused_questions(name, harness, asked) {
+        return Ok(refused);
+    }
     // Last before the create, so a start refused above never prints the swap.
     if mode == Mode::Worktree {
         let cwd = std::env::current_dir().ok();
@@ -2735,7 +2759,8 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(placement) => placement,
         Err(code) => return Ok(code),
     };
-    let label = edge_label(name, flags.label.as_deref(), server_takes_label());
+    let takes_label = pong.as_ref().is_some_and(advertises_label);
+    let label = edge_label(name, flags.label.as_deref(), takes_label);
     let started = start_the_agent(
         name,
         &placement,
@@ -2745,6 +2770,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
             sandbox: flags.sandbox.as_deref(),
         },
         label,
+        asked,
     );
     // An agent the server refused to start leaves the workspace with no
     // agent pane: it fails through the same path, with nothing to read, and
@@ -3416,14 +3442,54 @@ fn edge_label(name: &str, asked: Option<&str>, server_takes_label: bool) -> Opti
     None
 }
 
-/// Does the server advertise `agent_start_label`? A ping that fails reads as
-/// no, so the start goes ahead without the field rather than failing late.
-fn server_takes_label() -> bool {
+/// The server's pong, for the capabilities a start asks about. A ping that
+/// fails reads as advertising nothing, so the start goes ahead without the
+/// optional fields rather than failing late.
+fn ping() -> Option<serde_json::Value> {
     bounded(
         Method::Ping(crate::api::schema::PingParams::default()),
         None,
     )
-    .is_ok_and(|pong| advertises_label(&pong))
+    .ok()
+}
+
+/// #1179: a policy that reaches a human, or `--unattended`, from an agent
+/// caller is refused by the server. Ask it with a dry run before anything is
+/// created, so the refusal (exit 13) leaves no workspace or checkout behind.
+/// Any other answer is the real start's to give.
+fn refused_questions(
+    name: &str,
+    harness: &HarnessSpec,
+    asked: super::questions::Asked,
+) -> Option<i32> {
+    if !asked.unattended && !asked.questions.is_some_and(|policy| policy.reaches_human()) {
+        return None;
+    }
+    let preview = bounded(
+        Method::AgentStart(AgentStartParams {
+            dry_run: true,
+            name: name.to_string(),
+            cwd: None,
+            workspace_id: None,
+            tab_id: None,
+            split: None,
+            active: false,
+            here: false,
+            focus: false,
+            argv: (harness.argv)(HarnessOptions::default()),
+            label: None,
+            questions: asked.questions,
+            unattended: asked.unattended,
+        }),
+        None,
+    )
+    .ok()?;
+    let code = preview.pointer("/error/code")?.as_str()?;
+    (code == crate::app::questions::WideningRefused::CODE).then(|| {
+        let message = preview.pointer("/error/message").and_then(|m| m.as_str());
+        eprintln!("delegate {name}: {}", message.unwrap_or(code));
+        super::error_code_exit(code, false)
+    })
 }
 
 fn advertises_label(pong: &serde_json::Value) -> bool {
@@ -3451,6 +3517,7 @@ fn start_the_agent(
     harness: &HarnessSpec,
     options: HarnessOptions<'_>,
     label: Option<String>,
+    asked: super::questions::Asked,
 ) -> Result<serde_json::Value, String> {
     let argv = (harness.argv)(options);
     let response = request(
@@ -3467,6 +3534,8 @@ fn start_the_agent(
             focus: false,
             argv,
             label,
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
         None,
     )

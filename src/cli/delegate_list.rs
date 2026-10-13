@@ -213,6 +213,7 @@ mod tests {
             branch: None,
             repo: None,
             pr: None,
+            questions: None,
         }
     }
 

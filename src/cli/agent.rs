@@ -53,12 +53,12 @@ pub(super) const AGENT_HISTORY_USAGE: &str =
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--dry-run] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
 
 pub(super) const AGENT_RESTART_USAGE: &str =
     "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
 
-pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]";
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--questions POLICY] [--unattended] [--dry-run]";
 
 pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "flk agent wait <target> --status <",
@@ -114,6 +114,8 @@ struct AgentStartFlags {
     focus: bool,
     wait_ready: bool,
     ready_timeout_ms: Option<u64>,
+    /// #1179: `--questions` and `--unattended`.
+    asked: super::questions::Asked,
 }
 
 /// Parse the flags before `--`. `separator` is the index of the terminator, so
@@ -188,6 +190,16 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.wait_ready = true;
                 index += 1;
             }
+            "--questions" => {
+                flags.asked.questions = Some(super::questions::parse_policy(
+                    args.get(index + 1).filter(|_| index + 1 < separator),
+                )?);
+                index += 2;
+            }
+            "--unattended" => {
+                flags.asked.unattended = true;
+                index += 1;
+            }
             "--ready-timeout" => {
                 let value = value_for("--ready-timeout")?;
                 flags.ready_timeout_ms = Some(
@@ -239,7 +251,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         focus,
         wait_ready,
         ready_timeout_ms,
+        asked,
     } = flags;
+    let asked = asked.gate(
+        &format!("agent start {name}"),
+        super::questions::server_takes_questions,
+    );
     // Resolved here rather than in the parser, which stays a pure function of
     // `args`: the server would read a relative `--cwd` against its own
     // directory (#898).
@@ -261,6 +278,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             here,
             focus,
             argv: args[separator + 1..].to_vec(),
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?;
     if dry_run || !wait_ready || response.get("error").is_some() {
@@ -298,6 +317,7 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     let mut pivot = None;
     let mut focus = false;
     let mut dry_run = false;
+    let mut asked = super::questions::Asked::default();
 
     let mut index = 1;
     while index < args.len() {
@@ -346,6 +366,20 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
                 pivot = Some(String::new());
                 index += 1;
             }
+            "--questions" => {
+                match super::questions::parse_policy(args.get(index + 1)) {
+                    Ok(policy) => asked.questions = Some(policy),
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return Ok(super::exit::USAGE);
+                    }
+                }
+                index += 2;
+            }
+            "--unattended" => {
+                asked.unattended = true;
+                index += 1;
+            }
             "--dry-run" => {
                 dry_run = true;
                 index += 1;
@@ -365,6 +399,10 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    let asked = asked.gate(
+        &format!("agent fork {target}"),
+        super::questions::server_takes_questions,
+    );
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:fork".into(),
         method: Method::AgentFork(AgentForkParams {
@@ -376,6 +414,8 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
             label,
             pivot,
             focus,
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?)
 }
@@ -1164,7 +1204,7 @@ fn print_agent_help() {
     eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
-    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--dry-run]");
+    eprintln!("  {AGENT_FORK_USAGE}");
     eprintln!("  flk agent hibernate <target>|--all");
     eprintln!("  flk agent resume <target>|--all");
     eprintln!(

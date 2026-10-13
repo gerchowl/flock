@@ -1083,6 +1083,15 @@ pub struct AgentStartParams {
     /// (#868): an older one would drop it without a word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// `skip_serializing_if` predicate for a defaulted `bool` flag: absent on the
@@ -1109,6 +1118,15 @@ pub struct AgentSpawnParams {
     pub name: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Where an `agent.spawn` child runs (#329).
@@ -1164,6 +1182,15 @@ pub struct AgentForkParams {
     pub pivot: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Walk the fork ancestry of a pane/worktree (#175 O1, US-4). Target uses
@@ -1249,6 +1276,9 @@ pub struct DelegateRow {
     /// The PR poller's cached answer for the branch, never a live read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<PrInfo>,
+    /// The delegate's question policy (#1179), while it is an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
 }
 
 /// Does the sender want an answer (#280, R4 of #213)?
@@ -2509,6 +2539,11 @@ pub struct ServerCapabilities {
     /// the field (#868).
     #[serde(default)]
     pub agent_start_label: bool,
+    /// #1179: `agent.start`, `agent.spawn` and `agent.fork` accept
+    /// `questions` and `unattended`, and the agent record carries the policy.
+    /// Absent on an older server, which is how a client knows to omit them.
+    #[serde(default)]
+    pub agent_questions: bool,
 }
 
 /// Accept failures retained for the lifetime of the API listener.
@@ -3376,6 +3411,10 @@ pub struct AgentInfo {
     /// false, and an older server never sends it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumable: bool,
+    /// Where this agent's questions go (#1179, ADR-0034 §2). Absent on
+    /// remote, peer and fleet summaries, and from servers predating #1179.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
     pub revision: u64,
 }
 
@@ -3588,6 +3627,51 @@ impl DelegationVia {
             Self::Spawn => "spawn",
             Self::Fork => "fork",
         }
+    }
+}
+
+/// Where an agent's questions go (ADR-0034 §2, #1179). An attribute of the
+/// agent record, set at start, spawn and fork and kept across a restart, a
+/// resume, a hibernation and a live handoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionPolicy {
+    /// The harness shows its dialog to the operator watching the pane. The
+    /// default for an operator start, and for a record written before #1179.
+    #[default]
+    AskHuman,
+    /// Nobody watches the pane: questions go to the operator's queue. The
+    /// default for an agent the server starts itself, or an `--unattended`
+    /// start.
+    AskOperator,
+    /// Questions go to the architect as structured questions. The default
+    /// for an agent another agent started.
+    Route,
+    /// Questions are refused with a reason. Explicit only.
+    Deny,
+}
+
+impl QuestionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AskHuman => "ask_human",
+            Self::AskOperator => "ask_operator",
+            Self::Route => "route",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Parse the CLI spelling, which is the wire spelling.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::AskHuman, Self::AskOperator, Self::Route, Self::Deny]
+            .into_iter()
+            .find(|policy| policy.as_str() == raw)
+    }
+
+    /// A policy that reaches a human. Granting one is an operator verb: an
+    /// agent caller may only narrow, to `route` or `deny` (ADR-0034 §2).
+    pub fn reaches_human(self) -> bool {
+        matches!(self, Self::AskHuman | Self::AskOperator)
     }
 }
 
@@ -4986,6 +5070,7 @@ mod tests {
                     node_id: None,
                     clone_detection_warning: None,
                     agent_start_label: true,
+                    agent_questions: true,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -5434,6 +5519,7 @@ mod tests {
             run_id: None,
             turn_cursor: Some("term_1:0:3:9:w".into()),
             resumable: false,
+            questions: None,
             revision: 4,
         }
     }
