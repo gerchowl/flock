@@ -1116,24 +1116,44 @@ impl App {
         if self.mesh_store_recovering {
             return;
         }
-        self.mesh_store_recovering = true;
-        crate::mesh::runtime_store::begin_recovery();
+        let recover = self.mesh_recovery_work(minimum);
+        self.start_mesh_recovery(recover);
+    }
+
+    /// Capture the owned inputs for rebuilding custody and the inbox projection.
+    /// Keeping work separate from scheduling lets callers control its execution.
+    fn mesh_recovery_work(
+        &self,
+        minimum: u64,
+    ) -> impl FnOnce() -> Result<Vec<RecoveredMessage>, String> + Send + 'static {
         let origin = self.node_id.clone();
         let legacy = self.mailboxes.pending_messages();
         let recipients = self.mesh_recovery_recipients();
         let paused = self.fleet_pause.paused;
+        move || {
+            crate::mesh::runtime_store::resume(minimum).and_then(|()| match origin {
+                Some(origin) => api::mesh_mail::load_mesh_mail(origin, legacy, paused, recipients),
+                None => Ok(Vec::new()),
+            })
+        }
+    }
+
+    /// Schedule a custody rebuild, parking mail until its completion event.
+    /// A spawn failure finishes recovery immediately with the same error path.
+    fn start_mesh_recovery(
+        &mut self,
+        recover: impl FnOnce() -> Result<Vec<RecoveredMessage>, String> + Send + 'static,
+    ) {
+        if self.mesh_store_recovering {
+            return;
+        }
+        self.mesh_store_recovering = true;
+        crate::mesh::runtime_store::begin_recovery();
         let tx = self.event_tx.clone();
         let spawn = std::thread::Builder::new()
             .name("mesh-recovery".into())
             .spawn(move || {
-                let result = crate::mesh::runtime_store::recovery_work(|| {
-                    crate::mesh::runtime_store::resume(minimum).and_then(|()| match origin {
-                        Some(origin) => {
-                            api::mesh_mail::load_mesh_mail(origin, legacy, paused, recipients)
-                        }
-                        None => Ok(Vec::new()),
-                    })
-                });
+                let result = crate::mesh::runtime_store::recovery_work(recover);
                 if let Err(reason) = &result {
                     crate::mesh::runtime_store::failed(reason.clone());
                 }
