@@ -275,15 +275,19 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
 }
 
 /// Transcript evidence with the detectors' recognized live status rows removed.
+/// A Claude spinner wrapped over several rows is removed whole (#1264).
 pub(crate) fn progress_text(screen: &str) -> String {
-    screen
-        .lines()
-        .filter(|line| {
+    let lines: Vec<&str> = screen.lines().collect();
+    let spinners = agents::claude_code::spinner_rows(&lines);
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(row, line)| {
             !agents::codex::is_progress_chrome(line)
-                && !agents::claude_code::has_spinner_activity(line)
+                && !spinners.iter().any(|spinner| spinner.rows.contains(row))
                 && !agents::opencode::is_progress_chrome(line)
         })
-        .map(normalize_running_tool_counter)
+        .map(|(_, line)| normalize_running_tool_counter(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2992,6 +2996,17 @@ Which framework should we use?\n\
         assert!(has_spinner_activity("  ✶ Reading…")); // with leading whitespace
         assert!(has_spinner_activity("✻ Pouncing…"));
         assert!(has_spinner_activity("✽ Processing…"));
+    }
+
+    /// A ticking glyph on a wrapped spinner is not progress (#1264).
+    #[test]
+    fn progress_text_drops_a_wrapped_spinner_whole() {
+        let frame = |glyph: char| {
+            format!("⏺ Reading the brief\n\n{glyph} Investigating why every pane\n  reads idle…\n  ⎿  Tip: x\n")
+        };
+        let first = progress_text(&frame('✢'));
+        assert_eq!(first, progress_text(&frame('✶')));
+        assert_eq!(first, "⏺ Reading the brief\n\n  ⎿  Tip: x");
     }
 
     #[test]
