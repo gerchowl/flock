@@ -8,6 +8,7 @@ mod delegates;
 mod digest;
 mod edges;
 mod fleet;
+mod goals;
 mod handoffs;
 mod integrations;
 mod lineage;
@@ -1499,6 +1500,11 @@ impl App {
             Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
             Method::OwnerList(_) => return self.handle_owner_list(request.id),
             Method::OwnerShow(params) => return self.handle_owner_show(request.id, params),
+            Method::GoalArm(p) => return self.goal_arm(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStatus(p) => return self.goal_status(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalPause(p) => return self.goal_pause(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalResume(p) => return self.goal_resume(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStop(p) => return self.goal_stop(&request.id, p).unwrap_or_else(|e| e),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),

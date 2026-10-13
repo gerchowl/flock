@@ -12,7 +12,10 @@
   registered waits, wake), ADR-0029 (exit and error contract).
 - Decision owner: operator.
 - Implemented: G1a (#1034): the durable `Goal*` kinds, the in-memory record
-  and its re-issue on start and rotation (`src/app/goals.rs`). G1 was split
+  and its re-issue on start and rotation (`src/app/goals.rs`). G1b (#1155):
+  `goal.arm`, `goal.status`, `goal.pause`, `goal.resume` and `goal.stop` and
+  `flk goal` (`src/app/api/goals.rs`, `src/cli/goal.rs`); the writes are open
+  to the operator and to the goal's own agent, as goal-s1's were. G1 was split
   into G1a #1034, G1b #1155, G1c #1156 and G1d #1157 on 2026-10-12. Slices (§7) filed 2026-10-11: G0 #1033, G1 #1034, G2 #1035, G3a #885, G3b #1036, G3c #886, G4 #882 + #883, G5 #884, G6 #965. The cross-ADR order is §8.
 
 ## Context
