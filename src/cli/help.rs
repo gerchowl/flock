@@ -309,6 +309,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("events", "read", super::events::READ_USAGE),
     ("events", "wait", super::events::WAIT_USAGE),
     ("adapter", "hello", super::adapter::HELLO_USAGE),
+    ("owner", "policy", super::owner::POLICY_USAGE),
     ("checks", "list", "flk checks list"),
     ("checks", "ack", "flk checks ack <name>"),
     ("checks", "run", "flk checks run <name>"),
@@ -623,6 +624,7 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
+            "owner" => include_str!("owner.rs"),
             // `wait park` shares the `events` parser.
             "wait" => concat!(include_str!("../cli.rs"), include_str!("events.rs")),
             // These five live inline in the dispatcher itself.

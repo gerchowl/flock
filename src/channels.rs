@@ -11,13 +11,33 @@
 //!
 //! A token file is trusted only when it is a regular file owned by this user
 //! with mode 0600 holding 64 lowercase hex digits. Issuing writes a temp file
-//! in the same directory, fsyncs it and hard-links it into place, so a crash
-//! never leaves a partial token behind a valid name. A file that fails the
-//! check (a symlink, unreadable, empty, malformed, too open, someone else's) is
-//! replaced the same way on the next startup or reload, logged with the
-//! reason. Any other I/O error leaves the file untouched and is reported as
-//! `channel_token_unavailable`. Stale temp files are swept at each issue. The directory is
-//! tightened to 0700 when this user owns it and refused otherwise. The file is
+//! in the same directory and fsyncs it, so a crash never leaves a partial
+//! token behind a valid name. A first issue hard-links the temp into place,
+//! which fails rather than overwrites when another issuer got there first. A
+//! file that fails the check (a symlink, unreadable, empty, malformed, too
+//! open, someone else's) is replaced on the next startup or reload by renaming
+//! the temp over it, so the name is never missing, and the reason is logged.
+//! Any other I/O error leaves the file untouched and is reported as
+//! `channel_token_unavailable`.
+//!
+//! A temp file is named `.<pid>-<random>.tmp` after the process that wrote it.
+//! Each issue sweeps the temp files whose writer is gone, the leftovers of a
+//! crash, and keeps those of a live process: during a live handoff two
+//! servers issue into the same directory at once (#1170). A recycled pid only
+//! delays a sweep until that process exits too. A temp named without a pid
+//! (`.<random>.tmp`, written before #1170) is swept at once, as it was then:
+//! only an issuer of that older release, running during the one handoff that
+//! upgrades from it, can still be writing one. The directory is
+//! tightened to 0700 when this user owns it and refused otherwise.
+//!
+//! Known limits. Two issuers that find the same untrusted file both rename
+//! over it, so the second replaces the first's fresh token, which a reader
+//! may already hold. The pid check assumes every issuer shares this host's
+//! pid namespace: a data dir on a network share or a server in a container
+//! can sweep a live issuer's temp, which then logs
+//! `channel.token.issue_failed` until the next reload. On a platform without
+//! a process probe (`platform::fallback`) every pid counts as gone, so every
+//! temp is swept as before #1170. The file is
 //! read on every check, so deleting it revokes the binding at once, and a
 //! reload then issues a new token.
 
@@ -139,7 +159,11 @@ pub(crate) fn token_path(name: &str) -> PathBuf {
 /// failure is logged and leaves that binding refusing every hello.
 pub(crate) fn issue_tokens(bindings: &[ChannelBinding], node: &str) {
     for binding in bindings.iter().filter(|b| b.owner_node == node) {
-        match issue_token(&token_path(&binding.name), read_token) {
+        match issue_token(
+            &token_path(&binding.name),
+            read_token,
+            crate::platform::process_exists,
+        ) {
             Ok(Some(reason)) => crate::logging::channel_token_reissued(&binding.name, reason),
             Ok(None) => {}
             Err(err) => {
@@ -196,12 +220,29 @@ fn read_token(path: &Path) -> Result<String, TokenFault> {
     }
 }
 
+/// Whether a token directory entry is a temp file a crashed issuer left
+/// behind: `.<pid>-<random>.tmp` whose `pid` no longer runs, or a
+/// `.<random>.tmp` from before temp names carried a pid.
+fn is_orphan_temp(name: &str, alive: impl Fn(u32) -> bool) -> bool {
+    let Some(stem) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    match stem.split_once('-') {
+        Some((pid, _)) => pid.parse().is_ok_and(|pid| !alive(pid)),
+        None => true,
+    }
+}
+
 /// Make sure `path` holds a trusted token, as judged by `read`.
-/// `Some(reason)` when an untrusted file was replaced. Stale temp files a
-/// crashed issue left behind are swept first.
+/// `Some(reason)` when an untrusted file was replaced. Temp files whose
+/// writer is gone, as judged by `alive`, are swept first.
 fn issue_token(
     path: &Path,
     read: impl Fn(&Path) -> Result<String, TokenFault>,
+    alive: impl Fn(u32) -> bool,
 ) -> io::Result<Option<&'static str>> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::DirBuilder::new()
@@ -223,7 +264,7 @@ fn issue_token(
         // files are removed.
         let ours =
             fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_file() && m.uid() == euid());
-        if name.starts_with('.') && name.ends_with(".tmp") && ours {
+        if ours && is_orphan_temp(&name, &alive) {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -236,25 +277,31 @@ fn issue_token(
     let mut random = [0u8; 40];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let temp = dir.join(format!(".{}.tmp", hex(&random[32..])));
+    let temp = dir.join(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        hex(&random[32..])
+    ));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)?;
-    // The untrusted file goes only once the new token is safely on disk.
-    let linked = file
+    // The untrusted file is replaced only once the new token is safely on
+    // disk, in one rename, so the name never goes missing.
+    let placed = file
         .set_permissions(fs::Permissions::from_mode(0o600))
         .and_then(|()| file.write_all(hex(&random[..32]).as_bytes()))
         .and_then(|()| file.sync_all())
         .and_then(|()| match replaced {
-            Some(_) => fs::remove_file(path),
-            None => Ok(()),
-        })
-        .and_then(|()| fs::hard_link(&temp, path));
-    let _ = fs::remove_file(&temp);
-    match linked {
+            Some(_) => fs::rename(&temp, path),
+            None => fs::hard_link(&temp, path),
+        });
+    if replaced.is_none() || placed.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    match placed {
         // Another issuer linked a complete token first.
         Err(err) if err.kind() != io::ErrorKind::AlreadyExists => return Err(err),
         _ => {}
@@ -397,13 +444,13 @@ mod tests {
     fn an_issued_token_is_private_kept_and_matched_only_exactly() {
         let dir = std::env::temp_dir().join(format!("flk-chan-{}", std::process::id()));
         let path = dir.join("tokens/phone.token");
-        assert_eq!(issue_token(&path, read_token).unwrap(), None);
+        assert_eq!(issue_token(&path, read_token, |_| false).unwrap(), None);
         let issued = fs::read_to_string(&path).unwrap();
         assert_eq!(issued.len(), 64);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
-        assert_eq!(issue_token(&path, read_token).unwrap(), None);
+        assert_eq!(issue_token(&path, read_token, |_| false).unwrap(), None);
         assert_eq!(fs::read_to_string(&path).unwrap(), issued, "kept");
         let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "no temp file is left behind");
@@ -435,7 +482,10 @@ mod tests {
             Err(TokenFault::Untrusted("malformed"))
         ));
 
-        assert_eq!(issue_token(&path, read_token).unwrap(), Some("malformed"));
+        assert_eq!(
+            issue_token(&path, read_token, |_| false).unwrap(),
+            Some("malformed")
+        );
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode(path.parent().unwrap()),
@@ -447,7 +497,10 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!matches(&path, recovered.clone()));
-        assert_eq!(issue_token(&path, read_token).unwrap(), Some("not_private"));
+        assert_eq!(
+            issue_token(&path, read_token, |_| false).unwrap(),
+            Some("not_private")
+        );
         let rotated = fs::read_to_string(&path).unwrap();
         assert_ne!(
             rotated, recovered,
@@ -463,10 +516,10 @@ mod tests {
     fn a_non_trust_read_error_neither_deletes_nor_rotates_the_token() {
         let dir = std::env::temp_dir().join(format!("flk-chan-io-{}", std::process::id()));
         let path = dir.join("tokens/phone.token");
-        issue_token(&path, read_token).unwrap();
+        issue_token(&path, read_token, |_| false).unwrap();
         let issued = fs::read_to_string(&path).unwrap();
         let eio = |_: &Path| Err(TokenFault::Io(io::Error::from_raw_os_error(libc::EIO)));
-        let err = issue_token(&path, eio).unwrap_err();
+        let err = issue_token(&path, eio, |_| false).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         assert_eq!(fs::read_to_string(&path).unwrap(), issued, "left untouched");
         assert!(matches(&path, issued));
@@ -489,18 +542,127 @@ mod tests {
         std::os::unix::fs::symlink(&outside, tokens.join(".link.tmp")).unwrap();
 
         assert!(!matches(&path, "a".repeat(64)));
-        assert_eq!(issue_token(&path, read_token).unwrap(), Some("symlink"));
+        assert_eq!(
+            issue_token(&path, read_token, |_| false).unwrap(),
+            Some("symlink")
+        );
         assert!(fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "a".repeat(64));
         assert!(
             !tokens.join(".stale.tmp").exists(),
-            "a stale temp file is swept"
+            "a stale temp file without a pid is swept"
         );
         assert!(
             fs::symlink_metadata(tokens.join(".link.tmp")).is_ok(),
             "a symlink is never swept"
         );
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two servers issue into one directory during a live handoff: a temp
+    /// file whose writer still runs is kept, an orphan is swept (#1170).
+    #[test]
+    fn the_sweep_keeps_a_live_issuers_temp_and_removes_orphans() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-sw-{}", std::process::id()));
+        let tokens = dir.join("tokens");
+        let path = tokens.join("phone.token");
+        fs::create_dir_all(&tokens).unwrap();
+        let live = tokens.join(format!(".{}-ab12.tmp", std::process::id()));
+        let dead = tokens.join(".4294967-cd34.tmp");
+        let legacy = tokens.join(".ef56.tmp");
+        let foreign = tokens.join(".not-a-pid.tmp");
+        for temp in [&live, &dead, &legacy, &foreign] {
+            fs::write(temp, "partial").unwrap();
+        }
+
+        let alive = |pid: u32| pid == std::process::id();
+        assert_eq!(issue_token(&path, read_token, alive).unwrap(), None);
+        assert!(
+            live.exists(),
+            "a live issuer's temp file survives the sweep"
+        );
+        assert!(!dead.exists(), "a dead issuer's temp file is swept");
+        assert!(!legacy.exists(), "a temp file without a pid is swept");
+        assert!(foreign.exists(), "a name flock never writes is left alone");
+        let temps: Vec<_> = fs::read_dir(&tokens)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert_eq!(
+            temps.len(),
+            2,
+            "issuing leaves no temp of its own: {temps:?}"
+        );
+
+        assert!(is_orphan_temp(
+            ".4294967-cd34.tmp",
+            crate::platform::process_exists
+        ));
+        assert!(!is_orphan_temp(
+            &format!(".{}-ab12.tmp", std::process::id()),
+            crate::platform::process_exists
+        ));
+        assert!(!is_orphan_temp("phone.token", |_| false));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Replacing an untrusted token renames over it, so a reader never finds
+    /// the name missing (#1170). The old remove-then-link left a window.
+    #[test]
+    fn replacing_an_untrusted_token_never_leaves_the_name_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("flk-chan-rn-{}", std::process::id()));
+        let path = dir.join("tokens/phone.token");
+        assert_eq!(issue_token(&path, read_token, |_| false).unwrap(), None);
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (done, path) = (done.clone(), path.clone());
+            std::thread::spawn(move || {
+                let mut missing = 0u32;
+                while !done.load(Ordering::Relaxed) {
+                    if fs::symlink_metadata(&path).is_err() {
+                        missing += 1;
+                    }
+                }
+                missing
+            })
+        };
+        for _ in 0..100 {
+            fs::write(&path, "malformed").unwrap();
+            assert_eq!(
+                issue_token(&path, read_token, |_| false).unwrap(),
+                Some("malformed")
+            );
+        }
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), 0, "the token name went missing");
+        assert!(read_token(&path).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first issue links rather than renames, so a token another issuer
+    /// placed between the read and the link is kept, never overwritten.
+    #[test]
+    fn a_first_issue_never_overwrites_a_token_placed_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-lk-{}", std::process::id()));
+        let path = dir.join("tokens/phone.token");
+        assert_eq!(issue_token(&path, read_token, |_| false).unwrap(), None);
+        let issued = fs::read_to_string(&path).unwrap();
+
+        let missing = |_: &Path| Err(TokenFault::Missing);
+        assert_eq!(issue_token(&path, missing, |_| false).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), issued, "kept");
+        let temps = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temps, 0, "the losing temp file is removed");
         fs::remove_dir_all(&dir).unwrap();
     }
 

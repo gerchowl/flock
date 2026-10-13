@@ -65,6 +65,7 @@ mod mcp;
 // Slice 1-B provides custody primitives ahead of runtime integration.
 #[allow(dead_code)]
 mod mesh;
+mod owner_policy;
 mod pane;
 mod peer_stream;
 mod peers;
@@ -552,6 +553,7 @@ fn run() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
         println!("       flk adapter hello <binding> ...");
+        println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
@@ -629,6 +631,10 @@ fn run() -> io::Result<()> {
             (
                 "flk adapter hello <binding>",
                 "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk owner policy <show|adopt>",
+                "Show a repo's committed owner policy, or adopt it (operator)",
             ),
             (
                 "flk session <subcommand>",

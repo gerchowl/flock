@@ -188,9 +188,13 @@ pub struct App {
     pub(crate) delegations: delegation::DelegationIndex,
     /// ADR-0030 §1: goals by `AgentId`, folded in the same start pass.
     pub(crate) goals: goals::GoalIndex,
+    /// ADR-0035 §6.2: adopted owner policy versions by repo, folded in the
+    /// same start pass.
+    pub(crate) owner_policies: crate::owner_policy::OwnerPolicyIndex,
     /// ADR-0035 §1: owner bindings by repo slug, folded in the same pass.
     pub(crate) owners: owners::OwnerIndex,
-    /// The `EventHub::rotations` value the open goals and the owner bindings
+    /// The `EventHub::rotations` value the open goals, the adopted policies
+    /// and the owner bindings
     /// were last re-issued at.
     pub(crate) record_rotations_seen: u64,
     mesh_store_retry_at: Option<Instant>,
@@ -1014,6 +1018,7 @@ impl App {
             pending_agent_removals: Default::default(),
             delegations: Default::default(),
             goals: Default::default(),
+            owner_policies: Default::default(),
             owners: Default::default(),
             record_rotations_seen: 0,
             mesh_store_retry_at: None,

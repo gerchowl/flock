@@ -224,10 +224,11 @@ impl App {
     }
 
     /// Once per server start: read the durable log once and fold the
-    /// delegation edges, the goals (ADR-0031 §3) and the owner bindings
-    /// (ADR-0035 §1) from it, re-issuing what is open so log rotation cannot
-    /// drop it. The same read seeds the derived agent events (ADR-0028 §2,
-    /// #1027) and announces `gone` for an agent no restored pane carries.
+    /// delegation edges, the goals (ADR-0031 §3), the adopted owner
+    /// policies (ADR-0035 §6.2) and the owner bindings (ADR-0035 §1) from
+    /// it, re-issuing what is open so log rotation cannot drop it. The same
+    /// read seeds the derived agent events (ADR-0028 §2, #1027) and
+    /// announces `gone` for an agent no restored pane carries.
     ///
     /// Run from the server loop rather than from `App::new`, so a live
     /// handoff folds the log only after the exporting server has stopped
@@ -238,14 +239,15 @@ impl App {
         self.record_rotations_seen = self.event_hub.rotations();
         self.reissue_open_delegations(&restored);
         self.reissue_open_goals(&restored);
+        self.reissue_adopted_owner_policies(&restored);
         self.reissue_owner_bindings(&restored);
         self.begin_agent_phases(&restored);
     }
 
     /// Server loop: when the log rotated since the last look, re-issue the
-    /// open goals and the owner bindings from memory (ADR-0031 §4). A
-    /// rotation keeps the old active file as `.1`, so each record is on disk
-    /// until its copy lands.
+    /// open goals, the adopted owner policies and the owner bindings from
+    /// memory (ADR-0031 §4). A rotation keeps the old active file as `.1`,
+    /// so each record is on disk until its copy lands.
     pub(crate) fn reissue_records_after_rotation(&mut self) {
         let rotations = self.event_hub.rotations();
         if rotations == self.record_rotations_seen {
@@ -253,6 +255,7 @@ impl App {
         }
         self.record_rotations_seen = rotations;
         self.emit_goal_reissues();
+        self.emit_owner_policy_reissues();
         self.emit_owner_reissues();
     }
 
