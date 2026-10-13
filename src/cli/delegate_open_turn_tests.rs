@@ -79,7 +79,7 @@ fn a_long_first_round_still_running_is_open_not_no_result() {
     let open = no_result(Some(json!({"turn_open_at_ms": SUBMITTED_MS + 939})));
     assert!(matches!(wait.classify_result(&open), ResultPoll::Open));
     assert!(matches!(
-        wait.grace_decision(Grace::Open),
+        wait.grace_decision(Grace::Open, Instant::now()),
         SettledDecision::SettleAgain
     ));
 }
@@ -111,10 +111,161 @@ fn without_an_open_turn_from_this_round_the_grace_is_unchanged() {
     // A grace that ran out with no evidence of a running round is still
     // `no_result`.
     assert!(matches!(
-        wait.grace_decision(Grace::Exhausted),
+        wait.grace_decision(Grace::Exhausted, Instant::now()),
         SettledDecision::Report {
             outcome: Outcome::NoResult,
             ..
         }
     ));
+}
+
+// ---------- the round loop, over a scripted settle and store --------------
+
+use super::super::settled::{GoneReason, LastRecord, SettledOutcome};
+use std::collections::VecDeque;
+
+/// A settle core and result store that answer from a script, on a clock that
+/// only moves when the loop sleeps. Asking for a settle the script does not
+/// have panics, so a loop that never ends fails rather than hangs.
+struct Scripted {
+    settles: VecDeque<SettledOutcome>,
+    results: VecDeque<serde_json::Value>,
+    now: Instant,
+    started: Instant,
+    settled: usize,
+    polled: usize,
+}
+
+impl Scripted {
+    fn new(settles: Vec<SettledOutcome>, results: Vec<serde_json::Value>) -> Self {
+        let now = Instant::now();
+        Self {
+            settles: settles.into(),
+            results: results.into(),
+            now,
+            started: now,
+            settled: 0,
+            polled: 0,
+        }
+    }
+
+    fn slept(&self) -> Duration {
+        self.now.duration_since(self.started)
+    }
+}
+
+impl RoundIo for Scripted {
+    fn settle(&mut self, _after: Option<&str>) -> io::Result<(SettledOutcome, bool)> {
+        self.settled += 1;
+        let settled = self
+            .settles
+            .pop_front()
+            .expect("the loop settled more often than the script allows");
+        Ok((settled, false))
+    }
+
+    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+        self.polled += 1;
+        // The last answer stands until the script says otherwise.
+        let answer = if self.results.len() > 1 {
+            self.results.pop_front()
+        } else {
+            self.results.front().cloned()
+        };
+        Ok(answer.expect("the script has no agent.result answer"))
+    }
+
+    fn agent_record(&mut self) -> AgentFetch {
+        // The same turn the settle ended on: no new turn has started.
+        AgentFetch::Found(json!({"turn_cursor": "t:0:2:3:i"}))
+    }
+
+    fn now(&self) -> Instant {
+        self.now
+    }
+
+    fn sleep(&mut self, until: Instant, interval: Duration) {
+        self.now = until.min(self.now + interval).max(self.now);
+    }
+}
+
+fn settled() -> SettledOutcome {
+    SettledOutcome::Settled {
+        held_ms: 5_000,
+        last: LastRecord {
+            pane_id: Some("p".into()),
+            agent_status: Some("idle".into()),
+            turn_cursor: Some("t:0:2:3:i".into()),
+        },
+    }
+}
+
+fn reply(status: Option<&str>, text: &str) -> serde_json::Value {
+    let mut result = json!({
+        "pane_id": "p", "workspace_id": "w", "agent": "claude", "session_id": "s",
+        "finished": true, "text": text, "offset": 0, "total_chars": text.len(),
+        "at_ms": SUBMITTED_MS + 2_000,
+    });
+    if let Some(status) = status {
+        result["status"] = json!(status);
+    }
+    json!({"id": "r", "result": {"type": "agent_result", "result": result}})
+}
+
+fn ended(io: &mut Scripted, round: u64) -> (Outcome, i32) {
+    let entry = entry(round);
+    let wait = waiting(&entry);
+    match wait.decide(io).expect("the loop ends") {
+        RoundEnd::Report { outcome, .. } => (outcome, outcome.exit_code()),
+        RoundEnd::Usage(reason) | RoundEnd::Failed(reason) => panic!("not an outcome: {reason}"),
+    }
+}
+
+#[test]
+fn a_round_that_ended_without_a_sentinel_is_exit_5_at_once() {
+    // The shape a resumed session ends a round on (#582): the harness's own
+    // `No response requested.`, a finished reply with no sentinel.
+    let mut io = Scripted::new(vec![settled()], vec![reply(None, "No response requested.")]);
+    assert_eq!(ended(&mut io, 2), (Outcome::NoSentinel, 5));
+    assert_eq!((io.settled, io.polled), (1, 1));
+    assert_eq!(io.slept(), Duration::ZERO);
+}
+
+#[test]
+fn a_round_that_ended_with_nothing_written_is_no_result_after_one_grace() {
+    let mut io = Scripted::new(vec![settled()], vec![no_result(None)]);
+    let grace = harness_for(&entry(1)).result_grace;
+    assert_eq!(ended(&mut io, 1), (Outcome::NoResult, 5));
+    assert_eq!(io.settled, 1);
+    assert!(io.slept() >= grace && io.slept() <= grace + RESULT_POLL);
+}
+
+#[test]
+fn a_dead_pane_is_exit_4() {
+    let closed = SettledOutcome::Gone {
+        reason: GoneReason::Closed,
+        last: LastRecord::default(),
+    };
+    let mut io = Scripted::new(vec![closed], vec![]);
+    assert_eq!(ended(&mut io, 2), (Outcome::Gone, 4));
+    assert_eq!(io.polled, 0);
+
+    // Gone between the settle and the grace's question.
+    let gone = json!({"id": "r", "error": {"code": "agent_not_found", "message": "gone"}});
+    let mut io = Scripted::new(vec![settled()], vec![gone]);
+    assert_eq!(ended(&mut io, 2), (Outcome::Gone, 4));
+}
+
+#[test]
+fn a_still_running_turn_keeps_waiting_until_it_ends() {
+    let open = || no_result(Some(json!({"turn_open_at_ms": SUBMITTED_MS + 939})));
+    let mut io = Scripted::new(
+        vec![settled(), settled(), settled()],
+        vec![open(), open(), reply(Some("done"), "DONE: shipped")],
+    );
+    assert_eq!(ended(&mut io, 1), (Outcome::Done, 0));
+    // Each open answer cost a settle, never a grace: the screen's quiet is
+    // what paces the loop, not a timer.
+    assert_eq!((io.settled, io.polled), (3, 3));
+    assert_eq!(io.slept(), Duration::ZERO);
 }

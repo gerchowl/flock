@@ -4897,109 +4897,238 @@ struct Await<'a> {
     json: bool,
 }
 
-impl Await<'_> {
-    /// Settle, then wait for the reply, and report the round.
-    ///
-    /// The outer loop exists for one case: the agent takes ANOTHER turn while the
-    /// reply grace is running. The reply that answers the round the caller asked
-    /// about is then not the reply that arrives next, so rather than report
-    /// somebody else's turn the await settles again from the cursor it just
-    /// settled on. Every other outcome ends it.
-    fn run(self) -> io::Result<i32> {
-        // The cursor this await STARTED from, reported in every outcome. A caller
-        // that timed out resumes with `--after <turn_cursor>` and gets the same
-        // turn rather than starting the search again.
-        let reported_cursor = self.after.clone().unwrap_or_default();
-        let mut after = self.after.clone();
-        let mut monitor = super::delegate_verdict::Monitor::new(
-            self.silence_ms
+/// What the round loop needs from outside: one settle, the result store, the
+/// agent record and the clock that times the reply grace (#1257).
+///
+/// [`SocketRound`] is the one the CLI runs. A test scripts its own, so the
+/// loop's decisions (settle again, report, give up) run without a socket.
+trait RoundIo {
+    /// Settle once from `after`. The flag is the start watch's "never started".
+    fn settle(&mut self, after: Option<&str>)
+        -> io::Result<(super::settled::SettledOutcome, bool)>;
+    /// One `agent.result` for the delegate's agent.
+    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError>;
+    /// One `agent.get` for the delegate's agent.
+    fn agent_record(&mut self) -> AgentFetch;
+    fn now(&self) -> Instant;
+    /// Sleep for `interval`, never past `until`.
+    fn sleep(&mut self, until: Instant, interval: Duration);
+}
+
+/// How the round loop ended: an outcome to report, or a command failure.
+enum RoundEnd {
+    Report {
+        outcome: Outcome,
+        info: Option<serde_json::Value>,
+    },
+    /// A refused cursor: exit 2, with the reason on stderr and no object.
+    Usage(String),
+    /// A fatal failure: exit 1, with the server's own words.
+    Failed(String),
+}
+
+/// The round loop over the server socket, with the screen observers the
+/// settle feeds: the stall monitor and the not-started watch.
+struct SocketRound<'w, 'a> {
+    wait: &'w Await<'a>,
+    monitor: super::delegate_verdict::Monitor,
+    start_watch: start_watch::StartWatch,
+}
+
+impl<'w, 'a> SocketRound<'w, 'a> {
+    fn new(wait: &'w Await<'a>) -> Self {
+        let monitor = super::delegate_verdict::Monitor::new(
+            wait.silence_ms
                 .unwrap_or(super::delegate_verdict::DEFAULT_SILENCE_MS),
             Instant::now(),
         );
-
-        let baseline = self
+        let baseline = wait
             .after
             .as_deref()
             .and_then(|raw| super::settled::Cursor::parse(raw).ok());
         let now = Instant::now();
         let submitted = now
             .checked_sub(Duration::from_millis(
-                now_ms().saturating_sub(self.submitted_at_ms),
+                now_ms().saturating_sub(wait.submitted_at_ms),
             ))
             .unwrap_or(now);
-        let mut start_watch = start_watch::StartWatch::new(
+        let start_watch = start_watch::StartWatch::new(
             baseline,
-            crate::detect::parse_agent_label(self.harness.name),
+            crate::detect::parse_agent_label(wait.harness.name),
             submitted,
-            Duration::from_millis(self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS)),
+            Duration::from_millis(wait.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS)),
         );
-        loop {
-            let mut not_started = false;
-            // When the screen checks next need a sample: no event reports
-            // silence, so an evented wait must not hold past it (#1030).
-            let due = std::cell::Cell::new(None);
-            let remaining = self.remaining_timeout_ms();
-            let settled = super::settled::settled_wait_observed(
-                "delegate",
-                SettleTarget::Pinned(PinnedTarget {
-                    terminal_id: self.entry.terminal_id.clone(),
-                    pane_id: self.entry.pane_id.clone(),
-                }),
-                after.as_deref(),
-                self.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
-                remaining,
-                &due,
-                &mut |sample| {
-                    let Some(super::settled::Sample::Record {
-                        status,
-                        pane_id,
-                        cursor,
-                    }) = sample
-                    else {
-                        monitor.interrupted(Instant::now());
-                        start_watch.interrupted();
-                        // Nothing is timing after a gap: a stale due would
-                        // make an evented wait resample at once.
-                        due.set(None);
-                        return false;
-                    };
-                    let Some((screen, unfaint)) =
-                        detection_screens_with(pane_id, self.deadline, bounded)
-                    else {
-                        monitor.interrupted(Instant::now());
-                        start_watch.interrupted();
-                        // Nothing is timing after a gap: a stale due would
-                        // make an evented wait resample at once.
-                        due.set(None);
-                        return false;
-                    };
-                    if start_watch.observe_unfaint(
-                        cursor,
-                        *status,
-                        &screen,
-                        &unfaint,
-                        Instant::now(),
-                    ) {
-                        not_started = true;
-                        return true;
-                    }
-                    let status = match status {
-                        crate::api::schema::AgentStatus::Working => "working",
-                        crate::api::schema::AgentStatus::Blocked => "blocked",
-                        crate::api::schema::AgentStatus::Unknown => "unknown",
-                        _ => "idle",
-                    };
-                    let stalled = monitor.observe(status, &screen, Instant::now());
-                    due.set(
-                        [monitor.due(), start_watch.due()]
-                            .into_iter()
-                            .flatten()
-                            .min(),
-                    );
-                    stalled
-                },
-            )?;
+        Self {
+            wait,
+            monitor,
+            start_watch,
+        }
+    }
+}
 
+impl RoundIo for SocketRound<'_, '_> {
+    fn settle(
+        &mut self,
+        after: Option<&str>,
+    ) -> io::Result<(super::settled::SettledOutcome, bool)> {
+        let wait = self.wait;
+        let monitor = &mut self.monitor;
+        let start_watch = &mut self.start_watch;
+        let mut not_started = false;
+        // When the screen checks next need a sample: no event reports
+        // silence, so an evented wait must not hold past it (#1030).
+        let due = std::cell::Cell::new(None);
+        let settled = super::settled::settled_wait_observed(
+            "delegate",
+            SettleTarget::Pinned(PinnedTarget {
+                terminal_id: wait.entry.terminal_id.clone(),
+                pane_id: wait.entry.pane_id.clone(),
+            }),
+            after,
+            wait.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
+            wait.remaining_timeout_ms(),
+            &due,
+            &mut |sample| {
+                let Some(super::settled::Sample::Record {
+                    status,
+                    pane_id,
+                    cursor,
+                }) = sample
+                else {
+                    monitor.interrupted(Instant::now());
+                    start_watch.interrupted();
+                    // Nothing is timing after a gap: a stale due would
+                    // make an evented wait resample at once.
+                    due.set(None);
+                    return false;
+                };
+                let Some((screen, unfaint)) =
+                    detection_screens_with(pane_id, wait.deadline, bounded)
+                else {
+                    monitor.interrupted(Instant::now());
+                    start_watch.interrupted();
+                    // Nothing is timing after a gap: a stale due would
+                    // make an evented wait resample at once.
+                    due.set(None);
+                    return false;
+                };
+                if start_watch.observe_unfaint(cursor, *status, &screen, &unfaint, Instant::now()) {
+                    not_started = true;
+                    return true;
+                }
+                let status = match status {
+                    crate::api::schema::AgentStatus::Working => "working",
+                    crate::api::schema::AgentStatus::Blocked => "blocked",
+                    crate::api::schema::AgentStatus::Unknown => "unknown",
+                    _ => "idle",
+                };
+                let stalled = monitor.observe(status, &screen, Instant::now());
+                due.set(
+                    [monitor.due(), start_watch.due()]
+                        .into_iter()
+                        .flatten()
+                        .min(),
+                );
+                stalled
+            },
+        )?;
+        Ok((settled, not_started))
+    }
+
+    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+        bounded(
+            Method::AgentResult(AgentResultParams {
+                target: self.wait.entry.terminal_id.clone(),
+                max_chars: self.wait.max_chars,
+                offset: None,
+            }),
+            self.wait.deadline,
+        )
+    }
+
+    fn agent_record(&mut self) -> AgentFetch {
+        agent_record(&self.wait.entry.terminal_id, self.wait.deadline)
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, until: Instant, interval: Duration) {
+        sleep_bounded(until, interval);
+    }
+}
+
+impl Await<'_> {
+    /// Settle, then wait for the reply, and report the round.
+    fn run(self) -> io::Result<i32> {
+        // The cursor this await STARTED from, reported in every outcome. A caller
+        // that timed out resumes with `--after <turn_cursor>` and gets the same
+        // turn rather than starting the search again.
+        let reported_cursor = self.after.clone().unwrap_or_default();
+        let mut io = SocketRound::new(&self);
+        let end = self.decide(&mut io)?;
+        let monitor = io.monitor;
+        match end {
+            RoundEnd::Report { outcome, info } => {
+                let code = outcome.exit_code();
+                let screen = without_retries(|| detection_screen(&self.entry.pane_id, None))
+                    .unwrap_or_else(|| monitor.screen.clone());
+                let verdict = matches!(outcome, Outcome::Stalled)
+                    .then(|| monitor.latest.clone())
+                    .flatten()
+                    .unwrap_or_else(|| super::delegate_verdict::Verdict {
+                        verdict: outcome.as_str().into(),
+                        reason: if outcome == Outcome::NotStarted {
+                            "idle_without_new_turn"
+                        } else {
+                            "round_end"
+                        }
+                        .into(),
+                        retry_after_ms: None,
+                        last_line: super::delegate_verdict::last_line(&screen),
+                    });
+                let observation = event_observation(&self.entry.name, &screen, &verdict);
+                save_observation(self.entry, &observation);
+                let mut info = info.unwrap_or_else(|| serde_json::json!({}));
+                for (key, value) in observation.as_object().into_iter().flatten() {
+                    info[key] = value.clone();
+                }
+                info["settled_with_background_shells"] =
+                    serde_json::json!(crate::detect::settled_with_background_shells(&screen));
+                emit_outcome(
+                    self.entry,
+                    outcome.as_str(),
+                    Some(&info),
+                    self.json,
+                    &reported_cursor,
+                );
+                Ok(code)
+            }
+            RoundEnd::Usage(reason) => {
+                eprintln!("delegate: {reason}");
+                Ok(exit::USAGE)
+            }
+            RoundEnd::Failed(reason) => {
+                eprintln!("delegate: {reason}");
+                Ok(1)
+            }
+        }
+    }
+
+    /// The round loop: settle, then wait for the reply, until the round ends.
+    ///
+    /// It settles again in two cases. The agent took ANOTHER turn while the
+    /// reply grace ran: the reply that answers the round the caller asked about
+    /// is then not the reply that arrives next, so the loop waits past the
+    /// cursor it just settled on. Or the store records this round's turn as
+    /// still running although the screen went quiet (#1257): the loop settles
+    /// from the same cursor and asks the store again. Every other outcome ends
+    /// it.
+    fn decide(&self, io: &mut dyn RoundIo) -> io::Result<RoundEnd> {
+        let mut after = self.after.clone();
+        loop {
+            let (settled, not_started) = io.settle(after.as_deref())?;
             let settled_cursor = settled.turn_cursor().unwrap_or_default().to_string();
             let decision = if not_started
                 && matches!(settled, super::settled::SettledOutcome::Stalled { .. })
@@ -5009,52 +5138,14 @@ impl Await<'_> {
                     info: None,
                 }
             } else {
-                self.after_settle(settled, &settled_cursor)
+                self.after_settle(io, settled, &settled_cursor)
             };
             match decision {
                 SettledDecision::Report { outcome, info } => {
-                    let code = outcome.exit_code();
-                    let screen = without_retries(|| detection_screen(&self.entry.pane_id, None))
-                        .unwrap_or_else(|| monitor.screen.clone());
-                    let verdict = matches!(outcome, Outcome::Stalled)
-                        .then(|| monitor.latest.clone())
-                        .flatten()
-                        .unwrap_or_else(|| super::delegate_verdict::Verdict {
-                            verdict: outcome.as_str().into(),
-                            reason: if outcome == Outcome::NotStarted {
-                                "idle_without_new_turn"
-                            } else {
-                                "round_end"
-                            }
-                            .into(),
-                            retry_after_ms: None,
-                            last_line: super::delegate_verdict::last_line(&screen),
-                        });
-                    let observation = event_observation(&self.entry.name, &screen, &verdict);
-                    save_observation(self.entry, &observation);
-                    let mut info = info.unwrap_or_else(|| serde_json::json!({}));
-                    for (key, value) in observation.as_object().into_iter().flatten() {
-                        info[key] = value.clone();
-                    }
-                    info["settled_with_background_shells"] =
-                        serde_json::json!(crate::detect::settled_with_background_shells(&screen));
-                    emit_outcome(
-                        self.entry,
-                        outcome.as_str(),
-                        Some(&info),
-                        self.json,
-                        &reported_cursor,
-                    );
-                    return Ok(code);
+                    return Ok(RoundEnd::Report { outcome, info })
                 }
-                SettledDecision::Usage(reason) => {
-                    eprintln!("delegate: {reason}");
-                    return Ok(exit::USAGE);
-                }
-                SettledDecision::Failed(reason) => {
-                    eprintln!("delegate: {reason}");
-                    return Ok(1);
-                }
+                SettledDecision::Usage(reason) => return Ok(RoundEnd::Usage(reason)),
+                SettledDecision::Failed(reason) => return Ok(RoundEnd::Failed(reason)),
                 SettledDecision::WaitAgain => {
                     // Resume from the cursor that settled, not from the one this
                     // await started at: the new turn is what the round now means,
@@ -5091,6 +5182,7 @@ impl Await<'_> {
     /// What a settled outcome means for the delegate, once the grace is over.
     fn after_settle(
         &self,
+        io: &mut dyn RoundIo,
         settled: super::settled::SettledOutcome,
         settled_cursor: &str,
     ) -> SettledDecision {
@@ -5125,12 +5217,15 @@ impl Await<'_> {
             SettledOutcome::Error(reason) => SettledDecision::Failed(
                 super::compatibility::diagnose_failure("flk delegate", &reason),
             ),
-            SettledOutcome::Settled { .. } => self.grace_decision(self.await_reply(settled_cursor)),
+            SettledOutcome::Settled { .. } => {
+                let grace = self.await_reply(io, settled_cursor);
+                self.grace_decision(grace, io.now())
+            }
         }
     }
 
     /// What the reply grace means for the round.
-    fn grace_decision(&self, grace: Grace) -> SettledDecision {
+    fn grace_decision(&self, grace: Grace, now: Instant) -> SettledDecision {
         match grace {
             Grace::Reply { outcome, info } => SettledDecision::Report {
                 outcome,
@@ -5152,10 +5247,7 @@ impl Await<'_> {
                 info: None,
             },
             Grace::Exhausted => SettledDecision::Report {
-                outcome: if self
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                {
+                outcome: if self.deadline.is_some_and(|deadline| now >= deadline) {
                     // The deadline wins inside the grace too: a caller whose
                     // clock ran out does not get a late answer reinterpreted.
                     Outcome::Timeout
@@ -5180,17 +5272,17 @@ impl Await<'_> {
     /// working agent into `no_result` (#1121). The wait keeps asking until
     /// the server answers, the deadline passes (124), or it has not answered
     /// for [`UNANSWERED_LIMIT`] (`server_unavailable`).
-    fn await_reply(&self, settled_cursor: &str) -> Grace {
+    fn await_reply(&self, io: &mut dyn RoundIo, settled_cursor: &str) -> Grace {
         let grace = self.harness.result_grace;
         let bound = |end: Instant| self.deadline.map_or(end, |deadline| deadline.min(end));
-        let mut grace_end = bound(Instant::now() + grace);
+        let mut grace_end = bound(io.now() + grace);
         let mut unanswered_since: Option<Instant> = None;
         loop {
-            if Instant::now() >= grace_end {
+            if io.now() >= grace_end {
                 return Grace::Exhausted;
             }
-            let asked = Instant::now();
-            match self.poll_result() {
+            let asked = io.now();
+            match self.poll_result(io) {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
                 ResultPoll::Open => return Grace::Open,
                 ResultPoll::Gone => return Grace::Gone,
@@ -5198,11 +5290,12 @@ impl Await<'_> {
                 ResultPoll::Timeout => return Grace::Timeout,
                 ResultPoll::Unanswered => {
                     let since = *unanswered_since.get_or_insert(asked);
-                    if since.elapsed() >= UNANSWERED_LIMIT {
+                    if io.now().saturating_duration_since(since) >= UNANSWERED_LIMIT {
                         return Grace::Unavailable;
                     }
-                    grace_end = bound(grace_end + asked.elapsed() + RESULT_POLL);
-                    sleep_bounded(grace_end, RESULT_POLL);
+                    grace_end =
+                        bound(grace_end + io.now().saturating_duration_since(asked) + RESULT_POLL);
+                    io.sleep(grace_end, RESULT_POLL);
                     continue;
                 }
                 ResultPoll::NotYet => unanswered_since = None,
@@ -5210,13 +5303,13 @@ impl Await<'_> {
             // The agent took another turn, so the reply that answers THIS round
             // is not the next one to land. Settle again instead. A transport
             // failure here is a FAILURE, not "no new turn" (W4).
-            match self.started_another_turn(settled_cursor) {
+            match self.started_another_turn(io, settled_cursor) {
                 TurnCheck::NewTurn => return Grace::NewTurn,
                 TurnCheck::NoNewTurn => {}
                 TurnCheck::Timeout => return Grace::Timeout,
                 TurnCheck::Failed(reason) => return Grace::Refused(reason),
             }
-            sleep_bounded(grace_end, RESULT_POLL);
+            io.sleep(grace_end, RESULT_POLL);
         }
     }
 
@@ -5232,11 +5325,11 @@ impl Await<'_> {
     /// `Failed` ends it as exit 1 with the reason on stderr. Collapsing a
     /// `Fail` into `NoNewTurn` (the behaviour before W4) made an unreachable
     /// server look like a stable "no new turn" and the await spun silently.
-    fn started_another_turn(&self, settled_cursor: &str) -> TurnCheck {
+    fn started_another_turn(&self, io: &mut dyn RoundIo, settled_cursor: &str) -> TurnCheck {
         if settled_cursor.is_empty() {
             return TurnCheck::NoNewTurn;
         }
-        let record = match agent_record(&self.entry.terminal_id, self.deadline) {
+        let record = match io.agent_record() {
             AgentFetch::Found(record) => record,
             // The agent is gone — not a new turn, but the next `poll_result`
             // will see the gone-ness and return `Grace::Gone`.
@@ -5297,18 +5390,10 @@ impl Await<'_> {
     }
 
     /// Ask the store for the newest reply, and say whether it is this round's.
-    fn poll_result(&self) -> ResultPoll {
-        let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
-            Method::AgentResult(AgentResultParams {
-                target: self.entry.terminal_id.clone(),
-                max_chars: self.max_chars,
-                offset: None,
-            }),
-            self.deadline,
-        );
-        match bounded_res {
+    fn poll_result(&self, io: &mut dyn RoundIo) -> ResultPoll {
+        match io.agent_result() {
             Ok(response) => self.classify_result(&response),
-            Err(err) => match await_failure(&err, self.deadline, Instant::now()) {
+            Err(err) => match await_failure(&err, self.deadline, io.now()) {
                 AwaitFailure::Timeout => ResultPoll::Timeout,
                 AwaitFailure::NotYet => ResultPoll::Unanswered,
                 AwaitFailure::Fail(reason) => ResultPoll::Refused(reason),

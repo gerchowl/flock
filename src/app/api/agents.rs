@@ -1401,6 +1401,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// #1257: a resumed session (#582) ends its round on the harness's own
+    /// `No response requested.` with no `turn_duration` record. That round is
+    /// over, so a waiting supervisor reads a finished reply and never an open
+    /// turn it would wait on forever.
+    #[test]
+    fn agent_result_reads_a_resumed_round_as_finished() {
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let body = line(
+            serde_json::json!({"type": "user", "timestamp": "2026-10-13T01:00:00.000Z",
+                "message": {"role": "user", "content": "round 1"}}),
+        ) + &assistant_line("DONE: one")
+            + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}))
+            + &line(
+                serde_json::json!({"type": "user", "timestamp": "2026-10-13T01:06:15.939Z",
+                "message": {"role": "user", "content": "round 2"}}),
+            )
+            + &line(serde_json::json!({"type": "user", "isMeta": true,
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "Continue from where you left off."}]}}))
+            + &assistant_line("No response requested.");
+        let home = claude_home_with("resumed", "sess-resumed", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-resumed");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(info.finished);
+        assert_eq!(info.turn_open_at_ms, None);
+        assert_eq!(info.text, "No response requested.");
+        assert_eq!(info.status, None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// An opencode session database in a fixture HOME, in opencode's own
     /// schema: a finished turn ending on a verdict, then one still running.
     fn opencode_home_with(name: &str, session_id: &str, running: bool) -> std::path::PathBuf {
