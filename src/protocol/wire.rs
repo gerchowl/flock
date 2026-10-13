@@ -108,7 +108,8 @@ use serde::{Deserialize, Serialize};
 /// v28 adds the `events.read` socket method (#1028). An older server rejects
 /// it as an unknown variant, which the client normalizes to exit 78.
 /// v29 adds `channel.hello` (#1037). A channel adapter refuses to start below
-/// it, through the #868 skew gate.
+/// it, through the #868 skew gate. v29 also adds `wait.park` (#1031), gated
+/// the same way, in the same unreleased protocol.
 pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Refusal notice sent to clients while a live update handoff is in

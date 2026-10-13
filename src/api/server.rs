@@ -609,6 +609,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsWait(_) => "events.wait",
         Method::EventsRead(_) => "events.read",
         Method::ChannelHello(_) => "channel.hello",
+        Method::WaitPark(_) => "wait.park",
         Method::WaitHold(..) => "wait.hold",
         Method::WaitRelease(_) => "wait.release",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
