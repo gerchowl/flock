@@ -157,7 +157,9 @@ fn sync_hooks(status: super::IntegrationStatus, dry_run: bool) -> Outcome {
         }
         // Sync retains Codex trust state without granting new trust.
         match target {
-            IntegrationTarget::Claude => super::install_claude().map(|_| ())?,
+            IntegrationTarget::Claude => {
+                super::install_claude(&super::ClaudeQuestionHook::detect()).map(|_| ())?
+            }
             IntegrationTarget::Codex => super::install_codex_with_trust(false).map(|_| ())?,
             IntegrationTarget::Opencode => super::install_opencode().map(|_| ())?,
             _ => return Err(io::Error::other("unsupported sync target")),

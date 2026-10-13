@@ -18,7 +18,10 @@
   (§1a command gate, §1b mid-turn delivery, `ask_operator` in §2), and
   ADR-0035 owns the policy (gate rows, wake classes).
 - Decision owner: operator.
-- Implemented: none. Every Claude and Codex probe below (P1–P4, P6, P7,
+- Implemented: Q1 (#1179): the question policy on the agent record. Q2
+  (#1180): `hook.decide` with `pass` and `deny`, the Claude question entry
+  and its fail-closed stub path, `[questions] human_tools`. Every Claude and
+  Codex probe below (P1–P4, P6, P7,
   P9–P18) is re-runnable as `tests/probes/harness_question_hooks.py`, and all
   sixteen passed in one run on 2026-10-13 against the versions recorded in the
   inventory. Slices (§10) filed 2026-10-13: Q1 #1179, Q2 #1180, Q3 #1181, Q4
