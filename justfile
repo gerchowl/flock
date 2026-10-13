@@ -28,6 +28,10 @@ script-tests:
     python3 -m unittest discover -s scripts -p 'test_*.py' -t .
     @python3 scripts/platform_test_gap.py
 
+# Isolated real-sccache devShell regression probe (never uses port 4226).
+test-sccache:
+    python3 scripts/probe_sccache.py
+
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never

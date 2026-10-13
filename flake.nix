@@ -12,7 +12,11 @@
   };
 
   outputs =
-    { self, nixpkgs, guardrails }:
+    {
+      self,
+      nixpkgs,
+      guardrails,
+    }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -23,6 +27,13 @@
       ];
       forAllSystems = lib.genAttrs systems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      stableSccacheFor =
+        pkgs:
+        pkgs.writeShellScriptBin "sccache" ''
+          set -eu
+          SCCACHE_REAL=${pkgs.sccache}/bin/sccache
+          ${builtins.readFile ./nix/sccache.sh}
+        '';
     in
     {
       packages = forAllSystems (
@@ -61,6 +72,20 @@
         in
         {
           flock = self.packages.${system}.default;
+          sccache =
+            pkgs.runCommand "flock-sccache-probe"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.rustc
+                  (stableSccacheFor pkgs)
+                ];
+                RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
+              }
+              ''
+                python3 ${./scripts/probe_sccache.py}
+                touch "$out"
+              '';
           # The guardrails gate sweep, with the SAME env knobs as
           # .pre-commit-config.yaml — `nix flake check` ≡ `prek run --all-files`
           # for the gate layer; divergence means one of the two is misconfigured.
@@ -105,6 +130,7 @@
         system:
         let
           pkgs = pkgsFor system;
+          stableSccache = stableSccacheFor pkgs;
         in
         {
           # guardrails brings the governance toolbelt (prek/gitleaks/cargo-deny/
@@ -127,9 +153,18 @@
               ruby
               zig_0_15
             ];
-            # sccache (worktree/compile-cache inheritance) comes from the
-            # guardrails toolbelt + shellHook — fleet-shared ~/.cache/sccache.
+            # Keep guardrails' shared artifact cache, but give the daemon a
+            # persistent TMPDIR and its own socket (#1325). A wrapper covers
+            # lazy startup and idle restarts without changing the shell TMPDIR.
+            # SCCACHE_DIR alone only controls artifacts, not temporary files.
+            # sccache 0.15 endpoint contract: https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage
             hook = ''
+              export PATH="${stableSccache}/bin:$PATH"
+              case "$RUSTC_WRAPPER" in
+                sccache|*/sccache)
+                  export RUSTC_WRAPPER="${stableSccache}/bin/sccache"
+                  ;;
+              esac
               export LIBGHOSTTY_VT_OPTIMIZE=Debug
               export LIBGHOSTTY_VT_SIMD=true
             '';
