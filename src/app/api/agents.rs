@@ -1208,6 +1208,7 @@ mod tests {
                 visible_working: detection.visible_working,
                 background_tasks: detection.background_tasks,
                 needs_human: detection.needs_human,
+                question: detection.question,
                 settled_with_background_shells: detection.settled_with_background_shells,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),

@@ -2092,6 +2092,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -2623,6 +2624,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: now,
             });

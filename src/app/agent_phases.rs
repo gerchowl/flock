@@ -39,12 +39,21 @@
 //! `background` axis from the process tree, which raises no event: a job
 //! that ends while nothing else on the pane changes is seen at the pane's
 //! next state change (#1163).
+//!
+//! Questions (ADR-0028 §8a, #1038). The same reads open and close the
+//! question an agent's `attention` carries: `agent.question_opened` when a
+//! read shows a `question_id` the last one did not, and
+//! `agent.question_closed { withdrawn }` for the one it replaces or that left
+//! the screen, at once and with no window. Open questions are seeded from the
+//! log like phases. A restart re-reads an open dialog under a new id (the
+//! open-time sequence is the terminal's), so the old id is closed then.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::api::agent_state::{AgentState, Lifecycle, Phase, SETTLE_MS};
+use crate::api::agent_state::{AgentState, Attention, Lifecycle, Phase, SETTLE_MS};
+use crate::api::question::{Question, QuestionCloseReason};
 use crate::api::schema::{AgentPhaseEvent, EventData, EventEnvelope, EventKind};
 
 /// The settle window a phase must hold before it is announced: the one
@@ -88,6 +97,28 @@ pub(crate) struct AgentPhaseTracker {
     touched: RefCell<Touched>,
     /// Whether the first tick after start has read every agent.
     started: bool,
+    /// Each agent's open question: its pane and `question_id`.
+    questions: HashMap<String, (String, String)>,
+}
+
+/// The question an agent's `attention` carries.
+fn open_question(state: &AgentState) -> Option<&Question> {
+    match &state.attention {
+        Attention::NeedsHuman { question, .. } => question.as_deref(),
+        _ => None,
+    }
+}
+
+fn question_closed(agent_id: &str, pane: String, question_id: String) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::AgentQuestionClosed,
+        data: EventData::AgentQuestionClosed {
+            agent_id: agent_id.to_string(),
+            pane,
+            question_id,
+            reason: QuestionCloseReason::Withdrawn,
+        },
+    }
 }
 
 /// What the next tick must read.
@@ -127,6 +158,22 @@ impl AgentPhaseTracker {
     pub(crate) fn seed_from_events<'a>(&mut self, events: impl Iterator<Item = &'a EventEnvelope>) {
         let now = Instant::now();
         for envelope in events {
+            match &envelope.data {
+                EventData::AgentQuestionOpened {
+                    agent_id,
+                    pane,
+                    question_id,
+                    ..
+                } => {
+                    self.questions
+                        .insert(agent_id.clone(), (pane.clone(), question_id.clone()));
+                }
+                // The log closes a question before the next one opens.
+                EventData::AgentQuestionClosed { agent_id, .. } => {
+                    self.questions.remove(agent_id);
+                }
+                _ => {}
+            }
             let EventData::AgentPhaseChanged(event) = &envelope.data else {
                 continue;
             };
@@ -203,8 +250,49 @@ impl AgentPhaseTracker {
         (rescan || !panes.is_empty()).then(|| Work::Panes(panes.into_iter().collect()))
     }
 
-    /// Fold one agent's current `state` and return what it settles.
+    /// Fold one agent's current `state` and return what it opens, closes and
+    /// settles.
     pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        settle: Duration,
+        sample: Sample,
+    ) -> Vec<EventEnvelope> {
+        let mut events = self.observe_question(&sample);
+        events.extend(self.observe_phase(now, settle, sample));
+        events
+    }
+
+    /// The question events between the last read of an agent and this one.
+    fn observe_question(&mut self, sample: &Sample) -> Vec<EventEnvelope> {
+        let question = open_question(&sample.state);
+        let open = self.questions.get(&sample.agent_id);
+        if open.map(|(_, id)| id) == question.map(|question| &question.question_id) {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if let Some((pane, question_id)) = self.questions.remove(&sample.agent_id) {
+            events.push(question_closed(&sample.agent_id, pane, question_id));
+        }
+        if let Some(question) = question {
+            self.questions.insert(
+                sample.agent_id.clone(),
+                (sample.pane.clone(), question.question_id.clone()),
+            );
+            events.push(EventEnvelope {
+                event: EventKind::AgentQuestionOpened,
+                data: EventData::AgentQuestionOpened {
+                    agent_id: sample.agent_id.clone(),
+                    pane: sample.pane.clone(),
+                    question_id: question.question_id.clone(),
+                    question: question.clone(),
+                },
+            });
+        }
+        events
+    }
+
+    fn observe_phase(
         &mut self,
         now: Instant,
         settle: Duration,
@@ -257,14 +345,15 @@ impl AgentPhaseTracker {
 
     /// Announce `gone` for every tracked agent no pane carries (`on_panes`),
     /// and for every agent this server read that left `agent.list`
-    /// (`listed`). An agent only seeded from the log is judged by its pane
-    /// alone: detection not having reported yet is not an absence.
+    /// (`listed`), closing its open question first. An agent only seeded from
+    /// the log is judged by its pane alone: detection not having reported yet
+    /// is not an absence.
     pub(crate) fn retain_present(
         &mut self,
         on_panes: &HashSet<String>,
         listed: &HashSet<String>,
     ) -> Vec<EventEnvelope> {
-        let gone: Vec<String> = self
+        let mut gone: Vec<String> = self
             .agents
             .iter()
             .filter(|(agent_id, tracked)| {
@@ -272,8 +361,20 @@ impl AgentPhaseTracker {
             })
             .map(|(agent_id, _)| agent_id.clone())
             .collect();
+        // A question seeded for an agent the log holds no phase for.
+        gone.extend(
+            self.questions
+                .keys()
+                .filter(|agent_id| {
+                    !self.agents.contains_key(*agent_id) && !on_panes.contains(*agent_id)
+                })
+                .cloned(),
+        );
         let mut events = Vec::new();
         for agent_id in gone {
+            if let Some((pane, question_id)) = self.questions.remove(&agent_id) {
+                events.push(question_closed(&agent_id, pane, question_id));
+            }
             if let Some(mut tracked) = self.agents.remove(&agent_id) {
                 tracked.state.lifecycle = Lifecycle::Gone;
                 tracked.state.phase = Phase::Gone;
@@ -440,6 +541,7 @@ mod tests {
         let attention = match phase {
             Phase::NeedsHuman => Attention::NeedsHuman {
                 reason: HumanReason::Permission,
+                question: None,
             },
             Phase::LimitReached => Attention::Blocked {
                 reason: BlockedReason::ProviderLimit,
@@ -686,6 +788,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: Some(0),
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: at,
         });
@@ -794,6 +897,118 @@ mod tests {
         tick(&mut app, 100);
         tick(&mut app, 130);
         assert_eq!(logged(&log), ["agent.phase_changed"]);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// A screen through the detector into the server, the way a pane's
+    /// detector task publishes it.
+    fn screen(app: &mut crate::app::App, screen: &str) {
+        let detection = crate::detect::detect_agent(Some(crate::detect::Agent::Claude), screen);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Claude),
+            state: detection.state,
+            activity: detection.activity,
+            provider_limit: detection.provider_limit,
+            visible_blocker: detection.visible_blocker,
+            visible_idle: detection.visible_idle,
+            visible_working: detection.visible_working,
+            settled_with_background_shells: detection.settled_with_background_shells,
+            background_tasks: detection.background_tasks,
+            needs_human: detection.needs_human,
+            question: detection.question,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// ADR-0028 §8a (#1038): captured question screens, through the detector
+    /// and the server, open a durable `agent.question_opened` carrying the
+    /// payload `agent.get` shows; a redraw emits nothing; the next question
+    /// of the form closes the first as `withdrawn` and opens its own; the
+    /// dialog leaving closes it. A restart closes the logged question when
+    /// the screen re-reads it under a new id.
+    #[tokio::test]
+    async fn question_screens_open_and_close_durable_questions() {
+        macro_rules! fixture {
+            ($name:literal) => {
+                include_str!(concat!(
+                    "../../tests/fixtures/questions-1038/",
+                    $name,
+                    ".txt"
+                ))
+            };
+        }
+        let log = temp_log("questions");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_q"));
+        let tick = |app: &mut crate::app::App| app.tick_agent_phases(Instant::now());
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-single"));
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-single-redraw"));
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-two-q2"));
+        tick(&mut app);
+        status(&mut app, crate::detect::AgentState::Working);
+        tick(&mut app);
+        let questions: Vec<EventData> = hub
+            .read(0, 100, |envelope| {
+                matches!(
+                    envelope.event,
+                    EventKind::AgentQuestionOpened | EventKind::AgentQuestionClosed
+                )
+            })
+            .events
+            .into_iter()
+            .map(|(_, envelope)| envelope.data)
+            .collect();
+        let [EventData::AgentQuestionOpened {
+            question_id: first,
+            question,
+            ..
+        }, EventData::AgentQuestionClosed {
+            question_id: closed,
+            reason: QuestionCloseReason::Withdrawn,
+            ..
+        }, EventData::AgentQuestionOpened {
+            question_id: second,
+            ..
+        }, EventData::AgentQuestionClosed {
+            question_id: last,
+            reason: QuestionCloseReason::Withdrawn,
+            ..
+        }] = &questions[..]
+        else {
+            panic!("{questions:#?}");
+        };
+        assert_eq!((closed, last), (first, second));
+        assert_ne!(first, second);
+        assert_eq!(&question.question_id, first);
+        assert_eq!(question.form.prompt, "Which colour should the probe use?");
+
+        screen(&mut app, fixture!("claude-single"));
+        tick(&mut app);
+        let restarted = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&restarted, Some("agent_q"));
+        screen(&mut app, fixture!("claude-single"));
+        tick(&mut app);
+        assert_eq!(
+            logged(&log)
+                .into_iter()
+                .filter(|kind| kind.starts_with("agent.question_"))
+                .collect::<Vec<_>>(),
+            [
+                "agent.question_opened",
+                "agent.question_closed",
+                "agent.question_opened",
+                "agent.question_closed",
+                "agent.question_opened",
+                "agent.question_closed",
+                "agent.question_opened",
+            ]
+        );
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 

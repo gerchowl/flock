@@ -208,6 +208,11 @@ pub struct TerminalState {
     pub background_tasks: Option<u32>,
     /// What the detector's last `Blocked` screen asked of a human (#1023).
     pub needs_human: Option<crate::api::agent_state::HumanReason>,
+    /// The question that screen draws, with its `question_id` (#1038).
+    pub question: Option<crate::api::question::Question>,
+    /// How many questions this terminal has opened: the open-time sequence
+    /// a new `question_id` derives from.
+    question_opens: u64,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -357,6 +362,8 @@ impl TerminalState {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
+            question_opens: 0,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -408,6 +415,34 @@ impl TerminalState {
     ) -> Self {
         self.pending_agent_resume_plan = Some(plan);
         self
+    }
+
+    /// Take the question a detector screen draws (#1038): the open one is
+    /// kept while the screen asks the same, so a redraw keeps its id, and
+    /// anything else opens a new one at the next open-time sequence.
+    pub fn observe_question(
+        &mut self,
+        agent: Option<crate::detect::Agent>,
+        question: Option<crate::api::question::QuestionForm>,
+    ) {
+        let (Some(agent), Some(question)) = (agent, question) else {
+            self.question = None;
+            return;
+        };
+        let opened_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let carried = question.carry(
+            self.question.as_ref(),
+            &self.agent_id.to_string(),
+            crate::detect::agent_label(agent),
+            self.question_opens + 1,
+            opened_at_ms,
+        );
+        if self.question.as_ref().map(|open| &open.question_id) != Some(&carried.question_id) {
+            self.question_opens += 1;
+        }
+        self.question = Some(carried);
     }
 
     /// Update the scraped spinner activity, holding the last value through
@@ -1061,6 +1096,7 @@ impl TerminalState {
         self.settled_with_background_shells = false;
         self.background_tasks = None;
         self.needs_human = None;
+        self.question = None;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
@@ -1325,6 +1361,7 @@ impl TerminalState {
         self.settled_with_background_shells = false;
         self.background_tasks = None;
         self.needs_human = None;
+        self.question = None;
         self.stale_hook_idle_since = None;
         self.state = AgentState::Unknown;
         self.state_changed_at = None;
@@ -1384,6 +1421,7 @@ impl TerminalState {
         self.settled_with_background_shells = false;
         self.background_tasks = None;
         self.needs_human = None;
+        self.question = None;
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
@@ -2517,6 +2555,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2545,6 +2584,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
             },
             false,
             now + std::time::Duration::from_millis(100),
