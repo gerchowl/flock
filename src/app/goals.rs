@@ -124,23 +124,10 @@ impl App {
             index.apply(&envelope.data);
         }
         self.goals = index;
-        self.goal_rotations_seen = self.event_hub.rotations();
         self.emit_goal_reissues();
     }
 
-    /// Server loop: when the log rotated since the last look, re-issue the
-    /// open goals from memory (ADR-0031 §4). A rotation keeps the old active
-    /// file as `.1`, so the record is on disk until the copy lands.
-    pub(crate) fn reissue_goals_after_rotation(&mut self) {
-        let rotations = self.event_hub.rotations();
-        if rotations == self.goal_rotations_seen {
-            return;
-        }
-        self.goal_rotations_seen = rotations;
-        self.emit_goal_reissues();
-    }
-
-    fn emit_goal_reissues(&mut self) {
+    pub(super) fn emit_goal_reissues(&mut self) {
         for event in self.goals.reissue_events() {
             self.emit_event(event);
         }
@@ -399,6 +386,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
 
+    /// Each start re-issues every open goal exactly once, so a second
+    /// restart in a row adds one more copy per open goal, not one per copy
+    /// already in the log. A met goal is not re-issued.
+    #[tokio::test]
+    async fn two_restarts_in_a_row_each_reissue_one_copy_per_open_goal() {
+        const MET: &str = "agent_met";
+        let log = temp_log("goal-two-restarts");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        for envelope in open_script() {
+            app.record_goal_event(envelope);
+        }
+        app.record_goal_event(armed("agent_second"));
+        app.record_goal_event(armed(MET));
+        app.record_goal_event(event(
+            EventKind::GoalMet,
+            EventData::GoalMet {
+                agent_id: MET.into(),
+            },
+        ));
+        shutdown(app);
+
+        let reissued = |hub: &EventHub, agent: &str| {
+            goal_events(hub)
+                .iter()
+                .filter(|data| {
+                    matches!(
+                        data,
+                        EventData::GoalArmed {
+                            agent_id,
+                            reissued: true,
+                            ..
+                        } if agent_id == agent
+                    )
+                })
+                .count()
+        };
+        for restart in 1..=2 {
+            let hub = EventHub::with_persistence(log.clone());
+            let mut app = app_on(hub.clone());
+            app.reissue_open_records();
+            assert_eq!(reissued(&hub, AGENT), restart, "restart {restart}");
+            assert_eq!(reissued(&hub, "agent_second"), restart, "restart {restart}");
+            assert_eq!(reissued(&hub, MET), 0, "a met goal is closed");
+            assert_eq!(app.goals.get(AGENT), Some(&expected_open_record()));
+            shutdown(app);
+        }
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// ADR-0031's acceptance probe, pane move: moving an agent's pane into
+    /// another workspace re-scopes its pane id but keeps its `AgentId`, so
+    /// the goal stays with it, writes nothing, and refolds after a restart.
+    #[tokio::test]
+    async fn a_pane_move_keeps_the_goal_with_its_agent() {
+        let log = temp_log("goal-pane-move");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let agent = caller_is_an_agent(&mut app);
+        app.record_goal_event(armed(&agent));
+        let record = app.goals.get(&agent).cloned().expect("armed");
+        let written = goal_events(&hub).len();
+
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let pane_id = app.pane_info(0, pane).expect("pane info").pane_id;
+        let tab_id = app.public_tab_id(1, 0).expect("target tab");
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneMove(crate::api::schema::PaneMoveParams {
+                pane_id: pane_id.clone(),
+                destination: crate::api::schema::PaneMoveDestination::Tab {
+                    tab_id,
+                    target_pane_id: None,
+                    split: crate::api::schema::SplitDirection::Right,
+                    ratio: None,
+                },
+                focus: false,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).expect("json");
+        let moved = &response["result"]["move_result"]["pane"];
+        assert_ne!(moved["pane_id"], serde_json::json!(pane_id), "{response}");
+        let terminal = app
+            .state
+            .terminals
+            .iter()
+            .find(|(id, _)| serde_json::json!(id.to_string()) == moved["terminal_id"])
+            .map(|(_, terminal)| terminal.agent_id.to_string());
+        assert_eq!(
+            terminal,
+            Some(agent.clone()),
+            "the moved pane is the same agent"
+        );
+
+        assert_eq!(app.goals.get(&agent), Some(&record));
+        assert_eq!(
+            goal_events(&hub).len(),
+            written,
+            "a move writes no goal event"
+        );
+        shutdown(app);
+
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        app.reissue_open_records();
+        assert_eq!(app.goals.get(&agent), Some(&record));
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// ADR-0031's downgrade recovery: a 1.x server quarantined the active
+    /// file over its goal lines, then numbered on above them and rotated its
+    /// fresh file to `.1`. Putting the quarantined lines in front of the
+    /// active file brings every event back in sequence order, and the goal is
+    /// live in the record and re-issued after the next start.
+    #[tokio::test]
+    async fn a_log_a_1x_server_quarantined_is_recovered_with_its_goals_live() {
+        let log = temp_log("goal-downgrade-recovery");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        for envelope in open_script() {
+            app.record_goal_event(envelope);
+        }
+        shutdown(app);
+        let goal_lines = open_script().len() as u64;
+
+        let quarantined = log.with_file_name("event-log.corrupt.jsonl");
+        std::fs::rename(&log, &quarantined).expect("quarantine");
+        let line = |seq: u64, workspace_id: &str| {
+            let envelope = event(
+                EventKind::WorkspaceClosed,
+                EventData::WorkspaceClosed {
+                    workspace_id: workspace_id.into(),
+                },
+            );
+            format!(
+                "{}\n",
+                serde_json::json!({ "seq": seq, "ts_ms": 1, "envelope": envelope })
+            )
+        };
+        std::fs::write(
+            log.with_file_name("event-log.1.jsonl"),
+            line(goal_lines + 1, "before-rotation"),
+        )
+        .expect("rotated 1.x file");
+        let fresh = line(goal_lines + 2, "after-rotation");
+
+        let mut merged = std::fs::read_to_string(&quarantined).expect("quarantined lines");
+        merged.push_str(&fresh);
+        std::fs::write(&log, merged).expect("merged");
+        std::fs::remove_file(&quarantined).expect("remove quarantined");
+
+        let hub = EventHub::with_persistence(log.clone());
+        let seqs: Vec<u64> = hub
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(seq, _, _)| seq)
+            .collect();
+        assert_eq!(seqs, (1..=goal_lines + 2).collect::<Vec<_>>());
+        let mut app = app_on(hub.clone());
+        app.reissue_open_records();
+        assert_eq!(app.goals.get(AGENT), Some(&expected_open_record()));
+        assert_eq!(
+            goal_events(&hub).last(),
+            Some(&EventData::GoalArmed {
+                agent_id: AGENT.into(),
+                record: expected_open_record(),
+                reissued: true,
+            })
+        );
+        assert_eq!(hub.current_sequence(), goal_lines + 3, "no seq reused");
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
     /// ADR-0031 §4: a goal that writes nothing (parked) outlives more
     /// rotations than the log keeps files, because each rotation re-issues it.
     #[tokio::test]
@@ -419,7 +582,7 @@ mod tests {
                     workspace_id: format!("filler-{round}"),
                 },
             ));
-            app.reissue_goals_after_rotation();
+            app.reissue_records_after_rotation();
         }
         assert_eq!(hub.rotations(), 6);
         assert!(

@@ -254,6 +254,10 @@ pub struct TerminalState {
     /// did. `None` for an operator-started pane. Read by the ceiling to count
     /// one parent's live children.
     pub spawned_by: Option<String>,
+    /// Where this agent's questions go (#1179, ADR-0034 §2). Set once at
+    /// start, spawn or fork, persisted in the session snapshot, and stamped
+    /// into the pane as `FLOCK_QUESTIONS` on every launch of the agent.
+    pub questions: crate::api::schema::QuestionPolicy,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
@@ -373,6 +377,7 @@ impl TerminalState {
             run_id: None,
             spawn_depth: 0,
             spawned_by: None,
+            questions: crate::api::schema::QuestionPolicy::AskHuman,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,

@@ -81,6 +81,7 @@ pub(crate) fn start_server_for_mode(
             node_id: Some(identity.node_id()),
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
+            agent_questions: true,
         }),
     )
 }
@@ -607,6 +608,10 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsWait(_) => "events.wait",
         Method::EventsRead(_) => "events.read",
         Method::ChannelHello(_) => "channel.hello",
+        Method::OwnerBind(_) => "owner.bind",
+        Method::OwnerUnbind(_) => "owner.unbind",
+        Method::OwnerList(_) => "owner.list",
+        Method::OwnerShow(_) => "owner.show",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
@@ -1264,6 +1269,7 @@ mod tests {
                 node_id: None,
                 clone_detection_warning: None,
                 agent_start_label: true,
+                agent_questions: true,
             }),
             None,
             &Mutex::default(),

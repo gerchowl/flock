@@ -180,7 +180,18 @@ impl App {
         // answer to the same question, which is the drift #124 / #197 /
         // #199-#210 are.
         let caller = self.spawn_caller();
-        let result = match self.start_agent(params, &caller) {
+        // #1179: decided before anything is placed, so a refusal costs nothing.
+        let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
+            Ok(questions) => questions,
+            Err(refused) => {
+                return encode_error(
+                    id,
+                    crate::app::questions::WideningRefused::CODE,
+                    refused.message(),
+                )
+            }
+        };
+        let result = match self.start_agent(params, &caller, questions) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
@@ -659,6 +670,16 @@ impl App {
                     min_age_secs: 0,
                 },
                 true,
+            );
+        }
+        if let Some(reason) = (!params.raw)
+            .then(|| self.raw_text_refusal(resolved.ws_idx, resolved.pane_id))
+            .flatten()
+        {
+            return encode_error(
+                id,
+                reason,
+                crate::app::guarded_submit::raw_text_refusal_message(reason),
             );
         }
         self.begin_paste(

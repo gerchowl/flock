@@ -29,8 +29,13 @@ impl Drop for Rig {
     }
 }
 
+/// The default fixture records its argv and `RESTART_PROFILE` in `launch-<pid>`.
+/// It writes the record under a dot-prefixed temporary name and renames it into
+/// place, so a reader polling for `launch-*` sees either no record or the whole
+/// one, never a prefix of it (#1165). The rename stays in one directory, which
+/// keeps it a single atomic `rename(2)`.
 fn rig() -> Rig {
-    rig_with_script("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"launch-$$\"\nprintf '%s\\n' \"${RESTART_PROFILE:-unset}\" >> \"launch-$$\"\nwhile IFS= read -r line; do :; done\n")
+    rig_with_script("#!/bin/sh\n{ printf '%s\\n' \"$@\"; printf '%s\\n' \"${RESTART_PROFILE:-unset}\"; } > \".launch-$$.partial\"\nmv \".launch-$$.partial\" \"launch-$$\"\nwhile IFS= read -r line; do :; done\n")
 }
 
 fn rig_with_script(script: &str) -> Rig {
@@ -242,10 +247,13 @@ async fn restart_api_resumes_same_session_flags_env_and_delivers_continuation() 
     let expected = rig.directory.join(format!("launch-{}", resumed.unwrap()));
     // Resume uses a shell with a separate harness child, so find the launch
     // record by its resume argv rather than assuming shell pid == harness pid.
+    // Only renamed `launch-*` records count: the fixture's in-progress
+    // `.launch-*.partial` file can already start with the resume argv.
     let launch = loop {
         let text = std::fs::read_dir(&rig.directory)
             .unwrap()
             .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-"))
             .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
             .find(|text| text.starts_with("--resume\nrestart-session\n"));
         if let Some(text) = text {
@@ -259,6 +267,38 @@ async fn restart_api_resumes_same_session_flags_env_and_delivers_continuation() 
     };
     assert!(launch.contains("--model\nfixture-model\n"));
     assert!(launch.ends_with("fixture-env\n"));
+}
+
+/// #1179: a restart keeps the question policy on the record, and the resumed
+/// process is launched with its hint.
+#[tokio::test]
+async fn a_restart_keeps_the_question_policy_and_its_hint() {
+    // Written whole, then renamed, so a reader never sees half a record.
+    let mut rig = rig_with_script("#!/bin/sh\n{ printf '%s\\n' \"$@\"; printf '%s\\n' \"${FLOCK_QUESTIONS:-unset}\"; } > \"partial-$$\"\nmv \"partial-$$\" \"launch-$$\"\nwhile IFS= read -r line; do :; done\n");
+    rig.app.state.terminals.get_mut(&rig.id).unwrap().questions =
+        crate::api::schema::QuestionPolicy::Route;
+    assert!(request(&mut rig).get("result").is_some());
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let launch = loop {
+        let text = std::fs::read_dir(&rig.directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-"))
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|text| text.starts_with("--resume\nrestart-session\n"));
+        if let Some(text) = text {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "resumed fixture did not execute");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+    assert!(launch.ends_with("route\n"), "{launch}");
+    assert_eq!(
+        rig.app.state.terminals[&rig.id].questions,
+        crate::api::schema::QuestionPolicy::Route
+    );
 }
 
 #[tokio::test]

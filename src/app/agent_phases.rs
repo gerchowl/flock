@@ -34,11 +34,26 @@
 //! pane still holds its id, so it keeps its seeded phase and emits nothing
 //! until it is read again.
 //!
+//! A seeded agent is no longer in its pane (#1176) once the restore has
+//! completed (`begin_agent_phases` ran) and the settle window has passed
+//! since, and its pane is still a plain shell: spawned with the default
+//! shell, with that shell's own process group in the foreground. That is
+//! the cold restart of a hand-launched agent whose process died: its pane
+//! comes back as a shell under the same id, and no detector ever reports on
+//! it. Each seeded agent carries one deadline at the window's close, read
+//! once, and is read again on any later tick (something touched). An agent
+//! whose pane cannot be judged (no live child, an unreadable foreground
+//! group, a pane adopted over a live handoff rather than spawned here) keeps
+//! its seeded phase.
+//!
 //! Known limits. An agent whose last announcement rotated out of the log is
 //! announced again with `from: unknown`. Codex and opencode read their
 //! `background` axis from the process tree, which raises no event: a job
 //! that ends while nothing else on the pane changes is seen at the pane's
-//! next state change (#1163).
+//! next state change (#1163). A seeded agent whose pane runs some other
+//! command in front of its shell at the window's close is judged again only
+//! when something next touches the tracker: a shell left idle after that
+//! command ends keeps the seeded phase until then (#1245).
 //!
 //! Questions (ADR-0028 §8a, #1038). The same reads open and close the
 //! question the agent's terminal holds: `agent.question_opened` when a read
@@ -152,9 +167,14 @@ impl AgentPhaseTracker {
     /// Seed the last phase the durable log announced for each agent it has
     /// not seen go. Each seeded agent is tracked as announced, so a restart
     /// does not repeat that phase, and the first tick announces `gone` for
-    /// one that did not come back.
-    pub(crate) fn seed_from_events<'a>(&mut self, events: impl Iterator<Item = &'a EventEnvelope>) {
-        let now = Instant::now();
+    /// one that did not come back. Its pane is judged once the window has
+    /// held after `now`, the restore's completion (see `unread_since_restore`).
+    pub(crate) fn seed_from_events<'a>(
+        &mut self,
+        now: Instant,
+        settle: Duration,
+        events: impl Iterator<Item = &'a EventEnvelope>,
+    ) {
         for envelope in events {
             match &envelope.data {
                 EventData::AgentQuestionOpened {
@@ -187,7 +207,7 @@ impl AgentPhaseTracker {
                     candidate: event.to,
                     since: now,
                     state: event.state.clone(),
-                    due: None,
+                    due: Some(now + settle),
                     observed: false,
                 },
             );
@@ -342,21 +362,35 @@ impl AgentPhaseTracker {
         announce(&sample.agent_id, tracked, phase, held)
     }
 
+    /// The agents only seeded from the log, unread for the settle window
+    /// since the restore completed: the ones whose pane may now be judged.
+    pub(crate) fn unread_since_restore(&self, now: Instant, settle: Duration) -> Vec<String> {
+        self.agents
+            .iter()
+            .filter(|(_, tracked)| !tracked.observed && now >= tracked.since + settle)
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect()
+    }
+
     /// Announce `gone` for every tracked agent no pane carries (`on_panes`),
-    /// and for every agent this server read that left `agent.list`
-    /// (`listed`), closing its open question first. An agent only seeded from
-    /// the log is judged by its pane alone: detection not having reported yet
-    /// is not an absence.
+    /// for every agent this server read that left `agent.list` (`listed`),
+    /// and for every agent only seeded from the log whose pane is a plain
+    /// shell (`at_shell`, judged from `unread_since_restore`), closing its
+    /// open question first. Detection not having reported yet is not an
+    /// absence.
     pub(crate) fn retain_present(
         &mut self,
         on_panes: &HashSet<String>,
         listed: &HashSet<String>,
+        at_shell: &HashSet<String>,
     ) -> Vec<EventEnvelope> {
         let mut gone: Vec<String> = self
             .agents
             .iter()
             .filter(|(agent_id, tracked)| {
-                !on_panes.contains(*agent_id) || (tracked.observed && !listed.contains(*agent_id))
+                !on_panes.contains(*agent_id)
+                    || (tracked.observed && !listed.contains(*agent_id))
+                    || (!tracked.observed && at_shell.contains(*agent_id))
             })
             .map(|(agent_id, _)| agent_id.clone())
             .collect();
@@ -467,7 +501,16 @@ impl super::App {
             events.extend(self.agent_phases.observe(now, SETTLE, sample));
         }
         let listed = local.into_iter().map(|(agent_id, _)| agent_id).collect();
-        events.extend(self.agent_phases.retain_present(&on_panes, &listed));
+        let at_shell = self
+            .agent_phases
+            .unread_since_restore(now, SETTLE)
+            .into_iter()
+            .filter(|agent_id| self.agent_pane_is_plain_shell(agent_id))
+            .collect();
+        events.extend(
+            self.agent_phases
+                .retain_present(&on_panes, &listed, &at_shell),
+        );
         for event in events {
             self.emit_event(event);
         }
@@ -475,13 +518,17 @@ impl super::App {
 
     /// Once per start, where the server loop begins: seed the last announced
     /// phases from the final log `restored`, and announce `gone` for each
-    /// seeded agent no restored pane carries.
+    /// seeded agent no restored pane carries. The restore is complete here,
+    /// so the settle window for judging a seeded agent's pane starts now.
     pub(crate) fn begin_agent_phases(
         &mut self,
         restored: &[(u64, u64, crate::api::schema::EventEnvelope)],
     ) {
-        self.agent_phases
-            .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
+        self.agent_phases.seed_from_events(
+            Instant::now(),
+            SETTLE,
+            restored.iter().map(|(_, _, envelope)| envelope),
+        );
         for terminal in self.state.terminals.values_mut() {
             let agent_id = terminal.agent_id.to_string();
             if let Some((_, question)) = self.agent_phases.questions.get(&agent_id) {
@@ -489,7 +536,11 @@ impl super::App {
             }
         }
         let (_, on_panes) = self.local_agent_panes();
-        for event in self.agent_phases.retain_present(&on_panes, &on_panes) {
+        let none = HashSet::new();
+        for event in self
+            .agent_phases
+            .retain_present(&on_panes, &on_panes, &none)
+        {
             self.emit_event(event);
         }
     }
@@ -555,6 +606,26 @@ impl super::App {
             }
         }
         (listed, on_panes)
+    }
+
+    /// Whether the pane carrying `agent_id` is a plain shell that does not
+    /// read as an agent (#1176). False when it cannot tell.
+    fn agent_pane_is_plain_shell(&self, agent_id: &str) -> bool {
+        self.state.workspaces.iter().any(|ws| {
+            ws.tabs.iter().any(|tab| {
+                tab.layout.pane_ids().into_iter().any(|pane_id| {
+                    ws.pane_state(pane_id)
+                        .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                        .filter(|terminal| {
+                            terminal.agent_id.to_string() == agent_id
+                                && !terminal.is_agent_terminal()
+                        })
+                        .and_then(|terminal| self.terminal_runtimes.get(&terminal.id))
+                        .and_then(|runtime| runtime.foreground_is_own_shell())
+                        == Some(true)
+                })
+            })
+        })
     }
 
     /// Note a detector or hook report on a pane, before it is applied.
@@ -640,7 +711,7 @@ mod tests {
             let now = start + Duration::from_secs(*at);
             out.extend(kinds(match phase {
                 Some(phase) => tracker.observe(now, WIN, sample(*phase)),
-                None => tracker.retain_present(&HashSet::new(), &HashSet::new()),
+                None => tracker.retain_present(&HashSet::new(), &HashSet::new(), &HashSet::new()),
             }));
         }
         out
@@ -793,23 +864,23 @@ mod tests {
         let mut log = before.observe(start, WIN, sample(Finished));
         assert_eq!(log.len(), 1);
         let mut after = AgentPhaseTracker::default();
-        after.seed_from_events(log.iter());
+        after.seed_from_events(start, WIN, log.iter());
         assert!(after.observe(start, WIN, sample(Finished)).is_empty());
         let mut lost = AgentPhaseTracker::default();
-        lost.seed_from_events(log.iter());
+        lost.seed_from_events(start, WIN, log.iter());
         assert_eq!(
-            kinds(lost.retain_present(&HashSet::new(), &HashSet::new())),
+            kinds(lost.retain_present(&HashSet::new(), &HashSet::new(), &HashSet::new())),
             [
                 (EventKind::AgentPhaseChanged, Finished, Gone),
                 (EventKind::AgentGone, Finished, Gone)
             ]
         );
         // An agent the log saw go is not seeded: one by that id starts fresh.
-        log.extend(before.retain_present(&HashSet::new(), &HashSet::new()));
+        log.extend(before.retain_present(&HashSet::new(), &HashSet::new(), &HashSet::new()));
         let mut again = AgentPhaseTracker::default();
-        again.seed_from_events(log.iter());
+        again.seed_from_events(start, WIN, log.iter());
         assert!(again
-            .retain_present(&HashSet::new(), &HashSet::new())
+            .retain_present(&HashSet::new(), &HashSet::new(), &HashSet::new())
             .is_empty());
         assert_eq!(again.observe(start, WIN, sample(Finished)).len(), 1);
     }
@@ -1180,9 +1251,155 @@ mod tests {
             },
         });
         app.tick_agent_phases(now + Duration::from_secs(1));
+        // The adopted pane is not a shell spawned here: past the window,
+        // with detection still silent, it is not judged a plain shell.
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane,
+            24,
+            80,
+            std::env::temp_dir(),
+            &[crate::test_support::live_program()],
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .unwrap();
+        app.terminal_runtimes.insert(terminal, runtime);
+        app.emit_event(EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "w9".into(),
+            },
+        });
+        app.tick_agent_phases(now + SETTLE + Duration::from_secs(1));
         settled_idle(&mut app);
-        app.tick_agent_phases(now + Duration::from_secs(2));
+        app.tick_agent_phases(now + SETTLE + Duration::from_secs(2));
         assert_eq!(logged(&log), ["agent.phase_changed"]);
+        shutdown_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// A cold restart re-creates a hand-launched agent's pane as a plain
+    /// shell under the same id: give `app`'s pane a real default shell and
+    /// wait until it holds the terminal's foreground.
+    async fn restore_as_plain_shell(app: &mut crate::app::App) {
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let (events, _) = tokio::sync::mpsc::channel(64);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane,
+            24,
+            80,
+            std::env::temp_dir(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new(
+                &crate::test_support::live_program(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let ready = Instant::now() + Duration::from_secs(5);
+        while runtime.foreground_is_own_shell() != Some(true) && Instant::now() < ready {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(runtime.foreground_is_own_shell(), Some(true));
+        app.terminal_runtimes.insert(terminal, runtime);
+    }
+
+    fn shutdown_runtimes(app: &mut crate::app::App) {
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    /// #1176: a hand-launched agent whose process died in a cold restart
+    /// comes back as a plain shell that no detector reports on. Once the
+    /// settle window has passed since the restore it is `gone`, exactly once.
+    #[tokio::test]
+    async fn a_cold_restart_that_leaves_a_plain_shell_announces_one_gone() {
+        let log = temp_log("cold-shell");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_died"));
+        settled_idle(&mut app);
+        app.tick_agent_phases(Instant::now());
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_died"));
+        restore_as_plain_shell(&mut app).await;
+        let begun = Instant::now();
+        app.tick_agent_phases(begun);
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+        assert!(app.agent_phases.next_deadline(begun).is_some());
+        app.tick_agent_phases(begun + SETTLE);
+        app.tick_agent_phases(begun + SETTLE + Duration::from_secs(1));
+        app.emit_event(EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "w9".into(),
+            },
+        });
+        app.tick_agent_phases(begun + SETTLE + Duration::from_secs(2));
+        assert_eq!(
+            logged(&log),
+            ["agent.phase_changed", "agent.phase_changed", "agent.gone"]
+        );
+        assert_eq!(app.agent_phases.next_deadline(begun + SETTLE), None);
+        shutdown_runtimes(&mut app);
+
+        // A later start does not announce it again.
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_died"));
+        restore_as_plain_shell(&mut app).await;
+        let begun = Instant::now();
+        app.tick_agent_phases(begun);
+        app.tick_agent_phases(begun + SETTLE + Duration::from_secs(1));
+        assert_eq!(count(&log, "agent.gone"), 1, "{:?}", logged(&log));
+        shutdown_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// A pane that still reads as a plain shell inside the settle window is
+    /// not judged yet: an agent its detector finds before the window closes
+    /// is read as present, and never announced `gone`.
+    #[tokio::test]
+    async fn a_slow_to_redetect_agent_inside_the_window_emits_nothing() {
+        use crate::detect::AgentState as S;
+        let log = temp_log("slow-redetect");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_slow"));
+        settled_idle(&mut app);
+        app.tick_agent_phases(Instant::now());
+
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_slow"));
+        restore_as_plain_shell(&mut app).await;
+        let begun = Instant::now();
+        app.tick_agent_phases(begun);
+        app.emit_event(EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "w9".into(),
+            },
+        });
+        app.tick_agent_phases(begun + SETTLE / 2);
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+        settled_idle(&mut app);
+        app.tick_agent_phases(begun + SETTLE - Duration::from_secs(1));
+        app.tick_agent_phases(begun + SETTLE + Duration::from_secs(1));
+        status(&mut app, S::Idle);
+        app.tick_agent_phases(begun + SETTLE * 3);
+        assert_eq!(count(&log, "agent.gone"), 0, "{:?}", logged(&log));
+        assert_eq!(logged(&log), ["agent.phase_changed"]);
+        shutdown_runtimes(&mut app);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 

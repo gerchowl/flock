@@ -223,6 +223,12 @@ impl App {
             return false;
         };
 
+        // #1179: the resumed agent keeps its question policy hint.
+        let _questions = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| crate::integration::set_pending_questions(terminal.questions));
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,

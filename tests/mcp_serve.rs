@@ -424,6 +424,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
             "flock_agent_history",
             "flock_agent_result",
             "flock_events_read",
+            "flock_owner_show",
         ]
     );
     for tool in tools {

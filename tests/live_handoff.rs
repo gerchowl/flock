@@ -2476,6 +2476,107 @@ fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff
     cleanup_test_base(&base);
 }
 
+/// #1179 end to end: a real `flk` run inside an agent's pane. The agent it
+/// starts reads `route` and its pane carries `FLOCK_QUESTIONS=route`; widening
+/// a delegate, through `agent start` and `delegate start`, exits 13 and starts
+/// nothing; the policy survives a live handoff.
+#[test]
+fn question_policy_follows_the_starter_refuses_widening_and_survives_live_handoff() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    fs::create_dir_all(&base).unwrap();
+    let brief = base.join("brief.md");
+    fs::write(&brief, "never typed\n").unwrap();
+    let done = base.join("done");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let command = format!(
+        "export FLOCK_SOCKET_PATH={socket}; \
+         {flk} agent start child --cwd /tmp -- /bin/sh -c 'printf %s \"$FLOCK_QUESTIONS\" > {base}/hint; exec sleep 600' > {base}/child.json 2>&1; \
+         {flk} agent start wide --cwd /tmp --questions ask_human -- /bin/sh -c 'exec sleep 600' > {base}/wide.out 2>&1; echo $? > {base}/wide.code; \
+         {flk} delegate start widedel --brief {brief} --cwd /tmp --unattended > {base}/del.out 2>&1; echo $? > {base}/del.code; \
+         echo done > {done}; exec sleep 600",
+        socket = api_socket.display(),
+        flk = env!("CARGO_BIN_EXE_flk"),
+        base = base.display(),
+        brief = brief.display(),
+        done = done.display(),
+    );
+    let architect = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:architect",
+            "method": "agent.start",
+            "params": {"name": "architect", "cwd": "/tmp", "argv": ["/bin/sh", "-c", command]}
+        }),
+    );
+    assert_ok(architect.clone());
+    assert_eq!(architect["result"]["agent"]["questions"], "ask_human");
+    support::wait_for_file(&done, Duration::from_secs(30));
+
+    let child: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(base.join("child.json")).unwrap())
+            .unwrap_or_else(|err| panic!("child start output: {err}"));
+    assert_eq!(child["result"]["agent"]["questions"], "route", "{child}");
+    support::wait_for_file(&base.join("hint"), Duration::from_secs(10));
+    assert_eq!(fs::read_to_string(base.join("hint")).unwrap(), "route");
+    let wide = fs::read_to_string(base.join("wide.out")).unwrap();
+    assert_eq!(
+        fs::read_to_string(base.join("wide.code")).unwrap().trim(),
+        "13",
+        "{wide}"
+    );
+    assert!(wide.contains("questions_widening_refused"), "{wide}");
+    let del = fs::read_to_string(base.join("del.out")).unwrap();
+    assert_eq!(
+        fs::read_to_string(base.join("del.code")).unwrap().trim(),
+        "13",
+        "{del}"
+    );
+    let names = |socket: &Path| -> Vec<String> {
+        request(
+            socket,
+            serde_json::json!({"id":"test:list","method":"agent.list","params":{}}),
+        )["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|agent| agent["name"].as_str().map(str::to_string))
+            .collect()
+    };
+    let before = names(&api_socket);
+    assert!(
+        !before
+            .iter()
+            .any(|name| name == "wide" || name == "widedel"),
+        "a refused start creates nothing: {before:?}"
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let got = request(
+        &api_socket,
+        serde_json::json!({"id":"test:get","method":"agent.get","params":{"target":"child"}}),
+    );
+    assert_eq!(got["result"]["agent"]["questions"], "route", "{got}");
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
 /// A Claude session id that passes `valid_session_id`. A UUID, like the real
 /// ones, so the transcript file name has the shape Claude writes.
 const IDLE_CLAUDE_SESSION: &str = "0975c14a-1111-4222-8333-444455556666";

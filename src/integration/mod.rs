@@ -15,6 +15,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use portable_pty::CommandBuilder;
 use serde_json::{json, Map, Value};
 
+use crate::api::schema::QuestionPolicy;
 use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
@@ -111,6 +112,9 @@ pub(crate) const RUN_TRAILER_INTEGRATION_VERSION: u32 = 1;
 /// pane carries `Agent-Run: <FLOCK_RUN_ID>`. Kept here (not in the
 /// crate root) so both sides of the trailer story import the same name.
 pub(crate) const FLOCK_RUN_ID_ENV_VAR: &str = "FLOCK_RUN_ID";
+/// The question-policy hint (#1179, ADR-0034 §2). Never authority: only the
+/// fail-closed path of ADR-0034 §4 reads it, when the server cannot answer.
+pub(crate) const FLOCK_QUESTIONS_ENV_VAR: &str = "FLOCK_QUESTIONS";
 
 #[derive(Debug)]
 pub(crate) struct ClaudeInstallPaths {
@@ -310,6 +314,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     for (key, value) in take_pending_spawn_env() {
         cmd.env(key, value);
     }
+    // #1179: stamped last, from the agent record, so neither the server's own
+    // environment nor a carried profile key can supply a hint the record does
+    // not hold. `ask_human` and every non-agent pane carry none (ADR-0034 §4).
+    match take_pending_questions().filter(|policy| *policy != QuestionPolicy::AskHuman) {
+        Some(policy) => cmd.env(FLOCK_QUESTIONS_ENV_VAR, policy.as_str()),
+        None => cmd.env_remove(FLOCK_QUESTIONS_ENV_VAR),
+    }
 }
 
 /// Cut `cmd` down to `allowlist`, keeping what flock itself has already set.
@@ -503,6 +514,35 @@ pub(crate) fn set_pending_spawn_env(vars: Vec<(String, String)>) -> PendingSpawn
 
 fn take_pending_spawn_env() -> Vec<(String, String)> {
     PENDING_SPAWN_ENV.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+thread_local! {
+    /// The question policy of the agent the NEXT pane spawn on this thread
+    /// launches (#1179). The same one-shot shape as the run id.
+    static PENDING_QUESTIONS: std::cell::Cell<Option<QuestionPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Disarms the pending question policy on drop.
+#[must_use = "hold the guard across the spawn; dropping it immediately disarms the policy"]
+pub(crate) struct PendingQuestionsGuard;
+
+impl Drop for PendingQuestionsGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_questions();
+    }
+}
+
+/// Arm the question policy the NEXT pane spawn on this thread stamps as
+/// `FLOCK_QUESTIONS`. A guard for the run id's reason: a failed spawn never
+/// reaches `apply_pane_env`, and a leaked policy would land on the next pane.
+pub(crate) fn set_pending_questions(policy: QuestionPolicy) -> PendingQuestionsGuard {
+    PENDING_QUESTIONS.with(|slot| slot.set(Some(policy)));
+    PendingQuestionsGuard
+}
+
+fn take_pending_questions() -> Option<QuestionPolicy> {
+    PENDING_QUESTIONS.with(std::cell::Cell::take)
 }
 
 pub(crate) fn set_pending_run_id(run_id: String) -> PendingRunIdGuard {
@@ -3478,6 +3518,28 @@ mod tests {
             untouched.get_env(&selector),
             "an aborted agent spawn must not move the operator's own profile"
         );
+    }
+
+    /// #1179: the hint comes from the armed record only. `ask_human`, and a
+    /// pane nobody armed, carry none, even where the server's own
+    /// environment (inherited into `cmd`) has one.
+    #[test]
+    fn apply_pane_env_stamps_the_question_hint_from_the_record_only() {
+        let stamped = |armed: Option<QuestionPolicy>| {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.env(FLOCK_QUESTIONS_ENV_VAR, "route");
+            let _guard = armed.map(set_pending_questions);
+            apply_pane_env(&mut cmd, PaneId::from_raw(31));
+            cmd.get_env(FLOCK_QUESTIONS_ENV_VAR)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(stamped(Some(QuestionPolicy::Deny)).as_deref(), Some("deny"));
+        assert_eq!(
+            stamped(Some(QuestionPolicy::AskOperator)).as_deref(),
+            Some("ask_operator")
+        );
+        assert_eq!(stamped(Some(QuestionPolicy::AskHuman)), None);
+        assert_eq!(stamped(None), None);
     }
 
     #[test]

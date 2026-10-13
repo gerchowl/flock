@@ -559,7 +559,7 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
-            self.app.reissue_goals_after_rotation();
+            self.app.reissue_records_after_rotation();
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;
@@ -1364,6 +1364,7 @@ impl HeadlessServer {
                 node_id: self.app.node_id.clone(),
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
+                agent_questions: true,
             }),
         )?;
 

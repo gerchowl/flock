@@ -553,6 +553,7 @@ fn w12_cap_for_submit_methods_is_at_most_10_seconds() {
     use crate::api::schema::{PaneSendInputParams, PaneSendKeysParams};
     use std::time::Duration;
     let input = Method::PaneSendInput(PaneSendInputParams {
+        raw: false,
         pane_id: "p".to_string(),
         text: "x".to_string(),
         keys: Vec::new(),

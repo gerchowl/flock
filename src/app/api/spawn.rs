@@ -221,6 +221,18 @@ impl App {
             }
         };
 
+        // #1179: an agent caller, so `route` unless it narrows to `deny`.
+        let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
+            Ok(questions) => questions,
+            Err(refused) => {
+                return encode_error(
+                    id,
+                    crate::app::questions::WideningRefused::CODE,
+                    refused.message(),
+                )
+            }
+        };
+
         let Some(target_ws) = self.resolve_spawn_location(&params.location) else {
             return encode_error_with_data(
                 id,
@@ -279,6 +291,7 @@ impl App {
         // requester runs under is handed down deliberately, and the server
         // never had it to allow through in the first place.
         let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
+        let _questions_guard = crate::integration::set_pending_questions(questions);
 
         self.pretrust_claude_worktree(&argv, &cwd, &spawn_env);
         let (rows, cols) = self.state.estimate_pane_size();
@@ -301,6 +314,7 @@ impl App {
             .and_then(|id| self.state.terminals.get_mut(id))
         {
             terminal.launch_env = spawn_env;
+            terminal.questions = questions;
         }
 
         // Stamp the child's lineage BEFORE anything can read it. The run id
@@ -582,6 +596,8 @@ mod tests {
                 },
                 name: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -694,6 +710,8 @@ mod tests {
                 },
                 name: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         });
         let value: serde_json::Value = serde_json::from_str(&response).expect("json");
