@@ -70,3 +70,7 @@ toml_edit = "0.25.15"
 
 # Wipe node-key seeds and serialized private-key buffers after use.
 zeroize = { version = "1.9", features = ["serde"] }
+
+[dev-dependencies]
+# Await fixture FIFO reports without blocking the async restart test's runtime.
+tokio = { version = "1", features = ["net", "io-util"] }
