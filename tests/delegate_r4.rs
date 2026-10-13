@@ -170,6 +170,7 @@ fn start_server_with_readiness(announced: bool) -> Server {
     )
     .unwrap();
     write_fake_opencode(&base);
+    support::write_fake_gh(&bin_dir(&base));
     create_db(&base);
 
     let pair = native_pty_system()

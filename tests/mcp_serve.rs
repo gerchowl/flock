@@ -143,6 +143,18 @@ fn spawn_flock(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> Sp
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
+    // A worktree kill runs the merge gate in the server, which asks gh: give
+    // it the fake one, never the host's (#1278).
+    let bin = config_home.with_file_name("bin");
+    support::write_fake_gh(&bin);
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
 
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();

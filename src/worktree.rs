@@ -403,6 +403,16 @@ pub enum WorktreeMergeGate {
     /// The branch was judged and no merge evidence was found; only the
     /// checkout should be removed.
     NotMerged,
+    /// The branch is the head of an OPEN pull request (#1278): live work under
+    /// review. Never merged, whatever ancestry or content says, and the kill
+    /// path refuses outright rather than removing the checkout of a PR someone
+    /// is reviewing. `number` is the PR, when gh reported one.
+    OpenPr { number: Option<u64> },
+    /// The PR question could not be answered (gh failed, was rate-limited,
+    /// or is missing on a GitHub repo), so an open PR cannot be ruled out
+    /// (#1278). Never merged; every automatic path skips it and an explicit
+    /// kill is refused like [`WorktreeMergeGate::OpenPr`]. `reason` says why.
+    Unknown { reason: String },
     /// Nothing was judged. The checkout is not on disk, so no branch could be
     /// resolved and there was no question to put to git or gh (#360).
     ///
@@ -680,6 +690,10 @@ pub enum KillTier {
     SkipUnmergedDirty,
     /// Main checkout with uncommitted changes: left alone.
     SkipMainDirty,
+    /// Linked worktree whose branch heads an open PR, or whose PR state could
+    /// not be determined (#1278): never removed by a sweep or a scheduled
+    /// reap, forced or not — not even quarantined.
+    SkipLive,
     /// A running/working agent lives here: never disturbed by the sweep.
     SkipAgent,
 }
@@ -695,6 +709,9 @@ pub struct KillFacts {
     pub dirty: bool,
     /// The branch merge gate found positive evidence.
     pub merged: bool,
+    /// The branch may be under review: [`WorktreeMergeGate::is_live`], or a
+    /// gate that ran out of time and so could not rule that out.
+    pub live: bool,
 }
 
 /// Map a worktree's resolved facts to its sweep tier (#81). Pure so the tier
@@ -711,7 +728,9 @@ pub fn classify_kill_tier(facts: KillFacts) -> KillTier {
             KillTier::ClosePane
         };
     }
-    if facts.merged {
+    if facts.live {
+        KillTier::SkipLive
+    } else if facts.merged {
         KillTier::KillBranch { dirty: facts.dirty }
     } else if facts.dirty {
         KillTier::SkipUnmergedDirty
@@ -754,7 +773,7 @@ pub fn planned_action(tier: KillTier, force_dirty: bool) -> KillAction {
                 KillAction::Skip
             }
         }
-        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+        KillTier::SkipMainDirty | KillTier::SkipAgent | KillTier::SkipLive => KillAction::Skip,
     }
 }
 
@@ -779,8 +798,9 @@ pub fn scheduled_action(tier: KillTier) -> KillAction {
         // branch alive. §8.5 adversarial rows land here.
         KillTier::SkipUnmergedDirty => KillAction::Quarantine,
         // Protected tiers stay protected. A running agent is never
-        // disturbed; main-dirty is never quarantined either.
-        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+        // disturbed; main-dirty is never quarantined either, and neither is
+        // the checkout of a PR under review (#1278).
+        KillTier::SkipMainDirty | KillTier::SkipAgent | KillTier::SkipLive => KillAction::Skip,
     }
 }
 
@@ -1331,23 +1351,33 @@ pub(crate) fn integration_targets(
 
     let mut targets: Vec<IntegrationTarget> = Vec::new();
     for name in names {
-        // BOTH spellings are asked, because the local branch and its
-        // remote-tracking ref can sit at different commits and either may hold
-        // the squash. Neither can produce a false "landed": a target whose tree
-        // already holds the branch's content means that content is recorded,
-        // whichever ref happened to be current.
-        for git_ref in [branch_ref(&name), format!("refs/remotes/origin/{name}")] {
-            let exists = known.iter().any(|existing| existing == &git_ref);
-            let already = targets.iter().any(|target| target.git_ref == git_ref);
-            if exists && !already {
-                targets.push(IntegrationTarget {
-                    name: name.clone(),
-                    git_ref,
-                });
-            }
-        }
+        claim_target_refs(&mut targets, &known, &name);
     }
     targets
+}
+
+/// Append `name`'s local and origin refs to `targets`, each only where `known`
+/// says the ref exists and only once.
+///
+/// BOTH spellings are asked, because the local branch and its remote-tracking
+/// ref can sit at different commits and either may hold the squash. Neither
+/// can produce a false "landed": a target whose tree already holds the
+/// branch's content means that content is recorded, whichever ref happened to
+/// be current.
+fn claim_target_refs(targets: &mut Vec<IntegrationTarget>, known: &[String], name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    for git_ref in [branch_ref(name), format!("refs/remotes/origin/{name}")] {
+        let exists = known.iter().any(|existing| existing == &git_ref);
+        let already = targets.iter().any(|target| target.git_ref == git_ref);
+        if exists && !already {
+            targets.push(IntegrationTarget {
+                name: name.to_string(),
+                git_ref,
+            });
+        }
+    }
 }
 
 /// Add `name` to the ordered target-name list unless it is empty or already
@@ -1452,20 +1482,202 @@ fn github_repo_from_remote_url(url: &str) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
+/// The `gh pr view --json` fields the merge gate reads.
+const PR_GATE_FIELDS: &str = "state,number,headRefOid,baseRefName";
+
+/// What one `gh pr view` told the merge gate about the branch's PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrLookup {
+    /// Merged, and the local tip is inside what was merged.
+    Merged(String),
+    /// Open (a draft included): the branch is live work under review (#1278).
+    Open { number: Option<u64> },
+    /// A PR exists but proves nothing on its own: closed unmerged, or merged
+    /// at a head the local tip is not inside. Its base branch, when gh named
+    /// one, is a place this PR's work was meant to land, so it joins the
+    /// landing set for the ancestry and content checks.
+    Settled { base: Option<String> },
+}
+
+/// What asking gh about the branch's PR produced (#1278).
+///
+/// "gh answered: there is no PR" and "gh could not answer" are different
+/// facts and must not share a value: the first lets the local git sources
+/// decide, the second leaves an open PR possible, and an open PR whose tip is
+/// already in `dev` would otherwise read as merged and be deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrQuery {
+    /// gh found a PR for the branch.
+    Found(PrLookup),
+    /// gh answered, and there is no PR for the branch.
+    NoPr,
+    /// No remote of this repo is a GitHub repo, so no PR can exist: gh said
+    /// so itself, or gh is not installed and no remote URL is on github.com.
+    NotGitHub,
+    /// gh could not answer (rate limit, offline, unauthenticated, missing
+    /// binary for a GitHub repo, unreadable output). The reason, for the
+    /// verdict.
+    Failed(String),
+}
+
+/// Ask gh about the branch's PR and classify the outcome.
+///
 /// gh matches PRs by branch NAME, so a merged PR says nothing on its own about
-/// what the local branch holds — the tip has to be accounted for too. An exact
-/// match is the common case; a local tip REACHABLE FROM the merged head is the
-/// other safe one (#321), and everything else falls through to the tip-exact
-/// checks below.
-fn gh_pr_merged_evidence(
+/// what the local branch holds — the tip has to be accounted for too
+/// ([`pr_lookup_from_value`]).
+///
+/// `github_remote` decides what a gh that cannot be started means: on a repo
+/// with a github.com remote it is a failure, elsewhere there is nothing gh
+/// could have reported. Only gh's own "no pull requests found" is a no, and
+/// only its "no remotes / no known GitHub host" answers are not-GitHub; every
+/// other non-zero exit is a failure, which is the fail-closed reading. A
+/// known limit: a GitHub Enterprise remote with gh missing reads as
+/// not-GitHub, since only github.com URLs are recognised here.
+fn gh_pr_query(
     args: &[&str],
     cwd: &std::path::Path,
     root: &str,
     local_tip: Option<&str>,
-) -> Option<String> {
-    let json = run_command_capture("gh", args, Some(cwd)).ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
-    merged_pr_evidence(&value, root, local_tip)
+    github_remote: bool,
+) -> PrQuery {
+    let mut command = crate::process::TracedCommand::new("gh", "worktree");
+    command.args(args).current_dir(cwd);
+    let output = match command.output_traced() {
+        Ok(output) => output,
+        Err(err) if github_remote => return PrQuery::Failed(format!("gh did not run: {err}")),
+        Err(_) => return PrQuery::NotGitHub,
+    };
+    if !output.status.success() {
+        return classify_gh_failure(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+            github_remote,
+        );
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|value| pr_lookup_from_value(&value, root, local_tip));
+    match parsed {
+        Some(lookup) => PrQuery::Found(lookup),
+        None => PrQuery::Failed("gh answered with an unreadable PR".to_string()),
+    }
+}
+
+/// Map a failed `gh pr view`'s exit code and stderr to what it means for the
+/// gate. The answers are matched on gh's own wording, so a gh that rewords
+/// these lands on `Failed`, the safe side.
+///
+/// An unauthenticated gh stops before it looks at any remote, so it names no
+/// host. It exits [`GH_EXIT_AUTH_REQUIRED`], and its message depends on where
+/// it runs: "gh auth login" in a terminal, "set the GH_TOKEN environment
+/// variable" under GitHub Actions. Like a gh that cannot start, that is a
+/// failure only when a remote is on github.com; on any other repo no PR is
+/// known to exist (the same GitHub Enterprise limit as [`gh_pr_query`]).
+fn classify_gh_failure(code: Option<i32>, stderr: &str, github_remote: bool) -> PrQuery {
+    let unauthenticated = code == Some(GH_EXIT_AUTH_REQUIRED) || stderr.contains("gh auth login");
+    if stderr.contains("no pull requests found") {
+        PrQuery::NoPr
+    } else if stderr.contains("no git remotes found")
+        || stderr.contains("point to a known GitHub host")
+        || (!github_remote && unauthenticated)
+    {
+        PrQuery::NotGitHub
+    } else {
+        let reason = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+        PrQuery::Failed(format!("gh failed: {}", reason.unwrap_or("no message")))
+    }
+}
+
+/// gh's documented exit code for "this command requires authentication"
+/// (`gh help exit-codes`).
+const GH_EXIT_AUTH_REQUIRED: i32 = 4;
+
+/// The PR question for the gate, answered from both lookups (#1278).
+///
+/// The origin-pinned lookup is asked FIRST and its PR wins when it has one:
+/// in a fork checkout gh's own resolution goes to the upstream repo, where a
+/// same-named branch can carry someone else's PR. The unpinned lookup is
+/// asked only when the pinned one found no PR (or there is no pinned repo).
+/// Any failed lookup that is not overridden by a found PR is a failure: the
+/// gate cannot rule out an open PR, so it must not go on to call the branch
+/// merged.
+fn resolve_pr_query(mut ask: impl FnMut(bool) -> PrQuery, pinned_available: bool) -> PrQuery {
+    let pinned = pinned_available.then(|| ask(true));
+    if let Some(PrQuery::Found(lookup)) = pinned {
+        return PrQuery::Found(lookup);
+    }
+    let unpinned = ask(false);
+    match (pinned, unpinned) {
+        (_, PrQuery::Found(lookup)) => PrQuery::Found(lookup),
+        (Some(PrQuery::Failed(reason)), _) | (_, PrQuery::Failed(reason)) => {
+            PrQuery::Failed(reason)
+        }
+        (Some(PrQuery::NoPr), _) | (_, PrQuery::NoPr) => PrQuery::NoPr,
+        _ => PrQuery::NotGitHub,
+    }
+}
+
+/// Does any remote of this repo point at github.com? Errs toward `true` when
+/// git cannot answer, which keeps a gh that cannot run a failure.
+fn repo_has_github_remote(root: &str) -> bool {
+    match run_command_capture(
+        "git",
+        &["-C", root, "config", "--get-regexp", r"^remote\..*\.url$"],
+        None,
+    ) {
+        Ok(urls) => urls
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .any(|url| github_repo_from_remote_url(url).is_some()),
+        // `--get-regexp` exits 1 when no remote is configured at all.
+        Err(_) => run_command_capture("git", &["-C", root, "remote"], None)
+            .map_or(true, |remotes| !remotes.trim().is_empty()),
+    }
+}
+
+/// The decision [`gh_pr_query`] makes once gh has answered, split out from
+/// the subprocess so it is testable with no `gh` on PATH.
+///
+/// An OPEN state wins over everything else and needs no tip check: whatever
+/// the local branch holds, a PR under review on that branch name means
+/// someone is still working on it, and the gate fails closed (#1278). A state
+/// gh does not document is unreadable and answers `None`.
+fn pr_lookup_from_value(
+    value: &serde_json::Value,
+    root: &str,
+    local_tip: Option<&str>,
+) -> Option<PrLookup> {
+    let state = value.get("state").and_then(|v| v.as_str())?;
+    let number = value.get("number").and_then(|v| v.as_u64());
+    match state {
+        "OPEN" => Some(PrLookup::Open { number }),
+        "MERGED" | "CLOSED" => Some(match merged_pr_evidence(value, root, local_tip) {
+            Some(evidence) => PrLookup::Merged(evidence),
+            None => PrLookup::Settled {
+                base: value
+                    .get("baseRefName")
+                    .and_then(|v| v.as_str())
+                    .filter(|base| !base.trim().is_empty())
+                    .map(str::to_string),
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// `targets` plus the PR's base branch, when gh named one that is not already
+/// in the set and this clone has a ref for it (#1278: "the PR's base branch
+/// when known" is a landing branch for that PR's work).
+fn with_pr_base(
+    root: &str,
+    targets: &[IntegrationTarget],
+    base: Option<&str>,
+) -> Vec<IntegrationTarget> {
+    let mut targets = targets.to_vec();
+    if let Some(base) = base {
+        claim_target_refs(&mut targets, &local_and_origin_refs(root), base.trim());
+    }
+    targets
 }
 
 /// The decision [`gh_pr_merged_evidence`] makes once gh has answered, split out
@@ -1680,22 +1892,22 @@ fn commit_is_ancestor_of(root: &str, ancestor: &str, descendant: &str) -> bool {
     .is_ok()
 }
 
-/// Does every commit reachable from `branch` also live on some *other* ref?
+/// Does every commit reachable from `branch` also live on some *other* local
+/// branch?
 ///
 /// This is the "nothing to lose" case, not a merge: an accidental worktree that
 /// was branched and never committed to has a tip identical to whatever it was
-/// branched from, so deleting it discards no work at all. The three evidence
-/// sources above it all miss that whenever the base is itself unpushed and not
-/// on the default branch — branch a session off a local feature branch, change
-/// your mind, and the kill dialog would refuse to clean up after itself (#243).
+/// branched from, so deleting it discards no work at all. The evidence sources
+/// above it all miss that whenever the base is itself unpushed and not on the
+/// default branch — branch a session off a local feature branch, change your
+/// mind, and the kill dialog would refuse to clean up after itself (#243).
 ///
-/// The branch's own refs are excluded on both sides: `refs/heads/<branch>`
-/// (which would otherwise make the count trivially zero) and
-/// `refs/remotes/*/<branch>` (its own tracking ref is not independent
-/// evidence — the remote-containment check below deliberately ignores it too).
-/// An unreadable count is not evidence: `false` keeps the branch.
+/// Local branches only: containment in a remote branch is not evidence
+/// (#1278), and the caller also requires that `branch` was never pushed. The
+/// branch's own `refs/heads/<branch>` is excluded, since it would otherwise
+/// make the count trivially zero. An unreadable count is not evidence: `false`
+/// keeps the branch.
 fn branch_has_no_unique_commits(root: &str, branch: &str) -> bool {
-    let own_remote = format!("*/{branch}");
     run_command_capture(
         "git",
         &[
@@ -1709,14 +1921,10 @@ fn branch_has_no_unique_commits(root: &str, branch: &str) -> bool {
             &branch_ref(branch),
             "--not",
             // --exclude applies to the *next* ref glob, and its pattern is
-            // relative to that glob's namespace: bare name for --branches,
-            // remote-qualified for --remotes.
+            // relative to that glob's namespace: the bare name for --branches.
             "--exclude",
             branch,
             "--branches",
-            "--exclude",
-            &own_remote,
-            "--remotes",
         ],
         None,
     )
@@ -1739,29 +1947,40 @@ fn branch_ref(branch: &str) -> String {
 }
 
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
-/// 1. `gh pr view` with gh's own repo resolution, then pinned to the origin
-///    remote's repo (multi-remote checkouts resolve to upstream otherwise). The
+/// 1. `gh pr view` pinned to the origin remote's repo, then with gh's own
+///    repo resolution when the pinned one found no PR (multi-remote and fork
+///    checkouts resolve to upstream otherwise; [`resolve_pr_query`]). The
 ///    merged head is FETCHED when this clone does not have it (#646), under the
-///    same [`MERGE_GATE_TIMEOUT`] as everything else here.
+///    same [`MERGE_GATE_TIMEOUT`] as everything else here. An OPEN PR on the
+///    branch ends the gate at [`WorktreeMergeGate::OpenPr`], and a lookup gh
+///    could not answer ends it at [`WorktreeMergeGate::Unknown`], before any
+///    other source is asked (#1278): gh failing is not "no PR". Any other PR
+///    contributes its base branch to the landing set for the checks below.
 /// 2. `git branch --merged <target>`, asked of EVERY branch in the landing set
 ///    ([`integration_targets`]) rather than of one detected default — see #633
 ///    for why `origin/HEAD` alone is the wrong single question.
-/// 3. Remote containment: the branch tip is reachable from another pushed
-///    remote ref (e.g. merged into a feature branch) — the work is recorded,
-///    so deleting the local branch loses nothing.
-/// 4. The branch holds no commits of its own — every commit on it is already
-///    on some other ref, local or remote, so there is nothing to lose (#243).
-/// 5. `git merge-tree` content check, also asked of every target: a squash
+/// 3. A branch that was never pushed and holds no commits of its own — every
+///    commit on it is already on another LOCAL branch, so there is nothing to
+///    lose and no PR it could be the head of (#243).
+/// 4. `git merge-tree` content check, also asked of every target: a squash
 ///    leaves no ancestry to find, so the content question is the one that
 ///    recognises it.
 ///
 /// Anything inconclusive is NotMerged — deletion needs positive evidence.
 ///
-/// (4) is deliberately late even though it is the only purely-local check and
+/// Containment in an arbitrary remote branch is deliberately NOT evidence
+/// (#1278). It used to be: a branch with an open PR, merged by its builder
+/// into another pushed feature branch, read `contained in origin/<feature>`
+/// and `worktree kill` would have deleted the checkout and branch of a PR
+/// under review. A feature branch is not a place work lands, and the branch
+/// it was merged into can itself be deleted or rewritten. Only the landing
+/// set (and a merged PR) records work durably.
+///
+/// (3) is deliberately late even though it is the only purely-local check and
 /// would short-circuit the `gh` call. A disposable branch is very often *also*
-/// merged or remotely contained, and "merged into main" says more about where
-/// the work went than (4) can. Latency is the cheaper thing to spend here —
-/// the gate already runs off the UI thread behind "checking merge status…".
+/// merged, and "merged into main" says more about where the work went than
+/// (3) can. Latency is the cheaper thing to spend here — the gate already runs
+/// off the UI thread behind "checking merge status…".
 pub(crate) fn branch_merge_gate(
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
@@ -1788,39 +2007,32 @@ fn branch_merge_gate_against(
         None,
     )
     .ok();
-    if let Some(evidence) = gh_pr_merged_evidence(
-        &["pr", "view", branch, "--json", "state,number,headRefOid"],
-        checkout,
-        &root,
-        local_tip.as_deref(),
-    ) {
-        return WorktreeMergeGate::Merged { evidence };
-    }
-    if let Some(repo) =
+    let pinned_repo =
         run_command_capture("git", &["-C", &root, "remote", "get-url", "origin"], None)
             .ok()
             .as_deref()
-            .and_then(github_repo_from_remote_url)
-    {
-        if let Some(evidence) = gh_pr_merged_evidence(
-            &[
-                "pr",
-                "view",
-                branch,
-                "--repo",
-                &repo,
-                "--json",
-                "state,number,headRefOid",
-            ],
-            checkout,
-            &root,
-            local_tip.as_deref(),
-        ) {
-            return WorktreeMergeGate::Merged { evidence };
+            .and_then(github_repo_from_remote_url);
+    let github_remote = pinned_repo.is_some() || repo_has_github_remote(&root);
+    let ask = |pinned: bool| {
+        let mut args = vec!["pr", "view", branch];
+        if pinned {
+            args.extend(["--repo", pinned_repo.as_deref().unwrap_or_default()]);
         }
-    }
+        args.extend(["--json", PR_GATE_FIELDS]);
+        gh_pr_query(&args, checkout, &root, local_tip.as_deref(), github_remote)
+    };
+    let pr_base = match resolve_pr_query(ask, pinned_repo.is_some()) {
+        PrQuery::Found(PrLookup::Merged(evidence)) => {
+            return WorktreeMergeGate::Merged { evidence }
+        }
+        PrQuery::Found(PrLookup::Open { number }) => return WorktreeMergeGate::OpenPr { number },
+        PrQuery::Failed(reason) => return WorktreeMergeGate::Unknown { reason },
+        PrQuery::Found(PrLookup::Settled { base }) => base,
+        PrQuery::NoPr | PrQuery::NotGitHub => None,
+    };
+    let targets = with_pr_base(&root, targets, pr_base.as_deref());
 
-    for target in targets {
+    for target in &targets {
         if let Ok(merged) = run_command_capture(
             "git",
             &[
@@ -1849,24 +2061,17 @@ fn branch_merge_gate_against(
         }
     }
 
-    // Remote containment: any remote ref other than the branch's own
-    // tracking ref that contains the tip.
-    if let Some(remote_ref) = refs_containing(&root, branch, RefScope::Remote).first() {
-        return WorktreeMergeGate::Merged {
-            evidence: format!("contained in {remote_ref}"),
-        };
-    }
-
-    if branch_has_no_unique_commits(&root, branch) {
-        // Name the ref that holds them where one exists. The unnamed phrasing
-        // is true but tells the user nothing about where their work went. For
-        // the accidental-worktree case it is almost always the base branch the
-        // session was cut from, which is worth saying out loud (#243).
+    if !branch_was_pushed(&root, branch) && branch_has_no_unique_commits(&root, branch) {
+        // Name the branch that holds them where one exists. The unnamed
+        // phrasing is true but tells the user nothing about where their work
+        // went. For the accidental-worktree case it is almost always the base
+        // branch the session was cut from, which is worth saying out loud
+        // (#243).
         //
-        // A zero count does not guarantee a single containing ref — the commits
-        // may be spread over several — so the unnamed phrasing stays as the
-        // fallback rather than being replaced.
-        let evidence = match refs_containing(&root, branch, RefScope::All).first() {
+        // A zero count does not guarantee a single containing branch — the
+        // commits may be spread over several — so the unnamed phrasing stays
+        // as the fallback rather than being replaced.
+        let evidence = match local_branches_containing(&root, branch).first() {
             Some(holder) => format!("contained in {holder}"),
             None => "no commits of its own".to_string(),
         };
@@ -1879,7 +2084,7 @@ fn branch_merge_gate_against(
     // branch, and every source above asks an ancestry question. Ask the
     // question the gate actually cares about instead — would deleting this
     // lose work? — by merging the branch into each target in memory.
-    for target in targets {
+    for target in &targets {
         if branch_content_already_in(&root, branch, &target.git_ref) {
             return WorktreeMergeGate::Merged {
                 evidence: format!("already in {} (squashed or rebased)", target.name),
@@ -1940,45 +2145,55 @@ fn branch_content_already_in(root: &str, branch: &str, base: &str) -> bool {
     !base_tree.is_empty() && merged_tree == base_tree
 }
 
-/// Which refs [`refs_containing`] considers.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RefScope {
-    /// Remote-tracking refs only — the work is recorded off this machine.
-    Remote,
-    /// Local branches as well; enough to say the commits are not unique to
-    /// this branch, which is all the last evidence source claims.
-    All,
+/// Has `branch` ever been pushed? True when any remote-tracking ref ends in
+/// `/<branch>`, or when git cannot answer.
+///
+/// Errs toward `true` on purpose: the only caller uses `false` to accept local
+/// containment as deletion evidence, and a branch that was pushed can be the
+/// head of a PR (#1278).
+///
+/// The match is a suffix on the full refname, so it over-matches: branch `x`
+/// reads as pushed when any remote has `<prefix>/x` (`origin/feature/x`,
+/// `upstream/old/x`), even though `x` itself was never pushed. The cost is
+/// only ever a missed cleanup — such a branch loses the #243 "no commits of
+/// its own" evidence and needs `--keep-branch` or a manual `git branch -D` —
+/// never a wrong delete. Exact matching would need the remote names, and a
+/// remote name may itself contain `/`.
+fn branch_was_pushed(root: &str, branch: &str) -> bool {
+    let own_suffix = format!("/{branch}");
+    match run_command_capture(
+        "git",
+        &[
+            "-C",
+            root,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remotes",
+        ],
+        None,
+    ) {
+        Ok(refs) => refs.lines().any(|line| line.trim().ends_with(&own_suffix)),
+        Err(_) => true,
+    }
 }
 
-/// Display names of the refs that contain `branch`'s tip, in git's own listing
-/// order (local branches before remote-tracking ones), excluding refs that are
-/// not independent evidence about it:
+/// Short names of the LOCAL branches other than `branch` that contain its
+/// tip, in git's listing order.
 ///
-/// - the branch's own local ref and its tracking refs on every remote, since a
-///   ref cannot vouch for itself;
-/// - `refs/remotes/<remote>/HEAD`, which is a symbolic pointer at the remote's
-///   default branch and duplicates the branch it names. It has to be filtered
-///   on the *full* refname: `%(refname:short)` renders it as bare `origin`, so
-///   a `contains("HEAD")` filter misses it and the gate reports the meaningless
-///   `contained in origin` (#243).
-fn refs_containing(root: &str, branch: &str, scope: RefScope) -> Vec<String> {
-    let scope_flag = match scope {
-        RefScope::Remote => "-r",
-        RefScope::All => "-a",
-    };
-    let own_remote_suffix = format!("/{branch}");
+/// Local only: this names the holder for the never-pushed, no-unique-commits
+/// evidence, and containment in a remote branch is not evidence (#1278).
+fn local_branches_containing(root: &str, branch: &str) -> Vec<String> {
+    let own = branch_ref(branch);
     run_command_capture(
         "git",
         &[
             "-C",
             root,
             "branch",
-            scope_flag,
             "--contains",
-            &branch_ref(branch),
+            &own,
             "--format",
-            // Full refnames: the short form is ambiguous exactly where the
-            // filtering has to be precise.
+            // Full refnames, so the branch's own ref is filtered exactly.
             "%(refname)",
         ],
         None,
@@ -1986,18 +2201,9 @@ fn refs_containing(root: &str, branch: &str, scope: RefScope) -> Vec<String> {
     .map(|out| {
         out.lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .filter(|line| !line.ends_with("/HEAD"))
-            .filter(|line| {
-                *line != branch_ref(branch)
-                    && !(line.starts_with("refs/remotes/") && line.ends_with(&own_remote_suffix))
-            })
-            .map(|line| {
-                line.strip_prefix("refs/remotes/")
-                    .or_else(|| line.strip_prefix("refs/heads/"))
-                    .unwrap_or(line)
-                    .to_string()
-            })
+            .filter(|line| !line.is_empty() && *line != own)
+            .filter_map(|line| line.strip_prefix("refs/heads/"))
+            .map(str::to_string)
             .collect()
     })
     .unwrap_or_default()
@@ -2045,17 +2251,34 @@ pub struct WorktreeKillVerdict {
     pub protected: bool,
 }
 
+impl WorktreeMergeGate {
+    /// The branch may be live work under review: an open PR, or a PR question
+    /// nobody could answer (#1278). No automatic path (scheduled reap, the
+    /// kill-all sweep) touches such a checkout, and an explicit kill needs
+    /// `keep_branch`.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            WorktreeMergeGate::OpenPr { .. } | WorktreeMergeGate::Unknown { .. }
+        )
+    }
+}
+
 impl WorktreeKillVerdict {
     /// Positive merge evidence — the ONLY thing that permits a branch delete.
     pub fn merged(&self) -> bool {
         matches!(self.gate, WorktreeMergeGate::Merged { .. })
     }
 
-    /// What proved it, when merged.
+    /// What proved it, when merged; why the verdict could not be decided,
+    /// when unknown (#1278).
     pub fn evidence(&self) -> Option<&str> {
         match &self.gate {
             WorktreeMergeGate::Merged { evidence } => Some(evidence.as_str()),
-            WorktreeMergeGate::NotMerged | WorktreeMergeGate::CheckoutMissing => None,
+            WorktreeMergeGate::Unknown { reason } => Some(reason.as_str()),
+            WorktreeMergeGate::NotMerged
+            | WorktreeMergeGate::OpenPr { .. }
+            | WorktreeMergeGate::CheckoutMissing => None,
         }
     }
 
@@ -2071,12 +2294,14 @@ impl WorktreeKillVerdict {
         self.merged() && !keep_branch && !self.protected
     }
 
-    /// Wire/label name for the verdict: `merged` | `not_merged` |
-    /// `checkout_missing`.
+    /// Wire/label name for the verdict: `merged` | `not_merged` | `open_pr` |
+    /// `unknown` | `checkout_missing`.
     pub fn verdict_name(&self) -> &'static str {
         match self.gate {
             WorktreeMergeGate::Merged { .. } => "merged",
             WorktreeMergeGate::NotMerged => "not_merged",
+            WorktreeMergeGate::OpenPr { .. } => "open_pr",
+            WorktreeMergeGate::Unknown { .. } => "unknown",
             WorktreeMergeGate::CheckoutMissing => "checkout_missing",
         }
     }
@@ -2677,6 +2902,7 @@ mod tests {
             working_agent,
             dirty,
             merged,
+            live: false,
         };
 
         // A running agent is protected first, whatever else is true.
@@ -2718,6 +2944,26 @@ mod tests {
             classify_kill_tier(facts(false, false, true, false)),
             KillTier::SkipUnmergedDirty
         );
+    }
+
+    #[test]
+    fn a_live_branch_is_never_swept_or_reaped_forced_or_not() {
+        // #1278: an open PR or an unknown PR state outranks merged, clean and
+        // dirty alike, and neither force nor the scheduled path moves it.
+        for (dirty, merged) in [(false, false), (true, false), (false, true), (true, true)] {
+            let tier = classify_kill_tier(KillFacts {
+                is_main: false,
+                working_agent: false,
+                dirty,
+                merged,
+                live: true,
+            });
+            assert_eq!(tier, KillTier::SkipLive);
+        }
+        for force in [false, true] {
+            assert_eq!(planned_action(KillTier::SkipLive, force), KillAction::Skip);
+        }
+        assert_eq!(scheduled_action(KillTier::SkipLive), KillAction::Skip);
     }
 
     #[test]
@@ -2809,6 +3055,7 @@ mod tests {
             working_agent: false,
             dirty: false,
             merged: false,
+            live: false,
         };
 
         // 1. Dirty tree (unmerged + dirty) → SkipUnmergedDirty → Quarantine.
@@ -4301,91 +4548,27 @@ prunable stale
     }
 
     #[test]
-    fn containment_evidence_never_names_a_remotes_symbolic_head() {
-        // `%(refname:short)` renders refs/remotes/origin/HEAD as bare `origin`,
-        // so the old `contains("HEAD")` filter missed it and the first match
-        // for an empty branch cut from the default was `contained in origin` —
-        // which names no branch at all (#243).
-        let (repo, origin) = create_repo_with_bare_origin("containment-symbolic-head");
-        let default = detect_default_branch(&repo).expect("default branch");
-        run_git(&repo, &["push", "--quiet", "-u", "origin", &default]);
-        // A clone is what actually creates refs/remotes/origin/HEAD.
-        let clone = unique_temp_path("containment-symbolic-head-clone");
-        run_git(
-            &repo,
-            &[
-                "clone",
-                "--quiet",
-                &origin.display().to_string(),
-                clone.to_str().unwrap(),
-            ],
-        );
-        let clone_root = clone.display().to_string();
-        run_git(
-            &clone,
-            &["branch", "worktree/fresh", &format!("origin/{default}")],
-        );
-
-        let containing = refs_containing(&clone_root, "worktree/fresh", RefScope::Remote);
-        assert!(
-            !containing.iter().any(|r| r == "origin"),
-            "a remote's symbolic HEAD is not a branch name: {containing:?}"
-        );
-        assert!(
-            containing.iter().any(|r| r == &format!("origin/{default}")),
-            "the real remote branch must still be found: {containing:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&clone);
-        let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&origin);
-    }
-
-    #[test]
-    fn refs_containing_excludes_the_branchs_own_refs() {
-        // A ref cannot vouch for itself: neither refs/heads/<branch> nor its
-        // tracking ref on any remote is evidence about <branch>.
-        let (repo, _origin) = create_repo_with_bare_origin("refs-containing-own");
+    fn local_branches_containing_names_no_remote_and_not_the_branch_itself() {
+        // A ref cannot vouch for itself, and a remote ref is not evidence at
+        // all (#1278): only OTHER local branches may be named.
+        let (repo, _origin) = create_repo_with_bare_origin("local-containing-own");
         let root = repo.display().to_string();
         run_git(&repo, &["checkout", "--quiet", "-b", "solo"]);
         std::fs::write(repo.join("solo.txt"), "solo\n").unwrap();
         run_git(&repo, &["add", "solo.txt"]);
         run_git(&repo, &["commit", "--quiet", "-m", "solo work"]);
         run_git(&repo, &["push", "--quiet", "-u", "origin", "solo"]);
+        run_git(&repo, &["push", "--quiet", "origin", "solo:elsewhere"]);
+        run_git(&repo, &["fetch", "--quiet", "origin"]);
 
-        // Prove git really does list the refs being filtered, so the
-        // assertions below cannot pass by the helper simply returning nothing.
-        let raw = run_command_capture(
-            "git",
-            &[
-                "-C",
-                &root,
-                "branch",
-                "-a",
-                "--contains",
-                "refs/heads/solo",
-                "--format",
-                "%(refname)",
-            ],
-            None,
-        )
-        .expect("git lists the containing refs");
-        for own in ["refs/heads/solo", "refs/remotes/origin/solo"] {
-            assert!(
-                raw.lines().any(|line| line.trim() == own),
-                "fixture must contain {own} for the filter to be doing work: {raw:?}"
-            );
-        }
+        assert!(
+            local_branches_containing(&root, "solo").is_empty(),
+            "own ref and remote refs must not appear"
+        );
+        assert!(branch_was_pushed(&root, "solo"));
 
-        let all = refs_containing(&root, "solo", RefScope::All);
-        assert!(
-            !all.iter().any(|r| r == "solo" || r == "origin/solo"),
-            "own refs must not appear: {all:?}"
-        );
-        assert!(
-            refs_containing(&root, "solo", RefScope::Remote).is_empty(),
-            "only its own tracking ref contains it, so there is no evidence"
-        );
+        run_git(&repo, &["branch", "holder", "solo"]);
+        assert_eq!(local_branches_containing(&root, "solo"), vec!["holder"]);
 
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -5635,64 +5818,439 @@ prunable stale
         assert_eq!(github_repo_from_remote_url("git@github.com:broken"), None);
     }
 
+    /// The #1278 shape: a feature branch with its own pushed ref, merged by
+    /// its builder into ANOTHER pushed feature branch, never into the landing
+    /// set. The old remote-containment source read that as `contained in
+    /// origin/<feature>` and `worktree kill` would have deleted live work.
+    struct MergedIntoAFeatureBranch {
+        repo: PathBuf,
+        origin: PathBuf,
+        checkout: PathBuf,
+        scratch: PathBuf,
+    }
+
+    impl MergedIntoAFeatureBranch {
+        fn new(name: &str) -> Self {
+            let (repo, origin) = create_repo_with_bare_origin(name);
+            let default = detect_default_branch(&repo).expect("default branch");
+            run_git(&repo, &["push", "--quiet", "origin", &default]);
+            let checkout = unique_temp_path(&format!("{name}-checkout"));
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "feature/float",
+                    checkout.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(checkout.join("w.txt"), "w\n").unwrap();
+            run_git(&checkout, &["add", "w.txt"]);
+            run_git(&checkout, &["commit", "--quiet", "-m", "float work"]);
+            run_git(&checkout, &["push", "--quiet", "origin", "feature/float"]);
+
+            run_git(&repo, &["branch", "integration", &default]);
+            run_git(&repo, &["checkout", "--quiet", "integration"]);
+            std::fs::write(repo.join("study.txt"), "study\n").unwrap();
+            run_git(&repo, &["add", "study.txt"]);
+            run_git(&repo, &["commit", "--quiet", "-m", "study work"]);
+            run_git(&repo, &["merge", "--quiet", "--no-edit", "feature/float"]);
+            run_git(&repo, &["push", "--quiet", "origin", "integration"]);
+            run_git(&repo, &["checkout", "--quiet", &default]);
+            run_git(&repo, &["fetch", "--quiet", "origin"]);
+            Self {
+                repo,
+                origin,
+                checkout,
+                scratch: unique_temp_path(&format!("{name}-scratch")),
+            }
+        }
+
+        fn tip(&self) -> String {
+            run_command_capture(
+                "git",
+                &[
+                    "-C",
+                    &self.repo.display().to_string(),
+                    "rev-parse",
+                    "refs/heads/feature/float",
+                ],
+                None,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        }
+
+        fn cleanup(self) {
+            for dir in [self.checkout, self.repo, self.origin, self.scratch] {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Run `body` with a PATH holding `git` and a stub `gh` that prints `json`
+    /// for every call, so the PR evidence source answers without a network.
+    fn with_stub_gh<T>(scratch: &Path, json: &str, body: impl FnOnce() -> T) -> T {
+        with_gh_script(scratch, &format!("printf '%s\\n' '{json}'"), body)
+    }
+
+    /// [`with_stub_gh`] for any shell body, so a fixture can make gh fail.
+    fn with_gh_script<T>(scratch: &Path, script: &str, body: impl FnOnce() -> T) -> T {
+        let stub_root = scratch.join("stub-gh");
+        let bin_dir = stub_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let gh = bin_dir.join("gh");
+        std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        with_gh_absent_from_path(&stub_root, body)
+    }
+
     #[test]
-    fn branch_merge_gate_accepts_remote_containment_in_feature_branch() {
-        // origin bare repo; feature branch merged into a NON-default branch
-        // that is pushed — the containment fallback must accept it.
-        let origin = unique_temp_path("merge-gate-containment-origin");
-        std::fs::create_dir_all(&origin).unwrap();
-        run_git(&origin, &["init", "--quiet", "--bare"]);
+    fn branch_merge_gate_refuses_containment_in_a_feature_branch() {
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-feature-containment");
+        // Wholly contained in origin/integration AND the local integration
+        // branch, and neither is a landing branch: no evidence (#1278).
+        let gate = with_gh_absent_from_path(&fx.scratch, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert_eq!(gate, WorktreeMergeGate::NotMerged);
 
-        let repo = create_committed_repo("merge-gate-containment-repo");
-        run_git(
-            &repo,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
-        let default = detect_default_branch(&repo).expect("default branch");
-        run_git(&repo, &["push", "--quiet", "origin", &default]);
-
-        let checkout = unique_temp_path("merge-gate-containment-checkout");
-        run_git(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
+        // The same containment counts once the repo declares `integration` a
+        // landing branch.
+        let gate = with_gh_absent_from_path(&fx.scratch.join("configured"), || {
+            branch_merge_gate(
+                &fx.repo,
+                &fx.checkout,
                 "feature/float",
-                checkout.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(checkout.join("w.txt"), "w\n").unwrap();
-        run_git(&checkout, &["add", "w.txt"]);
-        run_git(&checkout, &["commit", "--quiet", "-m", "float work"]);
-        run_git(&checkout, &["push", "--quiet", "origin", "feature/float"]);
-
-        // Not merged anywhere else yet: own tracking ref must NOT count.
+                &["integration".to_string()],
+            )
+        });
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/float", &[]),
-            WorktreeMergeGate::NotMerged
-        );
-
-        // Merge into a pushed integration branch (not the default).
-        run_git(&repo, &["branch", "integration", &default]);
-        run_git(&repo, &["checkout", "--quiet", "integration"]);
-        run_git(&repo, &["merge", "--quiet", "feature/float"]);
-        run_git(&repo, &["push", "--quiet", "origin", "integration"]);
-        run_git(&repo, &["checkout", "--quiet", &default]);
-        run_git(&repo, &["fetch", "--quiet", "origin"]);
-
-        assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/float", &[]),
+            gate,
             WorktreeMergeGate::Merged {
-                evidence: "contained in origin/integration".to_string()
+                evidence: "merged into integration".to_string()
+            }
+        );
+        fx.cleanup();
+    }
+
+    #[test]
+    fn branch_merge_gate_counts_containment_in_a_closed_prs_base_branch() {
+        // "The PR's base branch when known" is a landing branch for that
+        // PR's work, even when it is a feature branch (a stacked PR).
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-pr-base");
+        let json = r#"{"state":"CLOSED","number":9,"headRefOid":"0000000000000000000000000000000000000000","baseRefName":"integration"}"#;
+        let gate = with_stub_gh(&fx.scratch, json, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: "merged into integration".to_string()
+            }
+        );
+        fx.cleanup();
+    }
+
+    #[test]
+    fn an_open_pr_blocks_the_gate_even_when_the_branch_landed() {
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-open-pr");
+        let default = detect_default_branch(&fx.repo).expect("default branch");
+        run_git(
+            &fx.repo,
+            &["merge", "--quiet", "--no-edit", "feature/float"],
+        );
+
+        // Contained in the default branch: merged, when no PR is open.
+        let gate = with_gh_absent_from_path(&fx.scratch, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: format!("merged into {default}")
             }
         );
 
-        let _ = std::fs::remove_dir_all(&checkout);
-        let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&origin);
+        // An open PR on the branch wins over every other source.
+        let json = format!(
+            r#"{{"state":"OPEN","number":150,"headRefOid":"{}","baseRefName":"{default}"}}"#,
+            fx.tip()
+        );
+        let verdict = with_stub_gh(&fx.scratch, &json, || {
+            resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+        });
+        assert_eq!(
+            verdict.gate,
+            WorktreeMergeGate::OpenPr { number: Some(150) }
+        );
+        assert!(!verdict.merged());
+        assert!(!verdict.would_delete_branch(false));
+        assert_eq!(verdict.verdict_name(), "open_pr");
+        assert_eq!(verdict.evidence(), None);
+        fx.cleanup();
     }
+
+    /// What gh 2.x prints, and how it exits, when it runs under GitHub Actions
+    /// with no token: the state every CI job of this repo is in.
+    const GH_UNAUTHENTICATED_IN_ACTIONS: &str = "echo 'gh: To use GitHub CLI in a GitHub \
+        Actions workflow, set the GH_TOKEN environment variable. Example:' >&2; exit 4";
+
+    #[test]
+    fn an_unauthenticated_gh_on_a_repo_with_no_github_remote_lets_git_decide() {
+        // #1278 CI round: a repo whose only remote is a local bare repo cannot
+        // have a PR, so a gh that refuses for want of a token is not a reason
+        // to keep the branch. The Actions wording names neither "gh auth
+        // login" nor a host, only the exit code says what happened.
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-gh-unauthenticated");
+        run_git(
+            &fx.repo,
+            &["merge", "--quiet", "--no-edit", "feature/float"],
+        );
+        let gate = with_gh_script(&fx.scratch, GH_UNAUTHENTICATED_IN_ACTIONS, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+        fx.cleanup();
+    }
+
+    #[test]
+    fn a_gh_that_cannot_answer_is_unknown_never_no_pr() {
+        // #1278 round 2: the branch is in the default branch, so with "no PR"
+        // it is merged. Every way gh can FAIL must instead leave the verdict
+        // unknown, because an open PR on the branch cannot be ruled out.
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-gh-fails");
+        run_git(
+            &fx.repo,
+            &["merge", "--quiet", "--no-edit", "feature/float"],
+        );
+        // A GitHub remote that is not origin: gh missing must count as a
+        // failure here, and no lookup is pinned to it.
+        run_git(
+            &fx.repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let failures = [
+            (
+                "rate",
+                "echo 'API rate limit exceeded for user' >&2; exit 1",
+            ),
+            (
+                "offline",
+                "echo 'error connecting to api.github.com' >&2; exit 1",
+            ),
+            (
+                "auth",
+                "echo 'To get started with GitHub CLI, please run: gh auth login' >&2; exit 4",
+            ),
+            ("auth-actions", GH_UNAUTHENTICATED_IN_ACTIONS),
+            ("garbage", "echo 'not json'"),
+        ];
+        for (name, script) in failures {
+            let verdict = with_gh_script(&fx.scratch.join(name), script, || {
+                resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+            });
+            assert!(
+                matches!(verdict.gate, WorktreeMergeGate::Unknown { .. }),
+                "{name}: {:?}",
+                verdict.gate
+            );
+            assert_eq!(verdict.verdict_name(), "unknown");
+            assert!(!verdict.would_delete_branch(false));
+            assert!(verdict.gate.is_live());
+        }
+        let verdict = with_gh_script(&fx.scratch.join("rate-reason"), failures[0].1, || {
+            resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+        });
+        assert_eq!(
+            verdict.evidence(),
+            Some("gh failed: API rate limit exceeded for user")
+        );
+
+        // gh missing on a repo with a GitHub remote: unknown.
+        let gate = with_gh_absent_from_path(&fx.scratch.join("missing"), || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(
+            matches!(gate, WorktreeMergeGate::Unknown { .. }),
+            "{gate:?}"
+        );
+
+        // gh's own "no pull requests found" is an answer: merged.
+        let gate = with_gh_script(
+            &fx.scratch.join("nopr"),
+            "echo 'no pull requests found for branch \"feature/float\"' >&2; exit 1",
+            || branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[]),
+        );
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+
+        // Without any GitHub remote, a missing gh means no PR can exist.
+        run_git(&fx.repo, &["remote", "remove", "upstream"]);
+        let gate = with_gh_absent_from_path(&fx.scratch.join("nogithub"), || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+        fx.cleanup();
+    }
+
+    #[test]
+    fn the_origin_pinned_pr_answer_wins_and_failures_are_never_no_pr() {
+        let open = || PrQuery::Found(PrLookup::Open { number: Some(1) });
+        let merged = || PrQuery::Found(PrLookup::Merged("PR #2 merged".into()));
+        let failed = || PrQuery::Failed("gh failed: rate".into());
+        let run = |pinned: Option<PrQuery>, unpinned: PrQuery| {
+            let has_pinned = pinned.is_some();
+            let mut pinned = pinned;
+            let mut unpinned = Some(unpinned);
+            let mut asked_unpinned = false;
+            let answer = resolve_pr_query(
+                |is_pinned| {
+                    if is_pinned {
+                        pinned.take().expect("pinned asked once")
+                    } else {
+                        asked_unpinned = true;
+                        unpinned.take().expect("unpinned asked once")
+                    }
+                },
+                has_pinned,
+            );
+            (answer, asked_unpinned)
+        };
+        // Fork case: origin says merged, gh's upstream resolution says open
+        // for a same-named branch. The pinned answer wins, and the unpinned
+        // lookup is not even asked.
+        assert_eq!(run(Some(merged()), open()), (merged(), false));
+        assert_eq!(run(Some(open()), merged()), (open(), false));
+        // No PR on origin: the unpinned answer decides.
+        assert_eq!(run(Some(PrQuery::NoPr), open()).0, open());
+        // A failure on either side, with no PR found, is a failure.
+        assert_eq!(run(Some(failed()), PrQuery::NoPr).0, failed());
+        assert_eq!(run(Some(PrQuery::NoPr), failed()).0, failed());
+        assert_eq!(run(None, failed()).0, failed());
+        assert_eq!(run(None, PrQuery::NotGitHub).0, PrQuery::NotGitHub);
+        assert_eq!(
+            run(Some(PrQuery::NoPr), PrQuery::NotGitHub).0,
+            PrQuery::NoPr
+        );
+    }
+
+    #[test]
+    fn gh_failure_wording_is_classified_fail_closed() {
+        for github in [false, true] {
+            assert_eq!(
+                classify_gh_failure(Some(1), "no pull requests found for branch \"x\"", github),
+                PrQuery::NoPr
+            );
+            assert_eq!(
+                classify_gh_failure(Some(1), "no git remotes found", github),
+                PrQuery::NotGitHub
+            );
+            assert_eq!(
+                classify_gh_failure(
+                    Some(1),
+                    "none of the git remotes configured for this repository point to a known GitHub host.",
+                    github
+                ),
+                PrQuery::NotGitHub
+            );
+            assert!(matches!(
+                classify_gh_failure(Some(1), "HTTP 502: Bad Gateway", github),
+                PrQuery::Failed(_)
+            ));
+            assert!(matches!(
+                classify_gh_failure(Some(1), "", github),
+                PrQuery::Failed(_)
+            ));
+        }
+        // Unauthenticated gh names no host: a failure only for a repo with a
+        // github.com remote. The terminal and the GitHub Actions wordings
+        // differ, and both exit 4 (#1278: CI ran gh with no token).
+        let terminal = "To get started with GitHub CLI, please run:  gh auth login";
+        let actions = "gh: To use GitHub CLI in a GitHub Actions workflow, \
+                       set the GH_TOKEN environment variable. Example:";
+        for auth in [terminal, actions] {
+            assert_eq!(
+                classify_gh_failure(Some(GH_EXIT_AUTH_REQUIRED), auth, false),
+                PrQuery::NotGitHub,
+                "{auth}"
+            );
+            assert!(
+                matches!(
+                    classify_gh_failure(Some(GH_EXIT_AUTH_REQUIRED), auth, true),
+                    PrQuery::Failed(_)
+                ),
+                "{auth}"
+            );
+        }
+        // Any other failure on a repo with no github.com remote still fails
+        // closed: only an authentication refusal says nothing about a PR.
+        assert!(matches!(
+            classify_gh_failure(Some(1), "HTTP 502: Bad Gateway", false),
+            PrQuery::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn a_squash_merged_pr_is_still_merged_through_the_pr_evidence() {
+        // Not an ancestor of any landing branch and its content not in one
+        // either: only the merged PR (at exactly this tip) proves it landed.
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-squash-pr");
+        let json = format!(
+            r#"{{"state":"MERGED","number":7,"headRefOid":"{}","baseRefName":"main"}}"#,
+            fx.tip()
+        );
+        let gate = with_stub_gh(&fx.scratch, &json, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert_eq!(
+            gate,
+            WorktreeMergeGate::Merged {
+                evidence: "PR #7 merged".to_string()
+            }
+        );
+        fx.cleanup();
+    }
+
+    #[test]
+    fn pr_lookup_reads_open_and_drafts_as_open_and_unknown_states_as_nothing() {
+        let root = "/nonexistent";
+        for value in [
+            serde_json::json!({"state": "OPEN", "number": 3}),
+            serde_json::json!({"state": "OPEN", "number": 3, "isDraft": true}),
+        ] {
+            assert_eq!(
+                pr_lookup_from_value(&value, root, Some("abc")),
+                Some(PrLookup::Open { number: Some(3) })
+            );
+        }
+        assert_eq!(
+            pr_lookup_from_value(&serde_json::json!({"state": "OPEN"}), root, None),
+            Some(PrLookup::Open { number: None })
+        );
+        assert_eq!(
+            pr_lookup_from_value(&serde_json::json!({"state": "WEIRD"}), root, None),
+            None
+        );
+        assert_eq!(
+            pr_lookup_from_value(
+                &serde_json::json!({"state": "CLOSED", "number": 4, "baseRefName": "dev"}),
+                root,
+                None
+            ),
+            Some(PrLookup::Settled {
+                base: Some("dev".to_string())
+            })
+        );
+    }
+
     #[test]
     fn main_root_from_common_dir_strips_dot_git() {
         assert_eq!(

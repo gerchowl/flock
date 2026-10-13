@@ -238,12 +238,26 @@ mod tests {
         app.mailboxes.start_relaying_question(&relay.correlation_id);
         let mut work = relay.into_work();
         work.run = Box::new(|| panic!("test relay panic"));
-        app.enqueue_message_relay(work);
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
-            .await
-            .unwrap()
+        // Background app events can arrive before the relay's completion.
+        // Force that ordering so the test cannot depend on worker scheduling.
+        app.event_tx
+            .try_send(AppEvent::ClipboardWrite {
+                content: Vec::new(),
+            })
             .unwrap();
-        app.handle_internal_event(event);
+        app.enqueue_message_relay(work);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = app.event_rx.recv().await.unwrap();
+                let completed = matches!(&event, AppEvent::MsgRelayCompleted(_));
+                app.handle_internal_event(event);
+                if completed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("panicking relay should complete");
         let response: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(response["id"], "request");
         assert_eq!(response["result"]["state"], "queued");
