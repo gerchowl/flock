@@ -115,6 +115,11 @@ use serde::{Deserialize, Serialize};
 /// `goal.pause`, `goal.resume` and `goal.stop` (ADR-0030 §1, #1155): v30 is
 /// not yet released, so they ship in it without a bump. All but
 /// `goal.status` are gated by #868, and `goal.status` normalizes to exit 78.
+/// v30 also adds `hook.decide` (ADR-0034 §1, #1180). `flk hook` is exempt
+/// from the #868 gate, so it does send it to an older server, gets the
+/// unknown-variant refusal and follows ADR-0034 §4: it passes in a pane
+/// without a `FLOCK_QUESTIONS` hint and denies with the hint's fallback
+/// reason in a pane with one.
 pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Refusal notice sent to clients while a live update handoff is in

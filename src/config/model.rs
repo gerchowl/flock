@@ -573,6 +573,17 @@ impl Default for EventsConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct QuestionsConfig {
+    /// Third-party tools that ask a human, such as an MCP "ask me on
+    /// Telegram" tool, by the name the harness reports (ADR-0034 §3). A
+    /// delegate's call to one is refused like its own question tool. Empty by
+    /// default. `flk integration install claude` adds them to the question
+    /// hook's matcher, so reinstall after changing the list.
+    pub human_tools: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SystemOneConfig {
@@ -683,6 +694,8 @@ pub struct Config {
     pub msg: MsgConfig,
     /// `[events]` — the `events.read` socket method (ADR-0028 §3).
     pub events: EventsConfig,
+    /// `[questions]` — question routing for delegates (ADR-0034).
+    pub questions: QuestionsConfig,
     /// `[[channels]]` — external channel bindings (ADR-0028 §8, #1037).
     pub channels: Vec<crate::channels::ChannelBinding>,
     pub systemone: SystemOneConfig,
