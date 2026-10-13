@@ -120,7 +120,8 @@ const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent na
 
 pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
-pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text [--raw] <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
+pub(super) const PANE_RUN_USAGE: &str = "flk pane run [--raw | --if-input-empty [--min-age-secs N] [--if-session ID]] <target> <command>\n  Types the command, waits 120 ms and presses Enter. It confirms nothing and needs no idle agent.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  --if-input-empty is the guarded submit that also requires an idle agent. To submit a prompt and confirm the turn, use flk agent send.";
 pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -521,6 +522,7 @@ fn pane_stash(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
+    let (raw, args) = take_raw(args);
     if args.len() < 2 {
         eprintln!("usage: {PANE_SEND_TEXT_USAGE}");
         return Ok(2);
@@ -530,8 +532,17 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     let text = args[1..].join(" ");
     super::print_send_response(&super::send_request(&Request {
         id: "cli:pane:send-text".into(),
-        method: Method::PaneSendText(PaneSendTextParams { pane_id, text }),
+        method: Method::PaneSendText(PaneSendTextParams { pane_id, text, raw }),
     })?)
+}
+
+/// Split a leading `--raw` off a text verb's argv (#1162). Only the leading
+/// position is a flag: after the target every word is the text.
+fn take_raw(args: &[String]) -> (bool, &[String]) {
+    match args.split_first() {
+        Some((first, rest)) if first == "--raw" => (true, rest),
+        _ => (false, args),
+    }
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
@@ -796,9 +807,18 @@ fn parse_guarded_pane_run(
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
+    let (raw, args) = take_raw(args);
     if args.len() < 2 {
-        eprintln!("usage: flk pane run <target> <command>");
+        eprintln!("usage: {PANE_RUN_USAGE}");
         return Ok(2);
+    }
+    if raw && args.iter().take(2).any(|arg| arg == "--if-input-empty") {
+        eprintln!("pane run: --raw and --if-input-empty cannot be combined");
+        return Ok(super::exit::USAGE);
+    }
+    if raw {
+        let pane_id = super::resolve_pane_arg(&args[0]);
+        return submit_sequence(&pane_id, &args[1..].join(" "), true);
     }
 
     match parse_guarded_pane_run(args) {
@@ -814,7 +834,10 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     }
     let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    submit_sequence(&pane_id, &text)
+    // The same type, settle, Enter in every pane. In an agent pane the server
+    // refuses the typed step before writing when the composer holds a draft
+    // (#1162), and then no Enter is sent.
+    submit_sequence(&pane_id, &text, false)
 }
 
 /// Type `text` into `pane_id` and press Enter, as the same two separate writes
@@ -830,17 +853,18 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
 /// (P578 r4-4 W2). The gap value is the single source of truth; the walking
 /// code is split by whether a stall must be bounded.
 ///
-/// The exit code is what [`super::send_ok_request`] returns — 0, or 1 after
-/// printing the server's refusal to stderr as it does — so `pane run`'s
-/// observable behaviour is unchanged, and a caller that only wants to know
-/// whether the submit landed reads it as non-zero.
-pub(super) fn submit_sequence(pane_id: &str, text: &str) -> std::io::Result<i32> {
+/// The exit code is what [`super::send_guarded_request`] returns: 0, or the
+/// server's refusal printed to stderr, exiting `REFUSED` (10) for one that
+/// changed nothing (`input_not_empty` for a draft in an agent's composer,
+/// #1162) and 1 otherwise. A refused type step sends no Enter.
+pub(super) fn submit_sequence(pane_id: &str, text: &str, raw: bool) -> std::io::Result<i32> {
     for step in pane_run_steps(pane_id, text) {
         let method = match step {
             PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
                 pane_id,
                 text,
                 keys: Vec::new(),
+                raw,
             }),
             PaneRunStep::Settle(gap) => {
                 std::thread::sleep(gap);
@@ -851,7 +875,7 @@ pub(super) fn submit_sequence(pane_id: &str, text: &str) -> std::io::Result<i32>
                 keys: vec!["Enter".into()],
             }),
         };
-        let exit_code = super::send_ok_request(method)?;
+        let exit_code = super::send_guarded_request(method)?;
         if exit_code != 0 {
             return Ok(exit_code);
         }
@@ -1595,7 +1619,7 @@ fn pane_help_text() -> String {
         "  flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
     );
     let _ = writeln!(out, "  flk pane clear-field <key> [--pane <pane_id>]");
-    let _ = writeln!(out, "  flk pane run <target> <command>");
+    let _ = writeln!(out, "  {PANE_RUN_USAGE}");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -1823,6 +1847,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_leading_raw_is_a_flag() {
+        let leading = argv(&["--raw", "1-1", "hi"]);
+        let (raw, rest) = super::take_raw(&leading);
+        assert!(raw);
+        assert_eq!(rest, argv(&["1-1", "hi"]));
+        let trailing = argv(&["1-1", "--raw"]);
+        let (raw, rest) = super::take_raw(&trailing);
+        assert!(!raw);
+        assert_eq!(rest, trailing);
+    }
+
+    #[test]
     fn pane_run_types_then_settles_then_submits() {
         let steps = pane_run_steps("1:p2", "cargo test");
         assert_eq!(
@@ -1858,7 +1894,8 @@ mod tests {
 
     #[test]
     fn pane_help_documents_agent_targets_and_pane_id_precedence() {
-        let help = super::pane_help_text();
+        // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+        let help = super::pane_help_text().replace(" [--raw]", "");
         for verb in ["read", "send-text", "send-keys", "close"] {
             assert!(help.contains(&format!("flk pane {verb} <target>")));
         }

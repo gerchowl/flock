@@ -1001,6 +1001,12 @@ pub struct AgentSendParams {
     /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
     #[serde(default)]
     pub submit: bool,
+    /// Without `submit`, type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 /// Queue a server-owned restart. The caller must finish its requesting turn.
@@ -1732,6 +1738,12 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    /// Type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1811,6 +1823,12 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Type `text` even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -327,6 +327,7 @@ async fn a_human_at_the_keyboard_keeps_it() {
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::PaneSendText(crate::api::schema::PaneSendTextParams {
+            raw: false,
             pane_id: pane.clone(),
             text: "half a thought".into(),
         }),
