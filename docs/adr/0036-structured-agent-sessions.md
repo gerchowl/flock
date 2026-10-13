@@ -141,7 +141,7 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
   "Today's date is …" is a `<system-reminder>` attachment in the transcript,
   and the binary carries a "The date has changed …" attachment for a later
   date. That a fork across a day boundary therefore keeps its cache is the
-  expectation, measured only by the real midnight run of A.7.2. (A.7)
+  expectation, not yet measured (A.7.2, #1305). (A.7)
 - **E14 Hot reload is cheap without compaction and resets the prefix with
   it.** Resuming a 41k-token session with a new MCP server read 98.9% from
   cache (first-token time 2.26 s). After `/compact` (40,032 → 1,237 tokens)
@@ -787,14 +787,14 @@ ok" unless noted. Input-equivalent cost = `in + 0.1 × read + 2 × write`
 | 3 | between the two tool calls of turn 2 | 2 | 19,053 | 135 | 117 | 99.3 | 2,949 | 2,177 |
 | 4 | base G, end of turn 1, immediately | 2 | 18,913 | 112 | 4 | 99.4 | 1,741 | 2,117 |
 | 4 | same point after 6 min | 2 | 19,025 | 0 | 4 | 100.0 | 1,421 | 1,905 |
-| 4 | same point 65 min after the 6-min read | see A.7.1 | | | | | | |
+| 4 | same point 65 min after the 6-min read | pending (#1305), A.7.1 | | | | | | |
 | 5a | point of test 2 + an MCP server added | 2 | 18,996 | 336 | 4 | 98.3 | 1,606 | 2,574 |
 | 5b | point of test 2 + `--tools Bash` (was `Bash,Read`) | 2 | 19,021 | 0 | 4 | 100.0 | 1,172 | 1,904 |
 | 5c | 41k session forked with its MCP server removed | 2 | 41,391 | 165 | 4 | 99.6 | 1,619 | 4,471 |
 | 5d | control for 5c, server kept | 2 | 41,391 | 41 | 4 | 99.9 | 1,877 | 4,223 |
 | 5e | 5b, asked to use Read | 4 | 37,966 | 353 | 230 | 99.1 | 1,752 | 4,507 |
 | 5g | point of test 2 + MCP added, asked to call it | 4 | 38,283 | 559 | 80 | 98.6 | 1,163 | 4,950 |
-| 6 | day boundary | see A.7.2 | | | | | | |
+| 6 | day boundary | pending (#1305), A.7.2 | | | | | | |
 | 7a | segment: fork at the first message after `/compact` | 2 | 5,195 | 2,266 | 4 | 69.6 | 683 | 5,054 |
 | 7b | slice of F's turn 1 (28 kB of text) as the first prompt of a fresh session | 2 | 5,195 | 13,808 | 6 | 27.3 | 1,588 | 28,138 |
 | 7c | `--resume-session-at` a preserved pre-compaction uuid | 2 | 5,195 | 2,153 | 3 | 70.7 | 1,139 | 4,828 |
@@ -818,8 +818,8 @@ Notes:
 
 #### A.7.1 Test 4, 65 minutes
 
-Pending at the time of writing; filled in before this record leaves
-Proposed (the run is scheduled on base G and recorded as `T4-65min`).
+Pending: not run when this record was written; tracked as #1305, which
+must be done before this record leaves Proposed.
 
 #### A.7.2 Test 6, day boundary
 
@@ -828,9 +828,7 @@ Proposed (the run is scheduled on base G and recorded as `T4-65min`).
 attachment appeared and the model answered 2026-10-13, so the override did
 not take effect on this path and the row proves nothing about a day
 boundary. A real run straddling local midnight (base at 23:56, fork at
-00:02) is recorded below.
-
-Pending at the time of writing.
+00:02) is pending: tracked as #1305, before this record leaves Proposed.
 
 ### A.8 Bytes
 
