@@ -181,6 +181,8 @@ fn spawn_flock_with_options(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, socket_path);
 
     SpawnedFlock {
         _master: pair.master,

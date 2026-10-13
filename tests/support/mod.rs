@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod fleet;
 pub mod process_table;
+pub mod readiness;
 pub mod scripted;
 pub mod timing;
 
