@@ -615,9 +615,9 @@ When an agent's screen shows a harness choice dialog, its `state` says what the 
 - `allow_other` means the dialog accepts free text: Claude's "Type something", or Codex's "None of the above". That entry is not listed as an option, and neither is Claude's "Chat about this".
 - `state` is `open` while the question waits, and `withdrawn` on the `agent.question_closed` that ends it. `expired` is for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)). `answered` comes with `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)); a build without it reads that state as `unknown`.
 - `header` is the form's tag. It is read only when the form has one question tab, because the screen marks the current tab by styling alone.
-- `question_id` is derived from the agent, the pane's `turn_cursor` when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. A different question gets a new id, and so does the same question asked again in a later turn.
+- `question_id` is derived from the agent, the pane's `turn_cursor` and the event log's sequence when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. Every new open gets an id that was never used before, whether it is a different question, a tab revisited, or the same question asked again, including after a restart or a live handoff. The log sequence is durable and only grows, so an id that was ever closed is never opened again.
 - A frame whose form cannot be read, such as a torn read, an overlay or a form's review page, keeps the open question. Only a screen that no longer asks a question closes it. A prompt whose form never reads still reads `needs_human{reason: "question"}`, just without `question`.
-- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab reopens that question under its earlier id, since it is the same question in the same turn.
+- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab opens that question again under a new id.
 
 Two durable kinds follow the same reads. Unlike the phase kinds, they are emitted at once, with no settle window:
 
@@ -628,7 +628,7 @@ Two durable kinds follow the same reads. Unlike the phase kinds, they are emitte
 
 `question_id` is a top-level field of both, so `"subjects": ["<question id>"]` matches the pair. On a screen, `reason` is always `withdrawn`. An answer typed at the pane also closes the question as `withdrawn`, because on screen it cannot be told apart from a cancel. Answered questions are reported by `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)) and by the harness hook ([#1194](https://github.com/gerchowl/flock/issues/1194)). Moving to the next tab of a form closes the previous tab's question the same way. `expired` is reserved for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)).
 
-A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then. A turn cursor restarts with the server, so the same question first asked after a restart can, rarely, get an id it had before the restart. A server older than these kinds skips them in its log.
+A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then, once, as `withdrawn`. A server older than these kinds skips them in its log.
 
 ## Channel adapters
 

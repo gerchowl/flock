@@ -4146,8 +4146,14 @@ pub enum EventData {
         #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
         reason: crate::api::question::QuestionCloseReason,
         /// The question as it closed, its `state` `withdrawn`, so a channel
-        /// can update what it rendered.
-        question: crate::api::question::Question,
+        /// can update what it rendered. Read leniently: a line without it, or
+        /// with a shape this build cannot read, still reads.
+        #[serde(
+            default,
+            deserialize_with = "crate::api::agent_state::or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        question: Option<crate::api::question::Question>,
     },
     /// #1020: every check on `head_sha` has concluded. `conclusion` is the
     /// rollup (`success`, `failure`, `error`).

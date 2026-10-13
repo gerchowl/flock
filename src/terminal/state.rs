@@ -415,14 +415,16 @@ impl TerminalState {
 
     /// Take the question a detector screen draws (#1038): the open one is
     /// kept while the screen asks the same, so a redraw keeps its id, and a
-    /// different form opens a new one at this turn cursor. A question screen
-    /// whose form did not read this frame (a torn read, an overlay) keeps the
-    /// open question. Only a screen that no longer asks one closes it.
+    /// different form opens a new one at this turn cursor and the event log's
+    /// `log_sequence`. A question screen whose form did not read this frame (a
+    /// torn read, an overlay) keeps the open question. Only a screen that no
+    /// longer asks one closes it.
     pub fn observe_question(
         &mut self,
         agent: Option<crate::detect::Agent>,
         needs_human: Option<crate::api::agent_state::HumanReason>,
         question: Option<crate::api::question::QuestionForm>,
+        log_sequence: u64,
     ) {
         let asking = needs_human == Some(crate::api::agent_state::HumanReason::Question);
         self.question = match (agent, question) {
@@ -431,6 +433,7 @@ impl TerminalState {
                 &self.agent_id.to_string(),
                 crate::detect::agent_label(agent),
                 &self.turn_cursor(),
+                log_sequence,
             )),
             _ if asking => self.question.take(),
             _ => None,

@@ -1086,10 +1086,10 @@ mod tests {
                     pane: "w1:p1".into(),
                     question_id: question.question_id.clone(),
                     reason: QuestionCloseReason::Withdrawn,
-                    question: Question {
+                    question: Some(Question {
                         state: QuestionState::Withdrawn,
                         ..question.clone()
-                    },
+                    }),
                 },
             },
         ];
@@ -1105,6 +1105,23 @@ mod tests {
             .map(|(_, _, envelope)| envelope)
             .collect();
         assert_eq!(back, written);
+        // A close without its question, or with one this build cannot read.
+        for question in [serde_json::Value::Null, serde_json::json!({"prompt": 7})] {
+            let mut line = serde_json::to_value(&written[1].data).unwrap();
+            line["question"] = question;
+            let data: EventData = serde_json::from_value(line).unwrap();
+            assert!(
+                matches!(data, EventData::AgentQuestionClosed { question: None, .. }),
+                "{data:?}"
+            );
+        }
+        let mut line = serde_json::to_value(&written[1].data).unwrap();
+        line.as_object_mut().unwrap().remove("question");
+        let data: EventData = serde_json::from_value(line).unwrap();
+        assert!(matches!(
+            data,
+            EventData::AgentQuestionClosed { question: None, .. }
+        ));
 
         let content = std::fs::read_to_string(&path).unwrap();
         let mut renamed = String::new();

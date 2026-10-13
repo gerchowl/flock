@@ -731,6 +731,7 @@ impl App {
         {
             self.touch_agent_phase(*pane_id);
         }
+        self.observe_question(&ev);
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
             self.refresh_new_flock_toast_context_for_update(update, &previous_toast);
