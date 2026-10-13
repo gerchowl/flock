@@ -171,6 +171,28 @@ impl App {
         }
     }
 
+    /// ADR-0014's operator boundary for an operator-only verb: a local
+    /// caller with no flk pane in its process ancestry that is not an inbound
+    /// mesh relay. It fails closed: a caller whose pid the socket could not
+    /// read is not the operator.
+    ///
+    /// Cooperative only until O19a (#1208, #1177, ADR-0035 §6.3 point 6): an
+    /// agent's detached (`setsid`) child has no pane in its ancestry and
+    /// passes (ADR-0027 §1a).
+    pub(super) fn caller_is_local_operator(&mut self) -> bool {
+        self.current_api_peer_pid.is_some()
+            && self
+                .parse_pane_id_or_peer("", self.current_api_peer_pid)
+                .is_none()
+            && self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_none()
+    }
+
     pub(super) fn handle_peers_enroll_reset(
         &mut self,
         id: String,
@@ -182,18 +204,7 @@ impl App {
             preview,
             expected_node_id,
         } = params;
-        if self.current_api_peer_pid.is_none()
-            || self
-                .parse_pane_id_or_peer("", self.current_api_peer_pid)
-                .is_some()
-            || self
-                .inbound
-                .edge(
-                    self.current_api_peer_pid,
-                    crate::platform::process_start_time,
-                )
-                .is_some()
-        {
+        if !self.caller_is_local_operator() {
             return encode_error(
                 id,
                 "operator_only",
