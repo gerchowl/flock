@@ -3195,6 +3195,38 @@ mod tests {
         assert!(detection_update_for_publish(Some(Agent::Codex), content, true).is_none());
     }
 
+    /// The server's own grid decides, with no client attached (#1264): a
+    /// 52x15 pane, the size an 80x24 client leaves behind on detach, holding
+    /// a real Claude frame whose activity label wraps, reads working, and the
+    /// turn ending on that same grid still reads idle.
+    #[tokio::test]
+    async fn a_wrapped_claude_spinner_on_a_headless_narrow_pane_reads_working() {
+        let frame =
+            include_str!("../tests/fixtures/claude-wrapped-spinner-1264/label-beside-glyph.txt")
+                .replace('\n', "\r\n");
+        let runtime = PaneRuntime::test_with_scrollback_bytes(52, 15, 1 << 20, frame.as_bytes());
+
+        let working =
+            detection_update_for_publish(Some(Agent::Claude), &runtime.detection_text(), false)
+                .expect("a painted frame publishes");
+        assert_eq!(working.state, AgentState::Working);
+        assert!(working.visible_working);
+        assert!(!working.visible_idle);
+
+        let rule = "\u{2500}".repeat(52);
+        runtime.test_process_pty_bytes(
+            format!(
+                "\x1b[2J\x1b[H\u{273b} Crunched for 3m 5s\r\n\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n"
+            )
+            .as_bytes(),
+        );
+        let idle =
+            detection_update_for_publish(Some(Agent::Claude), &runtime.detection_text(), false)
+                .expect("a painted frame publishes");
+        assert_eq!(idle.state, AgentState::Idle);
+        assert!(idle.visible_idle);
+    }
+
     #[test]
     fn blank_startup_screen_does_not_publish_idle() {
         for agent in [Agent::OpenCode, Agent::Codex, Agent::Pi] {
