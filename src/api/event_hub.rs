@@ -24,9 +24,11 @@ pub struct EventHub {
     arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     read_max_wait_ms: ReadMaxWait,
     /// How many times the active log file has rotated since this hub opened
-    /// (ADR-0031 §4). `rotate()` runs inside `push()` with `inner` held, so
-    /// it only counts, and the server loop re-issues what must outlive the
-    /// rotation once the lock is released.
+    /// (ADR-0031 §4). The one rotation counter: the `PersistentLog` holds a
+    /// clone and bumps it in `rotate()`, which runs inside `push()` with
+    /// `inner` held. So the rotation only counts, and the server loop
+    /// re-issues what must outlive it once the lock is released. A cold read
+    /// compares it before and after its disk pass.
     rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     cold_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -71,9 +73,9 @@ struct PersistentLog {
     active_events: u64,
     /// Bytes written to the active file since open/rotation.
     active_bytes: u64,
-    /// Rotations since open. A read outside the lock compares it before and
-    /// after, because a rotation in between renames the files it is reading.
-    rotations: u64,
+    /// The hub's rotation counter (`EventHub::rotations`), shared so that
+    /// every rotation, however it is reached, counts exactly once.
+    rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Rotation policy (ADR-0005): rotate the active file past either bound,
@@ -84,7 +86,10 @@ const MAX_ACTIVE_EVENTS: u64 = 100_000;
 const MAX_ROTATED: usize = 4;
 
 impl PersistentLog {
-    fn open(path: PathBuf) -> std::io::Result<Self> {
+    fn open(
+        path: PathBuf,
+        rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -100,7 +105,7 @@ impl PersistentLog {
             // is not worth it — the byte bound covers a restarted file.
             active_events: 0,
             active_bytes,
-            rotations: 0,
+            rotations,
         })
     }
 
@@ -108,8 +113,8 @@ impl PersistentLog {
         rotated_path(&self.path, index)
     }
 
-    /// Append one line, rotating past either bound. Returns whether it rotated.
-    fn append(&mut self, event: &PersistedEvent) -> std::io::Result<bool> {
+    /// Append one line, rotating past either bound.
+    fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(event)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         line.push(b'\n');
@@ -119,9 +124,8 @@ impl PersistentLog {
         self.active_events += 1;
         if self.active_bytes >= MAX_ACTIVE_BYTES || self.active_events >= MAX_ACTIVE_EVENTS {
             self.rotate()?;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(())
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
@@ -142,7 +146,8 @@ impl PersistentLog {
             .open(&self.path)?;
         self.active_events = 0;
         self.active_bytes = 0;
-        self.rotations += 1;
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -392,7 +397,7 @@ impl EventHub {
                 .rev()
                 .map(|event| (event.seq, event.envelope.clone()))
                 .collect();
-            match PersistentLog::open(path) {
+            match PersistentLog::open(path, hub.rotations.clone()) {
                 Ok(log) => state.log = Some(log),
                 Err(err) => crate::logging::event_log_open_failed(&err.to_string()),
             }
@@ -417,13 +422,8 @@ impl EventHub {
                         .unwrap_or(0),
                     envelope: event.clone(),
                 };
-                match log.append(&persisted) {
-                    Ok(true) => {
-                        self.rotations
-                            .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    }
-                    Ok(false) => {}
-                    Err(err) => crate::logging::event_log_write_failed(&err.to_string()),
+                if let Err(err) = log.append(&persisted) {
+                    crate::logging::event_log_write_failed(&err.to_string());
                 }
             }
         }
@@ -690,12 +690,6 @@ impl EventHub {
         // names and the rotation count are taken under the lock. A rotation
         // during the read renames files under it, so the read is retried, and
         // the last attempt holds the lock throughout.
-        let rotations = |hub: &Self| {
-            hub.inner
-                .lock()
-                .ok()
-                .and_then(|state| state.log.as_ref().map(|log| log.rotations))
-        };
         let mut restored: Vec<PersistedEvent> = Vec::new();
         for attempt in 0..3 {
             let Ok(state) = self.inner.lock() else {
@@ -704,7 +698,7 @@ impl EventHub {
             let Some(log) = state.log.as_ref() else {
                 return Vec::new();
             };
-            let before = log.rotations;
+            let before = self.rotations();
             let mut paths: Vec<PathBuf> = (1..=MAX_ROTATED)
                 .rev()
                 .map(|index| log.rotated_path(index))
@@ -721,7 +715,7 @@ impl EventHub {
             if held.is_some() {
                 break;
             }
-            if rotations(self) == Some(before) {
+            if self.rotations() == before {
                 break;
             }
         }
@@ -877,6 +871,33 @@ mod tests {
         cleanup(&path);
     }
 
+    /// #1171: the hub's rotation count is the log's own, so every rotation
+    /// counts once, whether `push` fills the file or `rotate` runs directly.
+    #[test]
+    fn every_rotation_counts_once_on_the_hub() {
+        let path = temp_log("rotation-count");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.rotate_on_next_push();
+        hub.push(workspace_event("w1"));
+        assert_eq!(hub.rotations(), 1);
+        hub.inner
+            .lock()
+            .unwrap()
+            .log
+            .as_mut()
+            .unwrap()
+            .rotate()
+            .unwrap();
+        assert_eq!(hub.rotations(), 2);
+        hub.push(workspace_event("w2"));
+        assert_eq!(
+            hub.rotations(),
+            2,
+            "a push below both bounds does not rotate"
+        );
+        cleanup(&path);
+    }
+
     /// #1027: the derived agent kinds are new to v2.0.0, whose reader skips
     /// a line when `envelope.event` is a string it cannot type and `seq` is a
     /// number (#1058). Every line this build writes for them has that shape,
@@ -964,7 +985,7 @@ mod tests {
     /// goal line's kind to one no build knows, leaving its data as written.
     #[test]
     fn a_reader_without_the_goal_kinds_skips_their_lines() {
-        use crate::api::schema::GoalRecord;
+        use crate::api::schema::{GoalDecision, GoalRecord, GoalSubtask, GoalVerdictRecord};
         let path = temp_log("goal-kinds-old-reader");
         let hub = EventHub::with_persistence(path.clone());
         hub.push(workspace_event("w1"));
@@ -987,6 +1008,23 @@ mod tests {
                 agent_id: agent_id(),
                 status: "s".into(),
             },
+            EventData::GoalSubtaskChanged {
+                agent_id: agent_id(),
+                subtask: GoalSubtask {
+                    id: "1".into(),
+                    text: "t".into(),
+                    done: false,
+                    owner: None,
+                },
+            },
+            EventData::GoalVerdict {
+                agent_id: agent_id(),
+                verdict: GoalVerdictRecord {
+                    decision: GoalDecision::Allow,
+                    rung: 1,
+                    reason: None,
+                },
+            },
             EventData::GoalMet {
                 agent_id: agent_id(),
             },
@@ -1006,6 +1044,8 @@ mod tests {
             EventKind::GoalArmed,
             EventKind::GoalAmended,
             EventKind::GoalStatusSet,
+            EventKind::GoalSubtaskChanged,
+            EventKind::GoalVerdict,
             EventKind::GoalMet,
             EventKind::GoalPaused,
             EventKind::GoalResumed,
@@ -1019,16 +1059,19 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let mut renamed = String::new();
+        let mut renamed_kinds = std::collections::BTreeSet::new();
         for line in content.lines() {
             let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
             let kind = value.pointer_mut("/envelope/event").unwrap();
             if kind.as_str().unwrap().starts_with("goal_") {
+                renamed_kinds.insert(kind.as_str().unwrap().to_string());
                 *kind = serde_json::Value::String(format!("unknown_{}", kind.as_str().unwrap()));
             }
             renamed.push_str(&value.to_string());
             renamed.push('\n');
         }
         std::fs::write(&path, renamed).unwrap();
+        assert_eq!(renamed_kinds.len(), 9, "every goal kind is on disk");
 
         let restarted = EventHub::with_persistence(path.clone());
         assert!(
@@ -1038,7 +1081,7 @@ mod tests {
         assert_eq!(restarted.persisted_events_after(0).len(), 1);
         assert_eq!(
             restarted.current_sequence(),
-            8,
+            10,
             "skipped goal seqs stay spent"
         );
         cleanup(&path);
