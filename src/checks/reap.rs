@@ -67,6 +67,10 @@ pub(crate) struct ReapWorkspaceSnapshot {
     /// Whether the branch's work has been merged elsewhere. Same optional
     /// semantics; a missing signal is treated as `merged=false`.
     pub merged: Option<bool>,
+    /// The branch heads an open PR, or its PR state is unknown
+    /// ([`crate::worktree::WorktreeMergeGate::is_live`], #1278). Such a
+    /// workspace is never reaped, not even quarantined.
+    pub live: bool,
     pub panes: Vec<ReapPaneSnapshot>,
 }
 
@@ -166,6 +170,7 @@ impl ReapFold {
                 working_agent: false, // gated above
                 dirty: ws.dirty.unwrap_or(true),
                 merged: ws.merged.unwrap_or(false),
+                live: ws.live,
             };
             let tier = classify_kill_tier(facts);
             out.push(ReapCandidate {
@@ -205,6 +210,7 @@ mod tests {
             branch: Some("feature-x".into()),
             dirty,
             merged,
+            live: false,
             panes,
         }
     }
@@ -400,6 +406,36 @@ mod tests {
             scheduled_action(candidates[0].tier),
             KillAction::CheckoutOnly
         );
+    }
+
+    #[test]
+    fn a_live_branch_is_never_reaped_or_quarantined() {
+        // #1278 round 2: an open PR (or a PR state gh could not answer) used
+        // to fold to CheckoutOnly when clean and Quarantine when dirty, so
+        // the scheduled reap removed or moved a checkout under review.
+        let mut fold = ReapFold::new();
+        let cfg = ReapConfig {
+            enable: true,
+            cadence_secs: 60,
+            idle_threshold_secs: 10,
+        };
+        let now = Instant::now();
+        for (dirty, merged) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut ws = snapshot(
+                "live",
+                true,
+                false,
+                vec![idle_seen_at(100, now)],
+                Some(dirty),
+                Some(merged),
+            );
+            ws.live = true;
+            let candidates = fold.evaluate(now, &cfg, &[ws]);
+            for candidate in &candidates {
+                assert_eq!(candidate.tier, KillTier::SkipLive);
+                assert_eq!(scheduled_action(candidate.tier), KillAction::Skip);
+            }
+        }
     }
 
     #[test]
