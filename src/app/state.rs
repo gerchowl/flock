@@ -1020,6 +1020,26 @@ pub struct WorktreeRemoveState {
 }
 
 impl WorktreeRemoveState {
+    /// Does a finished removal go on to delete the branch?
+    ///
+    /// #325: force stands in for merge evidence. It cannot reach a protected
+    /// branch — `branch_protected` clears `delete_branch` when the gate
+    /// resolves (#121). Nor can it reach the head of an open PR, or a branch
+    /// whose PR state is unknown (#1278): those keep the branch, forced or not.
+    pub fn deletes_branch(&self) -> bool {
+        let gate = self.merge_gate.as_ref();
+        self.delete_branch
+            && if gate.is_some_and(crate::worktree::WorktreeMergeGate::is_live) {
+                false
+            } else {
+                self.force
+                    || matches!(
+                        gate,
+                        Some(crate::worktree::WorktreeMergeGate::Merged { .. })
+                    )
+            }
+    }
+
     /// True when the next attempt will pass `--force`: either the user armed
     /// it up front, or git already refused for a reason force clears.
     pub fn forced(&self) -> bool {

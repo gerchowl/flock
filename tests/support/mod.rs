@@ -1249,6 +1249,36 @@ fn process_exists(pid: libc::pid_t) -> bool {
     }
 }
 
+/// Install a fake `gh` in `bin`, a directory the test puts first on the
+/// server's PATH, so a worktree's merge gate gets the same answer on every
+/// host instead of whatever the host's gh is, or is not, logged into (#1278:
+/// CI's unauthenticated gh failed the gate, a developer's real gh could reach
+/// GitHub).
+///
+/// It answers every `gh pr view` the way gh does for a branch with no PR, so
+/// the gate goes on to the local git evidence, and refuses anything else. Each
+/// call's argv is appended to `<bin>/gh.log`.
+pub fn write_fake_gh(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(bin).unwrap();
+    let log = bin.join("gh.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+if [ "$1" = pr ] && [ "$2" = view ]; then
+  echo 'no pull requests found for branch "'"$3"'"' >&2
+  exit 1
+fi
+echo "fake gh: unsupported command: $*" >&2
+exit 1
+"#,
+        log = log.display()
+    );
+    let gh = bin.join("gh");
+    fs::write(&gh, script).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

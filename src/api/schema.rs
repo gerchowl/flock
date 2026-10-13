@@ -3028,6 +3028,16 @@ pub enum ResponseResult {
         /// Refused because the branch is the repo default or config-protected
         /// (#121), independent of merge state.
         protected: bool,
+        /// The branch heads an OPEN pull request (#1278). Only ever true on a
+        /// dry run or a `keep_branch` kill: any other real kill of such a
+        /// checkout is refused with `worktree_open_pr` before anything moves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open_pr: bool,
+        /// gh could not say whether the branch heads an open PR (#1278), so
+        /// the same refusal applies, as `worktree_merge_unknown`; `evidence`
+        /// carries the reason.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge_unknown: bool,
         /// False for a dry run.
         removed: bool,
         branch_deleted: bool,
@@ -3505,13 +3515,17 @@ pub struct WorktreeInfo {
 /// to rescue work that was never at risk (#287).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KillVerdictInfo {
-    /// `merged` | `not_merged` | `checkout_missing`.
+    /// `merged` | `not_merged` | `open_pr` | `unknown` | `checkout_missing`.
     ///
     /// `checkout_missing` is not a judgement about the branch: the checkout is
-    /// not on disk, so there was no question to put to git (#360).
+    /// not on disk, so there was no question to put to git (#360). `open_pr`
+    /// means the branch heads an open pull request: live work, which a kill
+    /// refuses (#1278). `unknown` means gh could not answer the PR question,
+    /// which is refused the same way.
     pub verdict: String,
     /// What proved it, when merged — `already in main (squashed or rebased)`,
-    /// `PR #351 merged`, `contained in origin/main`, ...
+    /// `PR #351 merged`, `merged into dev`, ... — or why the verdict is
+    /// `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
     /// The branch is the repo default or config-protected (#121), so a kill
