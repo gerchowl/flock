@@ -1056,17 +1056,12 @@ fn delegate_workspace_error_waits_for_complete_request_and_client_close() {
 #[test]
 fn delegate_reap_removes_persisted_verdict() {
     let pane = Pane::new("working", "fixture");
-    let bin = pane.base.join("bin");
-    support::write_fake_gh(&bin);
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .unwrap();
+    // The fake pane answers workspace_not_found, so reap removes registry
+    // state without querying a worktree's merge gate or invoking gh.
     let verdict = pane.registry.join("fixture.verdict.json");
     std::fs::write(&verdict, "{}").unwrap();
     let out = pane
         .command(&["delegate", "reap", "fixture", "--json"], None)
-        .env("PATH", path)
         .output()
         .unwrap();
     assert_eq!(
