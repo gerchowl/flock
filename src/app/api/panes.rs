@@ -1016,6 +1016,16 @@ impl App {
             Ok(target) => target,
             Err(error) => return target_refusal(id, error),
         };
+        if let Some(reason) = (!params.raw)
+            .then(|| self.raw_text_refusal(ws_idx, pane_id))
+            .flatten()
+        {
+            return encode_error(
+                id,
+                reason,
+                crate::app::guarded_submit::raw_text_refusal_message(reason),
+            );
+        }
         let public = self
             .public_pane_id(ws_idx, pane_id)
             .unwrap_or_else(|| pane_id.raw().to_string());
@@ -1038,6 +1048,16 @@ impl App {
             Ok(target) => target,
             Err(error) => return target_refusal(id, error),
         };
+        if let Some(reason) = (!params.raw && !params.text.is_empty())
+            .then(|| self.raw_text_refusal(ws_idx, pane_id))
+            .flatten()
+        {
+            return encode_error(
+                id,
+                reason,
+                crate::app::guarded_submit::raw_text_refusal_message(reason),
+            );
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };

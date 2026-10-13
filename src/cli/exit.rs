@@ -83,7 +83,7 @@ exits! {
     REFUSED = 10, Later, "refused before acting, nothing changed";
     DELEGATE_NOT_STARTED = 11, AfterInspecting, "delegate start / wait: the delegate did not start";
     MSG_REFUSED = 13, Never, "msg: the receiver refused the message";
-    POLICY_REFUSED = 13, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014)";
+    POLICY_REFUSED = 13, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014), or an agent widening a delegate's question policy";
     RECONNECT_GAVE_UP = 75, Later, "client gave up reconnecting to its server (EX_TEMPFAIL)";
     PROTOCOL_GAP = 78, AfterHandoff, "client/server protocol gap";
     TIMEOUT = 124, Yes, "timed out";

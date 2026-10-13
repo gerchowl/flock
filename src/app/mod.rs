@@ -42,7 +42,9 @@ pub(crate) mod mailboxes;
 pub(crate) mod message_relay;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
+pub(crate) mod owners;
 mod peer_checkout;
+pub(crate) mod questions;
 mod runtime;
 mod session;
 pub mod state;
@@ -188,7 +190,10 @@ pub struct App {
     /// ADR-0035 §6.2: adopted owner policy versions by repo, folded in the
     /// same start pass.
     pub(crate) owner_policies: crate::owner_policy::OwnerPolicyIndex,
-    /// The `EventHub::rotations` value the open goals and adopted policies
+    /// ADR-0035 §1: owner bindings by repo slug, folded in the same pass.
+    pub(crate) owners: owners::OwnerIndex,
+    /// The `EventHub::rotations` value the open goals, the adopted policies
+    /// and the owner bindings
     /// were last re-issued at.
     pub(crate) record_rotations_seen: u64,
     mesh_store_retry_at: Option<Instant>,
@@ -1010,6 +1015,7 @@ impl App {
             delegations: Default::default(),
             goals: Default::default(),
             owner_policies: Default::default(),
+            owners: Default::default(),
             record_rotations_seen: 0,
             mesh_store_retry_at: None,
             mesh_store_recovering: false,
@@ -4230,6 +4236,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4404,6 +4412,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4435,6 +4445,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4458,6 +4470,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4482,6 +4496,8 @@ sidebar_pane_gap = 99
                 here: true,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4575,6 +4591,8 @@ sidebar_pane_gap = 99
                         here: false,
                         focus: false,
                         argv: vec![crate::test_support::live_program()],
+                        questions: None,
+                        unattended: false,
                     },
                 ),
             });
@@ -5043,6 +5061,8 @@ sidebar_pane_gap = 99
             here: false,
             focus: false,
             argv: vec![crate::test_support::live_program()],
+            questions: None,
+            unattended: false,
         };
 
         // `--active`: names the focused space, so there is something to split.
@@ -5138,6 +5158,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5377,6 +5399,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5433,6 +5457,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: true,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

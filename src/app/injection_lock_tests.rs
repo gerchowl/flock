@@ -34,7 +34,7 @@ mod harness {
             if typed.is_empty() {
                 idle.to_string()
             } else {
-                idle.replace("Ask Codex to do anything", typed)
+                idle.replace("Ask Codex to do anything", &typed.replace('\n', "\n  "))
             }
         },
     };
@@ -47,6 +47,7 @@ mod harness {
             } else {
                 typed
             };
+            let typed = typed.replace('\n', "\n┃  ");
             format!("┃\n┃  {typed}\n┃\n┃  Build test-model\n╹\ntab agents ctrl+p commands\n")
         },
     };
@@ -140,7 +141,9 @@ fn held(app: &App) -> bool {
 fn send_text(app: &mut App, pane: &str, text: &str) {
     let response = app.handle_api_request(Request {
         id: "req".into(),
+        // A raw send: a guarded one refuses a held pane (#1162).
         method: Method::PaneSendText(PaneSendTextParams {
+            raw: true,
             pane_id: pane.into(),
             text: text.into(),
         }),
@@ -788,7 +791,9 @@ async fn a_paste_held_by_an_injection_claims_no_evidence() {
     drain(&mut pty);
     let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
         id: "paste".into(),
+        // A raw send: a guarded one refuses a held pane (#1162).
         method: Method::AgentSend(crate::api::schema::AgentSendParams {
+            raw: true,
             target: pane.clone(),
             text: "note".into(),
             submit: false,
@@ -800,4 +805,196 @@ async fn a_paste_held_by_an_injection_claims_no_evidence() {
     assert!(response["result"]["evidence"]["level"].is_null());
     assert!(app.pending_paste.is_none(), "nothing left to observe");
     assert!(drain(&mut pty).is_empty(), "held behind the injection");
+}
+
+/// An operator's draft that wraps onto a second editor row.
+const MULTI_ROW: &str = "first line of a thought\nand its second line";
+
+/// The verbs that type without submitting through the guard (#1162), each
+/// aimed at `pane` the way its CLI sends it.
+fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
+    vec![
+        (
+            "pane send-text",
+            Method::PaneSendText(PaneSendTextParams {
+                pane_id: pane.into(),
+                text: "note".into(),
+                raw,
+            }),
+        ),
+        (
+            "pane run",
+            Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+                pane_id: pane.into(),
+                text: "note".into(),
+                keys: Vec::new(),
+                raw,
+            }),
+        ),
+        (
+            "agent send --no-submit",
+            Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: pane.into(),
+                text: "note".into(),
+                submit: false,
+                raw,
+            }),
+        ),
+    ]
+}
+
+fn call(app: &mut App, method: Method) -> serde_json::Value {
+    serde_json::from_str(&app.handle_api_request(Request {
+        id: "req".into(),
+        method,
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn typing_verbs_refuse_an_operator_draft_before_typing_in_every_harness() {
+    for harness in [&CLAUDE, &CODEX, &OPENCODE] {
+        for draft in [DRAFT, MULTI_ROW] {
+            for index in 0..typing_verbs("", false).len() {
+                let Rig {
+                    mut app,
+                    pane,
+                    mut pty,
+                } = lock_rig(harness);
+                let (verb, method) = typing_verbs(&pane, false).swap_remove(index);
+                paint(&app, harness, draft);
+                let response = call(&mut app, method);
+                let case = format!("{:?} {verb} onto {draft:?}", harness.agent);
+                assert_eq!(response["error"]["code"], "input_not_empty", "{case}");
+                assert!(drain(&mut pty).is_empty(), "{case}: nothing typed");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn typing_verbs_type_into_an_empty_composer_and_raw_types_onto_a_draft() {
+    for harness in [&CLAUDE, &CODEX, &OPENCODE] {
+        for (draft, raw) in [("", false), (DRAFT, true), (MULTI_ROW, true)] {
+            for index in 0..typing_verbs("", raw).len() {
+                let Rig {
+                    mut app,
+                    pane,
+                    mut pty,
+                } = lock_rig(harness);
+                let (verb, method) = typing_verbs(&pane, raw).swap_remove(index);
+                paint(&app, harness, draft);
+                let response = call(&mut app, method);
+                let case = format!("{:?} {verb} raw={raw} onto {draft:?}", harness.agent);
+                assert!(response.get("error").is_none(), "{case}: {response}");
+                assert_eq!(drain(&mut pty).len(), 1, "{case}: typed");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_shell_pane_is_typed_into_whatever_its_prompt_shows() {
+    for index in 0..typing_verbs("", false).len() {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        let (verb, method) = typing_verbs(&pane, false).swap_remove(index);
+        terminal(&mut app).detected_agent = None;
+        paint(&app, &CLAUDE, DRAFT);
+        let response = call(&mut app, method);
+        assert!(response.get("error").is_none(), "{verb}: {response}");
+        assert_eq!(drain(&mut pty).len(), 1, "{verb}: typed");
+    }
+}
+
+#[tokio::test]
+async fn typing_verbs_refuse_a_pane_an_injection_holds() {
+    for index in 0..typing_verbs("", false).len() {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        let (verb, method) = typing_verbs(&pane, false).swap_remove(index);
+        paint(&app, &CLAUDE, DRAFT);
+        let _attempt = inject(&app, &pane, Instant::now());
+        drain(&mut pty);
+        let response = call(&mut app, method);
+        assert_eq!(
+            response["error"]["code"], "injection_pending",
+            "{verb}: held text would replay onto the restored draft"
+        );
+        runtime(&app).end_injection_lease(&app.delivery_attempts()[0].attempt_id);
+        assert!(drain(&mut pty).is_empty(), "{verb}: nothing was held");
+    }
+}
+
+/// `agent send` into an agent pane (#1162): a one-row draft moves aside and
+/// comes back, a multi-row draft refuses before typing. `pane run` keeps its
+/// typing and refuses any draft instead (`typing_verbs_…`).
+#[tokio::test]
+async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
+    for harness in [&CLAUDE, &CODEX, &OPENCODE] {
+        let agent = harness.agent;
+        let send_submit = |pane: &str| {
+            Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: pane.into(),
+                text: "hello".into(),
+                submit: true,
+                raw: false,
+            })
+        };
+
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(harness);
+        paint(&app, harness, MULTI_ROW);
+        let response = call(&mut app, send_submit(&pane));
+        assert_eq!(response["error"]["code"], "input_not_empty", "{agent:?}");
+        assert!(drain(&mut pty).is_empty(), "{agent:?}: nothing typed");
+
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(harness);
+        paint(&app, harness, DRAFT);
+        let response = call(&mut app, send_submit(&pane));
+        assert!(response.get("error").is_none(), "{agent:?}: {response}");
+        let (_, _, mut attempt) = app.pending_agent_submit.take().expect("parked");
+        assert_eq!(
+            drain(&mut pty),
+            vec![clear_keys_for(&app, DRAFT)],
+            "{agent:?}: the draft is cleared, nothing typed beside it"
+        );
+        paint(&app, harness, "");
+        let now = Instant::now() + POLL;
+        assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+        assert_eq!(drain(&mut pty), vec![b"hello".to_vec()], "{agent:?}");
+        let at = now + GAP;
+        submit(&mut app, harness, &pane, &mut attempt, at);
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()], "{agent:?}");
+        paint(&app, harness, "");
+        assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, at), None);
+        assert_eq!(
+            drain(&mut pty),
+            vec![DRAFT.as_bytes().to_vec()],
+            "{agent:?}"
+        );
+        paint(&app, harness, DRAFT);
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, at + POLL),
+            Some(Outcome::ObservedAccepted),
+            "{agent:?}"
+        );
+        assert_eq!(
+            app.delivery_attempts()[0].draft.as_deref(),
+            Some("restored")
+        );
+    }
 }

@@ -9,6 +9,12 @@
   submit and confirmed outcomes), #850 (injection lock), #868 (client/server
   skew). Consumed by ADR-0028 §8 (external channels).
 - Decision owner: operator.
+- Amendment (2026-10-13, #1162): `pane run` without a guard, `pane send-text`
+  and `agent send --no-submit` still type with no idle requirement and no
+  confirmation, but into an agent pane whose composer holds a draft (or that
+  an injection holds) they refuse before typing with `input_not_empty` /
+  `injection_pending`, exit 10. `--raw` (socket `raw: true`) opts out. "Stays
+  for shells" below now reads: unchanged for shells, draft-safe for agents.
 - Implemented: none. Slices (§8) filed 2026-10-11: C1 #1017, C4a #1018, C5 #1021, C2 #1024, C3 #996, C4b #995, C4c #1025, C4d #1026.
 
 ## Context

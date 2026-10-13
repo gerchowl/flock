@@ -140,6 +140,27 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments.clone())?;
+    // #1179 / #868: an older server would drop `questions` without a word and
+    // start the child with no policy. An agent cannot read a stderr note, so
+    // the call is refused before anything starts, and says why.
+    let asks_questions = matches!(
+        &method,
+        Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+            questions: Some(_),
+            ..
+        }) | Method::AgentFork(crate::api::schema::AgentForkParams {
+            questions: Some(_),
+            ..
+        })
+    );
+    if asks_questions && !server_takes_questions(flock) {
+        return Err(McpError::from_flock_error(
+            crate::api::compatibility::ERROR_CODE,
+            "the server does not record a question policy (it predates #1179): hand it off \
+             with `flk server live-handoff`, or call again without `questions`",
+            crate::api::compatibility::EXIT_CODE,
+        ));
+    }
     let pane = match &method {
         Method::PaneArmSelfCompact(params) if params.instructions.is_some() => {
             Some(params.pane.clone())
@@ -185,6 +206,13 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     Ok(json!({
         "content": [ { "type": "text", "text": text } ]
     }))
+}
+
+/// Does the server advertise `agent_questions`? A ping that fails reads as no.
+fn server_takes_questions<F: FlockCall>(flock: &F) -> bool {
+    flock
+        .call(Method::Ping(crate::api::schema::PingParams::default()))
+        .is_ok_and(|pong| crate::cli::questions::advertises_questions(&pong))
 }
 
 /// Unwrap the raw flock socket response — an already-parsed JSON envelope
@@ -340,6 +368,38 @@ mod tests {
         )
         .expect("a server that stored them is a success");
         assert_eq!(current.calls.borrow().len(), 1);
+    }
+
+    /// #1179 / #868: `questions` goes only to a server that advertises it. An
+    /// older one gets nothing started, and the agent is told why.
+    #[test]
+    fn a_question_policy_is_never_sent_to_a_server_that_does_not_advertise_it() {
+        let fork = json!({"name": "flock_agent_fork",
+                          "arguments": {"target": "w1:p1", "questions": "deny"}});
+        let older = MockApi::ok(json!({"result": {"type": "pong", "capabilities": {
+            "live_handoff": true, "agent_start_label": true
+        }}}));
+        let err = route("tools/call", fork.clone(), &older, &ChannelOptions::off())
+            .expect_err("an older server must not get the start");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
+        );
+        let calls = older.calls.borrow();
+        assert_eq!(calls.len(), 1, "only the ping");
+        assert!(matches!(calls[0], Method::Ping(_)));
+        drop(calls);
+
+        let current = MockApi::ok(json!({"result": {"type": "pong", "capabilities": {
+            "agent_questions": true
+        }}}));
+        let _ = route("tools/call", fork, &current, &ChannelOptions::off());
+        let calls = current.calls.borrow();
+        assert!(
+            matches!(&calls[1], Method::AgentFork(p) if p.questions == Some(crate::api::schema::QuestionPolicy::Deny)),
+            "{calls:?}"
+        );
     }
 
     /// An older server whose abort then fails: the explanation survives, and
@@ -505,6 +565,7 @@ mod tests {
                 number: 624,
                 state: "closed".into(),
             }),
+            questions: Some(crate::api::schema::QuestionPolicy::Route),
         };
         let raw =
             json!({"id": "mcp:1", "result": {"type": "delegate_list", "delegates": [row.clone()]}});
