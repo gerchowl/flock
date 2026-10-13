@@ -54,12 +54,23 @@
 //! command in front of its shell at the window's close is judged again only
 //! when something next touches the tracker: a shell left idle after that
 //! command ends keeps the seeded phase until then (#1245).
+//!
+//! Questions (ADR-0028 §8a, #1038). The same reads open and close the
+//! question the agent's terminal holds: `agent.question_opened` when a read
+//! shows a `question_id` the last one did not, and
+//! `agent.question_closed { withdrawn }` for the one it replaces or that left
+//! the screen, at once and with no window. The terminal's question, not
+//! `attention`, is read, so a status that is not yet known after a start
+//! closes nothing. Open questions are seeded from the log, into the tracker
+//! and back onto their agents' terminals, so a restart or a handoff keeps
+//! the id of a dialog still on screen and emits nothing for it.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::api::agent_state::{AgentState, Lifecycle, Phase, SETTLE_MS};
+use crate::api::question::{Question, QuestionCloseReason, QuestionState};
 use crate::api::schema::{AgentPhaseEvent, EventData, EventEnvelope, EventKind};
 
 /// The settle window a phase must hold before it is announced: the one
@@ -71,6 +82,8 @@ pub(crate) struct Sample {
     pub agent_id: String,
     pub pane: String,
     pub state: AgentState,
+    /// The question the agent's terminal holds open.
+    pub question: Option<Question>,
 }
 
 struct Tracked {
@@ -103,6 +116,22 @@ pub(crate) struct AgentPhaseTracker {
     touched: RefCell<Touched>,
     /// Whether the first tick after start has read every agent.
     started: bool,
+    /// Each agent's open question and its pane.
+    questions: HashMap<String, (String, Question)>,
+}
+
+fn question_closed(agent_id: &str, pane: String, mut question: Question) -> EventEnvelope {
+    question.state = QuestionState::Withdrawn;
+    EventEnvelope {
+        event: EventKind::AgentQuestionClosed,
+        data: EventData::AgentQuestionClosed {
+            agent_id: agent_id.to_string(),
+            pane,
+            question_id: question.question_id.clone(),
+            reason: QuestionCloseReason::Withdrawn,
+            question: Some(question),
+        },
+    }
 }
 
 /// What the next tick must read.
@@ -147,6 +176,22 @@ impl AgentPhaseTracker {
         events: impl Iterator<Item = &'a EventEnvelope>,
     ) {
         for envelope in events {
+            match &envelope.data {
+                EventData::AgentQuestionOpened {
+                    agent_id,
+                    pane,
+                    question,
+                    ..
+                } => {
+                    self.questions
+                        .insert(agent_id.clone(), (pane.clone(), question.clone()));
+                }
+                // The log closes a question before the next one opens.
+                EventData::AgentQuestionClosed { agent_id, .. } => {
+                    self.questions.remove(agent_id);
+                }
+                _ => {}
+            }
             let EventData::AgentPhaseChanged(event) = &envelope.data else {
                 continue;
             };
@@ -223,8 +268,50 @@ impl AgentPhaseTracker {
         (rescan || !panes.is_empty()).then(|| Work::Panes(panes.into_iter().collect()))
     }
 
-    /// Fold one agent's current `state` and return what it settles.
+    /// Fold one agent's current `state` and return what it opens, closes and
+    /// settles.
     pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        settle: Duration,
+        sample: Sample,
+    ) -> Vec<EventEnvelope> {
+        let mut events = self.observe_question(&sample);
+        events.extend(self.observe_phase(now, settle, sample));
+        events
+    }
+
+    /// The question events between the last read of an agent and this one.
+    fn observe_question(&mut self, sample: &Sample) -> Vec<EventEnvelope> {
+        let question = sample.question.as_ref();
+        let open = self.questions.get(&sample.agent_id);
+        if open.map(|(_, open)| &open.question_id) == question.map(|question| &question.question_id)
+        {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if let Some((pane, open)) = self.questions.remove(&sample.agent_id) {
+            events.push(question_closed(&sample.agent_id, pane, open));
+        }
+        if let Some(question) = question {
+            self.questions.insert(
+                sample.agent_id.clone(),
+                (sample.pane.clone(), question.clone()),
+            );
+            events.push(EventEnvelope {
+                event: EventKind::AgentQuestionOpened,
+                data: EventData::AgentQuestionOpened {
+                    agent_id: sample.agent_id.clone(),
+                    pane: sample.pane.clone(),
+                    question_id: question.question_id.clone(),
+                    question: question.clone(),
+                },
+            });
+        }
+        events
+    }
+
+    fn observe_phase(
         &mut self,
         now: Instant,
         settle: Duration,
@@ -288,15 +375,16 @@ impl AgentPhaseTracker {
     /// Announce `gone` for every tracked agent no pane carries (`on_panes`),
     /// for every agent this server read that left `agent.list` (`listed`),
     /// and for every agent only seeded from the log whose pane is a plain
-    /// shell (`at_shell`, judged from `unread_since_restore`). Detection not
-    /// having reported yet is not an absence.
+    /// shell (`at_shell`, judged from `unread_since_restore`), closing its
+    /// open question first. Detection not having reported yet is not an
+    /// absence.
     pub(crate) fn retain_present(
         &mut self,
         on_panes: &HashSet<String>,
         listed: &HashSet<String>,
         at_shell: &HashSet<String>,
     ) -> Vec<EventEnvelope> {
-        let gone: Vec<String> = self
+        let mut gone: Vec<String> = self
             .agents
             .iter()
             .filter(|(agent_id, tracked)| {
@@ -306,8 +394,20 @@ impl AgentPhaseTracker {
             })
             .map(|(agent_id, _)| agent_id.clone())
             .collect();
+        // A question seeded for an agent the log holds no phase for.
+        gone.extend(
+            self.questions
+                .keys()
+                .filter(|agent_id| {
+                    !self.agents.contains_key(*agent_id) && !on_panes.contains(*agent_id)
+                })
+                .cloned(),
+        );
         let mut events = Vec::new();
         for agent_id in gone {
+            if let Some((pane, question)) = self.questions.remove(&agent_id) {
+                events.push(question_closed(&agent_id, pane, question));
+            }
             if let Some(mut tracked) = self.agents.remove(&agent_id) {
                 tracked.state.lifecycle = Lifecycle::Gone;
                 tracked.state.phase = Phase::Gone;
@@ -391,10 +491,12 @@ impl super::App {
             let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
                 continue;
             };
+            let question = self.terminal_question(ws_idx, pane_id);
             let sample = Sample {
                 agent_id,
                 pane,
                 state,
+                question,
             };
             events.extend(self.agent_phases.observe(now, SETTLE, sample));
         }
@@ -427,6 +529,12 @@ impl super::App {
             SETTLE,
             restored.iter().map(|(_, _, envelope)| envelope),
         );
+        for terminal in self.state.terminals.values_mut() {
+            let agent_id = terminal.agent_id.to_string();
+            if let Some((_, question)) = self.agent_phases.questions.get(&agent_id) {
+                terminal.question.get_or_insert_with(|| question.clone());
+            }
+        }
         let (_, on_panes) = self.local_agent_panes();
         let none = HashSet::new();
         for event in self
@@ -435,6 +543,37 @@ impl super::App {
         {
             self.emit_event(event);
         }
+    }
+
+    /// Carry the question a detector report reads onto its pane's terminal,
+    /// before the report is applied (#1038). Here, not in the state handler,
+    /// because a new question's id takes the event log's sequence.
+    pub(super) fn observe_question(&mut self, event: &crate::events::AppEvent) {
+        let crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent,
+            needs_human,
+            question,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let log_sequence = self.event_hub.current_sequence();
+        let terminal = self
+            .find_pane(*pane_id)
+            .and_then(|(ws_idx, _)| self.state.terminal_id_for_pane(ws_idx, *pane_id))
+            .and_then(|terminal_id| self.state.terminals.get_mut(&terminal_id));
+        if let Some(terminal) = terminal {
+            terminal.observe_question(*agent, *needs_human, question.clone(), log_sequence);
+        }
+    }
+
+    /// The question a pane's terminal holds open.
+    fn terminal_question(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<Question> {
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        terminal.question.clone()
     }
 
     /// Every listed local agent's id and pane, and the agent id of every
@@ -504,6 +643,7 @@ impl super::App {
 mod tests {
     use super::*;
     use crate::api::agent_state::{Attention, BlockedReason, HumanReason};
+    use crate::api::question::QuestionState;
 
     const WIN: Duration = Duration::from_secs(20);
 
@@ -511,6 +651,7 @@ mod tests {
         let attention = match phase {
             Phase::NeedsHuman => Attention::NeedsHuman {
                 reason: HumanReason::Permission,
+                question: None,
             },
             Phase::LimitReached => Attention::Blocked {
                 reason: BlockedReason::ProviderLimit,
@@ -531,6 +672,7 @@ mod tests {
             agent_id: "agent_a".into(),
             pane: "w1:p1".into(),
             state: state(phase),
+            question: None,
         }
     }
 
@@ -757,6 +899,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: Some(0),
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: at,
         });
@@ -865,6 +1008,219 @@ mod tests {
         tick(&mut app, 100);
         tick(&mut app, 130);
         assert_eq!(logged(&log), ["agent.phase_changed"]);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// A screen through the detector into the server, the way a pane's
+    /// detector task publishes it.
+    fn screen(app: &mut crate::app::App, screen: &str) {
+        let detection = crate::detect::detect_agent(Some(crate::detect::Agent::Claude), screen);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Claude),
+            state: detection.state,
+            activity: detection.activity,
+            provider_limit: detection.provider_limit,
+            visible_blocker: detection.visible_blocker,
+            visible_idle: detection.visible_idle,
+            visible_working: detection.visible_working,
+            settled_with_background_shells: detection.settled_with_background_shells,
+            background_tasks: detection.background_tasks,
+            needs_human: detection.needs_human,
+            question: detection.question,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// ADR-0028 §8a (#1038): captured question screens, through the detector
+    /// and the server, open a durable `agent.question_opened` carrying the
+    /// payload `agent.get` shows; a redraw emits nothing; the next question
+    /// of the form closes the first as `withdrawn` and opens its own; the
+    /// dialog leaving closes it. A restart with the dialog still on screen
+    /// keeps its id and emits nothing, before and after the screen is read.
+    #[tokio::test]
+    async fn question_screens_open_and_close_durable_questions() {
+        macro_rules! fixture {
+            ($name:literal) => {
+                include_str!(concat!(
+                    "../../tests/fixtures/questions-1038/",
+                    $name,
+                    ".txt"
+                ))
+            };
+        }
+        let log = temp_log("questions");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_q"));
+        let tick = |app: &mut crate::app::App| app.tick_agent_phases(Instant::now());
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-single"));
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-single-redraw"));
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-two-q2"));
+        tick(&mut app);
+        status(&mut app, crate::detect::AgentState::Working);
+        tick(&mut app);
+        let questions: Vec<EventData> = hub
+            .read(0, 100, |envelope| {
+                matches!(
+                    envelope.event,
+                    EventKind::AgentQuestionOpened | EventKind::AgentQuestionClosed
+                )
+            })
+            .events
+            .into_iter()
+            .map(|(_, envelope)| envelope.data)
+            .collect();
+        let [EventData::AgentQuestionOpened {
+            question_id: first,
+            question,
+            ..
+        }, EventData::AgentQuestionClosed {
+            question_id: closed,
+            reason: QuestionCloseReason::Withdrawn,
+            ..
+        }, EventData::AgentQuestionOpened {
+            question_id: second,
+            ..
+        }, EventData::AgentQuestionClosed {
+            question_id: last,
+            reason: QuestionCloseReason::Withdrawn,
+            question: Some(withdrawn),
+            ..
+        }] = &questions[..]
+        else {
+            panic!("{questions:#?}");
+        };
+        assert_eq!((closed, last), (first, second));
+        assert_ne!(first, second);
+        assert_eq!(&question.question_id, first);
+        assert_eq!(question.form.prompt, "Which colour should the probe use?");
+        assert_eq!(question.state, QuestionState::Open);
+        assert_eq!(withdrawn.state, QuestionState::Withdrawn);
+        let open_id = |app: &crate::app::App| {
+            let terminal = app.state.terminals.values().next().unwrap();
+            terminal.question.as_ref().map(|q| q.question_id.clone())
+        };
+
+        screen(&mut app, fixture!("claude-single"));
+        tick(&mut app);
+        let reopened = open_id(&app).unwrap();
+        assert_ne!(&reopened, first, "the same question in a later turn");
+        drop(app);
+        let restarted = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&restarted, Some("agent_q"));
+        assert_eq!(
+            open_id(&app),
+            Some(reopened.clone()),
+            "taken back from the log"
+        );
+        tick(&mut app);
+        screen(&mut app, fixture!("claude-single-redraw"));
+        tick(&mut app);
+        assert_eq!(open_id(&app), Some(reopened));
+        assert_eq!(
+            logged(&log)
+                .into_iter()
+                .filter(|kind| kind.starts_with("agent.question_"))
+                .collect::<Vec<_>>(),
+            [
+                "agent.question_opened",
+                "agent.question_closed",
+                "agent.question_opened",
+                "agent.question_closed",
+                "agent.question_opened",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// The opened question ids in the log, in order.
+    fn opened_ids(hub: &crate::api::EventHub) -> Vec<String> {
+        hub.read(0, 100, |envelope| {
+            envelope.event == EventKind::AgentQuestionOpened
+        })
+        .events
+        .into_iter()
+        .filter_map(|(_, envelope)| match envelope.data {
+            EventData::AgentQuestionOpened { question_id, .. } => Some(question_id),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// A form's tabs read one question each, through the real server and
+    /// log. Going back to the first tab opens it again under an id never used
+    /// before, so an answer to the live dialog is never refused as closed.
+    #[tokio::test]
+    async fn a_revisited_tab_opens_under_a_new_id() {
+        let log = temp_log("question-tabs");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_tabs"));
+        app.tick_agent_phases(Instant::now());
+        // The review page first: the agent is blocked, so the three opens
+        // below share one turn cursor and only the log tells them apart.
+        for name in [
+            "claude-two-review",
+            "claude-two-q1",
+            "claude-two-q2",
+            "claude-two-q1",
+        ] {
+            let path = format!(
+                "{}/tests/fixtures/questions-1038/{name}.txt",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            screen(&mut app, &std::fs::read_to_string(path).unwrap());
+            app.tick_agent_phases(Instant::now());
+        }
+        let ids = opened_ids(&hub);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 3, "{ids:?}");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap());
+    }
+
+    /// A restart whose dialog is gone by the time its pane is read again:
+    /// the question taken back from the log closes once, `withdrawn`.
+    #[tokio::test]
+    async fn a_seeded_question_whose_dialog_is_gone_closes_once() {
+        let log = temp_log("question-gone");
+        let hub = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&hub, Some("agent_gone_q"));
+        app.tick_agent_phases(Instant::now());
+        screen(
+            &mut app,
+            include_str!("../../tests/fixtures/questions-1038/claude-single.txt"),
+        );
+        app.tick_agent_phases(Instant::now());
+        drop(app);
+        let restarted = crate::api::EventHub::with_persistence(log.clone());
+        let mut app = server(&restarted, Some("agent_gone_q"));
+        app.tick_agent_phases(Instant::now());
+        status(&mut app, crate::detect::AgentState::Working);
+        app.tick_agent_phases(Instant::now());
+        status(&mut app, crate::detect::AgentState::Idle);
+        app.tick_agent_phases(Instant::now());
+        let closed: Vec<EventData> = restarted
+            .read(0, 100, |envelope| {
+                envelope.event == EventKind::AgentQuestionClosed
+            })
+            .events
+            .into_iter()
+            .map(|(_, envelope)| envelope.data)
+            .collect();
+        let [EventData::AgentQuestionClosed {
+            question_id,
+            question: Some(question),
+            ..
+        }] = &closed[..]
+        else {
+            panic!("{closed:#?}");
+        };
+        assert_eq!(&opened_ids(&restarted), std::slice::from_ref(question_id));
+        assert_eq!(question.state, QuestionState::Withdrawn);
         let _ = std::fs::remove_dir_all(log.parent().unwrap());
     }
 
