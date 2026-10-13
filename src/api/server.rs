@@ -575,6 +575,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgStatus(_) => "msg.status",
         Method::MsgWaitReply(_) => "msg.wait_reply",
         Method::MsgWake(_) => "msg.wake",
+        Method::HookDecide(_) => "hook.decide",
         Method::MsgMute(_) => "msg.mute",
         Method::MeshRoutes { .. } => "mesh.routes",
         Method::MeshHello(_) => "mesh.hello",

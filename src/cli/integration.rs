@@ -151,6 +151,10 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
             status.state,
             crate::integration::IntegrationStatusKind::NotInstalled
         ) {
+            // ADR-0034 §4: a question entry that fails open says so.
+            for note in crate::integration::question_hook_notes(status.target) {
+                println!("  ! {note}");
+            }
             if let Some(details) = crate::integration::settings_drift_details(status.target) {
                 for detail in details {
                     println!("  ! {detail}");
@@ -235,7 +239,11 @@ fn integration_install(args: &[String]) -> std::io::Result<i32> {
         eprintln!("--no-trust-hooks is only supported for codex");
         return Ok(2);
     }
-    match crate::integration::install_target_with_hook_trust(target, trust_hooks) {
+    match crate::integration::install_target_with_hook_trust(
+        target,
+        trust_hooks,
+        crate::integration::ClaudeQuestionHook::detect,
+    ) {
         Ok(messages) => {
             print_integration_messages(messages);
             Ok(0)

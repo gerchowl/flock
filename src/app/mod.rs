@@ -226,6 +226,13 @@ pub struct App {
     pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
     /// Plain paste observation parked by `respond_or_park` after dispatch.
     pub(crate) pending_paste: Option<paste_confirm::Paste>,
+    /// `integration.install`, answered from a worker thread by
+    /// `respond_or_park`, because installing Claude probes `claude --version`.
+    pub(crate) pending_integration_install: Option<api::integrations::PendingInstall>,
+    /// How the server learns the installed Claude Code's version, called only
+    /// on worker threads (it blocks up to 10 s). Replaceable so a test can
+    /// hold it and show the loop does not wait.
+    pub(crate) claude_version_probe: api::integrations::VersionProbe,
     /// Deferred submit set by `handle_agent_send` and consumed by
     /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
     /// request. A response path bypassing `respond_or_park` would reply ok
@@ -996,6 +1003,8 @@ impl App {
             message_relays: Default::default(),
             pending_agent_submit: None,
             pending_paste: None,
+            pending_integration_install: None,
+            claude_version_probe: std::sync::Arc::new(crate::integration::probe_claude_version),
             active_submissions: Default::default(),
             kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
@@ -1703,20 +1712,31 @@ impl App {
             return;
         }
 
-        for target in targets {
-            let label = crate::integration::integration_target_label(target);
-            match crate::integration::install_target(target) {
-                Ok(_) => self
-                    .state
-                    .integration_install_messages
-                    .push(format!("installed {label}")),
-                Err(err) => self
-                    .state
-                    .integration_install_messages
-                    .push(format!("{label}: {err}")),
-            }
-        }
+        // Off the loop: installing Claude probes `claude --version`.
+        let human_tools = self.state.config.questions.human_tools.clone();
+        let probe = self.claude_version_probe.clone();
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let messages = targets
+                .into_iter()
+                .map(|target| {
+                    let label = crate::integration::integration_target_label(target);
+                    let question = || {
+                        crate::integration::ClaudeQuestionHook::new(human_tools.clone(), probe())
+                    };
+                    match crate::integration::install_target(target, question) {
+                        Ok(_) => format!("installed {label}"),
+                        Err(err) => format!("{label}: {err}"),
+                    }
+                })
+                .collect();
+            let _ = event_tx.blocking_send(AppEvent::IntegrationsInstalled(messages));
+        });
+    }
 
+    /// The worker's report from [`Self::install_recommended_integrations`].
+    pub(crate) fn finish_recommended_integrations(&mut self, messages: Vec<String>) {
+        self.state.integration_install_messages = messages;
         self.state.integration_recommendations = crate::integration::integration_recommendations();
         self.state.mark_session_dirty();
     }
@@ -1799,6 +1819,9 @@ impl App {
         }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
+        }
+        if !invalid_section("questions") {
+            self.state.config.questions = config.questions.clone();
         }
         if !invalid_section("channels") {
             self.state.config.channels = config.channels.clone();
