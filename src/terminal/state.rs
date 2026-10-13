@@ -210,9 +210,6 @@ pub struct TerminalState {
     pub needs_human: Option<crate::api::agent_state::HumanReason>,
     /// The question that screen draws, with its `question_id` (#1038).
     pub question: Option<crate::api::question::Question>,
-    /// How many questions this terminal has opened: the open-time sequence
-    /// a new `question_id` derives from.
-    question_opens: u64,
     pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
@@ -363,7 +360,6 @@ impl TerminalState {
             background_tasks: None,
             needs_human: None,
             question: None,
-            question_opens: 0,
             provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
@@ -418,31 +414,27 @@ impl TerminalState {
     }
 
     /// Take the question a detector screen draws (#1038): the open one is
-    /// kept while the screen asks the same, so a redraw keeps its id, and
-    /// anything else opens a new one at the next open-time sequence.
+    /// kept while the screen asks the same, so a redraw keeps its id, and a
+    /// different form opens a new one at this turn cursor. A question screen
+    /// whose form did not read this frame (a torn read, an overlay) keeps the
+    /// open question. Only a screen that no longer asks one closes it.
     pub fn observe_question(
         &mut self,
         agent: Option<crate::detect::Agent>,
+        needs_human: Option<crate::api::agent_state::HumanReason>,
         question: Option<crate::api::question::QuestionForm>,
     ) {
-        let (Some(agent), Some(question)) = (agent, question) else {
-            self.question = None;
-            return;
+        let asking = needs_human == Some(crate::api::agent_state::HumanReason::Question);
+        self.question = match (agent, question) {
+            (Some(agent), Some(question)) => Some(question.carry(
+                self.question.as_ref(),
+                &self.agent_id.to_string(),
+                crate::detect::agent_label(agent),
+                &self.turn_cursor(),
+            )),
+            _ if asking => self.question.take(),
+            _ => None,
         };
-        let opened_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as u64);
-        let carried = question.carry(
-            self.question.as_ref(),
-            &self.agent_id.to_string(),
-            crate::detect::agent_label(agent),
-            self.question_opens + 1,
-            opened_at_ms,
-        );
-        if self.question.as_ref().map(|open| &open.question_id) != Some(&carried.question_id) {
-            self.question_opens += 1;
-        }
-        self.question = Some(carried);
     }
 
     /// Update the scraped spinner activity, holding the last value through

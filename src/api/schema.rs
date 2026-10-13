@@ -4136,7 +4136,8 @@ pub enum EventData {
         question_id: String,
         question: crate::api::question::Question,
     },
-    /// The question left the agent's screen, or the agent went.
+    /// The question left the agent's screen, was replaced by the next one, or
+    /// the agent went.
     #[serde(rename = "agent.question_closed")]
     AgentQuestionClosed {
         agent_id: String,
@@ -4144,6 +4145,9 @@ pub enum EventData {
         question_id: String,
         #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
         reason: crate::api::question::QuestionCloseReason,
+        /// The question as it closed, its `state` `withdrawn`, so a channel
+        /// can update what it rendered.
+        question: crate::api::question::Question,
     },
     /// #1020: every check on `head_sha` has concluded. `conclusion` is the
     /// rollup (`success`, `failure`, `error`).

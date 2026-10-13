@@ -1050,7 +1050,9 @@ mod tests {
     /// each question line's kind to one no build knows.
     #[test]
     fn a_reader_without_the_question_kinds_skips_their_lines() {
-        use crate::api::question::{Question, QuestionCloseReason, QuestionForm, QuestionSource};
+        use crate::api::question::{
+            Question, QuestionCloseReason, QuestionForm, QuestionSource, QuestionState,
+        };
         let path = temp_log("question-kinds-old-reader");
         let hub = EventHub::with_persistence(path.clone());
         hub.push(workspace_event("w1"));
@@ -1058,6 +1060,7 @@ mod tests {
             question_id: "q_0123456789abcdef".into(),
             source: QuestionSource::Screen,
             harness: "claude".into(),
+            state: QuestionState::Open,
             form: QuestionForm {
                 header: Some("Colour".into()),
                 prompt: "Which colour?".into(),
@@ -1083,6 +1086,10 @@ mod tests {
                     pane: "w1:p1".into(),
                     question_id: question.question_id.clone(),
                     reason: QuestionCloseReason::Withdrawn,
+                    question: Question {
+                        state: QuestionState::Withdrawn,
+                        ..question.clone()
+                    },
                 },
             },
         ];

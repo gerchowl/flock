@@ -8,19 +8,23 @@
 //! field names follow the hook path's: `prompt`, `header`, `options` of
 //! `{label, description}`, `multi_select`, `allow_other`.
 //!
-//! `question_id` is stable for one dialog instance (§8a): a redraw (the
-//! cursor moving, a checkbox toggled) keeps it, and a new dialog, or the same
-//! one asked again after it closed, gets a new one. It is derived from the
-//! agent, the open-time sequence and a fingerprint of what the dialog asks,
-//! never from where it is drawn.
+//! `question_id` is stable for one dialog instance (§8a). It is derived from
+//! the agent, the turn cursor at the moment the dialog opened and a
+//! fingerprint of what it asks, with whitespace collapsed so a resize that
+//! rewraps the prompt is the same question. A redraw (the cursor moving, a
+//! checkbox toggled, a rewrap) keeps it, and a new dialog, or the same one
+//! asked again in a later turn, gets a new one. Screen position never enters
+//! it. The open question is logged with `agent.question_opened`, and a server
+//! that starts (a restart or a live handoff) takes it back from the log, so a
+//! dialog still on screen keeps its id.
 //!
 //! Known limits of the screen source. It sees the one question a form shows:
 //! a form with several questions is one question per tab, and moving to the
-//! next tab closes the previous one. A header is read only when the form has a
-//! single question tab, since the current tab is marked by styling alone.
-//! `default`, `timeout_ms` and `state` are never set by a screen: the first two
-//! belong to message-sourced questions (#1242), the answered state to
-//! `question.answer` (#1039).
+//! next tab closes the previous one. Moving back reopens the earlier one under
+//! its earlier id, since it is the same question in the same turn. A header is
+//! read only when the form has a single question tab, since the current tab is
+//! marked by styling alone. `default` and `timeout_ms` are never set by a
+//! screen: they belong to message-sourced questions (#1242).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,8 +39,24 @@ pub struct Question {
     pub source: QuestionSource,
     /// The harness that asked: `claude`, `codex`.
     pub harness: String,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub state: QuestionState,
     #[serde(flatten)]
     pub form: QuestionForm,
+}
+
+/// Where a question is in its life (§8a): `open` while it waits, `withdrawn`
+/// once it left the screen unanswered, `expired` for a message question past
+/// its deadline (#1242). `answered { by, option_ids | text, at }` comes with
+/// `question.answer` (#1039) and reads `unknown` in this build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionState {
+    Open,
+    Withdrawn,
+    Expired,
+    #[default]
+    Unknown,
 }
 
 /// What a question asks, before it has an id: what a screen reads, and what
@@ -97,22 +117,23 @@ pub enum QuestionCloseReason {
 impl QuestionForm {
     /// The question this form is: `open` itself when it asks the same, so a
     /// redraw keeps its id, otherwise a new question whose id derives from
-    /// `agent_id`, the open-time `sequence` and `opened_at_ms`, and the form.
+    /// `agent_id`, the `turn_cursor` it opened at, and the form's fingerprint.
     pub fn carry(
         self,
         open: Option<&Question>,
         agent_id: &str,
         harness: &str,
-        sequence: u64,
-        opened_at_ms: u64,
+        turn_cursor: &str,
     ) -> Question {
-        if let Some(open) = open.filter(|open| open.harness == harness && open.form == self) {
+        let fingerprint = self.fingerprint();
+        if let Some(open) =
+            open.filter(|open| open.harness == harness && open.form.fingerprint() == fingerprint)
+        {
             return open.clone();
         }
-        let opened = format!("{agent_id}\0{harness}\0{sequence}\0{opened_at_ms}\0");
         let digest = Sha256::new()
-            .chain_update(opened)
-            .chain_update(serde_json::to_vec(&self).unwrap_or_default())
+            .chain_update(format!("{agent_id}\0{harness}\0{turn_cursor}\0"))
+            .chain_update(fingerprint)
             .finalize();
         let hex: String = digest[..8]
             .iter()
@@ -122,8 +143,35 @@ impl QuestionForm {
             question_id: format!("q_{hex}"),
             source: QuestionSource::Screen,
             harness: harness.to_string(),
+            state: QuestionState::Open,
             form: self,
         }
+    }
+
+    /// What the form asks with every whitespace run collapsed to one space,
+    /// so a rewrap at another width reads the same.
+    fn fingerprint(&self) -> Vec<u8> {
+        let fold = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let options: Vec<_> = self
+            .options
+            .iter()
+            .map(|option| {
+                (
+                    &option.id,
+                    fold(&option.label),
+                    option.description.as_deref().map(fold),
+                )
+            })
+            .collect();
+        let header = self.header.as_deref().map(fold);
+        let asks = (
+            header,
+            fold(&self.prompt),
+            options,
+            self.multi_select,
+            self.allow_other,
+        );
+        serde_json::to_vec(&asks).unwrap_or_default()
     }
 }
 
@@ -232,42 +280,75 @@ mod tests {
         }
     }
 
-    /// A redraw (the cursor moving, a checkbox toggled, Other focused) keeps
-    /// the `question_id`; a new dialog, or the same one asked again after it
-    /// closed, changes it.
+    /// A redraw (the cursor moving, a checkbox toggled, Other focused, a
+    /// resize that rewraps the prompt) keeps the `question_id`, and so does a
+    /// question screen whose form did not read. A new dialog changes it, and
+    /// so does the same one asked again in a later turn.
     #[test]
     fn a_redraw_keeps_the_question_id_and_a_new_dialog_changes_it() {
+        use crate::api::agent_state::HumanReason;
+        use crate::detect::AgentState;
         let mut terminal = crate::terminal::TerminalState::new(
             crate::terminal::TerminalId::alloc(),
             std::env::temp_dir(),
         );
-        let mut show = |screen: Option<&str>| {
-            let question = screen.and_then(|screen| read(Agent::Claude, screen));
-            terminal.observe_question(Some(Agent::Claude), question);
+        let mut show = |screen: &str| {
+            let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+            terminal.observe_question(
+                Some(Agent::Claude),
+                detection.needs_human,
+                detection.question,
+            );
             terminal.question.as_ref().map(|q| q.question_id.clone())
         };
-        let single = show(Some(fixture!("claude-single"))).unwrap();
+        let single = show(fixture!("claude-single")).unwrap();
         assert!(single.starts_with("q_") && single.len() == 18, "{single}");
+        assert_eq!(show(fixture!("claude-single-redraw")), Some(single.clone()));
         assert_eq!(
-            show(Some(fixture!("claude-single-redraw"))),
+            show(fixture!("claude-single-other-focused")),
             Some(single.clone())
         );
-        assert_eq!(
-            show(Some(fixture!("claude-single-other-focused"))),
-            Some(single.clone())
-        );
-        let multi = show(Some(fixture!("claude-multi"))).unwrap();
+        let multi = show(fixture!("claude-multi")).unwrap();
         assert_ne!(multi, single);
-        assert_eq!(
-            show(Some(fixture!("claude-multi-toggled"))),
-            Some(multi.clone())
-        );
-        let q1 = show(Some(fixture!("claude-two-q1"))).unwrap();
-        let q2 = show(Some(fixture!("claude-two-q2"))).unwrap();
+        assert_eq!(show(fixture!("claude-multi-toggled")), Some(multi.clone()));
+        let q1 = show(fixture!("claude-two-q1")).unwrap();
+        let q2 = show(fixture!("claude-two-q2")).unwrap();
         assert_ne!(q1, q2);
-        assert_eq!(show(None), None);
-        let again = show(Some(fixture!("claude-single"))).unwrap();
-        assert_ne!(again, single, "asked again after it closed");
+        // A narrower pane wraps the prompt and the description elsewhere.
+        let rewrapped = fixture!("claude-two-q2")
+            .replace(
+                "the narrow pane best,\n\u{2502} considering",
+                "the\n\u{2502} narrow pane best, considering",
+            )
+            .replace(
+                "one with long\n     descriptions",
+                "one\n     with long descriptions",
+            );
+        assert_ne!(rewrapped, fixture!("claude-two-q2"));
+        assert_eq!(show(&rewrapped), Some(q2.clone()));
+        // The review page is a question screen whose form does not read.
+        assert_eq!(show(fixture!("claude-two-review")), Some(q2.clone()));
+        terminal.observe_question(Some(Agent::Claude), None, None);
+        assert_eq!(
+            terminal.question, None,
+            "a screen that asks nothing closes it"
+        );
+        terminal.observe_question(Some(Agent::Claude), Some(HumanReason::Question), None);
+        assert_eq!(terminal.question, None);
+        // The agent works and asks the same question again.
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Blocked);
+        let mut show = |screen: &str| {
+            let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+            terminal.observe_question(
+                Some(Agent::Claude),
+                detection.needs_human,
+                detection.question,
+            );
+            terminal.question.as_ref().map(|q| q.question_id.clone())
+        };
+        let again = show(fixture!("claude-single")).unwrap();
+        assert_ne!(again, single, "asked again in a later turn");
     }
 
     /// The wire shape on `needs_human`: the form flattened beside the id,
@@ -277,7 +358,7 @@ mod tests {
         use crate::api::agent_state::{Attention, HumanReason};
         let question = read(Agent::Claude, fixture!("claude-single"))
             .unwrap()
-            .carry(None, "agent_a", "claude", 1, 0);
+            .carry(None, "agent_a", "claude", "t1:0:0:1:i");
         let attention = Attention::NeedsHuman {
             reason: HumanReason::Question,
             question: Some(Box::new(question.clone())),
@@ -286,6 +367,7 @@ mod tests {
         let payload = &wire["needs_human"]["question"];
         assert_eq!(payload["question_id"], question.question_id.as_str());
         assert_eq!(payload["source"], "screen");
+        assert_eq!(payload["state"], "open");
         assert_eq!(payload["harness"], "claude");
         assert_eq!(payload["prompt"], "Which colour should the probe use?");
         assert_eq!(payload["options"][1]["label"], "Blue");

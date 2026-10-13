@@ -598,6 +598,7 @@ When an agent's screen shows a harness choice dialog, its `state` says what the 
   "question_id": "q_1f1bfdbef4278496",
   "source": "screen",
   "harness": "claude",
+  "state": "open",
   "header": "Colour",
   "prompt": "Which colour should the probe use?",
   "options": [
@@ -612,20 +613,22 @@ When an agent's screen shows a harness choice dialog, its `state` says what the 
 - `harness` is `claude` (Claude Code's `AskUserQuestion` form) or `codex` (`request_user_input`). opencode is not read yet ([#1243](https://github.com/gerchowl/flock/issues/1243)).
 - An option's `id` is the number the dialog shows beside it. `description` is left out when the dialog shows none. Wrapped lines are joined with one space.
 - `allow_other` means the dialog accepts free text: Claude's "Type something", or Codex's "None of the above". That entry is not listed as an option, and neither is Claude's "Chat about this".
+- `state` is `open` while the question waits, and `withdrawn` on the `agent.question_closed` that ends it. `expired` is for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)). `answered` comes with `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)); a build without it reads that state as `unknown`.
 - `header` is the form's tag. It is read only when the form has one question tab, because the screen marks the current tab by styling alone.
-- `question_id` stays the same while the same dialog is on screen, so moving the cursor or toggling a checkbox does not change it. A different question, or the same one asked again after it closed, gets a new id. The id is derived from the agent, a per-pane sequence and the open time, plus the dialog's content. It never depends on where the dialog is drawn.
-- A prompt whose form cannot be read still reads `needs_human{reason: "question"}`, just without `question`. A form with several questions shows one at a time, so it reads as one question per tab. Its review page carries no `question`.
+- `question_id` is derived from the agent, the pane's `turn_cursor` when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. A different question gets a new id, and so does the same question asked again in a later turn.
+- A frame whose form cannot be read, such as a torn read, an overlay or a form's review page, keeps the open question. Only a screen that no longer asks a question closes it. A prompt whose form never reads still reads `needs_human{reason: "question"}`, just without `question`.
+- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab reopens that question under its earlier id, since it is the same question in the same turn.
 
 Two durable kinds follow the same reads. Unlike the phase kinds, they are emitted at once, with no settle window:
 
 | Kind | Carries | Emitted when |
 | --- | --- | --- |
 | `agent.question_opened` | `agent_id`, `pane`, `question_id`, `question` | a read shows a `question_id` the previous read did not |
-| `agent.question_closed` | `agent_id`, `pane`, `question_id`, `reason` | that question left the screen, was replaced by the next one, or its agent went |
+| `agent.question_closed` | `agent_id`, `pane`, `question_id`, `reason`, `question` (its `state` `withdrawn`) | that question left the screen, was replaced by the next one, or its agent went |
 
 `question_id` is a top-level field of both, so `"subjects": ["<question id>"]` matches the pair. On a screen, `reason` is always `withdrawn`. An answer typed at the pane also closes the question as `withdrawn`, because on screen it cannot be told apart from a cancel. Answered questions are reported by `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)) and by the harness hook ([#1194](https://github.com/gerchowl/flock/issues/1194)). Moving to the next tab of a form closes the previous tab's question the same way. `expired` is reserved for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)).
 
-After a restart or a live handoff, a dialog that is still open is read again under a new id. The id the log had open is closed then, so every `question_opened` is followed by exactly one `question_closed`. A server older than these kinds skips them in its log.
+A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then. A turn cursor restarts with the server, so the same question first asked after a restart can, rarely, get an id it had before the restart. A server older than these kinds skips them in its log.
 
 ## Channel adapters
 

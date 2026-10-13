@@ -41,19 +41,21 @@
 //! next state change (#1163).
 //!
 //! Questions (ADR-0028 §8a, #1038). The same reads open and close the
-//! question an agent's `attention` carries: `agent.question_opened` when a
-//! read shows a `question_id` the last one did not, and
+//! question the agent's terminal holds: `agent.question_opened` when a read
+//! shows a `question_id` the last one did not, and
 //! `agent.question_closed { withdrawn }` for the one it replaces or that left
-//! the screen, at once and with no window. Open questions are seeded from the
-//! log like phases. A restart re-reads an open dialog under a new id (the
-//! open-time sequence is the terminal's), so the old id is closed then.
+//! the screen, at once and with no window. The terminal's question, not
+//! `attention`, is read, so a status that is not yet known after a start
+//! closes nothing. Open questions are seeded from the log, into the tracker
+//! and back onto their agents' terminals, so a restart or a handoff keeps
+//! the id of a dialog still on screen and emits nothing for it.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::api::agent_state::{AgentState, Attention, Lifecycle, Phase, SETTLE_MS};
-use crate::api::question::{Question, QuestionCloseReason};
+use crate::api::agent_state::{AgentState, Lifecycle, Phase, SETTLE_MS};
+use crate::api::question::{Question, QuestionCloseReason, QuestionState};
 use crate::api::schema::{AgentPhaseEvent, EventData, EventEnvelope, EventKind};
 
 /// The settle window a phase must hold before it is announced: the one
@@ -65,6 +67,8 @@ pub(crate) struct Sample {
     pub agent_id: String,
     pub pane: String,
     pub state: AgentState,
+    /// The question the agent's terminal holds open.
+    pub question: Option<Question>,
 }
 
 struct Tracked {
@@ -97,26 +101,20 @@ pub(crate) struct AgentPhaseTracker {
     touched: RefCell<Touched>,
     /// Whether the first tick after start has read every agent.
     started: bool,
-    /// Each agent's open question: its pane and `question_id`.
-    questions: HashMap<String, (String, String)>,
+    /// Each agent's open question and its pane.
+    questions: HashMap<String, (String, Question)>,
 }
 
-/// The question an agent's `attention` carries.
-fn open_question(state: &AgentState) -> Option<&Question> {
-    match &state.attention {
-        Attention::NeedsHuman { question, .. } => question.as_deref(),
-        _ => None,
-    }
-}
-
-fn question_closed(agent_id: &str, pane: String, question_id: String) -> EventEnvelope {
+fn question_closed(agent_id: &str, pane: String, mut question: Question) -> EventEnvelope {
+    question.state = QuestionState::Withdrawn;
     EventEnvelope {
         event: EventKind::AgentQuestionClosed,
         data: EventData::AgentQuestionClosed {
             agent_id: agent_id.to_string(),
             pane,
-            question_id,
+            question_id: question.question_id.clone(),
             reason: QuestionCloseReason::Withdrawn,
+            question,
         },
     }
 }
@@ -162,11 +160,11 @@ impl AgentPhaseTracker {
                 EventData::AgentQuestionOpened {
                     agent_id,
                     pane,
-                    question_id,
+                    question,
                     ..
                 } => {
                     self.questions
-                        .insert(agent_id.clone(), (pane.clone(), question_id.clone()));
+                        .insert(agent_id.clone(), (pane.clone(), question.clone()));
                 }
                 // The log closes a question before the next one opens.
                 EventData::AgentQuestionClosed { agent_id, .. } => {
@@ -265,19 +263,20 @@ impl AgentPhaseTracker {
 
     /// The question events between the last read of an agent and this one.
     fn observe_question(&mut self, sample: &Sample) -> Vec<EventEnvelope> {
-        let question = open_question(&sample.state);
+        let question = sample.question.as_ref();
         let open = self.questions.get(&sample.agent_id);
-        if open.map(|(_, id)| id) == question.map(|question| &question.question_id) {
+        if open.map(|(_, open)| &open.question_id) == question.map(|question| &question.question_id)
+        {
             return Vec::new();
         }
         let mut events = Vec::new();
-        if let Some((pane, question_id)) = self.questions.remove(&sample.agent_id) {
-            events.push(question_closed(&sample.agent_id, pane, question_id));
+        if let Some((pane, open)) = self.questions.remove(&sample.agent_id) {
+            events.push(question_closed(&sample.agent_id, pane, open));
         }
         if let Some(question) = question {
             self.questions.insert(
                 sample.agent_id.clone(),
-                (sample.pane.clone(), question.question_id.clone()),
+                (sample.pane.clone(), question.clone()),
             );
             events.push(EventEnvelope {
                 event: EventKind::AgentQuestionOpened,
@@ -372,8 +371,8 @@ impl AgentPhaseTracker {
         );
         let mut events = Vec::new();
         for agent_id in gone {
-            if let Some((pane, question_id)) = self.questions.remove(&agent_id) {
-                events.push(question_closed(&agent_id, pane, question_id));
+            if let Some((pane, question)) = self.questions.remove(&agent_id) {
+                events.push(question_closed(&agent_id, pane, question));
             }
             if let Some(mut tracked) = self.agents.remove(&agent_id) {
                 tracked.state.lifecycle = Lifecycle::Gone;
@@ -458,10 +457,12 @@ impl super::App {
             let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
                 continue;
             };
+            let question = self.terminal_question(ws_idx, pane_id);
             let sample = Sample {
                 agent_id,
                 pane,
                 state,
+                question,
             };
             events.extend(self.agent_phases.observe(now, SETTLE, sample));
         }
@@ -481,10 +482,23 @@ impl super::App {
     ) {
         self.agent_phases
             .seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
+        for terminal in self.state.terminals.values_mut() {
+            let agent_id = terminal.agent_id.to_string();
+            if let Some((_, question)) = self.agent_phases.questions.get(&agent_id) {
+                terminal.question.get_or_insert_with(|| question.clone());
+            }
+        }
         let (_, on_panes) = self.local_agent_panes();
         for event in self.agent_phases.retain_present(&on_panes, &on_panes) {
             self.emit_event(event);
         }
+    }
+
+    /// The question a pane's terminal holds open.
+    fn terminal_question(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<Question> {
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        terminal.question.clone()
     }
 
     /// Every listed local agent's id and pane, and the agent id of every
@@ -534,6 +548,7 @@ impl super::App {
 mod tests {
     use super::*;
     use crate::api::agent_state::{Attention, BlockedReason, HumanReason};
+    use crate::api::question::QuestionState;
 
     const WIN: Duration = Duration::from_secs(20);
 
@@ -562,6 +577,7 @@ mod tests {
             agent_id: "agent_a".into(),
             pane: "w1:p1".into(),
             state: state(phase),
+            question: None,
         }
     }
 
@@ -927,8 +943,8 @@ mod tests {
     /// and the server, open a durable `agent.question_opened` carrying the
     /// payload `agent.get` shows; a redraw emits nothing; the next question
     /// of the form closes the first as `withdrawn` and opens its own; the
-    /// dialog leaving closes it. A restart closes the logged question when
-    /// the screen re-reads it under a new id.
+    /// dialog leaving closes it. A restart with the dialog still on screen
+    /// keeps its id and emits nothing, before and after the screen is read.
     #[tokio::test]
     async fn question_screens_open_and_close_durable_questions() {
         macro_rules! fixture {
@@ -978,6 +994,7 @@ mod tests {
         }, EventData::AgentQuestionClosed {
             question_id: last,
             reason: QuestionCloseReason::Withdrawn,
+            question: withdrawn,
             ..
         }] = &questions[..]
         else {
@@ -987,21 +1004,35 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(&question.question_id, first);
         assert_eq!(question.form.prompt, "Which colour should the probe use?");
+        assert_eq!(question.state, QuestionState::Open);
+        assert_eq!(withdrawn.state, QuestionState::Withdrawn);
+        let open_id = |app: &crate::app::App| {
+            let terminal = app.state.terminals.values().next().unwrap();
+            terminal.question.as_ref().map(|q| q.question_id.clone())
+        };
 
         screen(&mut app, fixture!("claude-single"));
         tick(&mut app);
+        let reopened = open_id(&app).unwrap();
+        assert_ne!(&reopened, first, "the same question in a later turn");
+        drop(app);
         let restarted = crate::api::EventHub::with_persistence(log.clone());
         let mut app = server(&restarted, Some("agent_q"));
-        screen(&mut app, fixture!("claude-single"));
+        assert_eq!(
+            open_id(&app),
+            Some(reopened.clone()),
+            "taken back from the log"
+        );
         tick(&mut app);
+        screen(&mut app, fixture!("claude-single-redraw"));
+        tick(&mut app);
+        assert_eq!(open_id(&app), Some(reopened));
         assert_eq!(
             logged(&log)
                 .into_iter()
                 .filter(|kind| kind.starts_with("agent.question_"))
                 .collect::<Vec<_>>(),
             [
-                "agent.question_opened",
-                "agent.question_closed",
                 "agent.question_opened",
                 "agent.question_closed",
                 "agent.question_opened",

@@ -3920,7 +3920,7 @@ impl AppState {
                 .update_terminal_state(pane_id, |terminal| {
                     terminal.provider_limit = provider_limit.clone();
                     terminal.needs_human = needs_human;
-                    terminal.observe_question(agent, question.clone());
+                    terminal.observe_question(agent, needs_human, question.clone());
                     terminal.update_live_activity(activity.clone(), state);
                     terminal.settled_with_background_shells =
                         settled_with_background_shells && state == AgentState::Idle;
