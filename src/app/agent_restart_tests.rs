@@ -273,10 +273,11 @@ async fn restart_api_resumes_same_session_flags_env_and_delivers_continuation() 
 /// process is launched with its hint.
 #[tokio::test]
 async fn a_restart_keeps_the_question_policy_and_its_hint() {
-    // Only the resumed harness writes this FIFO. Reading its report waits for
-    // execution, rather than assuming process spawn means the script ran within
+    // The original launch starts with --model. Every other launch reports its
+    // actual arguments, including a restart missing --resume. Reading
+    // its report waits for execution rather than assuming spawn means it ran in
     // five seconds (#1283). ADR-0034 §2 requires the record and hint to survive.
-    let mut rig = rig_with_script("#!/bin/sh\nif [ \"$1\" = --resume ]; then printf '%s\\n' \"$1\" \"$2\" \"${FLOCK_QUESTIONS:-unset}\" > resumed; fi\nwhile IFS= read -r line; do :; done\n");
+    let mut rig = rig_with_script("#!/bin/sh\nif [ \"$1\" != --model ]; then printf '%s\\n' \"$1\" \"$2\" \"${FLOCK_QUESTIONS:-unset}\" > resumed; fi\nwhile IFS= read -r line; do :; done\n");
     let path = rig.directory.join("resumed");
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: c_path is a live, NUL-terminated path to this rig's private FIFO.
