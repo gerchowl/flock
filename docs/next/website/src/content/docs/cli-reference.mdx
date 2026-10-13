@@ -20,6 +20,8 @@ When an existing status ping, submission guard, or failed command reveals a diff
 | `delegate` awaits: `not_started` | `8` | `11` |
 | `wait reply`, `msg send --await`, `msg status`: the receiver refused the message | `4` | `13` |
 
+Every verb now exits what the error-code registry assigns its error, for send-like and guarded verbs too, which is also what MCP reports as `data.exit` (#1238, #1195, #1241). Three codes changed with no stderr notice: `server_version_gap` exits `78` (was `1`), and `questions_widening_refused` and `operator_only` exit `13` (were `1`). A `later` refusal from a send-like or guarded verb stays `10`, and every other code stays `1`.
+
 ## Output format and the error envelope
 
 `--format json|text` is a global flag, and `--json` is its synonym (ADR-0029 §3). Where it may appear:
@@ -148,8 +150,9 @@ flk peers enroll --reset <peer>
 The default reset clears the configured-peer pin. Use
 `flk peers enroll --reset <peer> --direction inbound` for an inbound pin.
 The command shows the direction, name, and node ID before clearing that pin.
-Reset is refused when invoked from an agent pane or over MCP/relay; the
-operator's shell is the trust boundary. Peers using incompatible versions or a
+Reset is refused with `operator_only` and exit 13 (1 before #1195) when
+invoked from an agent pane or over MCP/relay; the operator's shell is the
+trust boundary. Peers using incompatible versions or a
 failing relay are refused with a concrete reason. Version refusals include
 `upgrade flk on <peer>` (or `this node` when the local version is older); discovery does not fall back to one-shot SSH.
 
@@ -567,6 +570,17 @@ flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR
 ```
 
 `events read` prints one JSON line per event (`seq`, `event`, `data`), oldest first, and `next_after: N` on stderr; resume with `--after N` and dedupe on `seq`. `--json` prints the whole reply. A `gap` on stderr means the cursor is older than what the server still retains. `--kinds` takes durable kind names (`message_queued`, or `message.queued`); `--subject` matches an id the event's data carries as a top-level value (a pane, workspace, agent or message id). `events wait` prints the first matching event after `--after` (default: now) and exits 0, or exits 124 at `--timeout` (`500ms`, `5s`, `2m`). The wait is held on the server, not polled. Against a server without `events.read` both exit 78. Prefer `events wait` over a loop around `agent get`. While it is held, `events wait` is a registered wait: an agent running it (in the foreground or as a background task) reads `phase: waiting_on_event`. See [Registered waits](/socket-api/#registered-waits). To follow agents, wait on the derived kinds: `flk events wait --kinds agent.phase_changed --subject <agent id>`, or `agent.needs_human`, `agent.limit_reached` and `agent.gone` (see [Supervisor events](/docs/socket-api/#supervisor-events)). To catch a question dialog, wait on `agent.question_opened`; `agent.question_closed` follows it (see [Open questions](/docs/socket-api/#open-questions)).
+
+Bind a repo to its resident owner, end the binding, and read the bindings on this node (ADR-0035 §1):
+
+```bash
+flk owner bind <owner/repo> --checkout PATH --harness claude|codex|opencode [--model NAME] [--profile NAME]... [--json]
+flk owner unbind <owner/repo> [--json]
+flk owner list [--json]
+flk owner show <owner/repo> [--json]
+```
+
+Each verb prints the server's reply (see [Owner bindings](/socket-api/#owner-bindings)) and exits 0. `bind` records the binding on the node whose server answers, which becomes the owner's home node; `--checkout` must name a git checkout on it (a relative path is resolved against the current directory), `--profile` repeats for the profile ladder, first choice first, and binding a bound repo again keeps its `agent_id`. `bind` and `unbind` are operator verbs: run from an agent's pane, relayed from a mesh peer, or from a caller whose pid the server could not read, they are refused with `operator_only` and **exit 13**, and nothing changes. That boundary is **cooperative only** until agents run as their own Unix user (#1208, #1177): a child an agent detaches with `setsid` passes as the operator. `unbind` and `show` of a repo with no binding exit 4 (`not_found`). A bad slug or checkout exits 1 (`invalid_params`), a usage error 2, and a server without the `owner.*` methods 78. Under `--json` every error is the envelope above.
 
 Check a channel adapter's binding before the adapter starts:
 
