@@ -111,7 +111,10 @@ use serde::{Deserialize, Serialize};
 /// it, through the #868 skew gate.
 /// v30 adds `owner.bind`, `owner.unbind`, `owner.list` and `owner.show`
 /// (ADR-0035 §1, #1196). Bind and unbind are gated by #868, so an older
-/// server is never sent them.
+/// server is never sent them. v30 also adds `goal.arm`, `goal.status`,
+/// `goal.pause`, `goal.resume` and `goal.stop` (ADR-0030 §1, #1155): v30 is
+/// not yet released, so they ship in it without a bump. All but
+/// `goal.status` are gated by #868, and `goal.status` normalizes to exit 78.
 pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Refusal notice sent to clients while a live update handoff is in
