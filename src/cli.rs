@@ -37,6 +37,7 @@ pub(crate) mod output;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
+pub(crate) mod questions;
 mod ready;
 mod report;
 mod revert;
@@ -1130,11 +1131,13 @@ fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io:
 }
 
 /// The exit status for an error response. Only a send-like or guarded verb
-/// maps a refusal to `REFUSED`; every other verb keeps `FAILURE`.
+/// maps a refusal to `REFUSED`; every other verb takes what the error-code
+/// registry assigns, which is `FAILURE` unless the code names another.
 pub(crate) fn error_exit(response: &serde_json::Value, send_like: bool) -> i32 {
     match response["error"]["code"].as_str() {
         Some(code) if send_like => refusal_exit(code),
-        _ => exit::FAILURE,
+        Some(code) => error_code_exit(code, false),
+        None => exit::FAILURE,
     }
 }
 

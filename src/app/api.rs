@@ -19,6 +19,7 @@ mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
+mod owners;
 mod panes;
 pub(crate) mod peers;
 pub(super) mod responses;
@@ -1499,6 +1500,10 @@ impl App {
                 return self.handle_wait_hold(request.id, predicate, hold_ms)
             }
             Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
+            Method::OwnerBind(params) => return self.handle_owner_bind(request.id, params),
+            Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
+            Method::OwnerList(_) => return self.handle_owner_list(request.id),
+            Method::OwnerShow(params) => return self.handle_owner_show(request.id, params),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),

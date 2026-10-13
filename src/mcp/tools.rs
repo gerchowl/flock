@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
     EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
-    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WaitParkParams, WorktreeKillParams,
-    WorktreeListParams,
+    MsgSendParams, OwnerRepoParams, PaneReadParams, ReadFormat, ReadSource, WaitParkParams,
+    WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -450,6 +450,18 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_wait_park,
             build: build_wait_park,
         },
+        Tool {
+            name: "flock_owner_show",
+            description: "Return a repo's resident-owner binding (ADR-0035 \
+                          §1), read-only: home `node`, the owner's \
+                          `agent_id`, `checkout`, `harness`, `model`, \
+                          `profiles` and `since_ms`. `repo` is the GitHub \
+                          slug `owner/name`. Binding is an operator verb and \
+                          is not reachable from MCP. Refusal: `not_found` \
+                          (no owner is bound to the repo on this node).",
+            input_schema: schema_owner_show,
+            build: build_owner_show,
+        },
     ]
 }
 
@@ -509,7 +521,8 @@ fn schema_agent_start() -> Value {
                 },
                 "required": ["kind"]
             },
-            "name": { "type": "string", "description": "Custom label for the child agent." }
+            "name": { "type": "string", "description": "Custom label for the child agent." },
+            "questions": questions_property()
         },
         "required": ["agent", "prompt", "location"],
         "additionalProperties": false
@@ -531,6 +544,10 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
         name: optional_string(&args, "name")?,
         // An MCP-spawned child never steals the operator's focus.
         focus: false,
+        questions: optional_questions(&args)?,
+        // An MCP caller is an agent, and an unattended start is an operator
+        // verb (ADR-0034 §2), so the tool does not offer it.
+        unattended: false,
     }))
 }
 
@@ -577,6 +594,20 @@ fn schema_delegate_list() -> Value {
                 "description": "Only edges in this repository (the edge's repo key).",
             },
         },
+        "additionalProperties": false,
+    })
+}
+
+fn schema_owner_show() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repo": {
+                "type": "string",
+                "description": "GitHub slug of the repo, `owner/name`.",
+            },
+        },
+        "required": ["repo"],
         "additionalProperties": false,
     })
 }
@@ -634,6 +665,7 @@ fn schema_agent_fork() -> Value {
                 "type": "string",
                 "description": "Custom label for the new workspace.",
             },
+            "questions": questions_property(),
         },
         "required": ["target"],
         "additionalProperties": false,
@@ -928,6 +960,12 @@ fn build_agent_get(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn build_owner_show(args: Value) -> Result<Method, McpError> {
+    Ok(Method::OwnerShow(OwnerRepoParams {
+        repo: required_string(&args, "repo")?,
+    }))
+}
+
 fn build_agent_lineage(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentLineage(LineageParams {
         target: required_string(&args, "target")?,
@@ -996,6 +1034,8 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
         label: optional_string(&args, "label")?,
         pivot: optional_string(&args, "pivot")?,
         focus: false,
+        questions: optional_questions(&args)?,
+        unattended: false,
     }))
 }
 
@@ -1476,6 +1516,25 @@ fn optional_string(args: &Value, field: &str) -> Result<Option<String>, McpError
     }
 }
 
+/// The `questions` argument of the tools that start an agent (#1179).
+fn questions_property() -> Value {
+    json!({"type": "string", "enum": ["route", "deny"],
+        "description": "Where the child's questions go (ADR-0034 §2). Default route: to you, as structured questions. deny refuses them, e.g. for a delegate started over ssh. A policy that reaches the human is an operator verb and is refused (exit 13)."})
+}
+
+/// `questions`, in any wire spelling: the server, not the schema, refuses a
+/// policy an agent may not grant, so the refusal carries its exit code.
+fn optional_questions(
+    args: &Value,
+) -> Result<Option<crate::api::schema::QuestionPolicy>, McpError> {
+    optional_string(args, "questions")?
+        .map(|raw| {
+            crate::api::schema::QuestionPolicy::parse(&raw)
+                .ok_or_else(|| McpError::invalid_params(format!("invalid `questions`: {raw}")))
+        })
+        .transpose()
+}
+
 fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>, McpError> {
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -1604,6 +1663,19 @@ mod tests {
         assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
     }
 
+    /// ADR-0035 §1: MCP reads an owner binding and never writes one.
+    #[test]
+    fn owner_show_is_a_read_and_no_tool_binds() {
+        let method = build_owner_show(json!({"repo": "example/widgets"})).unwrap();
+        assert!(matches!(&method, Method::OwnerShow(p) if p.repo == "example/widgets"));
+        assert!(method.is_retry_safe() && !method.needs_current_protocol());
+        assert!(build_owner_show(json!({})).is_err());
+        assert!(!table().iter().any(|tool| matches!(
+            (tool.build)(json!({"repo": "a/b", "target": "x"})),
+            Ok(Method::OwnerBind(_) | Method::OwnerUnbind(_))
+        )));
+    }
+
     #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
@@ -1636,6 +1708,7 @@ mod tests {
                 "flock_agent_result",
                 "flock_events_read",
                 "flock_wait_park",
+                "flock_owner_show",
             ]
         );
     }

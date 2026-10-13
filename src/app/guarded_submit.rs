@@ -360,6 +360,15 @@ fn clear_keys(runtime: &crate::terminal::TerminalRuntime, draft: &str) -> Vec<u8
     bytes
 }
 
+/// The message for a [`App::raw_text_refusal`] code, naming the way out.
+pub(crate) fn raw_text_refusal_message(reason: &str) -> &'static str {
+    if reason == "injection_pending" {
+        "flock is injecting into this agent's composer; send again when it is done, or pass raw to type anyway"
+    } else {
+        "the agent's composer holds a draft; nothing was typed. Send again once it is empty, or pass raw to type onto it"
+    }
+}
+
 /// Same execution plus a new working entry also captures turns between polls.
 fn progress(before: &str, after: &str) -> Result<bool, &'static str> {
     let before: Vec<_> = before.split(':').collect();
@@ -434,6 +443,43 @@ impl App {
         wake: bool,
     ) -> Result<Attempt, &'static str> {
         self.begin_guarded_injection(pane, text, session, settle, now, wake, false)
+    }
+
+    /// Why automated text may not be typed into this pane now (#1162), for
+    /// the verbs that type without submitting through the guard:
+    /// `pane.send_text`, `pane.send_input` and `agent.send` without `submit`.
+    ///
+    /// Only an agent pane is guarded, by its effective known agent: a shell
+    /// pane has no composer to merge into. Two cases refuse before a byte is
+    /// written:
+    /// - `injection_pending`: an injection holds the pane (#850). Text held
+    ///   now would replay after the lease, onto any draft the injection typed
+    ///   back.
+    /// - `input_not_empty`: the editor holds text that is not the harness's
+    ///   own hint. Typed text would join it, and the next Enter would submit
+    ///   both as one turn. Unlike the guarded submit there is no stash: these
+    ///   verbs leave their text in the composer, so a draft has nowhere to go
+    ///   back to.
+    ///
+    /// The editor is read without the idle gates, so a working agent's queued
+    /// draft counts too. Known limit: a harness whose editor is not on screen
+    /// (a dialog over it, OpenCode's busy footer, #950 §4) shows no draft, and
+    /// the text is typed.
+    pub(crate) fn raw_text_refusal(
+        &self,
+        ws: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&'static str> {
+        let agent = self
+            .terminal_for_pane(ws, pane_id)?
+            .effective_known_agent()?;
+        let runtime = self.lookup_runtime_sender(ws, pane_id)?;
+        if runtime.injection_lease_until().is_some() {
+            return Some("injection_pending");
+        }
+        let rows = editor_rows(agent, runtime)?;
+        let rows: Vec<_> = rows.iter().map(String::as_str).collect();
+        (!editor_rows_empty(agent, &rows)).then_some("input_not_empty")
     }
 
     pub(crate) fn injection_lock_enabled(&self) -> bool {

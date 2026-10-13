@@ -90,7 +90,12 @@ const FREE_TEXT: &[FreeText] = &[
     ),
     (["pane", "send-text"], 1, &[], &[]),
     (["pane", "send-keys"], 1, &[], &[]),
-    (["agent", "send"], 1, &["--submit", "--no-submit"], &[]),
+    (
+        ["agent", "send"],
+        1,
+        &["--submit", "--no-submit", "--raw"],
+        &[],
+    ),
     (
         ["pane", "arm-self-compact"],
         0,

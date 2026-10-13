@@ -231,6 +231,16 @@ pub enum Method {
     /// In-process only: the held `events.read` returned.
     #[serde(skip)]
     WaitRelease(String),
+    /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
+    #[serde(rename = "owner.bind")]
+    OwnerBind(OwnerBindParams),
+    /// ADR-0035 §1: end a repo's owner binding. Operator verb.
+    #[serde(rename = "owner.unbind")]
+    OwnerUnbind(OwnerRepoParams),
+    #[serde(rename = "owner.list")]
+    OwnerList(EmptyParams),
+    #[serde(rename = "owner.show")]
+    OwnerShow(OwnerRepoParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -313,6 +323,8 @@ impl Method {
                 | Self::AgentHistory(_)
                 | Self::AgentResult(_)
                 | Self::AgentLineage(_)
+                | Self::OwnerList(_)
+                | Self::OwnerShow(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
@@ -360,6 +372,8 @@ impl Method {
             | Self::AgentHistory(_)
             | Self::AgentResult(_)
             | Self::AgentLineage(_)
+            | Self::OwnerList(_)
+            | Self::OwnerShow(_)
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
@@ -422,6 +436,8 @@ impl Method {
             | Self::PaneRename(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
+            | Self::OwnerBind(_)
+            | Self::OwnerUnbind(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -1016,6 +1032,12 @@ pub struct AgentSendParams {
     /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
     #[serde(default)]
     pub submit: bool,
+    /// Without `submit`, type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 /// Queue a server-owned restart. The caller must finish its requesting turn.
@@ -1086,6 +1108,15 @@ pub struct AgentStartParams {
     /// (#868): an older one would drop it without a word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// `skip_serializing_if` predicate for a defaulted `bool` flag: absent on the
@@ -1112,6 +1143,15 @@ pub struct AgentSpawnParams {
     pub name: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Where an `agent.spawn` child runs (#329).
@@ -1167,6 +1207,15 @@ pub struct AgentForkParams {
     pub pivot: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Walk the fork ancestry of a pane/worktree (#175 O1, US-4). Target uses
@@ -1252,6 +1301,9 @@ pub struct DelegateRow {
     /// The PR poller's cached answer for the branch, never a live read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<PrInfo>,
+    /// The delegate's question policy (#1179), while it is an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
 }
 
 /// Does the sender want an answer (#280, R4 of #213)?
@@ -1747,6 +1799,12 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    /// Type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1826,6 +1884,12 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Type `text` even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2140,6 +2204,57 @@ pub struct ChannelHelloParams {
     pub token: crate::channels::ChannelToken,
 }
 
+/// `owner.bind` (ADR-0035 §1). The node is the serving node and the
+/// `AgentId` is minted by the server, so neither is a parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBindParams {
+    /// The GitHub slug, `owner/name`.
+    pub repo: String,
+    /// Absolute path of the owner's checkout on the serving node.
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The profile ladder, first choice first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+}
+
+/// `owner.unbind` and `owner.show`: the GitHub slug of a bound repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRepoParams {
+    pub repo: String,
+}
+
+/// The harness an owner binding names (ADR-0035 §1, `bind --harness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerHarness {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+/// A repo's resident-owner binding (ADR-0035 §1): durable server state set
+/// only by operator verbs, never read from the repo (§6.2). The owner keeps
+/// `agent_id` for life: binding a bound repo again changes the other fields
+/// and keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBinding {
+    pub repo: String,
+    /// The home node, named statically: no lease, no failover.
+    pub node: String,
+    pub agent_id: String,
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// When the repo was first bound (Unix ms). A re-bind keeps it.
+    pub since_ms: u64,
+}
+
 /// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
 pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
 pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
@@ -2331,6 +2446,10 @@ pub enum EventKind {
     GoalPaused,
     GoalResumed,
     GoalDisarmed,
+    /// ADR-0035 §1: a repo's owner binding. The live bindings are the fold
+    /// of these (`app::owners::OwnerIndex`).
+    OwnerBound,
+    OwnerUnbound,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -2435,6 +2554,8 @@ impl EventKind {
             | Self::GoalPaused
             | Self::GoalResumed
             | Self::GoalDisarmed
+            | Self::OwnerBound
+            | Self::OwnerUnbound
             | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
@@ -2514,6 +2635,11 @@ pub struct ServerCapabilities {
     /// the field (#868).
     #[serde(default)]
     pub agent_start_label: bool,
+    /// #1179: `agent.start`, `agent.spawn` and `agent.fork` accept
+    /// `questions` and `unattended`, and the agent record carries the policy.
+    /// Absent on an older server, which is how a client knows to omit them.
+    #[serde(default)]
+    pub agent_questions: bool,
 }
 
 /// Accept failures retained for the lifetime of the API listener.
@@ -2902,6 +3028,22 @@ pub enum ResponseResult {
     /// is no agent and nothing was recorded.
     WaitHeld {
         wait_id: Option<String>,
+    },
+    /// `owner.bind`: the binding as recorded. `rebound` is true when the
+    /// repo was already bound and kept its `agent_id`.
+    OwnerBound {
+        binding: OwnerBinding,
+        rebound: bool,
+    },
+    /// `owner.unbind`: the binding that ended.
+    OwnerUnbound {
+        binding: OwnerBinding,
+    },
+    OwnerList {
+        bindings: Vec<OwnerBinding>,
+    },
+    OwnerShow {
+        binding: OwnerBinding,
     },
     /// `channel.hello`: the binding the token unlocked, never the token.
     ChannelHello {
@@ -3394,6 +3536,10 @@ pub struct AgentInfo {
     /// false, and an older server never sends it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumable: bool,
+    /// Where this agent's questions go (#1179, ADR-0034 §2). Absent on
+    /// remote, peer and fleet summaries, and from servers predating #1179.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
     pub revision: u64,
 }
 
@@ -3606,6 +3752,51 @@ impl DelegationVia {
             Self::Spawn => "spawn",
             Self::Fork => "fork",
         }
+    }
+}
+
+/// Where an agent's questions go (ADR-0034 §2, #1179). An attribute of the
+/// agent record, set at start, spawn and fork and kept across a restart, a
+/// resume, a hibernation and a live handoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionPolicy {
+    /// The harness shows its dialog to the operator watching the pane. The
+    /// default for an operator start, and for a record written before #1179.
+    #[default]
+    AskHuman,
+    /// Nobody watches the pane: questions go to the operator's queue. The
+    /// default for an agent the server starts itself, or an `--unattended`
+    /// start.
+    AskOperator,
+    /// Questions go to the architect as structured questions. The default
+    /// for an agent another agent started.
+    Route,
+    /// Questions are refused with a reason. Explicit only.
+    Deny,
+}
+
+impl QuestionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AskHuman => "ask_human",
+            Self::AskOperator => "ask_operator",
+            Self::Route => "route",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Parse the CLI spelling, which is the wire spelling.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::AskHuman, Self::AskOperator, Self::Route, Self::Deny]
+            .into_iter()
+            .find(|policy| policy.as_str() == raw)
+    }
+
+    /// A policy that reaches a human. Granting one is an operator verb: an
+    /// agent caller may only narrow, to `route` or `deny` (ADR-0034 §2).
+    pub fn reaches_human(self) -> bool {
+        matches!(self, Self::AskHuman | Self::AskOperator)
     }
 }
 
@@ -4037,6 +4228,18 @@ pub enum EventData {
         agent_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// ADR-0035 §1: `repo` is bound to `binding`. The copy re-issued on every
+    /// server start and log rotation carries `reissued: true` and the whole
+    /// binding, so the fold replaces it either way.
+    OwnerBound {
+        binding: OwnerBinding,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// ADR-0035 §1: the binding of `repo` ended.
+    OwnerUnbound {
+        repo: String,
     },
     AgentHibernated {
         pane_id: String,
@@ -5014,6 +5217,7 @@ mod tests {
                     node_id: None,
                     clone_detection_warning: None,
                     agent_start_label: true,
+                    agent_questions: true,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -5462,6 +5666,7 @@ mod tests {
             run_id: None,
             turn_cursor: Some("term_1:0:3:9:w".into()),
             resumable: false,
+            questions: None,
             revision: 4,
         }
     }
