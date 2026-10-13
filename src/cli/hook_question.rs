@@ -81,7 +81,7 @@ pub(super) fn run(input: &serde_json::Value, seq: u64) -> i32 {
         "{}",
         claude_output(&verdict(response.as_ref(), hint.as_deref()))
     );
-    0
+    super::exit::SUCCESS
 }
 
 /// The server's verdict, or the §4 table's when it gave none: an error

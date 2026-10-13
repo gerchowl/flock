@@ -218,7 +218,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     if matches!(action, Action::Question) {
         return Ok(match agent {
             Agent::Claude => super::hook_question::run(&input, seq()),
-            _ => 0,
+            _ => super::exit::SUCCESS,
         });
     }
     let hook_event_name = str_field(&input, "hook_event_name").unwrap_or_default();
