@@ -58,6 +58,14 @@ as `expected_node_id` to clear it and invalidate its enrollment. Source defaults
 to `configured`. Reset is refused when invoked from an agent pane or over
 MCP/relay; the operator's shell is the trust boundary.
 
+## Owner policy
+
+`owner.policy.show { "repo": "<path>" }` reports a repo's owner policy (ADR-0035 §6.2, [Owner policy](/configuration/#owner-policy-flktoml)). `repo` is any path inside the repo. The result (`type: "owner_policy"`) carries `repo` (the canonical git common dir, the repo key), `default_branch`, `git_ref` (the ref read), `current` (the `.flk.toml` blob id there, or null), `adopted` (absent until the first adoption, then `{ "policy_version": <blob id or null> }`), `pending` (`current` differs from the adopted version), `policy` (the behaviour keys that apply: the adopted version's, or `{}`), `ignored_keys` (the current version's `[owner]` keys this build does not read) and `current_error` when the current version cannot be parsed. It fails with `owner_policy_unreadable` when the path is not in a git repo or the repo has no default branch.
+
+`owner.policy.adopt { "repo": "<path>", "policy_version": "<blob id>" | null }` makes the current version apply. It answers the same result with `adopted_now` (`false` when that version was already adopted). It is refused with `operator_only` for an agent pane, a mesh relay or an unattested caller, with `owner_policy_changed` when `policy_version` is no longer the current one, and with `owner_policy_unreadable` when the current version is not valid TOML. `adopt` is state-changing for the protocol gate, so a newer CLI refuses it against an older server with exit 78. `operator_only` maps to exit 13 through the error-code registry, for the CLI and for MCP's `data.exit`.
+
+An adoption is the durable event `owner_policy_adopted { repo, policy_version, reissued }`. The latest one per repo applies. Every server start and every log rotation writes each repo's adoption again with `reissued: true`. A server older than 2.0.0 cannot read a log holding it; 2.0.0 and later skip the kind if they do not know it.
+
 ## Choose an integration layer
 
 | Layer | Use it for |
@@ -130,6 +138,7 @@ Raw socket method names use dot notation:
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.restart`, `agent.lineage` |
 | Delegate | `delegate.list` |
 | Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
+| Hook | `hook.decide` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
@@ -160,11 +169,28 @@ Remove a linked checkout:
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
-`agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. The response waits until Enter is queued and reports transport success, not confirmed harness acceptance. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
+`agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Without `submit`, `agent.send`, `pane.send_text` and `pane.send_input` (with `text`) refuse before typing into an agent pane whose composer holds a draft (`input_not_empty`) or that a flock injection holds (`injection_pending`); `"raw": true` types anyway (#1162). A shell pane is never refused. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. The response waits until Enter is queued and reports transport success, not confirmed harness acceptance. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
 
 `agent.fork` branches a pane's agent conversation into a new linked worktree: it resolves `target` with the same grammar as `agent.send`, creates a worktree (optional `branch`, `base`, `path`, `label`), and starts a pane resuming a fork of the session, optionally seeded with a `pivot` prompt (omitted ⇒ the configured template; empty string ⇒ no seed). Only Claude sessions can fork; other agents return `unsupported_for_agent`, panes without a stored session return `no_agent_session`, and a session whose transcript is missing from disk returns `transcript_not_found` (the fork would resume nothing and exit). The `agent_forked` response carries `run_id`, `parent_pane_id`, the new `workspace`/`tab`/`root_pane`/`worktree` records, the spawned `argv`, and `seeded`. Each fork also emits an `agent_forked` event with the fork lineage (parent and child identifiers, repo key, branch, seeded).
 
 When `agent.start`, `agent.spawn` or `agent.fork` succeeds and the caller's process ancestry reaches an agent's pane, the server emits a durable `agent_delegated` event: `architect` (that agent's id, never taken from the request), `delegate`, `via` (`start`, `spawn` or `fork`), `workspace`, and, where the start produced them, `worktree`, `branch`, `repo` and `label`. On every server start, including after a live handoff, each still-open edge is emitted again with `reissued: true`, so log rotation cannot drop it. An edge stays open while its delegate is in the server's agent records, or while a removed delegate's worktree is still on disk. `agent.start` accepts an optional `label` for the edge, sent only to a server whose `ping` capabilities include `agent_start_label: true`, and its `agent_started` response carries `edge`: `architect <agent id>`, or `none (unattested)` when no agent pane is in the caller's ancestry.
+
+`agent.start`, `agent.spawn` and `agent.fork` accept an optional `questions` (`ask_human`, `ask_operator`, `route` or `deny`) and `unattended: true` (ADR-0034 §2). Omitted, the policy is `route` for a caller whose ancestry reaches an agent's pane, `ask_operator` with `unattended`, and `ask_human` otherwise. An agent caller asking for `ask_human` or `ask_operator`, or sending `unattended`, gets `questions_widening_refused` (retry `never`, exit 13) before anything is allocated. The policy is the agent record's `questions` field in `agent.get` and `agent.list` (absent from servers predating it, and from peer and fleet summaries), and the `questions` field of a `delegate.list` row. The child's pane gets `FLOCK_QUESTIONS=<policy>` unless the policy is `ask_human`. Send either field only to a server whose `ping` capabilities include `agent_questions: true`: an older server ignores unknown fields. The MCP tools `flock_agent_start` and `flock_agent_fork` take `questions` (`route` or `deny`) and refuse with `server_version_gap` (exit 78) against a server that does not advertise it, rather than starting the child without the policy.
+
+`hook.decide` is the verdict for one harness hook call (ADR-0034 §1). Params: `point` (`question`), `harness` (`claude`, `codex` or `opencode`), and optional `session_id` and `tool_name`. The pane is the caller's, by process ancestry, never a field of the request, and the verdict comes from the policy on its agent record: `{"type":"hook_decide","verdict":"pass"}` or `{"type":"hook_decide","verdict":"deny","reason":"…"}`. A `question` call for a tool that is neither the harness's question tool (`AskUserQuestion` and `ExitPlanMode` for Claude, `request_user_input` for Codex, `question` for opencode) nor in `[questions] human_tools` passes. Otherwise `ask_human` passes, `deny` is refused with the disabled-questions sentence, and `route` and `ask_operator` are refused with `state the question and options in your final message and end your turn` until routing lands. A caller outside every pane gets `no_caller_pane`. A server that predates the method answers `invalid_request`; the hook then follows the pane's `FLOCK_QUESTIONS` hint, as described under [Claude Code](/integrations/#claude-code).
+
+An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. The `goal.*` methods below change and read the record; the MCP tools follow (#1156).
+
+If a 1.x server did run against such a log, it renamed the active file to `event-log.corrupt.jsonl` in the server's data directory (`~/.config/flock`, or `~/.config/flock/sessions/<name>` for a named session) and started a fresh `event-log.jsonl`, numbering above the events it set aside. A rotated file (`event-log.1.jsonl` to `event-log.4.jsonl`) holding a goal event is not renamed, only skipped by that server. The quarantined file is never rotated, and it holds a full copy of every goal that was open when it was set aside, because the server re-issues each open goal into the active file on start and after every rotation. If the 1.x server rotated the log since, its rotations deleted the oldest rotated files (goal events included) and its fresh file may now be `event-log.1.jsonl` or older. Those events are gone, but the quarantined file still covers the goals.
+
+Version 2.0.0 is not enough to recover them. It only skips goal events: it neither folds nor re-issues them, so goals rotate out while it runs. Recovering needs the first release after 2.0.0 that includes the goal record (#1169, listed in the changelog under #1034):
+
+1. Stop every server that uses the log, and upgrade each to that release or newer.
+2. Copy `event-log.corrupt.jsonl` somewhere safe. A second quarantine would overwrite it.
+3. Put its lines in front of the active file, then remove it: `cat event-log.corrupt.jsonl event-log.jsonl > event-log.merged && mv event-log.merged event-log.jsonl && rm event-log.corrupt.jsonl`. If the quarantined file does not end in a newline, drop its last, partial line first. Do this even if the log rotated, because readers order events by sequence, not by file.
+4. Start the server. It reads every event back, folds the goals and re-issues each open one.
+
+Events the 1.x server wrote in between are kept, ordered after the recovered ones.
 
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
@@ -474,7 +500,17 @@ Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock
 }
 ```
 
-`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, while the newest transcript entry is not assistant text (the Stop hook's "settled" rule); for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet.
+`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, until the transcript records the turn's end, by the rules below; for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet. While a Claude turn is still going by that rule, the result carries `turn_open_at_ms`, when its prompt was written, and so does a `no_result` refusal as `data.turn_open_at_ms`: a supervisor can tell "this turn is still running" from "nothing was written" without trusting a screen that may read idle mid-turn. It is absent when the turn is over, when the prompt lies outside the 1 MiB read, or when its entry carries no time; older servers never send it.
+
+A Claude turn is over, read from the transcript Claude Code writes (2.1.28x–2.1.29x), when any of these holds:
+
+- a `turn_duration` entry follows the newest prompt: the ordinary end of a model turn, Stop-hook continuations included;
+- the newest message is Claude's own `No response requested.`, which closes a resumed session (after its hidden `Continue from where you left off.`) and some local commands, with no `turn_duration`;
+- the newest prompt is the `[Request interrupted by user…]` notice, which Claude writes instead of `turn_duration` after an interrupt;
+- the newest prompt is an entry the harness wrote (a local slash command or its output, such as `/compact`, `/model` or `/exit`; a `!` shell command or its output; a `<task-notification>`), and no assistant entry follows it. A local command never runs the model. A notification, or a custom slash command, that the model then answers reopens the turn with the model's first entry;
+- a compaction summary is the newest entry after the newest prompt.
+
+The last two are ambiguous for a notification or a command the model is about to answer, and for an automatic compaction inside a turn. They are read as over, because reading them as running would hold open a turn that may never run. Otherwise, in a transcript that holds any `turn_duration` entry, the turn is still running, even when the newest entry is assistant text: Claude writes a narration between two tool calls as text too. In a transcript without one (a one-shot session, or a first turn not yet over), the turn is over when the newest entry is assistant text.
 
 ## Reading a handed-over file
 
@@ -568,6 +604,149 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 
 Use `events.wait` when you want one matching event and then a response.
 
+### Supervisor events
+
+The server derives four durable kinds from each local agent's `state` (the one `agent.get` reports), so a supervisor reads facts instead of re-deriving them from `pane_agent_status_changed` (ADR-0028 §2):
+
+| Kind | Emitted when |
+| --- | --- |
+| `agent.phase_changed` | the agent's `phase` settled into a different supervisor phase |
+| `agent.needs_human` | that phase is `needs_human` |
+| `agent.limit_reached` | that phase is `limit_reached` |
+| `agent.gone` | no pane carries the agent any more, a pane this server read as an agent stopped being one (it left `agent.list`), or, after a restart, an agent's restored pane is still a plain shell once the settle window has passed |
+
+All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent.needs_human`, `agent.limit_reached` and `agent.gone` repeat the `agent.phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent.phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
+
+A phase is announced only once it has held for the server's settle window: 20 s, a fixed server constant that is not configurable yet (`[events] settle_ms` is [#1152](https://github.com/gerchowl/flock/issues/1152)). A prompt answered or a turn that ends within the window emits nothing. The window is applied once. `finished`, `finished_with_background` and `waiting_on_event` already include it, because the idle turn must hold that long before `phase` reads them, so moving into one of them from a working, prompt or limit phase is announced as soon as the server sees it. A move between two of them, such as a background shell or a registered wait coming and going, must hold for the window itself. `settling` and `unknown` are never announced. `gone` is announced at once.
+
+The server does not poll for these. It re-reads an agent's `state` when the detector or a hook reports a change on its pane or a pane lifecycle event fires, and otherwise only when a pending phase's window closes. Codex and opencode count background jobs from the process tree, which raises no event, so a job ending while nothing else on the pane changes is seen at the pane's next change ([#1163](https://github.com/gerchowl/flock/issues/1163)).
+
+`from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. Its pane is judged once the settle window has passed since the restore: if the pane is a plain shell by then (the server spawned it with the default shell, and that shell holds the terminal's foreground with nothing running in front of it), the agent's process did not survive the restart, and it is announced `gone` once. That is a hand-launched agent after a cold restart, whose pane comes back as a shell under the same id. A pane that cannot be judged keeps the logged phase: one adopted over a live handoff (its agent kept running), one without a live child, or one running another command in front of its shell, which is judged again the next time the server reads its agents. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
+
+### Open questions
+
+When an agent's screen shows a harness choice dialog, its `state` says what the dialog asks (ADR-0028 §8a). `attention` reads `{"needs_human": {"reason": "question", "question": {…}}}`:
+
+```json
+{
+  "question_id": "q_1f1bfdbef4278496",
+  "source": "screen",
+  "harness": "claude",
+  "state": "open",
+  "header": "Colour",
+  "prompt": "Which colour should the probe use?",
+  "options": [
+    {"id": "1", "label": "Red", "description": "A red probe"},
+    {"id": "2", "label": "Blue", "description": "A blue probe"}
+  ],
+  "multi_select": false,
+  "allow_other": true
+}
+```
+
+- `harness` is `claude` (Claude Code's `AskUserQuestion` form) or `codex` (`request_user_input`). opencode is not read yet ([#1243](https://github.com/gerchowl/flock/issues/1243)).
+- An option's `id` is the number the dialog shows beside it. `description` is left out when the dialog shows none. Wrapped lines are joined with one space.
+- `allow_other` means the dialog accepts free text: Claude's "Type something", or Codex's "None of the above". That entry is not listed as an option, and neither is Claude's "Chat about this".
+- `state` is `open` while the question waits, and `withdrawn` on the `agent.question_closed` that ends it. `expired` is for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)). `answered` comes with `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)); a build without it reads that state as `unknown`.
+- `header` is the form's tag. It is read only when the form has one question tab, because the screen marks the current tab by styling alone.
+- `question_id` is derived from the agent, the pane's `turn_cursor` and the event log's sequence when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. Every new open gets an id that was never used before, whether it is a different question, a tab revisited, or the same question asked again, including after a restart or a live handoff. The log sequence is durable and only grows, so an id that was ever closed is never opened again.
+- A frame whose form cannot be read, such as a torn read, an overlay or a form's review page, keeps the open question. Only a screen that no longer asks a question closes it. A prompt whose form never reads still reads `needs_human{reason: "question"}`, just without `question`.
+- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab opens that question again under a new id.
+
+Two durable kinds follow the same reads. Unlike the phase kinds, they are emitted at once, with no settle window:
+
+| Kind | Carries | Emitted when |
+| --- | --- | --- |
+| `agent.question_opened` | `agent_id`, `pane`, `question_id`, `question` | a read shows a `question_id` the previous read did not |
+| `agent.question_closed` | `agent_id`, `pane`, `question_id`, `reason`, `question` (its `state` `withdrawn`) | that question left the screen, was replaced by the next one, or its agent went |
+
+`question_id` is a top-level field of both, so `"subjects": ["<question id>"]` matches the pair. On a screen, `reason` is always `withdrawn`. An answer typed at the pane also closes the question as `withdrawn`, because on screen it cannot be told apart from a cancel. Answered questions are reported by `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)) and by the harness hook ([#1194](https://github.com/gerchowl/flock/issues/1194)). Moving to the next tab of a form closes the previous tab's question the same way. `expired` is reserved for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)).
+
+A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then, once, as `withdrawn`. A server older than these kinds skips them in its log.
+
+## Channel adapters
+
+An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
+
+**Start-up.** Before an adapter touches its chat, it calls `channel.hello` and starts only when that succeeds:
+
+```json
+{"id":"a1","method":"channel.hello","params":{"binding":"phone","token":"<contents of phone.token>"}}
+```
+
+```json
+{"id":"a1","result":{"type":"channel_hello","binding":"phone","owner_node":"atlas","target":"agent:agent_atlas_1","scopes":["notify","reply"]}}
+```
+
+`flk adapter hello <binding> [--token-file PATH]` does the same from a shell. It reads the token from the binding's token file unless `--token-file` names another one, prints the reply, and returns the exit codes below. An adapter that shells out to it gets the version check for free.
+
+**Version check.** `channel.hello` is new in protocol 29 and counts as state-changing for the skew gate (#868). `flk adapter hello` sends `ping` first, and against an older server exits 78 with `server_version_gap` without sending the hello. An adapter that speaks the socket directly must do the same: send `ping`, and refuse to start unless `protocol` is 29 or higher. An older server answers `channel.hello` itself with `invalid_request` ("unknown variant"), which an adapter must also treat as "this server has no channel support".
+
+**Failure modes.** Each one is a refusal from the [error-code registry](#response-shapes), and the adapter must not start:
+
+| Code | Exit | Meaning | Fix |
+| --- | --- | --- | --- |
+| `channel_unauthorized` | 1 | No binding by that name on this server, or the token does not match the issued one. These two cases share one answer. A token file that is not trusted (see [Channel bindings](/configuration/#channel-bindings)) matches nothing. | Use the binding's current token file. After a rotation, the old token is refused. |
+| `channel_not_owner` | 1 | The binding exists, but its `owner_node` is a different node. | Run the adapter on the owner node, or move the binding by changing `owner_node`. |
+| `channel_token_unavailable` | 1 | The token file could not be read for a reason other than trust (too many open files, an I/O error). The file is left untouched. | Retry once the reported condition clears. |
+| `server_version_gap` | 78 | The server is older than protocol 29. | Hand the server off with `flk server live-handoff`, or restart it. |
+
+`channel_not_owner` is answered before the token is checked, so anyone who can reach the socket can learn which binding names exist on a node and which node owns each one. Tokens can't be learned this way. Socket access is already the trust boundary: the socket is private to the user running the server.
+
+`channel_unauthorized` and `channel_not_owner` are in the `never` retry class: sending the same hello again can't succeed until the config or the token changes. `channel_token_unavailable` is in the `later` class: nothing changed, so retry once the condition clears. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`, `token_unavailable`). The token itself never appears in a log, an event or a response.
+
+**Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
+
+## Owner bindings
+
+A repo's resident owner (ADR-0035 §1) is a **binding**, not a session: server state on its home node, keyed by the repo's GitHub slug. Four methods, new in protocol 30:
+
+```json
+{"id":"o1","method":"owner.bind","params":{"repo":"example/widgets","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"]}}
+```
+
+```json
+{"id":"o1","result":{"type":"owner_bound","rebound":false,"binding":{"repo":"example/widgets","node":"atlas","agent_id":"agent_atlas_1","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"],"since_ms":1760000000000}}}
+```
+
+- `owner.bind` records the binding. `node` is the serving node and `agent_id` is minted by the server; neither is a parameter. `harness` is `claude`, `codex` or `opencode`. `checkout` must be an absolute path to a git checkout on the node, and `repo` must be `owner/name`; otherwise the answer is `invalid_params`. Binding a bound repo again replaces `checkout`, `harness`, `model` and `profiles`, keeps `agent_id` and `since_ms`, and answers `rebound: true`.
+- `owner.unbind` (`{"repo"}`) ends the binding and answers `owner_unbound` with the binding that ended.
+- `owner.list` answers `owner_list` with `bindings`, ordered by repo. `owner.show` (`{"repo"}`) answers `owner_show` with `binding`. Both are reads, and `owner.show` is the MCP tool `flock_owner_show`.
+
+`owner.bind` and `owner.unbind` are operator verbs: an owner holds merge and teardown authority over its delegates, so no agent may appoint itself (the ADR-0014 boundary). They are refused with `operator_only` when the caller is agent-attested, which today means its process ancestry reaches an agent's pane or the request was relayed from a mesh peer, and also when the server could not read the caller's pid. This is **cooperative only** until agents run as their own Unix user and the server attests by uid (ADR-0035 §6.3 points 1 and 6, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator. Both count as state-changing for the skew gate (#868). `owner.unbind` and `owner.show` answer `not_found` for a repo with no binding. Through `flk owner` (see the [CLI reference](/cli-reference/)), `operator_only` exits 13 and `not_found` exits 4. Repo slugs are case-insensitive, as on GitHub: the server records and looks them up in lowercase, so `Example/Widgets` and `example/widgets` are one binding.
+
+The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`) and `owner_unbound` (`repo`). The server folds them once per start, in the same log read as delegation edges and goals, and emits every binding again as `owner_bound` with `reissued: true` on every start and after every log rotation, so an owner that stays quiet cannot rotate out. A server older than 2.0.0 quarantines a log that holds these kinds; servers from 2.0.0 skip them.
+
+**Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo (#1234, after owner addresses resolve over the mesh, #1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
+
+## Goals
+
+Five methods, new in protocol 30, arm, read, pause, resume and stop an agent's goal (ADR-0030 §1). Each takes `target`: `self` (also when empty or absent) is the agent whose pane runs the caller, an `agent_id` that has a goal names it even after its pane is gone, and anything else resolves as an agent target does (name, terminal id, pane id). Every answer is `{"type":"goal","agent_id","goal"}`, with `goal` the record as the `goal_*` events above fold it.
+
+```json
+{"id":"g1","method":"goal.arm","params":{"target":"self","goal":"ship the parser","checks":["just check"]}}
+```
+
+```json
+{"id":"g1","result":{"type":"goal","agent_id":"agent_atlas_1","goal":{"goal":"ship the parser","checks":["just check"],"met":false}}}
+```
+
+- `goal.arm` (`target`, `goal`, optional `checks`) records `goal_armed` with a fresh record. The goal text is trimmed. A blank goal or check is `invalid_params`; an agent whose goal is armed and not met is `goal_already_armed` (stop it first). Arming over a met goal starts a new one.
+- `goal.status` (`target`) answers the record, met or open. It is a read.
+- `goal.pause` (`target`, optional `minutes`) records `goal_paused`. With `minutes` the server sets `until_ms` to its own clock plus that many minutes; without it the goal stays paused until resumed. `minutes: 0` is `invalid_params`. Pausing a paused goal records the new pause.
+- `goal.resume` (`target`) records `goal_resumed`; a goal that is not paused is `goal_not_paused`.
+- `goal.stop` (`target`, optional `reason`) records `goal_disarmed` with the reason, drops the record, met or open, and answers it as it was.
+
+An agent with no goal is `goal_not_armed`, and so is a met goal for `pause` and `resume`. `self` from a caller in no agent pane is `no_caller_pane`.
+
+**Who may call** (ADR-0030 §1, amendment of 2026-10-13). `goal.status` is open to every caller. The goal's own agent may `goal.arm` its goal but may not pause, resume or stop it, so it cannot walk out of the done gate. The operator and the agent's supervisor may do all four. The supervisor is the architect on the agent's `AgentDelegated` edge, matched by restart-stable `agent_id`, so it keeps that right across a server restart. Anyone else is refused with `goal_caller_refused` (retry `never`, exit 13 `POLICY_REFUSED`, the class `operator_only` has), and so is a caller the server cannot attest (it could not read the caller's pid, or the request was relayed from a mesh peer; goals are per host and peers relay none of it). Like `owner.bind`, the agent check reads process ancestry and is cooperative only until uid attestation (O19a, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator, so `setsid flk goal stop` lets an agent out of its own goal. `goal_caller_refused` exits 13 from the CLI, every other refusal exits 1, and none writes anything.
+
+**Skew (#868).** `goal.arm`, `goal.pause`, `goal.resume` and `goal.stop` are state-changing: a CLI refuses them locally with `server_version_gap` and exit 78 against an older server, before sending. `goal.status` reaches an older server, and its unknown-method answer is turned into the same exit 78.
+
+A timed pause is over once its `until_ms` passes: every `goal` answer leaves an expired `paused` out of the record it shows, and `goal.resume` answers `goal_not_paused`, the reading the stop ladder will take. The `goal_paused` event stays in the log.
+
+**Known limits of this release.** Nothing reads the record to decide a stop yet (the ladder, #1157).
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.
@@ -614,6 +793,58 @@ when nobody is watching the pane. `--status done` matches exactly `done`. The
 [Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
+
+### Registered waits
+
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses. There are two ways to open one:
+
+- **A held `events.read`.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`.
+- **`wait.park`.** Opens a wait on a predicate and returns at once, so the agent can end its turn.
+
+```json
+{"id":"p1","method":"wait.park","params":{"until":"delegate:agent_atlas_7 phase in [finished, needs_human, gone]","deadline_ms":1800000}}
+```
+
+```json
+{"id":"p1","result":{"type":"wait_parked","wait_id":"w_1760342400000_1","agent_id":"agent_atlas_3","predicate":"delegate:agent_atlas_7 phase in [gone, needs_human, finished]","deadline":1760344200000}}
+```
+
+`until` is a predicate text, parsed and validated by the server. This release supports:
+
+| Predicate | Waits for |
+| --- | --- |
+| `delegate:<agent id> phase in [<phase>, ...]` | a local agent's `phase` (ADR-0028 §1 vocabulary, except `unknown`) reaching one of the listed phases |
+| `reply:<correlation id>` | the answer to a message you sent |
+
+The reply echoes the predicate in its **canonical form**: phases deduplicated and listed in the phase table's order, single spaces. `deadline_ms` is mandatory and relative, at most 86 400 000 (24 h, the longest reply wait). An agent holds at most 16 open parks; held reads do not count.
+
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical form:
+
+```json
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "delegate:agent_atlas_7 phase in [gone, needs_human, finished]", "since": 1760342400000, "deadline": 1760344200000}}
+```
+
+A held read reports its filter as `events after <seq> [kinds <k>,...] [subjects <id>,...]`. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
+
+**How a park ends.** In this release a park closes only at its deadline: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }` (`since` and `deadline` in Unix ms). Opening a park when its predicate becomes true, and waking the agent, is #1032. A held read closes when it returns, so it expires only if that close never reached the server.
+
+**Failure modes.** Each refusal leaves nothing parked:
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `wait_predicate_invalid` | 2 | `until` is not a predicate of the grammar above: an unknown form (including a held read's `events ...` text), a phase outside the vocabulary or `unknown`, tokens not separated by whitespace (`phasein[...]`), anything but one pair of brackets (`[[finished]]`), an empty list or item, or a bad id. |
+| `wait_predicate_unsupported` | 2 | A predicate ADR-0028 names that this release cannot register: `pr:<n> ci_completed` and `any-delegate-of-mine changed` (#1250). |
+| `wait_deadline_too_long` | 2 | `deadline_ms` is over 24 h. Park again when it expires. |
+| `invalid_params` | 1 | `deadline_ms` is 0 or missing. |
+| `too_many_waits` | 10 | The agent already holds 16 open parks. Retry after one expires. |
+| `peer_incompatible` | 1 | The delegate runs on another host. This server cannot observe it (ADR-0028 §3a); park on that host. |
+| `agent_not_found` | 1 | No agent or delegation edge on this server has that id. |
+| `no_caller_pane` | 1 | The caller runs in no agent pane, so there is no agent to put the wait on. |
+| `server_version_gap` | 78 | The server speaks an older protocol than the client (for `wait.park`, below 30, so a v29 server too): `flk wait park` refuses before sending (#868). |
+
+A held read from outside an agent pane is served as before and records no wait.
+
+**Known limits.** `pr:<n> ci_completed` and `any-delegate-of-mine changed` are refused until #1250. A park ends at its deadline only, until #1032. Open parks are held in memory, so a server restart or live handoff drops them (#1240). A wait whose agent left stays until its deadline.
 
 ## The turn cursor
 
