@@ -108,6 +108,8 @@ The hook reports Claude Code session identity to the local Flock socket on sessi
 
 Flock uses `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set. The Claude config directory must already exist. Install writes `hooks/flock-agent-state.sh` and updates `settings.json` with Flock hook entries. Uninstall removes the matching hook entries and deletes the hook script.
 
+Install and uninstall replace both files atomically, and refuse when `settings.json` or `hooks/flock-agent-state.sh` is a symlink, for example into a read-only Home Manager store. The error names the path, and the link is left untouched. Merge the fragment from `flk integration manifest claude` into the file's source instead.
+
 ### Delegate questions
 
 Install also adds a `PreToolUse` entry on Claude's question tools, `AskUserQuestion|ExitPlanMode` plus any `[questions] human_tools` (ADR-0034 §3). No other tool call starts a process. The entry asks the server for a verdict with `hook.decide`, and the server answers from the policy on the agent's record:

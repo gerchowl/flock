@@ -1360,6 +1360,23 @@ fn claude_settings_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Refuse a file flk would rewrite when it is a symlink. A Home Manager or
+/// other declarative profile links `settings.json` and the hook stub into a
+/// read-only store: writing through fails, and replacing the link (as an
+/// atomic rename would) breaks the next switch. Either way the file belongs to
+/// its owner, who merges `flk integration manifest claude` instead.
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(io::Error::other(format!(
+            "{} is a symlink, so it is managed elsewhere (for example by Home Manager); \
+             flk leaves it untouched. Merge the fragment from \
+             `flk integration manifest claude` into its source instead",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<ClaudeInstallPaths> {
     let _settings = claude_settings_lock();
     let dir = claude_dir()?;
@@ -1370,10 +1387,12 @@ pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<Claude
         )));
     }
 
+    // Refused before anything is created or written.
+    let hook_path = effective_claude_hook_path(&dir);
+    refuse_symlink(&hook_path)?;
+    refuse_symlink(&dir.join("settings.json"))?;
     let hooks_dir = dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
-
-    let hook_path = effective_claude_hook_path(&dir);
     // Atomic, so a Claude session running the stub never reads half of it.
     atomic_write::replace(&hook_path, CLAUDE_HOOK_ASSET.as_bytes())?;
     make_executable(&hook_path)?;
@@ -2025,6 +2044,8 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
     let _settings = claude_settings_lock();
     let hook_path = claude_dir()?.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
     let settings_path = claude_dir()?.join("settings.json");
+    refuse_symlink(&hook_path)?;
+    refuse_symlink(&settings_path)?;
     let mut updated_settings = false;
 
     if settings_path.is_file() {
@@ -4330,16 +4351,18 @@ mod tests {
         assert_eq!(at_least(""), None);
     }
 
-    /// #1180: the server installs on worker threads, so installs overlap.
-    /// Each must see a whole file, and the result must keep the user's own
-    /// hook and hold exactly one flk question entry. A reader polling the
-    /// file meanwhile must never see it half-written.
+    /// #1180: the server installs on worker threads, so an install can race
+    /// an uninstall. Each spans two files (the stub and settings.json), so
+    /// without the lock one's write lands between the other's, leaving the
+    /// #143 half-state: a registration whose stub is gone, or a stub nothing
+    /// registers. With it, every round ends wholly installed or wholly not,
+    /// and the user's own hook survives.
     #[test]
-    fn concurrent_installs_leave_one_valid_settings_file() {
+    fn an_install_racing_an_uninstall_never_leaves_a_half_state() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let claude_dir = base.join("claude");
-        fs::create_dir_all(&claude_dir).unwrap();
+        fs::create_dir_all(claude_dir.join("hooks")).unwrap();
         let settings_path = claude_dir.join("settings.json");
         fs::write(
             &settings_path,
@@ -4347,70 +4370,90 @@ mod tests {
         )
         .unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let stub = claude_dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+        let question = ClaudeQuestionHook::default();
 
-        let done = std::sync::atomic::AtomicBool::new(false);
-        let torn = std::thread::scope(|scope| {
-            let reader = scope.spawn(|| {
-                let mut torn = Vec::new();
-                while !done.load(std::sync::atomic::Ordering::Acquire) {
-                    if let Ok(raw) = fs::read_to_string(&settings_path) {
-                        if serde_json::from_str::<Value>(&raw).is_err() {
-                            torn.push(raw);
-                        }
-                    }
-                }
-                torn
+        let mut half_states = Vec::new();
+        for round in 0..300 {
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let install = scope.spawn(|| {
+                    start.wait();
+                    install_claude(&question).map(|_| ())
+                });
+                let uninstall = scope.spawn(|| {
+                    start.wait();
+                    uninstall_claude().map(|_| ())
+                });
+                install.join().expect("install").expect("install succeeds");
+                uninstall
+                    .join()
+                    .expect("uninstall")
+                    .expect("uninstall succeeds");
             });
-            let installers: Vec<_> = (0..4)
-                .map(|n| {
-                    scope.spawn(move || {
-                        let question = ClaudeQuestionHook {
-                            human_tools: vec![format!("mcp__t{n}__ask")],
-                            on_failure_block: n % 2 == 0,
-                        };
-                        for _ in 0..50 {
-                            install_claude(&question).expect("an overlapping install");
-                        }
-                    })
-                })
-                .collect();
-            // Joined before any verdict, so a failed install stops the
-            // reader instead of leaving it spinning.
-            let installs: Vec<_> = installers.into_iter().map(|i| i.join()).collect();
-            done.store(true, std::sync::atomic::Ordering::Release);
-            (reader.join().expect("reader"), installs)
-        });
-        let (torn, installs) = torn;
+            let raw = fs::read_to_string(&settings_path).unwrap();
+            let registered = raw.contains(" question\"");
+            assert!(
+                raw.contains("echo mine"),
+                "round {round} lost the user's hook"
+            );
+            if registered != stub.exists() {
+                half_states.push((round, registered));
+            }
+        }
+
         assert!(
-            installs.iter().all(Result::is_ok),
-            "an overlapping install failed"
+            half_states.is_empty(),
+            "(round, registered) where the stub disagreed: {half_states:?}"
         );
-        assert!(
-            torn.is_empty(),
-            "a reader saw a half-written file: {torn:?}"
-        );
-        let settings: Value =
-            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        let commands: Vec<&str> = settings["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|entry| entry["hooks"].as_array().unwrap())
-            .filter_map(|hook| hook["command"].as_str())
-            .collect();
-        assert_eq!(commands.iter().filter(|c| **c == "echo mine").count(), 1);
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A Home Manager profile links settings.json and the stub into a
+    /// read-only store. Install and uninstall both refuse, naming the path
+    /// and the manifest, and leave the link exactly as it was.
+    #[test]
+    fn a_symlinked_settings_file_or_stub_is_refused_and_left_alone() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        let store = base.join("store");
+        fs::create_dir_all(claude_dir.join("hooks")).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let managed_settings = store.join("settings.json");
+        let managed_stub = store.join(CLAUDE_HOOK_INSTALL_NAME);
+        fs::write(&managed_settings, r#"{"hooks":{}}"#).unwrap();
+        fs::write(&managed_stub, "#!/bin/sh\n").unwrap();
+        let settings = claude_dir.join("settings.json");
+        let stub = claude_dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+
+        for (link, target) in [(&settings, &managed_settings), (&stub, &managed_stub)] {
+            std::os::unix::fs::symlink(target, link).unwrap();
+            let refusals = [
+                install_claude(&ClaudeQuestionHook::default())
+                    .map(|_| ())
+                    .unwrap_err(),
+                uninstall_claude().map(|_| ()).unwrap_err(),
+            ];
+            for refusal in refusals {
+                let message = refusal.to_string();
+                assert!(message.contains(&link.display().to_string()), "{message}");
+                assert!(
+                    message.contains("flk integration manifest claude"),
+                    "{message}"
+                );
+            }
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+            assert_eq!(&fs::read_link(link).unwrap(), target);
+            fs::remove_file(link).unwrap();
+        }
         assert_eq!(
-            commands.iter().filter(|c| c.ends_with(" question")).count(),
-            1,
-            "{commands:?}"
+            fs::read_to_string(&managed_settings).unwrap(),
+            r#"{"hooks":{}}"#
         );
-        assert!(fs::read_dir(&claude_dir)
-            .unwrap()
-            .flatten()
-            .all(|entry| !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".flock-write-")));
+        assert_eq!(fs::read_to_string(&managed_stub).unwrap(), "#!/bin/sh\n");
 
         clear_integration_path_env();
         let _ = fs::remove_dir_all(base);
