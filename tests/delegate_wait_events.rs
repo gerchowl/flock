@@ -272,6 +272,7 @@ fn start_server_with(slow_startup: bool, extra_config: &str) -> Server {
     )
     .unwrap();
     write_fake_opencode(&base);
+    support::write_fake_gh(&bin_dir(&base));
     create_db(&base);
     spawn_server(base)
 }
