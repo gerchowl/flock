@@ -698,6 +698,7 @@ fn run_wait_command(args: &[String]) -> std::io::Result<i32> {
         "output" => wait_output(&args[1..]),
         "agent-status" => wait_agent_status(&args[1..]),
         "reply" => msg::wait_reply(&args[1..]),
+        "park" => events::park(&args[1..]),
         "help" | "--help" | "-h" => {
             print_wait_help();
             Ok(0)
@@ -1418,6 +1419,13 @@ fn print_wait_help() {
     eprintln!(
         "    waits for the answer to a message you sent (msg send --intent needs-reply): \
          prints its body; exit 0 replied, 3 deferred or expired, 124 timed out"
+    );
+    eprintln!("  {}", events::PARK_USAGE);
+    eprintln!(
+        "    parks this agent on a registered wait and returns at once, so it can end \
+         its turn; the wait shows as `waiting_on_event` until the deadline (at most 24h). \
+         PREDICATE: 'delegate:<id> phase in [finished, needs_human, gone]' or \
+         'reply:<correlation_id>'; exit 2 for a bad or unsupported predicate"
     );
 }
 
