@@ -95,31 +95,6 @@ The flake also exposes a development shell:
 nix develop github:gerchowl/flock
 ```
 
-The devShell wraps sccache so its daemon uses `$HOME/.cache/sccache/tmp` and
-`$HOME/.cache/sccache/flock.sock`, shared across worktrees for the same user.
-The artifact cache is `$HOME/.cache/sccache`. This implements the stable-directory
-and isolated-server design accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
-[sccache 0.15 supports a Unix socket or explicit port](https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage),
-while [`SCCACHE_DIR` only selects artifact storage](https://github.com/mozilla/sccache/blob/v0.15.0/docs/Configuration.md#disk-local).
-It has no server-only temporary-directory setting, so the wrapper sets `TMPDIR`
-for each sccache invocation, including compiler subprocesses. Other devShell
-commands retain their own `TMPDIR`. A persistent directory avoids scratch-directory
-cleanup breaking later builds, at the cost of keeping daemon temporary files in
-the cache tree. The separate socket avoids reusing a daemon already started on
-the default port 4226 with a disposable directory.
-
-Set `SCCACHE_DIR` to override the cache root and its `tmp` subdirectory. Explicit
-`SCCACHE_SERVER_UDS` or `SCCACHE_SERVER_PORT` overrides the default socket, so you
-must ensure that endpoint's daemon was also started through the wrapper. Keep
-these paths absolute, persistent, and writable. Unix socket path limits apply (roughly 104
-bytes on macOS), so use a shorter persistent cache root or an explicit private
-port for a long home path. Existing platform-default artifact caches are not
-moved automatically, so the first build may repopulate the new root. Failure to create the temp directory prints its path
-and fails the build. Do not delete the cache tree while its daemon is running.
-`RUSTC_WRAPPER=""` still disables Rust caching, and custom wrappers remain intact.
-Run `nix develop --command just test-sccache` to check deleted startup directories,
-server restarts, and rebuild cache hits using isolated servers.
-
 Update through the same Nix workflow you used to install Flock. For a profile install, list your profile entries and upgrade the Flock entry:
 
 ```bash

@@ -81,6 +81,7 @@
                   (stableSccacheFor pkgs)
                 ];
                 RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_RAW = "${pkgs.sccache}/bin/sccache";
               }
               ''
                 python3 ${./scripts/probe_sccache.py}
@@ -153,13 +154,15 @@
               ruby
               zig_0_15
             ];
-            # Keep guardrails' shared artifact cache, but give the daemon a
+            # Leave sccache's platform artifact cache unchanged and give the daemon a
             # persistent TMPDIR and its own socket (#1325). A wrapper covers
             # lazy startup and idle restarts without changing the shell TMPDIR.
             # SCCACHE_DIR alone only controls artifacts, not temporary files.
             # sccache 0.15 endpoint contract: https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage
             hook = ''
               export PATH="${stableSccache}/bin:$PATH"
+              # The isolated cache-reuse probe also needs the unwrapped binary.
+              export FLOCK_TEST_SCCACHE_RAW="${pkgs.sccache}/bin/sccache"
               case "$RUSTC_WRAPPER" in
                 sccache|*/sccache)
                   export RUSTC_WRAPPER="${stableSccache}/bin/sccache"
