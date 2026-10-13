@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /fixture/questions-1038/repo
+
+
+❯ Call the AskUserQuestion tool exactly once with TWO questions. Question 1:
+  question "Which colour should the probe use?", header "Colour", multiSelect
+  false, options Red (description "A red probe") and Blue (description "A blue
+  probe"). Question 2: question "Which size should the probe have? Pick the one
+  that fits the narrow pane best, considering the wrapping of long text in a
+  small terminal", header "Size", multiSelect false, options Small (description
+  "A small probe that fits in any pane, even a very narrow one with long
+  descriptions that wrap") and Large (description "A large probe"). Do nothing
+  else.
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Colour  ☐ Size  ✔ Submit  →
+
+│ Which size should the probe have? Pick the one that fits the narrow pane best,
+│ considering the wrapping of long text in a small terminal
+
+❯ 1. Small
+     A small probe that fits in any pane, even a very narrow one with long
+     descriptions that wrap
+  2. Large
+     A large probe
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -58,6 +58,7 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
         };
     }
 
@@ -82,6 +83,13 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             _ => None,
         })
         .flatten();
+    let question = (needs_human == Some(crate::api::agent_state::HumanReason::Question))
+        .then(|| match agent {
+            Agent::Claude => claude_code::question(screen_content),
+            Agent::Codex => codex::question(screen_content),
+            _ => None,
+        })
+        .flatten();
     let activity = if agent == Agent::Claude && state == AgentState::Working {
         claude_code::live_activity_text(screen_content)
     } else {
@@ -103,6 +111,7 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
             .then(|| claude_code::background_task_count(screen_content))
             .flatten(),
         needs_human,
+        question,
     }
 }
 

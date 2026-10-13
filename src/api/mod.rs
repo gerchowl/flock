@@ -4,6 +4,7 @@ pub(crate) mod compatibility;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub mod question;
 mod reply_wait;
 pub mod schema;
 mod server;
