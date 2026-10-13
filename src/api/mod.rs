@@ -11,6 +11,7 @@ mod server;
 mod status;
 mod subscriptions;
 mod wait;
+pub mod wait_predicate;
 
 pub use event_hub::EventHub;
 pub(crate) use reply_wait::{best_answer, Answer};

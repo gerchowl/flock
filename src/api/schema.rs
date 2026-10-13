@@ -227,6 +227,14 @@ pub enum Method {
     EventsRead(EventsReadParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
+    /// In-process only: a held `events.read` registers its blocking wait
+    /// against the attested caller. Never on the wire, so no client can open
+    /// or close a wait it does not hold.
+    #[serde(skip)]
+    WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
+    /// In-process only: the held `events.read` returned.
+    #[serde(skip)]
+    WaitRelease(String),
     /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
     #[serde(rename = "owner.bind")]
     OwnerBind(OwnerBindParams),
@@ -397,7 +405,9 @@ impl Method {
             | Self::PaneWaitForOutput(_)
             | Self::ChecksList(_)
             | Self::DigestRender(_)
-            | Self::FleetStatus(_) => false,
+            | Self::FleetStatus(_)
+            | Self::WaitHold(..)
+            | Self::WaitRelease(_) => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)
@@ -2524,6 +2534,10 @@ pub enum EventKind {
     PrMerged,
     #[serde(rename = "pr.closed")]
     PrClosed,
+    /// ADR-0028 §5 (#1031): a registered wait reached its deadline while
+    /// still open. Emitted once, and the wait is gone.
+    #[serde(rename = "wait.expired")]
+    WaitExpired,
     /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
     /// See `EventData::OwnerPolicyAdopted`.
     OwnerPolicyAdopted,
@@ -2600,6 +2614,7 @@ impl EventKind {
             | Self::PrCiCompleted
             | Self::PrMerged
             | Self::PrClosed
+            | Self::WaitExpired
             | Self::OwnerPolicyAdopted => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
@@ -3030,6 +3045,11 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// is no agent and nothing was recorded.
+    WaitHeld {
+        wait_id: Option<String>,
     },
     /// `owner.bind`: the binding as recorded. `rebound` is true when the
     /// repo was already bound and kept its `agent_id`.
@@ -4420,6 +4440,16 @@ pub enum EventData {
         pr: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
+    },
+    /// #1031: `predicate` in its canonical form, `since` and `deadline` in
+    /// Unix ms.
+    #[serde(rename = "wait.expired")]
+    WaitExpired {
+        wait_id: String,
+        agent_id: String,
+        predicate: String,
+        since: u64,
+        deadline: u64,
     },
     /// ADR-0035 §6.2 (#1195): from now on `repo`'s owner runs on
     /// `policy_version`, the `.flk.toml` blob id on its default branch (null:

@@ -763,6 +763,24 @@ when nobody is watching the pane. `--status done` matches exactly `done`. The
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
 
+### Registered waits
+
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses.
+
+**A held `events.read` is a wait.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`. A held read from outside an agent pane is served as before and records no wait.
+
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical text. A held read's predicate is its filter, `events after <seq> [kinds <k>,...] [subjects <id>,...]`:
+
+```json
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "events after 412 kinds pr.ci_completed subjects agent_atlas_7", "since": 1760342400000, "deadline": 1760342950000}}
+```
+
+`since` and `deadline` are Unix ms. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
+
+A held read's wait closes when the read returns. If that close never reaches the server (the connection's thread died), the wait expires 10 s after its hold: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }`.
+
+**Known limits.** The registry is held in memory, so a server restart or live handoff drops open waits (#1240). A wait whose agent left stays until its deadline.
+
 ## The turn cursor
 
 Local `pane_info` and `agent_info` records carry a `turn_cursor`:

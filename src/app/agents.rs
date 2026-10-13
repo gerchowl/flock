@@ -1239,6 +1239,7 @@ impl App {
                 terminal.needs_human,
                 terminal.question.as_ref(),
             ),
+            self.waits.waiting(&terminal.agent_id.to_string()),
         );
         Some((terminal.agent_id.to_string(), state))
     }

@@ -1497,6 +1497,10 @@ impl App {
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
+            Method::WaitHold(predicate, hold_ms) => {
+                return self.handle_wait_hold(request.id, predicate, hold_ms)
+            }
+            Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
             Method::OwnerBind(params) => return self.handle_owner_bind(request.id, params),
             Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
             Method::OwnerList(_) => return self.handle_owner_list(request.id),
