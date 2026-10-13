@@ -14,8 +14,10 @@
 - Implemented: G1a (#1034): the durable `Goal*` kinds, the in-memory record
   and its re-issue on start and rotation (`src/app/goals.rs`). G1b (#1155):
   `goal.arm`, `goal.status`, `goal.pause`, `goal.resume` and `goal.stop` and
-  `flk goal` (`src/app/api/goals.rs`, `src/cli/goal.rs`); the writes are open
-  to the operator and to the goal's own agent, as goal-s1's were. G1 was split
+  `flk goal` (`src/app/api/goals.rs`, `src/cli/goal.rs`), with the caller
+  rule of the 2026-10-13 amendment below (§1): the operator and the agent's
+  delegation-edge supervisor may arm, pause, resume and stop a goal, the
+  agent itself may only arm it. G1 was split
   into G1a #1034, G1b #1155, G1c #1156 and G1d #1157 on 2026-10-12. Slices (§7) filed 2026-10-11: G0 #1033, G1 #1034, G2 #1035, G3a #885, G3b #1036, G3c #886, G4 #882 + #883, G5 #884, G6 #965. The cross-ADR order is §8.
 
 ## Context
@@ -92,6 +94,26 @@ one.
 Amended 2026-10-12 (owner decision on #1034): pause and resume are recorded as
 two durable kinds of their own, `GoalPaused` (with an optional end time) and
 `GoalResumed`.
+
+#### Amendment 2026-10-13: who may write a goal (owner decision, #1155)
+
+- The goal's **own agent** may arm its goal and set its status (ADR-0030 §6,
+  `goal status set`, a later slice). It may **not** pause, resume or stop it:
+  that would let it walk out of the done gate (rung 6) and the judge (rung 8).
+- **Pause, resume and stop**, and arming on another agent's behalf, are open
+  to the **operator** and to the agent's **supervisor**: the architect on its
+  `AgentDelegated` edge (ADR-0027), matched by restart-stable `AgentId`
+  (ADR-0028, #1013), never by pane, so an architect can stop a runaway
+  delegate after a restart too.
+- **Everyone else** is refused with `goal_caller_refused`, and so is a caller
+  the server cannot attest (no readable pid, or relayed from a mesh peer;
+  goals are per host, §7). Reading a goal (`goal.status`) stays open to every
+  caller.
+- `goal_caller_refused` takes the class `operator_only` has: retry `never`,
+  CLI exit 1 (`FAILURE`). The caller cannot fix it by retrying, and exit 13
+  (`POLICY_REFUSED`) is registered for the question-policy widening only.
+- Like `owner.bind`'s operator check, the agent check reads process ancestry
+  and is cooperative until uid attestation (ADR-0035 §6.3).
 
 That answers three #573 requirements at once: crash safety (every write is one
 appended event), versioned state (the owner's field report lost STATUS.md to

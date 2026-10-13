@@ -20,9 +20,9 @@ usage:
   flk goal resume [--agent TARGET] [--json]
   flk goal stop [--reason TEXT] [--agent TARGET] [--json]
 
---agent defaults to self, the agent whose pane runs the command. The operator
-may change any agent's goal, an agent only its own. A pause without --minutes
-lasts until resume.";
+--agent defaults to self, the agent whose pane runs the command. An agent may
+arm its own goal; pause, resume and stop belong to the operator and the
+agent's supervisor. A pause without --minutes lasts until resume.";
 
 pub(super) fn run_goal_command(args: &[String]) -> std::io::Result<i32> {
     let Some(verb) = args.first().map(String::as_str) else {

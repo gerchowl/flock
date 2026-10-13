@@ -677,11 +677,13 @@ Five methods, new in protocol 30, arm, read, pause, resume and stop an agent's g
 
 An agent with no goal is `goal_not_armed`, and so is a met goal for `pause` and `resume`. `self` from a caller in no agent pane is `no_caller_pane`.
 
-**Who may call.** `goal.status` is open to every caller. The four writes are open to the operator and to the goal's own agent, as goal-s1 let an agent arm, pause and stop its own goal: an agent changing another agent's goal is refused with `goal_caller_refused`, and so is a caller the server cannot attest (it could not read the caller's pid, or the request was relayed from a mesh peer; goals are per host and peers relay none of it). A supervisor arming its delegate's goal goes through `delegate start --goal` (#965), not these methods. Like `owner.bind`, the agent check reads process ancestry and is cooperative only: a child an agent detaches with `setsid` passes as the operator. All refusals exit 1 from the CLI and write nothing.
+**Who may call** (ADR-0030 §1, amendment of 2026-10-13). `goal.status` is open to every caller. The goal's own agent may `goal.arm` its goal but may not pause, resume or stop it, so it cannot walk out of the done gate. The operator and the agent's supervisor may do all four. The supervisor is the architect on the agent's `AgentDelegated` edge, matched by restart-stable `agent_id`, so it keeps that right across a server restart. Anyone else is refused with `goal_caller_refused` (retry `never`, exit 1, the class `operator_only` has), and so is a caller the server cannot attest (it could not read the caller's pid, or the request was relayed from a mesh peer; goals are per host and peers relay none of it). Like `owner.bind`, the agent check reads process ancestry and is cooperative only: a child an agent detaches with `setsid` passes as the operator. All refusals exit 1 from the CLI and write nothing.
 
 **Skew (#868).** `goal.arm`, `goal.pause`, `goal.resume` and `goal.stop` are state-changing: a CLI refuses them locally with `server_version_gap` and exit 78 against an older server, before sending. `goal.status` reaches an older server, and its unknown-method answer is turned into the same exit 78.
 
-**Known limits of this release.** Nothing reads the record to decide a stop yet (the ladder, #1157). An expired pause (`until_ms` in the past) stays in the record until the next pause or resume, and `goal.status` reports it as stored.
+A timed pause is over once its `until_ms` passes: every `goal` answer leaves an expired `paused` out of the record it shows, and `goal.resume` answers `goal_not_paused`, the reading the stop ladder will take. The `goal_paused` event stays in the log.
+
+**Known limits of this release.** Nothing reads the record to decide a stop yet (the ladder, #1157).
 
 ## Reading panes
 

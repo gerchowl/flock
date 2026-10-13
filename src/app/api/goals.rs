@@ -3,19 +3,20 @@
 //! (`app::goals`). Every write is one durable `Goal*` event through
 //! `record_goal_event`, so the record stays the fold of the log.
 //!
-//! Who may call: `goal.status` is a read and open to every caller. The four
-//! writes are open to the operator and to the goal's own agent, the way
-//! goal-s1 let an agent arm, pause and stop its own goal and ADR-0030 §6 has
-//! the agent record its own status. Another agent may not change a goal that
-//! is not its own (a supervisor arms a delegate's goal through
-//! `delegate start --goal`, G6 #965), and a caller this node cannot attest
-//! (no readable pid, or relayed from a mesh peer: goals are per host,
-//! ADR-0030 §7) is refused. The agent check reads process ancestry, so it is
-//! cooperative in the way `owner.bind`'s is (ADR-0035 §6.3).
+//! Who may call (ADR-0030 owner decision 2026-10-13): `goal.status` is a
+//! read, open to every caller. The operator and the agent's supervisor (the
+//! architect on its `AgentDelegated` edge, matched by restart-stable
+//! `AgentId`) may arm, pause, resume and stop it. The goal's own agent may arm
+//! its goal but not pause, resume or stop it, so it cannot walk out of the
+//! done gate (rung 6) or the judge (rung 8). Anyone else is refused, and so is
+//! a caller this node cannot attest (no readable pid, or relayed from a mesh
+//! peer: goals are per host, ADR-0030 §7). The agent check reads process
+//! ancestry, so it is cooperative in the way `owner.bind`'s is (ADR-0035
+//! §6.3).
 //!
-//! Known limit: an expired pause (`until_ms` in the past) stays in the record
-//! until the next pause or resume; the stop ladder (G1d #1157) reads it as
-//! over, and `goal.status` reports the stored record as is.
+//! A timed pause whose `until_ms` has passed is over: answers drop it from the
+//! record they show and `goal.resume` treats the goal as not paused, as the
+//! stop ladder (G1d #1157) will. The stored `GoalPaused` stays in the log.
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 use super::spawn::SpawnCaller;
@@ -38,7 +39,7 @@ impl App {
                 "the goal and every check must be non-empty",
             ));
         }
-        let agent_id = self.goal_writer(id, &params.target, "goal.arm")?;
+        let agent_id = self.goal_writer(id, &params.target, "goal.arm", true)?;
         if self.goals.get(&agent_id).is_some_and(|record| !record.met) {
             let message =
                 format!("{agent_id} already has an open goal; stop it first with `flk goal stop`");
@@ -63,11 +64,14 @@ impl App {
         params: GoalTargetParams,
     ) -> Result<String, Refusal> {
         let agent_id = self.goal_agent_id(id, &params.target)?;
-        let record = self
+        let mut record = self
             .goals
             .get(&agent_id)
             .cloned()
             .ok_or_else(|| not_armed(id, &agent_id))?;
+        if !pause_active(&record) {
+            record.paused = None;
+        }
         Ok(encode_success(
             id.into(),
             ResponseResult::Goal {
@@ -115,7 +119,7 @@ impl App {
         if self
             .goals
             .get(&agent_id)
-            .is_some_and(|record| record.paused.is_none())
+            .is_some_and(|record| !pause_active(record))
         {
             let message = format!("the goal of {agent_id} is not paused");
             return Err(encode_error(id.into(), "goal_not_paused", message));
@@ -132,7 +136,7 @@ impl App {
         id: &str,
         params: GoalStopParams,
     ) -> Result<String, Refusal> {
-        let agent_id = self.goal_writer(id, &params.target, "goal.stop")?;
+        let agent_id = self.goal_writer(id, &params.target, "goal.stop", false)?;
         let response = self.goal_status(
             id,
             GoalTargetParams {
@@ -163,7 +167,7 @@ impl App {
     /// [`Self::goal_writer`] for a verb that needs an open goal: one that is
     /// armed and not yet met.
     fn open_goal_writer(&mut self, id: &str, target: &str, verb: &str) -> Result<String, Refusal> {
-        let agent_id = self.goal_writer(id, target, verb)?;
+        let agent_id = self.goal_writer(id, target, verb, false)?;
         match self.goals.get(&agent_id) {
             Some(record) if !record.met => Ok(agent_id),
             Some(_) => {
@@ -177,19 +181,36 @@ impl App {
     }
 
     /// The `AgentId` a write is about, once the caller may write it (see the
-    /// module doc).
-    fn goal_writer(&mut self, id: &str, target: &str, verb: &str) -> Result<String, Refusal> {
+    /// module doc). `own_agent_may` is true for arm, the one write the goal's
+    /// own agent may make.
+    fn goal_writer(
+        &mut self,
+        id: &str,
+        target: &str,
+        verb: &str,
+        own_agent_may: bool,
+    ) -> Result<String, Refusal> {
         let agent_id = self.goal_agent_id(id, target)?;
         let why = if self.caller_unattested_or_relayed() {
             "this node cannot attest the caller (no readable pid, or relayed from a mesh peer), and goals are per host".to_string()
         } else {
-            match self.spawn_caller() {
-                SpawnCaller::Agent {
-                    agent_id: caller, ..
-                } if caller != agent_id => {
-                    format!("the caller is agent {caller}, and an agent may change only its own goal; the operator may change any")
-                }
-                _ => return Ok(agent_id),
+            let SpawnCaller::Agent {
+                agent_id: caller, ..
+            } = self.spawn_caller()
+            else {
+                return Ok(agent_id);
+            };
+            let supervisor = self
+                .delegations
+                .get(&agent_id)
+                .is_some_and(|edge| edge.architect == caller);
+            if supervisor || (own_agent_may && caller == agent_id) {
+                return Ok(agent_id);
+            }
+            if caller == agent_id {
+                "an agent may arm its own goal but not pause, resume or stop it; its supervisor or the operator may".to_string()
+            } else {
+                format!("the caller is agent {caller}, which is not this agent's supervisor; only its supervisor or the operator may")
             }
         };
         let message = format!("{verb} on the goal of {agent_id}: {why}");
@@ -235,6 +256,15 @@ impl App {
     }
 }
 
+/// Whether a goal is paused now: a timed pause is over once `until_ms` passes.
+fn pause_active(record: &GoalRecord) -> bool {
+    record.paused.as_ref().is_some_and(|pause| {
+        pause
+            .until_ms
+            .is_none_or(|until_ms| until_ms > crate::app::notifications::now_ms())
+    })
+}
+
 fn not_armed(id: &str, agent_id: &str) -> String {
     let message = format!("{agent_id} has no goal; arm one with `flk goal arm`");
     encode_error(id.into(), "goal_not_armed", message)
@@ -249,7 +279,9 @@ mod tests {
         GoalStopParams, GoalTargetParams, Method, Request,
     };
     use crate::api::EventHub;
-    use crate::app::delegation::handler_tests::{app_on, caller_is_an_agent, shutdown, temp_log};
+    use crate::app::delegation::handler_tests::{
+        app_on, caller_is_an_agent, shutdown, start, temp_log,
+    };
     use crate::app::App;
 
     fn call(app: &mut App, method: Method) -> Value {
@@ -314,12 +346,24 @@ mod tests {
         response["error"]["code"].as_str().unwrap_or("<success>")
     }
 
-    /// The acceptance round trip: an agent arms, pauses and resumes its own
-    /// goal through `self`, each write is one durable event, the record
-    /// survives a server restart, and stop drops it for good.
+    /// Make workspace 0's agent pane run as `agent_id`, the way a restored
+    /// session keeps an agent's restart-stable id.
+    fn caller_is_agent_id(app: &mut App, agent_id: &str) {
+        let minted = caller_is_an_agent(app);
+        let terminal = app
+            .state
+            .terminals
+            .values_mut()
+            .find(|terminal| terminal.agent_id.to_string() == minted)
+            .expect("caller terminal");
+        terminal.agent_id = crate::terminal::AgentId::from_persisted(agent_id.into());
+    }
+
+    /// Owner decision 2026-10-13: the goal's own agent may arm its goal and
+    /// read it, but may not pause, resume or stop it.
     #[tokio::test]
-    async fn arm_pause_resume_stop_round_trip_and_survive_a_restart() {
-        let log = temp_log("goal-verbs-round-trip");
+    async fn the_own_agent_arms_but_cannot_pause_resume_or_stop() {
+        let log = temp_log("goal-verbs-own-agent");
         let hub = EventHub::with_persistence(log.clone());
         let mut app = app_on(hub.clone());
         let agent = caller_is_an_agent(&mut app);
@@ -329,36 +373,79 @@ mod tests {
         assert_eq!(armed["result"]["agent_id"], agent.as_str());
         assert_eq!(armed["result"]["goal"]["goal"], "ship G1b", "trimmed");
         assert_eq!(armed["result"]["goal"]["checks"][0], "just check");
+        let written = goal_lines(&hub).len();
+        for method in [pause("self", Some(5)), resume("self"), stop(&agent)] {
+            let refused = call(&mut app, method);
+            assert_eq!(code(&refused), "goal_caller_refused", "{refused}");
+        }
+        assert_eq!(goal_lines(&hub).len(), written, "a refusal writes nothing");
+        assert_eq!(call(&mut app, status("self"))["result"], armed["result"]);
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
 
+    /// The acceptance round trip, by the supervisor: the architect on the
+    /// delegate's edge arms, pauses and resumes the delegate's goal, each
+    /// write is one durable event, and after a server restart the same
+    /// architect (matched by its restart-stable `AgentId`, not a pane) still
+    /// supervises it, reads the record unchanged, and stops it for good.
+    #[tokio::test]
+    async fn the_supervisor_controls_its_delegates_goal_across_a_restart() {
+        let log = temp_log("goal-verbs-supervisor");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        let architect = caller_is_an_agent(&mut app);
+        let (delegate, _) = start(&mut app, None);
+        assert_eq!(
+            app.delegations.get(&delegate).map(|e| e.architect.clone()),
+            Some(architect.clone())
+        );
+
+        let armed = call(&mut app, arm(&delegate, "ship G1b"));
+        assert_eq!(armed["result"]["agent_id"], delegate.as_str(), "{armed}");
         let before = crate::app::notifications::now_ms();
-        let paused = call(&mut app, pause("", Some(30)));
+        let paused = call(&mut app, pause(&delegate, Some(30)));
         let until_ms = paused["result"]["goal"]["paused"]["until_ms"]
             .as_u64()
             .expect("timed pause");
         assert!(until_ms >= before + 30 * 60_000, "{paused}");
-        assert!(call(&mut app, resume("self"))["result"]["goal"]
+        assert!(call(&mut app, resume(&delegate))["result"]["goal"]
             .get("paused")
             .is_none());
-        let paused = call(&mut app, pause("self", None));
+        let paused = call(&mut app, pause(&delegate, None));
         assert_eq!(paused["result"]["goal"]["paused"], serde_json::json!({}));
-        let read = call(&mut app, status("self"));
-        assert_eq!(read["result"], paused["result"]);
         assert_eq!(goal_lines(&hub).len(), 4, "one event per write");
         shutdown(app);
 
+        // The restarted server restores both panes with their agent ids: the
+        // architect's (where the caller runs) and the delegate's.
         let hub = EventHub::with_persistence(log.clone());
         let mut app = app_on(hub.clone());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("delegate"));
+        app.state.ensure_test_terminals();
+        let restored = app.state.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[1]
+            .pane_state(restored)
+            .expect("delegate pane")
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
+        terminal.agent_id = crate::terminal::AgentId::from_persisted(delegate.clone());
+        caller_is_agent_id(&mut app, &architect);
         app.reissue_open_records();
-        app.current_api_peer_pid = Some(std::process::id());
-        let after_restart = call(&mut app, status(&agent));
+        assert!(app.delegations.get(&delegate).is_some(), "edge refolded");
+        let after_restart = call(&mut app, status(&delegate));
         assert_eq!(after_restart["result"], paused["result"], "{after_restart}");
-
-        let stopped = call(&mut app, stop(&agent));
-        assert_eq!(stopped["result"]["goal"], paused["result"]["goal"]);
+        let resumed = call(&mut app, resume(&delegate));
+        assert_eq!(code(&resumed), "<success>", "{resumed}");
+        let stopped = call(&mut app, stop(&delegate));
+        assert_eq!(stopped["result"]["goal"]["goal"], "ship G1b", "{stopped}");
         assert_eq!(
             goal_lines(&hub).last(),
             Some(&EventData::GoalDisarmed {
-                agent_id: agent.clone(),
+                agent_id: delegate.clone(),
                 reason: Some("done by hand".into()),
             })
         );
@@ -367,10 +454,38 @@ mod tests {
         let mut app = app_on(EventHub::with_persistence(log.clone()));
         app.reissue_open_records();
         assert_eq!(
-            app.goals.get(&agent),
+            app.goals.get(&delegate),
             None,
             "a stopped goal is not refolded"
         );
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+
+    /// A timed pause whose end has passed is over: status drops it from the
+    /// record it shows, and resume answers that the goal is not paused.
+    #[tokio::test]
+    async fn an_expired_pause_does_not_read_as_current() {
+        let log = temp_log("goal-verbs-expired");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        let agent = caller_is_an_agent(&mut app);
+        assert_eq!(code(&call(&mut app, arm("self", "ship"))), "<success>");
+        app.record_goal_event(EventEnvelope {
+            event: EventKind::GoalPaused,
+            data: EventData::GoalPaused {
+                agent_id: agent.clone(),
+                until_ms: Some(1),
+            },
+        });
+        assert!(app
+            .goals
+            .get(&agent)
+            .and_then(|r| r.paused.as_ref())
+            .is_some());
+        let read = call(&mut app, status("self"));
+        assert!(read["result"]["goal"].get("paused").is_none(), "{read}");
+        app.test_pane_child_pids.clear();
+        assert_eq!(code(&call(&mut app, resume(&agent))), "goal_not_paused");
         shutdown(app);
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
@@ -411,8 +526,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
 
-    /// An agent may change only its own goal, an unattested caller none, and
-    /// `self` needs an agent pane. Every refusal writes nothing, and status
+    /// An agent that is not the target's supervisor changes nothing, an
+    /// unattested caller nothing either, and `self` needs an agent pane. Every refusal writes nothing, and status
     /// stays open to every caller.
     #[tokio::test]
     async fn writes_by_another_agent_or_an_unattested_caller_are_refused() {
@@ -471,26 +586,20 @@ mod tests {
         let hub = EventHub::with_persistence(log.clone());
         let mut app = app_on(hub.clone());
         let agent = caller_is_an_agent(&mut app);
+        app.test_pane_child_pids.clear();
+        let me = agent.as_str();
 
-        for method in [
-            status("self"),
-            pause("self", None),
-            resume("self"),
-            stop("self"),
-        ] {
+        for method in [status(me), pause(me, None), resume(me), stop(me)] {
             assert_eq!(code(&call(&mut app, method)), "goal_not_armed");
         }
-        assert_eq!(code(&call(&mut app, arm("self", "  "))), "invalid_params");
-        assert_eq!(code(&call(&mut app, arm("self", "ship"))), "<success>");
+        assert_eq!(code(&call(&mut app, arm(me, "  "))), "invalid_params");
+        assert_eq!(code(&call(&mut app, arm(me, "ship"))), "<success>");
         assert_eq!(
-            code(&call(&mut app, arm("self", "again"))),
+            code(&call(&mut app, arm(me, "again"))),
             "goal_already_armed"
         );
-        assert_eq!(
-            code(&call(&mut app, pause("self", Some(0)))),
-            "invalid_params"
-        );
-        assert_eq!(code(&call(&mut app, resume("self"))), "goal_not_paused");
+        assert_eq!(code(&call(&mut app, pause(me, Some(0)))), "invalid_params");
+        assert_eq!(code(&call(&mut app, resume(me))), "goal_not_paused");
 
         app.record_goal_event(EventEnvelope {
             event: EventKind::GoalMet,
@@ -498,14 +607,11 @@ mod tests {
                 agent_id: agent.clone(),
             },
         });
-        assert_eq!(code(&call(&mut app, pause("self", None))), "goal_not_armed");
-        assert_eq!(code(&call(&mut app, resume("self"))), "goal_not_armed");
+        assert_eq!(code(&call(&mut app, pause(me, None))), "goal_not_armed");
+        assert_eq!(code(&call(&mut app, resume(me))), "goal_not_armed");
+        assert_eq!(call(&mut app, status(me))["result"]["goal"]["met"], true);
         assert_eq!(
-            call(&mut app, status("self"))["result"]["goal"]["met"],
-            true
-        );
-        assert_eq!(
-            code(&call(&mut app, arm("self", "next"))),
+            code(&call(&mut app, arm(me, "next"))),
             "<success>",
             "a met goal is closed, so a new one may be armed"
         );
