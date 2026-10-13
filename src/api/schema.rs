@@ -230,6 +230,10 @@ pub enum Method {
     EventsRead(EventsReadParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
+    /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
+    /// return at once, so the agent can end its turn.
+    #[serde(rename = "wait.park")]
+    WaitPark(WaitParkParams),
     /// In-process only: a held `events.read` registers its blocking wait
     /// against the attested caller. Never on the wire, so no client can open
     /// or close a wait it does not hold.
@@ -465,6 +469,7 @@ impl Method {
             | Self::PaneMove(_)
             | Self::PaneRename(_)
             | Self::ChannelHello(_)
+            | Self::WaitPark(_)
             | Self::OwnerBind(_)
             | Self::OwnerUnbind(_)
             | Self::GoalArm(_)
@@ -2281,6 +2286,15 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
+/// `wait.park` (ADR-0028 §5, #1031). `until` is a predicate text the server
+/// parses (`crate::api::wait_predicate`); `deadline_ms` is relative and
+/// mandatory: a park that never opens still ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitParkParams {
+    pub until: String,
+    pub deadline_ms: u64,
+}
+
 /// `owner.policy.show` and `owner.policy.adopt` (ADR-0035 §6.2, #1195).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerPolicyParams {
@@ -3177,6 +3191,14 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// `wait.park`: the wait now open and when it expires (Unix ms).
+    WaitParked {
+        wait_id: String,
+        agent_id: String,
+        /// The predicate in its canonical form.
+        predicate: String,
+        deadline: u64,
     },
     /// The in-process `WaitHold`: the wait it opened, `None` when the caller
     /// is no agent and nothing was recorded.
