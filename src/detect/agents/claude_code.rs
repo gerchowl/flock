@@ -332,6 +332,116 @@ pub(in crate::detect) fn needs_human(content: &str) -> HumanReason {
     }
 }
 
+/// The `AskUserQuestion` form a `question` screen draws (ADR-0028 §8a,
+/// #1038), read from its invariant controls, all required: `Enter to select`
+/// as the last line, a numbered `Chat about this` under the rule that closes
+/// the form, and the rule that opens it above the numbered options. A form's
+/// review page and every other dialog lack that frame and read `None`. The
+/// cursor (`❯`) and the checkbox marks are not part of the question, so a
+/// redraw reads the same.
+pub(in crate::detect) fn question(content: &str) -> Option<crate::api::question::QuestionForm> {
+    use crate::api::question::{QuestionForm, QuestionOption};
+    let lines: Vec<&str> = content.lines().map(str::trim_end).collect();
+    let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    if !lines[last].starts_with("Enter to select") {
+        return None;
+    }
+    let close = lines[..last]
+        .iter()
+        .rposition(|line| is_horizontal_rule(line))?;
+    lines[close + 1..last]
+        .iter()
+        .filter_map(|line| question_option_line(line))
+        .find(|(_, _, label)| *label == "Chat about this")?;
+    let open = lines[..close]
+        .iter()
+        .rposition(|line| is_horizontal_rule(line))?;
+    let form = &lines[open + 1..close];
+    let first = form
+        .iter()
+        .position(|line| question_option_line(line).is_some())?;
+    let tabs = form
+        .first()
+        .filter(|line| line.contains(['\u{2610}', '\u{2612}']))
+        .map(|line| {
+            line.split("  ")
+                .filter_map(|tab| tab.trim().strip_prefix(['\u{2610}', '\u{2612}']))
+                .map(|tab| tab.trim().to_string())
+                .collect::<Vec<_>>()
+        });
+    let prompt = form[usize::from(tabs.is_some())..first]
+        .iter()
+        .map(|line| line.trim().trim_start_matches('\u{2502}').trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if prompt.is_empty() {
+        return None;
+    }
+    let mut question = QuestionForm {
+        header: tabs
+            .filter(|tabs| tabs.len() == 1)
+            .and_then(|mut tabs| tabs.pop()),
+        prompt,
+        options: Vec::new(),
+        multi_select: false,
+        allow_other: false,
+    };
+    // The column a description is indented to, while one may follow.
+    let mut description_col = None;
+    for line in &form[first..] {
+        if let Some((col, id, label)) = question_option_line(line) {
+            let (col, label) = match label
+                .strip_prefix("[ ] ")
+                .or_else(|| label.strip_prefix("[\u{2714}] "))
+            {
+                Some(label) => {
+                    question.multi_select = true;
+                    (col + 4, label)
+                }
+                None => (col, label),
+            };
+            description_col = None;
+            if matches!(label, "Type something." | "Type something") {
+                question.allow_other = true;
+            } else {
+                description_col = Some(col);
+                question.options.push(QuestionOption {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    description: None,
+                });
+            }
+            continue;
+        }
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        let text = line.trim();
+        match (description_col, question.options.last_mut()) {
+            (Some(col), Some(option)) if !text.is_empty() && indent >= col => {
+                let description = option.description.get_or_insert_with(String::new);
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str(text);
+            }
+            _ if text.is_empty() => {}
+            _ => description_col = None,
+        }
+    }
+    (!question.options.is_empty()).then_some(question)
+}
+
+/// A numbered row of the question form, `❯ 2. Blue` or `  2. Blue`: the
+/// column its label starts at, its number and its label.
+fn question_option_line(line: &str) -> Option<(usize, &str, &str)> {
+    let rest = line
+        .strip_prefix("\u{276f} ")
+        .or_else(|| line.strip_prefix("  "))?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let label = rest[digits..].strip_prefix(". ")?;
+    (digits > 0).then(|| (2 + digits + 2, &rest[..digits], label.trim()))
+}
+
 /// The region between the last box frame on the pane and its bottom border, or
 /// `None` when the pane has no closed frame.
 ///

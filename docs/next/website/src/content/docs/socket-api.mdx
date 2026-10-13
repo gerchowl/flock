@@ -179,7 +179,7 @@ When `agent.start`, `agent.spawn` or `agent.fork` succeeds and the caller's proc
 
 `hook.decide` is the verdict for one harness hook call (ADR-0034 §1). Params: `point` (`question`), `harness` (`claude`, `codex` or `opencode`), and optional `session_id` and `tool_name`. The pane is the caller's, by process ancestry, never a field of the request, and the verdict comes from the policy on its agent record: `{"type":"hook_decide","verdict":"pass"}` or `{"type":"hook_decide","verdict":"deny","reason":"…"}`. A `question` call for a tool that is neither the harness's question tool (`AskUserQuestion` and `ExitPlanMode` for Claude, `request_user_input` for Codex, `question` for opencode) nor in `[questions] human_tools` passes. Otherwise `ask_human` passes, `deny` is refused with the disabled-questions sentence, and `route` and `ask_operator` are refused with `state the question and options in your final message and end your turn` until routing lands. A caller outside every pane gets `no_caller_pane`. A server that predates the method answers `invalid_request`; the hook then follows the pane's `FLOCK_QUESTIONS` hint, as described under [Claude Code](/integrations/#claude-code).
 
-An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. There are no goal methods yet: `goal.*` verbs, the CLI and the MCP tools follow (#1155, #1156).
+An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. The `goal.*` methods below change and read the record; the MCP tools follow (#1156).
 
 If a 1.x server did run against such a log, it renamed the active file to `event-log.corrupt.jsonl` in the server's data directory (`~/.config/flock`, or `~/.config/flock/sessions/<name>` for a named session) and started a fresh `event-log.jsonl`, numbering above the events it set aside. A rotated file (`event-log.1.jsonl` to `event-log.4.jsonl`) holding a goal event is not renamed, only skipped by that server. The quarantined file is never rotated, and it holds a full copy of every goal that was open when it was set aside, because the server re-issues each open goal into the active file on start and after every rotation. If the 1.x server rotated the log since, its rotations deleted the oldest rotated files (goal events included) and its fresh file may now be `event-log.1.jsonl` or older. Those events are gone, but the quarantined file still covers the goals.
 
@@ -623,6 +623,47 @@ The server does not poll for these. It re-reads an agent's `state` when the dete
 
 `from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. Its pane is judged once the settle window has passed since the restore: if the pane is a plain shell by then (the server spawned it with the default shell, and that shell holds the terminal's foreground with nothing running in front of it), the agent's process did not survive the restart, and it is announced `gone` once. That is a hand-launched agent after a cold restart, whose pane comes back as a shell under the same id. A pane that cannot be judged keeps the logged phase: one adopted over a live handoff (its agent kept running), one without a live child, or one running another command in front of its shell, which is judged again the next time the server reads its agents. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
 
+### Open questions
+
+When an agent's screen shows a harness choice dialog, its `state` says what the dialog asks (ADR-0028 §8a). `attention` reads `{"needs_human": {"reason": "question", "question": {…}}}`:
+
+```json
+{
+  "question_id": "q_1f1bfdbef4278496",
+  "source": "screen",
+  "harness": "claude",
+  "state": "open",
+  "header": "Colour",
+  "prompt": "Which colour should the probe use?",
+  "options": [
+    {"id": "1", "label": "Red", "description": "A red probe"},
+    {"id": "2", "label": "Blue", "description": "A blue probe"}
+  ],
+  "multi_select": false,
+  "allow_other": true
+}
+```
+
+- `harness` is `claude` (Claude Code's `AskUserQuestion` form) or `codex` (`request_user_input`). opencode is not read yet ([#1243](https://github.com/gerchowl/flock/issues/1243)).
+- An option's `id` is the number the dialog shows beside it. `description` is left out when the dialog shows none. Wrapped lines are joined with one space.
+- `allow_other` means the dialog accepts free text: Claude's "Type something", or Codex's "None of the above". That entry is not listed as an option, and neither is Claude's "Chat about this".
+- `state` is `open` while the question waits, and `withdrawn` on the `agent.question_closed` that ends it. `expired` is for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)). `answered` comes with `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)); a build without it reads that state as `unknown`.
+- `header` is the form's tag. It is read only when the form has one question tab, because the screen marks the current tab by styling alone.
+- `question_id` is derived from the agent, the pane's `turn_cursor` and the event log's sequence when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. Every new open gets an id that was never used before, whether it is a different question, a tab revisited, or the same question asked again, including after a restart or a live handoff. The log sequence is durable and only grows, so an id that was ever closed is never opened again.
+- A frame whose form cannot be read, such as a torn read, an overlay or a form's review page, keeps the open question. Only a screen that no longer asks a question closes it. A prompt whose form never reads still reads `needs_human{reason: "question"}`, just without `question`.
+- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab opens that question again under a new id.
+
+Two durable kinds follow the same reads. Unlike the phase kinds, they are emitted at once, with no settle window:
+
+| Kind | Carries | Emitted when |
+| --- | --- | --- |
+| `agent.question_opened` | `agent_id`, `pane`, `question_id`, `question` | a read shows a `question_id` the previous read did not |
+| `agent.question_closed` | `agent_id`, `pane`, `question_id`, `reason`, `question` (its `state` `withdrawn`) | that question left the screen, was replaced by the next one, or its agent went |
+
+`question_id` is a top-level field of both, so `"subjects": ["<question id>"]` matches the pair. On a screen, `reason` is always `withdrawn`. An answer typed at the pane also closes the question as `withdrawn`, because on screen it cannot be told apart from a cancel. Answered questions are reported by `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)) and by the harness hook ([#1194](https://github.com/gerchowl/flock/issues/1194)). Moving to the next tab of a form closes the previous tab's question the same way. `expired` is reserved for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)).
+
+A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then, once, as `withdrawn`. A server older than these kinds skips them in its log.
+
 ## Channel adapters
 
 An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
@@ -678,6 +719,34 @@ The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`)
 
 **Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo (#1234, after owner addresses resolve over the mesh, #1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
 
+## Goals
+
+Five methods, new in protocol 30, arm, read, pause, resume and stop an agent's goal (ADR-0030 §1). Each takes `target`: `self` (also when empty or absent) is the agent whose pane runs the caller, an `agent_id` that has a goal names it even after its pane is gone, and anything else resolves as an agent target does (name, terminal id, pane id). Every answer is `{"type":"goal","agent_id","goal"}`, with `goal` the record as the `goal_*` events above fold it.
+
+```json
+{"id":"g1","method":"goal.arm","params":{"target":"self","goal":"ship the parser","checks":["just check"]}}
+```
+
+```json
+{"id":"g1","result":{"type":"goal","agent_id":"agent_atlas_1","goal":{"goal":"ship the parser","checks":["just check"],"met":false}}}
+```
+
+- `goal.arm` (`target`, `goal`, optional `checks`) records `goal_armed` with a fresh record. The goal text is trimmed. A blank goal or check is `invalid_params`; an agent whose goal is armed and not met is `goal_already_armed` (stop it first). Arming over a met goal starts a new one.
+- `goal.status` (`target`) answers the record, met or open. It is a read.
+- `goal.pause` (`target`, optional `minutes`) records `goal_paused`. With `minutes` the server sets `until_ms` to its own clock plus that many minutes; without it the goal stays paused until resumed. `minutes: 0` is `invalid_params`. Pausing a paused goal records the new pause.
+- `goal.resume` (`target`) records `goal_resumed`; a goal that is not paused is `goal_not_paused`.
+- `goal.stop` (`target`, optional `reason`) records `goal_disarmed` with the reason, drops the record, met or open, and answers it as it was.
+
+An agent with no goal is `goal_not_armed`, and so is a met goal for `pause` and `resume`. `self` from a caller in no agent pane is `no_caller_pane`.
+
+**Who may call** (ADR-0030 §1, amendment of 2026-10-13). `goal.status` is open to every caller. The goal's own agent may `goal.arm` its goal but may not pause, resume or stop it, so it cannot walk out of the done gate. The operator and the agent's supervisor may do all four. The supervisor is the architect on the agent's `AgentDelegated` edge, matched by restart-stable `agent_id`, so it keeps that right across a server restart. Anyone else is refused with `goal_caller_refused` (retry `never`, exit 13 `POLICY_REFUSED`, the class `operator_only` has), and so is a caller the server cannot attest (it could not read the caller's pid, or the request was relayed from a mesh peer; goals are per host and peers relay none of it). Like `owner.bind`, the agent check reads process ancestry and is cooperative only until uid attestation (O19a, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator, so `setsid flk goal stop` lets an agent out of its own goal. `goal_caller_refused` exits 13 from the CLI, every other refusal exits 1, and none writes anything.
+
+**Skew (#868).** `goal.arm`, `goal.pause`, `goal.resume` and `goal.stop` are state-changing: a CLI refuses them locally with `server_version_gap` and exit 78 against an older server, before sending. `goal.status` reaches an older server, and its unknown-method answer is turned into the same exit 78.
+
+A timed pause is over once its `until_ms` passes: every `goal` answer leaves an expired `paused` out of the record it shows, and `goal.resume` answers `goal_not_paused`, the reading the stop ladder will take. The `goal_paused` event stays in the log.
+
+**Known limits of this release.** Nothing reads the record to decide a stop yet (the ladder, #1157).
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.
@@ -724,6 +793,24 @@ when nobody is watching the pane. `--status done` matches exactly `done`. The
 [Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
+
+### Registered waits
+
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses.
+
+**A held `events.read` is a wait.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`. A held read from outside an agent pane is served as before and records no wait.
+
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical text. A held read's predicate is its filter, `events after <seq> [kinds <k>,...] [subjects <id>,...]`:
+
+```json
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "events after 412 kinds pr.ci_completed subjects agent_atlas_7", "since": 1760342400000, "deadline": 1760342950000}}
+```
+
+`since` and `deadline` are Unix ms. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
+
+A held read's wait closes when the read returns. If that close never reaches the server (the connection's thread died), the wait expires 10 s after its hold: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }`.
+
+**Known limits.** The registry is held in memory, so a server restart or live handoff drops open waits (#1240). A wait whose agent left stays until its deadline.
 
 ## The turn cursor
 

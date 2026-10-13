@@ -50,6 +50,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod waits;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -239,6 +240,8 @@ pub struct App {
     pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// Open registered waits per agent (ADR-0028 §5, #1031).
+    pub(crate) waits: waits::WaitRegistry,
     /// Settled phase per local agent, for ADR-0028 §2's derived events.
     pub(crate) agent_phases: agent_phases::AgentPhaseTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
@@ -1005,6 +1008,7 @@ impl App {
             active_submissions: Default::default(),
             kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            waits: Default::default(),
             agent_phases: Default::default(),
             self_compact_deadline: None,
             restarts: Default::default(),
@@ -6018,6 +6022,7 @@ sidebar_pane_gap = 99
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -6048,6 +6053,7 @@ sidebar_pane_gap = 99
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

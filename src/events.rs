@@ -120,6 +120,8 @@ pub enum AppEvent {
         background_tasks: Option<u32>,
         /// What a `Blocked` screen asks of a human (#1023), when it can say.
         needs_human: Option<crate::api::agent_state::HumanReason>,
+        /// The question that screen draws (#1038), when it can be read.
+        question: Option<crate::api::question::QuestionForm>,
         process_exited: bool,
         observed_at: Instant,
     },

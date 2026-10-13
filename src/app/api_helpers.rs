@@ -90,7 +90,7 @@ pub(super) fn pane_agent_status(
 /// nothing could. `screen_attention` is what the screen says a `blocked`
 /// agent waits on (#1023): without it, `blocked` is a prompt of unknown kind,
 /// as a hook reports it. A visible prompt is not a turn fact, so it reads
-/// `turn: unknown`.
+/// `turn: unknown`. `waiting` is the agent's oldest registered wait (#1031).
 pub(super) fn agent_state(
     status: crate::api::schema::AgentStatus,
     authority: crate::terminal::StateAuthority,
@@ -98,9 +98,11 @@ pub(super) fn agent_state(
     held_ms: Option<u64>,
     background: Option<(u32, crate::api::agent_state::StateSource)>,
     screen_attention: Option<crate::api::agent_state::Attention>,
+    waiting: crate::api::agent_state::Waiting,
 ) -> crate::api::agent_state::AgentState {
     use crate::api::agent_state::{
         AgentState, Attention, Background, HumanReason, Lifecycle, StateSource, StateSources, Turn,
+        Waiting,
     };
     use crate::api::schema::AgentStatus;
     let (turn, lifecycle) = match status {
@@ -122,6 +124,7 @@ pub(super) fn agent_state(
         (AgentStatus::Blocked, None) => (
             Attention::NeedsHuman {
                 reason: HumanReason::Unknown,
+                question: None,
             },
             Some(turn_source),
         ),
@@ -134,31 +137,39 @@ pub(super) fn agent_state(
         turn: (turn != Turn::Unknown).then_some(turn_source),
         background: background.map(|(_, source)| source),
         attention: attention_source,
+        waiting: (waiting != Waiting::Unknown).then_some(StateSource::WaitRegistry),
     };
     AgentState::derive(
         turn,
         Background::from_count(background.map(|(count, _)| count)),
         attention,
         lifecycle,
-        false,
+        waiting,
         held_ms,
         source,
     )
 }
 
 /// What the screen says a `blocked` agent waits on (#1023): a provider limit
-/// outranks the prompt that may still be drawn over it.
+/// outranks the prompt that may still be drawn over it. A `question` prompt
+/// carries the question it draws, when its form could be read (#1038).
 pub(super) fn screen_attention(
     provider_limit: Option<&crate::detect::provider_limit::ProviderLimit>,
     needs_human: Option<crate::api::agent_state::HumanReason>,
+    question: Option<&crate::api::question::Question>,
 ) -> Option<crate::api::agent_state::Attention> {
-    use crate::api::agent_state::{Attention, BlockedReason};
+    use crate::api::agent_state::{Attention, BlockedReason, HumanReason};
     match provider_limit {
         Some(wait) => Some(Attention::Blocked {
             reason: BlockedReason::ProviderLimit,
             retry_after_ms: wait.retry_after_ms,
         }),
-        None => needs_human.map(|reason| Attention::NeedsHuman { reason }),
+        None => needs_human.map(|reason| Attention::NeedsHuman {
+            reason,
+            question: question
+                .filter(|_| reason == HumanReason::Question)
+                .map(|question| Box::new(question.clone())),
+        }),
     }
 }
 
@@ -223,7 +234,7 @@ pub(super) fn normalize_custom_status(status: Option<String>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::encode_api_text;
-    use crate::api::agent_state::{Phase, StateSource, Turn, SETTLE_MS};
+    use crate::api::agent_state::{Phase, StateSource, Turn, Waiting, SETTLE_MS};
     use crate::detect::Agent;
     use crate::terminal::{StateAuthority, TerminalRuntime};
 
@@ -296,6 +307,7 @@ mod tests {
                 .as_ref()
                 .filter(|_| status == crate::api::schema::AgentStatus::Blocked),
             detection.needs_human,
+            None,
         );
         super::agent_state(
             status,
@@ -304,6 +316,7 @@ mod tests {
             Some(held),
             background,
             attention,
+            Waiting::None,
         )
     }
 
@@ -324,11 +337,14 @@ mod tests {
                 ))
             };
         }
-        let limit = Attention::Blocked {
+        const LIMIT: Attention = Attention::Blocked {
             reason: BlockedReason::ProviderLimit,
             retry_after_ms: None,
         };
-        let human = |reason| Attention::NeedsHuman { reason };
+        let human = |reason| Attention::NeedsHuman {
+            reason,
+            question: None,
+        };
         #[rustfmt::skip]
         let cases = [
             (Agent::Claude, fixture!("claude-trust"), human(R::Trust), Phase::NeedsHuman),
@@ -337,16 +353,16 @@ mod tests {
             (Agent::Claude, fixture!("claude-permission"), human(R::Permission), Phase::NeedsHuman),
             (Agent::Claude, fixture!("claude-question"), human(R::Question), Phase::NeedsHuman),
             (Agent::Claude, fixture!("claude-plan-exit"), human(R::Dialog), Phase::NeedsHuman),
-            (Agent::Claude, fixture!("claude-limit-footer"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-limit-options"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-limit-cancelled"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-weekly-options"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-weekly-stopped"), limit, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-footer"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-options"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-cancelled"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-weekly-options"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-weekly-stopped"), LIMIT, Phase::LimitReached),
             (Agent::Codex, include_str!("../../tests/fixtures/codex/folder-trust.txt"), human(R::Trust), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-login"), human(R::Login), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-permission"), human(R::Permission), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-question"), human(R::Question), Phase::NeedsHuman),
-            (Agent::Codex, fixture!("codex-limit"), limit, Phase::LimitReached),
+            (Agent::Codex, fixture!("codex-limit"), LIMIT, Phase::LimitReached),
         ];
         for (agent, screen, attention, phase) in cases {
             let detection = crate::detect::detect_agent(Some(agent), screen);
@@ -393,18 +409,28 @@ mod tests {
             Some(1),
             None,
             None,
+            Waiting::None,
         );
         assert_eq!(
             (state.attention, state.phase, state.source.attention),
             (
                 Attention::NeedsHuman {
-                    reason: HumanReason::Unknown
+                    reason: HumanReason::Unknown,
+                    question: None,
                 },
                 Phase::NeedsHuman,
                 Some(StateSource::Hook)
             )
         );
-        let idle = super::agent_state(S::Idle, StateAuthority::Screen, None, Some(1), None, None);
+        let idle = super::agent_state(
+            S::Idle,
+            StateAuthority::Screen,
+            None,
+            Some(1),
+            None,
+            None,
+            Waiting::None,
+        );
         assert_eq!(idle.attention, Attention::None);
         let gone = super::agent_state(
             S::Offline,
@@ -413,6 +439,7 @@ mod tests {
             Some(1),
             None,
             None,
+            Waiting::None,
         );
         assert_eq!(
             (gone.attention, gone.source.attention),
@@ -424,7 +451,9 @@ mod tests {
     fn lifecycle_outranks_turn_and_each_axis_names_its_source() {
         use crate::api::schema::AgentStatus as S;
         use StateAuthority as By;
-        let state = |status, by, agent| super::agent_state(status, by, agent, Some(1), None, None);
+        let state = |status, by, agent| {
+            super::agent_state(status, by, agent, Some(1), None, None, Waiting::None)
+        };
         let hibernated = state(S::Hibernated, By::Screen, None);
         assert_eq!(
             (hibernated.phase, hibernated.source.turn),

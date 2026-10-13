@@ -3913,6 +3913,7 @@ impl AppState {
                 settled_with_background_shells,
                 background_tasks,
                 needs_human,
+                question: _,
                 process_exited,
                 observed_at,
             } => self
@@ -6860,6 +6861,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -6903,6 +6905,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -6961,6 +6964,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -7124,6 +7128,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7152,6 +7157,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7264,6 +7270,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7310,6 +7317,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7353,6 +7361,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7414,6 +7423,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7473,6 +7483,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7503,6 +7514,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -7544,6 +7556,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7583,6 +7596,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7624,6 +7638,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7708,6 +7723,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7733,6 +7749,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7771,6 +7788,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7801,6 +7819,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7833,6 +7852,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7908,6 +7928,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7961,6 +7982,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7995,6 +8017,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -8026,6 +8049,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -8053,6 +8077,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

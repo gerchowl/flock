@@ -3702,6 +3702,8 @@ impl HeadlessServer {
         self.app.expire_relayed_entries();
         // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_idle_wakes(now);
+        // ADR-0028 §5: mirrored in the TUI runtime loop (#25).
+        self.app.tick_waits(now);
         // ADR-0028 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_agent_phases(now);
         // #540: mirrored in the TUI runtime loop (#25).
@@ -5589,6 +5591,7 @@ next_tab = ""
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -8467,6 +8470,7 @@ next_tab = ""
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: Instant::now(),
         });
@@ -8533,6 +8537,7 @@ next_tab = ""
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: Instant::now(),
         });
