@@ -111,8 +111,10 @@ pub enum Waiting {
     None,
     On {
         wait_id: String,
+        /// Canonical text (`crate::api::wait_predicate`). Kept as text on
+        /// read, so a newer server's predicate survives an older client.
         #[serde(default, deserialize_with = "or_unknown")]
-        predicate: crate::api::schema::WaitPredicate,
+        predicate: String,
         #[serde(default, deserialize_with = "or_unknown")]
         since: u64,
         #[serde(default, deserialize_with = "or_unknown")]
@@ -133,7 +135,9 @@ pub enum Lifecycle {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered as the ADR's phase table, which is the order a predicate's phase
+/// list is rendered in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Gone,
@@ -336,7 +340,7 @@ mod tests {
     fn on() -> Waiting {
         Waiting::On {
             wait_id: "w_1".into(),
-            predicate: Default::default(),
+            predicate: "reply:c1".into(),
             since: 1,
             deadline: 2,
         }
@@ -394,11 +398,11 @@ mod tests {
         assert_eq!(serde_json::to_value(Waiting::None).unwrap(), "none");
         assert_eq!(
             serde_json::to_value(on()).unwrap(),
-            serde_json::json!({"on": {"wait_id": "w_1", "predicate": {"after": 0},
+            serde_json::json!({"on": {"wait_id": "w_1", "predicate": "reply:c1",
                 "since": 1, "deadline": 2}})
         );
         let state: AgentState = serde_json::from_str(
-            r#"{"waiting":{"on":{"wait_id":"w_9","predicate":{"until":"pr:7"},"since":"x"}},
+            r#"{"waiting":{"on":{"wait_id":"w_9","predicate":{"pr":7},"since":"x"}},
                 "source":{"waiting":"wait_registry"}}"#,
         )
         .unwrap();
@@ -412,7 +416,7 @@ mod tests {
             panic!("an open wait keeps its variant");
         };
         assert_eq!((wait_id.as_str(), since), ("w_9", 0));
-        assert_eq!(predicate, Default::default());
+        assert_eq!(predicate, "", "a reshaped predicate reads as no text");
         assert_eq!(state.source.waiting, Some(StateSource::WaitRegistry));
         let state: AgentState = serde_json::from_str(r#"{"waiting":"parked"}"#).unwrap();
         assert_eq!(state.waiting, Waiting::Unknown);

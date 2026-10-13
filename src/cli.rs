@@ -1414,7 +1414,9 @@ fn print_wait_help() {
     eprintln!("  {}", events::PARK_USAGE);
     eprintln!(
         "    parks this agent on a registered wait and returns at once, so it can end \
-         its turn; the wait shows as `waiting_on_event` until the deadline"
+         its turn; the wait shows as `waiting_on_event` until the deadline (at most 24h). \
+         PREDICATE: 'delegate:<id> phase in [finished, needs_human, gone]' or \
+         'reply:<correlation_id>'; exit 2 for a bad or unsupported predicate"
     );
 }
 

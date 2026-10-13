@@ -227,7 +227,7 @@ pub enum Method {
     /// against the attested caller. Never on the wire, so no client can open
     /// or close a wait it does not hold.
     #[serde(skip)]
-    WaitHold(WaitPredicate, u64),
+    WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
     /// In-process only: the held `events.read` returned.
     #[serde(skip)]
     WaitRelease(String),
@@ -2122,27 +2122,12 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
-/// What a registered wait waits for (ADR-0028 §5): the `events.read`
-/// filter, from the cursor the wait started at. A park and a held read share
-/// it, so `state.waiting` reads the same for both.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitPredicate {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kinds: Vec<EventKind>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subjects: Vec<String>,
-    #[serde(default)]
-    pub after: u64,
-}
-
-/// `wait.park` (ADR-0028 §5, #1031). `deadline_ms` is relative and
+/// `wait.park` (ADR-0028 §5, #1031). `until` is a predicate text the server
+/// parses (`crate::api::wait_predicate`); `deadline_ms` is relative and
 /// mandatory: a park that never opens still ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitParkParams {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kinds: Vec<EventKind>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subjects: Vec<String>,
+    pub until: String,
     pub deadline_ms: u64,
 }
 
@@ -2909,6 +2894,8 @@ pub enum ResponseResult {
     WaitParked {
         wait_id: String,
         agent_id: String,
+        /// The predicate in its canonical form.
+        predicate: String,
         deadline: u64,
     },
     /// The in-process `WaitHold`: the wait it opened, `None` when the caller
@@ -4199,12 +4186,13 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
     },
-    /// #1031: `since` and `deadline` are Unix ms.
+    /// #1031: `predicate` in its canonical form, `since` and `deadline` in
+    /// Unix ms.
     #[serde(rename = "wait.expired")]
     WaitExpired {
         wait_id: String,
         agent_id: String,
-        predicate: WaitPredicate,
+        predicate: String,
         since: u64,
         deadline: u64,
     },

@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, EventEnvelope, EventGap, EventsReadParams, Method, Request,
-    ResponseResult, SequencedEvent, SuccessResponse, WaitPredicate, EVENTS_READ_DEFAULT_LIMIT,
+    ResponseResult, SequencedEvent, SuccessResponse, EVENTS_READ_DEFAULT_LIMIT,
     EVENTS_READ_MAX_LIMIT,
 };
 use crate::api::server::{should_stop_connection, CONNECTION_POLL_INTERVAL};
+use crate::api::wait_predicate::WaitPredicate;
 use crate::api::{ApiRequestMessage, ApiRequestSender, EventHub};
 
 /// A held read's open wait in the App's registry, released on drop so that
@@ -172,7 +173,7 @@ pub(super) fn read_events(
         // Nothing matched up to here: skip it rather than rescan it.
         after = read.scanned;
         if held.is_none() {
-            let predicate = WaitPredicate {
+            let predicate = WaitPredicate::Events {
                 kinds: params.kinds.clone(),
                 subjects: params.subjects.clone(),
                 after: params.after,

@@ -436,12 +436,17 @@ pub(super) fn table() -> &'static [Tool] {
             description: "Park yourself on a registered wait (ADR-0028 §5) and \
                           return at once, so you can end your turn: until \
                           `deadline_ms` passes you read `waiting_on_event`, and \
-                          a supervisor treats you as parked, not stalled. The \
-                          wait names the events you wait for, as in \
-                          `flock_events_read` (`kinds`, `subjects`). Returns the \
-                          `wait_id` and the deadline (Unix ms). Refusals: \
-                          `no_caller_pane` (not called from an agent pane), \
-                          `invalid_params` (no deadline, a non-durable kind).",
+                          a supervisor treats you as parked, not stalled. \
+                          `until` is the predicate: `delegate:<agent id> phase \
+                          in [finished, needs_human, gone]` or \
+                          `reply:<correlation id>`. Returns the `wait_id`, the \
+                          predicate in canonical form and the deadline (Unix \
+                          ms). Refusals: `wait_predicate_invalid`, \
+                          `wait_predicate_unsupported` (`pr:` and \
+                          `any-delegate-of-mine` are not supported yet), \
+                          `wait_deadline_too_long` (over 24 h), \
+                          `too_many_waits` (16 open parks), `peer_incompatible` \
+                          (a delegate on another host), `no_caller_pane`.",
             input_schema: schema_wait_park,
             build: build_wait_park,
         },
@@ -711,11 +716,10 @@ fn schema_wait_park() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "kinds": {"type": "array", "items": {"type": "string"}, "description": "Durable event kinds the wait is for, e.g. `pr.ci_completed`."},
-            "subjects": {"type": "array", "items": {"type": "string"}, "description": "Ids an event's data must carry as a top-level value."},
-            "deadline_ms": {"type": "integer", "minimum": 1, "description": "How long the wait stays open, in ms. Mandatory."},
+            "until": {"type": "string", "description": "The predicate: `delegate:<agent id> phase in [<phase>, ...]` or `reply:<correlation id>`."},
+            "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 86_400_000, "description": "How long the wait stays open, in ms (at most 24 h). Mandatory."},
         },
-        "required": ["deadline_ms"],
+        "required": ["until", "deadline_ms"],
         "additionalProperties": false,
     })
 }
@@ -1639,16 +1643,16 @@ mod tests {
     #[test]
     fn wait_park_needs_a_deadline() {
         let Method::WaitPark(params) = build_wait_park(json!({
-            "kinds": ["pr.ci_completed"], "subjects": ["agent_d1"], "deadline_ms": 600_000
+            "until": "reply:c1", "deadline_ms": 600_000
         }))
         .unwrap() else {
             panic!("expected wait.park");
         };
         assert_eq!(
-            (params.subjects, params.deadline_ms),
-            (vec!["agent_d1".into()], 600_000)
+            (params.until.as_str(), params.deadline_ms),
+            ("reply:c1", 600_000)
         );
-        assert!(build_wait_park(json!({"kinds": ["pr.ci_completed"]})).is_err());
+        assert!(build_wait_park(json!({"until": "reply:c1"})).is_err());
     }
 
     /// The schema is generated from the enum, so the caller-visible set of

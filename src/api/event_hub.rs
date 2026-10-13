@@ -882,7 +882,7 @@ mod tests {
     /// The line this build writes has that shape and reads back whole here.
     #[test]
     fn wait_expired_is_a_line_an_older_reader_skips() {
-        use crate::api::schema::{EventData, WaitPredicate};
+        use crate::api::schema::EventData;
         let path = temp_log("wait-expired");
         let hub = EventHub::with_persistence(path.clone());
         let expired = EventEnvelope {
@@ -890,11 +890,7 @@ mod tests {
             data: EventData::WaitExpired {
                 wait_id: "w_1_1".into(),
                 agent_id: "agent_a".into(),
-                predicate: WaitPredicate {
-                    kinds: vec![EventKind::PrMerged],
-                    subjects: vec!["agent_b".into()],
-                    after: 4,
-                },
+                predicate: "delegate:agent_b phase in [finished]".into(),
                 since: 1,
                 deadline: 2,
             },

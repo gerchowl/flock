@@ -1491,7 +1491,7 @@ mod tests {
             r#"{"after":1,"kinds":["message_queued"],"subjects":["ws_1:p2"],"wait_ms":50}"#,
         );
         assert_eq!(timed_out["result"]["events"], serde_json::json!([]));
-        let predicate = crate::api::schema::WaitPredicate {
+        let predicate = crate::api::wait_predicate::WaitPredicate::Events {
             kinds: vec![crate::api::schema::EventKind::MessageQueued],
             subjects: vec!["ws_1:p2".into()],
             after: 1,

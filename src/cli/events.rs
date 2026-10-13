@@ -6,7 +6,7 @@
 //! `flk events read` / `flk events wait` (ADR-0028 §5, #1029): the client
 //! side of `events.read`. Both are one server-side long-poll per call, never
 //! a client loop over `agent get`. `flk wait park` (#1031) registers a wait
-//! with the same filter and returns at once.
+//! on a predicate and returns at once.
 
 use std::time::{Duration, Instant};
 
@@ -20,8 +20,7 @@ pub(super) const READ_USAGE: &str =
     "flk events read [--after CURSOR] [--kinds K1,K2] [--subject ID]... [--limit N] [--json]";
 pub(super) const WAIT_USAGE: &str =
     "flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR";
-pub(super) const PARK_USAGE: &str =
-    "flk wait park [--kinds K1,K2] [--subject ID]... --deadline DUR [--json]";
+pub(super) const PARK_USAGE: &str = "flk wait park --until PREDICATE --deadline DUR [--json]";
 
 /// Slack on top of the server-side hold before the client stops reading.
 const READ_GRACE: Duration = Duration::from_secs(10);
@@ -110,32 +109,62 @@ fn parse_flags(args: &[String], allowed: &[&str]) -> Result<Flags, String> {
 }
 
 /// `flk wait park`: park the calling agent until the deadline, so it can
-/// end its turn. State-changing, so an older server refuses it with exit 78
-/// before it is sent (#868).
+/// end its turn. The server parses `--until`. State-changing, so an older
+/// server refuses it with exit 78 before it is sent (#868).
 pub(super) fn park(args: &[String]) -> std::io::Result<i32> {
-    let flags =
-        parse_flags(args, &["--kinds", "--subject", "--deadline", "--json"]).and_then(|flags| {
-            match flags.timeout_ms {
-                Some(0) => Err("--deadline must be above 0".to_owned()),
-                Some(_) => Ok(flags),
-                None => Err("missing required --deadline".to_owned()),
+    let (mut until, mut deadline_ms, mut json) = (None, None, super::output::json());
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let parsed = match flag.as_str() {
+            "--json" => {
+                json = true;
+                Ok(())
             }
-        });
-    let flags = match flags {
-        Ok(flags) => flags,
-        Err(reason) => {
+            "--until" => rest
+                .next()
+                .map(|value| until = Some(value.clone()))
+                .ok_or_else(|| "--until needs a predicate".to_owned()),
+            "--deadline" => rest
+                .next()
+                .ok_or_else(|| "--deadline needs a value".to_owned())
+                .and_then(|value| {
+                    crate::detect::provider_limit::parse_duration(value)
+                        .map_err(|reason| format!("invalid value for --deadline: {reason}"))
+                })
+                .map(|ms| deadline_ms = Some(ms)),
+            other => Err(format!("unknown option: {other}")),
+        };
+        if let Err(reason) = parsed {
             eprintln!("{reason}\nusage: {PARK_USAGE}");
             return Ok(exit::USAGE);
         }
+    }
+    let (Some(until), Some(deadline_ms @ 1..)) = (until, deadline_ms) else {
+        eprintln!("--until and a --deadline above 0 are required\nusage: {PARK_USAGE}");
+        return Ok(exit::USAGE);
     };
-    super::print_response(&super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: "cli:wait:park".into(),
-        method: Method::WaitPark(WaitParkParams {
-            kinds: flags.params.kinds,
-            subjects: flags.params.subjects,
-            deadline_ms: flags.timeout_ms.unwrap_or_default(),
-        }),
-    })?)
+        method: Method::WaitPark(WaitParkParams { until, deadline_ms }),
+    })?;
+    if let Some(code) = response["error"]["code"].as_str() {
+        return Ok(super::output::error(
+            &response,
+            super::error_code_exit(code, true),
+        ));
+    }
+    let result = &response["result"];
+    if json {
+        println!("{result}");
+    } else {
+        println!(
+            "parked {} on {} until {} (Unix ms)",
+            result["wait_id"].as_str().unwrap_or("?"),
+            result["predicate"].as_str().unwrap_or("?"),
+            result["deadline"],
+        );
+    }
+    Ok(exit::SUCCESS)
 }
 
 fn events_read(params: EventsReadParams, timeout: Duration) -> std::io::Result<Value> {
