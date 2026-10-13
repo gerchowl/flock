@@ -81,6 +81,7 @@ pub(crate) fn start_server_for_mode(
             node_id: Some(identity.node_id()),
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
+            agent_questions: true,
         }),
     )
 }
@@ -1264,6 +1265,7 @@ mod tests {
                 node_id: None,
                 clone_detection_warning: None,
                 agent_start_label: true,
+                agent_questions: true,
             }),
             None,
             &Mutex::default(),

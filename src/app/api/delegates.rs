@@ -100,6 +100,7 @@ impl App {
                     branch: edge.branch.clone(),
                     repo: edge.repo.clone(),
                     pr: pr.map(PrInfo::from_state),
+                    questions: agent.and_then(|agent| agent.questions),
                 }
             })
             .collect()

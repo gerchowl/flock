@@ -504,6 +504,7 @@ fn restore_tab(
         let saved_run_id = saved_pane.and_then(|p| p.run_id.clone());
         let saved_spawn_depth = saved_pane.map_or(0, |p| p.spawn_depth);
         let saved_spawned_by = saved_pane.and_then(|p| p.spawned_by.clone());
+        let saved_questions = saved_pane.and_then(|p| p.questions).unwrap_or_default();
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_last_prompt = saved_pane.and_then(|p| p.last_prompt.clone());
         let saved_header_reserved = saved_pane.is_some_and(|p| p.header_reserved);
@@ -582,6 +583,7 @@ fn restore_tab(
             terminal.run_id = saved_run_id.clone();
             terminal.spawn_depth = saved_spawn_depth;
             terminal.spawned_by = saved_spawned_by.clone();
+            terminal.questions = saved_questions;
             if let Some(agent) = initial_restore_agent {
                 let _ = terminal.set_detected_state_with_screen_signals_at(
                     Some(agent),
@@ -660,6 +662,7 @@ fn restore_tab(
                 terminal.run_id = saved_run_id.clone();
                 terminal.spawn_depth = saved_spawn_depth;
                 terminal.spawned_by = saved_spawned_by.clone();
+                terminal.questions = saved_questions;
                 if let Some(agent) = initial_restore_agent {
                     let _ = terminal.set_detected_state_with_screen_signals_at(
                         Some(agent),
@@ -1185,6 +1188,7 @@ mod tests {
                             run_id: None,
                             spawn_depth: 0,
                             spawned_by: None,
+                            questions: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:opencode".into(),
                                 agent: "opencode".into(),
@@ -1245,13 +1249,12 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn native_agent_restore_defers_runtime_launch() {
-        // Deterministic, existing directory: restore only needs the path to
-        // resolve, and nothing here asserts on which directory it is.
-        let cwd = std::env::temp_dir();
-        let snapshot = SessionSnapshot {
+    /// One codex agent pane with a resumable session.
+    fn codex_agent_snapshot(
+        cwd: PathBuf,
+        questions: Option<crate::api::schema::QuestionPolicy>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1278,6 +1281,7 @@ mod tests {
                             run_id: None,
                             spawn_depth: 0,
                             spawned_by: None,
+                            questions,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:codex".into(),
                                 agent: "codex".into(),
@@ -1304,7 +1308,15 @@ mod tests {
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
             pane_id_aliases: std::collections::HashMap::new(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn native_agent_restore_defers_runtime_launch() {
+        // Deterministic, existing directory: restore only needs the path to
+        // resolve, and nothing here asserts on which directory it is.
+        let snapshot = codex_agent_snapshot(std::env::temp_dir(), None);
         let (events, _event_rx) = mpsc::channel(4);
 
         let (_workspaces, terminals, runtimes) = restore(
@@ -1361,6 +1373,45 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    /// #1179: a restored or handed-off agent keeps its question policy, and a
+    /// snapshot from before #1179 restores as `ask_human`.
+    #[tokio::test]
+    async fn a_restored_agent_keeps_its_question_policy() {
+        use crate::api::schema::QuestionPolicy;
+        for (saved, restored) in [
+            (Some(QuestionPolicy::Route), QuestionPolicy::Route),
+            (None, QuestionPolicy::AskHuman),
+        ] {
+            let snapshot = codex_agent_snapshot(std::env::temp_dir(), saved);
+            let (_workspaces, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(terminals.values().next().unwrap().questions, restored);
+            let (_workspaces, terminals, _runtimes) = restore_handoff(
+                &snapshot,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                &mut HashMap::new(),
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("handoff restore");
+            assert_eq!(terminals.values().next().unwrap().questions, restored);
+        }
     }
 
     #[tokio::test]
@@ -1457,6 +1508,7 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
                 launch_env: Vec::new(),

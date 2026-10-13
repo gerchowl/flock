@@ -2712,6 +2712,7 @@ mod tests {
                     node_id: None,
                     clone_detection_warning: None,
                     agent_start_label: true,
+                    agent_questions: true,
                 }),
                 session_health: None,
                 api_listener: None,

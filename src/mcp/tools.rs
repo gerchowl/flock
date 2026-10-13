@@ -489,7 +489,8 @@ fn schema_agent_start() -> Value {
                 },
                 "required": ["kind"]
             },
-            "name": { "type": "string", "description": "Custom label for the child agent." }
+            "name": { "type": "string", "description": "Custom label for the child agent." },
+            "questions": questions_property()
         },
         "required": ["agent", "prompt", "location"],
         "additionalProperties": false
@@ -511,6 +512,10 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
         name: optional_string(&args, "name")?,
         // An MCP-spawned child never steals the operator's focus.
         focus: false,
+        questions: optional_questions(&args)?,
+        // An MCP caller is an agent, and an unattended start is an operator
+        // verb (ADR-0034 §2), so the tool does not offer it.
+        unattended: false,
     }))
 }
 
@@ -614,6 +619,7 @@ fn schema_agent_fork() -> Value {
                 "type": "string",
                 "description": "Custom label for the new workspace.",
             },
+            "questions": questions_property(),
         },
         "required": ["target"],
         "additionalProperties": false,
@@ -964,6 +970,8 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
         label: optional_string(&args, "label")?,
         pivot: optional_string(&args, "pivot")?,
         focus: false,
+        questions: optional_questions(&args)?,
+        unattended: false,
     }))
 }
 
@@ -1436,6 +1444,25 @@ fn optional_string(args: &Value, field: &str) -> Result<Option<String>, McpError
             "`{field}` must be a string"
         ))),
     }
+}
+
+/// The `questions` argument of the tools that start an agent (#1179).
+fn questions_property() -> Value {
+    json!({"type": "string", "enum": ["route", "deny"],
+        "description": "Where the child's questions go (ADR-0034 §2). Default route: to you, as structured questions. deny refuses them, e.g. for a delegate started over ssh. A policy that reaches the human is an operator verb and is refused (exit 13)."})
+}
+
+/// `questions`, in any wire spelling: the server, not the schema, refuses a
+/// policy an agent may not grant, so the refusal carries its exit code.
+fn optional_questions(
+    args: &Value,
+) -> Result<Option<crate::api::schema::QuestionPolicy>, McpError> {
+    optional_string(args, "questions")?
+        .map(|raw| {
+            crate::api::schema::QuestionPolicy::parse(&raw)
+                .ok_or_else(|| McpError::invalid_params(format!("invalid `questions`: {raw}")))
+        })
+        .transpose()
 }
 
 fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>, McpError> {
