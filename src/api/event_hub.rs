@@ -877,6 +877,44 @@ mod tests {
         cleanup(&path);
     }
 
+    /// #1031: `wait.expired` is new to v2.0.0, whose reader skips a line
+    /// with a numeric `seq` and an `envelope.event` it cannot type (#1058).
+    /// The line this build writes has that shape and reads back whole here.
+    #[test]
+    fn wait_expired_is_a_line_an_older_reader_skips() {
+        use crate::api::schema::{EventData, WaitPredicate};
+        let path = temp_log("wait-expired");
+        let hub = EventHub::with_persistence(path.clone());
+        let expired = EventEnvelope {
+            event: EventKind::WaitExpired,
+            data: EventData::WaitExpired {
+                wait_id: "w_1_1".into(),
+                agent_id: "agent_a".into(),
+                predicate: WaitPredicate {
+                    kinds: vec![EventKind::PrMerged],
+                    subjects: vec!["agent_b".into()],
+                    after: 4,
+                },
+                since: 1,
+                deadline: 2,
+            },
+        };
+        hub.push(expired.clone());
+        drop(hub);
+        let line = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(value["seq"].is_u64(), "{line}");
+        assert_eq!(value["envelope"]["event"], "wait.expired");
+        let restarted = EventHub::with_persistence(path.clone());
+        let back: Vec<EventEnvelope> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        assert_eq!(back, [expired]);
+        cleanup(&path);
+    }
+
     /// #1027: the derived agent kinds are new to v2.0.0, whose reader skips
     /// a line when `envelope.event` is a string it cannot type and `seq` is a
     /// number (#1058). Every line this build writes for them has that shape,
