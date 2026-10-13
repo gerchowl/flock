@@ -11,6 +11,9 @@
 - Builds on: ADR-0027 (delegate edges), ADR-0028 (state vocabulary, events,
   registered waits, wake), ADR-0029 (exit and error contract).
 - Decision owner: operator.
+- Amended by ADR-0034 §4 (shipped with #1180): §7's skew rule has one narrow
+  exception, for question points on hinted panes only, which refuse the
+  question tool when the server is unreachable, silent or older.
 - Implemented: G1a (#1034): the durable `Goal*` kinds, the in-memory record
   and its re-issue on start and rotation (`src/app/goals.rs`). G1b (#1155):
   `goal.arm`, `goal.status`, `goal.pause`, `goal.resume` and `goal.stop` and

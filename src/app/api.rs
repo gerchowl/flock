@@ -10,7 +10,7 @@ mod edges;
 mod fleet;
 mod goals;
 mod handoffs;
-mod integrations;
+pub(super) mod integrations;
 mod lineage;
 mod mesh;
 mod mesh_forward;
@@ -612,6 +612,11 @@ impl App {
 
         if let AppEvent::WorktreeKillGateFinished(result) = ev {
             self.handle_worktree_kill_gate_finished(result);
+            return;
+        }
+
+        if let AppEvent::IntegrationsInstalled(messages) = ev {
+            self.finish_recommended_integrations(messages);
             return;
         }
 
@@ -1365,6 +1370,7 @@ impl App {
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
         self.pending_paste = None;
+        self.pending_integration_install = None;
         self.detach_pending_message_relay();
         debug_assert!(
             self.pending_agent_submit.is_none(),
@@ -1516,6 +1522,7 @@ impl App {
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
+            Method::HookDecide(params) => return self.handle_hook_decide(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),

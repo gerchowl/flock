@@ -166,6 +166,9 @@ pub enum Method {
     OwnerPolicyAdopt(OwnerPolicyParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
+    /// ADR-0034 §1: a harness hook asks the server for its verdict.
+    #[serde(rename = "hook.decide")]
+    HookDecide(HookDecideParams),
     #[serde(rename = "msg.mute")]
     MsgMute(MsgMuteParams),
     #[serde(rename = "pane.split")]
@@ -457,6 +460,7 @@ impl Method {
             | Self::MsgReply(_)
             | Self::MsgWake(_)
             | Self::MsgMute(_)
+            | Self::HookDecide(_)
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
@@ -1618,6 +1622,62 @@ pub struct MsgWakeParams {
     /// `msg.read` resolves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+}
+
+/// `hook.decide` — the verdict for one harness hook call (ADR-0034 §1).
+///
+/// The calling pane is attested from the caller's process ancestry, never
+/// taken from the request, and its agent record's question policy decides.
+/// A caller the server cannot attest gets `no_caller_pane`, which the hook
+/// treats like an unreachable server (ADR-0034 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDecideParams {
+    pub point: HookPoint,
+    pub harness: HookHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The tool the harness is about to run, as the harness names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// The policy points `hook.decide` serves (ADR-0034 §1). Only `question` is
+/// wired so far: the shell gate's `tool.before` lands with #1181.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookPoint {
+    #[serde(rename = "question")]
+    Question,
+}
+
+/// The harness whose hook is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookHarness {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl HookHarness {
+    /// The harness's own question tools (ADR-0034 inventory): the tools a
+    /// `question` point is about, beside `[questions] human_tools`.
+    pub fn question_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["AskUserQuestion", "ExitPlanMode"],
+            Self::Codex => &["request_user_input"],
+            Self::Opencode => &["question"],
+        }
+    }
+}
+
+/// A `hook.decide` verdict. `answer` and `defer` arrive with #1183.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookVerdict {
+    /// Let the call through: the harness behaves as it would without flk.
+    Pass,
+    /// Refuse the call. The reason goes to the model.
+    Deny,
 }
 
 /// `msg.mute` — the recipient declines to be woken, for a bounded window
@@ -3165,6 +3225,12 @@ pub enum ResponseResult {
         /// The messages just consumed, oldest first. Each is marked delivered
         /// as part of this call, so a second read returns an empty list.
         messages: Vec<InboxMessage>,
+    },
+    HookDecide {
+        verdict: HookVerdict,
+        /// What the model is told on `deny`. Absent on `pass`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     MsgWake {
         /// The inbox this count is for, as a public pane id (#438). Lets a

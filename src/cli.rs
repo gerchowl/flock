@@ -28,6 +28,7 @@ mod fleet;
 mod goal;
 mod help;
 mod hook;
+mod hook_question;
 mod integration;
 mod issue;
 mod lineage;
