@@ -1529,9 +1529,10 @@ enum PrQuery {
 /// `github_remote` decides what a gh that cannot be started means: on a repo
 /// with a github.com remote it is a failure, elsewhere there is nothing gh
 /// could have reported. Only gh's own "no pull requests found" is a no, and
-/// only its "no remotes / no known GitHub host" answers are not-GitHub; every
-/// other non-zero exit is a failure, which is the fail-closed reading. A
-/// known limit: a GitHub Enterprise remote with gh missing reads as
+/// its "no remotes / no known GitHub host" answers are not-GitHub. An
+/// authentication failure (exit 4 or "gh auth login") is also not-GitHub
+/// when no github.com remote exists, but fails closed on github.com repos.
+/// Every other non-zero exit is a failure. A known limit: a GitHub Enterprise remote with gh missing reads as
 /// not-GitHub, since only github.com URLs are recognised here.
 fn gh_pr_query(
     args: &[&str],
@@ -1542,6 +1543,12 @@ fn gh_pr_query(
 ) -> PrQuery {
     let mut command = crate::process::TracedCommand::new("gh", "worktree");
     command.args(args).current_dir(cwd);
+    #[cfg(test)]
+    tests::GH_COMMAND_PATH.with(|path| {
+        if let Some(path) = path.borrow().as_ref() {
+            command.env("PATH", path);
+        }
+    });
     let output = match command.output_traced() {
         Ok(output) => output,
         Err(err) if github_remote => return PrQuery::Failed(format!("gh did not run: {err}")),
@@ -3638,28 +3645,64 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
-    /// Run `body` with a PATH that resolves `git` and nothing else, so `gh` is
-    /// genuinely ABSENT rather than present-and-unreachable.
-    ///
-    /// The distinction is the whole point of the #633 fixture. A stub `gh` that
-    /// exits non-zero proves the fallback works when GitHub says no; a missing
-    /// `gh` proves it works when nobody can be asked at all, which is the state
-    /// an offline machine, a server launched without the gh profile, and every
-    /// rate-limited hour are in. Both would pass with a stub and only one with
-    /// this.
+    thread_local! {
+        // Applied only to the gh subprocess, never to the test runner's env.
+        pub(super) static GH_COMMAND_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    /// Run `body` with gh's command-local PATH resolving only fixture tools.
+    /// Without a stub, gh is genuinely absent rather than failing to answer.
+    /// Git commands keep their normal environment.
     fn with_gh_absent_from_path<T>(scratch: &Path, body: impl FnOnce() -> T) -> T {
         let git = resolve_on_path("git").expect("git is on PATH for the fixture itself");
         let bin_dir = scratch.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::os::unix::fs::symlink(&git, bin_dir.join("git")).unwrap();
-        let original = std::env::var_os("PATH");
-        std::env::set_var("PATH", &bin_dir);
-        let value = body();
-        match original {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                GH_COMMAND_PATH.with(|path| path.replace(self.0.take()));
+            }
         }
+        let original_path = std::env::var_os("PATH");
+        let _restore = Restore(GH_COMMAND_PATH.with(|path| path.replace(Some(bin_dir))));
+        let value = body();
+        assert_eq!(std::env::var_os("PATH"), original_path);
         value
+    }
+
+    #[test]
+    fn gh_fixture_path_is_command_local_and_restored_after_a_panic() {
+        let scratch = unique_temp_path("gh-command-path");
+        let original = std::env::var_os("PATH");
+        let result = std::panic::catch_unwind(|| {
+            with_gh_absent_from_path(&scratch, || {
+                assert_eq!(std::env::var_os("PATH"), original);
+                let scoped = GH_COMMAND_PATH.with(|path| path.borrow().clone().unwrap());
+                assert!(!scoped.join("gh").exists());
+                let expected = original.clone();
+                std::thread::spawn(move || {
+                    assert_eq!(std::env::var_os("PATH"), expected);
+                    GH_COMMAND_PATH.with(|path| assert!(path.borrow().is_none()));
+                })
+                .join()
+                .unwrap();
+                let output = std::process::Command::new("gh")
+                    .env("PATH", scoped)
+                    .output();
+                assert_eq!(output.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                panic!("exercise scope teardown");
+            });
+        });
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"exercise scope teardown")
+        );
+        assert_eq!(std::env::var_os("PATH"), original);
+        GH_COMMAND_PATH.with(|path| assert!(path.borrow().is_none()));
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     /// A repo shaped like one whose GitHub default branch moved AFTER the clone:
