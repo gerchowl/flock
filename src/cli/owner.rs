@@ -1,7 +1,6 @@
 #![expect(
-    clippy::print_stdout,
     clippy::print_stderr,
-    reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
+    reason = "CLI output surface: usage and errors on stderr; replies go through print_response"
 )]
 //! `flk owner bind|unbind|list|show` (ADR-0035 §1, #1231): the operator's
 //! verbs over the `owner.*` socket methods. `flk owner policy show|adopt`
@@ -37,8 +36,9 @@ pub(super) fn run_owner_command(args: &[String]) -> std::io::Result<i32> {
         Some("list") if rest.is_empty() => Ok(Method::OwnerList(EmptyParams {})),
         Some("list") => Err(format!("usage: {LIST_USAGE}")),
         Some("show") => repo_operand(rest, SHOW_USAGE).map(Method::OwnerShow),
-        Some("help") => {
-            println!("{}", usage());
+        // Answered on stderr, as `flk owner policy`'s dispatcher did (#1195).
+        Some("help" | "--help" | "-h") if rest.is_empty() => {
+            eprintln!("{}", usage());
             return Ok(exit::SUCCESS);
         }
         _ => Err(usage()),

@@ -328,3 +328,37 @@ fn a_bind_without_its_required_flags_exits_2() {
     let listed = json_out(&cli(&server, &["owner", "list"]));
     assert_eq!(listed["result"]["bindings"], serde_json::json!([]));
 }
+
+/// `flk owner help`, `--help` and `-h` print every verb's usage on stderr
+/// and exit 0, as dev's `flk owner policy` dispatcher did (#1195). Help is
+/// answered before any request, so no server is needed.
+#[test]
+fn every_help_form_prints_the_usage_and_exits_0() {
+    let dir = std::env::temp_dir().join(format!("fown-help-{}", std::process::id()));
+    let mut problems = Vec::new();
+    for form in ["help", "--help", "-h"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["owner", form])
+            .env("FLOCK_SOCKET_PATH", dir.join("no-server.sock"))
+            .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+            .env_remove("FLOCK_PANE_ID")
+            .env_remove("FLOCK_AGENT_ID")
+            .env_remove("FLOCK_ENV")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(0) {
+            problems.push(format!("{form}: exit {:?}", output.status.code()));
+        }
+        for usage in [
+            "usage: flk owner bind",
+            "flk owner show",
+            "flk owner policy show",
+        ] {
+            if !stderr.contains(usage) {
+                problems.push(format!("{form}: {usage:?} not on stderr"));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
