@@ -81,6 +81,7 @@
                   (stableSccacheFor pkgs)
                 ];
                 RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
                 FLOCK_TEST_SCCACHE_RAW = "${pkgs.sccache}/bin/sccache";
               }
               ''
@@ -162,6 +163,7 @@
             hook = ''
               export PATH="${stableSccache}/bin:$PATH"
               # The isolated cache-reuse probe also needs the unwrapped binary.
+              export FLOCK_TEST_SCCACHE_WRAPPER="${stableSccache}/bin/sccache"
               export FLOCK_TEST_SCCACHE_RAW="${pkgs.sccache}/bin/sccache"
               case "$RUSTC_WRAPPER" in
                 sccache|*/sccache)

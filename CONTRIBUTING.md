@@ -96,7 +96,9 @@ Directory-creation failure prints the path and fails the build.
 Run `nix develop --command just test-sccache` to check deleted startup temp
 directories, explicit and lazy restarts, and hits from a platform-default cache
 warmed by an unwrapped daemon. The probe always supplies and asserts private
-endpoints, including when invoked outside the devShell. It isolates HOME and
+endpoints. Outside the devShell it exits before contacting any server with
+`run inside nix develop (the wrapper is not active)`. The endpoint guard also
+remains active under `python3 -O`. The probe isolates HOME and
 XDG paths, so it exercises platform default cache selection without accessing
 or stopping the host's shared cache server. Nix CI executes this check on Linux
 and evaluates Darwin checks without building them. The Darwin probe can be

@@ -12,16 +12,32 @@ import unittest
 def assert_private_endpoint(env, root, port):
     """Refuse every endpoint except the private socket or allocated port."""
     if port is None:
-        assert env.get('SCCACHE_SERVER_UDS') == str(root / 'server.sock')
-        assert 'SCCACHE_SERVER_PORT' not in env
+        private = (env.get('SCCACHE_SERVER_UDS') == str(root / 'server.sock')
+                   and 'SCCACHE_SERVER_PORT' not in env)
     else:
-        assert port != 4226
-        assert env.get('SCCACHE_SERVER_PORT') == str(port)
-        assert 'SCCACHE_SERVER_UDS' not in env
+        private = (port != 4226 and env.get('SCCACHE_SERVER_PORT') == str(port)
+                   and 'SCCACHE_SERVER_UDS' not in env)
+    if not private:
+        raise RuntimeError('refusing non-private sccache endpoint')
+
+
+def require_wrapper():
+    """Reject an inactive devShell before creating or contacting any server."""
+    expected = os.environ.get('FLOCK_TEST_SCCACHE_WRAPPER')
+    active = shutil.which('sccache')
+    rust_wrapper = shutil.which(os.environ.get('RUSTC_WRAPPER', ''))
+    raw = shutil.which(os.environ.get('FLOCK_TEST_SCCACHE_RAW', ''))
+    if not expected or not raw or any(
+        not path or Path(path).resolve() != Path(expected).resolve()
+        for path in (active, rust_wrapper)
+    ):
+        raise SystemExit('run inside nix develop (the wrapper is not active)')
+    return expected
 
 
 class SccacheProbe(unittest.TestCase):
     def probe(self, private_port):
+        wrapper = require_wrapper()
         # Short roots also keep the default Unix socket below macOS sun_path limits.
         with tempfile.TemporaryDirectory(prefix='sc-', dir='/tmp') as directory:
             root = Path(directory)
@@ -41,9 +57,7 @@ class SccacheProbe(unittest.TestCase):
                 env['SCCACHE_SERVER_PORT'] = str(port)
             else:
                 env['SCCACHE_SERVER_UDS'] = str(root / 'server.sock')
-            command = ((os.environ.get('FLOCK_TEST_SCCACHE')
-                        or os.environ.get('RUSTC_WRAPPER') or 'sccache')
-                       if private_port else 'sccache')
+            command = wrapper if private_port else 'sccache'
 
             def run(*args, executable=None):
                 assert_private_endpoint(env, root, port)
@@ -114,4 +128,5 @@ class SccacheProbe(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    require_wrapper()
     unittest.main()

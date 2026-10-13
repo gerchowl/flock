@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -98,11 +99,11 @@ class ProbeEndpointTests(unittest.TestCase):
     def test_rejects_missing_endpoint_and_default_port(self):
         root = Path('probe-root')
         for env, port in [({}, None), ({'SCCACHE_SERVER_PORT': '4226'}, 4226)]:
-            with self.subTest(env=env), self.assertRaises(AssertionError):
+            with self.subTest(env=env), self.assertRaisesRegex(RuntimeError, 'refusing non-private sccache endpoint'):
                 assert_private_endpoint(env, root, port)
 
     def test_rejects_foreign_socket(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(RuntimeError, 'refusing non-private sccache endpoint'):
             assert_private_endpoint({'SCCACHE_SERVER_UDS': 'foreign.sock'},
                                     Path('probe-root'), None)
 
@@ -111,3 +112,41 @@ class ProbeEndpointTests(unittest.TestCase):
         assert_private_endpoint({'SCCACHE_SERVER_UDS': str(root / 'server.sock')},
                                 root, None)
         assert_private_endpoint({'SCCACHE_SERVER_PORT': '43210'}, root, 43210)
+
+    def test_guard_survives_python_optimization(self):
+        result = subprocess.run(
+            [sys.executable, '-O', '-c',
+             "from pathlib import Path; "
+             "from scripts.probe_sccache import assert_private_endpoint; "
+             "assert_private_endpoint({'SCCACHE_SERVER_PORT': '4226'}, Path('probe-root'), 4226)"],
+            cwd=ROOT, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('refusing non-private sccache endpoint', result.stderr)
+
+    def test_outside_devshell_fails_before_invoking_sccache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / 'invoked'
+            binary = root / 'sccache'
+            binary.write_text('#!/bin/sh\n: > "$PROBE_INVOCATION_MARKER"\n')
+            binary.chmod(0o755)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('FLOCK_', 'SCCACHE_', 'RUSTC_WRAPPER'))}
+            env.update(PATH=directory, PROBE_INVOCATION_MARKER=str(marker))
+            cases = [([], False), (['-O'], False), ([], True), (['-O'], True)]
+            for flags, stale_markers in cases:
+                if stale_markers:
+                    env.update(FLOCK_TEST_SCCACHE_WRAPPER=sys.executable,
+                               FLOCK_TEST_SCCACHE_RAW=str(binary),
+                               RUSTC_WRAPPER=sys.executable)
+                with self.subTest(flags=flags, stale_markers=stale_markers):
+                    result = subprocess.run(
+                        [sys.executable, *flags, str(ROOT / 'scripts/probe_sccache.py')],
+                        env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('run inside nix develop (the wrapper is not active)',
+                                  result.stderr)
+                    self.assertFalse(marker.exists())
+                    self.assertNotIn('Owned endpoint:', result.stdout)
