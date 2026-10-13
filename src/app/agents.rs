@@ -439,6 +439,31 @@ impl App {
         argv: &[String],
         focus: bool,
     ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        self.replace_agent_root_shell_with_start_check(
+            ws_idx,
+            tab_idx,
+            cwd,
+            argv,
+            focus,
+            |app, terminal_id, _| app.agent_exited_at_start(terminal_id),
+        )
+    }
+
+    /// Stage and commit a root replacement using the supplied start check.
+    /// The check runs before the existing shell or visible tab is changed.
+    fn replace_agent_root_shell_with_start_check(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        cwd: PathBuf,
+        argv: &[String],
+        focus: bool,
+        check_start: impl FnOnce(
+            &mut Self,
+            &TerminalId,
+            crate::layout::PaneId,
+        ) -> Option<AgentExitedAtStart>,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
         let old_tab = &self.state.workspaces[ws_idx].tabs[tab_idx];
         let old_pane = old_tab.root_pane;
         let old_terminal = old_tab.panes[&old_pane].attached_terminal_id.clone();
@@ -461,7 +486,7 @@ impl App {
         let pane_id = tab.root_pane;
         let terminal_id = terminal.id.clone();
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        if let Some(exit) = self.agent_exited_at_start(&terminal_id) {
+        if let Some(exit) = check_start(self, &terminal_id, pane_id) {
             if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
                 runtime.shutdown();
             }
@@ -1435,6 +1460,35 @@ enum StartPlacement {
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
 
+    /// Wait for the watcher's publication, with a failure ceiling for a child
+    /// that never exits. A successful wait depends only on the event.
+    fn wait_for_replacement_exit(
+        mut events: tokio::sync::mpsc::Receiver<crate::events::AppEvent>,
+    ) -> Result<crate::layout::PaneId, &'static str> {
+        // The synchronous start check runs inside Tokio. Use a separate runtime
+        // for the bounded receive so it also works on a multi-thread runtime.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("exit observer runtime")
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        while let Some(event) = events.recv().await {
+                            if let crate::events::AppEvent::PaneDied { pane_id } = event {
+                                return Ok(pane_id);
+                            }
+                        }
+                        Err("replacement watcher channel closed before PaneDied")
+                    })
+                    .await
+                    .unwrap_or(Err("replacement did not report PaneDied within 30 s"))
+                })
+        })
+        .join()
+        .expect("exit observer thread")
+    }
+
     fn test_app() -> crate::app::App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::app::App::new(
@@ -1965,34 +2019,70 @@ mod tests {
         shutdown(app);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_start_failed_replacement_keeps_shell() {
         let (mut app, workspace, pane) = created_root_shell().await;
         let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
-        for argv in [
-            vec![std::env::temp_dir()
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.argv = vec![std::env::temp_dir()
                 .join("flock-818-missing-program")
                 .to_string_lossy()
-                .into_owned()],
-            vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
-        ] {
-            let mut request = targeted_start_request(&workspace, None);
-            if let Method::AgentStart(params) = &mut request.method {
-                params.argv = argv;
-            }
-            let raw = app.handle_api_request(request);
-            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            assert!(response.get("error").is_some(), "{response}");
-            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
-            assert!(!app
-                .terminal_runtimes
-                .get(&terminal)
-                .unwrap()
-                .has_received_input());
-            assert_eq!(app.terminal_runtimes.len(), 1);
+                .into_owned()];
         }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["error"]["code"], "agent_start_failed",
+            "{response}"
+        );
+        assert_root_shell_preserved(&app, pane, &terminal);
+
+        // Only the staged replacement uses this channel. The existing shell
+        // retains its sender, so its events cannot satisfy the wait.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        app.event_tx = tx;
+        let result = app.replace_agent_root_shell_with_start_check(
+            0,
+            0,
+            std::env::temp_dir(),
+            &["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            false,
+            move |app, terminal_id, pane_id| {
+                let observed = wait_for_replacement_exit(rx);
+                if observed != Ok(pane_id) {
+                    // Reap every fixture child before panicking, including a
+                    // replacement that stayed running past the failure ceiling.
+                    for (_, runtime) in app.terminal_runtimes.drain() {
+                        runtime.shutdown();
+                    }
+                    panic!("expected replacement {pane_id:?} exit event, got {observed:?}");
+                }
+                app.agent_exited_at_start(terminal_id)
+            },
+        );
+        let Err(super::AgentStartError::ExitedAtStart(exit)) = result else {
+            shutdown(app);
+            panic!("expected replacement to be refused with ExitedAtStart");
+        };
+        assert_eq!(exit.exit_code, Some(17));
+        assert_root_shell_preserved(&app, pane, &terminal);
         shutdown(app);
+    }
+
+    fn assert_root_shell_preserved(
+        app: &crate::app::App,
+        pane: crate::layout::PaneId,
+        terminal: &crate::terminal::TerminalId,
+    ) {
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert!(!app
+            .terminal_runtimes
+            .get(terminal)
+            .unwrap()
+            .has_received_input());
+        assert_eq!(app.terminal_runtimes.len(), 1);
     }
 
     /// #365: `--workspace <id>` named where the PANE goes and nothing about
