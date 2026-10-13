@@ -15,7 +15,8 @@
   ADR-0001 (the web bridge hosting rules), #868 (protocol gating). Designs
   #1301 (non-blocking questions, §2a) and the turn-end half of #697
   (self-compact and its continuation, §3a); records the owner decision of
-  #1300 for unknown-event logging (§8). Extends `agent.fork` /
+  #1300 for unknown-event logging (§8); reserves the extension points that
+  the follow-up spike #1310 designs (§12). Extends `agent.fork` /
   `agent.lineage` (`flock_agent_fork`, `flock_agent_lineage`) rather than
   adding verbs.
 - Follow-ups: #1307 (slice tracking), #1305 (cache tests 4 and 6), #1308
@@ -676,9 +677,48 @@ render them from events. "Source" says where the data comes from.
 | P20 | Hook output | `system/hook_*` | S9b |
 | P21 | Model and effort switching | respawn with `--model` / `--effort` at idle (§1 reload) | S11 |
 | P22 | Resume picker | flk's agent list | existing |
+| P23 | Harness, model and effort picker, for a new agent and for a switch at idle | per adapter, §10a | S17 |
+| P24 | Message view whose whole turns collapse and expand, not only tool output | turn boundaries from `command_lifecycle` and `result` | S18 |
 
 P16 and P17 have no source in the stream today and are not promised;
 #1308 tracks finding one or deciding against them.
+
+### 10a. The picker (P23) and collapsible turns (P24)
+
+- **Picker.** One picker, in the TUI and the web client, chooses harness,
+  model and effort. For a new agent it fills `agent.start`'s `harness`,
+  `model` and `effort`. For a running structured agent it is a switch at
+  idle: `agent.reload { model?, effort? }` goes through §1's hot reload
+  (close stdin at idle, `--resume` with the new `--model` / `--effort`), and
+  the init diff records the change. Where an adapter can switch in place,
+  it may skip the respawn, but only after a probe confirms the prefix
+  behaviour (a model change always misses the cache: caches are per model).
+  The model and effort lists come from each adapter, merged with flk's
+  model registry (ADR-0021) for aliases and tiers:
+  - **Claude.** The CLI has no list verb. The binary carries the SDK control
+    messages `supportedModels`, `supportedEffortLevels` and `set_model`
+    (A.4 method: `strings`; not probed live). S17 probes them first; until
+    they are confirmed the list is flk's registry (ADR-0021) validated by
+    `system/init.model` after the switch, the effort levels are the
+    `--effort` choices (`low`, `medium`, `high`, `xhigh`, `max`), and a
+    switch is always a reload.
+  - **Codex.** `codex app-server`'s `model/list` returns `Model{id, model,
+    displayName, isDefault, hidden, supportedReasoningEfforts,
+    defaultReasoningEffort, …}` (read from the generated schema, #1309);
+    `turn/start` takes `effort` per turn, so effort changes need no reload.
+  - **opencode.** `opencode serve` lists providers and models at
+    `GET /config/providers` and `GET /api/model` (from its OpenAPI document),
+    and `/api/session/{sessionID}/model` sets a session's model.
+- **Collapsible turns.** The message view groups the stream by turn: one
+  turn is the inputs a `result` closes (§3's items plus everything up to and
+  including that `result`; steered items fold into the turn they joined,
+  E4). Default rule: every turn except the last is collapsed to one line
+  (the first input's first line, the tool-call count, the outcome of §1
+  and the turn's tokens), the last turn and any turn with an open question
+  or a failed outcome are expanded, and a turn the user expanded stays
+  expanded for that client. Tool output inside an expanded turn keeps its
+  own collapse (P2). The rule is client state, not stream data: the stream
+  only carries the boundaries.
 
 ### 11. Harness neutrality
 
@@ -710,6 +750,25 @@ Only the server modes qualify (E18): Codex through `codex app-server`
 and opencode a `todo.updated` event that Claude lacks; they map to `steer`
 delivery and P15. Adapters for Codex and opencode are slices S14 and S15 and
 not part of the first delivery.
+
+### 12. Reserved extension points (#1310)
+
+The spike #1310 (structured agent output as validated HTML fragments, with
+anchored comments) follows this ADR. Three points are reserved here so it
+can land without reshaping §5, §6 or §8; their design belongs to #1310, not
+to this record:
+
+1. **A content-block kind beyond markdown.** The session event model keeps an
+   open `content.kind` on rendered text blocks (`markdown` today); a further
+   kind (markdown plus allow-listed components, or sanitised HTML) is added
+   as a new variant, and a client that does not know it falls back to the
+   unknown-event rendering of §8.
+2. **Stable per-block ids as comment anchors.** Every rendered block carries
+   a stable id (`message uuid` + block index), so a comment can anchor to
+   it; a comment is queued back to the agent as an input item through §3
+   (`kind` to be named by #1310) and passes the same gate.
+3. **The TUI's text fallback.** Every block kind has a plain-text rendering
+   that the TUI shows; a kind without one is not admitted.
 
 ## Failure modes and known limits
 
@@ -815,6 +874,8 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
 | S15 | opencode `serve` adapter | S4 | 400 |
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
+| S17 | Picker (P23): probe Claude's `supportedModels` / `set_model`, per-adapter model and effort lists merged with ADR-0021's registry, `agent.start` fields, `agent.reload{model, effort}` | S11 (S14, S15 for Codex and opencode lists) | 300 |
+| S18 | Collapsible turns (P24): turn grouping from `command_lifecycle` and `result`, the default collapse rule, one-line summaries, in the web client and the TUI view | S9a, S10 | 250 |
 
 The spike's demonstration ("one throwaway session rendered by both the TUI
 and a thin Bun client") is S9a plus S10 against S3; this record does not ship
