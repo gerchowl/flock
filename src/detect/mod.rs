@@ -52,6 +52,9 @@ pub struct AgentDetection {
     /// What a `Blocked` screen asks of a human (#1023), for harnesses whose
     /// prompts the detector can name. `None` otherwise, and on a provider limit.
     pub needs_human: Option<crate::api::agent_state::HumanReason>,
+    /// The structured question a `needs_human{question}` screen draws
+    /// (ADR-0028 §8a, #1038), when its harness's form can be read.
+    pub question: Option<crate::api::question::QuestionForm>,
 }
 
 /// Which agent we detected running in a pane.
@@ -349,6 +352,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
         };
     };
     agents::detect(agent, screen_content)

@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /fixture/questions-1038/repo
+
+
+❯ Call the AskUserQuestion tool exactly once with one question: question "Which
+  checks should the probe run?", header "Checks", multiSelect true, options
+  Lint (description "Run clippy with warnings denied"), Tests (description "Run
+  the nextest suite"), Format (description "Check rustfmt"). Do nothing else.
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Checks  ✔ Submit  →
+
+Which checks should the probe run?
+
+❯ 1. [ ] Lint
+         Run clippy with warnings denied
+  2. [ ] Tests
+         Run the nextest suite
+  3. [ ] Format
+         Check rustfmt
+  4. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

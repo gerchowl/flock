@@ -1087,6 +1087,105 @@ mod tests {
         cleanup(&path);
     }
 
+    /// ADR-0028 §3a for the question kinds (#1038): they read back whole
+    /// here, and a reader that predates them (v2.0.0, #1058) skips their
+    /// lines without quarantining the log. The older view is made by renaming
+    /// each question line's kind to one no build knows.
+    #[test]
+    fn a_reader_without_the_question_kinds_skips_their_lines() {
+        use crate::api::question::{
+            Question, QuestionCloseReason, QuestionForm, QuestionSource, QuestionState,
+        };
+        let path = temp_log("question-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let question = Question {
+            question_id: "q_0123456789abcdef".into(),
+            source: QuestionSource::Screen,
+            harness: "claude".into(),
+            state: QuestionState::Open,
+            form: QuestionForm {
+                header: Some("Colour".into()),
+                prompt: "Which colour?".into(),
+                options: vec![],
+                multi_select: false,
+                allow_other: true,
+            },
+        };
+        let written = [
+            EventEnvelope {
+                event: EventKind::AgentQuestionOpened,
+                data: EventData::AgentQuestionOpened {
+                    agent_id: "agent_a".into(),
+                    pane: "w1:p1".into(),
+                    question_id: question.question_id.clone(),
+                    question: question.clone(),
+                },
+            },
+            EventEnvelope {
+                event: EventKind::AgentQuestionClosed,
+                data: EventData::AgentQuestionClosed {
+                    agent_id: "agent_a".into(),
+                    pane: "w1:p1".into(),
+                    question_id: question.question_id.clone(),
+                    reason: QuestionCloseReason::Withdrawn,
+                    question: Some(Question {
+                        state: QuestionState::Withdrawn,
+                        ..question.clone()
+                    }),
+                },
+            },
+        ];
+        for envelope in written.clone() {
+            assert!(envelope.event.is_persisted());
+            hub.push(envelope);
+        }
+        drop(hub);
+        let back: Vec<EventEnvelope> = EventHub::with_persistence(path.clone())
+            .persisted_events_after(0)
+            .into_iter()
+            .skip(1)
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        assert_eq!(back, written);
+        // A close without its question, or with one this build cannot read.
+        for question in [serde_json::Value::Null, serde_json::json!({"prompt": 7})] {
+            let mut line = serde_json::to_value(&written[1].data).unwrap();
+            line["question"] = question;
+            let data: EventData = serde_json::from_value(line).unwrap();
+            assert!(
+                matches!(data, EventData::AgentQuestionClosed { question: None, .. }),
+                "{data:?}"
+            );
+        }
+        let mut line = serde_json::to_value(&written[1].data).unwrap();
+        line.as_object_mut().unwrap().remove("question");
+        let data: EventData = serde_json::from_value(line).unwrap();
+        assert!(matches!(
+            data,
+            EventData::AgentQuestionClosed { question: None, .. }
+        ));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            let name = kind.as_str().unwrap().to_string();
+            if name.starts_with("agent.question_") {
+                *kind = serde_json::Value::String(format!("unknown.{name}"));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        std::fs::write(&path, renamed).unwrap();
+        let older = EventHub::with_persistence(path.clone());
+        assert!(!path.with_file_name("event-log.corrupt.jsonl").exists());
+        assert_eq!(older.persisted_events_after(0).len(), 1);
+        assert_eq!(older.current_sequence(), 3, "skipped seqs stay spent");
+        cleanup(&path);
+    }
+
     /// ADR-0028 §3a for the owner kinds (ADR-0035 §1), the way the goal
     /// kinds are proved above: renamed to kinds no build knows, the
     /// `owner_bound` and `owner_unbound` lines are skipped, not quarantined.
