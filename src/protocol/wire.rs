@@ -120,6 +120,7 @@ use serde::{Deserialize, Serialize};
 /// unknown-variant refusal and follows ADR-0034 §4: it passes in a pane
 /// without a `FLOCK_QUESTIONS` hint and denies with the hint's fallback
 /// reason in a pane with one.
+/// v30 also adds `wait.park` (#1031), gated by #868.
 pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Refusal notice sent to clients while a live update handoff is in
