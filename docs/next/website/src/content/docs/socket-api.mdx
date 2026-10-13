@@ -634,6 +634,28 @@ An external channel (a Telegram bot, a Slack app) reaches flk through an **adapt
 
 **Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
 
+## Owner bindings
+
+A repo's resident owner (ADR-0035 §1) is a **binding**, not a session: server state on its home node, keyed by the repo's GitHub slug. Four methods, new in protocol 30:
+
+```json
+{"id":"o1","method":"owner.bind","params":{"repo":"example/widgets","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"]}}
+```
+
+```json
+{"id":"o1","result":{"type":"owner_bound","rebound":false,"binding":{"repo":"example/widgets","node":"atlas","agent_id":"agent_atlas_1","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"],"since_ms":1760000000000}}}
+```
+
+- `owner.bind` records the binding. `node` is the serving node and `agent_id` is minted by the server; neither is a parameter. `harness` is `claude`, `codex` or `opencode`. `checkout` must be an absolute path to a git checkout on the node, and `repo` must be `owner/name`; otherwise the answer is `invalid_params`. Binding a bound repo again replaces `checkout`, `harness`, `model` and `profiles`, keeps `agent_id` and `since_ms`, and answers `rebound: true`.
+- `owner.unbind` (`{"repo"}`) ends the binding and answers `owner_unbound` with the binding that ended.
+- `owner.list` answers `owner_list` with `bindings`, ordered by repo. `owner.show` (`{"repo"}`) answers `owner_show` with `binding`. Both are reads, and `owner.show` is the MCP tool `flock_owner_show`.
+
+`owner.bind` and `owner.unbind` are operator verbs: an owner holds merge and teardown authority over its delegates, so no agent may appoint itself (the ADR-0014 boundary). They are refused with `operator_only` when the caller is agent-attested, which today means its process ancestry reaches an agent's pane or the request was relayed from a mesh peer, and also when the server could not read the caller's pid. This is **cooperative only** until agents run as their own Unix user and the server attests by uid (ADR-0035 §6.3 points 1 and 6, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator. Both count as state-changing for the skew gate (#868). `owner.unbind` and `owner.show` answer `not_found` for a repo with no binding. Repo slugs are case-insensitive, as on GitHub: the server records and looks them up in lowercase, so `Example/Widgets` and `example/widgets` are one binding.
+
+The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`) and `owner_unbound` (`repo`). The server folds them once per start, in the same log read as delegation edges and goals, and emits every binding again as `owner_bound` with `reissued: true` on every start and after every log rotation, so an owner that stays quiet cannot rotate out. A server older than 2.0.0 quarantines a log that holds these kinds; servers from 2.0.0 skip them.
+
+**Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo (#1234, after owner addresses resolve over the mesh, #1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.
