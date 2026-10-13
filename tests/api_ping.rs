@@ -90,17 +90,6 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() && UnixStream::connect(path).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("socket did not appear at {}", path.display());
-}
-
 fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -368,7 +357,7 @@ fn server_state_is_isolated_between_fixtures() {
         let runtime = base.join("runtime");
         let socket = runtime.join("flock.sock");
         servers.push(spawn_flock(&config, &runtime, &socket));
-        wait_for_socket(&socket, Duration::from_secs(5));
+
         let app = if cfg!(debug_assertions) {
             "flock-dev"
         } else {
@@ -394,7 +383,6 @@ fn ping_over_socket_returns_version() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let value = send_request(
         &socket_path,
@@ -421,7 +409,6 @@ fn events_wait_returns_the_matching_event_or_times_out() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
     let child = spawn_flock(&base.join("config"), &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let quiet = run_flk(
         &socket_path,
@@ -498,7 +485,6 @@ fn events_wait_without_a_cursor_receives_a_live_event() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
     let child = spawn_flock(&base.join("config"), &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let head = run_flk(&socket_path, &["events", "read", "--json"]);
     let head: serde_json::Value = serde_json::from_slice(&head.stdout).unwrap();
@@ -548,7 +534,6 @@ fn workspace_list_and_create_round_trip() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let empty = send_request(
         &socket_path,
@@ -774,7 +759,6 @@ fn tab_methods_round_trip_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -909,7 +893,6 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     // the pane shell only has to accept a typed command line, and the work is
     // done by the `/bin/sh -c` it launches.
     let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1047,7 +1030,7 @@ fn opencode_provider_limit_screen_reaches_agent_get_and_recovers() {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
+
     let started = send_request(
         &socket_path,
         &serde_json::json!({
@@ -1117,7 +1100,6 @@ fn agent_start_creates_named_terminal_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -1177,7 +1159,6 @@ fn agent_wait_ready_reports_booting_then_returns_on_the_first_real_status() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -1258,7 +1239,6 @@ fn agent_wait_ready_gives_up_immediately_when_the_agent_exits() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -1306,7 +1286,6 @@ fn agent_methods_round_trip_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1479,7 +1458,6 @@ fn tab_create_with_no_focus_preserves_active_tab() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1560,7 +1538,6 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let mut reader = open_subscription(
         &socket_path,
@@ -1670,7 +1647,6 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1743,7 +1719,6 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1847,7 +1822,6 @@ fn pane_report_agent_updates_effective_state() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2036,7 +2010,6 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2108,7 +2081,6 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2247,7 +2219,6 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2372,7 +2343,6 @@ fn events_subscribe_streams_output_and_agent_status_events() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2495,7 +2465,6 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2618,7 +2587,6 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2753,7 +2721,7 @@ with log.open('w') as out:
         &socket_path,
         shell.to_str().unwrap(),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
+
     let created = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2917,7 +2885,7 @@ with log.open('w') as out:
         &socket_path,
         shell.to_str().unwrap(),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
+
     let created = send_request(
         &socket_path,
         &serde_json::json!({
@@ -3074,7 +3042,7 @@ with log.open('w') as out:
             &socket_path,
             shell.to_str().unwrap(),
         );
-        wait_for_socket(&socket_path, Duration::from_secs(5));
+
         if !lock {
             // A debug server reads `flock-dev`, a release one `flock`.
             let dir = if cfg!(debug_assertions) {
