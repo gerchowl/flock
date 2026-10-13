@@ -19,7 +19,7 @@
   which carries the same hidden flags, see A.4), codex-cli 0.160.1 and
   opencode 1.18.35, in throwaway sessions under a scratch working directory
   with every `FLOCK_*` and `CLAUDE_CODE_*` variable removed. No flk server was
-  started, reached or restarted. Total spend: about 1.7M tokens, 95% of them
+  started, reached or restarted. Total spend: about 1.6M tokens, 95% of them
   cache reads (A.9).
 
 ## Context
@@ -138,9 +138,10 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
   server added or removed, `--tools` reduced: miss" does not hold at
   2.1.296. (A.7)
 - **E13 The date is a recorded message, not part of the system prompt.**
-  "Today's date is …" is a `<system-reminder>` attachment in the transcript;
-  a changed date is appended as a new attachment ("The date has changed …").
-  A real day-boundary run is in A.7 T6. (A.7)
+  "Today's date is …" is a `<system-reminder>` attachment in the transcript,
+  and the binary carries a "The date has changed …" attachment for a later
+  date. That a fork across a day boundary therefore keeps its cache is the
+  expectation, measured only by the real midnight run of A.7.2. (A.7)
 - **E14 Hot reload is cheap without compaction and resets the prefix with
   it.** Resuming a 41k-token session with a new MCP server read 98.9% from
   cache (first-token time 2.26 s). After `/compact` (40,032 → 1,237 tokens)
@@ -207,9 +208,10 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   control request is open. Working is `system/status: requesting` or an
   open `message_start`. A stall is a started input with no stdout event for
   `[sessions] stall_ms` while no control request and no tool call is open;
-  a long-running tool is not a stall (its `tool_use` is open). The value is
-  an observation threshold for `agent.phase_changed`, not a timeout that
-  kills anything.
+  a long-running tool is not a stall (its `tool_use` is open). A stall is
+  reported as `agent.session_stalled{since}` and leaves the phase as it is
+  (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
+  that kills anything.
 - **The messaging socket (E16)** is a door flk does not own. Slice S3 must
   find a way to disable it or bind it to the server; until then a structured
   session is not started (open question 5).
@@ -267,7 +269,9 @@ an event-log stream (§4) named `queue/<agent>`:
   anchor?: { correlation_id | question_id | fork_point },
   priority: normal | urgent,
   delivery: at_idle | steer | interrupt,
-  state: queued | held | delivered | done | cancelled | dropped,
+  state: queued | held | stashed | delivered | done | cancelled | dropped,
+  (queued → delivered → done | cancelled; queued → held | stashed | dropped;
+   held | stashed → queued; delivered → held when the process dies without a result)
   body, attachments: [blob refs] }
 ```
 
@@ -313,9 +317,12 @@ an event-log stream (§4) named `queue/<agent>`:
 ### 5. The client wire contract
 
 One endpoint serves every frontend: `GET /v1/ws` (WebSocket) and
-`GET /v1/blob/<sha256>` (HTTP) on the axum server that `flk web` already
-runs (`src/web/mod.rs`, feature `web`), under ADR-0001's hosting rules
-(loopback by default, `--allow-non-loopback` explicit, refused under
+`GET /v1/blob/<sha256>` (HTTP). It runs inside the flk server process,
+because the streams, the queue and the blobs are server state. It reuses the
+axum stack of the `web` feature (`src/web/mod.rs`), not the `flk web`
+subcommand, which stays the terminal bridge it is (one pty client per
+socket). It is off by default, binds loopback by default, and follows
+ADR-0001's hosting rules (`--allow-non-loopback` explicit, refused under
 `tailscale funnel`, same-origin check on upgrade).
 
 Messages are JSON text frames, one object each, tagged by `t`:
@@ -351,8 +358,10 @@ server → client
   max-age=31536000, immutable`, `ETag` = the hash, range requests honoured.
   A client renders a large tool result from `preview` and fetches it only on
   demand (E17).
-- **Protocol gating (#868).** `hello.protocol` is compared with the server's
-  as `PROTOCOL_VERSION` is today. A client newer than the server gets
+- **Protocol gating (#868).** The JSON wire has its own version,
+  `WIRE_JSON_VERSION`, independent of the framed protocol's
+  `PROTOCOL_VERSION`, bumped once per release that adds a verb or an event
+  type. `hello.protocol` is compared with it. A client newer than the server gets
   `welcome` with the server's protocol and read-only capabilities; a `cmd`
   whose verb the server does not know is refused with `server_version_gap`
   (exit 78) before anything is allocated. A server never sends an `ev` whose
@@ -366,8 +375,9 @@ server → client
   deleting the file. Each token carries scopes `read`, `send`, `answer`,
   `operate`. Only the local operator (`caller_is_local_operator()`, ADR-0035)
   can issue or revoke one (`flk client token add|rm|list`; else
-  `operator_only`, exit 13), and verbs ADR-0035 reserves to the operator stay
-  operator-only whatever the token says. Known limit (#1177): agents still
+  `operator_only`, exit 13), and verbs that are operator-only under ADR-0014's
+  authority boundary (and ADR-0035's owner rules) stay operator-only
+  whatever the token says. Known limit (#1177): agents still
   run as the operator's uid, so any agent can read a token file; tokens
   protect against other machines and other users, not against the agents on
   this one, until #1177's separate agent user lands.
@@ -478,10 +488,10 @@ render them from events. "Source" says where the data comes from.
 
 | # | Capability | Source in stream-json | Slice |
 |---|---|---|---|
-| P1 | Streaming text and markdown, code blocks | `stream_event` deltas, `assistant` | S9 |
-| P2 | Tool call cards, collapsible output, Edit diffs | `assistant/tool_use`, tool-result `user`, `tool_use_result` | S9 |
-| P3 | Thinking display | `thinking_delta`, `assistant/thinking` | S9 |
-| P4 | Spinner, elapsed time, token counter | `system/status`, `system/thinking_tokens`, `message_delta.usage` | S9 |
+| P1 | Streaming text and markdown, code blocks | `stream_event` deltas, `assistant` | S9a |
+| P2 | Tool call cards, collapsible output, Edit diffs | `assistant/tool_use`, tool-result `user`, `tool_use_result` | S9a |
+| P3 | Thinking display | `thinking_delta`, `assistant/thinking` | S9a |
+| P4 | Spinner, elapsed time, token counter | `system/status`, `system/thinking_tokens`, `message_delta.usage` | S9a |
 | P5 | Permission dialog with allow once / always / deny and rule suggestions | `control_request{can_use_tool}.permission_suggestions` | S6 |
 | P6 | AskUserQuestion picker (multi-select, other) | `control_request{AskUserQuestion}` | S6 |
 | P7 | Plan mode approve / reject (`ExitPlanMode`) | `control_request{can_use_tool, ExitPlanMode}` | S6 |
@@ -489,15 +499,15 @@ render them from events. "Source" says where the data comes from.
 | P9 | Queued messages shown, editable, cancellable | flk queue (§3), `command_lifecycle` | S5 |
 | P10 | Prompt input with history, paste, image attach, `@file` mentions | flk-side composer; images as content blocks | S10 |
 | P11 | Slash commands (`/compact`, `/model`, `/clear`, `/context`, `/cost`) and completion | `system/init.slash_commands`; sent as a prompt | S10 |
-| P12 | Context usage meter, cost | `result.usage`, `modelUsage.contextWindow` | S9 |
-| P13 | Compaction notice | `system/compact_boundary` | S9 |
-| P14 | Subagent (Task) nesting | `parent_tool_use_id`, `--forward-subagent-text` | S9 |
-| P15 | Todo list | `TodoWrite` tool input | S9 |
+| P12 | Context usage meter, cost | `result.usage`, `modelUsage.contextWindow` | S9b |
+| P13 | Compaction notice | `system/compact_boundary` | S9b |
+| P14 | Subagent (Task) nesting | `parent_tool_use_id`, `--forward-subagent-text` | S9b |
+| P15 | Todo list | `TodoWrite` tool input | S9b |
 | P16 | Background shells and their output | `Bash` `run_in_background`; output needs the harness's own tool | gap |
 | P17 | Rewind / checkpoints (Esc Esc) | `--rewind-files` exists, unprobed | gap |
 | P18 | Rate-limit and usage banners | `rate_limit_event` | S4 |
-| P19 | MCP server status | `system/init.mcp_servers` | S9 |
-| P20 | Hook output | `system/hook_*` | S9 |
+| P19 | MCP server status | `system/init.mcp_servers` | S9b |
+| P20 | Hook output | `system/hook_*` | S9b |
 | P21 | Model and effort switching | respawn with `--model` / `--effort` at idle (§1 reload) | S11 |
 | P22 | Resume picker | flk's agent list | existing |
 
@@ -571,9 +581,10 @@ Each has a recommendation; acceptance as recommended is the default.
 5. **The messaging socket (E16).** *Recommend: S3 finds a supported switch
    to disable it or point it at the server; no structured session ships
    before that.*
-6. **Where the wire endpoint lives.** The `web` feature is off in release
-   builds today. *Recommend turning `web` on in release builds and serving
-   `/v1/ws` from the same axum server, rather than a second listener.*
+6. **Where the wire endpoint lives.** The `web` feature is conditional in
+   the nix package (`withWeb`) and off in release builds today. *Recommend
+   serving `/v1/ws` from the server process (§5) and turning `web` on in
+   release builds, as part of S7.*
 7. **TS generation.** `ts-rs` (TS straight from the types, drift checked by
    a cargo test) or `schemars` (JSON Schema first, TS through a Bun step).
    *Recommend `ts-rs`: the drift gate runs in plain `cargo nextest` and needs
@@ -604,7 +615,7 @@ Each has a recommendation; acceptance as recommended is the default.
 ## Slices
 
 Ordered; each is at most about 400 production lines (tests and doc comments
-excluded) and lands behind `runtime: structured` or the `web` feature.
+excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
 
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
@@ -614,10 +625,11 @@ excluded) and lands behind `runtime: structured` or the `web` feature.
 | S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, `at_idle` / `steer` / `interrupt`, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S5 | 350 |
-| S7 | Wire endpoint: `/v1/ws` hello / sub / cmd, cursors, gap / lagged, idempotency window, `/v1/blob`, protocol gate, client tokens | S3 | 400 |
+| S7 | Wire endpoint in the server process: `/v1/ws` hello / sub / cmd, cursors, gap / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
-| S9 | Bun reference client: connect, follow an agent from a cursor, render P1–P4, P12–P15, P19, P20, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
-| S10 | TUI structured view: server-side renderer from the in-process stream; composer with queue display (P9–P11) | S5 | 400 |
+| S9a | Bun reference client: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
+| S9b | Bun reference client: P12–P15, P19, P20, queue view | S9a | 350 (TS) |
+| S10 | TUI structured view: server-side renderer from the in-process stream; composer with queue display (P9–P11) | S3, S4, S5 | 400 |
 | S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
 | S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
 | S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
@@ -626,7 +638,7 @@ excluded) and lands behind `runtime: structured` or the `web` feature.
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
 
 The spike's demonstration ("one throwaway session rendered by both the TUI
-and a thin Bun client") is S9 plus S10 against S3; this record does not ship
+and a thin Bun client") is S9a plus S10 against S3; this record does not ship
 it, because the brief for #1299 limits the spike to the decision and its
 evidence.
 
