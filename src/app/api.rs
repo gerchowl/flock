@@ -1504,6 +1504,7 @@ impl App {
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
+            Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
             Method::WaitHold(predicate, hold_ms) => {
                 return self.handle_wait_hold(request.id, predicate, hold_ms)
             }
