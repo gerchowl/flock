@@ -155,6 +155,47 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
+/// The handoff importers server `old_pid` spawned inside the sandbox rooted at
+/// `config_home` (#1261).
+///
+/// An importer runs `flk server --handoff-import <socket> <token>`, where the
+/// socket is `<config dir>/flock-handoff-<old pid>.sock` and the config dir is
+/// under the sandbox's `XDG_CONFIG_HOME`. The file name alone is not enough:
+/// pids are reused, so a test server can share its pid with the server an
+/// operator's live importer was spawned by, and a global `pgrep -f` on the file
+/// name would hand the live server to this harness's cleanup kill. The socket
+/// argument must therefore sit under `config_home` and carry the exact name.
+/// argv is read through `process_table` and compared literally, never as a
+/// pattern.
+pub fn handoff_importer_pids(config_home: &Path, old_pid: u32) -> Vec<u32> {
+    let socket_name = format!("flock-handoff-{old_pid}.sock");
+    let roots: Vec<PathBuf> = [
+        Some(config_home.to_path_buf()),
+        config_home.canonicalize().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let in_sandbox = |socket: &Path| {
+        socket
+            .file_name()
+            .is_some_and(|name| name == socket_name.as_str())
+            && roots.iter().any(|root| socket.starts_with(root))
+    };
+    process_table::list_process_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| *pid != old_pid && *pid != std::process::id())
+        .filter(|pid| {
+            process_table::process_info(*pid).is_ok_and(|info| {
+                info.argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--handoff-import" && in_sandbox(Path::new(&pair[1])))
+            })
+        })
+        .collect()
+}
+
 pub fn wait_for_file(path: &Path, timeout: Duration) {
     let _timing = timing::wait("ready: file");
     let deadline = Instant::now() + timeout;

@@ -119,20 +119,11 @@ impl Server {
             r#"{"id":"handoff","method":"server.live_handoff","params":{}}"#,
         );
         assert!(answered.get("error").is_none(), "{answered}");
-        let pattern = format!("flock-handoff-{old_pid}.sock");
         let deadline = Instant::now() + WITHIN;
+        let config_home = self.base.join("config");
         loop {
-            let found = std::process::Command::new("pgrep")
-                .args(["-f", &pattern])
-                .output()
-                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-                .unwrap_or_default();
-            if let Some(pid) = found
-                .split_whitespace()
-                .filter_map(|pid| pid.parse::<u32>().ok())
-                .find(|pid| *pid != old_pid)
-            {
-                register_spawned_flock_pid(Some(pid));
+            if let Some(pid) = support::handoff_importer_pids(&config_home, old_pid).first() {
+                register_spawned_flock_pid(Some(*pid));
                 break;
             }
             assert!(Instant::now() < deadline, "no handoff importer appeared");
