@@ -6,7 +6,7 @@ use crate::api::schema::{
 };
 use crate::app::App;
 
-use super::responses::{encode_error, encode_error_body, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_error_with_data, encode_success};
 
 /// opencode messages `agent.result` reads to find the newest reply: a turn
 /// is a user message plus one assistant message per step, so this reaches
@@ -357,11 +357,17 @@ impl App {
                 .map(|terminal| terminal.state),
             Some(crate::detect::AgentState::Working | crate::detect::AgentState::Blocked)
         );
+        // Claude's record also says when an open turn began (#1257): a waiting
+        // supervisor reads that as "this round is still running", which a
+        // screen that reads idle mid-turn cannot overrule.
+        let mut turn_open_at_ms = None;
         let read = match &store {
             ConversationStore::Codex { path, .. } => crate::codex_transcript::read_tail(path),
             ConversationStore::Claude { path, .. } => {
                 crate::agent_transcript::read_tail(path).map(|read| {
-                    let over = crate::agent_transcript::finished(&read.events);
+                    let over = crate::agent_transcript::turn_over(&read.events);
+                    turn_open_at_ms =
+                        crate::agent_transcript::open_turn_at(&read.events).and_then(unix_ms);
                     (read.events, over)
                 })
             }
@@ -391,11 +397,16 @@ impl App {
             Err(err) => return store.unreadable(id, &err),
         };
         let Some(reply) = reply else {
-            return encode_error(
-                id,
-                "no_result",
-                format!("session {} has no assistant reply yet", store.session_id()),
-            );
+            let message = format!("session {} has no assistant reply yet", store.session_id());
+            return match turn_open_at_ms {
+                Some(at_ms) => encode_error_with_data(
+                    id,
+                    "no_result",
+                    message,
+                    serde_json::json!({ "turn_open_at_ms": at_ms }),
+                ),
+                None => encode_error(id, "no_result", message),
+            };
         };
         let (status, status_text) = crate::agent_transcript::sentinel(&reply.text).unzip();
         let settled_with_background_shells = self
@@ -428,6 +439,7 @@ impl App {
                     total_chars: u32::try_from(total).unwrap_or(u32::MAX),
                     next_offset: (end < total).then(|| u32::try_from(end).unwrap_or(u32::MAX)),
                     at_ms: reply.at.and_then(unix_ms),
+                    turn_open_at_ms,
                 },
             },
         )
@@ -1324,6 +1336,57 @@ mod tests {
         let error: crate::api::schema::ErrorResponse =
             serde_json::from_str(&result(&mut app, &target, None, None)).unwrap();
         assert_eq!(error.error.code, "no_result");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #1257: a turn the transcript still records as running is reported with
+    /// the time it began, on the `no_result` refusal of a first round and on
+    /// the earlier reply a later round still shows.
+    #[test]
+    fn agent_result_reports_when_an_open_turn_began() {
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let prompt = |text: &str, at: &str| {
+            line(serde_json::json!({"type": "user", "timestamp": at,
+                "message": {"role": "user", "content": text}}))
+        };
+        let tool = line(serde_json::json!({"type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}}));
+        let first = prompt("brief", "2026-10-13T01:06:15.939Z") + &tool;
+        let home = claude_home_with("open-first", "sess-open-first", &first);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-first");
+        let error: serde_json::Value =
+            serde_json::from_str(&result(&mut app, &target, None, None)).unwrap();
+        assert_eq!(error["error"]["code"], "no_result", "{error}");
+        assert_eq!(
+            error["error"]["data"]["turn_open_at_ms"],
+            1_791_853_575_939_u64
+        );
+        let _ = std::fs::remove_dir_all(home);
+
+        let second = prompt("round 1", "2026-10-13T01:00:00.000Z")
+            + &assistant_line("DONE: one")
+            + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}))
+            + &prompt("round 2", "2026-10-13T01:06:15.939Z")
+            + &tool
+            + &assistant_line("Reading the brief next.");
+        let home = claude_home_with("open-second", "sess-open-second", &second);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-second");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(!info.finished);
+        assert_eq!(info.status.as_deref(), Some("done"));
+        assert_eq!(info.turn_open_at_ms, Some(1_791_853_575_939));
+        let _ = std::fs::remove_dir_all(home);
+
+        let ended =
+            second + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}));
+        let home = claude_home_with("open-ended", "sess-open-ended", &ended);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-ended");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(info.finished);
+        assert_eq!(info.turn_open_at_ms, None);
         let _ = std::fs::remove_dir_all(home);
     }
 

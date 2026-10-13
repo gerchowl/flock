@@ -4712,6 +4712,11 @@ enum ResultPoll {
     /// The store has no reply yet, no session to read one from, or a reply from
     /// an earlier turn. All three mean the same thing to a caller: not now.
     NotYet,
+    /// The harness's own record shows a turn begun at or after this round's
+    /// submit that has not ended (#1257). Unlike `NotYet` this is positive
+    /// evidence that something WAS written this round, so it can never become
+    /// `no_result`.
+    Open,
     /// The request timed out before the deadline: the server did not answer,
     /// so nothing is known about the reply (#1121).
     Unanswered,
@@ -4738,6 +4743,9 @@ enum Grace {
     Refused(String),
     /// The agent started another turn, so the round has to settle again.
     NewTurn,
+    /// The store says this round's turn is still running although the screen
+    /// settled, so the round has to settle again from the same cursor.
+    Open,
     /// The grace ran out with no reply. The caller decides timeout vs no_result.
     Exhausted,
     /// A deadline-driven timeout from inside the grace: always `Outcome::Timeout`
@@ -4762,6 +4770,9 @@ enum SettledDecision {
     Failed(String),
     /// Settle again from the cursor that just settled.
     WaitAgain,
+    /// Settle again from the cursor this settle started from: the round has
+    /// not ended, and no newer turn has begun to wait past (#1257).
+    SettleAgain,
 }
 
 /// What `started_another_turn` concluded (W4).
@@ -4981,6 +4992,12 @@ impl Await<'_> {
                     // and re-waiting from the original would accept its reply.
                     after = Some(settled_cursor);
                 }
+                // The screen went quiet inside a turn the store still records
+                // as running. Waiting past the settled cursor would need the
+                // screen to show `working` again before anything could end the
+                // round, so the next settle starts from the same cursor and
+                // asks the store again once the screen has held quiet.
+                SettledDecision::SettleAgain => {}
             }
         }
     }
@@ -5039,38 +5056,44 @@ impl Await<'_> {
             SettledOutcome::Error(reason) => SettledDecision::Failed(
                 super::compatibility::diagnose_failure("flk delegate", &reason),
             ),
-            SettledOutcome::Settled { .. } => match self.await_reply(settled_cursor) {
-                Grace::Reply { outcome, info } => SettledDecision::Report {
-                    outcome,
-                    info: Some(info),
+            SettledOutcome::Settled { .. } => self.grace_decision(self.await_reply(settled_cursor)),
+        }
+    }
+
+    /// What the reply grace means for the round.
+    fn grace_decision(&self, grace: Grace) -> SettledDecision {
+        match grace {
+            Grace::Reply { outcome, info } => SettledDecision::Report {
+                outcome,
+                info: Some(info),
+            },
+            Grace::Gone => SettledDecision::Report {
+                outcome: Outcome::Gone,
+                info: None,
+            },
+            Grace::Refused(reason) => SettledDecision::Failed(reason),
+            Grace::NewTurn => SettledDecision::WaitAgain,
+            Grace::Open => SettledDecision::SettleAgain,
+            Grace::Timeout => SettledDecision::Report {
+                outcome: Outcome::Timeout,
+                info: None,
+            },
+            Grace::Unavailable => SettledDecision::Report {
+                outcome: Outcome::ServerUnavailable,
+                info: None,
+            },
+            Grace::Exhausted => SettledDecision::Report {
+                outcome: if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    // The deadline wins inside the grace too: a caller whose
+                    // clock ran out does not get a late answer reinterpreted.
+                    Outcome::Timeout
+                } else {
+                    Outcome::NoResult
                 },
-                Grace::Gone => SettledDecision::Report {
-                    outcome: Outcome::Gone,
-                    info: None,
-                },
-                Grace::Refused(reason) => SettledDecision::Failed(reason),
-                Grace::NewTurn => SettledDecision::WaitAgain,
-                Grace::Timeout => SettledDecision::Report {
-                    outcome: Outcome::Timeout,
-                    info: None,
-                },
-                Grace::Unavailable => SettledDecision::Report {
-                    outcome: Outcome::ServerUnavailable,
-                    info: None,
-                },
-                Grace::Exhausted => SettledDecision::Report {
-                    outcome: if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        // The deadline wins inside the grace too: a caller whose
-                        // clock ran out does not get a late answer reinterpreted.
-                        Outcome::Timeout
-                    } else {
-                        Outcome::NoResult
-                    },
-                    info: None,
-                },
+                info: None,
             },
         }
     }
@@ -5100,6 +5123,7 @@ impl Await<'_> {
             let asked = Instant::now();
             match self.poll_result() {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
+                ResultPoll::Open => return Grace::Open,
                 ResultPoll::Gone => return Grace::Gone,
                 ResultPoll::Refused(reason) => return Grace::Refused(reason),
                 ResultPoll::Timeout => return Grace::Timeout,
@@ -5189,6 +5213,20 @@ impl Await<'_> {
         finished && at_ms.is_some_and(|at_ms| at_ms >= self.submitted_at_ms)
     }
 
+    /// Does the store record a turn begun this round that has not ended?
+    ///
+    /// Read from `turn_open_at_ms`, on a result or on a `no_result` refusal's
+    /// `data`. Judged against the submit the way [`Self::is_fresh`] judges a
+    /// reply: a turn open since before this round cannot show that anything
+    /// was written to this one. A server that never sends the field leaves
+    /// the grace as it was.
+    fn opened_this_round(&self, carrier: Option<&serde_json::Value>) -> bool {
+        carrier
+            .and_then(|value| value.get("turn_open_at_ms"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|at_ms| at_ms >= self.submitted_at_ms)
+    }
+
     /// Ask the store for the newest reply, and say whether it is this round's.
     fn poll_result(&self) -> ResultPoll {
         let bounded_res: Result<serde_json::Value, BoundedError> = bounded(
@@ -5199,14 +5237,18 @@ impl Await<'_> {
             }),
             self.deadline,
         );
-        let response = match bounded_res {
-            Ok(response) => response,
+        match bounded_res {
+            Ok(response) => self.classify_result(&response),
             Err(err) => match await_failure(&err, self.deadline, Instant::now()) {
-                AwaitFailure::Timeout => return ResultPoll::Timeout,
-                AwaitFailure::NotYet => return ResultPoll::Unanswered,
-                AwaitFailure::Fail(reason) => return ResultPoll::Refused(reason),
+                AwaitFailure::Timeout => ResultPoll::Timeout,
+                AwaitFailure::NotYet => ResultPoll::Unanswered,
+                AwaitFailure::Fail(reason) => ResultPoll::Refused(reason),
             },
-        };
+        }
+    }
+
+    /// What one `agent.result` answer says about this round.
+    fn classify_result(&self, response: &serde_json::Value) -> ResultPoll {
         if let Some(error) = response.get("error") {
             let code = error
                 .get("code")
@@ -5217,12 +5259,16 @@ impl Await<'_> {
             if code == "agent_not_found" || code == "pane_not_found" {
                 return ResultPoll::Gone;
             }
+            if code == "no_result" && self.opened_this_round(error.get("data")) {
+                return ResultPoll::Open;
+            }
             if not_yet_codes(self.harness).contains(&code) {
                 return ResultPoll::NotYet;
             }
             return ResultPoll::Refused(server_error(error));
         }
         match response.pointer("/result/result") {
+            Some(info) if self.opened_this_round(Some(info)) => ResultPoll::Open,
             Some(info) if self.is_fresh(info) => ResultPoll::Fresh {
                 outcome: self.sentinelled(info),
                 info: info.clone(),
@@ -6068,3 +6114,7 @@ mod final_tests;
 #[cfg(test)]
 #[path = "delegate_decisions_tests.rs"]
 mod decisions_tests;
+
+#[cfg(test)]
+#[path = "delegate_open_turn_tests.rs"]
+mod open_turn_tests;
