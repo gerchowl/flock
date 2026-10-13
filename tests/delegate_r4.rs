@@ -202,32 +202,43 @@ fn start_server_with_readiness(announced: bool) -> Server {
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    if announced {
-        // This test measures a client deadline, not server process startup.
-        // The server emits this line only after binding its API socket.
-        let expected = format!("api socket: {}", socket.display());
-        let mut reader = BufReader::new(pair.master.try_clone_reader().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(
-                reader.read_line(&mut line).unwrap(),
-                0,
-                "server exited before readiness"
-            );
-            if line.trim() == expected {
-                break;
-            }
-        }
-    } else {
-        wait_for_socket(&socket, Duration::from_secs(5));
-    }
-    Server {
+    // Construct the owner before waiting, so any readiness failure kills and
+    // reaps this child through Server::drop.
+    let server = Server {
         _master: pair.master,
         child,
         base,
         socket,
+    };
+    drop(pair.slave);
+    if announced {
+        let reader = server._master.try_clone_reader().unwrap();
+        let socket = server.socket.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _ = tx.send(support::readiness::read_announcement(reader, &socket));
+        });
+        // This is a failure ceiling, not a startup-duration assertion. The
+        // announcement, including both socket lines, decides the pass path.
+        let result = rx.recv_timeout(Duration::from_secs(30));
+        match result {
+            Ok(result) => {
+                reader.join().expect("readiness reader panicked");
+                result.unwrap_or_else(|err| panic!("server readiness failed: {err}"));
+            }
+            Err(err) => {
+                drop(server);
+                // Do not join a potentially blocked reader on the failure path.
+                drop(reader);
+                panic!(
+                    "server readiness did not arrive within the 30-second failure ceiling: {err}"
+                );
+            }
+        }
+    } else {
+        wait_for_socket(&server.socket, Duration::from_secs(5));
     }
+    server
 }
 
 fn request(server: &Server, json: &str) -> serde_json::Value {
