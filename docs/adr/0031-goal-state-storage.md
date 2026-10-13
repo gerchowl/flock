@@ -137,9 +137,31 @@ SQLite with `fullfsync=ON` costs the same 4–5 ms as the fold's append.
     quarantining the log, #1020) being in a *released* binary. Without it, a
     server older than G1 that reads a log holding `Goal*` events quarantines the
     active file, for example after a downgrade or a handoff to an older binary.
-    #1058 is still open in batch #1066 and is planned to ship in v1.3.0. G1
-    must not ship to the fleet before the release carrying #1058 is the
-    oldest running version.
+    #1058 shipped in v2.0.0, so every server sharing a log must be 2.0.0 or
+    newer before a goal is armed. G1 must not ship to the fleet before 2.0.0
+    is the oldest running version.
+    **Downgrade recovery.** A 1.x server that meets a `Goal*` line in the
+    active file renames that file to `event-log.corrupt.jsonl` and starts a
+    fresh `event-log.jsonl`, numbering above the highest sequence it could
+    salvage. A rotated file holding a goal line is left on disk but dropped
+    from that server's view. The quarantined file is outside rotation, and
+    it holds a full copy of every goal open when it was set aside, because
+    G1 re-issues each open goal into the active file on start and after
+    every rotation. If the 1.x server rotated since, its own rotations have
+    deleted the oldest files, goal lines included, and its fresh file may
+    now be `event-log.1.jsonl`. The quarantined copy still covers the goals.
+    v2.0.0 is not enough to recover: it only skips `Goal*` lines, so it
+    neither folds nor re-issues them, and goals rotate out while it runs.
+    With every server on the log stopped, the operator upgrades them to the
+    first release after v2.0.0 that includes G1a (#1169), copies
+    `event-log.corrupt.jsonl` aside (a second quarantine would overwrite
+    it), puts its lines in front of `event-log.jsonl` and removes it. That
+    works whether or not the log rotated, because a reader orders events by
+    sequence, not by file. The next start folds the goals back and
+    re-issues them. The steps are in the socket API docs next to the goal
+    kinds, and
+    `a_log_a_1x_server_quarantined_is_recovered_with_its_goals_live` checks
+    them, with a rotation in between.
   - **G2 (#1035), G5 (#884):** rungs and the pre-compaction `GoalStatusSet`
     handshake read the in-memory record only.
   - **G3a (#885), G3b (#1036):** the breaker, `degraded` state and
