@@ -546,3 +546,69 @@ fn events_verbs_report_the_version_gap_against_an_older_server() {
         assert_eq!(methods, ["events.read", "ping"], "{args:?}");
     }
 }
+
+/// #1155 / #868: each `flk goal` write is refused before it is sent to an
+/// older server, under `--json` too, and `goal status` reaches it and turns
+/// its unknown method into the version gap through `normalize`.
+#[test]
+fn goal_verbs_report_the_version_gap_against_an_older_server() {
+    let writes = [
+        &["goal", "arm", "ship it", "--check", "just check"][..],
+        &["goal", "pause", "--minutes", "5", "--agent", "fixture"],
+        &["goal", "resume", "--agent", "fixture"],
+        &["goal", "stop", "--agent", "fixture"],
+    ];
+    for args in writes {
+        let (output, methods) = run(args, Some("1.2.0"), None, false);
+        assert_gap(output, "1.2.0");
+        assert_eq!(methods, ["ping"], "{args:?} was sent");
+
+        let json: Vec<_> = args.iter().copied().chain(["--json"]).collect();
+        let (output, methods) = run(&json, Some("1.2.0"), None, false);
+        assert_eq!(output.status.code(), Some(78), "{json:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            envelope["error"]["code"], "server_version_gap",
+            "{envelope}"
+        );
+        assert_eq!(envelope["error"]["exit"], 78, "{envelope}");
+        assert_eq!(methods, ["ping"], "{json:?} was sent");
+    }
+    let (output, methods) = run(
+        &["goal", "status", "--agent", "fixture"],
+        Some("1.2.0"),
+        Some(
+            serde_json::json!({"code":"invalid_request", "message":"unknown variant `goal.status`"}),
+        ),
+        false,
+    );
+    assert_gap(output, "1.2.0");
+    assert_eq!(methods, ["goal.status", "ping"]);
+}
+
+/// The gate refuses only an older server: a current one is sent the write.
+#[test]
+fn goal_writes_reach_a_current_server() {
+    let (output, methods) = run(
+        &["goal", "stop", "--agent", "fixture"],
+        Some("current"),
+        None,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(methods, ["ping", "goal.stop"]);
+}
+
+/// A goal write the caller may not make is a policy refusal: exit 13, like
+/// `operator_only` (ADR-0030 §1 amendment of 2026-10-13, ADR-0029 §2).
+#[test]
+fn a_refused_goal_caller_exits_13() {
+    let (output, methods) = run(
+        &["goal", "stop", "--agent", "fixture"],
+        Some("current"),
+        Some(serde_json::json!({"code":"goal_caller_refused", "message":"not your goal"})),
+        false,
+    );
+    assert_eq!(output.status.code(), Some(13));
+    assert_eq!(methods, ["ping", "goal.stop"]);
+}

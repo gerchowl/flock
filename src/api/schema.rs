@@ -249,6 +249,23 @@ pub enum Method {
     OwnerList(EmptyParams),
     #[serde(rename = "owner.show")]
     OwnerShow(OwnerRepoParams),
+    /// ADR-0030 §1: arm a goal for an agent. Written by the operator or by
+    /// the goal's own agent.
+    #[serde(rename = "goal.arm")]
+    GoalArm(GoalArmParams),
+    /// ADR-0030 §1: an agent's goal record. Open to every caller.
+    #[serde(rename = "goal.status")]
+    GoalStatus(GoalTargetParams),
+    /// ADR-0030 §1 (amended 2026-10-12): pause a goal, recorded as
+    /// `GoalPaused`.
+    #[serde(rename = "goal.pause")]
+    GoalPause(GoalPauseParams),
+    /// Resume a paused goal, recorded as `GoalResumed`.
+    #[serde(rename = "goal.resume")]
+    GoalResume(GoalTargetParams),
+    /// Stop (disarm) a goal, recorded as `GoalDisarmed`.
+    #[serde(rename = "goal.stop")]
+    GoalStop(GoalStopParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -333,6 +350,7 @@ impl Method {
                 | Self::AgentLineage(_)
                 | Self::OwnerList(_)
                 | Self::OwnerShow(_)
+                | Self::GoalStatus(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
@@ -384,6 +402,7 @@ impl Method {
             | Self::AgentLineage(_)
             | Self::OwnerList(_)
             | Self::OwnerShow(_)
+            | Self::GoalStatus(_)
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
@@ -449,6 +468,10 @@ impl Method {
             | Self::WaitPark(_)
             | Self::OwnerBind(_)
             | Self::OwnerUnbind(_)
+            | Self::GoalArm(_)
+            | Self::GoalPause(_)
+            | Self::GoalResume(_)
+            | Self::GoalStop(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2256,6 +2279,45 @@ pub struct OwnerRepoParams {
     pub repo: String,
 }
 
+/// `goal.arm` (ADR-0030 §1). `target` names the agent: `self` (the
+/// default when empty) is the agent whose pane runs the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalArmParams {
+    #[serde(default)]
+    pub target: String,
+    pub goal: String,
+    /// The frozen check commands of the done gate (rung 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+}
+
+/// `goal.status` and `goal.resume`: the agent whose goal is meant. `self`
+/// (the default when empty) is the caller's own agent. An `AgentId` that has
+/// a goal names it even when the agent has no live pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalTargetParams {
+    #[serde(default)]
+    pub target: String,
+}
+
+/// `goal.pause`. Without `minutes` the goal stays paused until resumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPauseParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<u64>,
+}
+
+/// `goal.stop`. `reason` is recorded on the `GoalDisarmed` event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalStopParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The harness an owner binding names (ADR-0035 §1, `bind --harness`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3088,6 +3150,12 @@ pub enum ResponseResult {
     },
     OwnerShow {
         binding: OwnerBinding,
+    },
+    /// Every `goal.*` method: the agent's goal record after the call. For
+    /// `goal.stop` it is the record as it was when it was dropped.
+    Goal {
+        agent_id: String,
+        goal: GoalRecord,
     },
     /// `channel.hello`: the binding the token unlocked, never the token.
     ChannelHello {

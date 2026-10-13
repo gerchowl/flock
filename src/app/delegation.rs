@@ -160,7 +160,7 @@ impl DelegationIndex {
             .collect()
     }
 
-    #[cfg(test)]
+    /// The edge whose delegate is `delegate`, open or gone.
     pub(crate) fn get(&self, delegate: &str) -> Option<&DelegationEdge> {
         self.edges.get(delegate)
     }
