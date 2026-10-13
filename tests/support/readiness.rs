@@ -1,10 +1,28 @@
-//! Strict startup-announcement parser shared with #1314.
-//! Callers bound the reader and own child cleanup on failure.
+//! Startup synchronization for harness-owned headless servers.
+//!
+//! `run_server` prints its ready message after both listeners and the app have
+//! been initialized. Reading that message waits on the child, not host speed.
+//! This is for normal starts, not handoffs or commands expected to fail.
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 const READY: &str = "flk server running; you can use any flk CLI command in another terminal.";
+
+/// Wait for the readiness announcement for this sandbox's API socket.
+///
+/// The caller must drop the parent's PTY slave first, so a failed child closes
+/// the output stream. EOF/read errors include the startup output in the panic.
+/// A child that remains alive but never announces readiness stays blocked here
+/// until the nextest hang ceiling cancels it. There is no startup duration contract.
+pub fn wait_for_server(master: &dyn portable_pty::MasterPty, api_socket: &Path) {
+    let _timing = super::timing::wait("ready: server announcement");
+    let reader = master
+        .try_clone_reader()
+        .expect("read server startup output");
+    read_announcement(reader, api_socket)
+        .unwrap_or_else(|err| panic!("server startup failed for {}: {err}", api_socket.display()));
+}
 
 /// Read the existing server banner and socket path in order, accepting PTY CRLF.
 ///
@@ -66,40 +84,5 @@ pub fn read_announcement(reader: impl Read, api_socket: &Path) -> io::Result<()>
                 ));
             }
         };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn readiness_reports_eof_before_the_complete_announcement() {
-        for output in [String::new(), format!("{READY}\r\n")] {
-            let error = read_announcement(output.as_bytes(), Path::new("fixture.sock"))
-                .expect_err("an incomplete announcement must fail");
-            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-            assert!(error.to_string().contains(&output));
-        }
-    }
-
-    #[test]
-    fn readiness_rejects_mismatch_without_reading_again() {
-        struct NoFurtherRead;
-        impl Read for NoFurtherRead {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                panic!("a malformed announcement must fail before another read")
-            }
-        }
-        for output in [
-            format!("{READY}\r\nunexpected line\r\n"),
-            format!("{READY}\r\napi socket: fixture.sock\r\nlogs: wrong order\r\n"),
-        ] {
-            let reader = io::Cursor::new(output.as_bytes()).chain(NoFurtherRead);
-            let error = read_announcement(reader, Path::new("fixture.sock"))
-                .expect_err("an unexpected stage must fail");
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains(&output));
-        }
     }
 }

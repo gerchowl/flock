@@ -21,6 +21,12 @@
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# Hang ceiling only (#1317): condition waits decide correctness, while a
+# silent live producer must eventually produce a named test failure in CI.
+filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binary(=cli_wrapper) | binary(=server_readiness)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # This end-to-end check intentionally observes the full 30-second startup grace.
 filter = 'binary(delegate_verdict) & test(delegate_idle_without_new_turn_reports_not_started_and_informs_s1)'
 slow-timeout = { period = "30s" }

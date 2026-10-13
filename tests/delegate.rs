@@ -37,7 +37,7 @@ use support::environment::Command;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
-    unregister_spawned_flock_pid, wait_for_socket,
+    unregister_spawned_flock_pid,
 };
 
 /// Short settle window so the suite stays fast.
@@ -360,7 +360,8 @@ fn spawn_server(base: PathBuf) -> Server {
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    wait_for_socket(&socket, Duration::from_secs(5));
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, &socket);
     Server {
         _master: pair.master,
         child,
