@@ -219,6 +219,16 @@ pub enum Method {
     EventsRead(EventsReadParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
+    /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
+    #[serde(rename = "owner.bind")]
+    OwnerBind(OwnerBindParams),
+    /// ADR-0035 §1: end a repo's owner binding. Operator verb.
+    #[serde(rename = "owner.unbind")]
+    OwnerUnbind(OwnerRepoParams),
+    #[serde(rename = "owner.list")]
+    OwnerList(EmptyParams),
+    #[serde(rename = "owner.show")]
+    OwnerShow(OwnerRepoParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -301,6 +311,8 @@ impl Method {
                 | Self::AgentHistory(_)
                 | Self::AgentResult(_)
                 | Self::AgentLineage(_)
+                | Self::OwnerList(_)
+                | Self::OwnerShow(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
@@ -348,6 +360,8 @@ impl Method {
             | Self::AgentHistory(_)
             | Self::AgentResult(_)
             | Self::AgentLineage(_)
+            | Self::OwnerList(_)
+            | Self::OwnerShow(_)
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
@@ -407,6 +421,8 @@ impl Method {
             | Self::PaneMove(_)
             | Self::PaneRename(_)
             | Self::ChannelHello(_)
+            | Self::OwnerBind(_)
+            | Self::OwnerUnbind(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2164,6 +2180,57 @@ pub struct ChannelHelloParams {
     pub token: crate::channels::ChannelToken,
 }
 
+/// `owner.bind` (ADR-0035 §1). The node is the serving node and the
+/// `AgentId` is minted by the server, so neither is a parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBindParams {
+    /// The GitHub slug, `owner/name`.
+    pub repo: String,
+    /// Absolute path of the owner's checkout on the serving node.
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The profile ladder, first choice first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+}
+
+/// `owner.unbind` and `owner.show`: the GitHub slug of a bound repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRepoParams {
+    pub repo: String,
+}
+
+/// The harness an owner binding names (ADR-0035 §1, `bind --harness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerHarness {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+/// A repo's resident-owner binding (ADR-0035 §1): durable server state set
+/// only by operator verbs, never read from the repo (§6.2). The owner keeps
+/// `agent_id` for life: binding a bound repo again changes the other fields
+/// and keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBinding {
+    pub repo: String,
+    /// The home node, named statically: no lease, no failover.
+    pub node: String,
+    pub agent_id: String,
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// When the repo was first bound (Unix ms). A re-bind keeps it.
+    pub since_ms: u64,
+}
+
 /// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
 pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
 pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
@@ -2355,6 +2422,10 @@ pub enum EventKind {
     GoalPaused,
     GoalResumed,
     GoalDisarmed,
+    /// ADR-0035 §1: a repo's owner binding. The live bindings are the fold
+    /// of these (`app::owners::OwnerIndex`).
+    OwnerBound,
+    OwnerUnbound,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -2455,6 +2526,8 @@ impl EventKind {
             | Self::GoalPaused
             | Self::GoalResumed
             | Self::GoalDisarmed
+            | Self::OwnerBound
+            | Self::OwnerUnbound
             | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
@@ -2913,6 +2986,22 @@ pub enum ResponseResult {
         gap: Option<EventGap>,
         events: Vec<SequencedEvent>,
         next_after: u64,
+    },
+    /// `owner.bind`: the binding as recorded. `rebound` is true when the
+    /// repo was already bound and kept its `agent_id`.
+    OwnerBound {
+        binding: OwnerBinding,
+        rebound: bool,
+    },
+    /// `owner.unbind`: the binding that ended.
+    OwnerUnbound {
+        binding: OwnerBinding,
+    },
+    OwnerList {
+        bindings: Vec<OwnerBinding>,
+    },
+    OwnerShow {
+        binding: OwnerBinding,
     },
     /// `channel.hello`: the binding the token unlocked, never the token.
     ChannelHello {
@@ -4097,6 +4186,18 @@ pub enum EventData {
         agent_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// ADR-0035 §1: `repo` is bound to `binding`. The copy re-issued on every
+    /// server start and log rotation carries `reissued: true` and the whole
+    /// binding, so the fold replaces it either way.
+    OwnerBound {
+        binding: OwnerBinding,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// ADR-0035 §1: the binding of `repo` ended.
+    OwnerUnbound {
+        repo: String,
     },
     AgentHibernated {
         pane_id: String,
