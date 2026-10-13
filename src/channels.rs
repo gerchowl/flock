@@ -28,7 +28,16 @@
 //! (`.<random>.tmp`, written before #1170) is swept at once, as it was then:
 //! only an issuer of that older release, running during the one handoff that
 //! upgrades from it, can still be writing one. The directory is
-//! tightened to 0700 when this user owns it and refused otherwise. The file is
+//! tightened to 0700 when this user owns it and refused otherwise.
+//!
+//! Known limits. Two issuers that find the same untrusted file both rename
+//! over it, so the second replaces the first's fresh token, which a reader
+//! may already hold. The pid check assumes every issuer shares this host's
+//! pid namespace: a data dir on a network share or a server in a container
+//! can sweep a live issuer's temp, which then logs
+//! `channel.token.issue_failed` until the next reload. On a platform without
+//! a process probe (`platform::fallback`) every pid counts as gone, so every
+//! temp is swept as before #1170. The file is
 //! read on every check, so deleting it revokes the binding at once, and a
 //! reload then issues a new token.
 
@@ -633,6 +642,27 @@ mod tests {
         done.store(true, Ordering::Relaxed);
         assert_eq!(watcher.join().unwrap(), 0, "the token name went missing");
         assert!(read_token(&path).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A first issue links rather than renames, so a token another issuer
+    /// placed between the read and the link is kept, never overwritten.
+    #[test]
+    fn a_first_issue_never_overwrites_a_token_placed_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("flk-chan-lk-{}", std::process::id()));
+        let path = dir.join("tokens/phone.token");
+        assert_eq!(issue_token(&path, read_token, |_| false).unwrap(), None);
+        let issued = fs::read_to_string(&path).unwrap();
+
+        let missing = |_: &Path| Err(TokenFault::Missing);
+        assert_eq!(issue_token(&path, missing, |_| false).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), issued, "kept");
+        let temps = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temps, 0, "the losing temp file is removed");
         fs::remove_dir_all(&dir).unwrap();
     }
 
