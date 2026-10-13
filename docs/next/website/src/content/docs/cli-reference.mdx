@@ -517,6 +517,20 @@ When a live handoff is not possible, restart instead: `flk agent hibernate --all
 
 `checks list` enumerates the runner's script checks together with the built-in state (blocked-alert / hibernation / issue-guard). `checks ack <name>` silences the next fire — for script checks the debounce window; for the built-in blocked-alert, the current in-flight episodes. `checks run <name>` forces a script check due right now.
 
+## Goals
+
+```bash
+flk goal arm <goal> [--check CMD]... [--agent TARGET] [--json]
+flk goal status [--agent TARGET] [--json]
+flk goal pause [--minutes N] [--agent TARGET] [--json]
+flk goal resume [--agent TARGET] [--json]
+flk goal stop [--reason TEXT] [--agent TARGET] [--json]
+```
+
+An agent's goal (ADR-0030) lives on the server, keyed by the agent's id, so a restart or a pane move keeps it. `--agent` defaults to `self`, the agent whose pane runs the command; from a shell outside any agent pane, name the agent (its name, pane id, or `agent_id`; an `agent_id` with a goal works after its pane is gone). `arm` records the goal and its frozen checks, and refuses with `goal_already_armed` while one is open. `pause` without `--minutes` lasts until `resume`. `stop` drops the goal. `status` prints the goal, its state (`armed`, `paused until …`, `met`), checks, status, checklist and last verdict; `--json` prints the server's answer, `{"result":{"type":"goal","agent_id","goal":{…}}}`.
+
+An agent may arm its own goal but not pause, resume or stop it; the operator and the agent's supervisor (the architect that delegated it) may do all four. Anyone else is refused with `goal_caller_refused` and **exit 13**. The check is cooperative until uid attestation (#1208): `setsid flk goal stop` from an agent passes as the operator. A timed pause that has run out shows as `armed`. The other refusals (`goal_not_armed`, `goal_not_paused`, `goal_already_armed`, `no_caller_pane`, `invalid_params`) exit 1. No refusal changes anything. Against an older server the four writes exit 78 before anything is sent, and `status` exits 78 too. See [Goals](/socket-api/#goals).
+
 ## Direct terminal attach
 
 ```bash
