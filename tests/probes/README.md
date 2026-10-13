@@ -68,3 +68,14 @@ servers and a minimal `--tools` list, and runs Codex against a throwaway
 `CODEX_HOME` (a copy of `auth.json`, deleted on exit) under
 `workspace-write`. `--cwd` must be a folder Claude already trusts. Re-run it
 on every harness version the fleet pins.
+
+`question_hook_claude.py` is #1180's live acceptance (ADR-0034 §3, §4): a real
+Claude Code session behind flk's question hook. In an isolated flk, a Claude
+delegate started from a root pane calls `AskUserQuestion`: no dialog is drawn,
+the hook returns `deny` with the server's reason, and a following `Read` starts
+no hook process. With the server stopped, a root's dialog draws and its hook
+takes under 500 ms, and a `route`-hinted delegate is refused with the fallback
+sentence. The hook entry is the one `flk integration install claude` writes
+into a sandbox `CLAUDE_CONFIG_DIR`, passed to Claude with `--settings`, so the
+operator's profile is never written. Run it once per build, `--flk` naming a
+build with the change and then one without, for the A/B.

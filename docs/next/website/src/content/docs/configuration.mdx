@@ -809,6 +809,17 @@ Turning `channel_push` off with a config reload stops pushes at once, because ea
 read_max_wait_ms = 540000   # default, 9 minutes
 ```
 
+## Delegate questions
+
+A delegate's question tool is refused rather than drawn as a dialog in a pane nobody watches (ADR-0034). Which agents are refused is the question policy each agent starts with, not configuration: see [Claude Code](/integrations/#claude-code) for the hook and [Socket API](/socket-api/) for `hook.decide`. `[questions]` lists the third-party tools that ask a human too:
+
+```toml
+[questions]
+human_tools = ["mcp__tg-mcp__ask"]   # default []
+```
+
+A delegate's call to a listed tool is refused like Claude's own `AskUserQuestion`. Names are matched exactly, as the harness reports them (an MCP tool is `mcp__<server>__<tool>`). A config reload applies the list to the server's verdicts at once, but the Claude hook entry only calls the server for a tool named in its matcher, so run `flk integration install claude` after changing the list.
+
 ## Channel bindings
 
 A binding connects one external channel to flk (ADR-0028 §8). The adapter that serves it is described under [Channel adapters](/socket-api/#channel-adapters). Declare each binding as a `[[channels]]` entry:

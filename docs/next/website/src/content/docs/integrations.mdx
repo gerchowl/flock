@@ -108,6 +108,22 @@ The hook reports Claude Code session identity to the local Flock socket on sessi
 
 Flock uses `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set. The Claude config directory must already exist. Install writes `hooks/flock-agent-state.sh` and updates `settings.json` with Flock hook entries. Uninstall removes the matching hook entries and deletes the hook script.
 
+### Delegate questions
+
+Install also adds a `PreToolUse` entry on Claude's question tools, `AskUserQuestion|ExitPlanMode` plus any `[questions] human_tools` (ADR-0034 §3). No other tool call starts a process. The entry asks the server for a verdict with `hook.decide`, and the server answers from the policy on the agent's record:
+
+| Policy | Verdict |
+| --- | --- |
+| `ask_human` (an operator start) | pass: the dialog draws as before |
+| `route` (started by another agent) or `ask_operator` (`--unattended`) | refused with `state the question and options in your final message and end your turn` |
+| `deny` | refused with `Questions are disabled for this agent. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` |
+
+Routing the question to the architect and returning its answer into the same tool call comes in a later release. Until then, the refused agent puts its question in its final message, which is what its architect reads.
+
+When the server cannot decide (it is stopped, does not answer, predates `hook.decide`, or cannot attest the pane), the pane's `FLOCK_QUESTIONS` hint decides. A pane without one, a root, passes within 500 ms, so its dialog draws as before. A pane with one is refused with a fixed sentence: `flk could not reach your architect. …` for `route`, `flk could not reach the operator's question queue …` for `ask_operator`, and the `deny` sentence above. The hook script does the same itself when `flk` is missing, exits non-zero, prints nothing or anything but JSON, or runs longer than its 10 s watchdog. The entry's `timeout` is 30 s. On Claude Code 2.1.295 or newer it also carries `onFailure: "block"`, so a hook script that cannot start, or a shell stuck past the timeout, refuses the call too. Older Claude Code has no `onFailure`. There the entry is installed without it, and install prints `question hook: fails open on timeout`. The same happens when `claude --version` cannot be read.
+
+Known limits: a managed policy that disables user hooks disables this entry too, and a deleted hook script fails open on Claude Code older than 2.1.295. In both cases the dialog draws in the delegate's pane, as it did before this hook.
+
 ## Codex
 
 Install the Codex hook:

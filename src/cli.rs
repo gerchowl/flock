@@ -27,6 +27,7 @@ pub(crate) mod exit;
 mod fleet;
 mod help;
 mod hook;
+mod hook_question;
 mod integration;
 mod issue;
 mod lineage;

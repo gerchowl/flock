@@ -32,7 +32,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 10;
+const CLAUDE_INTEGRATION_VERSION: u32 = 11;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -50,6 +50,93 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
 /// Seconds Claude gives each installed hook before killing it. Also the
 /// ceiling on how long `flk hook claude stop` may wait for its transcript.
 pub(crate) const CLAUDE_HOOK_TIMEOUT: u64 = 10;
+/// Seconds Claude gives the question hook (ADR-0034 §3): the hold plus 30 s,
+/// and the hold is 0 until answers are held for (#1183). Above the stub's
+/// 10 s watchdog and `flk hook`'s 5 s deadline, so the harness's own timeout
+/// fires only when the shell itself is stuck.
+pub(crate) const CLAUDE_QUESTION_HOOK_TIMEOUT: u64 = 30;
+/// The first Claude Code that honours a hook's `onFailure` (ADR-0034 P4, P9).
+const CLAUDE_ON_FAILURE_SINCE: crate::update::Version = crate::update::Version {
+    major: 2,
+    minor: 1,
+    patch: 295,
+};
+
+/// Claude's `PreToolUse` entry for the question point (ADR-0034 §3). Unlike
+/// [`CLAUDE_HOOK_ENTRIES`] its shape depends on the machine: the matcher on
+/// `[questions] human_tools`, and `onFailure` on the installed Claude Code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeQuestionHook {
+    /// Tools matched beside Claude's own question tools.
+    pub(crate) human_tools: Vec<String>,
+    /// Whether to install `onFailure: "block"`, which makes a hook that
+    /// cannot start or times out refuse the call instead of drawing the
+    /// dialog. Claude Code older than 2.1.295 has no such key, so it is left
+    /// out there, or when the version cannot be read, and the entry fails
+    /// open on those two failures (ADR-0034 §4).
+    pub(crate) on_failure_block: bool,
+}
+
+impl ClaudeQuestionHook {
+    /// The entry for this machine: the live config, and `claude --version`.
+    pub(crate) fn detect() -> Self {
+        let version = crate::process::TracedCommand::new("claude", "integration")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output_traced_with_timeout(std::time::Duration::from_secs(10))
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| claude_version(&String::from_utf8_lossy(&output.stdout)));
+        Self {
+            human_tools: crate::config::Config::load().config.questions.human_tools,
+            on_failure_block: version.is_some_and(|version| version >= CLAUDE_ON_FAILURE_SINCE),
+        }
+    }
+
+    /// Only question tools, so no other tool call starts a process. Claude
+    /// reads a matcher of letters, digits, `_` and `|` as a list of exact
+    /// names and anything else as a regex, so a list with a configured name
+    /// in it is anchored and escaped: unanchored, `mcp__x__ask` would also
+    /// match `mcp__x__ask_later`.
+    fn matcher(&self) -> String {
+        let own = crate::api::schema::HookHarness::Claude.question_tools();
+        if self.human_tools.is_empty() {
+            return own.join("|");
+        }
+        let names: Vec<String> = own
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .chain(self.human_tools.iter().map(|tool| regex::escape(tool)))
+            .collect();
+        format!("^({})$", names.join("|"))
+    }
+
+    fn entry(&self, command: String) -> Value {
+        let mut hook = json!({
+            "type": "command",
+            "command": command,
+            "timeout": CLAUDE_QUESTION_HOOK_TIMEOUT,
+        });
+        if self.on_failure_block {
+            hook["onFailure"] = json!("block");
+        }
+        json!({ "matcher": self.matcher(), "hooks": [hook] })
+    }
+
+    /// What `flk integration install` says about the entry it wrote.
+    fn install_note(&self) -> &'static str {
+        if self.on_failure_block {
+            "question hook: fails closed (onFailure: block)"
+        } else {
+            "question hook: fails open on timeout (claude < 2.1.295, or its version unreadable)"
+        }
+    }
+}
+
+/// `2.1.296 (Claude Code)` → 2.1.296.
+fn claude_version(output: &str) -> Option<crate::update::Version> {
+    crate::update::Version::parse(output.split_whitespace().next()?)
+}
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
 const CODEX_INTEGRATION_VERSION: u32 = 7;
@@ -592,7 +679,8 @@ pub(crate) fn install_target_with_hook_trust(
             messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
-            let installed = install_claude()?;
+            let question = ClaudeQuestionHook::detect();
+            let installed = install_claude(&question)?;
             let mut messages = Vec::new();
             if installed.removed_legacy_hook {
                 messages.push(
@@ -608,6 +696,7 @@ pub(crate) fn install_target_with_hook_trust(
                 "ensured claude settings at {}",
                 installed.settings_path.display()
             ));
+            messages.push(question.install_note().to_string());
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
@@ -1195,7 +1284,7 @@ fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
+pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<ClaudeInstallPaths> {
     let dir = claude_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1297,6 +1386,17 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
             *matcher,
         )?;
     }
+    // ADR-0034 §3: rewritten on every install, because its matcher and
+    // onFailure follow the config and the Claude version, and
+    // `ensure_command_hook` leaves an entry it already has untouched.
+    let question_command = format!("bash {quoted_hook_path} question");
+    remove_command_hook(hooks, "PreToolUse", &question_command)?;
+    hooks
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| io::Error::other("hook entries for PreToolUse must be an array"))?
+        .push(question.entry(question_command));
 
     fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
 
@@ -1312,7 +1412,7 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
 /// writes via [`ensure_command_hook`]. This is the canonical thing a consumer
 /// merges into its own (possibly read-only / externally-managed) settings.json
 /// instead of relying on flock to patch the file — the manifest "seam".
-fn claude_hooks_fragment(hook_path: &Path) -> Value {
+fn claude_hooks_fragment(hook_path: &Path, question: &ClaudeQuestionHook) -> Value {
     let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
     let mut hooks = Map::new();
     for (event, arg, matcher) in CLAUDE_HOOK_ENTRIES {
@@ -1335,7 +1435,26 @@ fn claude_hooks_fragment(hook_path: &Path) -> Value {
             Value::Array(vec![Value::Object(entry)]),
         );
     }
+    hooks.insert(
+        "PreToolUse".to_string(),
+        json!([question.entry(format!("bash {quoted_hook_path} question"))]),
+    );
     Value::Object(hooks)
+}
+
+/// [`integration_manifest`] for Claude, with the question entry this machine
+/// gets (see [`ClaudeQuestionHook::detect`]).
+fn claude_manifest(question: &ClaudeQuestionHook) -> io::Result<Value> {
+    let dir = claude_dir()?;
+    let hook_path = effective_claude_hook_path(&dir);
+    let settings_path = dir.join("settings.json");
+    Ok(json!({
+        "target": integration_target_label(crate::api::schema::IntegrationTarget::Claude),
+        "version": CLAUDE_INTEGRATION_VERSION,
+        "hookScript": hook_path.display().to_string(),
+        "settingsPath": settings_path.display().to_string(),
+        "hooks": claude_hooks_fragment(&hook_path, question),
+    }))
 }
 
 /// Verdict returned by [`verify_integration_manifest`] (#175 S2 gate for
@@ -1450,7 +1569,10 @@ fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let raw = fs::read_to_string(&settings_path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
     let installed_hooks = parsed.get("hooks").cloned().unwrap_or(Value::Null);
-    let expected_hooks = claude_hooks_fragment(&hook_path);
+    // Only commands are compared below, so the question entry's
+    // machine-dependent matcher and onFailure do not matter here, and the
+    // reap gate never runs `claude --version`.
+    let expected_hooks = claude_hooks_fragment(&hook_path, &ClaudeQuestionHook::default());
 
     // SUBSET semantics, matching the installer (#309). `ensure_command_hook`
     // APPENDS flock's entry and treats the event as satisfied when any entry
@@ -1542,16 +1664,7 @@ pub(crate) fn integration_manifest(
 ) -> io::Result<Value> {
     match target {
         crate::api::schema::IntegrationTarget::Claude => {
-            let dir = claude_dir()?;
-            let hook_path = effective_claude_hook_path(&dir);
-            let settings_path = dir.join("settings.json");
-            Ok(json!({
-                "target": integration_target_label(target),
-                "version": CLAUDE_INTEGRATION_VERSION,
-                "hookScript": hook_path.display().to_string(),
-                "settingsPath": settings_path.display().to_string(),
-                "hooks": claude_hooks_fragment(&hook_path),
-            }))
+            claude_manifest(&ClaudeQuestionHook::detect())
         }
         other => Err(io::Error::other(format!(
             "manifest is not available for {} yet; use `flk integration install {}`",
@@ -1871,6 +1984,11 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
                 hooks,
                 "PreToolUse",
                 &format!("bash {quoted_hook_path} working"),
+            )?;
+            updated_settings |= remove_command_hook(
+                hooks,
+                "PreToolUse",
+                &format!("bash {quoted_hook_path} question"),
             )?;
             updated_settings |= remove_command_hook(
                 hooks,
@@ -3568,7 +3686,8 @@ mod tests {
         fs::create_dir_all(shared.parent().unwrap()).unwrap();
         fs::create_dir_all(&profile).unwrap();
         fs::write(&shared, CLAUDE_HOOK_ASSET).unwrap();
-        let settings = json!({"hooks": claude_hooks_fragment(&shared)});
+        let settings =
+            json!({"hooks": claude_hooks_fragment(&shared, &ClaudeQuestionHook::default())});
         fs::write(profile.join("settings.json"), settings.to_string()).unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &profile);
         let status = installed_integration_statuses()
@@ -3578,7 +3697,7 @@ mod tests {
         assert_eq!(status.path, shared);
         assert_eq!(status.state, IntegrationStatusKind::Current);
         assert!(verify_claude_settings_drift().is_none());
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         assert_eq!(installed.hook_path, shared);
         assert!(!profile
             .join("hooks")
@@ -4009,7 +4128,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         assert!(installed.removed_legacy_hook);
         assert!(
@@ -4041,11 +4160,133 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         assert!(
             !installed.removed_legacy_hook,
             "clean install should not report a legacy removal"
         );
+    }
+
+    /// The legacy `PreToolUse ... working` entry is gone, and the question
+    /// entry is there exactly once (ADR-0034 §3).
+    fn assert_only_the_question_entry(settings: &Value) {
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" question"));
+    }
+
+    /// Claude reads the matcher as a regex once it holds anything but
+    /// letters, digits, `_` and `|` (an anchored list, or a configured name
+    /// with a `-`). Either way it must match the question tools and the
+    /// configured names exactly, and nothing else: a non-question tool call
+    /// must start no process (ADR-0034 §1).
+    #[test]
+    fn the_question_matcher_names_only_question_tools() {
+        let plain = ClaudeQuestionHook::default().matcher();
+        assert_eq!(plain, "AskUserQuestion|ExitPlanMode");
+        assert!(plain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '|'));
+
+        let configured = ClaudeQuestionHook {
+            human_tools: vec!["mcp__tg-mcp__ask".into(), "mcp__a.b__ask".into()],
+            on_failure_block: false,
+        }
+        .matcher();
+        let regex = regex::Regex::new(&configured).unwrap();
+        for tool in [
+            "AskUserQuestion",
+            "ExitPlanMode",
+            "mcp__tg-mcp__ask",
+            "mcp__a.b__ask",
+        ] {
+            assert!(regex.is_match(tool), "{configured} misses {tool}");
+        }
+        for tool in [
+            "Bash",
+            "Read",
+            "Edit",
+            "mcp__tg-mcp__ask_later",
+            "xAskUserQuestion",
+            "mcp__aXb__ask",
+        ] {
+            assert!(!regex.is_match(tool), "{configured} matches {tool}");
+        }
+    }
+
+    /// `onFailure: "block"` only where Claude Code honours it (ADR-0034 §3,
+    /// P4, P9); an older Claude gets the key-less entry.
+    #[test]
+    fn on_failure_is_installed_from_claude_2_1_295() {
+        let entry = |on_failure_block| {
+            ClaudeQuestionHook {
+                human_tools: Vec::new(),
+                on_failure_block,
+            }
+            .entry("cmd".into())
+        };
+        assert_eq!(entry(true)["hooks"][0]["onFailure"], "block");
+        assert!(entry(false)["hooks"][0].get("onFailure").is_none());
+        assert_eq!(
+            entry(true)["hooks"][0]["timeout"],
+            CLAUDE_QUESTION_HOOK_TIMEOUT
+        );
+
+        let at_least = |raw: &str| claude_version(raw).map(|v| v >= CLAUDE_ON_FAILURE_SINCE);
+        assert_eq!(at_least("2.1.296 (Claude Code)\n"), Some(true));
+        assert_eq!(at_least("2.1.295 (Claude Code)"), Some(true));
+        assert_eq!(at_least("2.1.294 (Claude Code)"), Some(false));
+        assert_eq!(at_least("1.9.999"), Some(false));
+        assert_eq!(at_least("not a version"), None);
+        assert_eq!(at_least(""), None);
+    }
+
+    /// A reinstall rewrites the question entry rather than keeping a stale
+    /// matcher or adding a second one, keeps a user's own PreToolUse hook,
+    /// and an uninstall removes only flk's.
+    #[test]
+    fn the_question_entry_is_rewritten_on_reinstall_and_removed_on_uninstall() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let read = || -> Value {
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap()
+        };
+
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
+        let widened = ClaudeQuestionHook {
+            human_tools: vec!["mcp__x__ask".into()],
+            on_failure_block: true,
+        };
+        install_claude(&widened).unwrap();
+
+        let pre = read()["hooks"]["PreToolUse"].clone();
+        assert_eq!(pre.as_array().unwrap().len(), 2, "{pre}");
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo mine");
+        assert_eq!(
+            pre[1]["matcher"],
+            "^(AskUserQuestion|ExitPlanMode|mcp__x__ask)$"
+        );
+        assert_eq!(pre[1]["hooks"][0]["onFailure"], "block");
+
+        uninstall_claude().unwrap();
+        let pre = read()["hooks"]["PreToolUse"].clone();
+        assert_eq!(pre.as_array().unwrap().len(), 1, "{pre}");
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo mine");
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -4062,7 +4303,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
@@ -4097,7 +4338,15 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(" stop"));
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        // ADR-0034 §3: the only PreToolUse entry is the question point.
+        assert_eq!(
+            settings["hooks"]["PreToolUse"],
+            json!([{"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{
+                "type": "command",
+                "command": format!("bash '{}' question", installed.hook_path.display()),
+                "timeout": CLAUDE_QUESTION_HOOK_TIMEOUT,
+            }]}])
+        );
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
@@ -4157,13 +4406,17 @@ mod tests {
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
         // install writes the canonical hook entries into settings.json...
-        let installed = install_claude().unwrap();
+        let question = ClaudeQuestionHook {
+            human_tools: vec!["mcp__tg-mcp__ask".into()],
+            on_failure_block: true,
+        };
+        let installed = install_claude(&question).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
 
         // ...and the manifest emits the EXACT same fragment a consumer declares,
         // so the two sources of truth cannot drift (ADR on #136).
-        let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
+        let manifest = claude_manifest(&question).unwrap();
         assert_eq!(manifest["hooks"], settings["hooks"]);
         assert_eq!(manifest["version"], json!(CLAUDE_INTEGRATION_VERSION));
         assert_eq!(
@@ -4206,7 +4459,7 @@ mod tests {
         .unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
         let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
@@ -4234,7 +4487,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         assert_eq!(installed.settings_path, claude_dir.join("settings.json"));
         assert_eq!(
@@ -4255,8 +4508,8 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
 
-        install_claude().unwrap();
-        install_claude().unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
@@ -4284,7 +4537,7 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(" stop"));
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        assert_only_the_question_entry(&settings);
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
@@ -4317,7 +4570,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        install_claude().unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
@@ -4351,7 +4604,7 @@ mod tests {
                 .unwrap()
                 .ends_with(" prompt")
         );
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        assert_only_the_question_entry(&settings);
         // v7: Stop is now installed (recap+reply scrape). It should not be
         // absent here — only the LEGACY `Stop ... idle` command is removed.
         // The presence assertion mirrors `install_claude_writes_hook_*`.
@@ -4491,7 +4744,9 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("HOME", &home);
 
-        let err = install_claude().unwrap_err().to_string();
+        let err = install_claude(&ClaudeQuestionHook::default())
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("claude directory not found"));
 
@@ -5511,7 +5766,7 @@ mod tests {
         std::env::set_var("HOME", &home);
         // Fresh install: the settings hooks fragment matches the expected
         // fragment byte-for-byte (that's what install_claude produces).
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let verdict = verify_integration_manifest();
         assert_eq!(verdict, ManifestVerdict::Ok, "expected Ok, got {verdict:?}");
         std::env::remove_var("HOME");
@@ -5527,7 +5782,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
         // Install so the hook script is Current…
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
         // …then clobber `hooks.Stop` to a different command; that's the
         // #143 half-state: hook file present but settings registration
         // drifted.
@@ -5572,7 +5827,7 @@ mod tests {
         let claude_dir = home.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         // Prepend a personal hook to Stop, keeping flock's entry.
         let settings_path = claude_dir.join("settings.json");
@@ -5606,7 +5861,7 @@ mod tests {
         let claude_dir = home.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         // Replace Stop with only a personal hook — the real-world shape of a
         // read-only, externally-owned settings.json.

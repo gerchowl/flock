@@ -1786,6 +1786,9 @@ impl App {
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
         }
+        if !invalid_section("questions") {
+            self.state.config.questions = config.questions.clone();
+        }
         if !invalid_section("channels") {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());

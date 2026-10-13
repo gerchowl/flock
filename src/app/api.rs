@@ -1499,6 +1499,7 @@ impl App {
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
+            Method::HookDecide(params) => return self.handle_hook_decide(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),

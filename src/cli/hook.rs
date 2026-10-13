@@ -38,7 +38,7 @@ use crate::api::schema::{
 /// `connect` leg is not covered (std `UnixStream` has no connect timeout), but
 /// the failure mode #158 cares about — no server listening — fails `connect`
 /// immediately with ENOENT/ECONNREFUSED, so it stays fire-and-forget.
-const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+pub(super) const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The line an agent ends its turn with; the Stop hook lifts it verbatim.
 const RECAP_SENTINEL: &str = "※ recap:";
@@ -141,6 +141,9 @@ enum Action {
     /// delegate table as plain text for the plugin to add to the compaction
     /// context (#962).
     Compacting,
+    /// The question point of ADR-0034: a `PreToolUse` hook on the harness's
+    /// question tools, answered with the server's verdict.
+    Question,
 }
 
 impl Action {
@@ -155,6 +158,7 @@ impl Action {
             "blocked" => Some(Self::State(PaneAgentState::Blocked)),
             "release" => Some(Self::Release),
             "compacting" => Some(Self::Compacting),
+            "question" => Some(Self::Question),
             _ => None,
         }
     }
@@ -180,14 +184,14 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         // stdout, like `flk --help`: the request was honoured, so this is the
         // command's output and can be redirected or paged.
         println!(
-            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting>"
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting|question>"
         );
         return Ok(0);
     }
 
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting>"
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting|question>"
         );
         return Ok(2);
     };
@@ -209,6 +213,14 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     let input = read_stdin_json();
+    // ADR-0034 §3: the question point prints a verdict and reports nothing.
+    // Only Claude's entry is installed so far (Codex is #1185).
+    if matches!(action, Action::Question) {
+        return Ok(match agent {
+            Agent::Claude => super::hook_question::run(&input, seq()),
+            _ => 0,
+        });
+    }
     let hook_event_name = str_field(&input, "hook_event_name").unwrap_or_default();
 
     // SubagentStop is a completion event Claude can emit after the main turn
@@ -300,7 +312,7 @@ fn plan(
         Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
         Action::State(state) => plan_state(agent, state, input, pane_id),
         Action::Release => plan_release(agent, input, pane_id),
-        Action::Compacting => HookOutcome::default(),
+        Action::Compacting | Action::Question => HookOutcome::default(),
     }
 }
 
