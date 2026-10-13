@@ -316,6 +316,10 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("fleet", "pause", "flk fleet pause [--reason TEXT]"),
     ("fleet", "resume", "flk fleet resume"),
     ("fleet", "status", "flk fleet status"),
+    ("owner", "bind", super::owner::BIND_USAGE),
+    ("owner", "unbind", super::owner::UNBIND_USAGE),
+    ("owner", "list", super::owner::LIST_USAGE),
+    ("owner", "show", super::owner::SHOW_USAGE),
     ("goal", "arm", "flk goal arm <goal> [--check CMD]... [--agent TARGET] [--json]"),
     ("goal", "status", "flk goal status [--agent TARGET] [--json]"),
     ("goal", "pause", "flk goal pause [--minutes N] [--agent TARGET] [--json]"),
@@ -627,10 +631,10 @@ mod tests {
             "integration" => include_str!("integration.rs"),
             "checks" => include_str!("checks.rs"),
             "fleet" => include_str!("fleet.rs"),
+            "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
-            "owner" => include_str!("owner.rs"),
             // `wait park` shares the `events` parser.
             "wait" => concat!(include_str!("../cli.rs"), include_str!("events.rs")),
             // These five live inline in the dispatcher itself.

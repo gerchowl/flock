@@ -20,6 +20,8 @@ When an existing status ping, submission guard, or failed command reveals a diff
 | `delegate` awaits: `not_started` | `8` | `11` |
 | `wait reply`, `msg send --await`, `msg status`: the receiver refused the message | `4` | `13` |
 
+Every verb now exits what the error-code registry assigns its error, for send-like and guarded verbs too, which is also what MCP reports as `data.exit` (#1238, #1195, #1241). Three codes changed with no stderr notice: `server_version_gap` exits `78` (was `1`), and `questions_widening_refused` and `operator_only` exit `13` (were `1`). A `later` refusal from a send-like or guarded verb stays `10`, and every other code stays `1`.
+
 ## Output format and the error envelope
 
 `--format json|text` is a global flag, and `--json` is its synonym (ADR-0029 §3). Where it may appear:
@@ -148,8 +150,9 @@ flk peers enroll --reset <peer>
 The default reset clears the configured-peer pin. Use
 `flk peers enroll --reset <peer> --direction inbound` for an inbound pin.
 The command shows the direction, name, and node ID before clearing that pin.
-Reset is refused when invoked from an agent pane or over MCP/relay; the
-operator's shell is the trust boundary. Peers using incompatible versions or a
+Reset is refused with `operator_only` and exit 13 (1 before #1195) when
+invoked from an agent pane or over MCP/relay; the operator's shell is the
+trust boundary. Peers using incompatible versions or a
 failing relay are refused with a concrete reason. Version refusals include
 `upgrade flk on <peer>` (or `this node` when the local version is older); discovery does not fall back to one-shot SSH.
 
@@ -577,6 +580,17 @@ flk wait park --until 'reply:c_42' --deadline 2h
 ```
 
 Prints `parked <wait_id> on <predicate> until <deadline> (Unix ms)`, with the predicate in canonical form, and exits 0; `--json` prints the `wait.park` result instead. Until the deadline (at most 24 h), `agent get` reports the wait as `state.waiting` and the agent's phase as `waiting_on_event`, so a supervisor sees it as parked, not stalled. In this release the park ends at its deadline, announced once as a durable `wait.expired` event; opening it when the predicate turns true is #1032. Exits 2 for a bad predicate (`wait_predicate_invalid`), one not supported yet (`wait_predicate_unsupported`: `pr:<n> ci_completed`, `any-delegate-of-mine changed`, #1250) or a deadline over 24 h (`wait_deadline_too_long`); 10 when the agent already holds 16 parks (`too_many_waits`); 1 for `peer_incompatible` (a delegate on another host), `agent_not_found` or `no_caller_pane`; 78 against a server without `wait.park`. A running `events wait` is a registered wait too. See [Registered waits](/socket-api/#registered-waits).
+
+Bind a repo to its resident owner, end the binding, and read the bindings on this node (ADR-0035 §1):
+
+```bash
+flk owner bind <owner/repo> --checkout PATH --harness claude|codex|opencode [--model NAME] [--profile NAME]... [--json]
+flk owner unbind <owner/repo> [--json]
+flk owner list [--json]
+flk owner show <owner/repo> [--json]
+```
+
+Each verb prints the server's reply (see [Owner bindings](/socket-api/#owner-bindings)) and exits 0. `bind` records the binding on the node whose server answers, which becomes the owner's home node; `--checkout` must name a git checkout on it (a relative path is resolved against the current directory), `--profile` repeats for the profile ladder, first choice first, and binding a bound repo again keeps its `agent_id`. `bind` and `unbind` are operator verbs: run from an agent's pane, relayed from a mesh peer, or from a caller whose pid the server could not read, they are refused with `operator_only` and **exit 13**, and nothing changes. That boundary is **cooperative only** until agents run as their own Unix user (#1208, #1177): a child an agent detaches with `setsid` passes as the operator. `unbind` and `show` of a repo with no binding exit 4 (`not_found`). A bad slug or checkout exits 1 (`invalid_params`), a usage error 2, and a server without the `owner.*` methods 78. Under `--json` every error is the envelope above.
 
 Check a channel adapter's binding before the adapter starts:
 
