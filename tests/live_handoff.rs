@@ -424,7 +424,12 @@ fn adopt_replacement_server(pid: u32) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
+fn wait_for_replacement_server_pid(
+    runtime_dir: &Path,
+    _config_home: &Path,
+    old_pid: u32,
+    timeout: Duration,
+) -> u32 {
     let deadline = Instant::now() + timeout;
     let mut last_pids = Vec::new();
     while Instant::now() < deadline {
@@ -442,39 +447,31 @@ fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Du
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
-    wait_for_handoff_importer_pid(old_pid, timeout)
+fn wait_for_replacement_server_pid(
+    _runtime_dir: &Path,
+    config_home: &Path,
+    old_pid: u32,
+    timeout: Duration,
+) -> u32 {
+    wait_for_handoff_importer_pid(config_home, old_pid, timeout)
 }
 
-/// The importer the server `old_pid` spawned, found by the handoff socket
-/// named on its command line. Unlike the runtime-dir sweep this also finds an
-/// importer running a binary other than the test build, such as a store copy.
-fn wait_for_handoff_importer_pid(old_pid: u32, timeout: Duration) -> u32 {
-    let handoff_socket_pattern = format!("flock-handoff-{old_pid}.sock");
+/// The importer the server `old_pid` spawned in the sandbox under
+/// `config_home`, found by the handoff socket on its command line. Unlike the
+/// runtime-dir sweep this also finds an importer running a binary other than
+/// the test build, such as a store copy. Scoped to the sandbox so a reused pid
+/// never selects an importer outside it (#1261).
+fn wait_for_handoff_importer_pid(config_home: &Path, old_pid: u32, timeout: Duration) -> u32 {
     let deadline = Instant::now() + timeout;
-    let mut last_stdout = String::new();
     while Instant::now() < deadline {
-        if let Ok(output) = std::process::Command::new("pgrep")
-            .args(["-f", &handoff_socket_pattern])
-            .output()
-        {
-            last_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            for line in last_stdout.lines() {
-                let Some(pid_text) = line.split_whitespace().next() else {
-                    continue;
-                };
-                let Ok(pid) = pid_text.parse::<u32>() else {
-                    continue;
-                };
-                if pid != old_pid {
-                    return adopt_replacement_server(pid);
-                }
-            }
+        if let Some(pid) = support::handoff_importer_pids(config_home, old_pid).first() {
+            return adopt_replacement_server(*pid);
         }
         thread::sleep(Duration::from_millis(25));
     }
     panic!(
-        "handoff importer for server {old_pid} did not appear; last pgrep output: {last_stdout}"
+        "handoff importer for server {old_pid} did not appear under {}",
+        config_home.display()
     );
 }
 
@@ -508,6 +505,76 @@ fn wait_for_http_contains(port: u16, needle: &str, timeout: Duration) -> String 
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// #1261: the importer lookup sees only importers inside this test's sandbox.
+///
+/// Pids are reused, so the server pid in a handoff socket's name is no proof of
+/// ownership: an operator's live importer can carry the same name. Two decoys
+/// carry `flock-handoff-<pid>.sock` with `--handoff-import`, one outside the
+/// sandbox and one with the name alone, and neither may be selected. A third,
+/// inside the sandbox, proves the lookup still finds a real match.
+#[test]
+fn handoff_importer_lookup_ignores_importers_outside_the_sandbox() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let elsewhere = base.join("elsewhere");
+    let old_pid = 60058;
+    let socket_name = format!("flock-handoff-{old_pid}.sock");
+    // Each decoy leads its own process group, so killing the group also takes
+    // the `sleep` the shell forked and nothing outlives the test.
+    let decoy = |args: Vec<String>| {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; exit 0", "decoy"])
+            .args(args)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let outside = elsewhere.join("flock-dev").join(&socket_name);
+    let inside = config_home.join("flock-dev").join(&socket_name);
+    let mut decoys = vec![
+        decoy(vec![
+            "server".into(),
+            "--handoff-import".into(),
+            outside.display().to_string(),
+            "token".into(),
+        ]),
+        decoy(vec![inside.display().to_string()]),
+    ];
+    let outside_pids: Vec<u32> = decoys.iter().map(|child| child.id()).collect();
+    let real = decoy(vec![
+        "server".into(),
+        "--handoff-import".into(),
+        inside.display().to_string(),
+        "token".into(),
+    ]);
+
+    let real_pid = real.id();
+    decoys.push(real);
+
+    // Every decoy's argv must be readable before the lookup runs, or a decoy
+    // that was not selected might only not have exec'd yet.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !decoys.iter().all(|child| {
+        support::process_table::process_info(child.id())
+            .is_ok_and(|info| info.argv.iter().any(|arg| arg == "decoy"))
+    }) {
+        assert!(Instant::now() < deadline, "a decoy never started");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let selected = support::handoff_importer_pids(&config_home, old_pid);
+    for child in &mut decoys {
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+    }
+    let _ = fs::remove_dir_all(&base);
+
+    assert_eq!(selected, vec![real_pid], "decoys outside: {outside_pids:?}");
+}
+
 #[test]
 fn live_server_holds_one_pty_master_fd_per_pane() {
     let _lock = test_lock();
@@ -576,8 +643,12 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
-    let replacement_pid =
-        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(10));
+    let replacement_pid = wait_for_replacement_server_pid(
+        &runtime_dir,
+        &config_home,
+        server_pid,
+        Duration::from_secs(10),
+    );
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_server_ptmx_fd_count(replacement_pid, 3, Duration::from_secs(5));
 
@@ -1771,6 +1842,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     if committed {
         wait_for_replacement_server_pid(
             &runtime_dir,
+            &config_home,
             spawned.child.process_id().unwrap(),
             Duration::from_secs(10),
         );
@@ -2266,8 +2338,12 @@ fn live_handoff_carries_more_panes_than_one_fd_batch() {
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     );
     assert_ok(handoff);
-    let replacement_pid =
-        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    let replacement_pid = wait_for_replacement_server_pid(
+        &runtime_dir,
+        &config_home,
+        server_pid,
+        Duration::from_secs(30),
+    );
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(30));
     wait_for_server_ptmx_fd_count(replacement_pid, MANY_PANES, Duration::from_secs(30));
@@ -2748,7 +2824,12 @@ fn live_handoff_keeps_an_idle_claude_pane_readable_repainted_and_its_mail_queued
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
-    wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    wait_for_replacement_server_pid(
+        &runtime_dir,
+        &config_home,
+        server_pid,
+        Duration::from_secs(30),
+    );
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(30));
 
@@ -2965,7 +3046,8 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "handoff failed:\n{stderr}");
 
-    let replacement_pid = wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
+    let replacement_pid =
+        wait_for_handoff_importer_pid(&config_home, server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(
         process_argv0(replacement_pid),
@@ -3022,7 +3104,8 @@ fn live_handoff_upgrades_an_older_server_to_the_client_version() {
         &api_socket,
     );
     assert!(ok, "handoff failed:\n{stderr}");
-    let replacement_pid = wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
+    let replacement_pid =
+        wait_for_handoff_importer_pid(&config_home, server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(
         process_argv0(replacement_pid),
@@ -3109,7 +3192,7 @@ fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
     );
     assert!(stderr.contains("same server version"), "{stderr}");
     assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
-    wait_for_handoff_importer_pid(server_pid, Duration::from_secs(30));
+    wait_for_handoff_importer_pid(&config_home, server_pid, Duration::from_secs(30));
     drop(spawned);
     assert_eq!(server_version(&api_socket), "0.0.1");
 
