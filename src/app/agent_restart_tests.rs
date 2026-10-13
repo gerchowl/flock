@@ -273,27 +273,54 @@ async fn restart_api_resumes_same_session_flags_env_and_delivers_continuation() 
 /// process is launched with its hint.
 #[tokio::test]
 async fn a_restart_keeps_the_question_policy_and_its_hint() {
-    // Written whole, then renamed, so a reader never sees half a record.
-    let mut rig = rig_with_script("#!/bin/sh\n{ printf '%s\\n' \"$@\"; printf '%s\\n' \"${FLOCK_QUESTIONS:-unset}\"; } > \"partial-$$\"\nmv \"partial-$$\" \"launch-$$\"\nwhile IFS= read -r line; do :; done\n");
+    // The original launch starts with --model. Every other launch reports its
+    // actual arguments, including a restart missing --resume. Reading
+    // its report waits for execution rather than assuming spawn means it ran in
+    // five seconds (#1283). ADR-0034 §2 requires the record and hint to survive.
+    let mut rig = rig_with_script("#!/bin/sh\nif [ \"$1\" != --model ]; then printf '%s\\n' \"$1\" \"$2\" \"${FLOCK_QUESTIONS:-unset}\" > resumed; fi\nwhile IFS= read -r line; do :; done\n");
+    let path = rig.directory.join("resumed");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: c_path is a live, NUL-terminated path to this rig's private FIFO.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let receiver = tokio::net::unix::pipe::OpenOptions::new()
+        .open_receiver(&path)
+        .unwrap();
+    // Keep the FIFO connected until the harness opens it, preventing an early
+    // EOF. The report has three lines, so completion does not depend on EOF.
+    let _sender = tokio::net::unix::pipe::OpenOptions::new()
+        .open_sender(&path)
+        .unwrap();
+    let mut receiver = tokio::io::BufReader::new(receiver);
     rig.app.state.terminals.get_mut(&rig.id).unwrap().questions =
         crate::api::schema::QuestionPolicy::Route;
     assert!(request(&mut rig).get("result").is_some());
     idle(&mut rig, Instant::now(), "");
     advance_until_verifying(&mut rig).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let launch = loop {
-        let text = std::fs::read_dir(&rig.directory)
-            .unwrap()
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-"))
-            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-            .find(|text| text.starts_with("--resume\nrestart-session\n"));
-        if let Some(text) = text {
-            break text;
+    use tokio::io::AsyncBufReadExt;
+    let mut report = Vec::new();
+    for _ in 0..3 {
+        loop {
+            tokio::select! {
+                result = receiver.read_until(b'\n', &mut report) => {
+                    assert!(result.unwrap() > 0, "resumed fixture closed its report");
+                    break;
+                }
+                event = rig.app.event_rx.recv() => {
+                    assert!(event.is_some(), "runtime event channel closed");
+                    // A late death event can belong to the original process.
+                    // Judge the resumed child itself, not the pane id alone.
+                    assert!(!rig.app.restart_runtime_gone(&rig.id),
+                        "resumed fixture exited before its report: {}",
+                        rig.app.restart_last_output(&rig.id));
+                }
+            }
         }
-        assert!(Instant::now() < deadline, "resumed fixture did not execute");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    };
+    }
+    let launch = String::from_utf8(report).unwrap();
+    assert!(
+        launch.starts_with("--resume\nrestart-session\n"),
+        "{launch}"
+    );
     assert!(launch.ends_with("route\n"), "{launch}");
     assert_eq!(
         rig.app.state.terminals[&rig.id].questions,
