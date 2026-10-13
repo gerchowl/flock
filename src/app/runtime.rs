@@ -1133,17 +1133,21 @@ impl App {
             }
             let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
             let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
-            let merged = branch.as_deref().map(|b| {
-                matches!(
-                    crate::worktree::branch_merge_gate(
-                        &space.repo_root,
-                        &space.checkout_path,
-                        b,
-                        &self.state.config.worktrees.integration_branches,
-                    ),
-                    crate::worktree::WorktreeMergeGate::Merged { .. }
+            let gate = branch.as_deref().map(|b| {
+                crate::worktree::branch_merge_gate(
+                    &space.repo_root,
+                    &space.checkout_path,
+                    b,
+                    &self.state.config.worktrees.integration_branches,
                 )
             });
+            let merged = gate
+                .as_ref()
+                .map(|gate| matches!(gate, crate::worktree::WorktreeMergeGate::Merged { .. }));
+            // #1278: an open PR or an unanswerable PR question is never reaped.
+            let live = gate
+                .as_ref()
+                .is_some_and(crate::worktree::WorktreeMergeGate::is_live);
             out.push(crate::checks::ReapWorkspaceSnapshot {
                 workspace_id: ws.id.clone(),
                 is_linked_worktree: true,
@@ -1153,6 +1157,7 @@ impl App {
                 branch,
                 dirty,
                 merged,
+                live,
                 panes,
             });
         }

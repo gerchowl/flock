@@ -758,6 +758,9 @@ impl App {
                 working_agent,
                 dirty,
                 merged: false,
+                // Settled when the row's gate lands; Enter waits for every
+                // gate (`resolving`), so this value is never executed.
+                live: false,
             });
             rows.push(WorktreeKillRow {
                 workspace_id: ws.id.clone(),
@@ -847,6 +850,10 @@ impl App {
             result.gate,
             crate::worktree::WorktreeMergeGate::Merged { .. }
         ) && !result.protected;
+        // #1278: an open PR, a PR question gh could not answer, or a gate that
+        // ran out of clock all leave "under review" possible, so the sweep
+        // must not touch the row at all, forced or not.
+        let live = result.gate.is_live() || result.timed_out;
         row.branch = result.branch;
         row.protected = result.protected;
         row.merge_gate = Some(result.gate);
@@ -855,6 +862,7 @@ impl App {
             working_agent: row.working_agent,
             dirty: row.dirty,
             merged,
+            live,
         });
         self.render_dirty.store(true, Ordering::Release);
         self.render_notify.notify_one();
@@ -1972,23 +1980,7 @@ impl App {
                     .state
                     .worktree_remove
                     .as_ref()
-                    .filter(|remove| {
-                        // #325: force stands in for merge evidence. It cannot
-                        // reach a protected branch — `branch_protected` clears
-                        // `delete_branch` when the gate resolves (#121), and
-                        // that is checked first here. Nor can it reach the
-                        // head of an open PR (#1278).
-                        remove.delete_branch
-                            && ((remove.force
-                                && !matches!(
-                                    remove.merge_gate,
-                                    Some(crate::worktree::WorktreeMergeGate::OpenPr { .. })
-                                ))
-                                || matches!(
-                                    remove.merge_gate,
-                                    Some(crate::worktree::WorktreeMergeGate::Merged { .. })
-                                ))
-                    })
+                    .filter(|remove| remove.deletes_branch())
                     .and_then(|remove| {
                         remove
                             .branch
@@ -4046,6 +4038,94 @@ mod tests {
             row.tier,
             crate::worktree::KillTier::KillBranch { dirty: false }
         );
+    }
+
+    #[test]
+    fn the_sweep_never_touches_an_open_pr_or_an_unknown_verdict() {
+        // #1278 round 2: an open PR, a PR question gh could not answer, and a
+        // gate that ran out of clock used to land on CheckoutOnly, so the
+        // sweep removed the checkout of a PR under review. Even the operator's
+        // force escalation must leave them alone.
+        let cases = [
+            (
+                crate::worktree::WorktreeMergeGate::OpenPr { number: Some(150) },
+                false,
+            ),
+            (
+                crate::worktree::WorktreeMergeGate::Unknown {
+                    reason: "gh failed: API rate limit exceeded".into(),
+                },
+                false,
+            ),
+            (crate::worktree::WorktreeMergeGate::NotMerged, true),
+        ];
+        for (gate, timed_out) in cases {
+            for dirty in [false, true] {
+                let mut app = app_for_worktree_tests();
+                let mut row = sweep_row("feature/under-review");
+                row.dirty = dirty;
+                app.state.worktree_kill_all = Some(WorktreeKillAllState {
+                    rows: vec![row],
+                    executing: false,
+                    force_dirty: true,
+                });
+                app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+                    workspace_id: "ws".into(),
+                    path: std::path::PathBuf::from("/repo/flock-issue"),
+                    branch: Some("feature/under-review".into()),
+                    gate: gate.clone(),
+                    protected: false,
+                    timed_out,
+                    probe: None,
+                });
+                let row = &app.state.worktree_kill_all.as_ref().unwrap().rows[0];
+                assert_eq!(row.tier, crate::worktree::KillTier::SkipLive, "{gate:?}");
+                assert_eq!(
+                    crate::worktree::planned_action(row.tier, true),
+                    KillAction::Skip,
+                    "{gate:?}, dirty {dirty}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forced_single_kill_keeps_the_branch_of_an_open_pr_or_unknown_verdict() {
+        // #1278: force stands in for missing merge evidence, not for a PR
+        // someone is reviewing (or one nobody could rule out).
+        let state = |gate| WorktreeRemoveState {
+            managed: true,
+            workspace_id: "ws".into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            error: None,
+            removing: true,
+            force_confirmation: None,
+            focus: RemoveWorktreeControl::Remove,
+            force: true,
+            probe: None,
+            delete_branch: true,
+            branch: Some("feature/live".into()),
+            merge_gate: Some(gate),
+            branch_protected: false,
+            gate_timed_out: false,
+        };
+        assert!(
+            !state(crate::worktree::WorktreeMergeGate::OpenPr { number: Some(150) })
+                .deletes_branch()
+        );
+        assert!(!state(crate::worktree::WorktreeMergeGate::Unknown {
+            reason: "gh failed: offline".into()
+        })
+        .deletes_branch());
+        // The neighbours: force still covers plain missing evidence, and
+        // merged evidence still deletes.
+        assert!(state(crate::worktree::WorktreeMergeGate::NotMerged).deletes_branch());
+        let mut merged = state(crate::worktree::WorktreeMergeGate::Merged {
+            evidence: "merged into main".into(),
+        });
+        merged.force = false;
+        assert!(merged.deletes_branch());
     }
 
     // ---------------------------------------------------------------

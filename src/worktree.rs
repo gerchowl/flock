@@ -408,6 +408,11 @@ pub enum WorktreeMergeGate {
     /// path refuses outright rather than removing the checkout of a PR someone
     /// is reviewing. `number` is the PR, when gh reported one.
     OpenPr { number: Option<u64> },
+    /// The PR question could not be answered (gh failed, was rate-limited,
+    /// or is missing on a GitHub repo), so an open PR cannot be ruled out
+    /// (#1278). Never merged; every automatic path skips it and an explicit
+    /// kill is refused like [`WorktreeMergeGate::OpenPr`]. `reason` says why.
+    Unknown { reason: String },
     /// Nothing was judged. The checkout is not on disk, so no branch could be
     /// resolved and there was no question to put to git or gh (#360).
     ///
@@ -685,6 +690,10 @@ pub enum KillTier {
     SkipUnmergedDirty,
     /// Main checkout with uncommitted changes: left alone.
     SkipMainDirty,
+    /// Linked worktree whose branch heads an open PR, or whose PR state could
+    /// not be determined (#1278): never removed by a sweep or a scheduled
+    /// reap, forced or not — not even quarantined.
+    SkipLive,
     /// A running/working agent lives here: never disturbed by the sweep.
     SkipAgent,
 }
@@ -700,6 +709,9 @@ pub struct KillFacts {
     pub dirty: bool,
     /// The branch merge gate found positive evidence.
     pub merged: bool,
+    /// The branch may be under review: [`WorktreeMergeGate::is_live`], or a
+    /// gate that ran out of time and so could not rule that out.
+    pub live: bool,
 }
 
 /// Map a worktree's resolved facts to its sweep tier (#81). Pure so the tier
@@ -716,7 +728,9 @@ pub fn classify_kill_tier(facts: KillFacts) -> KillTier {
             KillTier::ClosePane
         };
     }
-    if facts.merged {
+    if facts.live {
+        KillTier::SkipLive
+    } else if facts.merged {
         KillTier::KillBranch { dirty: facts.dirty }
     } else if facts.dirty {
         KillTier::SkipUnmergedDirty
@@ -759,7 +773,7 @@ pub fn planned_action(tier: KillTier, force_dirty: bool) -> KillAction {
                 KillAction::Skip
             }
         }
-        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+        KillTier::SkipMainDirty | KillTier::SkipAgent | KillTier::SkipLive => KillAction::Skip,
     }
 }
 
@@ -784,8 +798,9 @@ pub fn scheduled_action(tier: KillTier) -> KillAction {
         // branch alive. §8.5 adversarial rows land here.
         KillTier::SkipUnmergedDirty => KillAction::Quarantine,
         // Protected tiers stay protected. A running agent is never
-        // disturbed; main-dirty is never quarantined either.
-        KillTier::SkipMainDirty | KillTier::SkipAgent => KillAction::Skip,
+        // disturbed; main-dirty is never quarantined either, and neither is
+        // the checkout of a PR under review (#1278).
+        KillTier::SkipMainDirty | KillTier::SkipAgent | KillTier::SkipLive => KillAction::Skip,
     }
 }
 
@@ -1484,26 +1499,132 @@ enum PrLookup {
     Settled { base: Option<String> },
 }
 
-/// gh matches PRs by branch NAME, so a merged PR says nothing on its own about
-/// what the local branch holds — the tip has to be accounted for too. An exact
-/// match is the common case; a local tip REACHABLE FROM the merged head is the
-/// other safe one (#321), and everything else falls through to the tip-exact
-/// checks below.
+/// What asking gh about the branch's PR produced (#1278).
 ///
-/// `None` when gh could not answer (not installed, unauthenticated, offline,
-/// no PR for the branch): absence of a PR is not evidence of anything.
-fn gh_pr_lookup(
+/// "gh answered: there is no PR" and "gh could not answer" are different
+/// facts and must not share a value: the first lets the local git sources
+/// decide, the second leaves an open PR possible, and an open PR whose tip is
+/// already in `dev` would otherwise read as merged and be deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrQuery {
+    /// gh found a PR for the branch.
+    Found(PrLookup),
+    /// gh answered, and there is no PR for the branch.
+    NoPr,
+    /// No remote of this repo is a GitHub repo, so no PR can exist: gh said
+    /// so itself, or gh is not installed and no remote URL is on github.com.
+    NotGitHub,
+    /// gh could not answer (rate limit, offline, unauthenticated, missing
+    /// binary for a GitHub repo, unreadable output). The reason, for the
+    /// verdict.
+    Failed(String),
+}
+
+/// Ask gh about the branch's PR and classify the outcome.
+///
+/// gh matches PRs by branch NAME, so a merged PR says nothing on its own about
+/// what the local branch holds — the tip has to be accounted for too
+/// ([`pr_lookup_from_value`]).
+///
+/// `github_remote` decides what a gh that cannot be started means: on a repo
+/// with a github.com remote it is a failure, elsewhere there is nothing gh
+/// could have reported. Only gh's own "no pull requests found" is a no, and
+/// only its "no remotes / no known GitHub host" answers are not-GitHub; every
+/// other non-zero exit is a failure, which is the fail-closed reading. A
+/// known limit: a GitHub Enterprise remote with gh missing reads as
+/// not-GitHub, since only github.com URLs are recognised here.
+fn gh_pr_query(
     args: &[&str],
     cwd: &std::path::Path,
     root: &str,
     local_tip: Option<&str>,
-) -> Option<PrLookup> {
-    let json = run_command_capture("gh", args, Some(cwd)).ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
-    pr_lookup_from_value(&value, root, local_tip)
+    github_remote: bool,
+) -> PrQuery {
+    let mut command = crate::process::TracedCommand::new("gh", "worktree");
+    command.args(args).current_dir(cwd);
+    let output = match command.output_traced() {
+        Ok(output) => output,
+        Err(err) if github_remote => return PrQuery::Failed(format!("gh did not run: {err}")),
+        Err(_) => return PrQuery::NotGitHub,
+    };
+    if !output.status.success() {
+        return classify_gh_failure(&String::from_utf8_lossy(&output.stderr), github_remote);
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()
+        .and_then(|value| pr_lookup_from_value(&value, root, local_tip));
+    match parsed {
+        Some(lookup) => PrQuery::Found(lookup),
+        None => PrQuery::Failed("gh answered with an unreadable PR".to_string()),
+    }
 }
 
-/// The decision [`gh_pr_lookup`] makes once gh has answered, split out from
+/// Map a failed `gh pr view`'s stderr to what it means for the gate. Matched
+/// on gh's own wording, so a gh that rewords these lands on `Failed`, the
+/// safe side.
+///
+/// An unauthenticated gh says "gh auth login" before it looks at any remote,
+/// so it names no host. Like a gh that cannot start, that is a failure only
+/// when a remote is on github.com; on any other repo no PR is known to exist
+/// (the same GitHub Enterprise limit as [`gh_pr_query`]).
+fn classify_gh_failure(stderr: &str, github_remote: bool) -> PrQuery {
+    if stderr.contains("no pull requests found") {
+        PrQuery::NoPr
+    } else if stderr.contains("no git remotes found")
+        || stderr.contains("point to a known GitHub host")
+        || (!github_remote && stderr.contains("gh auth login"))
+    {
+        PrQuery::NotGitHub
+    } else {
+        let reason = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+        PrQuery::Failed(format!("gh failed: {}", reason.unwrap_or("no message")))
+    }
+}
+
+/// The PR question for the gate, answered from both lookups (#1278).
+///
+/// The origin-pinned lookup is asked FIRST and its PR wins when it has one:
+/// in a fork checkout gh's own resolution goes to the upstream repo, where a
+/// same-named branch can carry someone else's PR. The unpinned lookup is
+/// asked only when the pinned one found no PR (or there is no pinned repo).
+/// Any failed lookup that is not overridden by a found PR is a failure: the
+/// gate cannot rule out an open PR, so it must not go on to call the branch
+/// merged.
+fn resolve_pr_query(mut ask: impl FnMut(bool) -> PrQuery, pinned_available: bool) -> PrQuery {
+    let pinned = pinned_available.then(|| ask(true));
+    if let Some(PrQuery::Found(lookup)) = pinned {
+        return PrQuery::Found(lookup);
+    }
+    let unpinned = ask(false);
+    match (pinned, unpinned) {
+        (_, PrQuery::Found(lookup)) => PrQuery::Found(lookup),
+        (Some(PrQuery::Failed(reason)), _) | (_, PrQuery::Failed(reason)) => {
+            PrQuery::Failed(reason)
+        }
+        (Some(PrQuery::NoPr), _) | (_, PrQuery::NoPr) => PrQuery::NoPr,
+        _ => PrQuery::NotGitHub,
+    }
+}
+
+/// Does any remote of this repo point at github.com? Errs toward `true` when
+/// git cannot answer, which keeps a gh that cannot run a failure.
+fn repo_has_github_remote(root: &str) -> bool {
+    match run_command_capture(
+        "git",
+        &["-C", root, "config", "--get-regexp", r"^remote\..*\.url$"],
+        None,
+    ) {
+        Ok(urls) => urls
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .any(|url| github_repo_from_remote_url(url).is_some()),
+        // `--get-regexp` exits 1 when no remote is configured at all.
+        Err(_) => run_command_capture("git", &["-C", root, "remote"], None)
+            .map_or(true, |remotes| !remotes.trim().is_empty()),
+    }
+}
+
+/// The decision [`gh_pr_query`] makes once gh has answered, split out from
 /// the subprocess so it is testable with no `gh` on PATH.
 ///
 /// An OPEN state wins over everything else and needs no tip check: whatever
@@ -1815,13 +1936,15 @@ fn branch_ref(branch: &str) -> String {
 }
 
 /// PR-merged gate for deleting `branch`. Evidence sources, in order:
-/// 1. `gh pr view` with gh's own repo resolution, then pinned to the origin
-///    remote's repo (multi-remote checkouts resolve to upstream otherwise). The
+/// 1. `gh pr view` pinned to the origin remote's repo, then with gh's own
+///    repo resolution when the pinned one found no PR (multi-remote and fork
+///    checkouts resolve to upstream otherwise; [`resolve_pr_query`]). The
 ///    merged head is FETCHED when this clone does not have it (#646), under the
 ///    same [`MERGE_GATE_TIMEOUT`] as everything else here. An OPEN PR on the
-///    branch ends the gate at [`WorktreeMergeGate::OpenPr`] before any other
-///    source is asked (#1278); any other PR contributes its base branch to the
-///    landing set for the checks below.
+///    branch ends the gate at [`WorktreeMergeGate::OpenPr`], and a lookup gh
+///    could not answer ends it at [`WorktreeMergeGate::Unknown`], before any
+///    other source is asked (#1278): gh failing is not "no PR". Any other PR
+///    contributes its base branch to the landing set for the checks below.
 /// 2. `git branch --merged <target>`, asked of EVERY branch in the landing set
 ///    ([`integration_targets`]) rather than of one detected default — see #633
 ///    for why `origin/HEAD` alone is the wrong single question.
@@ -1873,32 +1996,29 @@ fn branch_merge_gate_against(
         None,
     )
     .ok();
-    let mut pr_base: Option<String> = None;
     let pinned_repo =
         run_command_capture("git", &["-C", &root, "remote", "get-url", "origin"], None)
             .ok()
             .as_deref()
             .and_then(github_repo_from_remote_url);
-    let mut lookups: Vec<Vec<&str>> = vec![vec!["pr", "view", branch, "--json", PR_GATE_FIELDS]];
-    if let Some(repo) = pinned_repo.as_deref() {
-        lookups.push(vec![
-            "pr",
-            "view",
-            branch,
-            "--repo",
-            repo,
-            "--json",
-            PR_GATE_FIELDS,
-        ]);
-    }
-    for args in &lookups {
-        match gh_pr_lookup(args, checkout, &root, local_tip.as_deref()) {
-            Some(PrLookup::Merged(evidence)) => return WorktreeMergeGate::Merged { evidence },
-            Some(PrLookup::Open { number }) => return WorktreeMergeGate::OpenPr { number },
-            Some(PrLookup::Settled { base }) => pr_base = pr_base.or(base),
-            None => {}
+    let github_remote = pinned_repo.is_some() || repo_has_github_remote(&root);
+    let ask = |pinned: bool| {
+        let mut args = vec!["pr", "view", branch];
+        if pinned {
+            args.extend(["--repo", pinned_repo.as_deref().unwrap_or_default()]);
         }
-    }
+        args.extend(["--json", PR_GATE_FIELDS]);
+        gh_pr_query(&args, checkout, &root, local_tip.as_deref(), github_remote)
+    };
+    let pr_base = match resolve_pr_query(ask, pinned_repo.is_some()) {
+        PrQuery::Found(PrLookup::Merged(evidence)) => {
+            return WorktreeMergeGate::Merged { evidence }
+        }
+        PrQuery::Found(PrLookup::Open { number }) => return WorktreeMergeGate::OpenPr { number },
+        PrQuery::Failed(reason) => return WorktreeMergeGate::Unknown { reason },
+        PrQuery::Found(PrLookup::Settled { base }) => base,
+        PrQuery::NoPr | PrQuery::NotGitHub => None,
+    };
     let targets = with_pr_base(&root, targets, pr_base.as_deref());
 
     for target in &targets {
@@ -2019,8 +2139,15 @@ fn branch_content_already_in(root: &str, branch: &str, base: &str) -> bool {
 ///
 /// Errs toward `true` on purpose: the only caller uses `false` to accept local
 /// containment as deletion evidence, and a branch that was pushed can be the
-/// head of a PR (#1278). A same-named branch under a deeper remote path also
-/// reads as pushed, which costs a manual cleanup at worst.
+/// head of a PR (#1278).
+///
+/// The match is a suffix on the full refname, so it over-matches: branch `x`
+/// reads as pushed when any remote has `<prefix>/x` (`origin/feature/x`,
+/// `upstream/old/x`), even though `x` itself was never pushed. The cost is
+/// only ever a missed cleanup — such a branch loses the #243 "no commits of
+/// its own" evidence and needs `--keep-branch` or a manual `git branch -D` —
+/// never a wrong delete. Exact matching would need the remote names, and a
+/// remote name may itself contain `/`.
 fn branch_was_pushed(root: &str, branch: &str) -> bool {
     let own_suffix = format!("/{branch}");
     match run_command_capture(
@@ -2113,16 +2240,31 @@ pub struct WorktreeKillVerdict {
     pub protected: bool,
 }
 
+impl WorktreeMergeGate {
+    /// The branch may be live work under review: an open PR, or a PR question
+    /// nobody could answer (#1278). No automatic path (scheduled reap, the
+    /// kill-all sweep) touches such a checkout, and an explicit kill needs
+    /// `keep_branch`.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            WorktreeMergeGate::OpenPr { .. } | WorktreeMergeGate::Unknown { .. }
+        )
+    }
+}
+
 impl WorktreeKillVerdict {
     /// Positive merge evidence — the ONLY thing that permits a branch delete.
     pub fn merged(&self) -> bool {
         matches!(self.gate, WorktreeMergeGate::Merged { .. })
     }
 
-    /// What proved it, when merged.
+    /// What proved it, when merged; why the verdict could not be decided,
+    /// when unknown (#1278).
     pub fn evidence(&self) -> Option<&str> {
         match &self.gate {
             WorktreeMergeGate::Merged { evidence } => Some(evidence.as_str()),
+            WorktreeMergeGate::Unknown { reason } => Some(reason.as_str()),
             WorktreeMergeGate::NotMerged
             | WorktreeMergeGate::OpenPr { .. }
             | WorktreeMergeGate::CheckoutMissing => None,
@@ -2142,12 +2284,13 @@ impl WorktreeKillVerdict {
     }
 
     /// Wire/label name for the verdict: `merged` | `not_merged` | `open_pr` |
-    /// `checkout_missing`.
+    /// `unknown` | `checkout_missing`.
     pub fn verdict_name(&self) -> &'static str {
         match self.gate {
             WorktreeMergeGate::Merged { .. } => "merged",
             WorktreeMergeGate::NotMerged => "not_merged",
             WorktreeMergeGate::OpenPr { .. } => "open_pr",
+            WorktreeMergeGate::Unknown { .. } => "unknown",
             WorktreeMergeGate::CheckoutMissing => "checkout_missing",
         }
     }
@@ -2748,6 +2891,7 @@ mod tests {
             working_agent,
             dirty,
             merged,
+            live: false,
         };
 
         // A running agent is protected first, whatever else is true.
@@ -2789,6 +2933,26 @@ mod tests {
             classify_kill_tier(facts(false, false, true, false)),
             KillTier::SkipUnmergedDirty
         );
+    }
+
+    #[test]
+    fn a_live_branch_is_never_swept_or_reaped_forced_or_not() {
+        // #1278: an open PR or an unknown PR state outranks merged, clean and
+        // dirty alike, and neither force nor the scheduled path moves it.
+        for (dirty, merged) in [(false, false), (true, false), (false, true), (true, true)] {
+            let tier = classify_kill_tier(KillFacts {
+                is_main: false,
+                working_agent: false,
+                dirty,
+                merged,
+                live: true,
+            });
+            assert_eq!(tier, KillTier::SkipLive);
+        }
+        for force in [false, true] {
+            assert_eq!(planned_action(KillTier::SkipLive, force), KillAction::Skip);
+        }
+        assert_eq!(scheduled_action(KillTier::SkipLive), KillAction::Skip);
     }
 
     #[test]
@@ -2880,6 +3044,7 @@ mod tests {
             working_agent: false,
             dirty: false,
             merged: false,
+            live: false,
         };
 
         // 1. Dirty tree (unmerged + dirty) → SkipUnmergedDirty → Quarantine.
@@ -5718,11 +5883,16 @@ prunable stale
     /// Run `body` with a PATH holding `git` and a stub `gh` that prints `json`
     /// for every call, so the PR evidence source answers without a network.
     fn with_stub_gh<T>(scratch: &Path, json: &str, body: impl FnOnce() -> T) -> T {
+        with_gh_script(scratch, &format!("printf '%s\\n' '{json}'"), body)
+    }
+
+    /// [`with_stub_gh`] for any shell body, so a fixture can make gh fail.
+    fn with_gh_script<T>(scratch: &Path, script: &str, body: impl FnOnce() -> T) -> T {
         let stub_root = scratch.join("stub-gh");
         let bin_dir = stub_root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let gh = bin_dir.join("gh");
-        std::fs::write(&gh, format!("#!/bin/sh\nprintf '%s\\n' '{json}'\n")).unwrap();
+        std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         with_gh_absent_from_path(&stub_root, body)
     }
@@ -5811,6 +5981,167 @@ prunable stale
         assert_eq!(verdict.verdict_name(), "open_pr");
         assert_eq!(verdict.evidence(), None);
         fx.cleanup();
+    }
+
+    #[test]
+    fn a_gh_that_cannot_answer_is_unknown_never_no_pr() {
+        // #1278 round 2: the branch is in the default branch, so with "no PR"
+        // it is merged. Every way gh can FAIL must instead leave the verdict
+        // unknown, because an open PR on the branch cannot be ruled out.
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-gh-fails");
+        run_git(
+            &fx.repo,
+            &["merge", "--quiet", "--no-edit", "feature/float"],
+        );
+        // A GitHub remote that is not origin: gh missing must count as a
+        // failure here, and no lookup is pinned to it.
+        run_git(
+            &fx.repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        let failures = [
+            (
+                "rate",
+                "echo 'API rate limit exceeded for user' >&2; exit 1",
+            ),
+            (
+                "offline",
+                "echo 'error connecting to api.github.com' >&2; exit 1",
+            ),
+            (
+                "auth",
+                "echo 'To get started with GitHub CLI, please run: gh auth login' >&2; exit 4",
+            ),
+            ("garbage", "echo 'not json'"),
+        ];
+        for (name, script) in failures {
+            let verdict = with_gh_script(&fx.scratch.join(name), script, || {
+                resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+            });
+            assert!(
+                matches!(verdict.gate, WorktreeMergeGate::Unknown { .. }),
+                "{name}: {:?}",
+                verdict.gate
+            );
+            assert_eq!(verdict.verdict_name(), "unknown");
+            assert!(!verdict.would_delete_branch(false));
+            assert!(verdict.gate.is_live());
+        }
+        let verdict = with_gh_script(&fx.scratch.join("rate-reason"), failures[0].1, || {
+            resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+        });
+        assert_eq!(
+            verdict.evidence(),
+            Some("gh failed: API rate limit exceeded for user")
+        );
+
+        // gh missing on a repo with a GitHub remote: unknown.
+        let gate = with_gh_absent_from_path(&fx.scratch.join("missing"), || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(
+            matches!(gate, WorktreeMergeGate::Unknown { .. }),
+            "{gate:?}"
+        );
+
+        // gh's own "no pull requests found" is an answer: merged.
+        let gate = with_gh_script(
+            &fx.scratch.join("nopr"),
+            "echo 'no pull requests found for branch \"feature/float\"' >&2; exit 1",
+            || branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[]),
+        );
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+
+        // Without any GitHub remote, a missing gh means no PR can exist.
+        run_git(&fx.repo, &["remote", "remove", "upstream"]);
+        let gate = with_gh_absent_from_path(&fx.scratch.join("nogithub"), || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+        fx.cleanup();
+    }
+
+    #[test]
+    fn the_origin_pinned_pr_answer_wins_and_failures_are_never_no_pr() {
+        let open = || PrQuery::Found(PrLookup::Open { number: Some(1) });
+        let merged = || PrQuery::Found(PrLookup::Merged("PR #2 merged".into()));
+        let failed = || PrQuery::Failed("gh failed: rate".into());
+        let run = |pinned: Option<PrQuery>, unpinned: PrQuery| {
+            let has_pinned = pinned.is_some();
+            let mut pinned = pinned;
+            let mut unpinned = Some(unpinned);
+            let mut asked_unpinned = false;
+            let answer = resolve_pr_query(
+                |is_pinned| {
+                    if is_pinned {
+                        pinned.take().expect("pinned asked once")
+                    } else {
+                        asked_unpinned = true;
+                        unpinned.take().expect("unpinned asked once")
+                    }
+                },
+                has_pinned,
+            );
+            (answer, asked_unpinned)
+        };
+        // Fork case: origin says merged, gh's upstream resolution says open
+        // for a same-named branch. The pinned answer wins, and the unpinned
+        // lookup is not even asked.
+        assert_eq!(run(Some(merged()), open()), (merged(), false));
+        assert_eq!(run(Some(open()), merged()), (open(), false));
+        // No PR on origin: the unpinned answer decides.
+        assert_eq!(run(Some(PrQuery::NoPr), open()).0, open());
+        // A failure on either side, with no PR found, is a failure.
+        assert_eq!(run(Some(failed()), PrQuery::NoPr).0, failed());
+        assert_eq!(run(Some(PrQuery::NoPr), failed()).0, failed());
+        assert_eq!(run(None, failed()).0, failed());
+        assert_eq!(run(None, PrQuery::NotGitHub).0, PrQuery::NotGitHub);
+        assert_eq!(
+            run(Some(PrQuery::NoPr), PrQuery::NotGitHub).0,
+            PrQuery::NoPr
+        );
+    }
+
+    #[test]
+    fn gh_failure_wording_is_classified_fail_closed() {
+        for github in [false, true] {
+            assert_eq!(
+                classify_gh_failure("no pull requests found for branch \"x\"", github),
+                PrQuery::NoPr
+            );
+            assert_eq!(
+                classify_gh_failure("no git remotes found", github),
+                PrQuery::NotGitHub
+            );
+            assert_eq!(
+                classify_gh_failure(
+                    "none of the git remotes configured for this repository point to a known GitHub host.",
+                    github
+                ),
+                PrQuery::NotGitHub
+            );
+            assert!(matches!(
+                classify_gh_failure("HTTP 502: Bad Gateway", github),
+                PrQuery::Failed(_)
+            ));
+            assert!(matches!(
+                classify_gh_failure("", github),
+                PrQuery::Failed(_)
+            ));
+        }
+        // Unauthenticated gh names no host: a failure only for a repo with a
+        // github.com remote.
+        let auth = "To get started with GitHub CLI, please run:  gh auth login";
+        assert_eq!(classify_gh_failure(auth, false), PrQuery::NotGitHub);
+        assert!(matches!(
+            classify_gh_failure(auth, true),
+            PrQuery::Failed(_)
+        ));
     }
 
     #[test]

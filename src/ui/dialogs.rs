@@ -723,6 +723,13 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
                 ),
                 Style::default().fg(app.palette.peach),
             ),
+            Some(crate::worktree::WorktreeMergeGate::Unknown { reason }) => (
+                format!(
+                    " ? merge status unknown ({reason}) — checkout only; branch {} is kept, even forced.",
+                    remove.branch.as_deref().unwrap_or("?")
+                ),
+                Style::default().fg(app.palette.yellow),
+            ),
             Some(crate::worktree::WorktreeMergeGate::Merged { evidence }) => (
                 format!(
                     " ✓ {evidence} — branch {} will be deleted too.",
@@ -988,6 +995,7 @@ pub(super) fn render_kill_all_worktrees_overlay(app: &AppState, frame: &mut Fram
                     KillTier::SkipUnmergedDirty => "skip — unmerged + dirty",
                     KillTier::SkipMainDirty => "skip — main, dirty",
                     KillTier::SkipAgent => "skip — agent busy",
+                    KillTier::SkipLive => "skip — open PR or merge status unknown",
                     _ => "skip",
                 };
                 (reason, app.palette.overlay0)

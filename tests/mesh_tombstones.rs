@@ -378,10 +378,13 @@ fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     discover(&fleet, &recipient);
     send(fleet.node("nodea"), &sender, &recipient, "kill-mail");
     state(fleet.node("nodea"), "kill-mail", "delivered");
+    // keep_branch: the fixture's origin is a github.com URL nobody can query,
+    // so the branch half is refused as `worktree_merge_unknown` (#1278). The
+    // tombstone comes from the checkout teardown, which is what this tests.
     api(
         owner,
         "worktree.kill",
-        json!({"workspace_id":recipient["workspace_id"],"force":true,"dry_run":false}),
+        json!({"workspace_id":recipient["workspace_id"],"force":true,"keep_branch":true,"dry_run":false}),
     );
     state(fleet.node("nodea"), "kill-mail", "recipient_gone");
     let reason: String = db(owner)

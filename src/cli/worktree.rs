@@ -697,9 +697,10 @@ pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
         "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
             super::exit::WORKTREE_NEEDS_FORCE
         }
-        // #1278: the branch heads an open PR. Refused before anything moved,
-        // and --force does not clear it: the PR closing (or --keep-branch) does.
-        "worktree_open_pr" => super::exit::REFUSED,
+        // #1278: the branch heads an open PR, or gh could not say whether it
+        // does. Refused before anything moved, and --force does not clear it:
+        // the PR closing, gh answering, or --keep-branch does.
+        "worktree_open_pr" | "worktree_merge_unknown" => super::exit::REFUSED,
         _ => super::exit::FAILURE,
     }
 }
@@ -820,11 +821,13 @@ mod tests {
     #[test]
     fn an_open_pr_refusal_exits_refused_not_needs_force() {
         // #1278: --force does not clear it, so it must not share exit 4.
-        let error = serde_json::json!({"code": "worktree_open_pr"});
-        assert_eq!(
-            super::kill_error_exit_code(&error),
-            crate::cli::exit::REFUSED
-        );
+        for code in ["worktree_open_pr", "worktree_merge_unknown"] {
+            let error = serde_json::json!({ "code": code });
+            assert_eq!(
+                super::kill_error_exit_code(&error),
+                crate::cli::exit::REFUSED
+            );
+        }
     }
 
     #[test]
