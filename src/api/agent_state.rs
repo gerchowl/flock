@@ -55,7 +55,7 @@ impl Background {
 /// `{"needs_human": {"reason": …}}`, `{"blocked": {"reason": …,
 /// "retry_after_ms"?: N}}` or `"unknown"` on the wire. A reason this build
 /// does not know reads as `unknown` and keeps its variant (§3a).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
     None,
@@ -63,6 +63,14 @@ pub enum Attention {
     NeedsHuman {
         #[serde(default, deserialize_with = "or_unknown")]
         reason: HumanReason,
+        /// The structured question, for `reason: question` when its source
+        /// could read one (ADR-0028 §8a, #1038).
+        #[serde(
+            default,
+            deserialize_with = "or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        question: Option<Box<crate::api::question::Question>>,
     },
     /// A state no quick answer at the pane resolves.
     Blocked {
@@ -258,7 +266,7 @@ impl AgentState {
     ) -> Self {
         let wait_open = matches!(waiting, Waiting::On { .. });
         let settled = turn == Turn::Idle && turn_held_ms.is_some_and(|ms| ms >= SETTLE_MS);
-        let phase = match (lifecycle, attention) {
+        let phase = match (lifecycle, &attention) {
             (Lifecycle::Gone, _) => Phase::Gone,
             (Lifecycle::Hibernated, _) => Phase::Hibernated,
             (Lifecycle::Offline, _) => Phase::Offline,
@@ -333,6 +341,7 @@ mod tests {
     };
     const HUMAN: A = A::NeedsHuman {
         reason: HumanReason::Permission,
+        question: None,
     };
 
     fn on() -> Waiting {
@@ -490,7 +499,8 @@ mod tests {
         assert_eq!(
             state.attention,
             A::NeedsHuman {
-                reason: HumanReason::Unknown
+                reason: HumanReason::Unknown,
+                question: None,
             }
         );
         let state: AgentState = serde_json::from_str(

@@ -1234,7 +1234,11 @@ impl App {
                 .state_changed_at
                 .map(|changed| changed.elapsed().as_millis() as u64),
             self.agent_background(terminal, status),
-            super::api_helpers::screen_attention(provider_wait, terminal.needs_human),
+            super::api_helpers::screen_attention(
+                provider_wait,
+                terminal.needs_human,
+                terminal.question.as_ref(),
+            ),
             self.waits.waiting(&terminal.agent_id.to_string()),
         );
         Some((terminal.agent_id.to_string(), state))

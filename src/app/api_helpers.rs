@@ -124,6 +124,7 @@ pub(super) fn agent_state(
         (AgentStatus::Blocked, None) => (
             Attention::NeedsHuman {
                 reason: HumanReason::Unknown,
+                question: None,
             },
             Some(turn_source),
         ),
@@ -150,18 +151,25 @@ pub(super) fn agent_state(
 }
 
 /// What the screen says a `blocked` agent waits on (#1023): a provider limit
-/// outranks the prompt that may still be drawn over it.
+/// outranks the prompt that may still be drawn over it. A `question` prompt
+/// carries the question it draws, when its form could be read (#1038).
 pub(super) fn screen_attention(
     provider_limit: Option<&crate::detect::provider_limit::ProviderLimit>,
     needs_human: Option<crate::api::agent_state::HumanReason>,
+    question: Option<&crate::api::question::Question>,
 ) -> Option<crate::api::agent_state::Attention> {
-    use crate::api::agent_state::{Attention, BlockedReason};
+    use crate::api::agent_state::{Attention, BlockedReason, HumanReason};
     match provider_limit {
         Some(wait) => Some(Attention::Blocked {
             reason: BlockedReason::ProviderLimit,
             retry_after_ms: wait.retry_after_ms,
         }),
-        None => needs_human.map(|reason| Attention::NeedsHuman { reason }),
+        None => needs_human.map(|reason| Attention::NeedsHuman {
+            reason,
+            question: question
+                .filter(|_| reason == HumanReason::Question)
+                .map(|question| Box::new(question.clone())),
+        }),
     }
 }
 
@@ -299,6 +307,7 @@ mod tests {
                 .as_ref()
                 .filter(|_| status == crate::api::schema::AgentStatus::Blocked),
             detection.needs_human,
+            None,
         );
         super::agent_state(
             status,
@@ -328,11 +337,14 @@ mod tests {
                 ))
             };
         }
-        let limit = Attention::Blocked {
+        const LIMIT: Attention = Attention::Blocked {
             reason: BlockedReason::ProviderLimit,
             retry_after_ms: None,
         };
-        let human = |reason| Attention::NeedsHuman { reason };
+        let human = |reason| Attention::NeedsHuman {
+            reason,
+            question: None,
+        };
         #[rustfmt::skip]
         let cases = [
             (Agent::Claude, fixture!("claude-trust"), human(R::Trust), Phase::NeedsHuman),
@@ -341,16 +353,16 @@ mod tests {
             (Agent::Claude, fixture!("claude-permission"), human(R::Permission), Phase::NeedsHuman),
             (Agent::Claude, fixture!("claude-question"), human(R::Question), Phase::NeedsHuman),
             (Agent::Claude, fixture!("claude-plan-exit"), human(R::Dialog), Phase::NeedsHuman),
-            (Agent::Claude, fixture!("claude-limit-footer"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-limit-options"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-limit-cancelled"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-weekly-options"), limit, Phase::LimitReached),
-            (Agent::Claude, fixture!("claude-weekly-stopped"), limit, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-footer"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-options"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-limit-cancelled"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-weekly-options"), LIMIT, Phase::LimitReached),
+            (Agent::Claude, fixture!("claude-weekly-stopped"), LIMIT, Phase::LimitReached),
             (Agent::Codex, include_str!("../../tests/fixtures/codex/folder-trust.txt"), human(R::Trust), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-login"), human(R::Login), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-permission"), human(R::Permission), Phase::NeedsHuman),
             (Agent::Codex, fixture!("codex-question"), human(R::Question), Phase::NeedsHuman),
-            (Agent::Codex, fixture!("codex-limit"), limit, Phase::LimitReached),
+            (Agent::Codex, fixture!("codex-limit"), LIMIT, Phase::LimitReached),
         ];
         for (agent, screen, attention, phase) in cases {
             let detection = crate::detect::detect_agent(Some(agent), screen);
@@ -403,7 +415,8 @@ mod tests {
             (state.attention, state.phase, state.source.attention),
             (
                 Attention::NeedsHuman {
-                    reason: HumanReason::Unknown
+                    reason: HumanReason::Unknown,
+                    question: None,
                 },
                 Phase::NeedsHuman,
                 Some(StateSource::Hook)

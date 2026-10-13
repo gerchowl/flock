@@ -2520,6 +2520,12 @@ pub enum EventKind {
     AgentLimitReached,
     #[serde(rename = "agent.gone")]
     AgentGone,
+    /// ADR-0028 §8a (#1038): a question opened on an agent, and closed. See
+    /// `EventData::AgentQuestionOpened`.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened,
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed,
     /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
     /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
     #[serde(rename = "pr.ci_completed")]
@@ -2603,6 +2609,8 @@ impl EventKind {
             | Self::AgentNeedsHuman
             | Self::AgentLimitReached
             | Self::AgentGone
+            | Self::AgentQuestionOpened
+            | Self::AgentQuestionClosed
             | Self::PrCiCompleted
             | Self::PrMerged
             | Self::PrClosed
@@ -4376,6 +4384,36 @@ pub enum EventData {
     AgentLimitReached(AgentPhaseEvent),
     #[serde(rename = "agent.gone")]
     AgentGone(AgentPhaseEvent),
+    /// ADR-0028 §8a (#1038): an agent's screen draws a question it did not
+    /// draw at the last read. Emitted at once, with no settle window: a
+    /// redraw keeps its `question_id`, so it cannot repeat. `question_id` is
+    /// repeated beside `question` so `events.read` subjects match it.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        question: crate::api::question::Question,
+    },
+    /// The question left the agent's screen, was replaced by the next one, or
+    /// the agent went.
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+        reason: crate::api::question::QuestionCloseReason,
+        /// The question as it closed, its `state` `withdrawn`, so a channel
+        /// can update what it rendered. Read leniently: a line without it, or
+        /// with a shape this build cannot read, still reads.
+        #[serde(
+            default,
+            deserialize_with = "crate::api::agent_state::or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        question: Option<crate::api::question::Question>,
+    },
     /// #1020: every check on `head_sha` has concluded. `conclusion` is the
     /// rollup (`success`, `failure`, `error`).
     #[serde(rename = "pr.ci_completed")]
