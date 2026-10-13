@@ -10,8 +10,10 @@
 //!
 //! Known limits: the fold is per node, so "one owner per repo fleet-wide" is
 //! not enforced across nodes yet (#1234, after O7 #1212 resolves owner
-//! addresses over the mesh); and the binding records no policy reference until
-//! adoption exists (O0, #1195).
+//! addresses over the mesh); and the binding records no policy reference yet.
+//! The join point is `App::owner_policies` (O0, #1195), whose adoptions are
+//! keyed by the checkout's git common dir rather than the slug: a binding
+//! reads its adopted version through `binding.checkout`.
 
 use std::collections::BTreeMap;
 

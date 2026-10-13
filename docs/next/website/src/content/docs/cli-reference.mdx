@@ -562,6 +562,15 @@ flk adapter hello <binding> [--token-file PATH]
 
 Prints the `channel.hello` reply (binding, owner node, target, scopes) and exits 0. Exits 1 with `channel_unauthorized` (unknown binding or wrong token) or `channel_not_owner`, and 78 against a server without `channel.hello`. The token is read from the binding's token file unless `--token-file` names another one. See [Channel adapters](/socket-api/#channel-adapters).
 
+Show or adopt a repo's owner policy, the `[owner]` section of `.flk.toml` committed on its default branch:
+
+```bash
+flk owner policy show [--repo PATH]
+flk owner policy adopt <VERSION|none> [--repo PATH]
+```
+
+`show` prints the current version (the blob id), the adopted one and whether a merged change is `pending`. `adopt` takes the version `show` printed (`none` when the default branch has no `.flk.toml`) and makes it apply. It is an operator verb: from an agent pane it exits 13 (`operator_only`). It exits 1 with `owner_policy_changed` when the default branch has moved past that version, and 78 against a server without it. `--repo` defaults to the current directory. See [Owner policy](/configuration/#owner-policy-flktoml).
+
 Use `wait output` for normal commands and servers. Use `wait agent-status` for coding agents. Use `wait reply` after `msg send --intent needs-reply`: it prints the reply body to stdout and metadata to stderr, or the full result with `--json`. A sender outside any pane can wait for its held answer. `msg send --await` sends and uses the same waiter and exit codes:
 
 | Exit | Reply-wait outcome |

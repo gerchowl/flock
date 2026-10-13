@@ -156,6 +156,14 @@ pub enum Method {
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
     PeersEnrollment(EmptyParams),
+    /// ADR-0035 §3 / §6.2 (#1195): the repo's committed owner policy, the
+    /// version the operator adopted, and whether a newer one is pending.
+    #[serde(rename = "owner.policy.show")]
+    OwnerPolicyShow(OwnerPolicyParams),
+    /// ADR-0035 §6.2 (#1195): the operator adopts the default branch's
+    /// current owner policy. Operator-only (ADR-0014).
+    #[serde(rename = "owner.policy.adopt")]
+    OwnerPolicyAdopt(OwnerPolicyParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
     #[serde(rename = "msg.mute")]
@@ -317,6 +325,7 @@ impl Method {
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
                 | Self::PeersEnrollment(_)
+                | Self::OwnerPolicyShow(_)
                 | Self::PaneList(_)
                 | Self::PaneGet(_)
                 | Self::PaneRead(_)
@@ -354,6 +363,7 @@ impl Method {
             | Self::PeersSummary(_)
             | Self::PeersHubFleet(_)
             | Self::PeersEnrollment(_)
+            | Self::OwnerPolicyShow(_)
             | Self::AgentList(_)
             | Self::AgentGet(_)
             | Self::AgentRead(_)
@@ -404,6 +414,7 @@ impl Method {
             | Self::TabClose(_)
             | Self::PeersCheckoutPrepare(_)
             | Self::PeersEnrollReset(_)
+            | Self::OwnerPolicyAdopt(_)
             | Self::AgentSend(_)
             | Self::AgentSpawn(_)
             | Self::AgentRename(_)
@@ -2171,6 +2182,19 @@ pub struct EventsReadParams {
     pub wait_ms: Option<u64>,
 }
 
+/// `owner.policy.show` and `owner.policy.adopt` (ADR-0035 §6.2, #1195).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerPolicyParams {
+    /// Any path inside the repo: a checkout or one of its worktrees. The
+    /// server reads through the repo's git common dir either way.
+    pub repo: String,
+    /// `adopt` only: the version the operator saw in `show`, the `.flk.toml`
+    /// blob id, or null when the default branch has no `.flk.toml`. Adoption
+    /// is refused when it is no longer the current one.
+    #[serde(default)]
+    pub policy_version: Option<String>,
+}
+
 /// `channel.hello` (ADR-0028 §8, #1037): a channel adapter's first call,
 /// proving it holds the binding's capability token. Gated as state-changing
 /// (#868) so an adapter refuses to start against a server without it.
@@ -2488,6 +2512,9 @@ pub enum EventKind {
     PrMerged,
     #[serde(rename = "pr.closed")]
     PrClosed,
+    /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
+    /// See `EventData::OwnerPolicyAdopted`.
+    OwnerPolicyAdopted,
 }
 
 impl EventKind {
@@ -2558,7 +2585,8 @@ impl EventKind {
             | Self::AgentGone
             | Self::PrCiCompleted
             | Self::PrMerged
-            | Self::PrClosed => true,
+            | Self::PrClosed
+            | Self::OwnerPolicyAdopted => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -2707,6 +2735,8 @@ pub enum ResponseResult {
         source: crate::mesh::store::PinSource,
         node_id: Option<String>,
     },
+    /// `owner.policy.show` / `owner.policy.adopt` (ADR-0035 §6.2, #1195).
+    OwnerPolicy(Box<crate::owner_policy::OwnerPolicyReport>),
     MeshRoutes {
         adverts: Vec<crate::mesh::routes::Advert>,
     },
@@ -4346,6 +4376,18 @@ pub enum EventData {
         pr: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
+    },
+    /// ADR-0035 §6.2 (#1195): from now on `repo`'s owner runs on
+    /// `policy_version`, the `.flk.toml` blob id on its default branch (null:
+    /// the branch had no `.flk.toml`). The latest one per repo applies
+    /// (`owner_policy::OwnerPolicyIndex`); every start and log rotation
+    /// writes it again with `reissued: true`.
+    OwnerPolicyAdopted {
+        /// The repo's git common dir, the key `AgentForked.parent_repo` uses.
+        repo: String,
+        policy_version: Option<String>,
+        #[serde(default)]
+        reissued: bool,
     },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.

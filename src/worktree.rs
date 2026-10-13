@@ -413,7 +413,7 @@ pub enum WorktreeMergeGate {
     CheckoutMissing,
 }
 
-fn run_command_capture(
+pub(crate) fn run_command_capture(
     program: &str,
     args: &[&str],
     cwd: Option<&std::path::Path>,

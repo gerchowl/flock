@@ -843,6 +843,39 @@ The server reads the file on every check, so:
 - to **rotate**, delete the file and run `flk server reload-config`, which issues a new token;
 - removing a binding from config refuses its adapter at the next hello, but the token file stays until you delete it.
 
+## Owner policy (`.flk.toml`)
+
+A repo's resident owner (ADR-0035) reads its behaviour from the `[owner]` section of the repo's committed `.flk.toml`. Only behaviour that grants nothing lives there. Authority (caps, budgets, merge and release gates, the auto-accept scope) is set by operator verbs and is never read from the repo (ADR-0035 §6.2).
+
+```toml
+[owner.standup]
+time = "09:00"
+
+[owner.wake]
+# the wake class table and its windows (ADR-0035 §2)
+```
+
+**Where it is read** (ADR-0004 decisions 4–5). flk reads `.flk.toml` as committed on the repo's default branch, through the git common dir. It never reads a worktree's checked-out or edited copy, a PR branch, or any other branch. The default branch is the one `origin/HEAD` names. Its remote-tracking ref `origin/<branch>` is read, which is what landed upstream as of the last fetch. The local branch is read only when there is no `origin` copy of it. `policy_version` is the blob id of that file.
+
+**Which keys apply.** This release reads `[owner.wake]` and `[owner.standup]`. Every other key in `[owner]` is ignored and listed as `ignored_keys`, and nothing outside `[owner]` is read. Later slices add keys as they give them a meaning. `[[owner.rules]]` waits for the trigger rules (#1216), which check its actions at adoption.
+
+**Adoption.** A merged change applies nothing by itself. The operator reads it and adopts it:
+
+```bash
+flk owner policy show [--repo PATH]                  # current, adopted, pending
+flk owner policy adopt <policy_version> [--repo PATH]  # or `none` for no .flk.toml
+```
+
+Until then the previously adopted version applies, and before any adoption nothing applies. `adopt` takes the version `show` reported and is refused with `owner_policy_changed` once the default branch has moved past it. The adoption is recorded as a durable `owner_policy_adopted` event. It survives restarts and log rotation.
+
+**Operator only.** `adopt` is refused with `operator_only` (exit 13) for a caller inside a flk pane, over a mesh relay, or whose pid the server cannot read. This is cooperative until agents run as their own Unix user (O19a, #1208, #1177): an agent's detached (`setsid`) child has no pane in its ancestry and passes (ADR-0035 §6.3 point 6).
+
+**Known limits.**
+
+- `origin/HEAD` is written at clone time and git never revises it. If the repo's default branch moved, run `git remote set-head origin --auto`. `show` reports the branch it read as `default_branch`.
+- A pending change is reported by `flk owner policy show`, not yet by a notification (#1239).
+- Repos are keyed by their canonical git common dir.
+
 ## Environment variables
 
 | Variable | Purpose |
