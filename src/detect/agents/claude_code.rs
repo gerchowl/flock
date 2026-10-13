@@ -101,9 +101,13 @@ pub(in crate::detect) fn live_turn_follows_echo(content: &str, text: &str) -> bo
         return false;
     }
     let lines: Vec<&str> = content_above_prompt_box(content).lines().collect();
-    let Some(working) = lines.iter().rposition(|line| {
-        has_spinner_activity(line) || line.to_lowercase().contains("esc to interrupt")
-    }) else {
+    let spinner = spinner_rows(&lines)
+        .last()
+        .map(|spinner| spinner.rows.start);
+    let interrupt = lines
+        .iter()
+        .rposition(|line| line.to_lowercase().contains("esc to interrupt"));
+    let Some(working) = spinner.max(interrupt) else {
         return false;
     };
     let Some(echo) = lines[..working]
@@ -760,35 +764,117 @@ const SPINNER_CHARS: &str = "·✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀�
 /// Claude Code spinner characters + activity label.
 /// The verb changes frequently ("Processing…", "Pouncing…", etc.), so rely
 /// on the spinner glyph + trailing ellipsis rather than specific wording.
-/// Include Claude's narrow-pane middle-dot frame too.
+/// Include Claude's narrow-pane middle-dot frame too, and a label wrapped
+/// over several rows (see [`spinner_at`]).
 pub(in crate::detect) fn has_spinner_activity(content: &str) -> bool {
     spinner_activity_text(content).is_some()
 }
 
 /// The free-text activity label from Claude's spinner line, e.g.
 /// "✶ Implementing the parser… (esc to interrupt)" -> "Implementing the parser".
+/// A wrapped label comes back joined into one line.
 pub(in crate::detect) fn spinner_activity_text(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let mut chars = trimmed.chars();
-        if let Some(first) = chars.next() {
-            if SPINNER_CHARS.contains(first) {
-                let rest: String = chars.collect();
-                if rest.starts_with(' ') && rest.contains('\u{2026}') {
-                    let text = rest
-                        .split('\u{2026}')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if text.chars().any(|c| c.is_alphanumeric()) {
-                        return Some(text);
-                    }
-                }
+    let lines: Vec<&str> = content.lines().collect();
+    (0..lines.len())
+        .find_map(|start| spinner_at(&lines, start))
+        .map(|spinner| spinner.label)
+}
+
+/// One spinner as drawn on screen: the rows it covers and its label.
+pub(in crate::detect) struct SpinnerRows {
+    pub(in crate::detect) rows: std::ops::Range<usize>,
+    pub(in crate::detect) label: String,
+}
+
+/// Every spinner on these rows, top to bottom. A wrapped spinner is one
+/// entry covering all of its rows.
+pub(in crate::detect) fn spinner_rows(lines: &[&str]) -> Vec<SpinnerRows> {
+    let mut found = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        match spinner_at(lines, start) {
+            Some(spinner) => {
+                start = spinner.rows.end;
+                found.push(spinner);
             }
+            None => start += 1,
         }
     }
+    found
+}
+
+/// The spinner whose glyph sits on row `start`, if there is one.
+///
+/// Claude draws `<glyph> <label>…`, then its stats (` (12s · ↓ 3k tokens)`)
+/// when they fit. A label too long for the pane is wrapped, not truncated,
+/// and the stats are dropped. Captured from a real Claude in an isolated flk
+/// (#1264), the two wrapped layouts alternate with the pane's width:
+///
+/// ```text
+/// ✢ Investigating why every working pane reads idle      label beside the glyph
+///   after a client detaches from the server…
+///
+/// ·                                                       label below the glyph
+/// Investigating why every working pane reads idle after a client detaches
+/// from the server…
+/// ```
+///
+/// A wrapped label counts only as that whole shape: each continuation row
+/// starts exactly at the label's column, and the only `…` is the one that ends
+/// the last row. Reading the glyph row alone took a wrapped spinner for no
+/// spinner at all, so every working Claude pane whose activity label outgrew
+/// its width read idle, as all of them did when a client shrank the server to
+/// 80x24 and detached (#1264). The recap glyph `※` starts prose, never a
+/// wrapped label.
+fn spinner_at(lines: &[&str], start: usize) -> Option<SpinnerRows> {
+    let line = lines[start];
+    let indent = leading_whitespace(line);
+    let mut chars = line.trim().chars();
+    let glyph = chars.next().filter(|c| SPINNER_CHARS.contains(*c))?;
+    let rest = chars.as_str();
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None;
+    }
+    if let Some((label, _)) = rest.split_once('\u{2026}') {
+        return spinner_label(label.trim().to_string(), start..start + 1);
+    }
+    if glyph == '\u{203b}' {
+        return None;
+    }
+    let (column, mut label) = match rest.trim() {
+        "" => (indent, String::new()),
+        beside => (indent + 2, beside.to_string()),
+    };
+    for (row, line) in lines.iter().enumerate().skip(start + 1) {
+        let text = line.trim();
+        if text.is_empty() || text.starts_with('⎿') || leading_whitespace(line) != column {
+            return None;
+        }
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        let Some((last, tail)) = text.split_once('\u{2026}') else {
+            label.push_str(text);
+            continue;
+        };
+        if !tail.is_empty() && !tail.starts_with(" (") {
+            return None;
+        }
+        label.push_str(last.trim_end());
+        return spinner_label(label, start..row + 1);
+    }
     None
+}
+
+fn spinner_label(label: String, rows: std::ops::Range<usize>) -> Option<SpinnerRows> {
+    label
+        .chars()
+        .any(char::is_alphanumeric)
+        .then_some(SpinnerRows { rows, label })
+}
+
+fn leading_whitespace(line: &str) -> usize {
+    line.chars().take_while(|c| c.is_whitespace()).count()
 }
 
 /// Public seam for detect::detect_agent: activity text relative to the live
@@ -941,6 +1027,98 @@ mod tests {
         // A finished turn under the echo is not a live one.
         let done = screen.replace("✶ Pondering… (3s · esc to interrupt)", "✻ Brewed for 3s");
         assert!(!live_turn_follows_echo(&done, text));
+    }
+
+    /// Captured from a real Claude in an isolated flk (#1264): the same
+    /// working turn in a 52-column pane (label beside the glyph) and a
+    /// 72-column one (label below it). Neither shows `esc to interrupt`, so the
+    /// wrapped spinner is the only working chrome on screen.
+    #[test]
+    fn captured_wrapped_spinner_labels_are_working() {
+        for screen in [
+            include_str!(
+                "../../../tests/fixtures/claude-wrapped-spinner-1264/label-beside-glyph.txt"
+            ),
+            include_str!(
+                "../../../tests/fixtures/claude-wrapped-spinner-1264/label-below-glyph.txt"
+            ),
+        ] {
+            assert!(has_prompt_box(screen), "{screen}");
+            assert!(has_working_chrome(screen), "{screen}");
+            assert_eq!(detect(screen), AgentState::Working, "{screen}");
+            assert_eq!(
+                live_activity_text(screen).as_deref(),
+                Some("Investigating why every working pane reads idle after a client detaches from the server"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_spinner_is_one_row_range() {
+        let lines = [
+            "out",
+            "",
+            "✢ Reading the",
+            "  brief…",
+            "  ⎿  Tip: x…",
+            "·",
+            "Next",
+            "step… (4s)",
+        ];
+        let spinners = spinner_rows(&lines);
+        let found: Vec<_> = spinners
+            .iter()
+            .map(|s| (s.rows.clone(), s.label.as_str()))
+            .collect();
+        assert_eq!(found, [(2..4, "Reading the brief"), (5..8, "Next step")]);
+    }
+
+    #[test]
+    fn a_wrapped_label_must_keep_its_shape() {
+        for (screen, why) in [
+            (
+                "✢ Reading the\n    brief…",
+                "continuation off the label column",
+            ),
+            (
+                "✢ Reading the\nbrief…",
+                "beside-glyph label continued at the glyph column",
+            ),
+            ("·\n  Reading the brief…", "below-glyph label indented"),
+            ("✢ Reading the\n\n  brief…", "a blank row ends the label"),
+            (
+                "✢ Reading the\n  ⎿  Tip: try this…",
+                "the tip row is not the label",
+            ),
+            (
+                "✢ Reading the\n  brief… and more prose",
+                "prose after the ellipsis",
+            ),
+            ("※ recap: the parser\n  works… Next: ship it", "recap prose"),
+            (
+                "※ recap: the parser\n  works…",
+                "the recap glyph never wraps a label",
+            ),
+            (
+                "✻ Crunched for 4s · done 1:26 AM · 1 shell still\n  running",
+                "a wrapped done line",
+            ),
+            ("✢ Reading the\n  brief", "no ellipsis at all"),
+        ] {
+            assert!(!has_spinner_activity(screen), "{why}: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_spinner_follows_the_echoed_prompt() {
+        let rule = "─".repeat(40);
+        let screen = format!(
+            "❯ Read /fixture/briefs/task.md and\n  execute it exactly.\n\n✶ Reading the brief and\n  planning the change…\n\n{rule}\n❯ \n{rule}\n"
+        );
+        assert!(live_turn_follows_echo(
+            &screen,
+            "Read /fixture/briefs/task.md and execute it exactly."
+        ));
     }
 
     fn prompt_box_below(content_above_prompt: &str) -> String {
