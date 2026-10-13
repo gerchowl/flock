@@ -288,6 +288,9 @@ impl App {
         self.expire_relayed_entries();
         // ADR-0018 §2: mail that became wakeable since it was queued.
         self.tick_idle_wakes(now);
+        // ADR-0028 §5: a registered wait past its deadline, mirrored in the
+        // headless loop (#25).
+        self.tick_waits(now);
         // ADR-0028 §2: derived agent events, mirrored in the headless loop (#25).
         self.tick_agent_phases(now);
         // #540: an armed self-compaction's turn boundary, its Enter, or its
@@ -712,6 +715,8 @@ impl App {
             // ADR-0018 §2: a settle, quiet window or mute that lifts, or the
             // Enter of a typed idle wake, must not wait for unrelated traffic.
             self.idle_wake.next_deadline(),
+            // ADR-0028 §5: a wait expires on time in a quiet loop.
+            self.waits.next_deadline(),
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
@@ -2092,6 +2097,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -2623,6 +2629,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: now,
             });

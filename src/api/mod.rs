@@ -4,12 +4,14 @@ pub(crate) mod compatibility;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub mod question;
 mod reply_wait;
 pub mod schema;
 mod server;
 mod status;
 mod subscriptions;
 mod wait;
+pub mod wait_predicate;
 
 pub use event_hub::EventHub;
 pub(crate) use reply_wait::{best_answer, Answer};

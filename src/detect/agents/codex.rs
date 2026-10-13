@@ -93,6 +93,99 @@ pub(in crate::detect) fn needs_human(content: &str) -> HumanReason {
     }
 }
 
+/// The `request_user_input` form a `question` screen draws (ADR-0028 §8a,
+/// #1038), read from its invariant controls, all required: the `Question n/m`
+/// counter above the prompt, numbered options under it, and the `enter to
+/// submit` footer below. A label and its description share a row, two
+/// spaces apart, and a wrapped description continues at its own column.
+/// Codex has no multi-select, and its `None of the above` row is the free-text
+/// entry (`allow_other`). The form shows one question at a time.
+pub(in crate::detect) fn question(content: &str) -> Option<crate::api::question::QuestionForm> {
+    use crate::api::question::{QuestionForm, QuestionOption};
+    let lines: Vec<&str> = content.lines().map(str::trim_end).collect();
+    let footer = lines.iter().rposition(|line| {
+        let line = line.to_lowercase();
+        line.contains("enter to submit answer") || line.contains("enter to submit all")
+    })?;
+    let head = lines[..footer].iter().rposition(|line| {
+        line.trim()
+            .strip_prefix("Question ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|counter| counter.split_once('/'))
+            .is_some_and(|(at, of)| at.parse::<u32>().is_ok() && of.parse::<u32>().is_ok())
+    })?;
+    let body = &lines[head + 1..footer];
+    let first = body
+        .iter()
+        .position(|line| question_option_line(line).is_some())?;
+    let prompt = body[..first]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut question = QuestionForm {
+        header: None,
+        prompt,
+        options: Vec::new(),
+        multi_select: false,
+        allow_other: false,
+    };
+    // The column the last option's description starts at.
+    let mut description_col = None;
+    for line in &body[first..] {
+        if let Some((id, label, description)) = question_option_line(line) {
+            description_col = description.map(|(col, _)| col);
+            if label == "None of the above" {
+                question.allow_other = true;
+                description_col = None;
+            } else {
+                question.options.push(QuestionOption {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    description: description.map(|(_, text)| text.to_string()),
+                });
+            }
+            continue;
+        }
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        match (description_col, question.options.last_mut()) {
+            (Some(col), Some(option)) if indent == col && !line.trim().is_empty() => {
+                let description = option.description.get_or_insert_with(String::new);
+                description.push(' ');
+                description.push_str(line.trim());
+            }
+            _ => description_col = None,
+        }
+    }
+    (!question.prompt.is_empty() && !question.options.is_empty()).then_some(question)
+}
+
+/// A question form row: number, label, and description with its column.
+type OptionRow<'a> = (&'a str, &'a str, Option<(usize, &'a str)>);
+
+/// A numbered row of the question form, `› 1. Red  A red probe`: its number,
+/// its label, and its description with the column it starts at.
+fn question_option_line(line: &str) -> Option<OptionRow<'_>> {
+    let rest = line.trim_start();
+    let rest = rest.strip_prefix("\u{203a} ").unwrap_or(rest);
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let row = rest[digits..].strip_prefix(". ")?;
+    if digits == 0 {
+        return None;
+    }
+    let Some((label, description)) = row.split_once("  ") else {
+        return Some((&rest[..digits], row.trim(), None));
+    };
+    let description = description.trim_start();
+    let col = line.chars().count() - description.chars().count();
+    Some((
+        &rest[..digits],
+        label.trim(),
+        Some((col, description.trim_end())),
+    ))
+}
+
 pub(super) fn has_prompt(content: &str) -> bool {
     has_codex_current_prompt(content) || content.lines().any(codex_prompt_line)
 }

@@ -8,6 +8,7 @@ mod delegates;
 mod digest;
 mod edges;
 mod fleet;
+mod goals;
 mod handoffs;
 mod integrations;
 mod lineage;
@@ -733,6 +734,7 @@ impl App {
         {
             self.touch_agent_phase(*pane_id);
         }
+        self.observe_question(&ev);
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
             self.refresh_new_flock_toast_context_for_update(update, &previous_toast);
@@ -1496,10 +1498,19 @@ impl App {
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
+            Method::WaitHold(predicate, hold_ms) => {
+                return self.handle_wait_hold(request.id, predicate, hold_ms)
+            }
+            Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
             Method::OwnerBind(params) => return self.handle_owner_bind(request.id, params),
             Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
             Method::OwnerList(_) => return self.handle_owner_list(request.id),
             Method::OwnerShow(params) => return self.handle_owner_show(request.id, params),
+            Method::GoalArm(p) => return self.goal_arm(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStatus(p) => return self.goal_status(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalPause(p) => return self.goal_pause(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalResume(p) => return self.goal_resume(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStop(p) => return self.goal_stop(&request.id, p).unwrap_or_else(|e| e),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
@@ -2641,6 +2652,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2656,6 +2668,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2727,6 +2740,7 @@ mod tests {
                 settled_with_background_shells: false,
                 background_tasks: None,
                 needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -2859,6 +2873,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2885,6 +2900,7 @@ mod tests {
             settled_with_background_shells: false,
             background_tasks: None,
             needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

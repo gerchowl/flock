@@ -227,6 +227,14 @@ pub enum Method {
     EventsRead(EventsReadParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
+    /// In-process only: a held `events.read` registers its blocking wait
+    /// against the attested caller. Never on the wire, so no client can open
+    /// or close a wait it does not hold.
+    #[serde(skip)]
+    WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
+    /// In-process only: the held `events.read` returned.
+    #[serde(skip)]
+    WaitRelease(String),
     /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
     #[serde(rename = "owner.bind")]
     OwnerBind(OwnerBindParams),
@@ -237,6 +245,23 @@ pub enum Method {
     OwnerList(EmptyParams),
     #[serde(rename = "owner.show")]
     OwnerShow(OwnerRepoParams),
+    /// ADR-0030 §1: arm a goal for an agent. Written by the operator or by
+    /// the goal's own agent.
+    #[serde(rename = "goal.arm")]
+    GoalArm(GoalArmParams),
+    /// ADR-0030 §1: an agent's goal record. Open to every caller.
+    #[serde(rename = "goal.status")]
+    GoalStatus(GoalTargetParams),
+    /// ADR-0030 §1 (amended 2026-10-12): pause a goal, recorded as
+    /// `GoalPaused`.
+    #[serde(rename = "goal.pause")]
+    GoalPause(GoalPauseParams),
+    /// Resume a paused goal, recorded as `GoalResumed`.
+    #[serde(rename = "goal.resume")]
+    GoalResume(GoalTargetParams),
+    /// Stop (disarm) a goal, recorded as `GoalDisarmed`.
+    #[serde(rename = "goal.stop")]
+    GoalStop(GoalStopParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -321,6 +346,7 @@ impl Method {
                 | Self::AgentLineage(_)
                 | Self::OwnerList(_)
                 | Self::OwnerShow(_)
+                | Self::GoalStatus(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
                 | Self::MsgStatus(_)
@@ -372,6 +398,7 @@ impl Method {
             | Self::AgentLineage(_)
             | Self::OwnerList(_)
             | Self::OwnerShow(_)
+            | Self::GoalStatus(_)
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
@@ -397,7 +424,9 @@ impl Method {
             | Self::PaneWaitForOutput(_)
             | Self::ChecksList(_)
             | Self::DigestRender(_)
-            | Self::FleetStatus(_) => false,
+            | Self::FleetStatus(_)
+            | Self::WaitHold(..)
+            | Self::WaitRelease(_) => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)
@@ -434,6 +463,10 @@ impl Method {
             | Self::ChannelHello(_)
             | Self::OwnerBind(_)
             | Self::OwnerUnbind(_)
+            | Self::GoalArm(_)
+            | Self::GoalPause(_)
+            | Self::GoalResume(_)
+            | Self::GoalStop(_)
             | Self::PaneSendText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
@@ -2232,6 +2265,45 @@ pub struct OwnerRepoParams {
     pub repo: String,
 }
 
+/// `goal.arm` (ADR-0030 §1). `target` names the agent: `self` (the
+/// default when empty) is the agent whose pane runs the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalArmParams {
+    #[serde(default)]
+    pub target: String,
+    pub goal: String,
+    /// The frozen check commands of the done gate (rung 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+}
+
+/// `goal.status` and `goal.resume`: the agent whose goal is meant. `self`
+/// (the default when empty) is the caller's own agent. An `AgentId` that has
+/// a goal names it even when the agent has no live pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalTargetParams {
+    #[serde(default)]
+    pub target: String,
+}
+
+/// `goal.pause`. Without `minutes` the goal stays paused until resumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPauseParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<u64>,
+}
+
+/// `goal.stop`. `reason` is recorded on the `GoalDisarmed` event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalStopParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The harness an owner binding names (ADR-0035 §1, `bind --harness`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2510,6 +2582,12 @@ pub enum EventKind {
     AgentLimitReached,
     #[serde(rename = "agent.gone")]
     AgentGone,
+    /// ADR-0028 §8a (#1038): a question opened on an agent, and closed. See
+    /// `EventData::AgentQuestionOpened`.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened,
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed,
     /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
     /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
     #[serde(rename = "pr.ci_completed")]
@@ -2518,6 +2596,10 @@ pub enum EventKind {
     PrMerged,
     #[serde(rename = "pr.closed")]
     PrClosed,
+    /// ADR-0028 §5 (#1031): a registered wait reached its deadline while
+    /// still open. Emitted once, and the wait is gone.
+    #[serde(rename = "wait.expired")]
+    WaitExpired,
     /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
     /// See `EventData::OwnerPolicyAdopted`.
     OwnerPolicyAdopted,
@@ -2589,9 +2671,12 @@ impl EventKind {
             | Self::AgentNeedsHuman
             | Self::AgentLimitReached
             | Self::AgentGone
+            | Self::AgentQuestionOpened
+            | Self::AgentQuestionClosed
             | Self::PrCiCompleted
             | Self::PrMerged
             | Self::PrClosed
+            | Self::WaitExpired
             | Self::OwnerPolicyAdopted => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
@@ -3023,6 +3108,11 @@ pub enum ResponseResult {
         events: Vec<SequencedEvent>,
         next_after: u64,
     },
+    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// is no agent and nothing was recorded.
+    WaitHeld {
+        wait_id: Option<String>,
+    },
     /// `owner.bind`: the binding as recorded. `rebound` is true when the
     /// repo was already bound and kept its `agent_id`.
     OwnerBound {
@@ -3038,6 +3128,12 @@ pub enum ResponseResult {
     },
     OwnerShow {
         binding: OwnerBinding,
+    },
+    /// Every `goal.*` method: the agent's goal record after the call. For
+    /// `goal.stop` it is the record as it was when it was dropped.
+    Goal {
+        agent_id: String,
+        goal: GoalRecord,
     },
     /// `channel.hello`: the binding the token unlocked, never the token.
     ChannelHello {
@@ -4356,6 +4452,36 @@ pub enum EventData {
     AgentLimitReached(AgentPhaseEvent),
     #[serde(rename = "agent.gone")]
     AgentGone(AgentPhaseEvent),
+    /// ADR-0028 §8a (#1038): an agent's screen draws a question it did not
+    /// draw at the last read. Emitted at once, with no settle window: a
+    /// redraw keeps its `question_id`, so it cannot repeat. `question_id` is
+    /// repeated beside `question` so `events.read` subjects match it.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        question: crate::api::question::Question,
+    },
+    /// The question left the agent's screen, was replaced by the next one, or
+    /// the agent went.
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+        reason: crate::api::question::QuestionCloseReason,
+        /// The question as it closed, its `state` `withdrawn`, so a channel
+        /// can update what it rendered. Read leniently: a line without it, or
+        /// with a shape this build cannot read, still reads.
+        #[serde(
+            default,
+            deserialize_with = "crate::api::agent_state::or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        question: Option<crate::api::question::Question>,
+    },
     /// #1020: every check on `head_sha` has concluded. `conclusion` is the
     /// rollup (`success`, `failure`, `error`).
     #[serde(rename = "pr.ci_completed")]
@@ -4382,6 +4508,16 @@ pub enum EventData {
         pr: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
+    },
+    /// #1031: `predicate` in its canonical form, `since` and `deadline` in
+    /// Unix ms.
+    #[serde(rename = "wait.expired")]
+    WaitExpired {
+        wait_id: String,
+        agent_id: String,
+        predicate: String,
+        since: u64,
+        deadline: u64,
     },
     /// ADR-0035 §6.2 (#1195): from now on `repo`'s owner runs on
     /// `policy_version`, the `.flk.toml` blob id on its default branch (null:

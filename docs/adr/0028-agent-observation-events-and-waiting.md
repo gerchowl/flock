@@ -482,7 +482,10 @@ choices, must therefore travel as data, not as screen text.
   numbered options and descriptions, Codex and opencode choice prompts). The
   `question_id` is derived from the agent, the turn cursor and a fingerprint of
   the prompt and options, so a redraw is the same question and a new dialog is
-  a new one. From a message: `msg.send` gains an optional `options` block, and
+  a new one. The turn cursor component includes the event-log sequence at
+  open (#1038), which is durable and only grows, so no new open, after a
+  restart or a handoff or for a revisited tab, reuses an id that was closed.
+  From a message: `msg.send` gains an optional `options` block, and
   the `question_id` is the message's correlation id.
 - **Events.** `agent.question_opened`, `agent.question_answered` (with who
   answered and through which binding) and `agent.question_closed` (`expired`,

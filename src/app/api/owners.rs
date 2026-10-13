@@ -101,16 +101,8 @@ impl App {
     /// only: a detached (`setsid`) child of an agent attests as the operator
     /// until uid attestation lands (ADR-0035 §6.3 points 1 and 6, O19a #1208).
     fn refuse_non_operator(&mut self, id: &str, verb: &str) -> Option<String> {
-        let unattested = self.current_api_peer_pid.is_none();
-        let relayed = self
-            .inbound
-            .edge(
-                self.current_api_peer_pid,
-                crate::platform::process_start_time,
-            )
-            .is_some();
         let agent = matches!(self.spawn_caller(), SpawnCaller::Agent { .. });
-        (unattested || agent || relayed).then(|| {
+        (self.caller_unattested_or_relayed() || agent).then(|| {
             encode_error(
                 id.to_string(),
                 "operator_only",
@@ -119,6 +111,23 @@ impl App {
                 ),
             )
         })
+    }
+}
+
+impl App {
+    /// A caller this node cannot attest: its pid could not be read, or the
+    /// request was relayed from a mesh peer. Neither has an agent pane in its
+    /// ancestry, so a check that only asks "is this an agent?" would take it
+    /// for the operator.
+    pub(super) fn caller_unattested_or_relayed(&mut self) -> bool {
+        self.current_api_peer_pid.is_none()
+            || self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some()
     }
 }
 
