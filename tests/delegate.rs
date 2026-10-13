@@ -106,6 +106,53 @@ impl Server {
         spawn_server(base)
     }
 
+    /// Hand this server off to a fresh process over `server.live_handoff`
+    /// (#1261): the pane processes survive, the server process does not.
+    ///
+    /// The replacement is not this harness's child, so it is registered for
+    /// the atexit and panic cleanup, and `stop_replacement` stops it. Returns
+    /// once the new process accepts connections.
+    fn live_handoff(&mut self) {
+        let old_pid = self.child.process_id().expect("server pid");
+        let answered = request(
+            self,
+            r#"{"id":"handoff","method":"server.live_handoff","params":{}}"#,
+        );
+        assert!(answered.get("error").is_none(), "{answered}");
+        let pattern = format!("flock-handoff-{old_pid}.sock");
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let found = std::process::Command::new("pgrep")
+                .args(["-f", &pattern])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default();
+            if let Some(pid) = found
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+                .find(|pid| *pid != old_pid)
+            {
+                register_spawned_flock_pid(Some(pid));
+                break;
+            }
+            assert!(Instant::now() < deadline, "no handoff importer appeared");
+            thread::sleep(Duration::from_millis(25));
+        }
+        // The old process has handed everything over once the request is
+        // answered. It is killed rather than awaited, as `tests/live_handoff.rs`
+        // does, and Drop reaps it.
+        let _ = self.child.kill();
+        while UnixStream::connect(&self.socket).is_err() {
+            assert!(Instant::now() < deadline, "the replacement never listened");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Stop the server a `live_handoff` left running.
+    fn stop_replacement(&self) {
+        let _ = request(self, r#"{"id":"stop","method":"server.stop","params":{}}"#);
+    }
+
     /// Wait until the debounced session snapshot mentions every `needle`.
     fn wait_session_saved(&self, needles: &[&str]) {
         let path = self
@@ -936,6 +983,19 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The registry file of delegate `name`, wherever under the sandbox's state
+/// dir the server key put it.
+fn registry_entry(server: &Server, name: &str) -> PathBuf {
+    let file = format!("{name}.json");
+    walk(&server.base.join("state"))
+        .into_iter()
+        .find(|path| {
+            path.file_name().is_some_and(|f| f == file.as_str())
+                && path.components().any(|c| c.as_os_str() == "delegates")
+        })
+        .unwrap_or_else(|| panic!("no registry entry for {name}"))
+}
+
 /// E3: a BLOCKED sentinel exits 3; a reply with no sentinel exits 5; without
 /// --json stdout is the reply text and stderr one summary line.
 #[test]
@@ -1679,6 +1739,59 @@ fn a25_an_unplanned_restart_leaves_the_delegate_resumable() {
         read_lines(&server.base.join("argv.log")).last(),
         Some(&format!("--session {SES}"))
     );
+}
+
+/// #1261: a delegate survives a live handoff with its agent still running.
+///
+/// A handoff keeps the pane processes but rebuilds the panes from the
+/// snapshot, which re-mints every terminal id. An entry that only knew its
+/// terminal id then answered "not a delegate" for a live delegate (flk 1.2.0).
+/// The agent id carries the identity across, and the entry is re-pointed at
+/// the new terminal so the next verb finds it by terminal again.
+#[test]
+fn a27_a_live_delegate_survives_a_live_handoff() {
+    let mut server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "task.md", "x\n");
+    let mut child = start_cwd(&server, "d1", &b, &["--json"]);
+    make_ready(&server, "d1");
+    assert_eq!(
+        exited_within(&mut child, WITHIN).and_then(|s| s.code()),
+        Some(0)
+    );
+    let before = agent_get(&server, "d1").expect("delegate agent");
+    let runs_before = read_lines(&server.base.join("argv.log")).len();
+
+    server.live_handoff();
+
+    let after = agent_get(&server, "d1").expect("the agent survives the handoff");
+    assert_eq!(after["agent_id"], before["agent_id"], "{after}");
+    assert_ne!(
+        after["terminal_id"], before["terminal_id"],
+        "a live handoff re-mints terminal ids; this test needs it to"
+    );
+    assert_eq!(
+        read_lines(&server.base.join("argv.log")).len(),
+        runs_before,
+        "the harness kept running: nothing was relaunched"
+    );
+
+    for round in ["first", "second"] {
+        let status = cli(&server, &["delegate", "status", "d1", "--json"]);
+        assert_eq!(
+            status.status.code(),
+            Some(0),
+            "{round} status after the handoff: {}",
+            stderr(&status)
+        );
+        let status = stdout_json(&status);
+        assert_eq!(status["name"], "d1", "{status}");
+        assert_ne!(status["outcome"], "gone", "{status}");
+    }
+    let entry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(registry_entry(&server, "d1")).unwrap()).unwrap();
+    assert_eq!(entry["terminal_id"], after["terminal_id"], "{entry}");
+    server.stop_replacement();
 }
 
 /// #1010: an agent that runs `agent hibernate --all` from its own pane skips
