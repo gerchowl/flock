@@ -8,18 +8,25 @@
   tokens of §8, questions of §8a), ADR-0034 (`hook.decide`, the question
   policy, routing to the architect), ADR-0010 (`flk report`), ADR-0019 (push
   delivery into a Claude session), ADR-0029 (exit codes, the JSON error
-  envelope), ADR-0032 (compiled context), ADR-0035 and #1177 (the operator
-  boundary, agents running as the operator's uid), ADR-0001 (the web bridge
-  hosting rules), #868 (protocol gating). Extends `agent.fork` /
+  envelope), ADR-0032 (compiled context), ADR-0014 (the operator authority
+  boundary), ADR-0035 §6.3 and #1177 / O19a #1208 (agents run as the separate
+  `flk-agent` user, attested by uid), ADR-0026 (mesh delivery, which
+  superseded the delivery contracts of ADR-0008, ADR-0018 and ADR-0019),
+  ADR-0001 (the web bridge hosting rules), #868 (protocol gating). Designs
+  #1301 (non-blocking questions, §2a) and the turn-end half of #697
+  (self-compact and its continuation, §3a); records the owner decision of
+  #1300 for unknown-event logging (§8). Extends `agent.fork` /
   `agent.lineage` (`flock_agent_fork`, `flock_agent_lineage`) rather than
   adding verbs.
+- Follow-ups: #1307 (slice tracking), #1305 (cache tests 4 and 6), #1308
+  (TUI parity gaps P16, P17), #1309 (live Codex and opencode runs).
 - Decision owner: operator.
 - Evidence: Appendix A was measured on 2026-10-13 against Claude Code
   2.1.296 (this host's `latest` channel; the fleet `stable` pin is 2.1.287,
   which carries the same hidden flags, see A.4), codex-cli 0.160.1 and
   opencode 1.18.35, in throwaway sessions under a scratch working directory
   with every `FLOCK_*` and `CLAUDE_CODE_*` variable removed. No flk server was
-  started, reached or restarted. Total spend: about 1.6M tokens, 95% of them
+  started, reached or restarted. Total spend: about 1.6M tokens, 76% of them
   cache reads (A.9).
 
 ## Context
@@ -151,8 +158,10 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
 - **E15 Concurrent cold writes are not deduplicated.** Ten concurrent fresh
   sessions with identical new content each wrote 13,808 cache tokens; an
   eleventh, after them, read it all. Subscription sessions write the 1-hour
-  cache (`ephemeral_1h_input_tokens`), which costs twice the base input
-  price. (A.7)
+  cache (`ephemeral_1h_input_tokens`), which Anthropic prices at twice the
+  base input rate (5-minute writes 1.25×, reads 0.1×; "Prompt caching",
+  docs.claude.com/en/docs/build-with-claude/prompt-caching, pricing table).
+  (A.7)
 - **E16 A second input door exists.** Every `-p` process opens a messaging
   socket under `/tmp/cc-socks/` and reports it as
   `system/init.messaging_socket_path`. (A.2)
@@ -165,7 +174,9 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
   resume, fork at a turn or message, compaction and cache token counts, but
   only in their server modes; their one-shot JSON modes (`codex exec
   --json`, `opencode run --format json`) stream no deltas and have no
-  approval path. (A.10)
+  approval path. Approvals, user questions, errors, interrupts and reasoning
+  of the server modes were read from their generated schemas only, not run
+  live (#1309). (A.10)
 
 ## Decision
 
@@ -181,18 +192,31 @@ A structured agent is a child process of the flk server: `claude -p
 --include-partial-messages --replay-user-messages --include-hook-events
 --permission-prompt-tool stdio --setting-sources local --strict-mcp-config
 --settings <flk file> --mcp-config <flk file> --session-id <uuid>` (or
-`--resume <id>`), with the agent's profile `CLAUDE_CONFIG_DIR` and the
+`--resume <id>`), started as the `flk-agent` user (§1a) with that user's
+private config dir for the agent's profile as `CLAUDE_CONFIG_DIR`, and the
 compiled context of ADR-0032 passed through `--append-system-prompt-file`
 and `--add-dir`. The server owns stdin and stdout exclusively.
 
-- **Isolation (E5, E6).** The profile's config dir is kept, because that is
-  where the login lives; isolation comes from `--setting-sources local`
-  (no user-level hooks, permissions or plugins), `--strict-mcp-config` (no
+- **Isolation and login (E5, E6, ADR-0035 §6.3 point 1).** A structured
+  agent never runs as the operator's uid. Its `CLAUDE_CONFIG_DIR` is a
+  private dir per profile in the `flk-agent` user's `HOME`
+  (`~flk-agent/.flk/claude/<profile>`), and that dir holds its own login:
+  `claude /login` run once per profile as `flk-agent` (the token lands in
+  `flk-agent`'s own keychain on macOS, or in the dir's credentials file on
+  Linux), or a `claude setup-token` token written into that dir's settings
+  as `CLAUDE_CODE_OAUTH_TOKEN` where no browser login is possible. The
+  operator's config dir and keychain are never read or copied: sharing them
+  would share a rotating refresh token between two dirs (E6). Inside that
+  dir the session is still isolated by flags: `--setting-sources local` (no
+  user-level hooks, permissions or plugins), `--strict-mcp-config` (no
   claude.ai connectors arriving late and shifting the tool set) and flk's
-  own `--settings` and `--mcp-config`. Because user-level permission rules
-  are dropped too, flk passes the agent's permission policy explicitly. The
-  fleet Stop hook never runs in a structured session; what it did there is
-  done by the server on `result` (§3).
+  own `--settings` and `--mcp-config`, so nothing that lands in the dir by
+  accident changes the session. Because user-level permission rules are
+  dropped, flk passes the agent's permission policy explicitly. The fleet
+  Stop hook never runs in a structured session; what it did there is done
+  by the server on `result` (§3a). The probes ran in the operator's profile
+  only because O19a is not live yet; the flag behaviour of E5 does not
+  depend on the user.
 - **One process per session id.** The server holds a session lease (agent id,
   session id, pid, start time) in its state and refuses a second spawn,
   resume or fork-in-place for a leased id with `session_busy` (a new
@@ -212,9 +236,9 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
   that kills anything.
-- **The messaging socket (E16)** is a door flk does not own. Slice S3 must
-  find a way to disable it or bind it to the server; until then a structured
-  session is not started (open question 5).
+- **The messaging socket (E16)** is a door flk does not own. Probe slice S0
+  must find a supported way to disable it or bind it to the server; until
+  then a structured session is not started (open question 5).
 - **Hot reload.** On a config change (MCP server, skill, settings) the
   server waits for idle (no started input, no open control request), closes
   stdin, waits for exit, and respawns with `--resume <id>` and the new
@@ -230,6 +254,37 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   reload together so they warm one entry (E15 shows simultaneous cold writes
   are paid per process, so "together" means one first, then the rest).
 
+### 1a. Identity and the operator boundary for structured agents
+
+`caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
+caller with no flk pane in its process ancestry as the operator. A
+structured agent has no pane, so its tool calls (`flk msg send`, `flk
+question answer`, any `flk` it runs through Bash) would pass. And a
+WebSocket over TCP carries no peer pid at all. Three rules close that:
+
+- **Structured agents require O19a (#1208).** A structured agent is started
+  only on a host where `flk-agent` exists; elsewhere `agent.start --runtime
+  structured` is refused with `structured_needs_agent_user` (a new
+  `ErrorCode`, retry class `AfterHuman`). The server reads the peer uid on
+  its socket (`getpeereid` / `SO_PEERCRED`, ADR-0035 §6.3); a `flk-agent`
+  caller is never the operator, whatever its ancestry, so the operator-only
+  verbs of ADR-0014 and ADR-0035 are refused with `operator_only` (exit 13).
+  `caller_is_local_operator()` gains that uid check first; a detached
+  (`setsid`) child of a structured agent is still `flk-agent` and still
+  refused.
+- **Which agent is calling.** The session lease (§1) records the process's
+  pid and start time. A socket caller whose ancestry reaches a leased pid
+  (with a matching `process_start_time`, so pid reuse cannot impersonate)
+  is that agent: it is the `msg.send` sender and the `agent:<id>` producer
+  of §3, exactly as a pane id attributes a `pty` agent today (ADR-0008,
+  with ADR-0026's authenticated origin). A `flk-agent` caller that reaches
+  no lease and no pane is an anonymous agent: it may read, and every send is
+  refused with `msg_not_allowed`.
+- **WebSocket clients always present a token** (§5). Loopback is not an
+  identity: the operator's own browser is a client with an `operator`-scoped
+  token that only the local operator can mint over the unix socket, and the
+  `principal` in `welcome` names the token, never the address.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
@@ -242,7 +297,7 @@ screen detector is not run.
 | `command_lifecycle{started}` | queue item `delivered`; `Turn::Working` |
 | `system/status{requesting}`, `stream_event/message_start` | `Turn::Working`; `ttft_ms` recorded |
 | `system/status{compacting}`, `system/compact_boundary` | `agent.compacted{pre_tokens, post_tokens, trigger}` |
-| `control_request{can_use_tool, tool_name: AskUserQuestion}` | a §8a question, `source: session`, options from `input.questions`; `Attention::NeedsHuman{Question}` or routed per ADR-0034 §2 |
+| `control_request{can_use_tool, tool_name: AskUserQuestion}` | a question record (§2a), `source: session`, options from `input.questions`; answered at once if the policy allows, otherwise deferred so the turn continues (§2a); routed per ADR-0034 §2 |
 | `control_request{can_use_tool}` (any other tool) | `hook.decide{point: permission.request}` (ADR-0034 §1); `pass` answers allow, `deny` answers deny with the reason; `defer` holds the request open and makes it a question |
 | `control_request{other subtype}` | answered with an error and logged as an unknown shape (§8) |
 | `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}` |
@@ -252,10 +307,64 @@ screen detector is not run.
 | anything unknown | §8 |
 
 Phase derivation is ADR-0028 §1's unchanged; only the inputs differ. A
-question answered through `question.answer` becomes the `control_response`
-(`behavior: allow`, `updatedInput` with `answers`), so the one answer verb of
-§8a works for structured agents too. Registered waits (§5) wake a structured
-agent by queueing a `system` item (§3) instead of typing into a pane.
+question answered while its control request is still open becomes the
+`control_response` (`behavior: allow`, `updatedInput` with `answers`), so the
+one answer verb of §8a works for structured agents too. Registered waits
+(ADR-0028 §5) wake a structured agent by queueing a `wake` item (§3) instead
+of typing into a pane.
+
+### 2a. Questions do not block (#1301)
+
+A question is a record, not a state the turn waits in.
+
+- **Record.** Every ask becomes a question record in the agent's stream:
+  `question.asked { question_id, source: session | recap | message,
+  ask_point: message_uuid, prompt, options, multi_select, allow_other }`.
+  `ask_point` is the boundary the question was asked at: for an
+  `AskUserQuestion` call, the tool-result message that closes it (§9's cut
+  rules allow a fork there); for a question the E9 parsers (#1038, #1243)
+  find in a turn's final text or `※ recap … Next: …` line, the final
+  `assistant` message of that turn. Later states are appended as
+  `question.answered { question_id, by, answer, via: in_place | fork }`,
+  `question.forked { question_id, fork_agent }` and `reply.delivered {
+  question_id, item_id }`. The ADR-0028 §8a kinds `agent.question_opened` /
+  `agent.question_closed` are emitted to the global log as today, so
+  `flk question list` and the TUI and web questions views read one source.
+- **The turn does not wait.** An `AskUserQuestion` control request is
+  answered at once by the gate when the question policy (ADR-0034 §2) can
+  answer it (a routed architect answering within `[questions] hold_ms`, as
+  ADR-0034 §3 does). Otherwise flk answers the control request with
+  `behavior: deny` and the message "Recorded as question <id>; the answer
+  will arrive as a message. Continue with work that does not depend on
+  it." The tool call ends, the turn continues, and the agent is
+  `working` or `finished`, never `waiting_on_human` for a question. This is
+  ADR-0034's `defer` verdict applied to a structured session. A permission
+  request is different: allowing a tool call later is not possible, so a
+  `can_use_tool` for any other tool stays open (it does block) until
+  `hook.decide` answers or the operator does; that is the only
+  `waiting_on_human` a structured agent has. An agent that really cannot
+  go on asks through ADR-0034 §3's explicit `flock_question_ask` with
+  `blocking: true`; that call is held open as a permission is.
+- **Answer in place.** `question.answer { question_id, answer }` on a
+  deferred question queues one `reply` item (`anchor: question_id`,
+  `delivery: at_idle`) for the agent's next turn boundary and records
+  `question.answered{via: in_place}`.
+- **Answer in a fork.** `question.fork { question_id, at?: ask_point |
+  latest }` forks the agent at `ask_point` (default) or its current point
+  through §9, as a fork with `return_to_parent` and `answers:
+  question_id`. The fork is where the operator or a supervisor discusses
+  and explores; the main agent keeps working and its transcript never sees
+  the discussion. The fork ends with `question.resolve { question_id,
+  answer }` (an MCP tool in the fork, or the operator), which records
+  `question.answered{via: fork}` and queues the one `reply` item to the
+  main agent with `producer: fork:<id>` and the fork id cited in the body.
+- **Exactly one reply.** The question's states are `open → (forked →)
+  answered`, and `reply.delivered` is recorded when that item's
+  `command_lifecycle` reports `started`. A second answer, in place or from
+  another fork, is refused with `question_closed` (exit 13, ADR-0028 §8a);
+  more than one fork of a question may exist, and the first to resolve
+  wins.
+- **Unknown question shapes** go through §8 like every other unknown event.
 
 ### 3. One server-owned input queue per agent
 
@@ -288,11 +397,39 @@ an event-log stream (§4) named `queue/<agent>`:
 - **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
   "delivered" means the harness started it, not that bytes were written.
 - **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
-  agent becomes a queue item instead of the inbox nudge (ADR-0008, ADR-0018,
-  ADR-0019 knock order). A delegate's structured result and receipt become a
+  agent becomes a queue item instead of the inbox nudge and knock order
+  (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
+  and ADR-0019; custody and the authenticated origin stay as ADR-0026
+  defines them). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
-  become server work on `result`: the server lifts the recap from the final
-  `assistant` text and wakes parked waits, with no hook at all.
+  become server work on `result` (§3a).
+- **Storage.** The queue persists as `queue.jsonl` beside the agent's
+  session streams (§4).
+
+### 3a. Turn-end work keys on `result` and goes through the queue (#697)
+
+#697's diagnosis comment (2026-10-13) found flk's own self-compact path
+sound: an armed self-compact fires at turn end and its continuation is
+delivered with a background shell, a held wait or a background subagent
+live. The misses came from an external, client-side supervisor that polled
+`agent_status` every few minutes and missed short idle windows between
+back-to-back turns. For a structured agent there is no polling at all:
+
+- **Trigger.** The turn end is the `result` event (E1). An armed self-compact
+  (`flock_self_compact`, `flk pane arm-self-compact`) queues a `system`
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`; the
+  queue writes it right after that `result`, before any other `at_idle`
+  item. Background shells, held waits and subagents do not matter, because
+  nothing reads a pane status.
+- **Continuation.** The post-compact continuation (the goal re-inject and
+  status of #998, or a supervisor's prompt) is a second item anchored to the
+  first; it becomes deliverable when the compaction's own `result` arrives
+  (after `system/compact_boundary`) and is written then. A supervisor that
+  wants to know uses the stream (`queue/<agent>` or the `events` stream),
+  not `agent_status` polling.
+- **Recap and wakes.** On every `result` the server lifts the recap from the
+  final `assistant` text and wakes parked waits, which is what the Stop hook
+  did for a `pty` agent.
 
 ### 4. Storage
 
@@ -301,6 +438,24 @@ an event-log stream (§4) named `queue/<agent>`:
   `<data dir>/sessions/<agent>/<session>.jsonl`. This is the lossless copy;
   `event-log.jsonl` (ADR-0005) keeps only the cross-agent facts of §2 so its
   readers and its rotation stay as they are.
+- **The queue.** `queue/<agent>` persists as
+  `<data dir>/sessions/<agent>/queue.jsonl`: one line per item change (added,
+  gated, edited, reordered, state change), appended before the change takes
+  effect, and folded into the in-memory queue at server start (as ADR-0031
+  folds goal state). The question records of §2a are lines in the same
+  file. When the file passes `[sessions] queue_rewrite_bytes` the server
+  writes a snapshot of the folded queue to a temporary file and renames it
+  over the old one; `seq` continues across the rewrite.
+- **Two kinds of seq.** ADR-0005's `seq` stays the one total order of the
+  durable event log, and the `events` wire stream uses it. A per-agent
+  stream (`agent/<id>`, `queue/<id>`) has its own `seq`, starting at 1,
+  dense and strictly increasing within that stream only; it is a cursor for
+  that stream and orders nothing across streams. Facts that other agents or
+  supervisors act on (a question opened or closed, an item delivered, a
+  compaction, a phase change) are also appended to the global log, carrying
+  `{stream, stream_seq}` so a reader can jump from the global order into the
+  per-agent stream. The global log is the only place where two agents'
+  events are ordered against each other.
 - **Blobs by hash.** A tool result, attachment or thinking block over
   `[sessions] blob_min_bytes` (default 2 KiB) is stored once under
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
@@ -366,21 +521,25 @@ server → client
   whose verb the server does not know is refused with `server_version_gap`
   (exit 78) before anything is allocated. A server never sends an `ev` whose
   type the client's protocol predates without the §8 unknown wrapper.
-- **Auth.** A connection over loopback from the operator's own `flk web`
-  session is the operator. Any other client presents a bearer token in
-  `hello`. Tokens follow the channel-token model of ADR-0028 §8
+- **Auth.** Every client presents a bearer token in `hello`; the address it
+  connects from grants nothing (§1a). The operator's own browser gets an
+  `operator`-scoped token through `flk client open`, which runs over the
+  unix socket (so `caller_is_local_operator()` and the uid check of §1a
+  apply), mints a one-time code, and opens the client with it; the client
+  exchanges the code for its session token once. Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
   deleting the file. Each token carries scopes `read`, `send`, `answer`,
-  `operate`. Only the local operator (`caller_is_local_operator()`, ADR-0035)
-  can issue or revoke one (`flk client token add|rm|list`; else
+  `operate` (`operate` is what the operator's own client holds). Only the
+  local operator (`caller_is_local_operator()` after §1a's uid check) can
+  issue or revoke one (`flk client token add|rm|list`; else
   `operator_only`, exit 13), and verbs that are operator-only under ADR-0014's
   authority boundary (and ADR-0035's owner rules) stay operator-only
-  whatever the token says. Known limit (#1177): agents still
-  run as the operator's uid, so any agent can read a token file; tokens
-  protect against other machines and other users, not against the agents on
-  this one, until #1177's separate agent user lands.
+  whatever the token says unless it is `operate`-scoped. Token files live in
+  the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
+  structured agents cannot pick up a client token. `pty` agents that still
+  run as the operator's uid until O19a can; that limit is #1177's.
 
 ### 6. One schema, generated TypeScript
 
@@ -422,6 +581,10 @@ files. No hand-written TS type may describe a wire shape.
 - **Logged once.** The first sighting of a shape on this server appends
   `session.unknown_shape { harness, version, shape, sample }` to the durable
   log and logs one `tracing` warning; later sightings bump a counter only.
+  Owner decision (#1300): this logging goes through `tracing` only, with no
+  direct writer, so when flock adopts vigil (#1300) it moves to vigil's
+  OTLP/JSON Lines output with no call-site change. The durable-log kind is
+  state, not telemetry, and stays in the event log.
   The sample is redacted: keys and JSON types are kept, every string becomes
   its length, numbers are kept, arrays keep their first element only. Older
   servers skip the new kind (ADR-0028 §3a).
@@ -438,7 +601,8 @@ files. No hand-written TS type may describe a wire shape.
 AgentForkParams += { at?: { message_uuid } | "latest",
                      shape?: prefix | segment | slice,
                      slice_to?: message_uuid,
-                     tools?: [names] , return_to_parent?: bool }
+                     tools?: [names] , return_to_parent?: bool,
+                     answers?: question_id }
 ```
 
 - **Cut rules.** A fork point is the uuid of an `assistant` message that
@@ -474,7 +638,9 @@ AgentForkParams += { at?: { message_uuid } | "latest",
 - **Return channel.** A fork with `return_to_parent` posts its finding as a
   `finding` item into the parent's queue (`producer: fork:<id>`, `anchor:
   fork_point`), through the parent's gate. A human can edit or drop it while
-  it is `queued`.
+  it is `queued`. A question fork (§2a) is the same mechanism with `answers:
+  question_id`: what it returns is a `reply` item anchored to the question,
+  at most one per question, and `question.resolve` is how it ends.
 - **Lineage.** `AgentForked` (`src/api/schema.rs`, emitted at
   `src/app/api/worktrees.rs`) gains `fork_point`, `shape`, `mechanism`
   (`fork_session | resume_at | rehydrate | slice`) and `source_session`.
@@ -503,15 +669,16 @@ render them from events. "Source" says where the data comes from.
 | P13 | Compaction notice | `system/compact_boundary` | S9b |
 | P14 | Subagent (Task) nesting | `parent_tool_use_id`, `--forward-subagent-text` | S9b |
 | P15 | Todo list | `TodoWrite` tool input | S9b |
-| P16 | Background shells and their output | `Bash` `run_in_background`; output needs the harness's own tool | gap |
-| P17 | Rewind / checkpoints (Esc Esc) | `--rewind-files` exists, unprobed | gap |
+| P16 | Background shells and their output | `Bash` `run_in_background`; output needs the harness's own tool | gap (#1308) |
+| P17 | Rewind / checkpoints (Esc Esc) | `--rewind-files` exists, unprobed | gap (#1308) |
 | P18 | Rate-limit and usage banners | `rate_limit_event` | S4 |
 | P19 | MCP server status | `system/init.mcp_servers` | S9b |
 | P20 | Hook output | `system/hook_*` | S9b |
 | P21 | Model and effort switching | respawn with `--model` / `--effort` at idle (§1 reload) | S11 |
 | P22 | Resume picker | flk's agent list | existing |
 
-P16 and P17 have no source in the stream today and are not promised.
+P16 and P17 have no source in the stream today and are not promised;
+#1308 tracks finding one or deciding against them.
 
 ### 11. Harness neutrality
 
@@ -556,7 +723,10 @@ not part of the first delivery.
   gate decides whether to resend. Tool side effects of the crashed turn are
   not undone.
 - **The 1-hour cache write costs 2× input.** A fork's cost guard shows it.
-- **Remote clients and agents share a uid (#1177).** See §5.
+- **Structured agents need O19a (#1208).** Until `flk-agent` exists on a
+  host, no structured agent starts there (§1a).
+- **`pty` agents still share the operator's uid (#1177)** and can read client
+  tokens until O19a; see §5.
 - **The structured view needs a client.** A structured agent has no terminal
   to attach to; `terminal/<pane>` is for `pty` agents only.
 
@@ -564,23 +734,28 @@ not part of the first delivery.
 
 Each has a recommendation; acceptance as recommended is the default.
 
-1. **Isolation.** Keep the profile `CLAUDE_CONFIG_DIR` and isolate with
-   `--setting-sources local --strict-mcp-config` plus flk's `--settings` and
-   `--mcp-config` (§1), or give each session a private config dir with a
-   long-lived `claude setup-token` login per profile? *Recommend the first:
-   measured to drop the leak (E5) and keep auth (E6) without a second
-   credential.*
+1. **Isolation and login under `flk-agent` (#1177, ADR-0035 §6.3).** A
+   structured agent runs as `flk-agent`, so it cannot use the operator's
+   config dir or keychain at all. Log each profile in once as `flk-agent`
+   (`claude /login` into a private config dir, refreshed in that dir only),
+   or provision a `claude setup-token` token per profile? *Recommend
+   `/login` per profile as `flk-agent` where a browser is available and
+   `setup-token` on headless hosts, never a copy of the operator's
+   credentials (E6), with the isolation flags of §1 on top (E5).*
 2. **Build on `--resume-session-at`?** *Recommend yes, behind the §9
    capability probe, with the rehydrate path as the measured fallback (E11).*
 3. **Questions and permissions over `--permission-prompt-tool stdio` or an
    MCP tool?** *Recommend stdio: it is the only path that brings
    `AskUserQuestion` back (E7), it needs no extra process, and it keeps the
    server the sole owner of the session's I/O.*
+3a. **Non-blocking by default (#1301)?** *Recommend yes for questions
+   (deferred, §2a), no for permission requests (held open), and an explicit
+   `flock_question_ask{blocking: true}` for the rare ask that must block.*
 4. **Default delivery per producer.** *Recommend human `steer`, everything
    else `at_idle`, `urgent` = `steer`, interrupts explicit only (§3).*
-5. **The messaging socket (E16).** *Recommend: S3 finds a supported switch
-   to disable it or point it at the server; no structured session ships
-   before that.*
+5. **The messaging socket (E16).** *Recommend: probe slice S0 finds a
+   supported switch to disable it or point it at the server; no structured
+   session ships before that.*
 6. **Where the wire endpoint lives.** The `web` feature is conditional in
    the nix package (`withWeb`) and off in release builds today. *Recommend
    serving `/v1/ws` from the server process (§5) and turning `web` on in
@@ -591,8 +766,9 @@ Each has a recommendation; acceptance as recommended is the default.
    no Bun in the Rust CI job.*
 8. **Web client framework.** *Recommend none for the reference client
    (plain TS and DOM, Bun's bundler) until a second view needs one.*
-9. **Remote client tokens and scopes** as in §5. *Recommend as written; a
-   token never grants operator-only verbs.*
+9. **Client tokens and scopes** as in §5, with no loopback trust (§1a).
+   *Recommend as written; only an `operate`-scoped token, minted over the
+   unix socket by the local operator, reaches operator-only verbs.*
 10. **Storage first cut.** *Recommend per-agent JSONL plus the blob store
    only; zstd sealing, SQLite and DuckDB as later slices when a measured
    view needs them.*
@@ -614,17 +790,19 @@ Each has a recommendation; acceptance as recommended is the default.
 
 ## Slices
 
-Ordered; each is at most about 400 production lines (tests and doc comments
+Tracked in #1307. Ordered; each is at most about 400 production lines (tests and doc comments
 excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
 
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
+| S0 | Probe: the messaging socket of E16 (a supported switch to disable it or bind it to the server), recorded in the appendix | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
-| S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry, `flk report --unknown-events` | S1 | 250 |
-| S3 | Structured runtime: spawn with the §1 launch profile, session lease (`session_busy`), stdout pump into the per-agent stream, blob store, truthful outcome, messaging-socket switch | S1 | 400 |
+| S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile, session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
 | S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, `at_idle` / `steer` / `interrupt`, `flk agent send` and msg delivery routed to it | S3 | 400 |
-| S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S5 | 350 |
+| S5b | Turn-end work through the queue: armed self-compact and its continuation on `result`, recap lift, wake of parked waits (§3a, #697) | S5 | 200 |
+| S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
 | S7 | Wire endpoint in the server process: `/v1/ws` hello / sub / cmd, cursors, gap / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
@@ -633,6 +811,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
 | S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
 | S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
+| S6b | Non-blocking questions: question records, deferred answers, `question.answer` / `question.fork` / `question.resolve`, exactly one reply (§2a, #1301) | S6, S12 | 350 |
 | S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
 | S15 | opencode `serve` adapter | S4 | 400 |
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
@@ -840,7 +1019,7 @@ Over every probe run (1,864,109 bytes of stdout JSON):
 
 Sum over all `result.usage` objects at the time of writing: input 176,
 cache read 1,204,445, cache write 365,494, output 6,860; total 1,576,975
-tokens, under the 2M ceiling the brief set.
+tokens (76% cache reads), under the 2M ceiling the brief set.
 
 ### A.10 Codex and opencode
 
@@ -867,4 +1046,4 @@ loopback port (`GET /doc`: OpenAPI 3.1, 162 paths; `GET /event` SSE; one
 
 Not verified live: reasoning events, approvals, questions, errors and
 interrupts on both (read from the schemas only), and any live Codex
-`app-server` session.
+`app-server` session; #1309 tracks those runs.
