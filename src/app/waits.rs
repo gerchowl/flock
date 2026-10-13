@@ -8,19 +8,12 @@
 //!   background task (Claude `run_in_background`) is attributed the same way
 //!   (§4), so that pane reads `waiting_on_event`, not
 //!   `finished_with_background`;
-//! - `wait.park --until <predicate>`, which returns at once and stays open
-//!   until its mandatory deadline. The predicate is parsed and validated here
-//!   (`crate::api::wait_predicate`); a delegate on another host is refused
-//!   with `peer_incompatible`, since this server cannot observe it (§3a).
+//! - `wait.park`, which returns at once and stays open until its mandatory
+//!   deadline (#1031 part B).
 //!
 //! Each is recorded against the attested caller, the agent whose pane the
 //! caller's process ancestry runs in (`spawn_caller`, ADR-0014). A caller in
-//! no agent pane holds no agent state, so its held read records nothing and
-//! its park is refused.
-//!
-//! Limits: at most [`MAX_PARKS_PER_AGENT`] open parks per agent and a
-//! deadline of at most [`MAX_PARK_DEADLINE`], each refused with its own code
-//! beyond that. Held reads are bounded by their connection and their hold.
+//! no agent pane holds no agent state, so its held read records nothing.
 //!
 //! A wait still open at its deadline is removed and announced once as a
 //! durable `wait.expired`. A held read is released when its request returns,
@@ -28,32 +21,24 @@
 //! expiring a wait each mark the agent's pane for the derived phase events
 //! (ADR-0028 §2), so `agent.phase_changed` follows the wait.
 //!
-//! Known limits. Opening a park on its predicate, and the wake that follows,
-//! are E6 (#1032): until then a park ends at its deadline. The registry is
-//! in memory, so a server restart or live handoff drops open parks (#1240).
-//! A wait whose agent left stays until its deadline.
+//! Known limits. Opening a wait on its predicate, and the wake that follows,
+//! are E6 (#1032). The registry is in memory, so a server restart or live
+//! handoff drops open waits (#1240). A wait whose agent left stays until its
+//! deadline.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::api::agent_state::Waiting;
-use crate::api::schema::{EventData, EventEnvelope, EventKind, ResponseResult, WaitParkParams};
-use crate::api::wait_predicate::{PredicateError, WaitPredicate};
+use crate::api::schema::{EventData, EventEnvelope, EventKind, ResponseResult};
+use crate::api::wait_predicate::WaitPredicate;
 
-use super::api::responses::{encode_error, encode_success};
+use super::api::responses::encode_success;
 use super::{App, SpawnCaller};
 
 /// How long a held read's wait outlives its hold before the registry gives
 /// up on its release: the CLI's own slack over the server-side hold.
 const HOLD_GRACE: Duration = Duration::from_secs(10);
-
-/// The longest a park may stay open: the longest reply wait
-/// (`msg.wait_reply`), so a park outlives no other wait flk holds.
-pub(crate) const MAX_PARK_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Open parks one agent may hold. A supervisor parks on a handful of
-/// delegates; more is a loop parking without ending its turn.
-pub(crate) const MAX_PARKS_PER_AGENT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenWait {
@@ -109,15 +94,6 @@ impl WaitRegistry {
         self.waits.remove(wait_id)
     }
 
-    /// The agent's open parks: every wait but a held read's.
-    fn parks_of(&self, agent_id: &str) -> usize {
-        self.waits
-            .values()
-            .filter(|wait| wait.agent_id == agent_id)
-            .filter(|wait| !matches!(wait.predicate, WaitPredicate::Events { .. }))
-            .count()
-    }
-
     /// The agent's oldest open wait, as `state.waiting` reports it.
     pub(crate) fn waiting(&self, agent_id: &str) -> Waiting {
         self.waits
@@ -150,106 +126,6 @@ impl WaitRegistry {
 }
 
 impl App {
-    /// `wait.park`: open a wait for the attested calling agent.
-    pub(super) fn handle_wait_park(&mut self, id: String, params: WaitParkParams) -> String {
-        if params.deadline_ms == 0 {
-            return encode_error(id, "invalid_params", "wait.park needs a deadline above 0");
-        }
-        let hold = Duration::from_millis(params.deadline_ms);
-        if hold > MAX_PARK_DEADLINE {
-            return encode_error(
-                id,
-                "wait_deadline_too_long",
-                format!(
-                    "a park stays open at most {} h; park again when it expires",
-                    MAX_PARK_DEADLINE.as_secs() / 3600
-                ),
-            );
-        }
-        let predicate = match WaitPredicate::parse(&params.until) {
-            Ok(WaitPredicate::Events { .. }) => Err(PredicateError::Unsupported(
-                "an `events` predicate is a held read: run `flk events wait` instead".into(),
-            )),
-            parsed => parsed,
-        };
-        let predicate = match predicate {
-            Ok(predicate) => predicate,
-            Err(PredicateError::Invalid(reason)) => {
-                return encode_error(id, "wait_predicate_invalid", reason)
-            }
-            Err(PredicateError::Unsupported(reason)) => {
-                return encode_error(id, "wait_predicate_unsupported", reason)
-            }
-        };
-        if let WaitPredicate::DelegatePhase { delegate, .. } = &predicate {
-            if let Some(refusal) = self.delegate_subject_refusal(delegate) {
-                return encode_error(id, refusal.0, refusal.1);
-            }
-        }
-        let SpawnCaller::Agent {
-            agent_id, pane_id, ..
-        } = self.spawn_caller()
-        else {
-            return encode_error(
-                id,
-                "no_caller_pane",
-                "wait.park parks the agent whose pane runs the caller, and this caller \
-                 runs in no agent pane",
-            );
-        };
-        if self.waits.parks_of(&agent_id) >= MAX_PARKS_PER_AGENT {
-            return encode_error(
-                id,
-                "too_many_waits",
-                format!(
-                    "this agent already holds {MAX_PARKS_PER_AGENT} open parks; end your turn \
-                     and let one expire first"
-                ),
-            );
-        }
-        let canonical = predicate.to_string();
-        let Some((wait_id, deadline)) = self.open_wait(agent_id.clone(), pane_id, predicate, hold)
-        else {
-            return encode_error(id, "invalid_params", "wait.park deadline is out of range");
-        };
-        encode_success(
-            id,
-            ResponseResult::WaitParked {
-                wait_id,
-                agent_id,
-                predicate: canonical,
-                deadline,
-            },
-        )
-    }
-
-    /// Why a park on `delegate` cannot be registered here, if it cannot: an
-    /// agent on another host (§3a), or no agent this server knows.
-    fn delegate_subject_refusal(&self, delegate: &str) -> Option<(&'static str, String)> {
-        if self
-            .delegations
-            .edges()
-            .any(|edge| edge.delegate == delegate)
-        {
-            return None;
-        }
-        match self.locate_agent(delegate) {
-            Some(location) if location.local => None,
-            Some(location) => Some((
-                "peer_incompatible",
-                format!(
-                    "{delegate} runs on {}; a wait on another host's agent is not \
-                     supported, park on that host",
-                    location.host
-                ),
-            )),
-            None => Some((
-                "agent_not_found",
-                format!("no agent {delegate} on this server"),
-            )),
-        }
-    }
-
     /// A held `events.read` opens its blocking wait. A caller in no agent
     /// pane records nothing.
     pub(super) fn handle_wait_hold(
@@ -325,7 +201,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::api::agent_state::{Phase, Waiting, SETTLE_MS};
-    use crate::api::schema::{EventData, EventKind, Method, Request, WaitParkParams};
+    use crate::api::schema::{EventData, EventKind, Method, Request};
     use crate::api::wait_predicate::WaitPredicate;
     use crate::app::App;
     use crate::detect::Agent;
@@ -405,17 +281,6 @@ mod tests {
         let state = &got["result"]["agent"]["state"];
         let phase = serde_json::from_value(state["phase"].clone()).expect("phase");
         (phase, state["waiting"].clone())
-    }
-
-    fn park_until(until: &str, deadline_ms: u64) -> Method {
-        Method::WaitPark(WaitParkParams {
-            until: until.into(),
-            deadline_ms,
-        })
-    }
-
-    fn park(deadline_ms: u64) -> Method {
-        park_until("reply:c_42", deadline_ms)
     }
 
     fn any_events() -> WaitPredicate {
@@ -500,131 +365,23 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1031): a parked agent reads `waiting_on_event`, with
-    /// its predicate in canonical form.
-    #[test]
-    fn a_parked_agent_reads_waiting_on_event() {
-        let (mut app, agent_id) = settled_claude_with_a_background_shell();
-        // The fixture's only agent is the caller, so it is the local delegate.
-        let until = format!("delegate:{agent_id} phase in [gone,finished,  needs_human]");
-        let parked = call(&mut app, park_until(&until, 60_000));
-        let canonical = format!("delegate:{agent_id} phase in [gone, needs_human, finished]");
-        assert_eq!(parked["result"]["agent_id"], agent_id.as_str());
-        assert_eq!(parked["result"]["predicate"], canonical.as_str());
-        let (phase, waiting) = state(&mut app, &agent_id);
-        assert_eq!(phase, Phase::WaitingOnEvent);
-        assert_eq!(waiting["on"]["wait_id"], parked["result"]["wait_id"]);
-        assert_eq!(waiting["on"]["predicate"], canonical.as_str());
-        assert_eq!(waiting["on"]["deadline"], parked["result"]["deadline"]);
-    }
-
-    /// Acceptance (#1031): a predicate the grammar does not have, or one the
-    /// ADR names that this slice cannot register, is refused with its typed
-    /// code, which the CLI exits 2 on. Nothing is parked.
-    #[test]
-    fn an_unknown_or_unsupported_predicate_is_refused_with_its_code() {
-        let (mut app, _) = settled_claude_with_a_background_shell();
-        let code = |app: &mut App, until: &str| {
-            call(app, park_until(until, 60_000))["error"]["code"].clone()
-        };
-        for until in [
-            "pr:812 ci_completed",
-            "any-delegate-of-mine changed",
-            "events after 0",
-        ] {
-            assert_eq!(
-                code(&mut app, until),
-                "wait_predicate_unsupported",
-                "{until}"
-            );
-        }
-        for until in [
-            "agent_d1 finished",
-            "delegate:agent_d1 phase in [stalled]",
-            "reply:",
-        ] {
-            assert_eq!(code(&mut app, until), "wait_predicate_invalid", "{until}");
-        }
-        for name in ["wait_predicate_unsupported", "wait_predicate_invalid"] {
-            assert_eq!(
-                crate::cli::error_code_exit(name, true),
-                crate::cli::exit::USAGE
-            );
-        }
-        assert_eq!(app.waits.next_deadline(), None);
-    }
-
-    /// A delegate on another host cannot be observed here (ADR-0028 §3a),
-    /// and an id no server knows is not a delegate.
-    #[test]
-    fn a_remote_or_unknown_delegate_is_refused() {
-        let (mut app, _) = settled_claude_with_a_background_shell();
-        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "kiln".into(),
-            ..Default::default()
-        });
-        peer.host = Some("kiln".into());
-        peer.workspaces = vec![crate::api::schema::PeerWorkspaceSummary {
-            id: "w1".into(),
-            workspace: "remote".into(),
-            project_key: None,
-            project_label: None,
-            branch: None,
-            is_linked_worktree: false,
-            agent: Some("cc".into()),
-            status: crate::api::schema::AgentStatus::Idle,
-            status_age_secs: None,
-            activity: None,
-            agents: vec![crate::api::schema::PeerAgentSummary {
-                agent_id: "agent_kiln_1".into(),
-                pane_id: "w1:p1".into(),
-                agent: Some("cc".into()),
-                status: crate::api::schema::AgentStatus::Idle,
-            }],
-        }];
-        app.state.peer_summaries = vec![peer];
-        let refused = |app: &mut App, delegate: &str| {
-            let until = format!("delegate:{delegate} phase in [finished]");
-            call(app, park_until(&until, 60_000))["error"]["code"].clone()
-        };
-        assert_eq!(refused(&mut app, "agent_kiln_1"), "peer_incompatible");
-        assert_eq!(refused(&mut app, "agent_nowhere_1"), "agent_not_found");
-        assert_eq!(app.waits.next_deadline(), None);
-    }
-
-    /// A park is bounded in length and in number per agent. Held reads do
-    /// not count against the parks.
-    #[test]
-    fn parks_are_bounded_in_deadline_and_count() {
-        let (mut app, _) = settled_claude_with_a_background_shell();
-        let longest = u64::try_from(super::MAX_PARK_DEADLINE.as_millis()).unwrap();
-        assert_eq!(
-            call(&mut app, park(longest + 1))["error"]["code"],
-            "wait_deadline_too_long"
-        );
-        call(&mut app, Method::WaitHold(any_events(), 60_000));
-        for _ in 0..super::MAX_PARKS_PER_AGENT {
-            assert!(call(&mut app, park(longest))["result"]["wait_id"].is_string());
-        }
-        let refused = call(&mut app, park(60_000));
-        assert_eq!(refused["error"]["code"], "too_many_waits");
-        assert_eq!(
-            crate::cli::error_code_exit("too_many_waits", true),
-            crate::cli::exit::REFUSED
-        );
-    }
-
     /// Acceptance (#1031): an expired deadline emits `wait.expired` once and
     /// clears the wait.
+    /// A held read whose release never arrived (its connection thread died)
+    /// expires at its hold plus the grace.
     #[test]
-    fn an_expired_park_is_announced_once_and_cleared() {
+    fn a_held_read_whose_release_is_lost_expires_once() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
-        let parked = call(&mut app, park(1_000));
-        let wait_id = parked["result"]["wait_id"].clone();
+        let held = call(&mut app, Method::WaitHold(any_events(), 1_000));
+        let wait_id = held["result"]["wait_id"].clone();
         let due = app
             .waits
             .next_deadline()
-            .expect("the park is a loop deadline");
+            .expect("the hold is a loop deadline");
+        assert!(
+            due.saturating_duration_since(Instant::now()) > super::HOLD_GRACE,
+            "the hold plus its grace"
+        );
 
         app.tick_waits(due - Duration::from_millis(1));
         assert_eq!(state(&mut app, &agent_id).0, Phase::WaitingOnEvent);
@@ -655,22 +412,12 @@ mod tests {
 
     /// A caller in no agent pane has no agent state to put a wait on.
     #[test]
-    fn a_caller_outside_an_agent_pane_cannot_park_and_holds_nothing() {
+    fn a_caller_outside_an_agent_pane_holds_nothing() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         app.current_api_peer_pid = None;
-        assert_eq!(
-            call(&mut app, park(60_000))["error"]["code"],
-            "no_caller_pane"
-        );
         let held = call(&mut app, Method::WaitHold(any_events(), 1));
         assert_eq!(held["result"]["wait_id"], serde_json::Value::Null);
         assert_eq!(app.waits.next_deadline(), None);
-    }
-
-    #[test]
-    fn a_park_needs_a_deadline() {
-        let (mut app, _) = settled_claude_with_a_background_shell();
-        assert_eq!(call(&mut app, park(0))["error"]["code"], "invalid_params");
     }
 
     /// With two waits open, the older one is reported.

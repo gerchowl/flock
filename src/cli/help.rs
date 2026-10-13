@@ -288,7 +288,6 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk wait reply <correlation_id> [--timeout MS] [--json]",
     ),
-    ("wait", "park", super::events::PARK_USAGE),
     (
         "integration",
         "install",
@@ -620,10 +619,8 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
-            // `wait park` shares the `events` parser.
-            "wait" => concat!(include_str!("../cli.rs"), include_str!("events.rs")),
-            // These five live inline in the dispatcher itself.
-            "config" | "channel" | "terminal" | "session" | "hook" => {
+            // These six live inline in the dispatcher itself.
+            "config" | "channel" | "terminal" | "wait" | "session" | "hook" => {
                 include_str!("../cli.rs")
             }
             _ => "",

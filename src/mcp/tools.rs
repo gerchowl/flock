@@ -28,8 +28,7 @@ use serde_json::{json, Value};
 use crate::api::schema::{
     AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
     EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
-    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WaitParkParams, WorktreeKillParams,
-    WorktreeListParams,
+    MsgSendParams, PaneReadParams, ReadFormat, ReadSource, WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -431,25 +430,6 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_events_read,
             build: build_events_read,
         },
-        Tool {
-            name: "flock_wait_park",
-            description: "Park yourself on a registered wait (ADR-0028 §5) and \
-                          return at once, so you can end your turn: until \
-                          `deadline_ms` passes you read `waiting_on_event`, and \
-                          a supervisor treats you as parked, not stalled. \
-                          `until` is the predicate: `delegate:<agent id> phase \
-                          in [finished, needs_human, gone]` or \
-                          `reply:<correlation id>`. Returns the `wait_id`, the \
-                          predicate in canonical form and the deadline (Unix \
-                          ms). Refusals: `wait_predicate_invalid`, \
-                          `wait_predicate_unsupported` (`pr:` and \
-                          `any-delegate-of-mine` are not supported yet), \
-                          `wait_deadline_too_long` (over 24 h), \
-                          `too_many_waits` (16 open parks), `peer_incompatible` \
-                          (a delegate on another host), `no_caller_pane`.",
-            input_schema: schema_wait_park,
-            build: build_wait_park,
-        },
     ]
 }
 
@@ -708,18 +688,6 @@ fn schema_events_read() -> Value {
             "limit": {"type": "integer", "minimum": 1, "description": "At most this many events (default 256)."},
             "wait_ms": {"type": "integer", "minimum": 0, "description": "Hold the call until a matching event lands, in ms (capped at 540000). Blocks this MCP session."},
         },
-        "additionalProperties": false,
-    })
-}
-
-fn schema_wait_park() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "until": {"type": "string", "description": "The predicate: `delegate:<agent id> phase in [<phase>, ...]` or `reply:<correlation id>`."},
-            "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 86_400_000, "description": "How long the wait stays open, in ms (at most 24 h). Mandatory."},
-        },
-        "required": ["until", "deadline_ms"],
         "additionalProperties": false,
     })
 }
@@ -1124,12 +1092,6 @@ fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
 
 /// Ceiling of `flock_events_read`'s hold, below the 600 s MCP tool timeout.
 const MCP_EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
-
-fn build_wait_park(args: Value) -> Result<Method, McpError> {
-    let params: WaitParkParams = serde_json::from_value(args)
-        .map_err(|err| McpError::invalid_params(format!("invalid wait.park arguments: {err}")))?;
-    Ok(Method::WaitPark(params))
-}
 
 fn build_events_read(args: Value) -> Result<Method, McpError> {
     let mut params: EventsReadParams = serde_json::from_value(args)
@@ -1635,24 +1597,8 @@ mod tests {
                 "flock_agent_history",
                 "flock_agent_result",
                 "flock_events_read",
-                "flock_wait_park",
             ]
         );
-    }
-
-    #[test]
-    fn wait_park_needs_a_deadline() {
-        let Method::WaitPark(params) = build_wait_park(json!({
-            "until": "reply:c1", "deadline_ms": 600_000
-        }))
-        .unwrap() else {
-            panic!("expected wait.park");
-        };
-        assert_eq!(
-            (params.until.as_str(), params.deadline_ms),
-            ("reply:c1", 600_000)
-        );
-        assert!(build_wait_park(json!({"until": "reply:c1"})).is_err());
     }
 
     /// The schema is generated from the enum, so the caller-visible set of

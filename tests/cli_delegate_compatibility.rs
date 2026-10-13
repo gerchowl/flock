@@ -261,7 +261,6 @@ fn every_mutating_verb_refuses_skew_before_sending() {
         &["pane", "send-text", "w1:p1", "hello"],
         &["msg", "reply", "msg_fixture", "hello"],
         &["worktree", "create", "--cwd", "CWD", "--branch", "chore/x"],
-        &["wait", "park", "--until", "reply:c1", "--deadline", "10m"],
     ] {
         let (output, methods) = run(args, Some("0.9.0"), None, false);
         assert_gap(output, "0.9.0");

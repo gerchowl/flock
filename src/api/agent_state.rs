@@ -135,9 +135,7 @@ pub enum Lifecycle {
     Unknown,
 }
 
-/// Ordered as the ADR's phase table, which is the order a predicate's phase
-/// list is rendered in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Gone,
@@ -340,7 +338,7 @@ mod tests {
     fn on() -> Waiting {
         Waiting::On {
             wait_id: "w_1".into(),
-            predicate: "reply:c1".into(),
+            predicate: "events after 3".into(),
             since: 1,
             deadline: 2,
         }
@@ -398,7 +396,7 @@ mod tests {
         assert_eq!(serde_json::to_value(Waiting::None).unwrap(), "none");
         assert_eq!(
             serde_json::to_value(on()).unwrap(),
-            serde_json::json!({"on": {"wait_id": "w_1", "predicate": "reply:c1",
+            serde_json::json!({"on": {"wait_id": "w_1", "predicate": "events after 3",
                 "since": 1, "deadline": 2}})
         );
         let state: AgentState = serde_json::from_str(

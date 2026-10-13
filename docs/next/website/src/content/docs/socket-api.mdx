@@ -671,55 +671,21 @@ the states it observes, and the settle window is applied by the client.
 
 ### Registered waits
 
-An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses. There are two ways to open one:
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses.
 
-- **A held `events.read`.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`.
-- **`wait.park`.** Opens a wait on a predicate and returns at once, so the agent can end its turn.
+**A held `events.read` is a wait.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`. A held read from outside an agent pane is served as before and records no wait.
 
-```json
-{"id":"p1","method":"wait.park","params":{"until":"delegate:agent_atlas_7 phase in [finished, needs_human, gone]","deadline_ms":1800000}}
-```
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical text. A held read's predicate is its filter, `events after <seq> [kinds <k>,...] [subjects <id>,...]`:
 
 ```json
-{"id":"p1","result":{"type":"wait_parked","wait_id":"w_1760342400000_1","agent_id":"agent_atlas_3","predicate":"delegate:agent_atlas_7 phase in [gone, needs_human, finished]","deadline":1760344200000}}
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "events after 412 kinds pr.ci_completed subjects agent_atlas_7", "since": 1760342400000, "deadline": 1760342950000}}
 ```
 
-`until` is a predicate text, parsed and validated by the server. This release supports:
+`since` and `deadline` are Unix ms. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
 
-| Predicate | Waits for |
-| --- | --- |
-| `delegate:<agent id> phase in [<phase>, ...]` | a local agent's `phase` (ADR-0028 §1 vocabulary) reaching one of the listed phases |
-| `reply:<correlation id>` | the answer to a message you sent |
+A held read's wait closes when the read returns. If that close never reaches the server (the connection's thread died), the wait expires 10 s after its hold: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }`.
 
-The reply echoes the predicate in its **canonical form**: phases deduplicated and listed in the phase table's order, single spaces. `deadline_ms` is mandatory and relative, at most 86 400 000 (24 h, the longest reply wait). An agent holds at most 16 open parks; held reads do not count.
-
-`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical form:
-
-```json
-"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "delegate:agent_atlas_7 phase in [gone, needs_human, finished]", "since": 1760342400000, "deadline": 1760344200000}}
-```
-
-A held read reports its filter as `events after <seq> [kinds <k>,...] [subjects <id>,...]`. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
-
-**How a park ends.** In this release a park closes only at its deadline: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }` (`since` and `deadline` in Unix ms). Opening a park when its predicate becomes true, and waking the agent, is #1032. A held read closes when it returns, so it expires only if that close never reached the server.
-
-**Failure modes.** Each refusal leaves nothing parked:
-
-| Code | Exit | Meaning |
-| --- | --- | --- |
-| `wait_predicate_invalid` | 2 | `until` is not a predicate of the grammar above (an unknown form or phase, an empty list, a bad id). |
-| `wait_predicate_unsupported` | 2 | A predicate ADR-0028 names that this release cannot register: `pr:<n> ci_completed` and `any-delegate-of-mine changed` (#1250), or an `events ...` form, which is a held read's: use `flk events wait`. |
-| `wait_deadline_too_long` | 2 | `deadline_ms` is over 24 h. Park again when it expires. |
-| `invalid_params` | 1 | `deadline_ms` is 0 or missing. |
-| `too_many_waits` | 10 | The agent already holds 16 open parks. Retry after one expires. |
-| `peer_incompatible` | 1 | The delegate runs on another host. This server cannot observe it (ADR-0028 §3a); park on that host. |
-| `agent_not_found` | 1 | No agent or delegation edge on this server has that id. |
-| `no_caller_pane` | 1 | The caller runs in no agent pane, so there is no agent to put the wait on. |
-| `server_version_gap` | 78 | The server is older than protocol 29: `flk wait park` refuses before sending (#868). |
-
-A held read from outside an agent pane is served as before and records no wait.
-
-**Known limits.** `pr:<n> ci_completed` and `any-delegate-of-mine changed` are refused until #1250. A park ends at its deadline only, until #1032. Open parks are held in memory, so a server restart or live handoff drops them (#1240). A wait whose agent left stays until its deadline.
+**Known limits.** The registry is held in memory, so a server restart or live handoff drops open waits (#1240). A wait whose agent left stays until its deadline.
 
 ## The turn cursor
 
