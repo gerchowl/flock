@@ -124,23 +124,10 @@ impl App {
             index.apply(&envelope.data);
         }
         self.goals = index;
-        self.goal_rotations_seen = self.event_hub.rotations();
         self.emit_goal_reissues();
     }
 
-    /// Server loop: when the log rotated since the last look, re-issue the
-    /// open goals from memory (ADR-0031 §4). A rotation keeps the old active
-    /// file as `.1`, so the record is on disk until the copy lands.
-    pub(crate) fn reissue_goals_after_rotation(&mut self) {
-        let rotations = self.event_hub.rotations();
-        if rotations == self.goal_rotations_seen {
-            return;
-        }
-        self.goal_rotations_seen = rotations;
-        self.emit_goal_reissues();
-    }
-
-    fn emit_goal_reissues(&mut self) {
+    pub(super) fn emit_goal_reissues(&mut self) {
         for event in self.goals.reissue_events() {
             self.emit_event(event);
         }
@@ -419,7 +406,7 @@ mod tests {
                     workspace_id: format!("filler-{round}"),
                 },
             ));
-            app.reissue_goals_after_rotation();
+            app.reissue_records_after_rotation();
         }
         assert_eq!(hub.rotations(), 6);
         assert!(
