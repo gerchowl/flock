@@ -17,11 +17,11 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
     cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_flock_pid,
-    send_input, unregister_spawned_flock_pid, wait_for_disconnect, wait_for_socket,
+    send_input, unregister_spawned_flock_pid, wait_for_disconnect,
 };
 
 struct SpawnedFlock {
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -100,6 +100,8 @@ fn spawn_server_with_env(
     )
 }
 
+/// Normal starts announce readiness after app and both listener initialization.
+/// EOF/mismatches fail in the shared reader, and nextest bounds silent children.
 fn spawn_server_exe(
     exe: &Path,
     config_home: &Path,
@@ -146,10 +148,13 @@ fn spawn_server_exe(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    SpawnedFlock {
-        _master: pair.master,
+    drop(pair.slave);
+    let spawned = SpawnedFlock {
+        master: pair.master,
         child,
-    }
+    };
+    support::readiness::wait_for_server(spawned.master.as_ref(), api_socket);
+    spawned
 }
 
 fn spawn_named_session_server(
@@ -188,10 +193,19 @@ fn spawn_named_session_server(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    SpawnedFlock {
-        _master: pair.master,
+    drop(pair.slave);
+    let spawned = SpawnedFlock {
+        master: pair.master,
         child,
-    }
+    };
+    support::readiness::wait_for_server(
+        spawned.master.as_ref(),
+        &config_home
+            .join("flock-dev/sessions")
+            .join(session_name)
+            .join("flock.sock"),
+    );
+    spawned
 }
 
 fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedFlock {
@@ -226,10 +240,16 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    SpawnedFlock {
-        _master: pair.master,
+    drop(pair.slave);
+    let spawned = SpawnedFlock {
+        master: pair.master,
         child,
-    }
+    };
+    support::readiness::wait_for_server(
+        spawned.master.as_ref(),
+        &config_home.join("flock-dev/flock.sock"),
+    );
+    spawned
 }
 
 fn try_request(
@@ -291,6 +311,10 @@ fn assert_ok(response: serde_json::Value) {
     );
 }
 
+/// Verify handoff/rollback API usability after the wire handshake completes.
+/// Importer output is /dev/null (src/server/handoff.rs::spawn_handoff_import),
+/// so replacement readiness is signalled over READY/OWNED, not the PTY banner.
+/// Keep these bounded checks and the independent replacement PID assertions.
 fn wait_for_api(socket_path: &Path, timeout: Duration) {
     let _timing = support::timing::wait("ready: api");
     let deadline = Instant::now() + timeout;
@@ -584,7 +608,6 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -671,7 +694,6 @@ fn live_handoff_preserves_named_session_socket_paths() {
     let client_socket = session_dir.join("flock-client.sock");
 
     let spawned = spawn_named_session_server(&config_home, &runtime_dir, "work");
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let before = request(
@@ -688,7 +710,7 @@ fn live_handoff_preserves_named_session_socket_paths() {
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(5));
+    UnixStream::connect(&client_socket).expect("handoff client listener is bound");
     assert!(
         !config_home.join("flock-dev/flock.sock").exists(),
         "named handoff unexpectedly bound the default session API socket"
@@ -723,7 +745,6 @@ fn live_handoff_preserves_pane_process_io() {
     let second_received_marker = base.join("second-received");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -830,7 +851,7 @@ fn live_handoff_preserves_pane_process_io() {
     );
     thread::sleep(Duration::from_millis(300));
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(5));
+    UnixStream::connect(&client_socket).expect("handoff client listener is bound");
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
     assert_eq!(unsafe { libc::kill(second_child_pid as libc::pid_t, 0) }, 0);
     assert!(
@@ -917,7 +938,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     .unwrap();
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -954,7 +974,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(5));
 
     let mut client_stream = UnixStream::connect(&client_socket).unwrap();
     let (server_protocol, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
@@ -1008,7 +1027,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     .unwrap();
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1045,7 +1063,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(5));
 
     let mut client_stream = UnixStream::connect(&client_socket).unwrap();
     let (server_protocol, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
@@ -1076,7 +1093,6 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
     let pane_id_marker = base.join("old-pane-id");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1111,7 +1127,6 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1161,7 +1176,6 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     let shell_marker = base.join("shell-after-agent");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let command = format!(
@@ -1227,7 +1241,6 @@ fn live_handoff_keeps_shell_pane_after_foreground_process_exits() {
     let shell_marker = base.join("shell-after-foreground");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1300,7 +1313,6 @@ fn live_handoff_preserves_python_http_server() {
     let port = unused_local_port();
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1384,7 +1396,7 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
         } else {
             spawn_default_session_server(&config_home, &runtime_dir)
         };
-        wait_for_socket(api_socket, Duration::from_secs(10));
+
         let created = request(
             api_socket,
             serde_json::json!({
@@ -1467,7 +1479,6 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
         &api,
         &[("FLOCK_CONFIG_PATH", config.to_str().unwrap())],
     );
-    wait_for_socket(&api, Duration::from_secs(10));
     register_runtime_dir(&runtime);
     let created = request(
         &api,
@@ -1618,7 +1629,6 @@ fn removed_config_key_during_handoff_succeeds_preserving_policy() {
         &api,
         &[("FLOCK_CONFIG_PATH", config.to_str().unwrap())],
     );
-    wait_for_socket(&api, Duration::from_secs(10));
     register_runtime_dir(&runtime);
     let created = request(
         &api,
@@ -1665,7 +1675,6 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     let received_marker = base.join("received");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1791,7 +1800,6 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         ));
     }
     let spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, &extra_env);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1866,7 +1874,8 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         );
     }
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(5));
+    UnixStream::connect(&client_socket).expect("handoff client listener is bound");
+
     let after = request(
         &api_socket,
         serde_json::json!({"id":"identity-after","method":"ping","params":{}}),
@@ -2323,7 +2332,6 @@ fn live_handoff_carries_more_panes_than_one_fd_batch() {
     let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -2376,7 +2384,6 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
         &api_socket,
         &[("FLOCK_TEST_HANDOFF_IMPORT_FAIL", "mid_fds")],
     );
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -2468,7 +2475,6 @@ fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff
     let started_marker = base.join("child-started");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let command = format!(
@@ -2569,7 +2575,6 @@ fn question_policy_follows_the_starter_refuses_widening_and_survives_live_handof
     let done = base.join("done");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let command = format!(
@@ -2690,7 +2695,6 @@ fn live_handoff_keeps_an_idle_claude_pane_readable_repainted_and_its_mail_queued
     let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -3020,7 +3024,6 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
     let (old_exe, new_exe, profile_flk) = nix_style_install(&base);
 
     let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -3090,7 +3093,6 @@ fn live_handoff_upgrades_an_older_server_to_the_client_version() {
     let client = client_version();
 
     let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned.child.process_id().expect("server pid");
     assert_eq!(server_version(&api_socket), "0.0.1");
@@ -3135,7 +3137,6 @@ fn live_handoff_refuses_a_relative_import_exe_of_the_old_version() {
     let client = client_version();
 
     let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let (ok, stderr) = run_handoff_cli(
@@ -3173,7 +3174,6 @@ fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
     let client = client_version();
 
     let spawned = spawn_server_exe(&old_exe, &config_home, &runtime_dir, &api_socket, &[]);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned.child.process_id().expect("server pid");
 
@@ -3190,6 +3190,8 @@ fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
         !ok,
         "a same-version re-exec must not report success:\n{stderr}"
     );
+    // src/cli/server.rs::judge_handoff emits this refusal after querying the
+    // replacement. run_handoff_cli waits for that command's actual exit/output.
     assert!(stderr.contains("same server version"), "{stderr}");
     assert!(stderr.contains(&format!("flk {client}")), "{stderr}");
     wait_for_handoff_importer_pid(&config_home, server_pid, Duration::from_secs(30));
@@ -3216,7 +3218,6 @@ fn live_handoff_refuses_a_default_downgrade() {
         &api_socket,
         &[("FLOCK_TEST_BUILD_VERSION", "99.0.0")],
     );
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let (ok, stderr) = run_handoff_cli(
@@ -3251,7 +3252,6 @@ fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
     let marker = base.join("stuck.pid");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
