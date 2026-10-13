@@ -245,11 +245,16 @@ fn spawn_named_server(
         .env_remove("FLOCK_ENV")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     support::environment::assert_command_isolated(&command);
-    let child = command.spawn().unwrap();
+    let mut child = command.spawn().unwrap();
     register_spawned_flock_pid(Some(child.id()));
+    support::readiness::read_announcement(
+        child.stderr.as_mut().expect("server startup output"),
+        &named_session_socket(config_home, session),
+    )
+    .expect("named server readiness announcement");
     SpawnedServerProcess { child }
 }
 
@@ -351,6 +356,8 @@ fn spawn_flock_with_config(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, socket_path);
     SpawnedFlock {
         _master: Some(pair.master),
         child,
