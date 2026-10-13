@@ -1350,7 +1350,18 @@ fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Serialises every read-modify-write of Claude's settings.json in this
+/// process. The server installs on worker threads (#1180), so two installs,
+/// or an install and an uninstall, can overlap, and each rewrites the whole
+/// file from what it read.
+fn claude_settings_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<ClaudeInstallPaths> {
+    let _settings = claude_settings_lock();
     let dir = claude_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1363,7 +1374,8 @@ pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<Claude
     fs::create_dir_all(&hooks_dir)?;
 
     let hook_path = effective_claude_hook_path(&dir);
-    fs::write(&hook_path, CLAUDE_HOOK_ASSET)?;
+    // Atomic, so a Claude session running the stub never reads half of it.
+    atomic_write::replace(&hook_path, CLAUDE_HOOK_ASSET.as_bytes())?;
     make_executable(&hook_path)?;
     // Rebrand cleanup: drop the dead `herdr-agent-state.sh` shim left by a
     // pre-flock install (its `HERDR_ENV` gate is never set now).
@@ -1464,7 +1476,11 @@ pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<Claude
         .ok_or_else(|| io::Error::other("hook entries for PreToolUse must be an array"))?
         .push(question.entry(question_command));
 
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    // Atomic, so Claude and a concurrent reader never see a half-written file.
+    atomic_write::replace(
+        &settings_path,
+        serde_json::to_string_pretty(&settings)?.as_bytes(),
+    )?;
 
     Ok(ClaudeInstallPaths {
         hook_path,
@@ -2006,6 +2022,7 @@ pub(crate) fn uninstall_omp() -> io::Result<OmpUninstallResult> {
 }
 
 pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
+    let _settings = claude_settings_lock();
     let hook_path = claude_dir()?.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
     let settings_path = claude_dir()?.join("settings.json");
     let mut updated_settings = false;
@@ -2086,7 +2103,10 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
         }
 
         if updated_settings {
-            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+            atomic_write::replace(
+                &settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
         }
     }
 
@@ -4308,6 +4328,92 @@ mod tests {
         assert_eq!(at_least("1.9.999"), Some(false));
         assert_eq!(at_least("not a version"), None);
         assert_eq!(at_least(""), None);
+    }
+
+    /// #1180: the server installs on worker threads, so installs overlap.
+    /// Each must see a whole file, and the result must keep the user's own
+    /// hook and hold exactly one flk question entry. A reader polling the
+    /// file meanwhile must never see it half-written.
+    #[test]
+    fn concurrent_installs_leave_one_valid_settings_file() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let torn = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut torn = Vec::new();
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Ok(raw) = fs::read_to_string(&settings_path) {
+                        if serde_json::from_str::<Value>(&raw).is_err() {
+                            torn.push(raw);
+                        }
+                    }
+                }
+                torn
+            });
+            let installers: Vec<_> = (0..4)
+                .map(|n| {
+                    scope.spawn(move || {
+                        let question = ClaudeQuestionHook {
+                            human_tools: vec![format!("mcp__t{n}__ask")],
+                            on_failure_block: n % 2 == 0,
+                        };
+                        for _ in 0..50 {
+                            install_claude(&question).expect("an overlapping install");
+                        }
+                    })
+                })
+                .collect();
+            // Joined before any verdict, so a failed install stops the
+            // reader instead of leaving it spinning.
+            let installs: Vec<_> = installers.into_iter().map(|i| i.join()).collect();
+            done.store(true, std::sync::atomic::Ordering::Release);
+            (reader.join().expect("reader"), installs)
+        });
+        let (torn, installs) = torn;
+        assert!(
+            installs.iter().all(Result::is_ok),
+            "an overlapping install failed"
+        );
+        assert!(
+            torn.is_empty(),
+            "a reader saw a half-written file: {torn:?}"
+        );
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let commands: Vec<&str> = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert_eq!(commands.iter().filter(|c| **c == "echo mine").count(), 1);
+        assert_eq!(
+            commands.iter().filter(|c| c.ends_with(" question")).count(),
+            1,
+            "{commands:?}"
+        );
+        assert!(fs::read_dir(&claude_dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".flock-write-")));
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     /// ADR-0034 §4: `flk integration status` says when the installed question
