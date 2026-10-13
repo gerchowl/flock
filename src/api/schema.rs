@@ -1011,6 +1011,12 @@ pub struct AgentResultInfo {
     pub next_offset: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_ms: Option<u64>,
+    /// When the newest turn began, while the harness's own record shows it
+    /// still running (#1257); the same value rides on a `no_result` refusal as
+    /// `data.turn_open_at_ms`. Claude only. Absent when the turn is over or
+    /// the record cannot date it, and older servers never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_open_at_ms: Option<u64>,
 }
 
 /// Turns returned by `agent.history` when the caller names no `limit`.
