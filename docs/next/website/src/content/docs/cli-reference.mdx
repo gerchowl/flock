@@ -20,6 +20,8 @@ When an existing status ping, submission guard, or failed command reveals a diff
 | `delegate` awaits: `not_started` | `8` | `11` |
 | `wait reply`, `msg send --await`, `msg status`: the receiver refused the message | `4` | `13` |
 
+Every verb now exits what the error-code registry assigns its error, for send-like and guarded verbs too, which is also what MCP reports as `data.exit` (#1238, #1231, #1241). Three codes changed with no stderr notice: `server_version_gap` exits `78` (was `1`), and `questions_widening_refused` and `operator_only` exit `13` (were `1`). A `later` refusal from a send-like or guarded verb stays `10`, and every other code stays `1`.
+
 ## Output format and the error envelope
 
 `--format json|text` is a global flag, and `--json` is its synonym (ADR-0029 §3). Where it may appear:

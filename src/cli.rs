@@ -1662,6 +1662,40 @@ mod config_check_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A send-like or guarded verb's refusal exits what the registry assigns
+    /// (#1231, #1241): `later` is `REFUSED`, a version gap 78, a widening or
+    /// operator refusal 13. Only an unregistered code or a plain `never` /
+    /// `maybe` one stays `FAILURE`. Before #1231 every non-`later` code here
+    /// exited 1, unlike the same call through MCP's `data.exit`.
+    #[test]
+    fn a_send_like_refusal_exits_its_registered_code() {
+        use super::exit;
+        for (code, want) in [
+            ("not_settled", exit::REFUSED),
+            ("server_version_gap", exit::PROTOCOL_GAP),
+            ("questions_widening_refused", exit::POLICY_REFUSED),
+            ("operator_only", exit::OPERATOR_ONLY),
+            ("pane_not_found", exit::FAILURE),
+            ("pane_send_failed", exit::FAILURE),
+            ("an_unregistered_code", exit::FAILURE),
+        ] {
+            assert_eq!(super::refusal_exit(code), want, "{code}");
+            assert_eq!(
+                super::error_code_exit(code, true),
+                want,
+                "{code}: MCP data.exit"
+            );
+        }
+        assert_eq!(
+            (
+                exit::PROTOCOL_GAP,
+                exit::POLICY_REFUSED,
+                exit::OPERATOR_ONLY
+            ),
+            (78, 13, 13)
+        );
+    }
+
     #[test]
     fn only_public_pane_ids_skip_the_target_round_trip() {
         for id in ["w3:p2", "w_1:p1a", "p_7", "p_1_2", "1-1", "w_2-3", "w2-3"] {

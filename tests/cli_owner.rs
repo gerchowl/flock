@@ -310,8 +310,21 @@ fn an_attested_agent_caller_is_refused_with_13() {
 #[test]
 fn a_bind_without_its_required_flags_exits_2() {
     let server = start_server();
-    let output = cli(&server, &["owner", "bind", REPO, "--harness", "claude"]);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    for args in [
+        &["owner", "bind", REPO, "--harness", "claude"][..],
+        &[
+            "owner",
+            "bind",
+            REPO,
+            "--checkout",
+            "--profile",
+            "--harness",
+            "claude",
+        ],
+    ] {
+        let output = cli(&server, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+    }
     let listed = json_out(&cli(&server, &["owner", "list"]));
     assert_eq!(listed["result"]["bindings"], serde_json::json!([]));
 }

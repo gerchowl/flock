@@ -80,8 +80,12 @@ fn parse_bind(args: &[String]) -> Result<OwnerBindParams, String> {
     };
     let (mut checkout, mut harness, mut model, mut profiles) = (None, None, None, Vec::new());
     while let Some(flag) = flags.next() {
+        // A value that is itself a flag means the value was left out: `bind r
+        // --checkout --harness claude` must not bind a checkout named
+        // `--harness`.
         let value = flags
             .next()
+            .filter(|value| !value.starts_with("--"))
             .ok_or_else(|| format!("{flag} needs a value\n{}", usage()))?;
         match flag.as_str() {
             "--checkout" => checkout = Some(value.clone()),
@@ -174,7 +178,14 @@ mod tests {
                 "gpt",
             ],
             &["example/widgets", "--checkout"],
-            &["example/widgets", "--checkout", "/srv/w", "--force", "x"],
+            // Without the check this binds a checkout named `--profile`.
+            &[
+                "example/widgets",
+                "--checkout",
+                "--profile",
+                "--harness",
+                "claude",
+            ],
         ] {
             assert!(parse_bind(&args(bad)).is_err(), "{bad:?}");
         }
