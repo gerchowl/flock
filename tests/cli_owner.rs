@@ -3,7 +3,7 @@
 //!
 //! The agent caller is real: `flk owner bind` runs inside a pane `agent.start`
 //! launched, so the server attests it by process ancestry, not by a fixture
-//! flag, and its refusal must exit 13 (`exit::OPERATOR_ONLY`).
+//! flag, and its refusal must exit 13 (`exit::POLICY_REFUSED`).
 
 // Integration tests drive the compiled binary through raw Command; the
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.

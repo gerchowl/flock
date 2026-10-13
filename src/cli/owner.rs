@@ -4,11 +4,12 @@
     reason = "CLI output surface: this module's job is stdout/stderr for humans and scripts"
 )]
 //! `flk owner bind|unbind|list|show` (ADR-0035 §1, #1231): the operator's
-//! verbs over the `owner.*` socket methods.
+//! verbs over the `owner.*` socket methods. `flk owner policy show|adopt`
+//! (ADR-0035 §6.2, #1195) is documented at [`policy`].
 //!
 //! `bind` and `unbind` are operator verbs. The server refuses an agent,
 //! relayed or unattested caller with `operator_only`, which exits 13
-//! (`exit::OPERATOR_ONLY`, ADR-0029 §2). That check is cooperative only until
+//! (`exit::POLICY_REFUSED`, ADR-0029 §2). That check is cooperative only until
 //! agents run as their own Unix user (O19a, #1208, #1177): a child an agent
 //! detaches with `setsid` still attests as the operator. `unbind` and `show`
 //! of a repo with no binding exit `GONE` (4). Every verb prints the server's
@@ -16,18 +17,21 @@
 
 use super::exit;
 use crate::api::schema::{
-    EmptyParams, Method, OwnerBindParams, OwnerHarness, OwnerRepoParams, Request,
+    EmptyParams, Method, OwnerBindParams, OwnerHarness, OwnerPolicyParams, OwnerRepoParams, Request,
 };
 
 pub(super) const BIND_USAGE: &str = "flk owner bind <owner/repo> --checkout PATH --harness claude|codex|opencode [--model NAME] [--profile NAME]... [--json]";
 pub(super) const UNBIND_USAGE: &str = "flk owner unbind <owner/repo> [--json]";
 pub(super) const LIST_USAGE: &str = "flk owner list [--json]";
 pub(super) const SHOW_USAGE: &str = "flk owner show <owner/repo> [--json]";
+pub(super) const POLICY_USAGE: &str =
+    "flk owner policy show [--repo PATH] | flk owner policy adopt <VERSION|none> [--repo PATH]";
 
 pub(super) fn run_owner_command(args: &[String]) -> std::io::Result<i32> {
     let verb = args.first().map(String::as_str);
     let rest = args.get(1..).unwrap_or_default();
     let method = match verb {
+        Some("policy") => return policy(rest),
         Some("bind") => parse_bind(rest).map(Method::OwnerBind),
         Some("unbind") => repo_operand(rest, UNBIND_USAGE).map(Method::OwnerUnbind),
         Some("list") if rest.is_empty() => Ok(Method::OwnerList(EmptyParams {})),
@@ -57,7 +61,9 @@ pub(super) fn run_owner_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn usage() -> String {
-    format!("usage: {BIND_USAGE}\n       {UNBIND_USAGE}\n       {LIST_USAGE}\n       {SHOW_USAGE}")
+    format!(
+        "usage: {BIND_USAGE}\n       {UNBIND_USAGE}\n       {LIST_USAGE}\n       {SHOW_USAGE}\n       {POLICY_USAGE}"
+    )
 }
 
 /// The one `<owner/repo>` operand of `unbind` and `show`.
@@ -105,6 +111,54 @@ fn parse_bind(args: &[String]) -> Result<OwnerBindParams, String> {
         model,
         profiles,
     })
+}
+
+/// `flk owner policy show|adopt` (ADR-0035 §6.2, #1195). `show` reports the
+/// repo's owner policy as committed on its default branch, the version the
+/// operator adopted, and whether a newer one is pending. `adopt` is the
+/// operator verb that makes the current version apply. It is state-changing
+/// for the #868 gate, so against a server without it it exits 78 before
+/// sending, and a refusal of an agent caller exits 13 (`operator_only`,
+/// `exit::POLICY_REFUSED`). That refusal is cooperative only until O19a
+/// (#1208, #1177): see ADR-0035 §6.3 point 6.
+fn policy(args: &[String]) -> std::io::Result<i32> {
+    let (verb, version, rest) = match args {
+        [verb, rest @ ..] if verb == "show" => (verb, None, rest),
+        [verb, version, rest @ ..] if verb == "adopt" && !version.starts_with("--") => {
+            let version = (version != "none").then(|| version.clone());
+            (verb, version, rest)
+        }
+        _ => {
+            eprintln!("usage: {POLICY_USAGE}");
+            return Ok(super::exit::USAGE);
+        }
+    };
+    let repo = match rest {
+        [] => std::env::current_dir()?,
+        [flag, path] if flag == "--repo" => std::path::absolute(path)?,
+        _ => {
+            eprintln!("usage: {POLICY_USAGE}");
+            return Ok(super::exit::USAGE);
+        }
+    };
+    let params = OwnerPolicyParams {
+        repo: repo.to_string_lossy().into_owned(),
+        policy_version: version,
+    };
+    let (id, method) = if verb == "show" {
+        ("cli:owner:policy:show", Method::OwnerPolicyShow(params))
+    } else {
+        ("cli:owner:policy:adopt", Method::OwnerPolicyAdopt(params))
+    };
+    let response = super::send_request(&Request {
+        id: id.into(),
+        method,
+    })?;
+    if verb == "show" {
+        super::print_response(&response)
+    } else {
+        super::print_send_response(&response)
+    }
 }
 
 fn parse_harness(raw: &str) -> Result<OwnerHarness, String> {

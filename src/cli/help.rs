@@ -308,6 +308,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("events", "read", super::events::READ_USAGE),
     ("events", "wait", super::events::WAIT_USAGE),
     ("adapter", "hello", super::adapter::HELLO_USAGE),
+    ("owner", "policy", super::owner::POLICY_USAGE),
     ("checks", "list", "flk checks list"),
     ("checks", "ack", "flk checks ack <name>"),
     ("checks", "run", "flk checks run <name>"),

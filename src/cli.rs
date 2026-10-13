@@ -218,8 +218,8 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "digest" => digest::run_digest_command(&args[2..])?,
         "events" => events::run_events_command(&args[2..])?,
         "adapter" => adapter::run_adapter_command(&args[2..])?,
-        "fleet" => fleet::run_fleet_command(&args[2..])?,
         "owner" => owner::run_owner_command(&args[2..])?,
+        "fleet" => fleet::run_fleet_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
@@ -1155,9 +1155,9 @@ pub(crate) fn error_code_exit(code: &str, send_like: bool) -> i32 {
 
 /// A send-like or guarded verb's exit for a server refusal: `REFUSED` for an
 /// error whose retry class is `later` (refused before acting, nothing
-/// changed), which names its old code on stderr (#1025). Any other code takes
-/// what the error-code registry assigns (`operator_only` is 13, #1231), and an
-/// unregistered one is `FAILURE`.
+/// changed), which names its old code on stderr (#1025), else what the
+/// error-code registry assigns (`FAILURE` for most codes, `POLICY_REFUSED`
+/// for `operator_only`).
 pub(crate) fn refusal_exit(code: &str) -> i32 {
     match crate::api::error_code::ErrorCode::from_code(code) {
         Some(code) if code.retry() == exit::Retry::Later => exit::moved(exit::REFUSED),
@@ -1664,8 +1664,8 @@ mod config_check_tests {
 mod tests {
     /// A send-like or guarded verb's refusal exits what the registry assigns
     /// (#1231, #1241): `later` is `REFUSED`, a version gap 78, a widening or
-    /// operator refusal 13. Only an unregistered code or a plain `never` /
-    /// `maybe` one stays `FAILURE`. Before #1231 every non-`later` code here
+    /// operator refusal 13 (`POLICY_REFUSED`). Only an unregistered code or a plain `never` /
+    /// `maybe` one stays `FAILURE`. Before #1195 every non-`later` code here
     /// exited 1, unlike the same call through MCP's `data.exit`.
     #[test]
     fn a_send_like_refusal_exits_its_registered_code() {
@@ -1674,7 +1674,7 @@ mod tests {
             ("not_settled", exit::REFUSED),
             ("server_version_gap", exit::PROTOCOL_GAP),
             ("questions_widening_refused", exit::POLICY_REFUSED),
-            ("operator_only", exit::OPERATOR_ONLY),
+            ("operator_only", exit::POLICY_REFUSED),
             ("pane_not_found", exit::FAILURE),
             ("pane_send_failed", exit::FAILURE),
             ("an_unregistered_code", exit::FAILURE),
@@ -1686,14 +1686,7 @@ mod tests {
                 "{code}: MCP data.exit"
             );
         }
-        assert_eq!(
-            (
-                exit::PROTOCOL_GAP,
-                exit::POLICY_REFUSED,
-                exit::OPERATOR_ONLY
-            ),
-            (78, 13, 13)
-        );
+        assert_eq!((exit::PROTOCOL_GAP, exit::POLICY_REFUSED), (78, 13));
     }
 
     #[test]
