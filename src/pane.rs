@@ -2246,6 +2246,25 @@ impl PaneRuntime {
         self.spawned_with_default_shell
     }
 
+    /// Whether the pane is a plain shell: it was spawned with the default
+    /// shell, and that shell's own process group holds the terminal, so no
+    /// agent, job or command runs in front of it. `None` when it cannot tell:
+    /// no live child, or an unreadable foreground group.
+    pub(crate) fn foreground_is_own_shell(&self) -> Option<bool> {
+        if !self.spawned_with_default_shell {
+            return Some(false);
+        }
+        let pid = self.child_pid()?;
+        #[cfg(unix)]
+        let foreground = self
+            .io
+            .foreground_process_group_id()
+            .or_else(|| crate::platform::foreground_process_group_id(pid));
+        #[cfg(not(unix))]
+        let foreground = crate::platform::foreground_process_group_id(pid);
+        foreground.map(|pgid| pgid == pid)
+    }
+
     /// Sticky across all input writes, including flock-authored input.
     /// Imported runtimes start touched because their input history is unknown.
     pub(crate) fn has_received_input(&self) -> bool {

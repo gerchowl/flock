@@ -31,6 +31,12 @@ impl TerminalRuntime {
         self.0.was_spawned_with_default_shell()
     }
 
+    /// Whether the pane is a plain shell with nothing in front of it, `None`
+    /// when it cannot tell (ADR-0028 §2, #1176).
+    pub(crate) fn foreground_is_own_shell(&self) -> Option<bool> {
+        self.0.foreground_is_own_shell()
+    }
+
     /// Whether any input has reached this terminal, or its history is unknown.
     pub(crate) fn has_received_input(&self) -> bool {
         self.0.has_received_input()
