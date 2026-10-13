@@ -3,7 +3,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -81,21 +81,7 @@ fn timestamp(record: &Value) -> Option<SystemTime> {
     if raw.as_bytes().get(4) != Some(&b'-') {
         return None;
     }
-    let seconds = crate::agent_transcript::parse_rfc3339_utc(raw)?;
-    let millis = raw
-        .split_once('.')
-        .and_then(|(_, fraction)| fraction.strip_suffix('Z'))
-        .map(|fraction| {
-            fraction
-                .chars()
-                .take(3)
-                .chain(std::iter::repeat('0'))
-                .take(3)
-                .collect::<String>()
-        })
-        .and_then(|fraction| fraction.parse::<u64>().ok())
-        .unwrap_or(0);
-    seconds.checked_add(Duration::from_millis(millis))
+    crate::agent_transcript::parse_rfc3339_utc(raw)
 }
 
 fn text_message(role: Role, text: String, at: Option<SystemTime>) -> TranscriptEvent {
