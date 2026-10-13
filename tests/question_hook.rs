@@ -20,9 +20,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
     unregister_spawned_flock_pid, wait_for_socket,
@@ -78,6 +79,14 @@ fn run_stub(socket: &Path, bin: &Path, hint: Option<&str>) -> (Option<String>, D
     (reason(&stdout), elapsed)
 }
 
+/// support::environment's sandbox for the flk the stub runs. The stub reaches
+/// flk through `FLOCK_BIN`, not its argv, so the wrapper cannot see that it
+/// is a flk launch and the test hands the isolated environment over itself.
+fn isolation(socket: &Path) -> Vec<(&'static str, PathBuf)> {
+    let root = socket.parent().expect("socket dir").join("iso");
+    support::environment::isolated_env(&root, &root.join("run"))
+}
+
 fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Duration) {
     let mut command = Command::new("/bin/sh");
     command
@@ -89,6 +98,9 @@ fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Durat
         .env("FLOCK_PANE_ID", "p_test")
         .env("FLOCK_SOCKET_PATH", socket)
         .env("FLOCK_BIN", bin)
+        // The flk the stub starts inherits these: a sandbox HOME and XDG
+        // tree, never the test runner's.
+        .envs(isolation(socket))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
