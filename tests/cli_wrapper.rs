@@ -1076,6 +1076,106 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     cleanup_test_base(&base);
 }
 
+/// Run `flk pane run` against a fake server that answers `pane.send_input`
+/// with `typed` and anything else with ok. Returns the exit code and the
+/// requests, in order.
+fn pane_run_requests(
+    args: &[&str],
+    typed: serde_json::Value,
+) -> (Option<i32>, Vec<serde_json::Value>) {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("flock.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        listener.set_nonblocking(true).unwrap();
+        // Serve until the CLI has exited: every request it made is in.
+        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let line = read_request_line(&stream);
+                    if answer_protocol_check(&mut stream, &line) {
+                        continue;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let mut response = if request["method"] == "pane.send_input" {
+                        typed.clone()
+                    } else {
+                        serde_json::json!({"result": {"type": "ok"}})
+                    };
+                    response["id"] = request["id"].clone();
+                    writeln!(stream, "{response}").unwrap();
+                    requests.push(request);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+        requests
+    });
+    let mut argv = vec!["pane", "run"];
+    argv.extend_from_slice(args);
+    let run = run_cli(&socket_path, &argv);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let requests = server.join().unwrap();
+    cleanup_test_base(&base);
+    (run.status.code(), requests)
+}
+
+fn methods(requests: &[serde_json::Value]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap())
+        .collect()
+}
+
+/// #1162: into an agent pane with an empty composer, `pane run` is what it
+/// always was: type, settle, Enter, exit 0. No idle requirement, no turn
+/// confirmation, no extra request.
+#[test]
+fn pane_run_into_an_empty_agent_composer_types_and_presses_enter_as_before() {
+    let (code, requests) = pane_run_requests(
+        &["1-1", "/compact"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(requests[0]["params"]["text"], "/compact");
+    assert!(
+        requests[0]["params"].get("raw").is_none(),
+        "the server's draft check applies: {}",
+        requests[0]
+    );
+    assert_eq!(requests[1]["params"]["keys"], serde_json::json!(["Enter"]));
+}
+
+/// #1162: a draft refusal ends `pane run` with exit 10 before its Enter, so
+/// nothing the operator typed is submitted.
+#[test]
+fn pane_run_refused_onto_a_draft_exits_10_and_presses_no_enter() {
+    let refused = serde_json::json!({"error": {"code": "input_not_empty", "message": "draft"}});
+    let (code, requests) = pane_run_requests(&["1-1", "echo hello"], refused);
+    assert_eq!(code, Some(10));
+    assert_eq!(methods(&requests), ["pane.send_input"]);
+}
+
+/// #1162: `--raw` tells the server to type onto whatever is there.
+#[test]
+fn pane_run_raw_asks_the_server_to_type_anyway() {
+    let (code, requests) = pane_run_requests(
+        &["--raw", "1-1", "echo hello"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(requests[0]["params"]["raw"], true);
+}
+
 #[test]
 fn pane_report_metadata_sends_presentation_request() {
     for (pane_args, calling_pane, expected_pane) in [
