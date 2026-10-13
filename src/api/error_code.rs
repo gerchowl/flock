@@ -48,6 +48,7 @@ impl ErrorCode {
         match self {
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,
             ErrorCode::QuestionsWideningRefused => exit::POLICY_REFUSED,
+            ErrorCode::OperatorOnly => exit::OPERATOR_ONLY,
             _ => exit::FAILURE,
         }
     }
@@ -269,11 +270,12 @@ mod tests {
     }
 
     #[test]
-    fn the_version_gap_keeps_exit_78_a_widening_exits_13_and_every_other_code_exits_1() {
+    fn the_version_gap_keeps_exit_78_a_widening_or_operator_refusal_exits_13_and_every_other_code_exits_1(
+    ) {
         for code in ErrorCode::ALL {
             let want = match code {
                 ErrorCode::ServerVersionGap => 78,
-                ErrorCode::QuestionsWideningRefused => 13,
+                ErrorCode::QuestionsWideningRefused | ErrorCode::OperatorOnly => 13,
                 _ => 1,
             };
             assert_eq!(code.exit(), want, "{code:?}");

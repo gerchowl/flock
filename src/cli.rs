@@ -34,6 +34,7 @@ mod mcp;
 mod msg;
 mod notification;
 pub(crate) mod output;
+mod owner;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
@@ -218,6 +219,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "events" => events::run_events_command(&args[2..])?,
         "adapter" => adapter::run_adapter_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
+        "owner" => owner::run_owner_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
@@ -1153,14 +1155,15 @@ pub(crate) fn error_code_exit(code: &str, send_like: bool) -> i32 {
 
 /// A send-like or guarded verb's exit for a server refusal: `REFUSED` for an
 /// error whose retry class is `later` (refused before acting, nothing
-/// changed), which names its old code on stderr (#1025), else `FAILURE`.
+/// changed), which names its old code on stderr (#1025). Any other code takes
+/// what the error-code registry assigns (`operator_only` is 13, #1231), and an
+/// unregistered one is `FAILURE`.
 pub(crate) fn refusal_exit(code: &str) -> i32 {
-    let later = crate::api::error_code::ErrorCode::from_code(code)
-        .is_some_and(|code| code.retry() == exit::Retry::Later);
-    if later {
-        return exit::moved(exit::REFUSED);
+    match crate::api::error_code::ErrorCode::from_code(code) {
+        Some(code) if code.retry() == exit::Retry::Later => exit::moved(exit::REFUSED),
+        Some(code) => code.exit(),
+        None => exit::FAILURE,
     }
-    exit::FAILURE
 }
 
 pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
