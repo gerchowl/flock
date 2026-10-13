@@ -713,6 +713,16 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
                 " ✗ the checkout is gone — no branch to judge; ↵ closes the workspace.".to_string(),
                 Style::default().fg(app.palette.yellow),
             ),
+            // #1278: ahead of the force arm too. Force stands in for missing
+            // merge evidence, not for a PR someone is still reviewing.
+            Some(crate::worktree::WorktreeMergeGate::OpenPr { number }) => (
+                format!(
+                    " ✗ {} is open — checkout only; branch {} is kept, even forced.",
+                    number.map_or_else(|| "its PR".to_string(), |n| format!("PR #{n}")),
+                    remove.branch.as_deref().unwrap_or("?")
+                ),
+                Style::default().fg(app.palette.peach),
+            ),
             Some(crate::worktree::WorktreeMergeGate::Merged { evidence }) => (
                 format!(
                     " ✓ {evidence} — branch {} will be deleted too.",

@@ -1976,9 +1976,14 @@ impl App {
                         // #325: force stands in for merge evidence. It cannot
                         // reach a protected branch — `branch_protected` clears
                         // `delete_branch` when the gate resolves (#121), and
-                        // that is checked first here.
+                        // that is checked first here. Nor can it reach the
+                        // head of an open PR (#1278).
                         remove.delete_branch
-                            && (remove.force
+                            && ((remove.force
+                                && !matches!(
+                                    remove.merge_gate,
+                                    Some(crate::worktree::WorktreeMergeGate::OpenPr { .. })
+                                ))
                                 || matches!(
                                     remove.merge_gate,
                                     Some(crate::worktree::WorktreeMergeGate::Merged { .. })

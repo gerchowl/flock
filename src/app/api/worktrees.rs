@@ -859,6 +859,30 @@ impl App {
             &self.state.config.worktrees.integration_branches,
         );
         let would_delete_branch = verdict.would_delete_branch(params.keep_branch);
+        let open_pr = match verdict.gate {
+            crate::worktree::WorktreeMergeGate::OpenPr { number } => Some(number),
+            _ => None,
+        };
+
+        // #1278: the head of an open PR is live work under review. A kill is
+        // "checkout AND branch", and the branch half is never allowed here, so
+        // a real kill is refused before anything moves; only a caller that
+        // asked for the checkout alone (`keep_branch`) gets past. A dry run
+        // still answers, with `open_pr` set and `would_delete_branch` false.
+        if let Some(number) = open_pr {
+            if !params.dry_run && !params.keep_branch {
+                let pr = number.map_or_else(|| "a PR".to_string(), |n| format!("PR #{n}"));
+                return encode_error(
+                    id,
+                    "worktree_open_pr",
+                    format!(
+                        "branch {} is the head of open {pr}; refusing to kill a checkout under \
+                         review (--keep-branch removes the checkout only)",
+                        verdict.branch.as_deref().unwrap_or("?")
+                    ),
+                );
+            }
+        }
 
         let checkout_path = target.checkout.display().to_string();
         // #400: taken BEFORE the removal, because that is the only moment the
@@ -887,6 +911,7 @@ impl App {
                     evidence: verdict.evidence().map(str::to_string),
                     checkout_missing: verdict.checkout_missing(),
                     protected: verdict.protected,
+                    open_pr: open_pr.is_some(),
                     removed: false,
                     branch_deleted: false,
                     would_delete_branch,
@@ -974,6 +999,7 @@ impl App {
                 evidence: verdict.evidence().map(str::to_string),
                 checkout_missing: verdict.checkout_missing(),
                 protected: verdict.protected,
+                open_pr: open_pr.is_some(),
                 removed: true,
                 branch_deleted,
                 would_delete_branch,
@@ -3123,6 +3149,113 @@ mod tests {
         assert!(branch_deleted);
         assert!(!branch_exists(&repo, "feature/merged"));
 
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// #1278: the head of an open PR is live work. A real kill is refused
+    /// before anything moves, a dry run reports `open_pr` and no branch
+    /// delete, and only a `keep_branch` kill removes the checkout — even when
+    /// every other evidence source would have called the branch merged.
+    #[tokio::test]
+    async fn api_worktree_kill_refuses_the_head_of_an_open_pr() {
+        let repo = create_committed_repo("api-kill-open-pr-repo");
+        let checkout = unique_temp_path("api-kill-open-pr");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/under-review",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        // A stub `gh` ahead of the real one: every `gh pr view` says OPEN.
+        let stub = unique_temp_path("api-kill-open-pr-gh");
+        std::fs::create_dir_all(&stub).unwrap();
+        std::fs::write(
+            stub.join("gh"),
+            "#!/bin/sh\nprintf '%s\\n' '{\"state\":\"OPEN\",\"number\":150,\"baseRefName\":\"main\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            stub.join("gh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![stub.clone()];
+        paths.extend(std::env::split_paths(&original_path));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+
+        let mut app = app_with_parent(&repo);
+        let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let kill = |dry_run: bool, keep_branch: bool| {
+            crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: Some(ws_id.clone()),
+                path: None,
+                force: true,
+                keep_branch,
+                dry_run,
+                keep_processes: false,
+                caller_pid: None,
+                self_kill_confirmed: None,
+            })
+        };
+
+        let response = app.handle_api_request(Request {
+            id: "dry".into(),
+            method: kill(true, false),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            merged,
+            open_pr,
+            would_delete_branch,
+            removed,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(!merged, "an open PR is never merged: {response}");
+        assert!(open_pr);
+        assert!(!would_delete_branch);
+        assert!(!removed);
+
+        // Forced, and still refused: force covers a dirty checkout, not a PR
+        // under review.
+        let response = app.handle_api_request(Request {
+            id: "real".into(),
+            method: kill(false, false),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "worktree_open_pr");
+        assert!(error.error.message.contains("PR #150"), "{response}");
+        assert!(checkout.exists(), "nothing moved");
+        assert!(branch_exists(&repo, "feature/under-review"));
+        assert_eq!(app.state.workspaces.len(), 2);
+
+        let response = app.handle_api_request(Request {
+            id: "keep".into(),
+            method: kill(false, true),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeKilled {
+            removed,
+            branch_deleted,
+            open_pr,
+            ..
+        } = success.result
+        else {
+            panic!("expected worktree_killed: {response}");
+        };
+        assert!(removed && open_pr && !branch_deleted);
+        assert!(branch_exists(&repo, "feature/under-review"));
+
+        std::env::set_var("PATH", original_path);
+        let _ = std::fs::remove_dir_all(&stub);
         let _ = std::fs::remove_dir_all(&repo);
     }
 
