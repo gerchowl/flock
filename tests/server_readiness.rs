@@ -82,12 +82,14 @@ fn readiness_binaries_have_a_runner_hang_ceiling() {
     let overrides = config["profile"]["default"]["overrides"]
         .as_array()
         .unwrap();
-    for binary in [
-        "delegate",
-        "agent_settled",
-        "api_ping",
-        "cli_wrapper",
-        "server_readiness",
+    for (binary, test) in [
+        ("delegate", None),
+        ("agent_settled", None),
+        ("api_ping", None),
+        ("cli_wrapper", None),
+        ("server_readiness", None),
+        ("live_handoff", Some("rollback_store_open_failure_preserves_panes_and_original_error")),
+        ("flk", Some("app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation")),
     ] {
         let entry = overrides
             .iter()
@@ -96,6 +98,7 @@ fn readiness_binaries_have_a_runner_hang_ceiling() {
                     .as_str()
                     .unwrap()
                     .contains(&format!("binary(={binary})"))
+                    && test.is_none_or(|test| entry["filter"].as_str().unwrap().contains(&format!("test(={test})")))
                     && entry
                         .get("slow-timeout")
                         .is_some_and(|slow| slow.get("terminate-after").is_some())

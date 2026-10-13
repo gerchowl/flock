@@ -27,6 +27,12 @@ filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binar
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# Backstop every fixture wait in #1051, including child startup and CLI teardown.
+# Completion still depends on the worker reason or complete launch report.
+filter = '(binary(=live_handoff) & test(=rollback_store_open_failure_preserves_panes_and_original_error)) | (binary(=flk) & test(=app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation))'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # This end-to-end check intentionally observes the full 30-second startup grace.
 filter = 'binary(delegate_verdict) & test(delegate_idle_without_new_turn_reports_not_started_and_informs_s1)'
 slow-timeout = { period = "30s" }

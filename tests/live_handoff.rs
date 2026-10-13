@@ -236,10 +236,21 @@ fn try_request(
     socket_path: &Path,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RequestError> {
+    try_request_with_timeout(socket_path, request, None)
+}
+
+/// Bound a condition probe without imposing its ceiling on handoff requests.
+fn try_request_with_timeout(
+    socket_path: &Path,
+    request: serde_json::Value,
+    timeout: Option<Duration>,
+) -> Result<serde_json::Value, RequestError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|err| RequestError {
         retryable: true,
         message: format!("connect {}: {err}", socket_path.display()),
     })?;
+    stream.set_read_timeout(timeout).unwrap();
+    stream.set_write_timeout(timeout).unwrap();
     let request_text = request.to_string();
     stream
         .write_all(request_text.as_bytes())
@@ -1882,9 +1893,34 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     };
     assert_eq!(fs::read(identity_path).unwrap(), expected_identity);
     if store_failure {
-        let status = request(
-            &api_socket,
-            serde_json::json!({"id":"mesh-status", "method":"peers.enrollment", "params":{}}),
+        // API readiness precedes the worker's failure event. Observe its final
+        // reason rather than assuming ping also completed custody recovery.
+        let status = support::fleet::wait_until(
+            "mesh recovery failure",
+            Duration::from_secs(10),
+            || {
+                let status = try_request_with_timeout(
+                    &api_socket,
+                    serde_json::json!({"id":"mesh-status", "method":"peers.enrollment", "params":{}}),
+                    Some(Duration::from_secs(10)),
+                ).unwrap_or_else(|err| panic!("{}", err.message));
+                assert!(status.get("error").is_none(), "{status}");
+                match &status["result"]["mesh_suspended_reason"] {
+                    serde_json::Value::String(reason)
+                        if reason == "injected mesh store open failure" =>
+                    {
+                        Some(status)
+                    }
+                    // The worker clears RECOVERING before publishing its reason.
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(reason)
+                        if reason == "recovering store after handoff" =>
+                    {
+                        None
+                    }
+                    other => panic!("unexpected mesh recovery reason: {other}"),
+                }
+            },
         );
         assert_eq!(
             status["result"]["mesh_suspended_reason"],
