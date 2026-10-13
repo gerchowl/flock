@@ -93,6 +93,10 @@ pub enum TranscriptEvent {
     /// A compaction boundary: prior messages remain on disk but are logically
     /// superseded. Rendered as a single divider, not as content.
     Compacted,
+    /// The harness's own end-of-turn record: Claude Code writes a `system`
+    /// entry with `subtype: "turn_duration"` once a turn is over, Stop-hook
+    /// continuations included (#1257). Never rendered.
+    TurnEnded,
     /// Anything else on disk — hooks, file-history, titles, permission mode.
     Meta,
 }
@@ -250,6 +254,11 @@ fn parse_entry(value: &serde_json::Value) -> TranscriptEvent {
     if is_hidden(value) {
         return TranscriptEvent::Meta;
     }
+    if value.get("type").and_then(|v| v.as_str()) == Some("system")
+        && value.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration")
+    {
+        return TranscriptEvent::TurnEnded;
+    }
     let role = match value.get("type").and_then(|v| v.as_str()) {
         Some("user") => Role::User,
         Some("assistant") => Role::Assistant,
@@ -278,7 +287,23 @@ fn parse_entry(value: &serde_json::Value) -> TranscriptEvent {
 pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<SystemTime> {
     let (date, rest) = raw.split_once('T')?;
     let time = rest.strip_suffix('Z')?;
-    let time = time.split_once('.').map_or(time, |(head, _frac)| head);
+    // Milliseconds are kept: a prompt is attributed to a round by comparing its
+    // time with the round's millisecond submit (#1257), and a time cut to the
+    // second dates a prompt written in the submit's own second before it.
+    // A fraction that is not digits costs the milliseconds, not the entry.
+    let (time, millis) = match time.split_once('.') {
+        Some((head, frac)) => (
+            head,
+            frac.chars()
+                .take(3)
+                .chain(std::iter::repeat('0'))
+                .take(3)
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0),
+        ),
+        None => (time, 0),
+    };
 
     let mut date_parts = date.split('-');
     let year: i64 = date_parts.next()?.parse().ok()?;
@@ -310,7 +335,7 @@ pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<SystemTime> {
 
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
     let secs = u64::try_from(secs).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
+    Some(UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(millis))
 }
 
 fn parse_block(value: &serde_json::Value) -> Block {
@@ -551,6 +576,128 @@ pub fn finished(events: &[TranscriptEvent]) -> bool {
             *role == Role::Assistant
                 && matches!(blocks.last(), Some(Block::Text(t)) if !t.trim().is_empty())
         })
+}
+
+/// How Claude Code begins the user entry it writes when a turn is interrupted
+/// (`[Request interrupted by user]`, `… for tool use]`). That entry ends the
+/// interrupted turn, and no `turn_duration` record follows it.
+const INTERRUPTED_PREFIX: &str = "[Request interrupted by user";
+
+/// The assistant entry Claude Code writes itself, without asking the model,
+/// when it closes a turn that needs no answer: after a resumed session's hidden
+/// `Continue from where you left off.` entry, and after some local commands
+/// (`/exit`). No `turn_duration` record follows it.
+const NO_RESPONSE: &str = "No response requested.";
+
+/// How the user entries begin that the harness writes itself rather than a
+/// person or a supervisor typing a prompt: a local slash command and its output
+/// (`/compact`, `/model`, `/exit`), a `!` shell command and its output, and a
+/// background task's notification. None of them is followed by a
+/// `turn_duration` record. A local command never runs the model. A
+/// notification written while the agent is idle may or may not start a turn,
+/// and a custom slash command expands into a prompt the model then answers.
+const HARNESS_ENTRY_PREFIXES: [&str; 9] = [
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<task-notification>",
+];
+
+/// Whether a Claude transcript's newest turn is over by the harness's own
+/// record (#1257).
+///
+/// Each rule is read off the shapes Claude Code 2.1.28x–2.1.29x writes,
+/// surveyed over every transcript on a development machine, where every
+/// boundary before a later prompt reads as over except a prompt queued into a
+/// running turn. The newest turn is over when any of these holds:
+///
+/// 1. A [`TranscriptEvent::TurnEnded`] (`turn_duration`) follows the newest
+///    prompt: the ordinary end of a model turn, Stop-hook continuations
+///    included.
+/// 2. The newest message is the harness's own [`NO_RESPONSE`] entry, which
+///    closes a resumed session (#582) and some local commands.
+/// 3. The newest prompt is the interruption notice.
+/// 4. The newest prompt is an entry the harness wrote ([`HARNESS_ENTRY_PREFIXES`])
+///    and no assistant entry follows it. Ambiguous for a notification or a
+///    custom slash command the model is about to answer, and read as over: the
+///    model's first entry reopens the turn, while the opposite reading would
+///    hold a turn open that never runs.
+/// 5. A compaction summary is the newest entry after the newest prompt.
+///    Ambiguous for an automatic compaction inside a turn, read as over for
+///    the same reason as 4.
+///
+/// Otherwise a transcript that holds any `turn_duration` record comes from a
+/// writer that records its turn ends, and its turn is still running: assistant
+/// text alone is no end there, because Claude writes a narration between two
+/// tool calls as text too. A transcript without one (a one-shot session, or a
+/// first turn not yet over) is over when [`finished`] says so, as before.
+pub fn turn_over(events: &[TranscriptEvent]) -> bool {
+    let Some(prompt) = last_prompt(events) else {
+        return finished(events);
+    };
+    let ended = |events: &[TranscriptEvent]| {
+        events
+            .iter()
+            .any(|event| matches!(event, TranscriptEvent::TurnEnded))
+    };
+    let prompt_starts = |prefixes: &[&str]| {
+        matches!(&events[prompt], TranscriptEvent::Message { blocks, .. }
+            if blocks.iter().any(|block| matches!(block, Block::Text(text)
+                if prefixes.iter().any(|prefix| text.trim_start().starts_with(prefix)))))
+    };
+    let after = &events[prompt + 1..];
+    let answered = after.iter().any(|event| {
+        matches!(
+            event,
+            TranscriptEvent::Message {
+                role: Role::Assistant,
+                ..
+            }
+        )
+    });
+    let newest_message = events.iter().rev().find_map(|event| match event {
+        TranscriptEvent::Message { role, blocks, .. } => Some((role, blocks)),
+        _ => None,
+    });
+    let no_response = newest_message.is_some_and(|(role, blocks)| {
+        *role == Role::Assistant
+            && matches!(blocks.last(), Some(Block::Text(text)) if text.trim() == NO_RESPONSE)
+    });
+    let compacted_last = after
+        .iter()
+        .rev()
+        .find(|event| !matches!(event, TranscriptEvent::Meta))
+        .is_some_and(|event| matches!(event, TranscriptEvent::Compacted));
+    if ended(after)
+        || no_response
+        || prompt_starts(&[INTERRUPTED_PREFIX])
+        || (prompt_starts(&HARNESS_ENTRY_PREFIXES) && !answered)
+        || compacted_last
+    {
+        return true;
+    }
+    !ended(events) && finished(events)
+}
+
+/// When the newest turn began, while [`turn_over`] says it is still running.
+///
+/// `None` when the turn is over, when the newest prompt lies outside the
+/// events read (a single turn longer than the read window), or when its entry
+/// carries no parseable time: an open turn that cannot be dated cannot be
+/// attributed to a round.
+pub fn open_turn_at(events: &[TranscriptEvent]) -> Option<SystemTime> {
+    if turn_over(events) {
+        return None;
+    }
+    match &events[last_prompt(events)?] {
+        TranscriptEvent::Message { at, .. } => *at,
+        _ => None,
+    }
 }
 
 /// Index of the newest prompt a person (or a supervisor) gave: a user message
@@ -1135,11 +1282,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // 2026-08-11T06:51:09Z — checked against the epoch value directly so a
-        // broken days-from-civil implementation cannot pass.
+        // 2026-08-11T06:51:09.988Z — checked against the epoch value directly
+        // so a broken days-from-civil implementation cannot pass. The
+        // milliseconds are kept (#1257).
         assert_eq!(
             ats[0],
-            Some(UNIX_EPOCH + Duration::from_secs(1_786_431_069))
+            Some(UNIX_EPOCH + Duration::from_millis(1_786_431_069_988))
         );
         assert_eq!(ats[1], None, "an unparseable stamp must not drop content");
         assert_eq!(out.events.len(), 2);
@@ -1827,5 +1975,192 @@ mod tests {
         ));
         let err = read_history(&missing, TranscriptDetail::Reply, None, 20);
         assert!(matches!(err, Err(TranscriptError::Unreadable)));
+    }
+
+    // ---- #1257: the harness's own record of an open turn -------------------
+
+    fn entries(lines: &[serde_json::Value]) -> Vec<TranscriptEvent> {
+        lines.iter().map(parse_entry).collect()
+    }
+
+    fn prompt_at(text: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "timestamp": at,
+            "message": {"role": "user", "content": text}})
+    }
+
+    fn reply_entry(blocks: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "assistant", "timestamp": "2026-10-13T01:06:20.000Z",
+            "message": {"role": "assistant", "content": blocks}})
+    }
+
+    fn turn_ended() -> serde_json::Value {
+        serde_json::json!({"type": "system", "subtype": "turn_duration", "durationMs": 1})
+    }
+
+    fn ms(at: Option<SystemTime>) -> Option<u128> {
+        at.map(|at| at.duration_since(UNIX_EPOCH).unwrap().as_millis())
+    }
+
+    #[test]
+    fn the_turn_duration_record_is_a_turn_end() {
+        assert_eq!(entries(&[turn_ended()]), vec![TranscriptEvent::TurnEnded]);
+    }
+
+    #[test]
+    fn a_narration_does_not_end_a_turn_for_a_writer_that_records_turn_ends() {
+        let narration = entries(&[
+            prompt_at("round 1", "2026-10-13T01:00:00.000Z"),
+            reply_entry(serde_json::json!([{"type": "text", "text": "DONE: one"}])),
+            turn_ended(),
+            prompt_at("round 2", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+            reply_entry(serde_json::json!([{"type": "text", "text": "Now the next step."}])),
+        ]);
+        assert!(!turn_over(&narration));
+        assert_eq!(ms(open_turn_at(&narration)), Some(1_791_853_575_939));
+
+        let mut ended = narration;
+        ended.push(TranscriptEvent::TurnEnded);
+        assert!(turn_over(&ended));
+        assert_eq!(open_turn_at(&ended), None);
+    }
+
+    #[test]
+    fn a_first_turn_mid_tool_is_open_and_its_text_ends_it_without_records() {
+        let mid_tool = entries(&[
+            prompt_at("brief", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+        ]);
+        assert!(!turn_over(&mid_tool));
+        assert!(open_turn_at(&mid_tool).is_some());
+
+        let replied = entries(&[
+            prompt_at("brief", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "text", "text": "DONE: x"}])),
+        ]);
+        assert!(turn_over(&replied));
+        assert_eq!(open_turn_at(&replied), None);
+    }
+
+    #[test]
+    fn an_interrupted_turn_is_over_although_no_record_follows() {
+        let interrupted = entries(&[
+            prompt_at("round 1", "2026-10-13T01:00:00.000Z"),
+            turn_ended(),
+            prompt_at("brief", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+            prompt_at(
+                "[Request interrupted by user for tool use]",
+                "2026-10-13T01:06:30.000Z",
+            ),
+        ]);
+        assert!(turn_over(&interrupted));
+        assert_eq!(open_turn_at(&interrupted), None);
+    }
+
+    #[test]
+    fn an_open_turn_without_a_time_cannot_be_dated() {
+        let undated = entries(&[
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "brief"}}),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+        ]);
+        assert!(!turn_over(&undated));
+        assert_eq!(open_turn_at(&undated), None);
+    }
+
+    #[test]
+    fn transcript_times_keep_their_milliseconds() {
+        assert_eq!(
+            ms(parse_rfc3339_utc("2026-10-13T01:06:15.939Z")),
+            Some(1_791_853_575_939)
+        );
+        assert_eq!(
+            ms(parse_rfc3339_utc("2026-10-13T01:06:15.9Z")),
+            Some(1_791_853_575_900)
+        );
+        assert_eq!(
+            ms(parse_rfc3339_utc("2026-10-13T01:06:15Z")),
+            Some(1_791_853_575_000)
+        );
+    }
+
+    /// A delegate's earlier round, ended the ordinary way.
+    fn earlier_round() -> Vec<serde_json::Value> {
+        vec![
+            prompt_at("round 1", "2026-10-13T01:00:00.000Z"),
+            reply_entry(serde_json::json!([{"type": "text", "text": "DONE: one"}])),
+            turn_ended(),
+        ]
+    }
+
+    fn meta(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "user", "isMeta": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+    }
+
+    #[test]
+    fn a_resumed_session_ends_its_turn_without_a_turn_duration_record() {
+        // Claude 2.1.29x after a resume (#582): the round's prompt and a tool
+        // call from before the restart, then a hidden continuation and the
+        // harness's own reply. No `turn_duration` follows.
+        let mut lines = earlier_round();
+        lines.extend([
+            prompt_at("round 2", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+            serde_json::json!({"type": "user", "timestamp": "2026-10-13T01:06:20.000Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}),
+            meta("Continue from where you left off."),
+            reply_entry(serde_json::json!([{"type": "text", "text": "No response requested."}])),
+        ]);
+        let events = entries(&lines);
+        assert!(turn_over(&events));
+        assert_eq!(open_turn_at(&events), None);
+    }
+
+    #[test]
+    fn a_local_command_is_a_turn_that_never_ran_the_model() {
+        for output in [
+            "<command-name>/compact</command-name>",
+            "<local-command-stdout>Set model to Opus</local-command-stdout>",
+            "<bash-input>git status</bash-input>",
+            "<bash-stdout>clean</bash-stdout>",
+        ] {
+            let mut lines = earlier_round();
+            lines.push(prompt_at(output, "2026-10-13T01:06:15.939Z"));
+            let events = entries(&lines);
+            assert!(turn_over(&events), "{output}");
+            assert_eq!(open_turn_at(&events), None, "{output}");
+        }
+    }
+
+    #[test]
+    fn a_notification_or_a_command_the_model_answers_reopens_the_turn() {
+        // Written while the agent idles, a notification may start no turn.
+        let mut lines = earlier_round();
+        lines.push(prompt_at(
+            "<task-notification> <task-id>b1</task-id>",
+            "2026-10-13T01:06:15.939Z",
+        ));
+        assert!(turn_over(&entries(&lines)));
+        // The model's first entry is what says a turn is running.
+        lines.push(reply_entry(
+            serde_json::json!([{"type": "tool_use", "name": "Bash"}]),
+        ));
+        let events = entries(&lines);
+        assert!(!turn_over(&events));
+        assert_eq!(ms(open_turn_at(&events)), Some(1_791_853_575_939));
+    }
+
+    #[test]
+    fn a_compaction_as_the_newest_entry_ends_the_turn() {
+        let mut lines = earlier_round();
+        lines.extend([
+            prompt_at("round 2", "2026-10-13T01:06:15.939Z"),
+            reply_entry(serde_json::json!([{"type": "tool_use", "name": "Bash"}])),
+            serde_json::json!({"type": "user", "isCompactSummary": true,
+                "message": {"role": "user", "content": "a summary"}}),
+        ]);
+        assert!(turn_over(&entries(&lines)));
     }
 }

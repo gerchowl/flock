@@ -1156,6 +1156,51 @@ mod tests {
         cleanup(&path);
     }
 
+    /// ADR-0028 §3a for `owner_policy_adopted` (ADR-0035 §6.2): a reader
+    /// that predates the kind skips its lines instead of quarantining the
+    /// log. The older reader's view is made by renaming the kind.
+    #[test]
+    fn a_reader_without_the_owner_policy_kind_skips_its_lines() {
+        let path = temp_log("owner-policy-kind-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        assert!(EventKind::OwnerPolicyAdopted.is_persisted());
+        hub.push(EventEnvelope {
+            event: EventKind::OwnerPolicyAdopted,
+            data: EventData::OwnerPolicyAdopted {
+                repo: "/repo/.git".into(),
+                policy_version: Some("0123abcd".into()),
+                reissued: false,
+            },
+        });
+        hub.push(workspace_event("w2"));
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"owner_policy_adopted\""), "{content}");
+        std::fs::write(
+            &path,
+            content.replace(
+                "\"owner_policy_adopted\"",
+                "\"unknown_owner_policy_adopted\"",
+            ),
+        )
+        .unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "an owner policy line must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 2);
+        assert_eq!(
+            restarted.current_sequence(),
+            3,
+            "the skipped seq stays spent"
+        );
+        cleanup(&path);
+    }
+
     /// Skipping is for kinds this binary does not know. A known kind with
     /// malformed data is corruption, and must still be caught.
     #[test]
