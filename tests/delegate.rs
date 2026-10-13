@@ -320,6 +320,7 @@ fn start_server_with(slow_startup: bool, extra_config: &str) -> Server {
     )
     .unwrap();
     write_fake_opencode(&base);
+    support::write_fake_gh(&bin_dir(&base));
     create_db(&base);
     spawn_server(base)
 }
@@ -2027,6 +2028,15 @@ fn a17_reap_after_the_workspace_was_closed_removes_the_checkout() {
     let reaped = cli(&server, &["delegate", "reap", "w1", "--json"]);
     assert_eq!(reaped.status.code(), Some(0), "reap: {}", stderr(&reaped));
     assert!(!worktree.exists(), "the checkout is removed by path");
+    // The reap went through the merge gate, which asked gh about the branch's
+    // PR and was told there is none (#1278).
+    assert!(
+        read_lines(&bin_dir(&server.base).join("gh.log"))
+            .iter()
+            .any(|call| call.starts_with("pr view feat/p578-w2")),
+        "the merge gate asked gh: {:?}",
+        read_lines(&bin_dir(&server.base).join("gh.log"))
+    );
     assert!(
         !walk(&server.base.join("state"))
             .iter()

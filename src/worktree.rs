@@ -1548,7 +1548,11 @@ fn gh_pr_query(
         Err(_) => return PrQuery::NotGitHub,
     };
     if !output.status.success() {
-        return classify_gh_failure(&String::from_utf8_lossy(&output.stderr), github_remote);
+        return classify_gh_failure(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+            github_remote,
+        );
     }
     let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout)
         .ok()
@@ -1559,20 +1563,23 @@ fn gh_pr_query(
     }
 }
 
-/// Map a failed `gh pr view`'s stderr to what it means for the gate. Matched
-/// on gh's own wording, so a gh that rewords these lands on `Failed`, the
-/// safe side.
+/// Map a failed `gh pr view`'s exit code and stderr to what it means for the
+/// gate. The answers are matched on gh's own wording, so a gh that rewords
+/// these lands on `Failed`, the safe side.
 ///
-/// An unauthenticated gh says "gh auth login" before it looks at any remote,
-/// so it names no host. Like a gh that cannot start, that is a failure only
-/// when a remote is on github.com; on any other repo no PR is known to exist
-/// (the same GitHub Enterprise limit as [`gh_pr_query`]).
-fn classify_gh_failure(stderr: &str, github_remote: bool) -> PrQuery {
+/// An unauthenticated gh stops before it looks at any remote, so it names no
+/// host. It exits [`GH_EXIT_AUTH_REQUIRED`], and its message depends on where
+/// it runs: "gh auth login" in a terminal, "set the GH_TOKEN environment
+/// variable" under GitHub Actions. Like a gh that cannot start, that is a
+/// failure only when a remote is on github.com; on any other repo no PR is
+/// known to exist (the same GitHub Enterprise limit as [`gh_pr_query`]).
+fn classify_gh_failure(code: Option<i32>, stderr: &str, github_remote: bool) -> PrQuery {
+    let unauthenticated = code == Some(GH_EXIT_AUTH_REQUIRED) || stderr.contains("gh auth login");
     if stderr.contains("no pull requests found") {
         PrQuery::NoPr
     } else if stderr.contains("no git remotes found")
         || stderr.contains("point to a known GitHub host")
-        || (!github_remote && stderr.contains("gh auth login"))
+        || (!github_remote && unauthenticated)
     {
         PrQuery::NotGitHub
     } else {
@@ -1580,6 +1587,10 @@ fn classify_gh_failure(stderr: &str, github_remote: bool) -> PrQuery {
         PrQuery::Failed(format!("gh failed: {}", reason.unwrap_or("no message")))
     }
 }
+
+/// gh's documented exit code for "this command requires authentication"
+/// (`gh help exit-codes`).
+const GH_EXIT_AUTH_REQUIRED: i32 = 4;
 
 /// The PR question for the gate, answered from both lookups (#1278).
 ///
@@ -5983,6 +5994,29 @@ prunable stale
         fx.cleanup();
     }
 
+    /// What gh 2.x prints, and how it exits, when it runs under GitHub Actions
+    /// with no token: the state every CI job of this repo is in.
+    const GH_UNAUTHENTICATED_IN_ACTIONS: &str = "echo 'gh: To use GitHub CLI in a GitHub \
+        Actions workflow, set the GH_TOKEN environment variable. Example:' >&2; exit 4";
+
+    #[test]
+    fn an_unauthenticated_gh_on_a_repo_with_no_github_remote_lets_git_decide() {
+        // #1278 CI round: a repo whose only remote is a local bare repo cannot
+        // have a PR, so a gh that refuses for want of a token is not a reason
+        // to keep the branch. The Actions wording names neither "gh auth
+        // login" nor a host, only the exit code says what happened.
+        let fx = MergedIntoAFeatureBranch::new("merge-gate-gh-unauthenticated");
+        run_git(
+            &fx.repo,
+            &["merge", "--quiet", "--no-edit", "feature/float"],
+        );
+        let gate = with_gh_script(&fx.scratch, GH_UNAUTHENTICATED_IN_ACTIONS, || {
+            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        });
+        assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
+        fx.cleanup();
+    }
+
     #[test]
     fn a_gh_that_cannot_answer_is_unknown_never_no_pr() {
         // #1278 round 2: the branch is in the default branch, so with "no PR"
@@ -6017,6 +6051,7 @@ prunable stale
                 "auth",
                 "echo 'To get started with GitHub CLI, please run: gh auth login' >&2; exit 4",
             ),
+            ("auth-actions", GH_UNAUTHENTICATED_IN_ACTIONS),
             ("garbage", "echo 'not json'"),
         ];
         for (name, script) in failures {
@@ -6111,35 +6146,54 @@ prunable stale
     fn gh_failure_wording_is_classified_fail_closed() {
         for github in [false, true] {
             assert_eq!(
-                classify_gh_failure("no pull requests found for branch \"x\"", github),
+                classify_gh_failure(Some(1), "no pull requests found for branch \"x\"", github),
                 PrQuery::NoPr
             );
             assert_eq!(
-                classify_gh_failure("no git remotes found", github),
+                classify_gh_failure(Some(1), "no git remotes found", github),
                 PrQuery::NotGitHub
             );
             assert_eq!(
                 classify_gh_failure(
+                    Some(1),
                     "none of the git remotes configured for this repository point to a known GitHub host.",
                     github
                 ),
                 PrQuery::NotGitHub
             );
             assert!(matches!(
-                classify_gh_failure("HTTP 502: Bad Gateway", github),
+                classify_gh_failure(Some(1), "HTTP 502: Bad Gateway", github),
                 PrQuery::Failed(_)
             ));
             assert!(matches!(
-                classify_gh_failure("", github),
+                classify_gh_failure(Some(1), "", github),
                 PrQuery::Failed(_)
             ));
         }
         // Unauthenticated gh names no host: a failure only for a repo with a
-        // github.com remote.
-        let auth = "To get started with GitHub CLI, please run:  gh auth login";
-        assert_eq!(classify_gh_failure(auth, false), PrQuery::NotGitHub);
+        // github.com remote. The terminal and the GitHub Actions wordings
+        // differ, and both exit 4 (#1278: CI ran gh with no token).
+        let terminal = "To get started with GitHub CLI, please run:  gh auth login";
+        let actions = "gh: To use GitHub CLI in a GitHub Actions workflow, \
+                       set the GH_TOKEN environment variable. Example:";
+        for auth in [terminal, actions] {
+            assert_eq!(
+                classify_gh_failure(Some(GH_EXIT_AUTH_REQUIRED), auth, false),
+                PrQuery::NotGitHub,
+                "{auth}"
+            );
+            assert!(
+                matches!(
+                    classify_gh_failure(Some(GH_EXIT_AUTH_REQUIRED), auth, true),
+                    PrQuery::Failed(_)
+                ),
+                "{auth}"
+            );
+        }
+        // Any other failure on a repo with no github.com remote still fails
+        // closed: only an authentication refusal says nothing about a PR.
         assert!(matches!(
-            classify_gh_failure(auth, true),
+            classify_gh_failure(Some(1), "HTTP 502: Bad Gateway", false),
             PrQuery::Failed(_)
         ));
     }

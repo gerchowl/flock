@@ -116,6 +116,7 @@ fn start_server_with_rows(rows: u16) -> Server {
     )
     .unwrap();
     write_fake_codex(&base);
+    support::write_fake_gh(&bin_dir(&base));
     fs::write(base.join("screen"), screen_for("working")).unwrap();
 
     let pair = native_pty_system()

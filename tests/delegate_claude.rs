@@ -149,6 +149,7 @@ fn start_server() -> Server {
     )
     .unwrap();
     write_fake_claude(&base);
+    support::write_fake_gh(&bin_dir(&base));
 
     let pair = native_pty_system()
         .openpty(PtySize {
