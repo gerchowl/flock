@@ -53,7 +53,7 @@
 //! next state change (#1163). A seeded agent whose pane runs some other
 //! command in front of its shell at the window's close is judged again only
 //! when something next touches the tracker: a shell left idle after that
-//! command ends keeps the seeded phase until then.
+//! command ends keeps the seeded phase until then (#1245).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
