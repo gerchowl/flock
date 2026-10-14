@@ -1,4 +1,4 @@
-//! Startup synchronization for harness-owned headless servers.
+//! Startup synchronization for harness-owned headless servers and fixtures.
 //!
 //! `run_server` prints its ready message after both listeners and the app have
 //! been initialized. Reading that message waits on the child, not host speed.
@@ -84,5 +84,114 @@ pub fn read_announcement(reader: impl Read, api_socket: &Path) -> io::Result<()>
                 ));
             }
         };
+    }
+}
+
+/// A shared failure-only ceiling for harness condition waits (ADR-0037 §1).
+pub struct Stages {
+    deadline: std::time::Instant,
+}
+
+impl Stages {
+    /// Start one deadline shared by all protocol stages.
+    pub fn new(ceiling: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + ceiling,
+        }
+    }
+
+    /// Wait for any descriptor, preferring earlier entries when several fire.
+    /// EOF and descriptor errors wake poll too, so callers can report liveness.
+    pub fn readable(&self, descriptors: &[std::os::fd::RawFd]) -> io::Result<usize> {
+        loop {
+            let remaining = self
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "composer stage stayed silent",
+                ));
+            }
+            let mut polls: Vec<_> = descriptors
+                .iter()
+                .map(|&fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // The caller keeps all descriptors open through poll.
+            let result =
+                unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, millis) };
+            if result > 0 {
+                return Ok(polls
+                    .iter()
+                    .position(|p| p.revents != 0)
+                    .expect("poll returned a ready descriptor"));
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Read a line with this deadline, rejecting EOF and malformed output.
+    pub fn line(&self, stream: &mut std::os::unix::net::UnixStream) -> io::Result<String> {
+        read_socket_line(
+            stream,
+            |fd| self.readable(&[fd]).map(|_| ()),
+            "stage producer closed",
+        )
+    }
+
+    /// Require the next protocol stage exactly.
+    pub fn expect(
+        &self,
+        stream: &mut std::os::unix::net::UnixStream,
+        expected: &str,
+    ) -> io::Result<()> {
+        let actual = self.line(stream)?;
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected {expected}, got {actual}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read a bounded UTF-8 line, checking readiness and liveness before each read.
+/// The injected wait must bound silence, including a partial line.
+/// Raw EOF uses the supplied reason; errors from the wait retain their source.
+pub fn read_socket_line(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut wait: impl FnMut(std::os::fd::RawFd) -> io::Result<()>,
+    eof_reason: &str,
+) -> io::Result<String> {
+    use std::os::fd::AsRawFd;
+    let mut bytes = Vec::new();
+    loop {
+        wait(stream.as_raw_fd())?;
+        let mut byte = [0];
+        if stream.read(&mut byte)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, eof_reason));
+        }
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+        bytes.push(byte[0]);
+        if bytes.len() > 65536 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "composer stage line too long",
+            ));
+        }
     }
 }

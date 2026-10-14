@@ -1,3 +1,6 @@
+# #1393: older runners can leak sibling capture pipes on Darwin (upstream #3553).
+nextest-version = "0.9.145"
+
 # nextest configuration.
 #
 # Why this exists: the integration suites in `tests/` each spawn several real
