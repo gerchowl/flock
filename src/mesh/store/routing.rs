@@ -231,23 +231,29 @@ impl<D: DiskSpace> Store<D> {
         Ok(leased)
     }
 
-    /// A withdrawn adjacent edge cannot retain a request's routing lease.
-    /// Called only after topology changes, and writes only affected custody.
-    pub fn withdraw_request_hops(&mut self, live: &[String]) -> Result<()> {
+    /// Clear assignments whose recipient no longer routes through that hop.
+    /// The edge may remain live after a downstream withdrawal. Only affected
+    /// custody is written, and paused stores retain their assignments unchanged.
+    pub fn withdraw_request_hops(
+        &mut self,
+        routes: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
-        let live = serde_json::to_string(live)?;
-        let condition = "state IN ('custody','held') AND next_hop!='' AND next_hop NOT IN (SELECT value FROM json_each(?1))";
+        let routes = serde_json::to_string(routes)?;
+        let condition = "state IN ('custody','held') AND next_hop!='' AND NOT EXISTS (
+            SELECT 1 FROM json_each(?1) route WHERE route.key=envelopes.recipient_node
+            AND route.value=envelopes.next_hop)";
         let any: bool = self.connection.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM envelopes WHERE {condition})"),
-            [&live],
+            [&routes],
             |r| r.get(0),
         )?;
         if any {
             self.connection.execute(
                 &format!("UPDATE envelopes SET next_hop='',lease_until=0 WHERE {condition}"),
-                [&live],
+                [&routes],
             )?;
         }
         Ok(())

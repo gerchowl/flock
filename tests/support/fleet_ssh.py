@@ -110,6 +110,15 @@ def emit(line):
         sys.stdout.flush()
 
 
+def wake_on_poll_release(gate):
+    deadline = time.monotonic() + 30
+    while gate.is_dir() and not (gate / "release").exists():
+        if child.poll() is not None or time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+    emit(json.dumps({"push": "mesh.wake"}) + "\n")
+
+
 def forward_input():
     try:
         for line in sys.stdin:
@@ -161,6 +170,18 @@ def forward_input():
                         if time.monotonic() >= deadline:
                             break
                         time.sleep(0.01)
+                gate = base / f"gate-outbound-poll-{source}-{target}"
+                if outbound and gate.is_dir():
+                    if not (gate / "release").exists():
+                        # Inhibit leases without occupying the serialized stream,
+                        # so explicit topology withdrawals can still propagate.
+                        if not (gate / "entered").exists():
+                            (gate / "entered").touch()
+                            threading.Thread(target=wake_on_poll_release, args=(gate,), daemon=True).start()
+                        outbound_collections.discard(request.get("id"))
+                        emit(json.dumps({"id": request["id"], "result": {"answers": []}}) + "\n")
+                        continue
+                    (gate / "passed").touch()
                 replay = base / f"replay-{kind}-{source}-{target}"
                 if replay.exists():
                     request["params"] = json.loads(replay.read_text())
