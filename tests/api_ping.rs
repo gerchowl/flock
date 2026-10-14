@@ -1,3 +1,5 @@
+#[path = "support/composer.rs"]
+mod composer;
 mod support;
 
 use std::fs;
@@ -2855,10 +2857,16 @@ fn guarded_submit_enter_follows_socket_paste_by_at_least_100ms() {
     let script = base.join("codex");
     let shell = base.join("composer-shell");
     let log = base.join("input.jsonl");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
     fs::write(
         &script,
         r#"import json, os, sys, time, tty
 from pathlib import Path
+import socket
+gate = socket.socket(socket.AF_UNIX)
+gate.connect(str(Path(__file__).with_name('gate.sock')))
+gate.sendall(b'boot\n')
+assert gate.recv(1) == b'G'
 tty.setraw(0)
 log = Path(__file__).with_name('input.jsonl')
 os.write(1, b'\x1b[?2004h\x1b[2J\x1b[HOpenAI Codex\r\nREADY\r\n\xe2\x80\xba \r\n  ? for shortcuts\r\n')
@@ -2895,42 +2903,49 @@ with log.open('w') as out:
         .to_string(),
     );
     let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let read = send_request(
-            &socket_path,
-            &serde_json::json!({
-                "id": "read", "method": "pane.read", "params": {"pane_id": pane, "source": "recent"}
-            })
-            .to_string(),
-        );
-        if read.to_string().contains("READY") {
-            break;
+    // ADR-0037 §1: this is a failure ceiling for the whole protocol, rather
+    // than a startup timing assertion. The fixture cannot emit before subscribe.
+    let stages = composer::Stages::new(Duration::from_secs(120));
+    let mut producer = stages.accept(&gate).expect("composer did not connect");
+    stages.expect(&mut producer, "boot").unwrap();
+    let mut events = UnixStream::connect(&socket_path).unwrap();
+    writeln!(
+        events,
+        "{}",
+        serde_json::json!({
+            "id": "composer-ready", "method": "events.subscribe",
+            "params": {"subscriptions": [
+                {"type": "pane.output_matched", "pane_id": pane, "source": "recent",
+                 "lines": 40, "match": {"type": "substring", "value": "READY"}},
+                {"type": "pane.agent_status_changed", "pane_id": pane, "agent_status": "idle"}
+            ]}
+        })
+    )
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&stages.line(&mut events).unwrap()).unwrap();
+    assert_eq!(ack["id"], "composer-ready", "{ack}");
+    assert_eq!(ack["result"]["type"], "subscription_started", "{ack}");
+    producer.write_all(b"G").unwrap();
+    let mut output_seen = false;
+    let mut idle_seen = false;
+    while !output_seen || !idle_seen {
+        let event: serde_json::Value =
+            serde_json::from_str(&stages.line(&mut events).unwrap()).unwrap();
+        assert_eq!(event["data"]["pane_id"], pane, "{event}");
+        match event["event"].as_str() {
+            Some("pane.output_matched") if !output_seen => {
+                assert!(event["data"]["read"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("READY"));
+                output_seen = true;
+            }
+            Some("pane.agent_status_changed") if !idle_seen => {
+                assert_eq!(event["data"]["agent_status"], "idle", "{event}");
+                idle_seen = true;
+            }
+            _ => panic!("unexpected composer readiness stage: {event}"),
         }
-        assert!(
-            Instant::now() < deadline,
-            "fake composer never became ready: {read}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let agent = send_request(
-            &socket_path,
-            &serde_json::json!({"id":"idle", "method":"agent.get", "params":{"target":pane}})
-                .to_string(),
-        );
-        if matches!(
-            agent["result"]["agent"]["agent_status"].as_str(),
-            Some("idle" | "done")
-        ) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "composer never detected idle: {agent}"
-        );
-        thread::sleep(Duration::from_millis(20));
     }
     let read_log = || -> Vec<serde_json::Value> {
         fs::read_to_string(&log)
