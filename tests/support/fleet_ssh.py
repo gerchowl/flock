@@ -112,11 +112,31 @@ def emit(line):
 
 def wake_on_poll_release(gate):
     deadline = time.monotonic() + 30
-    while gate.is_dir() and not (gate / "release").exists():
-        if child.poll() is not None or time.monotonic() >= deadline:
+    while True:
+        if not gate.is_dir():
+            reason = "poll gate removed before release"
+        elif child.poll() is not None:
+            reason = "relay exited before poll release"
+        elif (gate / "release").exists():
+            emit(json.dumps({"push": "mesh.wake"}) + "\n")
             return
-        time.sleep(0.01)
-    emit(json.dumps({"push": "mesh.wake"}) + "\n")
+        elif time.monotonic() >= deadline:
+            reason = "poll gate was not released at the 30 s ceiling"
+        else:
+            time.sleep(0.01)
+            continue
+        try:
+            sys.stderr.write(f"fake-ssh: {reason}\n")
+            sys.stderr.flush()
+            if gate.is_dir():
+                pending = gate / "failed.pending"
+                pending.write_text(reason)
+                pending.replace(gate / "failed")
+        finally:
+            # Interrupt the main loop even if writing the diagnostic fails.
+            # Its finally block owns reaping the relay and its descendants.
+            os.kill(os.getpid(), signal.SIGTERM)
+        return
 
 
 def forward_input():
