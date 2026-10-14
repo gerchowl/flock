@@ -660,19 +660,43 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
     fleet::wait_until("delivery ack after inbox commit", DEADLINE, || {
         gate.join("entered").exists().then_some(())
     });
-    conversation.read_question();
     cut(&conversation.fleet, "nodea", "nodeb");
     assert_eq!(cli_result(&output)["state"], "queued");
     std::fs::remove_dir_all(gate).unwrap();
     // The origin retries the committed key after the acknowledgement was lost.
     reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
-    state(conversation.fleet.node("nodea"), "question", "delivered");
-    assert!(conversation
+    // Confirm replay of the committed key before generating a read receipt.
+    // Otherwise genuine read evidence can overtake the delivery observation.
+    let duplicate = conversation
         .fleet
         .base
-        .join("delivered-receipt-nodea-nodeb")
-        .exists());
+        .join("delivered-receipt-nodea-nodeb");
+    fleet::wait_until("duplicate delivery acknowledged", DEADLINE, || {
+        api(conversation.fleet.node("nodeb"), "ping", json!({}));
+        let status = api(
+            conversation.fleet.node("nodea"),
+            "msg.status",
+            json!({
+                "correlation_id":"question"
+            }),
+        );
+        match status["state"].as_str() {
+            Some("queued" | "custody" | "collect_failed") => None,
+            Some("delivered") => duplicate.exists().then_some(()),
+            other => panic!("unexpected state before genuine read: {other:?}; {status}"),
+        }
+    });
+    let inbox: (i64, i64) = db(conversation.fleet.node("nodeb"))
+        .query_row(
+            "SELECT count(*),sum(state='inbox') FROM envelopes WHERE correlation='question'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inbox, (1, 1), "replay must preserve one unread import");
+    conversation.read_question();
+    state(conversation.fleet.node("nodea"), "question", "read");
     assert_eq!(
         read(
             conversation.fleet.node("nodeb"),
