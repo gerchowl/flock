@@ -21,7 +21,7 @@ use crate::api::error_code::ErrorCode;
 use crate::platform::structured as private_fs;
 
 /// File-only structured-session policy. Default refuses launches until O19a.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StructuredConfig {
     /// Execution identity; operator mode is an explicit exception to #1177.
@@ -29,6 +29,18 @@ pub struct StructuredConfig {
     /// Absolute path to a setup-token file, owned by this user and mode 0600.
     /// The token itself is never stored in config or written into settings.
     pub token_file: Option<PathBuf>,
+    /// Persistent profile name under flock state; defaults to `default`.
+    pub profile: String,
+}
+
+impl Default for StructuredConfig {
+    fn default() -> Self {
+        Self {
+            run_as: RunAs::Agent,
+            token_file: None,
+            profile: "default".into(),
+        }
+    }
 }
 
 /// Unix identity policy, amended by the owner on 2026-10-14.
@@ -110,6 +122,9 @@ impl VerifiedBinary {
     /// Check `--version` on this exact resolved path. The injected reader must
     /// run that path with `--version`, fail on a nonzero exit, and return stdout.
     /// S3a-1 tests inject text; process execution belongs to #1438.
+    /// The reader must bound `--version` execution time. Resolving this path
+    /// again at exec still races replacement; only `fexecve` fully closes that
+    /// gap. Both are explicit runtime obligations in #1438.
     pub fn check(
         path: &Path,
         read_version: impl FnOnce(&Path, &[&str]) -> io::Result<String>,
@@ -187,7 +202,7 @@ impl Token {
         if !path.is_absolute() {
             return Err(io::Error::other("structured.token_file must be absolute"));
         }
-        let mut raw = Zeroizing::new(String::new());
+        let mut raw = Zeroizing::new(String::with_capacity(16_385));
         private_fs::open_token(path)?
             .take(16_385)
             .read_to_string(&mut raw)?;
@@ -246,7 +261,44 @@ struct McpConfig {
     mcp_servers: BTreeMap<String, serde_json::Value>,
 }
 
-/// Owns a fresh 0700 config directory and recursively removes it on drop,
+/// Persistent private harness profile, retained for resume, hot reload and forks
+/// (ADR-0036 §1, §9). Sessions never delete its transcripts or registry.
+/// `flk-agent` profiles belong under that user's `~/.flk/claude/<profile>` once
+/// O19a is available; operator profiles use the separate flock-owned tree below.
+#[derive(Debug)]
+pub struct ProfileConfigDir(PathBuf);
+
+impl ProfileConfigDir {
+    /// Create/reuse `<state_dir>/structured/claude/<profile>` for operator mode.
+    /// The existing flock state root is supplied by the caller. Every component
+    /// below it must be a real directory owned by this uid with mode 0700.
+    /// Existing directories with unsafe ownership or mode are refused, not fixed.
+    pub fn for_operator(state_dir: &Path, profile: &str) -> io::Result<Self> {
+        if profile.is_empty()
+            || !profile
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(io::Error::other(
+                "structured.profile must contain only ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        let mut path = state_dir.canonicalize()?;
+        for component in ["structured", "claude", profile] {
+            path.push(component);
+            private_fs::ensure_private_dir(&path)?;
+        }
+        Ok(Self(path))
+    }
+
+    /// Stable CLAUDE_CONFIG_DIR. Dropping this value does not remove the profile.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Owns a fresh 0700 directory for generated session settings and MCP files,
+/// distinct from the persistent CLAUDE_CONFIG_DIR. Recursively removes it on drop,
 /// including during unwinding. Keep it until the child process group is gone.
 /// SIGKILL and filesystem failures cannot be recovered by a Rust destructor.
 #[derive(Debug)]
@@ -264,7 +316,7 @@ impl SessionConfigDir {
         Ok(Self(path))
     }
 
-    /// Private directory used as CLAUDE_CONFIG_DIR for this session only.
+    /// Temporary directory for this session's generated `--settings`/`--mcp-config`.
     pub fn path(&self) -> &Path {
         &self.0
     }
@@ -292,6 +344,7 @@ pub struct LaunchProfile {
     args: Vec<OsString>,
     binary: VerifiedBinary,
     environment: EnvironmentAllowlist,
+    profile_directory: ProfileConfigDir,
     directory: SessionConfigDir,
 }
 
@@ -300,7 +353,7 @@ impl LaunchProfile {
     /// `session_id` is supplied by the session owner (#1438), never a path.
     pub fn prepare(
         config: &StructuredConfig,
-        parent: &Path,
+        state_dir: &Path,
         session_id: &str,
         binary: VerifiedBinary,
         read_env: impl FnMut(&str) -> Option<OsString>,
@@ -312,7 +365,8 @@ impl LaunchProfile {
                 .as_deref()
                 .ok_or_else(|| io::Error::other("structured.token_file is required"))?,
         )?;
-        let directory = SessionConfigDir::create(parent)?;
+        let profile_directory = ProfileConfigDir::for_operator(state_dir, &config.profile)?;
+        let directory = SessionConfigDir::create(state_dir)?;
         let settings = LaunchSettings::default();
         let settings_path = directory.write("settings.json", &settings)?;
         let mcp_path = directory.write("mcp.json", &McpConfig::default())?;
@@ -351,6 +405,7 @@ impl LaunchProfile {
             args,
             binary,
             environment,
+            profile_directory,
             directory,
         })
     }
@@ -370,6 +425,11 @@ impl LaunchProfile {
         self.binary.version()
     }
 
+    /// Persistent harness profile for registry checks, resume and fork operations.
+    pub fn config_dir(&self) -> &Path {
+        self.profile_directory.path()
+    }
+
     /// Emit only the allowlisted and session-specific entries for a child builder.
     /// The sink must not log or persist the token. This single delivery seam
     /// lets #1438 change transport if the token-inheritance review requires it.
@@ -377,7 +437,7 @@ impl LaunchProfile {
         for (key, value) in &self.environment.values {
             set(key, value);
         }
-        set("CLAUDE_CONFIG_DIR", self.directory.path().as_os_str());
+        set("CLAUDE_CONFIG_DIR", self.config_dir().as_os_str());
         set(
             "CLAUDE_CODE_OAUTH_TOKEN",
             OsStr::new(self.environment.token.0.as_str()),

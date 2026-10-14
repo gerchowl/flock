@@ -601,6 +601,7 @@ mod tests {
         assert!(is_blocklisted("ui.sound.path"));
         assert!(is_blocklisted("structured.run_as"));
         assert!(is_blocklisted("structured.token_file"));
+        assert!(is_blocklisted("structured.profile"));
         // Segment-aligned: "keysfoo" is NOT blocked by "keys".
         assert!(!is_blocklisted("keysfoo"));
         assert!(!is_blocklisted("structuredfoo"));

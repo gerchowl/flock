@@ -29,6 +29,7 @@ impl Fixture {
         StructuredConfig {
             run_as: RunAs::Operator,
             token_file: Some(self.file("token", FAKE_TOKEN.as_bytes(), 0o600)),
+            ..StructuredConfig::default()
         }
     }
 
@@ -57,6 +58,7 @@ fn structured_config_requires_explicit_operator_opt_in() {
     let default: crate::config::Config = toml::from_str("").expect("default config");
     assert_eq!(default.structured.run_as, RunAs::Agent);
     assert!(default.structured.token_file.is_none());
+    assert_eq!(default.structured.profile, "default");
     let config: crate::config::Config = toml::from_str(&format!(
         "[structured]\nrun_as = 'operator'\ntoken_file = {token_path:?}"
     ))
@@ -222,7 +224,12 @@ fn allowlist_excludes_server_credentials_and_live_session_markers() {
         ]
     );
     assert_eq!(emitted["CLAUDE_CODE_OAUTH_TOKEN"], FAKE_TOKEN);
-    assert_eq!(emitted["CLAUDE_CONFIG_DIR"], profile.directory.path());
+    assert_eq!(
+        emitted["CLAUDE_CONFIG_DIR"],
+        profile.profile_directory.path()
+    );
+    assert_eq!(profile.config_dir(), profile.profile_directory.path());
+    assert_ne!(profile.profile_directory.path(), profile.directory.path());
     assert!(!format!("{profile:?}").contains(FAKE_TOKEN));
     assert!(profile
         .args()
@@ -326,10 +333,91 @@ fn config_directory_is_removed_on_unwind_and_writer_error() {
     assert!(result.is_err());
     assert_eq!(
         fs::read_dir(&fixture.0)
-            .expect("fixture files only")
+            .expect("fixture files")
+            .filter(|entry| entry
+                .as_ref()
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("flk-claude-"))
             .count(),
-        2
+        0
     );
+    assert!(fixture.0.join("structured/claude/default").is_dir());
+}
+
+#[test]
+fn harness_profile_persists_across_session_drop_and_unwind() {
+    let fixture = Fixture::new();
+    let first = fixture.profile();
+    let persistent = first.config_dir().to_owned();
+    assert_eq!(persistent, fixture.0.join("structured/claude/default"));
+    assert_eq!(
+        fs::metadata(&persistent)
+            .expect("profile")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let transcript = persistent.join("transcript.jsonl");
+    fs::write(&transcript, "retained transcript").expect("harness transcript");
+    let generated = first.directory.path().to_owned();
+    drop(first);
+    assert!(transcript.is_file());
+    assert!(!generated.exists());
+    let second = fixture.profile();
+    assert_eq!(second.config_dir(), persistent);
+    assert_eq!(
+        fs::read_to_string(&transcript).expect("resume transcript"),
+        "retained transcript"
+    );
+    let generated = second.directory.path().to_owned();
+    let result = std::panic::catch_unwind(|| {
+        let _session = second;
+        panic!("session unwind");
+    });
+    assert!(result.is_err());
+    assert!(!generated.exists());
+    assert!(transcript.is_file());
+    let mut config = fixture.config();
+    config.profile = "work".into();
+    let other = LaunchProfile::prepare(&config, &fixture.0, SESSION_ID, fixture.binary(), |_| None)
+        .expect("other profile");
+    assert_eq!(
+        other.profile_directory.path(),
+        fixture.0.join("structured/claude/work")
+    );
+    assert_ne!(other.profile_directory.path(), persistent);
+}
+
+#[test]
+fn persistent_profiles_refuse_unsafe_modes_links_files_and_names() {
+    let fixture = Fixture::new();
+    let profile = ProfileConfigDir::for_operator(&fixture.0, "work").expect("private profile");
+    for relative in ["structured", "structured/claude", "structured/claude/work"] {
+        let path = fixture.0.join(relative);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("unsafe mode");
+        assert!(ProfileConfigDir::for_operator(&fixture.0, "work").is_err());
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("unchanged directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("restore mode");
+    }
+    let link = fixture.0.join("structured/claude/link");
+    symlink(profile.path(), &link).expect("profile symlink");
+    assert!(ProfileConfigDir::for_operator(&fixture.0, "link").is_err());
+    fs::write(fixture.0.join("structured/claude/file"), "not a directory").expect("file fixture");
+    assert!(ProfileConfigDir::for_operator(&fixture.0, "file").is_err());
+    for name in ["", ".", "..", "../escape", "work/nested", "λ"] {
+        assert!(ProfileConfigDir::for_operator(&fixture.0, name).is_err());
+    }
+    assert!(!fixture.0.join("escape").exists());
 }
 
 #[test]

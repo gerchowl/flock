@@ -61,6 +61,41 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Create or validate a persistent private directory without following symlinks.
+/// Existing permissions and ownership are never silently changed.
+pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let directory = match open() {
+        Ok(directory) => directory,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            match create_private_dir(path) {
+                Ok(()) => (),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(err) => return Err(err),
+            }
+            open()?
+        }
+        Err(err) => return Err(err),
+    };
+    // SAFETY: geteuid has no preconditions and accesses no Rust memory.
+    validate_private_dir(&directory.metadata()?, unsafe { libc::geteuid() })
+}
+
+fn validate_private_dir(meta: &fs::Metadata, uid: libc::uid_t) -> io::Result<()> {
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o7777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "structured profile requires a directory owned by the current user with mode 0700",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +121,19 @@ mod tests {
             0o700
         );
         assert_eq!(file.metadata().expect("file").mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn persistent_directory_owner_validation_refuses_another_uid() {
+        let directory = SessionConfigDir::create(&std::env::temp_dir()).expect("directory fixture");
+        let meta = fs::metadata(directory.path()).expect("fixture metadata");
+        assert!(validate_private_dir(&meta, meta.uid()).is_ok());
+        assert_eq!(
+            validate_private_dir(&meta, meta.uid().wrapping_add(1))
+                .expect_err("another owner must be refused")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
