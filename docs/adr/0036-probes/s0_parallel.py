@@ -14,7 +14,10 @@ the `touch` with a pre-allowed MCP tool (`s0_mcpstub.py`, standing in for
 `flock_question_ask`) and record whether its result arrives while the
 permission request is open. `sleep_then_mcp` is their control: the same MCP
 call behind a pre-allowed `sleep 5` (and behind a pre-allowed, writing
-`sleep 5 && touch`), with no permission open.
+`sleep 5 && touch`), with no permission open. `read_behind_permission`
+puts a concurrency-safe Read after the prompting `touch` in the same message
+and records whether the Read result arrives before the permission is
+answered.
 
     S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_parallel.py [runs] [hold_s]
@@ -118,6 +121,73 @@ def run_control(shape, n):
         return out
 
 
+# A.13's case left untested by the controls: a concurrency-safe call (Read)
+# ordered after a prompting Bash `touch` in the same message. The driver holds
+# the `touch` permission open for `hold_s` and records whether the Read result
+# arrives before it answers. If it does, an open permission holds only the
+# non-concurrency-safe calls after it.
+READ_BEHIND = {
+    "read_behind_permission": (
+        "In ONE response, make exactly these two tool calls in parallel, in this order, "
+        "without waiting for either: (1) Bash: `touch s0-probe.txt`; (2) Read: the file "
+        "`a.txt` in the working directory. Then summarise both outcomes in one line."
+    ),
+}
+
+
+def run_read_behind(shape, n, hold_s):
+    with L.Session(f"parallel-{shape}-{n}", FLAGS) as sess:
+        out = {"shape": shape, "run": n, "hold_s": hold_s}
+        sess.user(READ_BEHIND[shape])
+        first = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
+        if first is None or L.is_result(first):
+            out["error"] = "no control request"
+            sess.close()
+            return out
+        out["first_request"] = {"tool": first["request"].get("tool_name"), "tool_use_id": first["request"].get("tool_use_id"), "t": first["_t"]}
+        # the Read never prompts in the default mode: does its result arrive
+        # while the permission request is open?
+        got = sess.wait(lambda e: any(u["name"] == "Read" for u in L.tool_uses([e])), timeout=10)
+        rid = None if got is None else [u["id"] for u in L.tool_uses([got]) if u["name"] == "Read"][0]
+        res_ev = None if rid is None else sess.wait(
+            lambda e: any(x["tool_use_id"] == rid for x in L.tool_results([e])), timeout=hold_s)
+        out["read_result_while_permission_open"] = None if res_ev is None else {
+            "t": res_ev["_t"], "content": [x["content"] for x in L.tool_results([res_ev]) if x["tool_use_id"] == rid]}
+        # any other prompt that arrived while the first one was open
+        out["prompts_while_first_open"] = [
+            e["request"].get("tool_name") for e in sess.since(first["_i"] + 1) if L.is_can_use_tool(e)]
+        answered = {first["request_id"]}
+        out["first_answered_at"] = sess.now()
+        sess.answer(first["request_id"], answer_for(first, "deny"))
+        pos = first["_i"] + 1
+        while True:
+            e = sess.wait(lambda e: (L.is_can_use_tool(e) and e["request_id"] not in answered) or L.is_result(e), timeout=120, start=pos)
+            if e is None or L.is_result(e):
+                res = e
+                break
+            out.setdefault("unexpected_prompts", []).append(e["request"].get("tool_name"))
+            answered.add(e["request_id"])
+            sess.answer(e["request_id"], answer_for(e, "allow" if e["request"].get("tool_name") == "Read" else "deny"))
+            pos = e["_i"] + 1
+        evs = sess.since(0)
+        uses = L.tool_uses(evs)
+        results = {x["tool_use_id"]: x["t"] for x in L.tool_results(evs)}
+        out["calls"] = [{"name": u["name"], "msg": u["msg"], "use_t": u["t"], "result_t": results.get(u["id"])} for u in uses]
+        bc = next((c for c in out["calls"] if c["name"] == "Bash"), None)
+        rc = next((c for c in out["calls"] if c["name"] == "Read"), None)
+        if bc and rc:
+            out["one_message"] = bc["msg"] == rc["msg"]
+        if rc and rc["result_t"] is not None:
+            out["read_result_before_permission_answered"] = rc["result_t"] < out["first_answered_at"]
+        out["timeline"] = [
+            {"t": e["_t"], "ev": f"can_use_tool:{e['request'].get('tool_name')}"} for e in evs if L.is_can_use_tool(e)
+        ] + [{"t": x["t"], "ev": f"tool_result:{x['tool_use_id'][-6:]}:{'err' if x['is_error'] else 'ok'}"} for x in L.tool_results(evs)]
+        out["timeline"].sort(key=lambda x: x["t"])
+        out["result"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error"), "num_turns": res.get("num_turns"), "usage": L.usage(res)}
+        out["exit"] = sess.close()
+        return out
+
+
 def answer_for(req, label):
     r = req["request"]
     if r.get("tool_name") == "AskUserQuestion":
@@ -198,8 +268,16 @@ def run(shape, n, hold_s):
 def main():
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     hold_s = float(sys.argv[2]) if len(sys.argv) > 2 else 10
-    shapes = sys.argv[3:] or list(PROMPTS) + list(CONTROLS)
-    L.emit([run_control(s, i + 1) if s in CONTROLS else run(s, i + 1, hold_s) for i in range(runs) for s in shapes])
+    shapes = sys.argv[3:] or list(PROMPTS) + list(CONTROLS) + list(READ_BEHIND)
+
+    def one(s, n):
+        if s in CONTROLS:
+            return run_control(s, n)
+        if s in READ_BEHIND:
+            return run_read_behind(s, n, hold_s)
+        return run(s, n, hold_s)
+
+    L.emit([one(s, i + 1) for i in range(runs) for s in shapes])
 
 
 if __name__ == "__main__":

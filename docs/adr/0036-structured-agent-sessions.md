@@ -2,7 +2,8 @@
 
 - Status: Accepted (2026-10-13, owner decisions recorded); amended
   2026-10-14 with the S0 probe findings (#1324, "S0 findings for the
-  architect" says where each landed)
+  architect" says where each landed), and with the A.13 controls, the A.16
+  login results and the owner's narrowing of decision 1 (#1404)
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -217,13 +218,15 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 - **Isolation and login (E5, E6, ADR-0035 §6.3 point 1).** A structured
   agent never runs as the operator's uid. Its `CLAUDE_CONFIG_DIR` is a
   private dir per profile in the `flk-agent` user's `HOME`
-  (`~flk-agent/.flk/claude/<profile>`), and that dir holds its own login:
-  `claude /login` run once per profile as `flk-agent` (the token lands in
-  `flk-agent`'s own keychain on macOS, or in the dir's credentials file on
-  Linux), or a `claude setup-token` token written into that dir's settings
-  as `CLAUDE_CODE_OAUTH_TOKEN` where no browser login is possible. The
-  operator's config dir and keychain are never read or copied: sharing them
-  would share a rotating refresh token between two dirs (E6). Inside that
+  (`~flk-agent/.flk/claude/<profile>`). The login is a `claude setup-token`
+  token only (owner decision 1, narrowed 2026-10-14): g-fleet renders it
+  from sops as a 0600 file owned by `flk-agent` (g-fleet#476), and flk
+  passes it into the session's environment as `CLAUDE_CODE_OAUTH_TOKEN`
+  and never logs it. `claude /login` is not used for agents: as a macOS
+  user with no GUI session it cannot save its login (no keychain, and no
+  plaintext fallback on 2.1.287), while the token path works for that user
+  (A.16). The operator's config dir and keychain are never read or copied:
+  sharing them would share a rotating refresh token between two dirs (E6). Inside that
   dir the session is still isolated by flags: `--setting-sources local` (no
   user-level hooks, permissions or plugins), `--strict-mcp-config` (no
   claude.ai connectors arriving late and shifting the tool set) and flk's
@@ -252,8 +255,11 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 - **Stall and waiting.** `waiting_on_human` is exact: a `can_use_tool`
   control request is open. S0 observed only one open at a time, and only
   for non-concurrency-safe calls: no later call of the same message ran
-  until the open one was answered (A.13, §2b). Why is still open ("Open S0
-  items", item 1), so flk does not rely on it. It tracks open control
+  until the open one was answered (A.13, §2b). The controls showed that
+  this comes from serial execution of non-concurrency-safe tools, not from
+  the permission (A.13); a concurrency-safe call behind an open permission
+  is still untested ("Open S0 items"), so flk does not rely on one open
+  request at a time. It tracks open control
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is a started input with no stdout event for
@@ -505,11 +511,13 @@ verbs; they differ in what the agent can say and in what can block them.
      (`AskUserQuestion`) or was pre-allowed (an MCP tool without a
      read-only hint, so `flock_question_ask` too). Only one control request
      was ever open, and a pre-allowed call ordered before the prompting one
-     ran first. Why is not settled: the open permission may hold the later
-     call, or Claude Code may run non-concurrency-safe tools one at a time,
-     so that any unfinished earlier call holds it. The controls that decide
-     it, and the case of a concurrency-safe call behind an open permission,
-     are pending ("Open S0 items", item 1). Either way, a question that
+     ran first. The controls settled why: with no permission open, a
+     pre-allowed MCP call still waited for a slow pre-allowed Bash call
+     ordered before it (A.13), so Claude Code runs non-concurrency-safe
+     tools one at a time and any unfinished earlier call holds the later
+     one; the open permission is one way to stay unfinished. A
+     concurrency-safe call behind an open permission is still untested
+     ("Open S0 items"). Either way, a question that
      must not wait behind a permission has to be asked before the call
      that may prompt, or in a separate message, and the compiled context
      (ADR-0032) tells the agent so. The MCP tool still never prompts
@@ -1181,6 +1189,10 @@ to this record:
   prompt (A.13, §2b).** Not holding a question cannot help it there; the
   compiled context tells agents to ask before, or apart from, a call that
   may prompt.
+- **The login token is in the session's environment (owner decision 1).**
+  flk never logs it, but whether the harness passes
+  `CLAUDE_CODE_OAUTH_TOKEN` on to the agent's own tool processes is
+  untested; A.11 saw it pass its `CLAUDE_CODE_MESSAGING_TOKEN` on to them.
 - **System One is advisory.** When it is not configured, times out or its
   breaker is open, questions are not held (§2a), batches are not joined and
   no item is marked relevant (§3): the defaults, never a stall.
@@ -1194,7 +1206,8 @@ Each item names the question, the answer, and where the body follows it.
 "As recommended" means the recommendation of the proposed record, which the
 body already carried. An "S0 note" line (2026-10-14, #1324) records what
 the S0 probes found that bears on a decision. The notes record facts; they
-change no decision.
+change no decision. An "Owner decision, 2026-10-14" line records a later
+decision by the owner.
 
 1. **Isolation and login under `flk-agent` (#1177, ADR-0035 §6.3).** As
    recommended: `claude /login` once per profile as `flk-agent` into a
@@ -1204,6 +1217,15 @@ change no decision.
    `/login` and its keychain item work for a macOS user with no GUI login
    session; probe slice S0 checks it, and if they do not, `setup-token` is
    the macOS path too. (§1)
+   *S0 note:* as a macOS user with no GUI session and no keychain,
+   `claude auth login` failed to save its login and wrote no plaintext
+   file (2.1.287); a `setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN`
+   worked for the same user (A.16).
+   *Owner decision, 2026-10-14 (#1404):* agent users log in with
+   `setup-token` only. g-fleet renders it from sops as a 0600 file owned by
+   `flk-agent` (g-fleet#476); flk passes it into the session env and never
+   logs it. `/login` is kept for GUI operators only. Rejected alternative:
+   unlocking a keychain at boot. (§1, S3)
 2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
    capability probe, with the rehydrate path as the measured fallback
    (E11). (§9)
@@ -1218,9 +1240,10 @@ change no decision.
    (§2b)
    *S0 note:* in A.13 an open permission held every later call of the
    same message, a pre-allowed MCP call included, while a call ordered
-   before the prompting one ran first. Whether the permission or serial
-   execution of non-concurrency-safe tools holds the later call is an open
-   S0 item. (§2b case 1)
+   before the prompting one ran first. The controls showed that serial
+   execution of non-concurrency-safe tools holds the later call, with or
+   without a permission open; a concurrency-safe call behind an open
+   permission is an open S0 item. (§2b case 1, A.13)
    - 3a. **Non-blocking questions (#1301).** As recommended (questions are
      deferred, permission requests block), plus three additions now in
      §2a: an honest-blocker question, where the agent has nothing else to
@@ -1315,10 +1338,10 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
-| S0 | Not complete: the probes landed (#1356); open items, the A.13 controls and A.16 (pending on the owner), see "Open S0 items". Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
+| S0 | Not complete: the probes landed (#1356), and the A.13 controls and A.16 ran (#1404); open: a concurrency-safe call behind an open permission (A.13), see "Open S0 items". Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
-| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (`--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
 | S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
@@ -1654,8 +1677,9 @@ file into `plans/`. All of it was removed afterwards by the session ids and
 working directories in the captures (PR #1356 lists the paths). The
 drivers have since been changed to give every session a fresh temporary
 `CLAUDE_CONFIG_DIR`, deleted on close, with the login passed in as
-`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. They have not been
-re-run that way yet. Nothing measured here depends on the profile: user
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Of the figures
+below, only the A.13 controls were measured that way (2026-10-14); the
+others have not been re-run. Nothing measured here depends on the profile: user
 settings were already dropped by `--setting-sources local`.
 
 Totals over the
@@ -1788,17 +1812,45 @@ one `can_use_tool` was ever open, and no call later in the message ran,
 prompting or not, until the open one was answered. A pre-allowed MCP call
 ordered before the prompting one ran first.
 
-What it does not show is why. Claude Code may simply run
-non-concurrency-safe tools one at a time, so a later call would wait
-behind any running earlier call, permission or not. The control is
-pending (needs a re-run with a model): `s0_parallel.py`'s
-`sleep_then_mcp` and `slowtouch_then_mcp` shapes put the same pre-allowed
-MCP call behind a pre-allowed `sleep 5` and a pre-allowed, writing
-`sleep 5 && touch`, with no permission open. If the MCP result waits for
-the Bash call there too, serial execution of non-concurrent tools is what
-holds it, and the open permission is just one way an earlier call can
-stay unfinished. Also untested: a concurrency-safe call (`Read`, or an MCP
-tool with `readOnlyHint`) behind an open permission.
+**Controls, 2026-10-14 (no permission open).** `s0_parallel.py 2 10
+sleep_then_mcp slowtouch_then_mcp`, run on the token path of the S0
+preamble (a fresh `CLAUDE_CONFIG_DIR` per session, the login passed as
+`CLAUDE_CODE_OAUTH_TOKEN` from `S0_OAUTH_TOKEN_FILE`), Claude Code 2.1.296,
+model `haiku`. Both shapes put the same pre-allowed MCP call behind a
+pre-allowed Bash call: `sleep 5` (in `--allowedTools` as `Bash(sleep:*)`),
+and `sleep 5 && touch` (also `Bash(touch:*)`), which writes and so is not
+concurrency-safe even if `sleep` alone were classed read-only. No
+`can_use_tool` was sent. All four runs exited 0, and no token appeared in
+the output. Times are seconds from session start, `tool_use` → `tool_result`
+(#1307, comment 6165573342).
+
+| Control | Run | One message | MCP result after the Bash result | Bash | MCP `echo` |
+|---|---|---|---|---|---|
+| `sleep 5`, then MCP | 1 | yes | yes | 2.62 → 8.42 | 2.70 → 8.43 |
+| `sleep 5`, then MCP | 2 | yes | yes | 1.91 → 7.21 | 1.99 → 7.21 |
+| `sleep 5 && touch`, then MCP | 1 | yes | yes | 2.25 → 7.55 | 2.35 → 7.56 |
+| `sleep 5 && touch`, then MCP | 2 | yes | yes | 2.11 → 7.41 | 2.21 → 7.42 |
+
+**Reading.** With no permission request open, the later MCP call of the
+same message still finished only after the slow Bash call, about 4 ms
+behind it (within 0.01 s at this table's resolution). So the hold in the
+first table comes from serial execution of non-concurrency-safe tools
+(Bash, and an MCP tool without a read-only hint), and is not specific to
+permissions: an open permission is one way an earlier call stays
+unfinished, and a long-running tool is another. Not shown by these shapes:
+what the harness does with a concurrency-safe call in that position, and
+whether more than one control request can be open at once when the calls
+are concurrency-safe.
+
+**A concurrency-safe call behind an open permission: pending a run.**
+`s0_parallel.py 2 10 read_behind_permission` asks for a Bash `touch`
+(which prompts) and then a `Read` of `a.txt` (which does not prompt in
+the default mode) in one message, holds the `touch` permission open for
+10 s, and records whether the `Read` result arrives before the permission
+is answered (`read_result_before_permission_answered`), plus any other
+prompt that arrived while it was open. Untested until it runs (see "Open
+S0 items"). An MCP tool with `readOnlyHint` in the same position is not
+probed.
 
 ### A.14 The harness's own queue in `-p` (§3)
 
@@ -1860,18 +1912,37 @@ Write, and in `plan` mode that wrote a plan file into
 `$CLAUDE_CONFIG_DIR/plans/` (the probe created that directory; it was
 removed). The second run's step 6 only reads the mode.
 
-### A.16 `claude /login` for a macOS user with no GUI session (owner decision 1) — BLOCKED on the operator
+### A.16 `claude /login` for a macOS user with no GUI session (owner decision 1)
 
-Not run: it needs a second macOS user, and the probe brief forbids an
-agent creating one or using `sudo`. `s0_login_flk_agent.sh` is the
-runbook; the operator runs it as that user from a non-GUI shell
-(`ssh flk-agent@localhost` or `sudo -iu flk-agent`) and posts its output
-on #1307. It records the user's keychain state (`security
-default-keychain`, `list-keychains`, `show-keychain-info`, whether a
-`gui/<uid>` launchd domain exists), runs `claude auth login` with
+Run by the operator on 2026-10-14 (#1307, comments 6165592953 and
+6165606960), as a throwaway non-admin macOS user, `s0probe` (uid 502),
+entered with `sudo -iu`: a shell with no GUI login session. Claude Code
+2.1.287. The runbook is `s0_login_flk_agent.sh`: it records the user's
+keychain state, runs `claude auth login` with
 `CLAUDE_CONFIG_DIR=$HOME/.flk/claude/s0-login`, checks where the token
-landed without printing it, runs one `-p` turn, and says to repeat the turn
-from a new shell and after a reboot.
+landed without printing it, and runs one `-p` turn.
+
+| Check | Result |
+|---|---|
+| `gui/<uid>` launchd domain | absent |
+| default keychain | none (`SecKeychainCopyDomainDefault user: A default keychain could not be found`) |
+| `claude auth login` | the browser step completed, then `Login failed: Couldn't save your login. If your Mac's keychain is locked, unlock it and log in again.`, exit 1 |
+| keychain item `Claude Code-credentials-<8 hex>` | not found (`security` exit 44) |
+| `.credentials.json` in the config dir | not written |
+| `claude auth status` | `loggedIn: false` |
+| the `-p` turn | exit 1 |
+
+The plaintext fallback read from the 2.1.296 code (below) did not happen on
+2.1.287 when the user has no keychain at all. So `/login` cannot persist a
+login for a user with no GUI session on that version.
+
+**The token path, same user and shell.** A `claude setup-token` token was
+installed as a 0600 file in the user's home. `CLAUDE_CODE_OAUTH_TOKEN=<the
+file's content> CLAUDE_CONFIG_DIR=<a fresh temp dir> claude -p --model haiku
+--no-session-persistence 'Reply with exactly: ok'` printed `ok` and exited
+0. The setup-token path works for a user with no GUI session and no
+keychain. Not reported: the repeat from a new shell and after a reboot
+that the runbook asks for.
 
 What the code shows (code, not run): the OAuth blob is written with
 `security add-generic-password -U -a "$USER" -s "Claude
@@ -1880,26 +1951,23 @@ was checked against the work profile's existing item) into the user's
 default keychain. If that write fails and the failure is not "locked"
 (`security` exit 36) for an item the keychain already holds, the token is
 written to `.credentials.json` in the config dir instead (telemetry
-`plaintext_fallback_used`). A user with no unlocked login keychain would
-therefore most likely get the plaintext file, which is the Linux path of
-§1. Reading it back in a later session goes through `security
-find-generic-password` first.
+`plaintext_fallback_used`). That reading is of 2.1.296; the run above, on
+2.1.287 with no default keychain, did not reach it. 2.1.296 was not run as
+that user.
 
 ### Open S0 items
 
-S0 is not complete until these have run:
+S0 is complete once item 1 is recorded.
 
-1. **A.13 controls, pending a re-run.** `s0_parallel.py 2 10
-   sleep_then_mcp slowtouch_then_mcp` decides whether an open permission or
-   serial execution of non-concurrency-safe tools holds a later call
-   (finding 3). They need a login token in `S0_OAUTH_TOKEN_FILE`
-   (`claude setup-token`, docs/adr/0036-probes/README.md). The untested
-   case "a concurrency-safe call behind an open permission" belongs with
-   them.
-2. **A.16 `/login` as a user with no GUI session, BLOCKED on the
-   operator.** It needs a second macOS user. The operator runs
-   `s0_login_flk_agent.sh` as that user from a non-GUI shell and posts the
-   output on #1307.
+1. **A.13: a concurrency-safe call behind an open permission, pending a
+   run.** `s0_parallel.py 2 10 read_behind_permission` (A.13). It needs a
+   login token in `S0_OAUTH_TOKEN_FILE` (`claude setup-token`,
+   docs/adr/0036-probes/README.md). Its result is recorded in A.13.
+
+Closed on 2026-10-14: the A.13 controls (no permission open; the hold is
+serial execution of non-concurrency-safe tools, A.13) and A.16 (`/login`
+cannot persist a login for a user with no GUI session; the token path
+works, A.16; owner decision 1 narrowed).
 
 ### A.17 Gotchas met while probing
 
@@ -1963,7 +2031,9 @@ and each item ends with where.
    for non-concurrent calls.
    *Applied, as observed and pending the controls, in §1 "Stall and
    waiting" (open requests tracked by id), §2b case 1 and "Failure
-   modes"; noted under owner decisions 3 and 3a.*
+   modes"; noted under owner decisions 3 and 3a. The controls ran on
+   2026-10-14 (#1404): serial execution holds the later call, not the
+   permission (A.13); §1, §2b and decision 3's note say so.*
 4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
    exists (`cancel_async_message{message_uuid}`, `queued` only), so
    `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the
@@ -1997,8 +2067,10 @@ and each item ends with where.
    token as a plaintext `.credentials.json` in the profile dir rather than
    in a keychain. That is safe only because the dir is private to
    `flk-agent` (§1); S3 should check its mode.
-   *Not applied: A.16 has not run ("Open S0 items", item 2); §1 and owner
-   decision 1 stand until it does.*
+   *Superseded by the run (A.16, 2026-10-14): on 2.1.287, with no keychain,
+   `/login` wrote no plaintext file and failed. The owner narrowed
+   decision 1 to `setup-token` for agent users (#1404); applied in §1 and
+   the S3 row.*
 7. **§9 capability probe.** An unsupported control subtype is answered at
    once with `error: "Unsupported control request subtype: <name>"`
    (A.14), so a capability probe can test a control verb such as
