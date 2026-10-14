@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use support::socket_dir::SocketDir;
 use support::{
     cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_flock_pid,
     send_input, unregister_spawned_flock_pid, wait_for_disconnect,
@@ -55,7 +56,7 @@ impl Drop for SpawnedFlock {
 ///
 /// What actually keeps concurrent binaries off each other's paths is naming:
 /// each test roots its config home, runtime dir and socket inside its own
-/// `unique_test_dir()` (a short per-binary prefix plus OS entropy), and the
+/// `SocketDir` reservation (a short per-binary prefix plus OS entropy), and the
 /// spawn helpers redirect `XDG_CONFIG_HOME` and
 /// `XDG_RUNTIME_DIR` into that tree. Most also pass an explicit
 /// `FLOCK_SOCKET_PATH` inside it; three deliberately `env_remove` it to
@@ -74,14 +75,32 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Atomically reserve a short random path, independent of PID reuse after a kill.
-/// Entropy or creation errors fail loudly. Abandoned directories remain untouched.
-fn unique_test_dir() -> PathBuf {
-    let mut random = [0; 8];
-    getrandom::fill(&mut random).expect("test directory entropy");
-    let path = PathBuf::from(format!("/tmp/hlh-{:016x}", u64::from_ne_bytes(random)));
-    fs::create_dir(&path).expect("reserve isolated handoff directory");
-    path
+#[test]
+fn socket_directory_is_removed_after_scope_exit() {
+    let path = {
+        let directory = SocketDir::reserve("hlh");
+        let base = directory.path().to_path_buf();
+        fs::create_dir(base.join("nested")).unwrap();
+        fs::write(base.join("nested/record"), b"fixture").unwrap();
+        base.clone()
+    };
+    assert!(!path.exists(), "normal scope leaked {path:?}");
+}
+
+#[test]
+fn socket_directory_is_removed_on_unwind() {
+    let mut path = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let directory = SocketDir::reserve("hlh");
+        let base = directory.path().to_path_buf();
+        path = Some(base.clone());
+        fs::create_dir(base.join("nested")).unwrap();
+        fs::write(base.join("nested/record"), b"fixture").unwrap();
+        panic!("fixture unwind");
+    }));
+    assert!(result.is_err(), "fixture must exercise unwinding");
+    let path = path.unwrap();
+    assert!(!path.exists(), "unwind leaked {path:?}");
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedFlock {
@@ -322,7 +341,8 @@ fn try_request_bounded(
 /// An alive API peer that never replies must fail inside the socket ceiling.
 #[test]
 fn recovery_request_fails_when_peer_stays_alive_and_silent() {
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let socket = base.join("silent.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let (release, gate) = std::sync::mpsc::channel();
@@ -580,7 +600,8 @@ fn wait_for_http_contains(port: u16, needle: &str, timeout: Duration) -> String 
 /// inside the sandbox, proves the lookup still finds a real match.
 #[test]
 fn handoff_importer_lookup_ignores_importers_outside_the_sandbox() {
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let elsewhere = base.join("elsewhere");
     let old_pid = 60058;
@@ -644,7 +665,8 @@ fn handoff_importer_lookup_ignores_importers_outside_the_sandbox() {
 #[test]
 fn live_server_holds_one_pty_master_fd_per_pane() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -728,7 +750,8 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
 #[test]
 fn live_handoff_preserves_named_session_socket_paths() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let session_dir = config_home.join("flock-dev/sessions/work");
@@ -774,7 +797,8 @@ fn live_handoff_preserves_named_session_socket_paths() {
 #[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -946,7 +970,8 @@ fn live_handoff_preserves_pane_process_io() {
 #[test]
 fn live_handoff_preserves_keyboard_protocol_for_client_input() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1035,7 +1060,8 @@ pathlib.Path({received:?}).write_text(data.hex())
 #[test]
 fn live_handoff_preserves_modify_other_keys_for_client_input() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1128,7 +1154,8 @@ pathlib.Path({received:?}).write_text(data.hex())
 #[test]
 fn live_handoff_accepts_old_pane_id_from_child_env() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1209,7 +1236,8 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
 #[test]
 fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1274,7 +1302,8 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
 #[test]
 fn live_handoff_keeps_shell_pane_after_foreground_process_exits() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1340,7 +1369,8 @@ fn live_handoff_keeps_shell_pane_after_foreground_process_exits() {
 #[test]
 fn live_handoff_preserves_python_http_server() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1411,7 +1441,8 @@ fn live_handoff_preserves_python_http_server() {
 #[test]
 fn live_handoff_preserves_http_servers_across_multiple_sessions() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let sessions = [
@@ -1504,7 +1535,8 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
 #[test]
 fn removed_config_keys_warn_on_cold_start_and_live_reload() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
     let runtime = base.join("runtime");
@@ -1555,7 +1587,8 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
 
 #[test]
 fn config_check_json_and_cli_warnings_name_source_keys() {
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime = base.join("runtime");
     let env = support::environment::isolated_env(&config_home, &runtime);
@@ -1654,7 +1687,8 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
 #[test]
 fn removed_config_key_during_handoff_succeeds_preserving_policy() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     fs::create_dir_all(&base).unwrap();
     let config_home = base.join("config");
     let runtime = base.join("runtime");
@@ -1709,7 +1743,8 @@ fn removed_config_key_during_handoff_succeeds_preserving_policy() {
 #[test]
 fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -1809,7 +1844,8 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             .unwrap_or_else(|error| panic!("{}", error.message))
     };
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -2392,7 +2428,8 @@ fn assert_pane_answers(api_socket: &Path, pane_id: &str, tag: usize) {
 #[test]
 fn live_handoff_carries_more_panes_than_one_fd_batch() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -2437,7 +2474,8 @@ fn live_handoff_carries_more_panes_than_one_fd_batch() {
 #[test]
 fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -2533,7 +2571,8 @@ fn delegation_edges(config_home: &Path) -> Vec<(String, String, String, bool)> {
 #[test]
 fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -2631,7 +2670,8 @@ fn delegation_edge_from_an_agent_pane_is_logged_and_reissued_across_live_handoff
 #[test]
 fn question_policy_follows_the_starter_refuses_widening_and_survives_live_handoff() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -2755,7 +2795,8 @@ fn visible_text(api_socket: &Path, pane_id: &str) -> String {
 #[test]
 fn live_handoff_keeps_an_idle_claude_pane_readable_repainted_and_its_mail_queued() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3083,7 +3124,8 @@ fn process_argv0(pid: u32) -> String {
 #[test]
 fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3149,7 +3191,8 @@ fn live_handoff_cli_hands_off_to_the_invoking_client_binary() {
 #[test]
 fn live_handoff_upgrades_an_older_server_to_the_client_version() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3195,7 +3238,8 @@ fn live_handoff_upgrades_an_older_server_to_the_client_version() {
 #[test]
 fn live_handoff_refuses_a_relative_import_exe_of_the_old_version() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3232,7 +3276,8 @@ fn live_handoff_refuses_a_relative_import_exe_of_the_old_version() {
 #[test]
 fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3272,7 +3317,8 @@ fn live_handoff_fails_when_the_replacement_is_still_the_old_version() {
 #[test]
 fn live_handoff_refuses_a_default_downgrade() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
@@ -3311,7 +3357,8 @@ fn live_handoff_refuses_a_default_downgrade() {
 #[test]
 fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
     let _lock = test_lock();
-    let base = unique_test_dir();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
