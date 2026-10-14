@@ -3,6 +3,12 @@
 //! This is an adapter model, not flock's frontend-neutral event schema (§11).
 //! Parsing is infallible, requires an observed harness version and retains the
 //! exact original line for unknown shapes, including non-JSON diagnostics.
+//!
+//! Optional metadata uses `Option<Option<T>>`: absent is None, explicit null is
+//! Some(None), and a value is Some(Some(value)). Under ADR-0036 §8, changing a
+//! metadata value to null leaves the shape key unchanged; adding an absent key
+//! changes its top-level key set. Required payloads and discriminators still
+//! classify incompatible shapes as Unknown.
 #![deny(missing_docs)]
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -59,41 +65,36 @@ pub struct ToolRequest {
     pub input: Map<String, Value>,
     /// Correlation with the assistant tool call.
     pub tool_use_id: String,
-    /// Harness `subtype` metadata from Appendix A.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
-    )]
-    pub subtype: Option<String>,
+    /// Required control discriminator; null is an unknown wire shape (§8).
+    pub subtype: String,
     /// Harness `display_name` metadata from Appendix A.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub display_name: Option<String>,
+    pub display_name: Option<Option<String>>,
     /// Harness `description` metadata from Appendix A.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub description: Option<String>,
+    pub description: Option<Option<String>>,
     /// Harness `permission_suggestions` metadata from Appendix A.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub permission_suggestions: Option<Vec<Value>>,
+    pub permission_suggestions: Option<Option<Vec<Value>>>,
     /// Harness `requires_user_interaction` metadata from Appendix A.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub requires_user_interaction: Option<bool>,
+    pub requires_user_interaction: Option<Option<bool>>,
     /// Future control fields absent from the catalogue.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -111,7 +112,7 @@ pub struct RateLimitInfo {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub resets_at: Option<Value>,
+    pub resets_at: Option<Option<Value>>,
     /// Harness `rateLimitType` metadata from Appendix A.
     #[serde(rename = "rateLimitType")]
     #[serde(
@@ -119,7 +120,7 @@ pub struct RateLimitInfo {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    pub rate_limit_type: Option<String>,
+    pub rate_limit_type: Option<Option<String>>,
     /// Future provider metadata absent from the catalogue.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -143,20 +144,20 @@ macro_rules! events {
                 subtype: Option<String>,
                 /// Harness session identifier, if emitted on this envelope.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-                pub session_id: Option<String>,
+                pub session_id: Option<Option<String>>,
                 /// Transcript/event UUID, if emitted.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-                pub uuid: Option<String>,
+                pub uuid: Option<Option<String>>,
                 /// Parent tool call for subagent output; explicit null is retained.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
                 pub parent_tool_use_id: Option<Option<String>>,
                 /// Harness timestamp, in its original JSON representation.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-                pub timestamp: Option<Value>,
+                pub timestamp: Option<Option<Value>>,
                 $($(#[$field_doc])* pub $field: $ty,)*
                 $($(#[$optional_doc])*
                     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-                    pub $optional: Option<$optional_ty>,)*
+                    pub $optional: Option<Option<$optional_ty>>,)*
                 /// Fields not modelled by the Appendix A catalogue.
                 #[serde(flatten)]
                 pub extra: Map<String, Value>,
@@ -346,7 +347,7 @@ events! {
         compact_metadata: Map<String, Value>,
     } optional {
         /// Harness `logical_parent_uuid` metadata from Appendix A.
-        logical_parent_uuid: Option<String>,
+        logical_parent_uuid: String,
     }
     /// A harness-reported tool denial (A.2, A.17).
     PermissionDenied("system", "/subtype", "permission_denied") {
@@ -518,11 +519,11 @@ events! {
         /// Harness `result` metadata from Appendix A.
         result: String,
         /// Harness `stop_reason` metadata from Appendix A.
-        stop_reason: Option<String>,
+        stop_reason: String,
         /// Harness `terminal_reason` metadata from Appendix A.
         terminal_reason: String,
         /// Harness `api_error_status` metadata from Appendix A.
-        api_error_status: Option<u16>,
+        api_error_status: u16,
         /// Harness `usage` metadata from Appendix A.
         usage: Map<String, Value>,
         /// Harness `modelUsage` metadata from Appendix A.
@@ -549,11 +550,11 @@ events! {
         /// Harness `result` metadata from Appendix A.
         result: String,
         /// Harness `stop_reason` metadata from Appendix A.
-        stop_reason: Option<String>,
+        stop_reason: String,
         /// Harness `terminal_reason` metadata from Appendix A.
         terminal_reason: String,
         /// Harness `api_error_status` metadata from Appendix A.
-        api_error_status: Option<u16>,
+        api_error_status: u16,
         /// Harness `usage` metadata from Appendix A.
         usage: Map<String, Value>,
         /// Harness `modelUsage` metadata from Appendix A.

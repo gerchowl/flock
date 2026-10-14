@@ -350,14 +350,16 @@ fn read_installed_status(server: &ServerRuntimeStatus) -> InstalledStatusJson {
     installed_status_at(
         crate::integration::launch::stable_launch_path(),
         server,
-        std::time::Duration::from_secs(2),
+        |path| execute_installed_version(path, std::time::Duration::from_secs(2)),
     )
 }
 
+/// Derive drift from a version probe, retaining real path resolution before
+/// the injected command executes. Production supplies its bounded transport.
 fn installed_status_at(
     path: std::io::Result<std::path::PathBuf>,
     server: &ServerRuntimeStatus,
-    timeout: std::time::Duration,
+    execute: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::Output>,
 ) -> InstalledStatusJson {
     let mut status = InstalledStatusJson {
         binary: None,
@@ -368,7 +370,7 @@ fn installed_status_at(
     };
     let result = path.and_then(|path| {
         status.binary = Some(path.display().to_string());
-        probe_installed_version(&path, timeout)
+        probe_installed_version(&path, execute)
     });
     match result {
         Ok(version) => {
@@ -386,18 +388,25 @@ fn installed_status_at(
     status
 }
 
-fn probe_installed_version(
+fn execute_installed_version(
     path: &std::path::Path,
     timeout: std::time::Duration,
-) -> std::io::Result<String> {
+) -> std::io::Result<std::process::Output> {
     // --version is an identity-only command, including for older installed flk.
     // Never execute a harness's arbitrary configured MCP command to probe it.
-    // Resolve only for this probe, never for the persisted launch command.
-    let probe_path = std::fs::canonicalize(path)?;
-    let output = crate::process::TracedCommand::new(probe_path, "status")
+    crate::process::TracedCommand::new(path, "status")
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        .output_traced_with_timeout(timeout)?;
+        .output_traced_with_timeout(timeout)
+}
+
+fn probe_installed_version(
+    path: &std::path::Path,
+    execute: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::Output>,
+) -> std::io::Result<String> {
+    // Resolve only for this probe, never for the persisted launch command.
+    let probe_path = std::fs::canonicalize(path)?;
+    let output = execute(&probe_path)?;
     if !output.status.success() {
         return Err(std::io::Error::other("installed flk --version failed"));
     }
@@ -573,6 +582,7 @@ mod installed_tests {
     #[test]
     fn installed_version_probe_reports_three_way_drift_after_symlink_retarget() {
         use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::process::ExitStatusExt;
         let dir = crate::test_support::unique_temp_path("installed-version-drift");
         std::fs::create_dir_all(&dir).unwrap();
         let launch = dir.join("flk");
@@ -585,6 +595,23 @@ mod installed_tests {
             std::fs::write(path, format!("#!/bin/sh\nprintf 'flk {version}\\n'\n")).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let first_resolved = std::fs::canonicalize(&first).unwrap();
+        let second_resolved = std::fs::canonicalize(&second).unwrap();
+        let mut executed = Vec::new();
+        let mut execute = |resolved: &std::path::Path| {
+            executed.push(resolved.to_path_buf());
+            let version = if resolved == first_resolved {
+                crate::build_info::version()
+            } else {
+                assert_eq!(resolved, second_resolved, "execute the resolved target");
+                "99.0.0-fixture".to_owned()
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: format!("flk {version}\n").into_bytes(),
+                stderr: Vec::new(),
+            })
+        };
         symlink(&first, &launch).unwrap();
         let server = ServerRuntimeStatus::Running {
             version: Some(crate::build_info::version()),
@@ -593,32 +620,27 @@ mod installed_tests {
             session_health: None,
             api_listener: None,
         };
-        let before = installed_status_at(
-            Ok(launch.clone()),
-            &server,
-            std::time::Duration::from_secs(10),
-        );
+        let before = installed_status_at(Ok(launch.clone()), &server, &mut execute);
         assert_eq!(before.client_drift, Some(false), "{before:?}");
         assert_eq!(before.server_drift, Some(false));
         std::fs::remove_file(&launch).unwrap();
         symlink(&second, &launch).unwrap();
-        let after = installed_status_at(
-            Ok(launch.clone()),
-            &server,
-            std::time::Duration::from_secs(10),
-        );
+        let after = installed_status_at(Ok(launch.clone()), &server, &mut execute);
         assert_eq!(after.version.as_deref(), Some("99.0.0-fixture"));
         assert_eq!(after.client_drift, Some(true));
         assert_eq!(after.server_drift, Some(true));
         assert_eq!(after.binary.as_deref(), Some(launch.to_str().unwrap()));
         assert!(after.error.is_none());
-        let absent = installed_status_at(
-            Ok(launch),
-            &ServerRuntimeStatus::NotRunning,
-            std::time::Duration::from_secs(10),
-        );
+        let absent =
+            installed_status_at(Ok(launch), &ServerRuntimeStatus::NotRunning, &mut execute);
         assert!(absent.server_drift.is_none());
-        assert!(absent.version.is_some());
+        assert_eq!(absent.version.as_deref(), Some("99.0.0-fixture"));
+        assert_eq!(absent.client_drift, Some(true));
+        assert!(absent.error.is_none());
+        assert_eq!(
+            executed,
+            vec![first_resolved, second_resolved.clone(), second_resolved]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -630,30 +652,29 @@ mod installed_tests {
         let path = dir.join("flk");
         std::fs::write(&path, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err =
-            probe_installed_version(&path, std::time::Duration::from_millis(100)).unwrap_err();
+        let err = probe_installed_version(&path, |path| {
+            execute_installed_version(path, std::time::Duration::from_millis(100))
+        })
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         for script in [
             "#!/bin/sh\nexit 1\n",
             "#!/bin/sh\nprintf 'unrelated output\\n'\n",
         ] {
             std::fs::write(&path, script).unwrap();
-            let status = installed_status_at(
-                Ok(path.clone()),
-                &ServerRuntimeStatus::NotRunning,
-                std::time::Duration::from_secs(10),
-            );
+            let status =
+                installed_status_at(Ok(path.clone()), &ServerRuntimeStatus::NotRunning, |path| {
+                    execute_installed_version(path, std::time::Duration::from_secs(10))
+                });
             assert!(status.version.is_none());
             assert!(status.error.is_some());
             assert!(status.client_drift.is_none());
             assert!(status.server_drift.is_none());
         }
         std::fs::remove_file(&path).unwrap();
-        let missing = installed_status_at(
-            Ok(path),
-            &ServerRuntimeStatus::NotRunning,
-            std::time::Duration::from_secs(10),
-        );
+        let missing = installed_status_at(Ok(path), &ServerRuntimeStatus::NotRunning, |path| {
+            execute_installed_version(path, std::time::Duration::from_secs(10))
+        });
         assert!(missing.error.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }

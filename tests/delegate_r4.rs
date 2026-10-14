@@ -666,6 +666,33 @@ fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
     finish(child);
     wait_typed(&server, 1);
 
+    // A configured advice producer may stay alive and silent. It must not
+    // receive a fresh budget after the delegate deadline has already expired.
+    // Dropping this listener resets queued advice connections, including when
+    // an assertion unwinds before the fake producer has finished connecting.
+    let advice_marker = server.base.join("advice-started");
+    let advice_path = server.base.join("advice-gate.sock");
+    let advice_gate = UnixListener::bind(&advice_path).unwrap();
+    let curl = bin_dir(&server.base).join("curl");
+    fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\nexec python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); open(sys.argv[2], \"w\").write(\"entered\"); s.recv(1)' '{}' '{}'\n",
+            advice_path.display(),
+            advice_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = server
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("config.toml");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str("\n[systemone]\ntimeout_s = 5.0\n");
+    fs::write(config, contents).unwrap();
+
     let pid = server.child.process_id().expect("server pid") as libc::pid_t;
     // Relay startup requests normally. Freeze only when the CLI reaches its
     // settled-phase sample, so process startup is outside the measured budget.
@@ -690,7 +717,9 @@ fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
                 frozen_tx.send(Instant::now()).unwrap();
                 // Keep both sockets open without replying until the CLI exits.
                 // The guard resumes this isolated server even on assertion panic.
-                let _ = release_rx.recv();
+                release_rx
+                    .recv_timeout(WITHIN)
+                    .expect("frozen relay release");
                 drop(frozen);
                 break;
             }
@@ -714,25 +743,44 @@ fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
             "--json",
         ],
     )
+    .env("SYSTEMONE_URL", "http://advice.invalid")
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    let started = frozen_rx
-        .recv_timeout(WITHIN)
-        .expect("settled sample reached");
+    let started = match frozen_rx.recv_timeout(WITHIN) {
+        Ok(started) => started,
+        Err(error) => {
+            let out = finish(waiter);
+            panic!(
+                "settled sample never arrived: {error}; stderr {}",
+                stderr(&out)
+            );
+        }
+    };
     let status = exited_within(&mut waiter, Duration::from_secs(8));
     let elapsed = started.elapsed();
-    drop(release_tx);
+    release_tx.send(()).expect("release frozen relay");
     relay.join().unwrap();
-    let status = status.expect("the wait must end while the server is frozen");
+    drop(advice_gate);
     let out = finish(waiter);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "the wait must end while the server is frozen; silent advice entered: {}",
+            advice_marker.exists()
+        )
+    });
     assert_eq!(status.code(), Some(124), "stderr {}", stderr(&out));
     assert!(
         elapsed < Duration::from_secs(5),
         "ended at its deadline, not later: {elapsed:?}"
     );
     assert_eq!(stdout_json(&out)["outcome"], "timeout");
+    assert_eq!(stdout_json(&out)["s1_skipped"], "deadline");
+    assert!(
+        !advice_marker.exists(),
+        "expired wait must not start optional advice"
+    );
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
