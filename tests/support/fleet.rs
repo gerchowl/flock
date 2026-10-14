@@ -307,19 +307,11 @@ impl Node {
 
     /// Create a workspace over the JSON API socket (fresh servers have none).
     pub fn create_workspace(&self, cwd: &Path) -> String {
-        let mut stream = UnixStream::connect(&self.api_socket).expect("API socket should connect");
         let request = format!(
             "{{\"id\":\"test:ws\",\"method\":\"workspace.create\",\"params\":{{\"cwd\":\"{}\",\"focus\":true}}}}\n",
             cwd.display()
         );
-        stream.write_all(request.as_bytes()).unwrap();
-        stream.flush().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
-        let mut response = String::new();
-        std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+        let response = self.api(&request);
         assert!(
             response.contains("\"result\""),
             "workspace.create failed on {}: {response}",
@@ -329,20 +321,10 @@ impl Node {
     }
 
     /// Raw JSON-API call against this node's socket; returns the response line.
+    /// Both I/O directions use ten-second timeouts configured before sending.
     pub fn api(&self, request: &str) -> String {
-        let mut stream = UnixStream::connect(&self.api_socket).expect("API socket should connect");
-        stream.write_all(request.as_bytes()).unwrap();
-        if !request.ends_with('\n') {
-            stream.write_all(b"\n").unwrap();
-        }
-        stream.flush().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
-        let mut response = String::new();
-        std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
-        response
+        super::json_api::request(&self.api_socket, request, Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("API exchange for {} failed: {e}", self.name))
     }
 
     /// Type one command line into a shell pane and press Enter.
