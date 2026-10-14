@@ -162,37 +162,84 @@ mod tests {
         let (_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app =
             super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let store = crate::mesh::runtime_store::TestStore::new();
+        let relay = RelaySend {
+            mesh: store.delivery(),
+            id: "request".into(),
+            peer: crate::config::PeerConfig::default(),
+            to_agent: "agent_nodeb_recipient".into(),
+            host: "nodeb".into(),
+            direct: true,
+            from_agent: "agent_nodea_sender".into(),
+            correlation_id: "question".into(),
+            intent: MsgIntent::NeedsReply,
+            respond_to: None,
+        };
+        let completion = || {
+            AppEvent::MsgRelayCompleted(Box::new(RelayCompletion {
+                send: relay.clone(),
+                result: Ok(true),
+                receipt: None,
+            }))
+        };
+        // Unrelated events must not count toward the four relay completions.
+        // Gate workers until these events are received to force that ordering.
+        for _ in 0..4 {
+            app.event_tx
+                .try_send(AppEvent::ClipboardWrite {
+                    content: Vec::new(),
+                })
+                .unwrap();
+        }
+        let mut releases = Vec::new();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         for index in 0..5 {
             let started = started_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let completed = completion();
             app.enqueue_message_relay(RelayWork {
                 run: Box::new(move || {
+                    release_rx.recv().unwrap();
                     started.send(index).unwrap();
-                    AppEvent::ClipboardWrite {
-                        content: Vec::new(),
-                    }
+                    completed
                 }),
-                failure: AppEvent::ClipboardWrite {
-                    content: Vec::new(),
-                },
+                failure: completion(),
             });
         }
-        for _ in 0..4 {
-            tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut completed = 0;
+            while completed < 4 {
+                match app.event_rx.recv().await.unwrap() {
+                    AppEvent::MsgRelayCompleted(_) => completed += 1,
+                    _ => {
+                        for release in releases.drain(..) {
+                            release.send(()).unwrap();
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("four relay workers should complete");
         let mut started: Vec<_> = started_rx.try_iter().collect();
         started.sort();
         assert_eq!(started, vec![0, 1, 2, 3]);
         assert_eq!(app.message_relays.running, 4);
         assert_eq!(app.message_relays.waiting.len(), 1);
         app.finish_message_relay();
-        tokio::time::timeout(std::time::Duration::from_secs(5), app.event_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    app.event_rx.recv().await.unwrap(),
+                    AppEvent::MsgRelayCompleted(_)
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("queued relay worker should complete");
         assert_eq!(started_rx.try_recv().unwrap(), 4);
         for _ in 0..4 {
             app.finish_message_relay();

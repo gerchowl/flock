@@ -19,7 +19,7 @@ mod support;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
@@ -142,6 +142,10 @@ fn create_db(base: &Path) {
 }
 
 fn start_server() -> Server {
+    start_server_with_readiness(false)
+}
+
+fn start_server_with_readiness(announced: bool) -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -198,13 +202,43 @@ fn start_server() -> Server {
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    wait_for_socket(&socket, Duration::from_secs(5));
-    Server {
+    // Construct the owner before waiting, so any readiness failure kills and
+    // reaps this child through Server::drop.
+    let server = Server {
         _master: pair.master,
         child,
         base,
         socket,
+    };
+    drop(pair.slave);
+    if announced {
+        let reader = server._master.try_clone_reader().unwrap();
+        let socket = server.socket.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let _ = tx.send(support::readiness::read_announcement(reader, &socket));
+        });
+        // This is a failure ceiling, not a startup-duration assertion. The
+        // announcement, including both socket lines, decides the pass path.
+        let result = rx.recv_timeout(Duration::from_secs(30));
+        match result {
+            Ok(result) => {
+                reader.join().expect("readiness reader panicked");
+                result.unwrap_or_else(|err| panic!("server readiness failed: {err}"));
+            }
+            Err(err) => {
+                drop(server);
+                // Do not join a potentially blocked reader on the failure path.
+                drop(reader);
+                panic!(
+                    "server readiness did not arrive within the 30-second failure ceiling: {err}"
+                );
+            }
+        }
+    } else {
+        wait_for_socket(&server.socket, Duration::from_secs(5));
     }
+    server
 }
 
 fn request(server: &Server, json: &str) -> serde_json::Value {
@@ -599,12 +633,28 @@ fn a21_worktree_without_branch_is_a_usage_error() {
     assert!(walk(&server.base.join("wt")).is_empty(), "no checkout");
 }
 
+/// Resume the test's own server when the frozen socket is released.
+struct FrozenServer(libc::pid_t);
+
+impl FrozenServer {
+    fn stop(pid: libc::pid_t) -> Self {
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        Self(pid)
+    }
+}
+
+impl Drop for FrozenServer {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 /// E22 (regression guard; passes on 6ddf746 too): with the server frozen
 /// (SIGSTOP) while `delegate wait` is still in the settled phase, the wait ends
 /// at its timeout: exit 124 with the timeout outcome object.
 #[test]
 fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
-    let server = start_server();
+    let server = start_server_with_readiness(true);
     operator_workspace(&server);
     let b = brief(&server, "task.md", "x\n");
     let mut child = start_cwd(&server, "d1", &b, &["--json"]);
@@ -617,7 +667,41 @@ fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
     wait_typed(&server, 1);
 
     let pid = server.child.process_id().expect("server pid") as libc::pid_t;
-    let mut waiter = cli_spawn(
+    // Relay startup requests normally. Freeze only when the CLI reaches its
+    // settled-phase sample, so process startup is outside the measured budget.
+    // Keep the public socket name: the delegate registry is keyed by that path.
+    let socket = server.base.join("runtime/upstream.sock");
+    fs::rename(&server.socket, &socket).unwrap();
+    let listener = UnixListener::bind(&server.socket).unwrap();
+    let (frozen_tx, frozen_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let relay = thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut client = stream.unwrap();
+            let mut line = String::new();
+            BufReader::new(client.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let mut upstream = UnixStream::connect(&socket).unwrap();
+            if request["id"] == "cli:settled:agent-get" {
+                let frozen = FrozenServer::stop(pid);
+                upstream.write_all(line.as_bytes()).unwrap();
+                frozen_tx.send(Instant::now()).unwrap();
+                // Keep both sockets open without replying until the CLI exits.
+                // The guard resumes this isolated server even on assertion panic.
+                let _ = release_rx.recv();
+                drop(frozen);
+                break;
+            }
+            upstream.set_read_timeout(Some(WITHIN)).unwrap();
+            upstream.write_all(line.as_bytes()).unwrap();
+            let mut response = String::new();
+            BufReader::new(upstream).read_line(&mut response).unwrap();
+            client.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let mut waiter = command(
         &server,
         &[
             "delegate",
@@ -629,14 +713,19 @@ fn a22_a_frozen_server_cannot_hold_a_wait_past_its_deadline() {
             "2000",
             "--json",
         ],
-    );
-    thread::sleep(Duration::from_millis(300));
-    let started = Instant::now();
-    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let started = frozen_rx
+        .recv_timeout(WITHIN)
+        .expect("settled sample reached");
     let status = exited_within(&mut waiter, Duration::from_secs(8));
-    unsafe { libc::kill(pid, libc::SIGCONT) };
-    let status = status.expect("the wait must end while the server is frozen");
     let elapsed = started.elapsed();
+    drop(release_tx);
+    relay.join().unwrap();
+    let status = status.expect("the wait must end while the server is frozen");
     let out = finish(waiter);
     assert_eq!(status.code(), Some(124), "stderr {}", stderr(&out));
     assert!(
