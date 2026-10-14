@@ -667,12 +667,39 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
     // The origin retries the committed key after the acknowledgement was lost.
     reconnect(&conversation.fleet, "nodea", "nodeb");
     due(conversation.fleet.node("nodea"));
-    state(conversation.fleet.node("nodea"), "question", "delivered");
-    assert!(conversation
+    // Replay must meet the already-read row without making it unread again.
+    // Genuine read evidence may overtake the lost delivery acknowledgement.
+    let duplicate = conversation
         .fleet
         .base
-        .join("delivered-receipt-nodea-nodeb")
-        .exists());
+        .join("delivered-receipt-nodea-nodeb");
+    fleet::wait_until("duplicate delivery acknowledged", DEADLINE, || {
+        api(conversation.fleet.node("nodeb"), "ping", json!({}));
+        if !duplicate.exists() {
+            return None;
+        }
+        let status = api(
+            conversation.fleet.node("nodea"),
+            "msg.status",
+            json!({
+                "correlation_id":"question"
+            }),
+        );
+        match status["state"].as_str() {
+            Some("queued") => None,
+            Some("delivered" | "read") => Some(()),
+            other => panic!("unexpected state after genuine read: {other:?}; {status}"),
+        }
+    });
+    state(conversation.fleet.node("nodea"), "question", "read");
+    let inbox: (i64, i64) = db(conversation.fleet.node("nodeb"))
+        .query_row(
+            "SELECT count(*),sum(state='read') FROM envelopes WHERE correlation='question'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inbox, (1, 1), "replay must preserve one read import");
     assert_eq!(
         read(
             conversation.fleet.node("nodeb"),
