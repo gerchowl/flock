@@ -5,7 +5,7 @@
 //! the supervisor must observe both completions before releasing session files.
 //! Disk and transport failures are explicit completions, never turn results.
 //! Each durable record is buffered before one write_all. Reopen repairs a torn
-//! final record by truncating to the last good newline, logging discarded bytes
+//! final record without a trailing LF, logging discarded bytes
 //! and continuing its sequence; interior corruption remains an explicit error.
 //! Envelope origins distinguish transport summaries from stdout lookalikes.
 //! Any top-level result ends the input gate; its outcome remains adapter work.
@@ -224,11 +224,15 @@ impl Transport {
 
     /// Cancel both workers, including a reader blocked on consumer back-pressure.
     /// Cancellation is explicit Interrupted completion, not a silent EOF.
+    /// Like close_stdin, cancellation can leave a partial JSON line on stdin
+    /// before EOF. Record stop intent first; truncation is never turn success.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
 }
 
+/// Drop requests cancellation without joining. An in-flight stdin write may be
+/// left as a partial JSON line before EOF, just as with close_stdin/cancel.
 impl Drop for Transport {
     fn drop(&mut self) {
         self.cancel();
@@ -301,9 +305,9 @@ fn write_inputs(
 
 /// Open an exclusively owned session stream. Records are serialized in memory
 /// and submitted with one write_all; short writes/crashes can still tear a tail.
-/// Recovery truncates only a malformed final record (including invalid JSON with
-/// a trailing LF), syncs the repair, logs discarded bytes and resumes the last
-/// good sequence. Interior corruption and non-dense sequences fail explicitly.
+/// Recovery truncates only a final tail without a trailing LF, syncs the repair,
+/// logs discarded bytes and resumes the last good sequence. Malformed records
+/// ending in LF are corruption and are refused, as are non-dense sequences.
 fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
@@ -332,20 +336,16 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                 break;
             }
             let record = serde_json::from_slice::<StreamRecord>(&line);
-            if line.ends_with(b"\n") && record.is_ok() {
-                let record = record.map_err(io::Error::other)?;
+            if line.ends_with(b"\n") {
+                let record = record.map_err(|_| io::Error::other("corrupt session record"))?;
                 if Some(record.seq) != seq.checked_add(1) {
                     return Err(io::Error::other("non-dense session sequence"));
                 }
                 seq = record.seq;
                 good_bytes += n;
             } else {
-                if line.ends_with(b"\n") && good_bytes + n < length {
-                    return Err(io::Error::other("interior session corruption"));
-                }
-                // An oversized torn tail is scanned in bounded chunks. A newline
-                // before EOF would make it interior corruption, never a repair.
-                let mut position = good_bytes + n;
+                // A bounded scan accepts only an unterminated final tail. Any
+                // newline makes this a complete corrupt record, never a repair.
                 let mut chunk = [0; 8192];
                 loop {
                     if cancel.load(Ordering::Acquire) {
@@ -355,12 +355,9 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                     if n == 0 {
                         break;
                     }
-                    for (index, byte) in chunk[..n].iter().enumerate() {
-                        if *byte == b'\n' && position + index as u64 + 1 != length {
-                            return Err(io::Error::other("interior session corruption"));
-                        }
+                    if chunk[..n].contains(&b'\n') {
+                        return Err(io::Error::other("corrupt session record"));
                     }
-                    position += n as u64;
                 }
                 break;
             }

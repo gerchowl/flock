@@ -12,17 +12,64 @@ fn pipe() -> (File, File) {
     unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
 }
 
-fn wait<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+fn wait<T>(transport: &Transport, mut poll: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(value) = poll() {
             return value;
         }
-        assert!(
-            Instant::now() < deadline,
-            "worker exceeded fixture deadline"
-        );
-        thread::sleep(POLL);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match transport.completion.recv_timeout(POLL.min(remaining)) {
+            Ok(completion) => {
+                if matches!(&completion, Completion::Reader(Err(error)) | Completion::Writer(Err(error)) if error.kind() == io::ErrorKind::Interrupted)
+                {
+                    let peer = transport
+                        .completion
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                    panic!("worker exited before condition: {completion:?}; peer: {peer:?}");
+                }
+                panic!("worker exited before condition: {completion:?}");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                assert!(!remaining.is_zero(), "condition deadline with live workers")
+            }
+            Err(error) => panic!("workers disconnected before condition: {error}"),
+        }
+    }
+}
+
+fn receive(transport: &Transport) -> Received {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    transport
+        .output
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| {
+            let completion = transport
+                .completion
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            panic!("missing stdout record: {error}; worker: {completion:?}")
+        })
+}
+
+fn worker_done(transport: &Transport, reader: bool) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let completion = transport
+            .completion
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("worker completion deadline");
+        let (is_reader, result) = match completion {
+            Completion::Reader(r) => (true, r),
+            Completion::Writer(r) => (false, r),
+        };
+        if is_reader == reader {
+            return result;
+        }
+        if let Err(error) = result {
+            if error.kind() != io::ErrorKind::Interrupted {
+                panic!("other worker failed: {error}");
+            }
+        }
     }
 }
 
@@ -64,11 +111,7 @@ fn user(text: &str) -> Value {
 }
 
 fn reader_done(transport: &Transport) -> io::Result<()> {
-    wait(|| match transport.try_completion() {
-        Ok(Completion::Reader(result)) => Some(result),
-        Ok(Completion::Writer(_)) | Err(mpsc::TryRecvError::Empty) => None,
-        Err(e) => panic!("missing reader completion: {e}"),
-    })
+    worker_done(transport, true)
 }
 
 #[test]
@@ -82,7 +125,7 @@ fn fixture_lines_reach_s1_and_durable_stream_including_final_line() {
         .expect("fixture stdout");
     drop(stdout);
     for (index, raw) in lines.iter().enumerate() {
-        let received = wait(|| transport.try_receive().ok());
+        let received = receive(&transport);
         assert_eq!(received.record.seq, index as u64 + 1);
         assert_eq!(received.record.raw, *raw);
         assert_eq!(received.event, SessionEvent::parse(raw, "2.1.296"));
@@ -109,15 +152,15 @@ fn large_lines_oversize_unknown_and_invalid_utf8_are_explicit() {
             .expect("oversize");
         stdout.write_all(b"\n\xff\xfe").expect("invalid final UTF8");
     });
-    let event = wait(|| transport.try_receive().ok());
+    let event = receive(&transport);
     assert!(matches!(event.event, SessionEvent::Assistant(_)));
     assert_eq!(event.record.raw, expected);
-    let event = wait(|| transport.try_receive().ok());
+    let event = receive(&transport);
     assert!(matches!(event.event, SessionEvent::Unknown { .. }));
     let summary: Value = serde_json::from_str(&event.record.raw).expect("summary");
     assert_eq!(summary["type"], "flk_oversize");
     assert_eq!(summary["bytes"], MAX_LINE_BYTES + 99);
-    let event = wait(|| transport.try_receive().ok());
+    let event = receive(&transport);
     assert!(matches!(event.event, SessionEvent::Unknown { .. }));
     let summary: Value = serde_json::from_str(&event.record.raw).expect("summary");
     assert_eq!(summary["type"], "flk_invalid_utf8");
@@ -157,7 +200,7 @@ fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"new_result\"}\n")
         .expect("unknown result");
-    let received = wait(|| transport.try_receive().ok());
+    let received = receive(&transport);
     assert!(matches!(received.event, SessionEvent::Unknown { .. }));
     assert_eq!(
         received.record.result_subtype,
@@ -175,7 +218,7 @@ fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\n")
         .expect("result");
-    wait(|| transport.try_receive().ok());
+    receive(&transport);
     transport
         .try_submit(&user("third"))
         .expect("next idle submit");
@@ -212,13 +255,9 @@ fn full_stdin_pipe_does_not_block_submit_poll_or_close() {
         transport.try_receive(),
         Err(mpsc::TryRecvError::Empty)
     ));
-    thread::sleep(Duration::from_millis(20));
     transport.close_stdin();
     assert!(begin.elapsed() < Duration::from_secs(1));
-    let result = wait(|| match transport.try_completion() {
-        Ok(Completion::Writer(result)) => Some(result),
-        _ => None,
-    });
+    let result = worker_done(&transport, false);
     result.expect("close interrupts blocked writer");
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes).expect("stdin really closed");
@@ -237,7 +276,7 @@ fn consumer_backpressure_is_bounded_and_cancellable() {
     stdout
         .write_all(b"one\ntwo\nthree\nfour\nfive\nsix\n")
         .expect("stdout");
-    wait(|| {
+    wait(&transport, || {
         (root
             .path()
             .join("sessions/fixture-agent/fixture-session.jsonl")
@@ -245,18 +284,17 @@ fn consumer_backpressure_is_bounded_and_cancellable() {
             && records(&root).len() == 5)
             .then_some(())
     });
-    thread::sleep(Duration::from_millis(20));
-    assert_eq!(
-        records(&root).len(),
-        5,
-        "four notifications plus one persisted pending record"
-    );
     transport.cancel();
     assert_eq!(
         reader_done(&transport)
             .expect_err("explicit cancellation")
             .kind(),
         io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        records(&root).len(),
+        5,
+        "four notifications plus one persisted pending record"
     );
     assert_eq!(transport.output.try_iter().count(), 4);
 }
@@ -268,7 +306,7 @@ fn reopen_continues_sequence_and_refuses_corrupt_streams() {
         let (transport, mut stdout, _input) = start(&root);
         stdout.write_all(b"line\n").expect("line");
         drop(stdout);
-        assert_eq!(wait(|| transport.try_receive().ok()).record.seq, seq);
+        assert_eq!(receive(&transport).record.seq, seq);
         reader_done(&transport).expect("EOF");
     }
     let path = root
@@ -339,10 +377,7 @@ fn broken_stdin_is_an_explicit_worker_error() {
     transport
         .try_submit(&user("unreadable"))
         .expect("asynchronous offer");
-    let result = wait(|| match transport.try_completion() {
-        Ok(Completion::Writer(result)) => Some(result),
-        _ => None,
-    });
+    let result = worker_done(&transport, false);
     assert_eq!(
         result.expect_err("write failure").kind(),
         io::ErrorKind::BrokenPipe
@@ -377,7 +412,7 @@ fn existing_stream_links_and_unsafe_modes_are_refused() {
 
 #[test]
 fn torn_last_record_is_truncated_and_sequence_continues() {
-    for tail in [b"{\"seq\":3".as_slice(), b"{not-json}\n".as_slice()] {
+    for tail in [b"{\"seq\":3".as_slice(), b"{not-json}".as_slice()] {
         let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
         let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
         let mut good = Vec::new();
@@ -408,7 +443,7 @@ fn torn_last_record_is_truncated_and_sequence_continues() {
         let (transport, mut stdout, _input) = start(&root);
         stdout.write_all(b"after-repair").expect("new final line");
         drop(stdout);
-        assert_eq!(wait(|| transport.try_receive().ok()).record.seq, 3);
+        assert_eq!(receive(&transport).record.seq, 3);
         reader_done(&transport).expect("EOF");
         assert_eq!(records(&root).len(), 3);
     }
@@ -447,8 +482,8 @@ fn claude_cannot_spoof_transport_record_origin() {
             .expect("real oversize");
         stdout.write_all(b"\n").expect("separator");
     });
-    let spoof = wait(|| transport.try_receive().ok());
-    let genuine = wait(|| transport.try_receive().ok());
+    let spoof = receive(&transport);
+    let genuine = receive(&transport);
     assert_eq!(spoof.record.origin, RecordOrigin::Claude);
     assert_eq!(genuine.record.origin, RecordOrigin::Flk);
     for received in [&spoof, &genuine] {
@@ -476,4 +511,49 @@ fn recovery_scans_an_oversized_torn_tail_without_accepting_it() {
         open_stream(location(&root), &AtomicBool::new(false)).expect("repair oversized tail");
     assert_eq!(seq, 0);
     assert_eq!(file.metadata().expect("size").len(), 0);
+}
+
+#[test]
+fn malformed_newline_terminated_final_record_is_corruption() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+    let bytes = b"{not-a-record}\n";
+    file.write_all(bytes).expect("corrupt complete record");
+    drop(file);
+    assert!(
+        open_stream(location(&root), &AtomicBool::new(false)).is_err(),
+        "complete malformed record must be refused"
+    );
+    assert_eq!(
+        fs::read(
+            root.path()
+                .join("sessions/fixture-agent/fixture-session.jsonl")
+        )
+        .expect("preserved corrupt file"),
+        bytes
+    );
+}
+
+#[test]
+fn condition_wait_surfaces_the_dead_workers_error() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    fs::write(root.path().join("sessions"), b"not a directory").expect("disk failure fixture");
+    let (transport, _out, _input) = start(&root);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait(&transport, || None::<()>)
+    }))
+    .expect_err("worker failure surfaces immediately");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("panic diagnostic");
+    assert!(
+        message.contains("Reader(Err"),
+        "actual worker failure: {message}"
+    );
+    assert!(
+        !message.contains("deadline"),
+        "worker death is not a timeout"
+    );
 }
