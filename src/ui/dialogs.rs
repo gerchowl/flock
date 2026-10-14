@@ -333,7 +333,7 @@ fn render_dialog_field_label(
     );
 }
 
-/// A single-line text input box backed by a [`LineEditor`] (#159). Renders the
+/// A single-line text input box backed by a [`crate::app::line_editor::LineEditor`] (#159). Renders the
 /// horizontally-scrolled window (a leading space, then up to `width-2` chars so
 /// a trailing cell is reserved for the cursor). Returns the screen position of
 /// the insertion point when `focused`, so the caller can place the *real*

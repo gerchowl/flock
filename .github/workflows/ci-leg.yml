@@ -5,7 +5,7 @@ name: CI leg
 # once per platform and reports `check (<leg>)` from the result, so a red
 # shard on one platform never fails the other platform's required check.
 #
-#   lint    fmt and clippy, from the start, alongside build
+#   lint    fmt, clippy and rustdoc, from the start, alongside build
 #   build   compile every test binary once into a nextest archive, and fail
 #           unless the shards partition the leg's tests exactly
 #   test    one job per shard of .config/ci-shards.toml: the serial ones
@@ -61,6 +61,9 @@ jobs:
 
       - name: Lint
         run: just lint
+
+      - name: Check Rust documentation
+        run: just doc-check
 
       # Maintenance-script unittests and the platform test-gap ratchet (#597).
       # Ubuntu only: pure Python plus git fixtures, so one platform is enough.

@@ -35,7 +35,7 @@ pub(crate) struct AgentLocation {
     /// Separate from `host` on purpose. `host` is what the machine calls
     /// itself (`bastion`); the route is what THIS server knows it as
     /// (`kiln`). They routinely differ — a live cross-host send failed with
-    /// "not in this server's [[peers]]" because the relay looked up a peer
+    /// "not in this server's `[[peers]]`" because the relay looked up a peer
     /// named after the reported hostname. Resolution knows which peer the
     /// answer came from, so it should hand that back rather than make the
     /// caller re-derive it.

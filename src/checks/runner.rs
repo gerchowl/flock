@@ -15,7 +15,7 @@
 //! * `in_flight` — a run has been dispatched; blocks re-dispatch until the
 //!   outcome comes back. Also participates in the concurrency cap.
 //! * `last_outcome` — most recent Outcome (for readback + tests).
-//! * `ack_until` — user-visible "silence this check until <instant>". The
+//! * `ack_until` — user-visible `silence this check until <instant>`. The
 //!   runner still runs the check but refuses to fire while acked.
 //!
 //! Scheduling (§8.4, machine-asleep semantics): after a long sleep, a check
@@ -320,7 +320,7 @@ impl CheckRunner {
 
     /// Pop up to `max_concurrent - in_flight` checks whose `next_due <= now`.
     /// Each returned RunnableCheck is marked in-flight; the caller MUST call
-    /// [`complete`] later or the check will never re-dispatch.
+    /// [`Self::complete`] later or the check will never re-dispatch.
     pub(crate) fn next_runnable(&mut self, now: Instant) -> Vec<RunnableCheck> {
         let slots = self.max_concurrent.saturating_sub(self.in_flight());
         if slots == 0 {

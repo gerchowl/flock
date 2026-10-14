@@ -1296,7 +1296,7 @@ impl App {
     }
 
     /// Snapshot every live pane's blocked-alert relevant fields, and hand
-    /// them to the [`BlockedAlertFold`]. Any fires are dispatched through
+    /// them to the [`crate::checks::BlockedAlertFold`]. Any fires are dispatched through
     /// the same Notify + `CheckFired` path used by script checks so the
     /// `[ui.toast]` policy applies uniformly and one code path emits the
     /// durable event.

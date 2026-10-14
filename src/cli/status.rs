@@ -388,6 +388,11 @@ fn installed_status_at(
     status
 }
 
+/// Run the installed binary's identity-only `--version` command with null stdin.
+///
+/// Stdin is fixed inside this executor. The caller supplies the output timeout.
+/// Production passes this executor to [`probe_installed_version`], which resolves
+/// the installed path first. Tests can inject controlled output instead.
 fn execute_installed_version(
     path: &std::path::Path,
     timeout: std::time::Duration,
