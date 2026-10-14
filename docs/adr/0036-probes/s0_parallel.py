@@ -116,6 +116,7 @@ def run_control(shape, n):
         if sl and mc and sl["result_t"] and mc["result_t"]:
             out["one_message"] = sl["msg"] == mc["msg"]
             out["mcp_waited_for_sleep"] = mc["result_t"] >= sl["result_t"]
+        out["init_permission_mode"] = L.init_permission_modes(evs)
         out["result"] = None if res is None else {"text": res.get("result"), "usage": L.usage(res)}
         out["exit"] = sess.close()
         return out
@@ -142,6 +143,7 @@ def run_read_behind(shape, n, hold_s):
         first = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
         if first is None or L.is_result(first):
             out["error"] = "no control request"
+            out["init_permission_mode"] = L.init_permission_modes(sess.since(0))
             sess.close()
             return out
         out["first_request"] = {"tool": first["request"].get("tool_name"), "tool_use_id": first["request"].get("tool_use_id"), "t": first["_t"]}
@@ -183,6 +185,7 @@ def run_read_behind(shape, n, hold_s):
             {"t": e["_t"], "ev": f"can_use_tool:{e['request'].get('tool_name')}"} for e in evs if L.is_can_use_tool(e)
         ] + [{"t": x["t"], "ev": f"tool_result:{x['tool_use_id'][-6:]}:{'err' if x['is_error'] else 'ok'}"} for x in L.tool_results(evs)]
         out["timeline"].sort(key=lambda x: x["t"])
+        out["init_permission_mode"] = L.init_permission_modes(evs)
         out["result"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error"), "num_turns": res.get("num_turns"), "usage": L.usage(res)}
         out["exit"] = sess.close()
         return out
@@ -205,6 +208,7 @@ def run(shape, n, hold_s):
         first = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
         if first is None or L.is_result(first):
             out["error"] = "no control request"
+            out["init_permission_mode"] = L.init_permission_modes(sess.since(0))
             sess.close()
             return out
         uses = L.tool_uses(sess.since(0))
@@ -260,6 +264,7 @@ def run(shape, n, hold_s):
             {"t": e["_t"], "ev": f"can_use_tool:{e['request'].get('tool_name')}"} for e in evs if L.is_can_use_tool(e)
         ] + [{"t": x["t"], "ev": f"tool_result:{x['tool_use_id'][-6:]}:{'err' if x['is_error'] else 'ok'}"} for x in L.tool_results(evs)]
         out["timeline"].sort(key=lambda x: x["t"])
+        out["init_permission_mode"] = L.init_permission_modes(evs)
         out["result"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error"), "num_turns": res.get("num_turns"), "usage": L.usage(res)}
         out["exit"] = sess.close()
         return out

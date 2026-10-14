@@ -11,7 +11,9 @@ use a real Claude profile:
   `Session.close()` deletes with everything the harness wrote into it
   (session registry and inbox key, `session-env/`, `projects/`, `plans/`),
 - the working directory is a fresh temporary directory, also deleted,
-- `--setting-sources local --strict-mcp-config --no-session-persistence`.
+- `--setting-sources local --strict-mcp-config --no-session-persistence`,
+- `--permission-mode default`: without it, a session with an empty config
+  dir started in `auto` and nothing prompted (ADR-0036 A.17, #1404).
 
 An empty config dir is not logged in (E6), so the login is passed in as
 `CLAUDE_CODE_OAUTH_TOKEN`. Get one with `claude setup-token` (once, in a

@@ -1666,7 +1666,10 @@ ran in a fresh temporary working directory holding `a.txt` and `b.txt`
 --output-format stream-json --verbose --replay-user-messages
 --include-hook-events --setting-sources local --strict-mcp-config
 --no-session-persistence --model haiku` plus the flags each section names.
-No flk server, pane or sccache server was started or reached.
+No flk server, pane or sccache server was started or reached. None of the
+runs recorded here passed `--permission-mode`. The drivers now pass
+`--permission-mode default` (#1404): under the token path, with an empty
+config dir, every session started in `auto` (A.13, A.17).
 
 **Isolation caveat.** The runs recorded here set `CLAUDE_CONFIG_DIR` to the
 operator's live work profile, for its keychain login (E6). That was not
@@ -1820,8 +1823,11 @@ model `haiku`. Both shapes put the same pre-allowed MCP call behind a
 pre-allowed Bash call: `sleep 5` (in `--allowedTools` as `Bash(sleep:*)`),
 and `sleep 5 && touch` (also `Bash(touch:*)`), which writes and so is not
 concurrency-safe even if `sleep` alone were classed read-only. No
-`can_use_tool` was sent. All four runs exited 0, and no token appeared in
-the output. Times are seconds from session start, `tool_use` → `tool_result`
+`can_use_tool` was sent. Every session's `system/init.permissionMode` was
+`auto`, not `default` (no `--permission-mode` was passed then, A.17);
+both Bash calls matched an allow rule, so neither needed the mode to be
+allowed. A re-run in `default` has not been done. All four runs exited 0,
+and no token appeared in the output. Times are seconds from session start, `tool_use` → `tool_result`
 (#1307, comment 6165573342).
 
 | Control | Run | One message | MCP result after the Bash result | Bash | MCP `echo` |
@@ -1848,9 +1854,14 @@ are concurrency-safe.
 the default mode) in one message, holds the `touch` permission open for
 10 s, and records whether the `Read` result arrives before the permission
 is answered (`read_result_before_permission_answered`), plus any other
-prompt that arrived while it was open. Untested until it runs (see "Open
-S0 items"). An MCP tool with `readOnlyHint` in the same position is not
-probed.
+prompt that arrived while it was open. A first run on 2026-10-14 (two
+runs, Claude Code 2.1.296, token path) did not test it: the sessions
+started in `auto` mode, the `touch` was allowed with no `can_use_tool`,
+and the driver stopped with `no control request`. Both calls were in one
+message and both results were ok. The driver now passes `--permission-mode
+default` and records `init_permission_mode`. Untested until it runs again
+(see "Open S0 items"). An MCP tool with `readOnlyHint` in the same
+position is not probed.
 
 ### A.14 The harness's own queue in `-p` (§3)
 
@@ -1983,6 +1994,21 @@ works, A.16; owner decision 1 narrowed).
   any stdio deny; only `result.permission_denials` records it. This rests
   on the uncommitted captures of `s0_carrier.py`, `s0_parallel.py` and
   `s0_permmode.py`; re-running them reproduces it.
+
+- **Without `--permission-mode`, the startup mode is not set by the
+  flags.** With the same flags, the A.15 runs in the operator's profile
+  started in `default`, while every token-path session with an empty
+  config dir (the four A.13 controls and the two first
+  `read_behind_permission` runs, 2.1.296) started in `auto`. There, a Bash
+  `touch` with no allow rule ran with no `can_use_tool` and no
+  `permission_denials`. In the code, the startup mode with no CLI mode is
+  resolved from settings `defaultMode`, a proactivity level and the
+  auto-mode gate `tengu_auto_mode_config` (code). Which of them picked
+  `auto` here was not determined. The drivers now pass `--permission-mode
+  default`. §1's launch command passes no `--permission-mode` either, and
+  presets (§10b), which carry one, come only with S19, so an S3 session's
+  startup mode would depend on this default. That is a design question,
+  filed as #1406, and not decided here.
 
 ### S0 findings for the architect
 
