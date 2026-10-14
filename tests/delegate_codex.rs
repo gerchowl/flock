@@ -1484,7 +1484,6 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
                 ],
             );
             assert!(capture.status.success(), "{}", stderr(&capture));
-            eprintln!("#1479 {frame} recent {format}: {}", stdout(&capture));
             if format == "text" {
                 assert!(stdout(&capture).contains(needle), "{painted}");
             }
@@ -1499,10 +1498,6 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
             .iter()
             .find(|agent| agent["pane_id"] == pane)
             .expect("listed pane");
-        eprintln!(
-            "#1479 {frame} agent list: agent_status={} turn={}",
-            agent["agent_status"], agent["state"]["turn"]
-        );
         if status == "working" {
             assert_eq!(agent["agent_status"], "working");
         } else {

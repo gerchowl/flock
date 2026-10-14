@@ -339,7 +339,7 @@ fn codex_working_status_line(line: &str) -> bool {
 
     let trimmed = line.trim_start();
     let lower = trimmed.to_lowercase();
-    // Codex's non-truecolor spinner alternates filled and hollow bullets.
+    // Codex's non-truecolor spinner alternates filled `•` and hollow `◦` bullets.
     (trimmed.starts_with('•') || trimmed.starts_with('◦'))
         && (trimmed.contains("Working (")
             || trimmed.contains("Compacting context (")
@@ -414,6 +414,7 @@ fn codex_prompt_line(line: &str) -> bool {
 }
 
 fn codex_block_marker_line(line: &str) -> bool {
+    // Both spinner glyphs, `•` and `◦`, start the current output block.
     line.starts_with('•')
         || line.starts_with('◦')
         || line.starts_with('■')
