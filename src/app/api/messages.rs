@@ -1600,6 +1600,10 @@ mod tests {
     fn test_app_with_hub(hub: crate::api::EventHub) -> crate::app::App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = crate::app::App::new(&Config::default(), true, None, api_rx, hub);
+        // API workers use this channel, independent of App::new's UI samplers.
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        app.event_tx = event_tx;
+        app.event_rx = event_rx;
         app.state.workspaces = vec![
             crate::workspace::Workspace::test_new("alpha"),
             crate::workspace::Workspace::test_new("beta"),
@@ -1920,7 +1924,7 @@ mod tests {
 
         let mut replacement = test_app_with_hub(crate::api::EventHub::default());
         replacement.node_id = app.node_id.clone();
-        replacement.resume_mesh_store(0);
+        let recovery = hold_recovery(&mut replacement);
         let (respond_to, responses) = std::sync::mpsc::channel();
         replacement.handle_api_request_message(crate::api::ApiRequestMessage {
             request: Request {
@@ -1940,13 +1944,8 @@ mod tests {
             "a reply must not be answered before the inbox is rebuilt"
         );
 
-        let recovered = loop {
-            match replacement.event_rx.recv().await {
-                Some(crate::events::AppEvent::MeshStoreRecovered(result)) => break result,
-                Some(_) => continue,
-                None => panic!("recovery worker dropped its channel"),
-            }
-        };
+        recovery.send(Ok(())).expect("release recovery");
+        let recovered = recovered(&mut replacement).await;
         replacement.finish_mesh_recovery(recovered);
         let response: serde_json::Value =
             serde_json::from_str(&responses.try_recv().expect("parked reply answered")).unwrap();
@@ -1982,16 +1981,88 @@ mod tests {
         })
     }
 
+    // A failure ceiling, never a delay: each successful wait ends on its event.
+    const RECOVERY_TEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn recovery_release(
+        release: std::sync::mpsc::Receiver<Result<(), String>>,
+        limit: std::time::Duration,
+    ) -> Result<(), String> {
+        release
+            .recv_timeout(limit)
+            .map_err(|error| format!("recovery gate: {error:?}"))?
+    }
+
+    /// Hold the real rebuild until the test has dispatched all parked requests.
+    /// Dropping the release sender or exceeding the ceiling fails recovery.
+    fn hold_recovery(app: &mut crate::app::App) -> std::sync::mpsc::Sender<Result<(), String>> {
+        let (release, gate) = std::sync::mpsc::channel();
+        let recover = app.mesh_recovery_work(0);
+        app.start_mesh_recovery(move || {
+            recovery_release(gate, RECOVERY_TEST_LIMIT)?;
+            recover()
+        });
+        release
+    }
+
+    async fn recovered_within(
+        app: &mut crate::app::App,
+        limit: std::time::Duration,
+    ) -> Result<Vec<crate::app::RecoveredMessage>, String> {
+        match tokio::time::timeout(limit, app.event_rx.recv())
+            .await
+            .expect("recovery worker timed out")
+        {
+            Some(crate::events::AppEvent::MeshStoreRecovered(result)) => result,
+            Some(event) => panic!("unexpected recovery event: {event:?}"),
+            None => panic!("recovery worker dropped its channel"),
+        }
+    }
+
     async fn recovered(
         app: &mut crate::app::App,
     ) -> Result<Vec<crate::app::RecoveredMessage>, String> {
-        loop {
-            match app.event_rx.recv().await {
-                Some(crate::events::AppEvent::MeshStoreRecovered(result)) => return result,
-                Some(_) => continue,
-                None => panic!("recovery worker dropped its channel"),
-            }
-        }
+        recovered_within(app, RECOVERY_TEST_LIMIT).await
+    }
+
+    #[test]
+    fn recovery_gate_fails_when_release_is_silent_or_disconnected() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let error = recovery_release(gate, std::time::Duration::from_millis(10)).unwrap_err();
+        assert!(error.contains("Timeout"), "{error}");
+        drop(release);
+
+        let (release, gate) = std::sync::mpsc::channel();
+        drop(release);
+        let error = recovery_release(gate, RECOVERY_TEST_LIMIT).unwrap_err();
+        assert!(error.contains("Disconnected"), "{error}");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "recovery worker timed out")]
+    async fn recovery_wait_fails_when_producer_stays_alive_and_silent() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _ = recovered_within(&mut app, std::time::Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "recovery worker dropped its channel")]
+    async fn recovery_wait_fails_when_producer_disconnects() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        app.event_rx = rx;
+        drop(tx);
+        let _ = recovered(&mut app).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "unexpected recovery event")]
+    async fn recovery_wait_rejects_unexpected_events() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.event_tx
+            .try_send(crate::events::AppEvent::IntegrationsInstalled(Vec::new()))
+            .unwrap();
+        let _ = recovered(&mut app).await;
     }
 
     fn answer(responses: &std::sync::mpsc::Receiver<String>) -> serde_json::Value {
@@ -2004,11 +2075,12 @@ mod tests {
         let _store = crate::mesh::runtime_store::TestStore::new();
         app.node_id = Some("nodea".into());
         app.restore_mesh_mail().unwrap();
-        app.resume_mesh_store(0);
+        let recovery = hold_recovery(&mut app);
         let send = fyi_send(&app, "first");
         let first = park(&mut app, send);
         let send = fyi_send(&app, "second");
         let second = park(&mut app, send);
+        recovery.send(Ok(())).expect("release recovery");
         let result = recovered(&mut app).await;
         app.finish_mesh_recovery(result);
         for responses in [&first, &second] {
@@ -2021,6 +2093,33 @@ mod tests {
             .map(|message| message.correlation_id)
             .collect();
         assert_eq!(order, ["first", "second"]);
+    }
+
+    /// Completion queued before dispatch is drained and mail answers immediately.
+    #[tokio::test]
+    async fn mail_after_recovery_completion_is_not_parked() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        app.node_id = Some("nodea".into());
+        app.restore_mesh_mail().unwrap();
+        app.resume_mesh_store(0);
+        let result = recovered(&mut app).await;
+        app.event_tx
+            .try_send(crate::events::AppEvent::MeshStoreRecovered(result))
+            .unwrap();
+        let (respond_to, responses) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: Request {
+                id: "completed".into(),
+                method: fyi_send(&app, "after-recovery"),
+            },
+            respond_to,
+            peer_pid: None,
+        });
+        let response = answer(&responses);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(!app.mesh_store_recovering);
+        assert!(app.recovery_parked.is_empty());
     }
 
     #[tokio::test]
@@ -2042,11 +2141,15 @@ mod tests {
         let _store = crate::mesh::runtime_store::TestStore::new();
         app.node_id = Some("nodea".into());
         app.restore_mesh_mail().unwrap();
-        app.resume_mesh_store(0);
+        let recovery = hold_recovery(&mut app);
         let send = fyi_send(&app, "failed");
         let parked = park(&mut app, send);
-        let _ = recovered(&mut app).await;
-        app.finish_mesh_recovery(Err("injected recovery failure".into()));
+        recovery
+            .send(Err("injected recovery failure".into()))
+            .expect("release failed recovery");
+        let result = recovered(&mut app).await;
+        assert_eq!(result.as_ref().unwrap_err(), "injected recovery failure");
+        app.finish_mesh_recovery(result);
         let response = answer(&parked);
         assert_eq!(
             response["error"]["code"], "mail_store_unavailable",
@@ -2062,7 +2165,7 @@ mod tests {
         let _store = crate::mesh::runtime_store::TestStore::new();
         app.node_id = Some("nodea".into());
         app.restore_mesh_mail().unwrap();
-        app.resume_mesh_store(0);
+        let recovery = hold_recovery(&mut app);
         let send = fyi_send(&app, "ghost");
         let parked = park(&mut app, send);
         app.expire_recovery_parked(std::time::Instant::now());
@@ -2073,6 +2176,7 @@ mod tests {
             response["error"]["code"], "mail_store_unavailable",
             "{response}"
         );
+        recovery.send(Ok(())).expect("release recovery");
         let result = recovered(&mut app).await;
         app.finish_mesh_recovery(result);
         let pane = pane_target(&app, 1);

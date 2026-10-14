@@ -1520,6 +1520,24 @@ enum PrQuery {
     Failed(String),
 }
 
+/// Commands used to resolve merge evidence, explicitly carried into workers.
+///
+/// Production callers use the default bare `gh`, resolved on their normal PATH.
+/// A caller may supply an executable path, including a nonexistent path to
+/// exercise missing-tool behavior. No process or thread environment changes.
+#[derive(Clone)]
+pub(crate) struct MergeGateContext {
+    gh_program: PathBuf,
+}
+
+impl Default for MergeGateContext {
+    fn default() -> Self {
+        Self {
+            gh_program: PathBuf::from("gh"),
+        }
+    }
+}
+
 /// Ask gh about the branch's PR and classify the outcome.
 ///
 /// gh matches PRs by branch NAME, so a merged PR says nothing on its own about
@@ -1535,20 +1553,15 @@ enum PrQuery {
 /// Every other non-zero exit is a failure. A known limit: a GitHub Enterprise remote with gh missing reads as
 /// not-GitHub, since only github.com URLs are recognised here.
 fn gh_pr_query(
+    context: &MergeGateContext,
     args: &[&str],
     cwd: &std::path::Path,
     root: &str,
     local_tip: Option<&str>,
     github_remote: bool,
 ) -> PrQuery {
-    let mut command = crate::process::TracedCommand::new("gh", "worktree");
+    let mut command = crate::process::TracedCommand::new(&context.gh_program, "worktree");
     command.args(args).current_dir(cwd);
-    #[cfg(test)]
-    tests::GH_COMMAND_PATH.with(|path| {
-        if let Some(path) = path.borrow().as_ref() {
-            command.env("PATH", path);
-        }
-    });
     let output = match command.output_traced() {
         Ok(output) => output,
         Err(err) if github_remote => return PrQuery::Failed(format!("gh did not run: {err}")),
@@ -1989,19 +2002,21 @@ fn branch_ref(branch: &str) -> String {
 /// (3) can. Latency is the cheaper thing to spend here — the gate already runs
 /// off the UI thread behind "checking merge status…".
 pub(crate) fn branch_merge_gate(
+    context: &MergeGateContext,
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     branch: &str,
     configured_targets: &[String],
 ) -> WorktreeMergeGate {
     let targets = integration_targets(repo_root, configured_targets);
-    branch_merge_gate_against(repo_root, checkout, branch, &targets)
+    branch_merge_gate_against(context, repo_root, checkout, branch, &targets)
 }
 
 /// [`branch_merge_gate`] for a caller that already resolved the landing set, so
 /// one verdict's protection tiers and merge answer cannot be decided against
 /// two different lists.
 fn branch_merge_gate_against(
+    context: &MergeGateContext,
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     branch: &str,
@@ -2026,7 +2041,14 @@ fn branch_merge_gate_against(
             args.extend(["--repo", pinned_repo.as_deref().unwrap_or_default()]);
         }
         args.extend(["--json", PR_GATE_FIELDS]);
-        gh_pr_query(&args, checkout, &root, local_tip.as_deref(), github_remote)
+        gh_pr_query(
+            context,
+            &args,
+            checkout,
+            &root,
+            local_tip.as_deref(),
+            github_remote,
+        )
     };
     let pr_base = match resolve_pr_query(ask, pinned_repo.is_some()) {
         PrQuery::Found(PrLookup::Merged(evidence)) => {
@@ -2328,6 +2350,7 @@ impl WorktreeKillVerdict {
 /// the same question asked twice, and answering them from two different lists
 /// is how a `dev` worktree ends up with `merged: true` and `protected: false`.
 pub(crate) fn resolve_kill_verdict(
+    context: &MergeGateContext,
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     extra_protected: &[String],
@@ -2335,7 +2358,7 @@ pub(crate) fn resolve_kill_verdict(
 ) -> WorktreeKillVerdict {
     let targets = integration_targets(repo_root, integration_branches);
     let (branch, protected) = kill_verdict_facts(checkout, &targets, extra_protected);
-    let gate = resolve_kill_gate(repo_root, checkout, branch.as_deref(), &targets);
+    let gate = resolve_kill_gate(context, repo_root, checkout, branch.as_deref(), &targets);
     WorktreeKillVerdict {
         branch,
         gate,
@@ -2364,6 +2387,7 @@ fn kill_verdict_facts(
 
 /// The expensive half: the evidence-gated merge answer for a resolved branch.
 fn resolve_kill_gate(
+    context: &MergeGateContext,
     repo_root: &std::path::Path,
     checkout: &std::path::Path,
     branch: Option<&str>,
@@ -2374,7 +2398,7 @@ fn resolve_kill_gate(
         // that is gone has none to resolve — two different refusals that used
         // to share one wording (#360).
         None => gate_for_branchless_checkout(checkout),
-        Some(branch) => branch_merge_gate_against(repo_root, checkout, branch, targets),
+        Some(branch) => branch_merge_gate_against(context, repo_root, checkout, branch, targets),
     }
 }
 
@@ -2428,6 +2452,7 @@ fn collect_indexed_within<T>(
 /// sequence is twenty round trips, and this runs on the request path. The
 /// deadline is shared, so the whole batch costs at most what one row does.
 pub(crate) fn resolve_kill_verdicts_bounded(
+    context: &MergeGateContext,
     jobs: &[(PathBuf, PathBuf)],
     extra_protected: &[String],
     integration_branches: &[String],
@@ -2448,8 +2473,10 @@ pub(crate) fn resolve_kill_verdicts_bounded(
         let branch = facts[index].1.clone();
         let targets = facts[index].0.clone();
         let tx = tx.clone();
+        let context = context.clone();
         std::thread::spawn(move || {
-            let gate = resolve_kill_gate(&repo_root, &checkout, branch.as_deref(), &targets);
+            let gate =
+                resolve_kill_gate(&context, &repo_root, &checkout, branch.as_deref(), &targets);
             let _ = tx.send((index, gate));
         });
     }
@@ -2480,12 +2507,14 @@ pub(crate) fn resolve_kill_verdicts_bounded(
 /// threads, so the verdict a dialog renders and the verdict `worktree.kill`
 /// enforces are produced by the same code.
 pub(crate) fn resolve_kill_verdict_with_timeout(
+    context: &MergeGateContext,
     repo_root: PathBuf,
     checkout: PathBuf,
     extra_protected: &[String],
     integration_branches: &[String],
 ) -> (WorktreeKillVerdict, bool) {
     resolve_kill_verdicts_bounded(
+        context,
         &[(repo_root, checkout)],
         extra_protected,
         integration_branches,
@@ -3636,62 +3665,35 @@ mod tests {
         }
     }
 
-    /// Absolute path of `program` as this process's PATH resolves it, so a
-    /// fixture can build a PATH that keeps one tool and drops the rest.
-    fn resolve_on_path(program: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    }
-
-    thread_local! {
-        // Applied only to the gh subprocess, never to the test runner's env.
-        pub(super) static GH_COMMAND_PATH: std::cell::RefCell<Option<PathBuf>> = const {
-            std::cell::RefCell::new(None)
-        };
-    }
-
-    /// Run `body` with gh's command-local PATH resolving only fixture tools.
-    /// Without a stub, gh is genuinely absent rather than failing to answer.
-    /// Git commands keep their normal environment.
-    fn with_gh_absent_from_path<T>(scratch: &Path, body: impl FnOnce() -> T) -> T {
-        let git = resolve_on_path("git").expect("git is on PATH for the fixture itself");
+    /// Supply an explicit gh executable path. It is absent unless the fixture
+    /// writes a stub there, and never falls back to a tool on the host PATH.
+    fn with_gh_command<T>(scratch: &Path, body: impl FnOnce(&MergeGateContext) -> T) -> T {
         let bin_dir = scratch.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        std::os::unix::fs::symlink(&git, bin_dir.join("git")).unwrap();
-        struct Restore(Option<PathBuf>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                GH_COMMAND_PATH.with(|path| path.replace(self.0.take()));
-            }
-        }
-        let original_path = std::env::var_os("PATH");
-        let _restore = Restore(GH_COMMAND_PATH.with(|path| path.replace(Some(bin_dir))));
-        let value = body();
-        assert_eq!(std::env::var_os("PATH"), original_path);
-        value
+        body(&MergeGateContext {
+            gh_program: bin_dir.join("gh"),
+        })
     }
 
     #[test]
     fn gh_fixture_path_is_command_local_and_restored_after_a_panic() {
         let scratch = unique_temp_path("gh-command-path");
         let original = std::env::var_os("PATH");
+        assert_eq!(MergeGateContext::default().gh_program, Path::new("gh"));
         let result = std::panic::catch_unwind(|| {
-            with_gh_absent_from_path(&scratch, || {
+            with_gh_command(&scratch, |context| {
                 assert_eq!(std::env::var_os("PATH"), original);
-                let scoped = GH_COMMAND_PATH.with(|path| path.borrow().clone().unwrap());
-                assert!(!scoped.join("gh").exists());
+                assert!(!context.gh_program.exists());
                 let expected = original.clone();
+                let worker_context = context.clone();
                 std::thread::spawn(move || {
                     assert_eq!(std::env::var_os("PATH"), expected);
-                    GH_COMMAND_PATH.with(|path| assert!(path.borrow().is_none()));
+                    assert!(!worker_context.gh_program.exists());
+                    assert_eq!(MergeGateContext::default().gh_program, Path::new("gh"));
                 })
                 .join()
                 .unwrap();
-                let output = std::process::Command::new("gh")
-                    .env("PATH", scoped)
-                    .output();
+                let output = std::process::Command::new(&context.gh_program).output();
                 assert_eq!(output.unwrap_err().kind(), std::io::ErrorKind::NotFound);
                 panic!("exercise scope teardown");
             });
@@ -3701,7 +3703,7 @@ mod tests {
             Some(&"exercise scope teardown")
         );
         assert_eq!(std::env::var_os("PATH"), original);
-        GH_COMMAND_PATH.with(|path| assert!(path.borrow().is_none()));
+        assert_eq!(MergeGateContext::default().gh_program, Path::new("gh"));
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
@@ -4419,6 +4421,8 @@ prunable stale
 
     #[test]
     fn branch_merge_gate_deletes_a_branch_with_no_commits_of_its_own() {
+        let gh_scratch =
+            unique_temp_path("branch-merge-gate-deletes-a-branch-with-no-commits-of-its-own-gh");
         // The reported case (#243): branch a session off a local feature
         // branch that was never pushed, change your mind immediately, kill it.
         // The tip is not on the default branch and not on any remote, so all
@@ -4447,7 +4451,9 @@ prunable stale
         // The evidence names the base the session was cut from, rather than
         // the bare "no commits of its own" — the user learns where the work is.
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "worktree/fresh", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "worktree/fresh", &[])
+            }),
             WorktreeMergeGate::Merged {
                 evidence: "contained in feature/base".to_string()
             }
@@ -4459,12 +4465,15 @@ prunable stale
         run_git(&checkout, &["add", "new.txt"]);
         run_git(&checkout, &["commit", "--quiet", "-m", "real work"]);
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "worktree/fresh", &[]),
+            with_gh_command(&gh_scratch.join("1"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "worktree/fresh", &[])
+            }),
             WorktreeMergeGate::NotMerged
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
@@ -4497,6 +4506,8 @@ prunable stale
 
     #[test]
     fn branch_merge_gate_is_not_fooled_by_a_tag_sharing_the_branch_name() {
+        let gh_scratch =
+            unique_temp_path("branch-merge-gate-is-not-fooled-by-a-tag-sharing-the-branch-name-gh");
         // git resolves a bare name against refs/tags BEFORE refs/heads, so a
         // release tag and a hotfix branch sharing a name (`v1.0` here) made
         // every commit-ish argument in the gate read the tag's history. The
@@ -4531,17 +4542,23 @@ prunable stale
             "the branch's commit lives nowhere else — the tag is not it"
         );
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "v1.0", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "v1.0", &[])
+            }),
             WorktreeMergeGate::NotMerged,
             "a same-named tag must not become evidence for deleting the branch"
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
     fn branch_merge_gate_is_not_fooled_by_a_tag_shadowing_the_default_branch() {
+        let gh_scratch = unique_temp_path(
+            "branch-merge-gate-is-not-fooled-by-a-tag-shadowing-the-default-branch-gh",
+        );
         // The *base* of `git branch --merged <base>` is a commit-ish too, and
         // shadowable the same way: tag the default branch's name onto some
         // other commit and the merged set is computed about the wrong history.
@@ -4581,13 +4598,16 @@ prunable stale
         );
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "sidework", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "sidework", &[])
+            }),
             WorktreeMergeGate::NotMerged,
             "a tag shadowing the default branch must not authorise a delete"
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
@@ -5178,6 +5198,7 @@ prunable stale
 
     #[test]
     fn the_list_verdict_inherits_the_squash_merge_answer() {
+        let gh_scratch = unique_temp_path("the-list-verdict-inherits-the-squash-merge-answer-gh");
         // #396's whole reason for sharing one resolver. A squash-merged branch
         // is not an ancestor of the default branch, so a list that asked the
         // ancestry question itself would report landed work as unmerged — and
@@ -5205,7 +5226,9 @@ prunable stale
         run_git(&checkout, &["add", "new.txt"]);
         run_git(&checkout, &["commit", "--quiet", "-m", "work"]);
 
-        let verdict = resolve_kill_verdict(&repo, &checkout, &[], &[]);
+        let verdict = with_gh_command(&gh_scratch.join("0"), |context| {
+            resolve_kill_verdict(context, &repo, &checkout, &[], &[])
+        });
         assert_eq!(verdict.branch.as_deref(), Some("feature/landed"));
         assert!(!verdict.merged(), "unlanded work is not safe to delete");
 
@@ -5232,7 +5255,9 @@ prunable stale
             "a squash must leave the branch tip unreachable from the default branch"
         );
 
-        let verdict = resolve_kill_verdict(&repo, &checkout, &[], &[]);
+        let verdict = with_gh_command(&gh_scratch.join("1"), |context| {
+            resolve_kill_verdict(context, &repo, &checkout, &[], &[])
+        });
         assert!(verdict.merged(), "a squash-merged branch is safe to delete");
         assert_eq!(
             verdict.evidence(),
@@ -5247,10 +5272,12 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
     fn kill_verdict_protects_the_repos_own_branches() {
+        let gh_scratch = unique_temp_path("kill-verdict-protects-the-repos-own-branches-gh");
         // #121's tiers belong to the verdict, not to each dialog. The fleet
         // sweep had no protected check at all: it fed the gate's `merged`
         // straight into its tier, and the gate calls the default branch merged
@@ -5274,14 +5301,23 @@ prunable stale
         );
 
         // Unprotected by default...
-        let verdict = resolve_kill_verdict(&repo, &main_checkout, &[], &[]);
+        let verdict = with_gh_command(&gh_scratch.join("0"), |context| {
+            resolve_kill_verdict(context, &repo, &main_checkout, &[], &[])
+        });
         assert_eq!(verdict.branch.as_deref(), Some("release/1.0"));
         assert!(!verdict.protected);
 
         // ...and protected by the repo's `protected_branches` policy, which
         // only ever adds.
-        let verdict =
-            resolve_kill_verdict(&repo, &main_checkout, &["release/1.0".to_string()], &[]);
+        let verdict = with_gh_command(&gh_scratch.join("1"), |context| {
+            resolve_kill_verdict(
+                context,
+                &repo,
+                &main_checkout,
+                &["release/1.0".to_string()],
+                &[],
+            )
+        });
         assert!(verdict.protected);
         assert!(
             !verdict.would_delete_branch(false),
@@ -5296,6 +5332,7 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&main_checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
@@ -5433,6 +5470,7 @@ prunable stale
 
     #[test]
     fn branch_merge_gate_sees_a_squash_merge() {
+        let gh_scratch = unique_temp_path("branch-merge-gate-sees-a-squash-merge-gh");
         // The live miss (#287): the PR squash-merged, so the branch's work is
         // in main while none of its commits is an ancestor of main. Every
         // ancestry-based source says "no evidence" and the merge-gated kill
@@ -5460,7 +5498,9 @@ prunable stale
         run_git(&checkout, &["commit", "--quiet", "-m", "second"]);
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "feature/squashed", &[])
+            }),
             WorktreeMergeGate::NotMerged,
             "unmerged work must keep the branch"
         );
@@ -5488,7 +5528,9 @@ prunable stale
         );
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed", &[]),
+            with_gh_command(&gh_scratch.join("1"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "feature/squashed", &[])
+            }),
             WorktreeMergeGate::Merged {
                 evidence: format!("already in {default} (squashed or rebased)")
             }
@@ -5496,10 +5538,13 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
     fn branch_merge_gate_keeps_a_branch_whose_squash_left_work_behind() {
+        let gh_scratch =
+            unique_temp_path("branch-merge-gate-keeps-a-branch-whose-squash-left-work-behind-gh");
         // The dangerous neighbour of the case above: the branch was squashed,
         // then gained a commit. Its content is NOT fully in the default branch
         // any more, and the containment check must not wave it through.
@@ -5528,17 +5573,21 @@ prunable stale
         run_git(&checkout, &["commit", "--quiet", "-m", "after the squash"]);
 
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/squashed-plus", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "feature/squashed-plus", &[])
+            }),
             WorktreeMergeGate::NotMerged,
             "post-squash work must keep the branch"
         );
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
     fn branch_merge_gate_requires_positive_evidence() {
+        let gh_scratch = unique_temp_path("branch-merge-gate-requires-positive-evidence-gh");
         let repo = create_committed_repo("merge-gate-evidence");
         let checkout = unique_temp_path("merge-gate-evidence-checkout");
         run_git(
@@ -5558,14 +5607,18 @@ prunable stale
 
         // Unmerged branch: no evidence (gh pr view fails in a remote-less repo).
         assert_eq!(
-            branch_merge_gate(&repo, &checkout, "feature/unmerged", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &repo, &checkout, "feature/unmerged", &[])
+            }),
             WorktreeMergeGate::NotMerged
         );
 
         // Merge it into the default branch: the git fallback now has evidence.
         let default = detect_default_branch(&repo).expect("default branch");
         run_git(&repo, &["merge", "--quiet", "feature/unmerged"]);
-        let gate = branch_merge_gate(&repo, &checkout, "feature/unmerged", &[]);
+        let gate = with_gh_command(&gh_scratch.join("1"), |context| {
+            branch_merge_gate(context, &repo, &checkout, "feature/unmerged", &[])
+        });
         assert_eq!(
             gate,
             WorktreeMergeGate::Merged {
@@ -5575,6 +5628,7 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
@@ -5596,8 +5650,14 @@ prunable stale
 
         let scratch = unique_temp_path("merge-gate-stale-origin-head-path");
         std::fs::create_dir_all(&scratch).unwrap();
-        let gate = with_gh_absent_from_path(&scratch, || {
-            branch_merge_gate(&stale.repo, &stale.checkout, "feature/landed-into-dev", &[])
+        let gate = with_gh_command(&scratch, |context| {
+            branch_merge_gate(
+                context,
+                &stale.repo,
+                &stale.checkout,
+                "feature/landed-into-dev",
+                &[],
+            )
         });
         let _ = std::fs::remove_dir_all(&scratch);
 
@@ -5639,8 +5699,8 @@ prunable stale
 
         let scratch = unique_temp_path("merge-gate-unmerged-anywhere-path");
         std::fs::create_dir_all(&scratch).unwrap();
-        let gate = with_gh_absent_from_path(&scratch, || {
-            branch_merge_gate(&stale.repo, &orphan, "feature/nowhere", &[])
+        let gate = with_gh_command(&scratch, |context| {
+            branch_merge_gate(context, &stale.repo, &orphan, "feature/nowhere", &[])
         });
         let _ = std::fs::remove_dir_all(&scratch);
 
@@ -5730,6 +5790,7 @@ prunable stale
 
     #[test]
     fn every_branch_the_gate_judges_against_is_protected() {
+        let gh_scratch = unique_temp_path("every-branch-the-gate-judges-against-is-protected-gh");
         // #633's other half. The gate now calls a branch merged when its
         // content is in ANY landing target — and `dev`, trivially, is contained
         // in itself. If a target were not also protected, `worktree kill` on a
@@ -5756,7 +5817,9 @@ prunable stale
             "the branch this repo squash-merges into must be judged against: {names:?}"
         );
 
-        let verdict = resolve_kill_verdict(&stale.repo, &dev_checkout, &[], &[]);
+        let verdict = with_gh_command(&gh_scratch.join("0"), |context| {
+            resolve_kill_verdict(context, &stale.repo, &dev_checkout, &[], &[])
+        });
         assert_eq!(verdict.branch.as_deref(), Some("dev"));
         assert!(
             verdict.merged(),
@@ -5784,10 +5847,13 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&dev_checkout);
         stale.cleanup();
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
     fn a_configured_integration_branch_becomes_a_landing_target() {
+        let gh_scratch =
+            unique_temp_path("a-configured-integration-branch-becomes-a-landing-target-gh");
         // The escape hatch for a repo whose PRs land somewhere the hardcoded
         // `dev`/`main`/`master` set cannot know about (#633). The fixture's
         // branch is already in `dev`, so this needs work of its own that has
@@ -5817,17 +5883,22 @@ prunable stale
         run_git(&stale.repo, &["checkout", "--quiet", "main"]);
 
         assert_eq!(
-            branch_merge_gate(&stale.repo, &checkout, "feature/for-staging", &[]),
+            with_gh_command(&gh_scratch.join("0"), |context| {
+                branch_merge_gate(context, &stale.repo, &checkout, "feature/for-staging", &[])
+            }),
             WorktreeMergeGate::NotMerged,
             "without the policy entry there is no evidence about staging"
         );
         assert_eq!(
-            branch_merge_gate(
-                &stale.repo,
-                &checkout,
-                "feature/for-staging",
-                &["staging".to_string()],
-            ),
+            with_gh_command(&gh_scratch.join("1"), |context| {
+                branch_merge_gate(
+                    context,
+                    &stale.repo,
+                    &checkout,
+                    "feature/for-staging",
+                    &["staging".to_string()],
+                )
+            }),
             WorktreeMergeGate::Merged {
                 evidence: "already in staging (squashed or rebased)".to_string()
             },
@@ -5845,6 +5916,7 @@ prunable stale
 
         let _ = std::fs::remove_dir_all(&checkout);
         stale.cleanup();
+        std::fs::remove_dir_all(gh_scratch).unwrap();
     }
 
     #[test]
@@ -5934,21 +6006,66 @@ prunable stale
         }
     }
 
-    /// Run `body` with a PATH holding `git` and a stub `gh` that prints `json`
-    /// for every call, so the PR evidence source answers without a network.
-    fn with_stub_gh<T>(scratch: &Path, json: &str, body: impl FnOnce() -> T) -> T {
+    /// Supply a gh context whose stub prints `json` for every call, so the
+    /// PR evidence source answers without a network.
+    fn with_stub_gh<T>(scratch: &Path, json: &str, body: impl FnOnce(&MergeGateContext) -> T) -> T {
         with_gh_script(scratch, &format!("printf '%s\\n' '{json}'"), body)
     }
 
     /// [`with_stub_gh`] for any shell body, so a fixture can make gh fail.
-    fn with_gh_script<T>(scratch: &Path, script: &str, body: impl FnOnce() -> T) -> T {
+    fn with_gh_script<T>(
+        scratch: &Path,
+        script: &str,
+        body: impl FnOnce(&MergeGateContext) -> T,
+    ) -> T {
         let stub_root = scratch.join("stub-gh");
         let bin_dir = stub_root.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let gh = bin_dir.join("gh");
         std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        with_gh_absent_from_path(&stub_root, body)
+        with_gh_command(&stub_root, body)
+    }
+
+    #[test]
+    fn bounded_kill_verdict_workers_inherit_the_gh_fixture() {
+        let fx = MergedIntoAFeatureBranch::new("bounded-verdict-gh-scope");
+        let log = fx.scratch.join("gh.calls");
+        std::fs::create_dir_all(&fx.scratch).unwrap();
+        let json = merged_pr_json(7, &fx.tip());
+        let script = format!(
+            "printf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{}'",
+            log.display(),
+            json,
+        );
+        let verdicts = with_gh_script(&fx.scratch, &script, |context| {
+            resolve_kill_verdicts_bounded(
+                context,
+                &[
+                    (fx.repo.clone(), fx.checkout.clone()),
+                    (fx.repo.clone(), fx.checkout.clone()),
+                ],
+                &[],
+                &[],
+            )
+        });
+        assert_eq!(verdicts.len(), 2);
+        for (verdict, timed_out) in verdicts {
+            assert!(
+                !timed_out,
+                "fixture worker did not answer within the gate bound"
+            );
+            assert_eq!(verdict.evidence(), Some("PR #7 merged"));
+        }
+        let calls = std::fs::read_to_string(log).expect("both workers must use the fake gh");
+        assert_eq!(calls.lines().count(), 2, "{calls}");
+        assert!(
+            calls
+                .lines()
+                .all(|line| line.starts_with("pr view feature/float ")),
+            "{calls}"
+        );
+        fx.cleanup();
     }
 
     #[test]
@@ -5956,15 +6073,16 @@ prunable stale
         let fx = MergedIntoAFeatureBranch::new("merge-gate-feature-containment");
         // Wholly contained in origin/integration AND the local integration
         // branch, and neither is a landing branch: no evidence (#1278).
-        let gate = with_gh_absent_from_path(&fx.scratch, || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_gh_command(&fx.scratch, |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert_eq!(gate, WorktreeMergeGate::NotMerged);
 
         // The same containment counts once the repo declares `integration` a
         // landing branch.
-        let gate = with_gh_absent_from_path(&fx.scratch.join("configured"), || {
+        let gate = with_gh_command(&fx.scratch.join("configured"), |context| {
             branch_merge_gate(
+                context,
                 &fx.repo,
                 &fx.checkout,
                 "feature/float",
@@ -5986,8 +6104,8 @@ prunable stale
         // PR's work, even when it is a feature branch (a stacked PR).
         let fx = MergedIntoAFeatureBranch::new("merge-gate-pr-base");
         let json = r#"{"state":"CLOSED","number":9,"headRefOid":"0000000000000000000000000000000000000000","baseRefName":"integration"}"#;
-        let gate = with_stub_gh(&fx.scratch, json, || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_stub_gh(&fx.scratch, json, |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert_eq!(
             gate,
@@ -6008,8 +6126,8 @@ prunable stale
         );
 
         // Contained in the default branch: merged, when no PR is open.
-        let gate = with_gh_absent_from_path(&fx.scratch, || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_gh_command(&fx.scratch, |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert_eq!(
             gate,
@@ -6023,8 +6141,8 @@ prunable stale
             r#"{{"state":"OPEN","number":150,"headRefOid":"{}","baseRefName":"{default}"}}"#,
             fx.tip()
         );
-        let verdict = with_stub_gh(&fx.scratch, &json, || {
-            resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+        let verdict = with_stub_gh(&fx.scratch, &json, |context| {
+            resolve_kill_verdict(context, &fx.repo, &fx.checkout, &[], &[])
         });
         assert_eq!(
             verdict.gate,
@@ -6053,8 +6171,8 @@ prunable stale
             &fx.repo,
             &["merge", "--quiet", "--no-edit", "feature/float"],
         );
-        let gate = with_gh_script(&fx.scratch, GH_UNAUTHENTICATED_IN_ACTIONS, || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_gh_script(&fx.scratch, GH_UNAUTHENTICATED_IN_ACTIONS, |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
         fx.cleanup();
@@ -6098,8 +6216,8 @@ prunable stale
             ("garbage", "echo 'not json'"),
         ];
         for (name, script) in failures {
-            let verdict = with_gh_script(&fx.scratch.join(name), script, || {
-                resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+            let verdict = with_gh_script(&fx.scratch.join(name), script, |context| {
+                resolve_kill_verdict(context, &fx.repo, &fx.checkout, &[], &[])
             });
             assert!(
                 matches!(verdict.gate, WorktreeMergeGate::Unknown { .. }),
@@ -6110,8 +6228,8 @@ prunable stale
             assert!(!verdict.would_delete_branch(false));
             assert!(verdict.gate.is_live());
         }
-        let verdict = with_gh_script(&fx.scratch.join("rate-reason"), failures[0].1, || {
-            resolve_kill_verdict(&fx.repo, &fx.checkout, &[], &[])
+        let verdict = with_gh_script(&fx.scratch.join("rate-reason"), failures[0].1, |context| {
+            resolve_kill_verdict(context, &fx.repo, &fx.checkout, &[], &[])
         });
         assert_eq!(
             verdict.evidence(),
@@ -6119,8 +6237,8 @@ prunable stale
         );
 
         // gh missing on a repo with a GitHub remote: unknown.
-        let gate = with_gh_absent_from_path(&fx.scratch.join("missing"), || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_gh_command(&fx.scratch.join("missing"), |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert!(
             matches!(gate, WorktreeMergeGate::Unknown { .. }),
@@ -6131,14 +6249,14 @@ prunable stale
         let gate = with_gh_script(
             &fx.scratch.join("nopr"),
             "echo 'no pull requests found for branch \"feature/float\"' >&2; exit 1",
-            || branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[]),
+            |context| branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[]),
         );
         assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
 
         // Without any GitHub remote, a missing gh means no PR can exist.
         run_git(&fx.repo, &["remote", "remove", "upstream"]);
-        let gate = with_gh_absent_from_path(&fx.scratch.join("nogithub"), || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_gh_command(&fx.scratch.join("nogithub"), |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert!(matches!(gate, WorktreeMergeGate::Merged { .. }), "{gate:?}");
         fx.cleanup();
@@ -6250,8 +6368,8 @@ prunable stale
             r#"{{"state":"MERGED","number":7,"headRefOid":"{}","baseRefName":"main"}}"#,
             fx.tip()
         );
-        let gate = with_stub_gh(&fx.scratch, &json, || {
-            branch_merge_gate(&fx.repo, &fx.checkout, "feature/float", &[])
+        let gate = with_stub_gh(&fx.scratch, &json, |context| {
+            branch_merge_gate(context, &fx.repo, &fx.checkout, "feature/float", &[])
         });
         assert_eq!(
             gate,

@@ -88,6 +88,7 @@ fn readiness_binaries_have_a_runner_hang_ceiling() {
         "api_ping",
         "cli_wrapper",
         "server_readiness",
+        "live_handoff",
         "mesh_step2",
     ] {
         let entry = overrides
@@ -198,4 +199,41 @@ fn readiness_reports_a_failed_child_without_hanging_on_the_parent_slave() {
     drop(pair.master);
     assert!(!child.wait().unwrap().success());
     std::fs::remove_dir_all(base).unwrap();
+}
+
+/// Every normal live-handoff launch must consume the shared announcement.
+/// Importers use the handoff wire handshake, not this startup path.
+#[test]
+fn readiness_live_handoff_launches_use_the_shared_reader() {
+    let source = include_str!("live_handoff.rs");
+    assert!(
+        !source.contains("wait_for_socket("),
+        "socket existence is not startup readiness"
+    );
+    for name in [
+        "spawn_server_exe",
+        "spawn_named_session_server",
+        "spawn_default_session_server",
+    ] {
+        let body = source
+            .split(&format!("fn {name}("))
+            .nth(1)
+            .unwrap()
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("drop(pair.slave)"),
+            "{name} must release the parent slave"
+        );
+        assert!(
+            body.contains("support::readiness::wait_for_server("),
+            "{name} must wait for readiness"
+        );
+        assert!(
+            body.find("let spawned = SpawnedFlock").unwrap()
+                < body.find("support::readiness::wait_for_server(").unwrap(),
+            "{name} must own cleanup before a readiness panic"
+        );
+    }
 }
