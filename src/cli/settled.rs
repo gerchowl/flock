@@ -830,7 +830,7 @@ fn settled_core_observed(
     due: &std::cell::Cell<Option<Instant>>,
     observer: &mut dyn FnMut(Option<&Sample>) -> bool,
 ) -> std::io::Result<SettledOutcome> {
-    let now = Instant::now();
+    let now = requests.now();
     let timeout = timeout_ms.map(Duration::from_millis);
     let deadline = timeout.and_then(|timeout| now.checked_add(timeout));
     // The window bounds a wait the caller left UNBOUNDED. Given a `--timeout`,
@@ -925,7 +925,7 @@ fn settled_core_observed(
                 Ok(sample) => sample,
                 Err(reason) => return Ok(SettledOutcome::Error(reason)),
             };
-            if let Some(outcome) = settle(&mut wait, sample) {
+            if let Some(outcome) = settle(&mut wait, sample, requests.now()) {
                 return Ok(outcome);
             }
             wait
@@ -943,7 +943,7 @@ fn settled_core_observed(
                 // surviving is over however long it had lasted.
                 interrupted.reached();
                 let stalled = observer(Some(&sample));
-                if let Some(outcome) = settle(&mut wait, sample) {
+                if let Some(outcome) = settle(&mut wait, sample, requests.now()) {
                     return Ok(outcome);
                 }
                 if stalled {
@@ -968,11 +968,11 @@ fn settled_core_observed(
             Err(failure @ (PinnedFailure::Slow | PinnedFailure::Retry)) => {
                 observer(None);
                 if failure == PinnedFailure::Slow {
-                    interrupted.note_slow(verb);
+                    interrupted.note_slow(verb, requests.now());
                 } else {
-                    interrupted.note(verb);
+                    interrupted.note(verb, requests.now());
                 }
-                if let Some(window) = interrupted.spent_window() {
+                if let Some(window) = interrupted.spent_window(requests.now()) {
                     return Ok(SettledOutcome::Error(unreachable_reason(window)));
                 }
             }
@@ -985,7 +985,7 @@ fn settled_core_observed(
         if answered {
             pause(requests, &wait, deadline, due.get(), &mut cursor);
         } else {
-            sleep_bounded(deadline);
+            sleep_bounded(requests, deadline);
         }
     }
 }
@@ -1000,7 +1000,12 @@ fn event_cursor(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) ->
         return None;
     }
     let refusal = requests
-        .events_read(u64::MAX, &[], Duration::ZERO, request_timeout(deadline)?)
+        .events_read(
+            u64::MAX,
+            &[],
+            Duration::ZERO,
+            request_timeout(deadline, requests.now())?,
+        )
         .ok()?;
     super::events::cursor_ahead_head(&refusal)
 }
@@ -1020,9 +1025,9 @@ fn pause(
     cursor: &mut Option<u64>,
 ) {
     let Some(after) = *cursor else {
-        return sleep_bounded(deadline);
+        return sleep_bounded(requests, deadline);
     };
-    let now = Instant::now();
+    let now = requests.now();
     let span = wait.dwell_left(now).unwrap_or(RESAMPLE).min(RESAMPLE);
     let span = due.map_or(span, |due| span.min(due.saturating_duration_since(now)));
     // The hold and the read both end by the deadline: a frozen server must
@@ -1045,19 +1050,19 @@ fn pause(
                 .pointer("/result/next_after")
                 .and_then(serde_json::Value::as_u64);
             if cursor.is_none() {
-                sleep_bounded(deadline);
+                sleep_bounded(requests, deadline);
             }
         }
         // Not an answer: the next sample meets the same server and counts it.
-        Err(_) => sleep_bounded(deadline),
+        Err(_) => sleep_bounded(requests, deadline),
     }
 }
 
 /// Fold one sample in and turn a terminal step into an outcome.
 ///
 /// `None` means keep polling, which is the only case the loop does not act on.
-fn settle(wait: &mut SettledWait, sample: Sample) -> Option<SettledOutcome> {
-    let step = wait.observe(sample, Instant::now());
+fn settle(wait: &mut SettledWait, sample: Sample, now: Instant) -> Option<SettledOutcome> {
+    let step = wait.observe(sample, now);
     let last = wait.last_record();
     match step {
         Step::Continue => None,
@@ -1145,9 +1150,9 @@ impl Interrupted {
     }
 
     /// Record one request timeout, and say so the first time.
-    fn note_slow(&mut self, verb: &str) {
+    fn note_slow(&mut self, verb: &str, now: Instant) {
         if self.slow_since.is_none() {
-            self.slow_since = Some(Instant::now());
+            self.slow_since = Some(now);
         }
         if self.said_slow {
             return;
@@ -1157,12 +1162,12 @@ impl Interrupted {
     }
 
     /// Record one transport failure, and say so the first time.
-    fn note(&mut self, verb: &str) {
+    fn note(&mut self, verb: &str, now: Instant) {
         // Stamped once per run and never re-stamped: measuring from the LATEST
         // failure instead is what would make the window a sliding one, and a
         // server that fails every 199 ms would then never reach it.
         if self.since.is_none() {
-            self.since = Some(Instant::now());
+            self.since = Some(now);
         }
         if self.slow_since.is_none() {
             self.slow_since = self.since;
@@ -1186,11 +1191,11 @@ impl Interrupted {
     /// so the deadline is the bound" — and in both cases the wait must go on
     /// retrying. Returning the window rather than a bool is what lets the
     /// message name the one number the notice already printed.
-    fn spent_window(&self) -> Option<Duration> {
+    fn spent_window(&self, now: Instant) -> Option<Duration> {
         let spent = |window: Option<Duration>, since: Option<Instant>| {
             let window = window?;
             since
-                .filter(|since| since.elapsed() >= window)
+                .filter(|since| now.saturating_duration_since(*since) >= window)
                 .map(|_| window)
         };
         spent(self.window, self.since).or_else(|| spent(self.slow_window, self.slow_since))
@@ -1243,7 +1248,7 @@ fn resolve_initial(
     interrupted: &mut Interrupted,
 ) -> Result<serde_json::Value, InitialFailure> {
     loop {
-        let Some(timeout) = request_timeout(deadline) else {
+        let Some(timeout) = request_timeout(deadline, requests.now()) else {
             return Err(InitialFailure::TimedOut);
         };
         let reply = match target {
@@ -1259,13 +1264,13 @@ fn resolve_initial(
                 // not leave them waiting in the resolve forever (#614), and a
                 // busy one gets the longer slow window (#910).
                 match unanswered {
-                    Unanswered::Slow => interrupted.note_slow(verb),
-                    Unanswered::Unreachable => interrupted.note(verb),
+                    Unanswered::Slow => interrupted.note_slow(verb, requests.now()),
+                    Unanswered::Unreachable => interrupted.note(verb, requests.now()),
                 }
-                if let Some(window) = interrupted.spent_window() {
+                if let Some(window) = interrupted.spent_window(requests.now()) {
                     return Err(InitialFailure::Unreachable(unreachable_reason(window)));
                 }
-                sleep_bounded(deadline);
+                sleep_bounded(requests, deadline);
                 continue;
             }
             Ok(value) => value,
@@ -1273,7 +1278,7 @@ fn resolve_initial(
         // An answer of any kind ends the run: whatever else is decided from
         // here, this server was reachable a moment ago.
         interrupted.reached();
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if deadline.is_some_and(|deadline| requests.now() >= deadline) {
             return Err(InitialFailure::TimedOut);
         }
         if value.get("error").is_some() {
@@ -1320,6 +1325,24 @@ enum PinnedFailure {
 /// which means fatal, and whether the second request is still inside the
 /// deadline — are reachable from a test without a server or a live socket.
 trait PinnedRequests {
+    /// Monotonic time used by every deadline, dwell and recovery window.
+    ///
+    /// Kept with the transport so simulated request costs, event holds and
+    /// polling share one time domain. Overrides must advance monotonically
+    /// and use the same origin as caller-supplied deadlines and observer due
+    /// times. The default uses the real clock without changing socket bounds.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// Wait between samples. A virtual transport advances its clock here.
+    /// Request methods must also account for their own elapsed time. Neither
+    /// method cancels a stuck transport: real requests still need I/O timeouts,
+    /// and scripted transports must fail on exhausted input or operation budgets.
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
     /// `Err` is a transport failure: not an answer.
     fn agent_get(
         &mut self,
@@ -1524,14 +1547,14 @@ fn sample_pinned(
     deadline: Option<Instant>,
 ) -> Result<Sample, PinnedFailure> {
     let terminal_id = wait.pinned_terminal().to_string();
-    let agent_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
+    let agent_timeout = request_timeout(deadline, requests.now()).ok_or(PinnedFailure::TimedOut)?;
     let agent_value = requests
         .agent_get(&terminal_id, agent_timeout)
         .map_err(|unanswered| match unanswered {
             Unanswered::Unreachable => PinnedFailure::Retry,
             Unanswered::Slow => PinnedFailure::Slow,
         })?;
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    if deadline.is_some_and(|deadline| requests.now() >= deadline) {
         return Err(PinnedFailure::TimedOut);
     }
 
@@ -1540,14 +1563,14 @@ fn sample_pinned(
     if !(agent_value.get("error").is_some() && is_agent_not_found(&agent_value)) {
         return classify_pinned(&terminal_id, &agent_value, None);
     }
-    let pane_timeout = request_timeout(deadline).ok_or(PinnedFailure::TimedOut)?;
+    let pane_timeout = request_timeout(deadline, requests.now()).ok_or(PinnedFailure::TimedOut)?;
     let pane_value = match requests.pane_get(wait.last_pane_id().unwrap_or_default(), pane_timeout)
     {
         Ok(value) => Some(value),
         Err(Unanswered::Slow) => return Err(PinnedFailure::Slow),
         Err(Unanswered::Unreachable) => None,
     };
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    if deadline.is_some_and(|deadline| requests.now() >= deadline) {
         return Err(PinnedFailure::TimedOut);
     }
     classify_pinned(&terminal_id, &agent_value, pane_value.as_ref())
@@ -1653,25 +1676,25 @@ fn reported_status_name(status: AgentStatus) -> &'static str {
 
 /// How long the next request may take, clamped to something a read timeout can
 /// express and to the time the deadline has left.
-fn request_timeout(deadline: Option<Instant>) -> Option<Duration> {
+fn request_timeout(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
     match deadline {
         None => Some(REQUEST_TIMEOUT),
         Some(deadline) => {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(now);
             (!left.is_zero()).then(|| left.min(REQUEST_TIMEOUT).max(Duration::from_millis(1)))
         }
     }
 }
 
 /// Sleep one poll interval, or less if the deadline arrives first.
-fn sleep_bounded(deadline: Option<Instant>) {
+fn sleep_bounded(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) {
     let nap = match deadline {
         None => POLL_INTERVAL,
         Some(deadline) => deadline
-            .saturating_duration_since(Instant::now())
+            .saturating_duration_since(requests.now())
             .min(POLL_INTERVAL),
     };
-    std::thread::sleep(nap);
+    requests.sleep(nap);
 }
 #[cfg(test)]
 mod tests {
@@ -2446,8 +2469,8 @@ mod tests {
             ))],
             Duration::from_millis(80),
         );
-        let deadline = Instant::now() + Duration::from_millis(40);
         let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
+        let deadline = requests.now() + Duration::from_millis(40);
         assert!(matches!(
             resolve_initial(
                 &mut requests,
@@ -2468,6 +2491,7 @@ mod tests {
             ))],
             Duration::from_millis(80),
         );
+        let deadline = requests.now() + Duration::from_millis(40);
         assert!(matches!(
             resolve_initial(
                 &mut requests,
@@ -2484,7 +2508,7 @@ mod tests {
             vec![Ok(response(r#"{"result":{"agent":{}}}"#))],
             Duration::ZERO,
         );
-        let past = Instant::now() - Duration::from_millis(1);
+        let past = requests.now() - Duration::from_millis(1);
         assert!(matches!(
             resolve_initial(
                 &mut requests,
@@ -2510,10 +2534,11 @@ mod tests {
             Duration::ZERO,
         );
         let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
+        let deadline = requests.now() + Duration::from_secs(5);
         match resolve_initial(
             &mut requests,
             InitialTarget::Agent("ghost"),
-            Some(Instant::now() + Duration::from_secs(5)),
+            Some(deadline),
             "agent wait",
             &mut interrupted,
         ) {
@@ -2532,9 +2557,9 @@ mod tests {
     #[test]
     fn the_interruption_line_is_said_once_per_invocation() {
         let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
-        interrupted.note("agent wait");
-        interrupted.note("agent wait");
-        interrupted.note("agent wait");
+        interrupted.note("agent wait", Instant::now());
+        interrupted.note("agent wait", Instant::now());
+        interrupted.note("agent wait", Instant::now());
         assert!(interrupted.said);
     }
 
@@ -2562,20 +2587,24 @@ mod tests {
     /// answer clears it — so a wait that recovers and later drops is given a
     /// whole window rather than the remainder of one that ended minutes ago.
     ///
-    /// A zero window stands in for the reached limit without sleeping 30 s, and
-    /// `Instant` has no fake here: the point is that the run's clock starts once
-    /// and stops on an answer, neither of which needs time to have passed.
+    /// Explicit monotonic samples reach the limit without sleeping and prove
+    /// that only an answer resets the first-failure timestamp.
     #[test]
     fn a_run_of_failures_is_timed_from_its_first_and_cleared_by_an_answer() {
-        let mut interrupted = Interrupted::new(Some(Duration::ZERO));
-        assert!(interrupted.spent_window().is_none(), "no failure is no run");
-        interrupted.note("agent wait");
+        let start = Instant::now();
+        let limit = Duration::from_secs(1);
+        let mut interrupted = Interrupted::new(Some(limit));
+        assert!(
+            interrupted.spent_window(start + limit).is_none(),
+            "no failure is no run"
+        );
+        interrupted.note("agent wait", start);
         let first = interrupted.since.expect("a failure starts the run");
         assert!(
-            interrupted.spent_window().is_some(),
-            "a zero window is already spent"
+            interrupted.spent_window(start + limit).is_some(),
+            "the virtual window is spent at its limit"
         );
-        interrupted.note("agent wait");
+        interrupted.note("agent wait", start);
         assert_eq!(
             interrupted.since,
             Some(first),
@@ -2584,7 +2613,7 @@ mod tests {
         interrupted.reached();
         assert!(interrupted.since.is_none(), "an answer ends the run");
         assert!(
-            interrupted.spent_window().is_none(),
+            interrupted.spent_window(start + limit).is_none(),
             "so the next drop starts over"
         );
 
@@ -2592,15 +2621,15 @@ mod tests {
         // measured, and never spent, because the deadline is the bound that ends
         // this wait — with 124, which a supervisor is written to read.
         let mut bounded = Interrupted::new(None);
-        bounded.note("agent wait");
+        bounded.note("agent wait", Instant::now());
         assert!(bounded.since.is_some(), "the failure is still recorded");
         assert!(
-            bounded.spent_window().is_none(),
+            bounded.spent_window(Instant::now()).is_none(),
             "with a --timeout the window does not apply at all"
         );
     }
 
-    /// A window a test can wait out: one whole second, which at the 200 ms poll
+    /// A virtual window: one whole second, which at the 200 ms poll
     /// interval is five retries before it is spent. Still whole seconds, so the
     /// reason it produces is formatted exactly as the shipped 30 s one is.
     const TEST_UNREACHABLE: Duration = Duration::from_secs(1);
@@ -2624,7 +2653,7 @@ mod tests {
     /// The whole wait, over a scripted transport — plus how long it took and how
     /// many requests it made.
     ///
-    /// The elapsed clock is returned because every test below is about a wait
+    /// Virtual elapsed time is returned because every test below is about a wait
     /// that has to END: `Scripted` panics rather than inventing a reply, so a
     /// regression that keeps polling fails the test rather than hanging it, and
     /// the bound catches the case where the wait is slow rather than endless.
@@ -2649,7 +2678,7 @@ mod tests {
         slow: Duration,
     ) -> (SettledOutcome, Duration, usize) {
         let mut requests = Scripted::new(replies, Duration::ZERO);
-        let started = Instant::now();
+        let started = requests.now();
         let outcome = settled_core(
             &mut requests,
             "agent wait",
@@ -2661,11 +2690,15 @@ mod tests {
             slow,
         )
         .expect("the wait core does no io of its own");
-        (outcome, started.elapsed(), requests.granted.len())
+        (
+            outcome,
+            requests.now().duration_since(started),
+            requests.granted.len(),
+        )
     }
 
-    /// How long any of these waits may take before it is a hang rather than a
-    /// window: the shipped one is 30 s, and none of these comes near it.
+    /// Virtual ceiling for the scripted windows, separate from the finite
+    /// reply and clock-operation budgets that make regressions fail.
     const TEST_CEILING: Duration = Duration::from_secs(5);
 
     /// #614, the bug itself. With no `--timeout` and a server that answers one
@@ -2744,6 +2777,7 @@ mod tests {
             "each run of slow polls outlasted the window: {elapsed:?}"
         );
         assert_eq!(asked, 17, "the wait read every scripted reply");
+        assert_eq!(elapsed, Duration::from_secs(3), "exact virtual poll time");
         assert!(elapsed < TEST_CEILING, "{elapsed:?}");
     }
 
@@ -2922,12 +2956,39 @@ mod tests {
         assert_eq!(line["held_ms"], 0);
     }
 
+    /// A finite monotonic simulation: even a live, silent scripted producer
+    /// fails on its operation budget instead of spinning or waiting forever.
+    struct VirtualClock {
+        now: std::cell::Cell<Instant>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl VirtualClock {
+        fn new() -> Self {
+            Self {
+                now: std::cell::Cell::new(Instant::now()),
+                reads: std::cell::Cell::new(0),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            let reads = self.reads.get() + 1;
+            assert!(reads <= 1000, "virtual clock operation budget exhausted");
+            self.reads.set(reads);
+            self.now.get()
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.now.set(self.now() + duration);
+        }
+    }
+
     /// A scripted transport, so the two-request sequence is reachable without a
-    /// server. `cost` is slept per reply, which is what makes the deadline tests
-    /// real rather than simulated.
+    /// server. `cost` advances virtual time per reply, including late answers.
     struct Scripted {
         replies: std::collections::VecDeque<Result<serde_json::Value, Unanswered>>,
         cost: Duration,
+        clock: VirtualClock,
         /// The timeout each request was actually granted, in order.
         granted: Vec<Duration>,
     }
@@ -2937,13 +2998,14 @@ mod tests {
             Self {
                 replies: replies.into(),
                 cost,
+                clock: VirtualClock::new(),
                 granted: Vec::new(),
             }
         }
 
         fn next(&mut self, timeout: Duration) -> Result<serde_json::Value, Unanswered> {
             self.granted.push(timeout);
-            std::thread::sleep(self.cost);
+            self.clock.advance(self.cost);
             self.replies
                 .pop_front()
                 .expect("a scripted reply for every request the wait makes")
@@ -2951,6 +3013,14 @@ mod tests {
     }
 
     impl PinnedRequests for Scripted {
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.clock.advance(duration);
+        }
+
         fn agent_get(
             &mut self,
             _terminal_id: &str,
@@ -2997,12 +3067,9 @@ mod tests {
             ],
             Duration::ZERO,
         );
-        let fetched = sample_pinned(
-            &mut requests,
-            &settle,
-            Some(Instant::now() + Duration::from_secs(5)),
-        )
-        .expect("the pane fallback answers");
+        let deadline = requests.now() + Duration::from_secs(5);
+        let fetched = sample_pinned(&mut requests, &settle, Some(deadline))
+            .expect("the pane fallback answers");
 
         // The record arrived intact — it is the EPOCH, not a missing field, that
         // says the child was replaced.
@@ -3043,9 +3110,6 @@ mod tests {
         );
 
         // 1000 ms of budget, 600 ms per reply: the first fits, the pair does not.
-        // The margins are wide so a loaded CI runner's oversleeping (macOS
-        // overshoots tens of ms) cannot push the first reply past the deadline.
-        let deadline = Instant::now() + Duration::from_millis(1000);
         let mut requests = Scripted::new(
             vec![
                 Ok(response(
@@ -3058,6 +3122,7 @@ mod tests {
             ],
             Duration::from_millis(600),
         );
+        let deadline = requests.now() + Duration::from_millis(1000);
         assert_eq!(
             sample_pinned(&mut requests, &settle, Some(deadline))
                 .expect_err("both replies land past the deadline"),
@@ -3088,13 +3153,13 @@ mod tests {
             Instant::now(),
         );
 
-        let deadline = Instant::now() + Duration::from_millis(40);
         let mut requests = Scripted::new(
             vec![Ok(response(
                 r#"{"error":{"code":"permission_denied","message":"nope"}}"#,
             ))],
             Duration::from_millis(80),
         );
+        let deadline = requests.now() + Duration::from_millis(40);
         assert_eq!(
             sample_pinned(&mut requests, &settle, Some(deadline)).expect_err("the reply is late"),
             PinnedFailure::TimedOut
@@ -3119,7 +3184,7 @@ mod tests {
             ))],
             Duration::ZERO,
         );
-        let past = Instant::now() - Duration::from_millis(1);
+        let past = requests.now() - Duration::from_millis(1);
         assert_eq!(
             sample_pinned(&mut requests, &settle, Some(past)).expect_err("no budget left"),
             PinnedFailure::TimedOut
@@ -3136,6 +3201,7 @@ mod tests {
     /// agent, `Some(false)` a hold that ran its whole span with nothing to
     /// report, and `None` a server that never answered.
     struct Evented {
+        clock: VirtualClock,
         records: std::collections::VecDeque<&'static str>,
         woken: std::collections::VecDeque<Option<bool>>,
         agent_gets: usize,
@@ -3144,6 +3210,14 @@ mod tests {
     }
 
     impl PinnedRequests for Evented {
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.clock.advance(duration);
+        }
+
         fn agent_get(
             &mut self,
             _terminal_id: &str,
@@ -3198,7 +3272,7 @@ mod tests {
             }
             match self.woken.pop_front().expect("a scripted read") {
                 None => return Err(Unanswered::Slow),
-                Some(false) => std::thread::sleep(wait),
+                Some(false) => self.clock.advance(wait),
                 Some(true) => {}
             }
             Ok(serde_json::json!({"result": {"events": [], "next_after": after + 1}}))
@@ -3212,12 +3286,13 @@ mod tests {
     #[test]
     fn an_evented_wait_samples_once_per_change() {
         let mut requests = Evented {
+            clock: VirtualClock::new(),
             records: ["0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
             woken: [Some(true), Some(false)].into(),
             agent_gets: 0,
             reads: Vec::new(),
         };
-        let started = Instant::now();
+        let started = requests.now();
         let outcome = settled_core(
             &mut requests,
             "agent wait",
@@ -3247,7 +3322,7 @@ mod tests {
         assert_eq!(subjects, &[TERM.to_string(), "w1:p1".to_string()]);
         assert_eq!(*idle, RESAMPLE, "nothing is due while it works");
         assert!(*dwell <= Duration::from_millis(600), "{dwell:?}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(requests.now().duration_since(started) < Duration::from_secs(5));
     }
 
     /// #1121: a held read the server never answers is not an answer. The wait
@@ -3256,6 +3331,7 @@ mod tests {
     #[test]
     fn an_unanswered_read_is_resampled_never_an_outcome() {
         let mut requests = Evented {
+            clock: VirtualClock::new(),
             records: ["0:1:1:w", "0:1:1:w", "0:1:2:i", "0:1:2:i"].into(),
             woken: [None, Some(true), Some(false)].into(),
             agent_gets: 0,
@@ -3291,13 +3367,14 @@ mod tests {
     #[test]
     fn a_server_gone_mid_dwell_is_retried_at_the_poll_pace() {
         let mut requests = Evented {
+            clock: VirtualClock::new(),
             records: ["0:1:2:i", "down"].into(),
             woken: [Some(false)].into(),
             agent_gets: 0,
             reads: Vec::new(),
         };
-        let due = std::cell::Cell::new(Some(Instant::now()));
-        let started = Instant::now();
+        let due = std::cell::Cell::new(Some(requests.now()));
+        let started = requests.now();
         let outcome = settled_core_observed(
             &mut requests,
             "agent wait",
@@ -3317,7 +3394,11 @@ mod tests {
         assert!(matches!(outcome, SettledOutcome::TimedOut), "{outcome:?}");
         let made = requests.agent_gets + requests.reads.len();
         // 1.5 s at one sample per 200 ms is about 8; a spin makes thousands.
-        assert!(made <= 15, "{made} requests in {:?}", started.elapsed());
+        assert!(
+            made <= 15,
+            "{made} requests in {:?}",
+            requests.now().duration_since(started)
+        );
     }
 
     /// #1030 skew: a server below `events.read`'s protocol is never sent one.
