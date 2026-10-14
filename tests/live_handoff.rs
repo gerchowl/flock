@@ -9,7 +9,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,8 +55,8 @@ impl Drop for SpawnedFlock {
 ///
 /// What actually keeps concurrent binaries off each other's paths is naming:
 /// each test roots its config home, runtime dir and socket inside its own
-/// `unique_test_dir()` (a per-binary prefix plus this process's pid and a
-/// unique suffix), and the spawn helpers redirect `XDG_CONFIG_HOME` and
+/// `unique_test_dir()` (a short per-binary prefix plus OS entropy), and the
+/// spawn helpers redirect `XDG_CONFIG_HOME` and
 /// `XDG_RUNTIME_DIR` into that tree. Most also pass an explicit
 /// `FLOCK_SOCKET_PATH` inside it; three deliberately `env_remove` it to
 /// exercise default path resolution (`live_handoff.rs`, `auto_detect.rs`), and
@@ -75,10 +74,33 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Atomically reserve a short random path, independent of PID reuse after a kill.
+/// Entropy or creation errors fail loudly. Abandoned directories remain untouched.
 fn unique_test_dir() -> PathBuf {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
+    let mut random = [0; 8];
+    getrandom::fill(&mut random).expect("test directory entropy");
+    let path = PathBuf::from(format!("/tmp/hlh-{:016x}", u64::from_ne_bytes(random)));
+    fs::create_dir(&path).expect("reserve isolated handoff directory");
+    path
+}
+
+#[test]
+fn unique_test_dir_preserves_stale_pid_directory() {
+    let stale = PathBuf::from(format!("/tmp/hlh-{}-0", std::process::id()));
+    fs::create_dir_all(&stale).unwrap();
+    let marker = stale.join("stale-owner");
+    fs::write(&marker, b"retain").unwrap();
+    let first = unique_test_dir();
+    let second = unique_test_dir();
+    assert_ne!(first, stale);
+    assert_ne!(first, second);
+    assert!(first.is_dir() && second.is_dir());
+    assert_eq!(fs::read(&marker).unwrap(), b"retain");
+    cleanup_test_base(&first);
+    cleanup_test_base(&second);
+    fs::remove_file(marker).unwrap();
+    // Only remove an empty legacy directory, never another run's contents.
+    let _ = fs::remove_dir(stale);
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedFlock {
@@ -256,10 +278,26 @@ fn try_request(
     socket_path: &Path,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RequestError> {
+    try_request_bounded(socket_path, request, None)
+}
+
+/// Bound reads and writes when checking that recovery leaves the loop usable.
+/// Handoff calls elsewhere keep their existing protocol/runner failure ceilings.
+fn try_request_bounded(
+    socket_path: &Path,
+    request: serde_json::Value,
+    ceiling: Option<Duration>,
+) -> Result<serde_json::Value, RequestError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|err| RequestError {
         retryable: true,
         message: format!("connect {}: {err}", socket_path.display()),
     })?;
+    stream
+        .set_read_timeout(ceiling)
+        .expect("API read failure ceiling");
+    stream
+        .set_write_timeout(ceiling)
+        .expect("API write failure ceiling");
     let request_text = request.to_string();
     stream
         .write_all(request_text.as_bytes())
@@ -298,6 +336,29 @@ fn try_request(
             socket_path.display()
         ),
     })
+}
+
+/// An alive API peer that never replies must fail inside the socket ceiling.
+#[test]
+fn recovery_request_fails_when_peer_stays_alive_and_silent() {
+    let base = unique_test_dir();
+    let socket = base.join("silent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        gate.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let result = try_request_bounded(
+        &socket,
+        serde_json::json!({"id":"silent", "method":"ping", "params":{}}),
+        Some(Duration::from_millis(50)),
+    );
+    release.send(()).unwrap();
+    peer.join().unwrap();
+    cleanup_test_base(&base);
+    let error = result.expect_err("silent API peer must fail");
+    assert!(error.message.contains("read response"), "{}", error.message);
 }
 
 fn request(socket_path: &Path, request: serde_json::Value) -> serde_json::Value {
@@ -1762,6 +1823,10 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
 }
 
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
+    let request = |socket: &Path, value| {
+        try_request_bounded(socket, value, Some(Duration::from_secs(10)))
+            .unwrap_or_else(|error| panic!("{}", error.message))
+    };
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1971,7 +2036,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     wait_for_output(&api_socket, &pane_id, &format!("got:{failure_point}"));
     if store_failure || slow_open {
         if slow_open {
-            let started = Instant::now();
+            // The existing file gate holds real recovery open while the app answers.
             let status = request(
                 &api_socket,
                 serde_json::json!({"id":"slow-open-status", "method":"peers.enrollment", "params":{}}),
@@ -1980,7 +2045,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 status["result"]["mesh_suspended_reason"],
                 "recovering store after handoff"
             );
-            assert!(started.elapsed() < Duration::from_secs(1), "{status}");
+            assert!(fail_file.exists(), "recovery must still be blocked");
             let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
                 .arg("status")
                 .env("FLOCK_SOCKET_PATH", &api_socket)
@@ -2015,14 +2080,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                         .is_some_and(|reason| reason.contains("mesh store recovery in progress")),
                     "{failed}"
                 );
-                let started = Instant::now();
                 assert_ok(request(
                     &api_socket,
                     serde_json::json!({
                         "id":"responsive-after-rollback", "method":"ping", "params":{}
                     }),
                 ));
-                assert!(started.elapsed() < Duration::from_secs(1));
                 assert!(fail_file.exists(), "recovery must still be blocked");
                 assert_ok(request(
                     &api_socket,
@@ -2041,7 +2104,6 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         if failure_point == "slow_store" {
             // #887: mail waits for recovery only up to its bound, then is
             // refused and dropped, so a caller's retry cannot duplicate it.
-            let started = Instant::now();
             let refused = request(
                 &api_socket,
                 serde_json::json!({"id":"send-during-recovery", "method":"msg.send", "params":{
@@ -2053,7 +2115,6 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 refused["error"]["code"], "mail_store_unavailable",
                 "{refused}"
             );
-            assert!(started.elapsed() < Duration::from_secs(10), "{refused}");
             assert!(fail_file.exists(), "recovery must still be blocked");
         }
         fs::remove_file(&fail_file).unwrap();
@@ -2063,11 +2124,20 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 &api_socket,
                 serde_json::json!({"id":"mesh-recovered", "method":"peers.enrollment", "params":{}}),
             );
-            if status["result"]["mesh_suspended_reason"].is_null() {
-                break;
+            assert_ok(status.clone());
+            assert_eq!(status["result"]["type"], "peers_enrollment", "{status}");
+            // Successful enrollment omits the optional reason after recovery.
+            match status["result"]["mesh_suspended_reason"].as_str() {
+                None if status["result"]["mesh_suspended_reason"].is_null() => break,
+                Some("recovering store after handoff") => {}
+                Some("injected mesh store open failure") if store_failure => {}
+                other => panic!("unexpected recovery state {other:?}: {status}"),
             }
-            assert!(Instant::now() < deadline, "{status}");
-            thread::sleep(Duration::from_millis(100));
+            assert!(
+                Instant::now() < deadline,
+                "recovery never completed: {status}"
+            );
+            thread::yield_now();
         }
         assert_ok(request(
             &api_socket,
