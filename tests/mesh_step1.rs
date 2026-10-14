@@ -686,6 +686,7 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
             }),
         );
         match status["state"].as_str() {
+            Some("queued") => None,
             Some("delivered" | "read") => Some(()),
             other => panic!("unexpected state after genuine read: {other:?}; {status}"),
         }
