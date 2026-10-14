@@ -109,7 +109,10 @@ impl Conversation {
     }
 
     fn to(specs: &[NodeSpec], target: &str) -> Self {
-        let fleet = fleet::spawn("s2", specs);
+        Self::from_fleet(fleet::spawn("s2", specs), target)
+    }
+
+    fn from_fleet(fleet: Fleet, target: &str) -> Self {
         let sender = Agent::start(fleet.node("nodea"));
         let receiver = Agent::start(fleet.node(target));
         fleet::wait_until("recipient discovery", DEADLINE, || {
@@ -665,6 +668,145 @@ fn laptop_collects_answer_through_a_different_hub() {
     let found = route(c.fleet.node("nodea"), c.fleet.node("noded.example"));
     assert_eq!(found["next_hop"], fleet::node_id(c.fleet.node("nodec")));
     once(c.fleet.node("noded.example"), "question");
+}
+
+// The relay stays alive and silent while the release marker never arrives.
+#[test]
+fn unreleased_outbound_poll_gate_reports_failure() {
+    let c = Conversation::new(DIRECT);
+    c.send();
+    c.read_question();
+    let gate = c.fleet.gate_outbound_poll("nodea", "nodeb");
+    c.reply();
+    gate.wait_entered(DEADLINE);
+    let failed = c.fleet.base.join("gate-outbound-poll-nodea-nodeb/failed");
+    // The observer allows the waiter's 30 s ceiling to fire before checking it.
+    let reason = fleet::wait_until(
+        "poll gate reports unreleased failure",
+        DEADLINE + Duration::from_secs(10),
+        || {
+            api(c.fleet.node("nodea"), "ping", json!({}));
+            api(c.fleet.node("nodeb"), "ping", json!({}));
+            fs::read_to_string(&failed).ok()
+        },
+    );
+    assert_eq!(reason, "poll gate was not released at the 30 s ceiling");
+}
+
+// Withhold reciprocal adverts for the entire conversation, not just startup.
+#[test]
+fn direct_pinned_edge_delivers_reply_without_route_generation() {
+    let fleet = fleet::spawn_with_startup_probe("direct-lease", DIRECT, |fleet, _| {
+        fs::write(fleet.base.join("withhold-route-adverts"), b"").unwrap();
+    });
+    let gate = fleet.gate_outbound_poll("nodea", "nodeb");
+    let c = Conversation::from_fleet(fleet, "nodeb");
+    c.send();
+    c.read_question();
+    gate.wait_entered(DEADLINE);
+    assert!(routes(c.fleet.node("nodeb")).is_empty());
+    let generation =
+        api(c.fleet.node("nodeb"), "peers.enrollment", json!({}))["route_generation"].clone();
+    let reply = c.reply();
+    let hop: String = db(c.fleet.node("nodeb"))
+        .query_row(
+            "SELECT next_hop FROM envelopes WHERE correlation=?1",
+            [reply["correlation_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        hop,
+        fleet::node_id(c.fleet.node("nodea")),
+        "authenticated direct edge must assign immediately"
+    );
+    gate.release();
+    c.answer_once();
+    assert!(routes(c.fleet.node("nodeb")).is_empty());
+    assert_eq!(
+        api(c.fleet.node("nodeb"), "peers.enrollment", json!({}))["route_generation"],
+        generation
+    );
+}
+
+// Restore the stale durable assignment after the route pass has cleared it.
+// With no subsequent topology change, only collection can invalidate it again.
+#[test]
+fn lease_time_clears_stale_assignment_after_route_pass() {
+    let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");
+    cut(&c.fleet, "nodea", "nodec");
+    fleet::wait_until("return route uses first hub", DEADLINE, || {
+        routes(c.fleet.node("noded.example"))
+            .iter()
+            .any(|r| {
+                r["node"] == fleet::node_id(c.fleet.node("nodea"))
+                    && r["next_hop"] == fleet::node_id(c.fleet.node("nodeb"))
+            })
+            .then_some(())
+    });
+    c.send();
+    fleet::wait_until("request imported before gating leases", DEADLINE, || {
+        (scalar(
+            c.fleet.node("noded.example"),
+            "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='inbox'",
+        ) == 1)
+            .then_some(())
+    });
+    let gate = c.fleet.gate_outbound_poll("nodeb", "noded.example");
+    c.read_question();
+    // Entry proves every poll forwarded before arming the gate has completed.
+    // Mint only inside that window, so the reply cannot have an earlier lease.
+    gate.wait_entered(DEADLINE);
+    let reply = c.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let spoke = c.fleet.node("noded.example");
+    let initial: (String, i64, String) = db(spoke)
+        .query_row(
+            "SELECT next_hop,collect_attempts,state FROM envelopes WHERE correlation=?1",
+            [correlation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        initial,
+        (fleet::node_id(c.fleet.node("nodeb")), 0, "held".into()),
+        "reply must be minted inside the acknowledged poll gate"
+    );
+    cut(&c.fleet, "nodea", "nodeb");
+    c.fleet.wait_route("nodea", "nodeb", false);
+    c.fleet.wait_route("nodeb", "nodea", false);
+    c.fleet.wait_route("noded.example", "nodea", false);
+    wait_unrouted_reply(spoke, correlation);
+    let generation = api(spoke, "peers.enrollment", json!({}))["route_generation"].clone();
+    assert_eq!(db(spoke).execute(
+        "UPDATE envelopes SET next_hop=?1,retry_at=0 WHERE correlation=?2 AND state='held' AND next_hop=''",
+        rusqlite::params![fleet::node_id(c.fleet.node("nodeb")), correlation],
+    ).unwrap(), 1);
+    gate.release();
+    wait_unrouted_reply(spoke, correlation);
+    assert_eq!(
+        api(spoke, "peers.enrollment", json!({}))["route_generation"],
+        generation
+    );
+    let attempts: i64 = db(spoke)
+        .query_row(
+            "SELECT collect_attempts FROM envelopes WHERE correlation=?1",
+            [correlation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 0, "stale row must never be leased");
+    assert_eq!(
+        scalar(
+            c.fleet.node("nodeb"),
+            "SELECT count(*) FROM envelopes WHERE kind='message' AND request_origin IS NOT NULL"
+        ),
+        0
+    );
+    reconnect(&c.fleet, "nodea", "nodec");
+    c.fleet.wait_route("noded.example", "nodea", true);
+    c.answer_once();
+    once(spoke, "question");
 }
 
 // Withdrawal must invalidate a stored assignment even when its edge stays live.

@@ -28,20 +28,7 @@ impl NextHop {
 impl App {
     pub(super) fn request_next_hop(&mut self, owner: &str) -> NextHop {
         self.refresh_mesh_routes();
-        // A live authenticated direct edge already proves reachability to its
-        // owner. Directory discovery can precede the reciprocal topology advert.
-        let node = self
-            .mesh_routes
-            .table
-            .next_hop(owner)
-            .or_else(|| {
-                self.outbound_reply_peer(owner).and_then(|peer| {
-                    let edge = crate::peer_stream::enrollment(&peer);
-                    (edge.state == "pinned" && edge.node_id.as_deref() == Some(owner))
-                        .then(|| owner.to_owned())
-                })
-            })
-            .unwrap_or_default();
+        let node = self.custody_routes().remove(owner).unwrap_or_default();
         let peer = self
             .outbound_reply_peer(&node)
             .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned");
@@ -178,6 +165,66 @@ mod tests {
             hops_left: 7,
         }
     }
+    #[tokio::test]
+    async fn direct_outbound_assignment_survives_collection_without_adverts() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = app();
+        let identity = crate::mesh::identity::NodeIdentity::load().unwrap();
+        app.node_id = Some(identity.node_id());
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let peer = crate::config::PeerConfig {
+            name: "direct.example".into(),
+            ssh: "direct-edge-test.invalid".into(),
+            ..Default::default()
+        };
+        with_store(|store| {
+            store
+                .put_pin(
+                    &peer.name,
+                    &crate::mesh::store::IdentityPin {
+                        node_id: recipient.node_id(),
+                        public_key: recipient.public_key().to_vec(),
+                    },
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        crate::peer_stream::test_enroll(&peer, &recipient.node_id());
+        app.state.peers = vec![peer];
+        let next = app.request_next_hop(&recipient.node_id());
+        assert_eq!(next.node, recipient.node_id());
+        assert!(app.mesh_routes.table.routes().is_empty());
+        let generation = app.mesh_routes.table.generation();
+        let mut mail = crate::mesh::sign::tests::signed();
+        mail.key.origin_node = identity.node_id();
+        mail.return_binding.request = mail.key.clone();
+        mail.return_binding.recipient_node = next.node.clone();
+        crate::mesh::sign::seal(&mut mail, &identity);
+        let offered = with_store(|store| {
+            store
+                .accept_origin(&mail, &next.node, Admission::Held, 8, 0)
+                .map_err(|error| error.to_string())?;
+            store
+                .collect_outbound(
+                    crate::mesh::store::Offer::All,
+                    &mail.key.origin_node,
+                    &next.node,
+                    &crate::mesh::collect::OutboundCollect::default(),
+                    &app.custody_routes(),
+                    1,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            offered.len(),
+            1,
+            "direct assignment must survive lease validation"
+        );
+        assert_eq!(offered[0].envelope.key, mail.key);
+        assert_eq!(app.mesh_routes.table.generation(), generation);
+    }
+
     #[tokio::test]
     async fn forger_hub_altering_origin_or_body_is_refused_invalid_signature() {
         let _store = crate::mesh::runtime_store::TestStore::new();
