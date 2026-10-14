@@ -1,9 +1,13 @@
 # #1393: upstream nextest #3553 prevents sibling capture-pipe inheritance.
-# Remove this override when pinned nixpkgs provides nextest >= 0.9.145.
+# Remove this override when pinned nixpkgs supplies the shared nextest-version.
 { cargo-nextest, fetchFromGitHub, rustPlatform }:
 let
-  version = "0.9.146";
+  # Shared with the CI installers via scripts/nextest_version.py.
+  # A version bump requires refreshing both the source and cargo vendor hashes.
+  version = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./nextest-version);
   src = fetchFromGitHub {
+    # A stale hash must not reuse a cached source from a different version.
+    name = "cargo-nextest-${version}-source";
     owner = "nextest-rs";
     repo = "nextest";
     tag = "cargo-nextest-${version}";

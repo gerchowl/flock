@@ -1,4 +1,4 @@
-# guardrails-ok(ci-shim): host-bound: one platform leg of ci.yml (cargo-nextest with zig 0.15 + macos-15 SDK constraints); every step is a `just` recipe or scripts/ci_shards.py
+# guardrails-ok(ci-shim): host-bound: one platform leg of ci.yml (cargo-nextest with zig 0.15 + macos-15 SDK constraints); run steps use `just` recipes or scripts/ entry points
 name: CI leg
 
 # One platform's test run, split across parallel jobs (#991). ci.yml calls this
@@ -83,10 +83,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Read nextest version
+        id: nextest-version
+        shell: bash
+        run: |
+          version="$(python3 scripts/nextest_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust tools
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
-          tool: just,cargo-nextest
+          tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
 
       # Pinned to 0.15.2, and the macOS leg to macos-15 rather than
       # macos-latest: the vendored libghostty-vt zig build cannot link against
@@ -136,10 +143,17 @@ jobs:
       # No toolchain, zig or cache: nothing is compiled here. The runner
       # image's cargo only dispatches to cargo-nextest, and the archive
       # carries its own standard library.
+      - name: Read nextest version
+        id: nextest-version
+        shell: bash
+        run: |
+          version="$(python3 scripts/nextest_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust tools
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
-          tool: just,cargo-nextest
+          tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
 
       - name: Download test archive
         uses: actions/download-artifact@v8
