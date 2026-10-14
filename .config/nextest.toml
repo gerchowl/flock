@@ -1,3 +1,6 @@
+# #1393: older runners can leak sibling capture pipes on Darwin (upstream #3553).
+nextest-version = "0.9.145"
+
 # nextest configuration.
 #
 # Why this exists: the integration suites in `tests/` each spawn several real
@@ -32,6 +35,12 @@ serial-pty = { max-threads = 1 }
 # where observed (docs/next/nextest-timings.md).
 # mesh_step2 (#1349) uses the default 420s: p99 36.409s requires >= 364.09s.
 filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binary(=cli_wrapper) | binary(=server_readiness) | binary(=live_handoff)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# Backstop every fixture wait in #1051, including child startup and CLI teardown.
+# Completion still depends on the worker reason or complete launch report.
+filter = '(binary(=live_handoff) & test(=rollback_store_open_failure_preserves_panes_and_original_error)) | (binary(=flk) & test(=app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation))'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.default.overrides]]
