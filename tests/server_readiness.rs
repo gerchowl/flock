@@ -89,6 +89,7 @@ fn readiness_binaries_have_a_runner_hang_ceiling() {
         "cli_wrapper",
         "server_readiness",
         "live_handoff",
+        "mesh_step2",
     ] {
         let entry = overrides
             .iter()
