@@ -332,8 +332,8 @@ fn config_directory_is_removed_on_unwind_and_writer_error() {
     });
     assert!(result.is_err());
     assert_eq!(
-        fs::read_dir(&fixture.0)
-            .expect("fixture files")
+        fs::read_dir(fixture.0.join("structured/sessions"))
+            .expect("contained session files")
             .filter(|entry| entry
                 .as_ref()
                 .expect("entry")

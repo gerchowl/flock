@@ -130,6 +130,43 @@ pub(crate) fn open_append_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Remove a validated Claude transient. Sockets must use the observed cc-socks
+/// namespace, a private canonical parent, and the dead session's exact pid name.
+pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if meta.uid() != uid
+        || (if socket_pid.is_some() {
+            !meta.file_type().is_socket()
+        } else {
+            !meta.is_file()
+        })
+    {
+        return Err(io::Error::other("unsafe Claude transient type/owner"));
+    }
+    if let Some(pid) = socket_pid {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("socket parent missing"))?;
+        let name = parent.file_name().and_then(|n| n.to_str());
+        if !path.is_absolute()
+            || path.file_name() != Some(std::ffi::OsStr::new(&format!("{pid}.sock")))
+            || !(name == Some("cc-socks") || name == Some(format!("cc-socks-{uid}").as_str()))
+            || parent.canonicalize()? != parent
+        {
+            return Err(io::Error::other("unsafe Claude socket path"));
+        }
+        ensure_private_dir(parent)?;
+    }
+    fs::remove_file(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
