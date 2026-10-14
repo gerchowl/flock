@@ -339,7 +339,8 @@ fn codex_working_status_line(line: &str) -> bool {
 
     let trimmed = line.trim_start();
     let lower = trimmed.to_lowercase();
-    trimmed.starts_with('•')
+    // Codex's non-truecolor spinner alternates filled and hollow bullets.
+    (trimmed.starts_with('•') || trimmed.starts_with('◦'))
         && (trimmed.contains("Working (")
             || trimmed.contains("Compacting context (")
             || trimmed.contains("Waiting for background terminal (")
@@ -413,7 +414,11 @@ fn codex_prompt_line(line: &str) -> bool {
 }
 
 fn codex_block_marker_line(line: &str) -> bool {
-    line.starts_with('•') || line.starts_with('■') || line.starts_with('✗') || line.starts_with('✓')
+    line.starts_with('•')
+        || line.starts_with('◦')
+        || line.starts_with('■')
+        || line.starts_with('✗')
+        || line.starts_with('✓')
 }
 
 fn codex_status_detail_line(line: &str) -> bool {
@@ -494,6 +499,52 @@ pub(in crate::detect) fn has_codex_folder_trust(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOLLOW_WORKING: &str =
+        include_str!("../../../tests/fixtures/codex/working-hollow-background.txt");
+
+    #[test]
+    fn hollow_spinner_1479_is_live_working_with_and_without_background() {
+        for screen in [
+            HOLLOW_WORKING.to_owned(),
+            HOLLOW_WORKING.replace(" · 1 background terminal running", ""),
+            HOLLOW_WORKING.replace(
+                "background terminal running",
+                "backgroun\nd terminal running",
+            ),
+        ] {
+            let detection = crate::detect::detect_agent(Some(crate::detect::Agent::Codex), &screen);
+            assert_eq!(detection.state, AgentState::Working, "{screen}");
+            assert!(detection.visible_working, "{screen}");
+            assert!(!detection.visible_idle, "{screen}");
+            assert!(live_turn_follows_echo(
+                &screen,
+                "Reply exactly INLINE_CAPTURE_721. Do not use tools."
+            ));
+        }
+    }
+
+    #[test]
+    fn hollow_spinner_1479_does_not_keep_a_finished_or_quoted_turn_working() {
+        for screen in [
+            "◦ Working (3s • esc to interrupt)\n• DONE: fixture turn finished\n› Ask Codex to do anything\n  · 1 background terminal running\n  ? for shortcuts",
+            "› Draft quoting an earlier screen\n  ◦ Working (3s • esc to interrupt)\n  ? for shortcuts",
+            "• DONE: fixture turn finished\n› Ask Codex to do anything\n  · 1 background terminal running\n  ? for shortcuts",
+        ] {
+            let detection = crate::detect::detect_agent(Some(crate::detect::Agent::Codex), screen);
+            assert_eq!(detection.state, AgentState::Idle, "{screen}");
+            assert!(!detection.visible_working, "{screen}");
+            assert!(detection.visible_idle, "{screen}");
+        }
+    }
+
+    #[test]
+    fn hollow_spinner_1479_is_progress_chrome_in_both_animation_phases() {
+        assert_eq!(
+            crate::detect::progress_text(HOLLOW_WORKING),
+            crate::detect::progress_text(&HOLLOW_WORKING.replace('◦', "•"))
+        );
+    }
 
     const FOLDER_TRUST: &str = include_str!("../../../tests/fixtures/codex/folder-trust.txt");
 
