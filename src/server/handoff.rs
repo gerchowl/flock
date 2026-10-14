@@ -1230,6 +1230,53 @@ mod tests {
         assert_all_write_ends_closed(&reads);
     }
 
+    /// The receiver can stop reading after a batch while originals remain
+    /// owned by the exporter. No scheduling race is needed to produce EPIPE.
+    #[test]
+    fn closed_reader_after_first_fd_batch_returns_broken_pipe_and_keeps_originals() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socketpair");
+        sender
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write ceiling");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read ceiling");
+        let (reads, writes) = pipes(150);
+        send_fd_batch(&sender, &writes[..64]).expect("first batch");
+        let imported = recv_fds(&receiver, 64).expect("first batch received");
+        assert_eq!(imported.len(), 64);
+        close_fds(&imported);
+        receiver
+            .shutdown(std::net::Shutdown::Read)
+            .expect("close read side");
+        let half_closed = send_fd_batch(&sender, &writes[64..128])
+            .expect_err("a half-closed reader cannot receive the next batch");
+        assert!(
+            matches!(half_closed.raw_os_error(), Some(libc::EPIPE | libc::EINVAL)),
+            "unexpected half-close error: {half_closed}"
+        );
+        drop(receiver);
+        let err = send_fds_and_wait_restored(&mut sender, &writes[64..])
+            .expect_err("the next batch cannot reach a closed reader");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        for (&read, &write) in reads.iter().zip(&writes) {
+            let byte = b'x';
+            assert_eq!(
+                unsafe { libc::write(write, (&byte as *const u8).cast(), 1) },
+                1
+            );
+            let mut got = 0u8;
+            assert_eq!(
+                unsafe { libc::read(read, (&mut got as *mut u8).cast(), 1) },
+                1
+            );
+            assert_eq!(got, byte, "every original descriptor remains usable");
+        }
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        close_fds(&reads);
+    }
+
     #[test]
     fn sender_dying_mid_transfer_closes_every_fd_already_received() {
         let (reads, writes) = pipes(150);
