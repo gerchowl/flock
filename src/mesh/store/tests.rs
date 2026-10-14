@@ -2745,11 +2745,45 @@ fn a_delivery_attempt_write_stays_keyed_with_a_full_registry() {
         .unwrap();
     }
     tx.commit().unwrap();
-    let started = std::time::Instant::now();
+    // Count SQLite VM instructions, including reads: counting changed rows
+    // alone would miss a full-registry read/deserialization before the upsert.
+    // A fixed budget below the registry size catches an accidental table walk
+    // independently of host scheduling, disk latency or debug-build speed.
+    let operations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = operations.clone();
+    store
+        .connection
+        .progress_handler(
+            1,
+            Some(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+    let before = store.connection.total_changes();
     assert!(store
         .record_attempt(&attempt(cap, "queued", false))
         .unwrap());
-    let elapsed = started.elapsed();
+    assert_eq!(store.connection.total_changes() - before, 2);
+    let insertion_operations = operations.swap(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        insertion_operations < 512,
+        "insertion used {insertion_operations} VM operations"
+    );
+    // An update to an existing attempt is one keyed upsert, no eviction.
+    let before = store.connection.total_changes();
+    assert!(store.record_attempt(&attempt(cap, "typed", false)).unwrap());
+    assert_eq!(store.connection.total_changes() - before, 1);
+    let update_operations = operations.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        update_operations < 256,
+        "update used {update_operations} VM operations"
+    );
+    store
+        .connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .unwrap();
     let ids: Vec<String> = store
         .connection
         .prepare("SELECT id FROM delivery_attempts ORDER BY id LIMIT 3")
@@ -2768,16 +2802,6 @@ fn a_delivery_attempt_write_stays_keyed_with_a_full_registry() {
         .query_row("SELECT count(*) FROM delivery_attempts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(retained as usize, cap);
-    // An update to an existing attempt is one keyed upsert, no eviction.
-    let before = store.connection.total_changes();
-    assert!(store.record_attempt(&attempt(cap, "typed", false)).unwrap());
-    assert_eq!(store.connection.total_changes() - before, 1);
-    // Generous for a debug build on a loaded runner, far below what parsing
-    // and rewriting 4096 rows per write cost before this was keyed.
-    assert!(
-        elapsed < std::time::Duration::from_millis(250),
-        "one attempt write took {elapsed:?}"
-    );
 }
 
 #[test]
