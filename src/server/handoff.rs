@@ -297,6 +297,21 @@ pub(crate) fn accept_and_validate_on(
     Ok(stream)
 }
 
+/// Typed importer refusal retained inside `io::Error` through rollback.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(super) struct ImportRefusal(String);
+
+#[cfg(unix)]
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "handoff import refused: {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ImportRefusal {}
+
 /// Read one line from the importer and require it to be `expected`. A line
 /// carrying [`IMPORT_REFUSAL_PREFIX`] is the importer naming why it refused,
 /// and surfaces as `handoff import refused: <reason>` at whichever step the
@@ -309,9 +324,7 @@ fn expect_line(stream: &mut UnixStream, expected: &str, what: &str) -> io::Resul
         return Ok(());
     }
     if let Some(reason) = trimmed.strip_prefix(IMPORT_REFUSAL_PREFIX) {
-        return Err(io::Error::other(format!(
-            "handoff import refused: {reason}"
-        )));
+        return Err(io::Error::other(ImportRefusal(reason.to_owned())));
     }
     Err(io::Error::other(format!(
         "{what}: unexpected response {trimmed:?}"
@@ -985,6 +998,9 @@ mod tests {
             err.to_string(),
             "handoff import refused: pane restore failed"
         );
+        assert!(err
+            .get_ref()
+            .is_some_and(|cause| cause.is::<ImportRefusal>()));
 
         let (mut importer_side, mut exporter_side) =
             UnixStream::pair().expect("socketpair available");

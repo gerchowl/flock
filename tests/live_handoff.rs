@@ -1760,6 +1760,7 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         failed.get("error").is_some(),
         "bad protocol handoff should fail: {failed}"
     );
+    assert_eq!(failed["error"]["kind"], "import_refused", "{failed}");
     // #600: the exporter must surface WHY the import refused, not an opaque
     // "handoff stream closed while reading line". Both sides are post-fix in
     // this test, so the importer's `error: <reason>` round-trips into
@@ -2482,33 +2483,23 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
         &api_socket,
         serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":params}),
     );
-    // Refusal can race with the next sendmsg: either the named refusal or
-    // BrokenPipe reaches the API. Both must roll back before ownership commits.
+    // Peer closure can surface on send or read. Classify its typed kind,
+    // keeping timeouts and unexpected protocol failures outside this class.
     assert_eq!(failed["error"]["code"], "handoff_failed", "{failed}");
     assert!(failed.get("result").is_none(), "{failed}");
-    let message = failed["error"]["message"]
+    let kind = failed["error"]["kind"]
         .as_str()
-        .expect("failure diagnostic");
-    let broken_pipe = std::io::Error::from_raw_os_error(libc::EPIPE).to_string();
+        .expect("typed handoff kind");
+    let peer_closed = matches!(kind, "broken_pipe" | "connection_reset");
     if close_reader {
         assert_eq!(
             fs::read_to_string(base.join("closed-reader.stage")).expect("importer reached stage"),
             "reader closed after manifest"
         );
-        // A half-closed peer can report EINVAL before its process exits.
-        // This fixture orders read shutdown, not process exit.
-        // Timeouts and other errors still fail.
-        let closed_read_side = std::io::Error::from_raw_os_error(libc::EINVAL).to_string();
-        assert!(
-            message == broken_pipe || message == closed_read_side,
-            "{failed}"
-        );
+        // Read shutdown before peer exit can also reject SCM_RIGHTS with EINVAL.
+        assert!(peer_closed || kind == "invalid_input", "{failed}");
     } else {
-        assert!(
-            message == "handoff import refused: test handoff import failure after 64 of 150 fds"
-                || message == broken_pipe,
-            "unexpected transfer failure: {failed}"
-        );
+        assert!(peer_closed || kind == "import_refused", "{failed}");
     }
 
     wait_for_api(&api_socket, Duration::from_secs(10));

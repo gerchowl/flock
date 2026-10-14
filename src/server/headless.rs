@@ -383,6 +383,38 @@ fn public_pane_sort_key(pane_id: &str) -> (usize, usize, String) {
     (workspace, pane, pane_id.to_string())
 }
 
+/// Preserve typed I/O and importer-refusal evidence alongside diagnostic prose.
+fn failed_handoff_response(
+    id: String,
+    err: &io::Error,
+    dropped: &[api::schema::UndrainedPane],
+) -> api::schema::HandoffFailureResponse {
+    use api::schema::HandoffFailureKind;
+    let kind = if err
+        .get_ref()
+        .is_some_and(|cause| cause.is::<crate::server::handoff::ImportRefusal>())
+    {
+        HandoffFailureKind::ImportRefused
+    } else {
+        match err.kind() {
+            io::ErrorKind::BrokenPipe => HandoffFailureKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset => HandoffFailureKind::ConnectionReset,
+            io::ErrorKind::InvalidInput => HandoffFailureKind::InvalidInput,
+            _ => HandoffFailureKind::Other,
+        }
+    };
+    api::schema::HandoffFailureResponse {
+        id,
+        error: api::schema::HandoffFailureBody {
+            error: api::schema::ErrorBody {
+                code: api::error_code::ErrorCode::HandoffFailed.as_str().into(),
+                message: failed_handoff_message(err, dropped),
+            },
+            kind,
+        },
+    }
+}
+
 /// A failed handoff's message, naming any pane whose input `--skip-undrained`
 /// had already dropped before the failure: that input is gone even though
 /// the old server keeps running.
@@ -2744,51 +2776,46 @@ impl HeadlessServer {
             self.handoff_skipped_undrained.clear();
             let outcome = self.perform_live_handoff(params.clone());
             let dropped_before_failure = std::mem::take(&mut self.handoff_skipped_undrained);
-            let response = match outcome {
-                Ok(skipped_undrained) if skipped_undrained.is_empty() => {
-                    serde_json::to_string(&api::schema::SuccessResponse {
+            let response =
+                match outcome {
+                    Ok(skipped_undrained) if skipped_undrained.is_empty() => {
+                        serde_json::to_string(&api::schema::SuccessResponse {
+                            id: msg.request.id,
+                            result: api::schema::ResponseResult::Ok {},
+                        })
+                    }
+                    Ok(skipped_undrained) => serde_json::to_string(&api::schema::SuccessResponse {
                         id: msg.request.id,
-                        result: api::schema::ResponseResult::Ok {},
-                    })
+                        result: api::schema::ResponseResult::LiveHandoff { skipped_undrained },
+                    }),
+                    Err(HandoffError::Undrained(panes)) => {
+                        serde_json::to_string(&api::schema::ErrorResponse {
+                            id: msg.request.id,
+                            error: api::schema::ErrorBody {
+                                code: "handoff_undrained".into(),
+                                message: undrained_handoff_message(&panes),
+                            },
+                        })
+                    }
+                    // #426: its own error code, not `handoff_failed`. The refusal is
+                    // the one handoff outcome an operator can act on differently —
+                    // retrying is pointless and the recovery destroys their sessions
+                    // — so `flk server live-handoff` prints the message as prose
+                    // rather than as the JSON every other failure gets.
+                    Err(HandoffError::SessionBroken) => {
+                        serde_json::to_string(&api::schema::ErrorResponse {
+                            id: msg.request.id,
+                            error: api::schema::ErrorBody {
+                                code: "session_broken".into(),
+                                message: crate::health::session_warning::HANDOFF_REFUSAL.into(),
+                            },
+                        })
+                    }
+                    Err(HandoffError::Failed(err)) => serde_json::to_string(
+                        &failed_handoff_response(msg.request.id, &err, &dropped_before_failure),
+                    ),
                 }
-                Ok(skipped_undrained) => serde_json::to_string(&api::schema::SuccessResponse {
-                    id: msg.request.id,
-                    result: api::schema::ResponseResult::LiveHandoff { skipped_undrained },
-                }),
-                Err(HandoffError::Undrained(panes)) => {
-                    serde_json::to_string(&api::schema::ErrorResponse {
-                        id: msg.request.id,
-                        error: api::schema::ErrorBody {
-                            code: "handoff_undrained".into(),
-                            message: undrained_handoff_message(&panes),
-                        },
-                    })
-                }
-                // #426: its own error code, not `handoff_failed`. The refusal is
-                // the one handoff outcome an operator can act on differently —
-                // retrying is pointless and the recovery destroys their sessions
-                // — so `flk server live-handoff` prints the message as prose
-                // rather than as the JSON every other failure gets.
-                Err(HandoffError::SessionBroken) => {
-                    serde_json::to_string(&api::schema::ErrorResponse {
-                        id: msg.request.id,
-                        error: api::schema::ErrorBody {
-                            code: "session_broken".into(),
-                            message: crate::health::session_warning::HANDOFF_REFUSAL.into(),
-                        },
-                    })
-                }
-                Err(HandoffError::Failed(err)) => {
-                    serde_json::to_string(&api::schema::ErrorResponse {
-                        id: msg.request.id,
-                        error: api::schema::ErrorBody {
-                            code: "handoff_failed".into(),
-                            message: failed_handoff_message(&err, &dropped_before_failure),
-                        },
-                    })
-                }
-            }
-            .unwrap_or_else(|_| "{}".to_string());
+                .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
             return true;
         }
@@ -4217,6 +4244,28 @@ mod tests {
         let mut ids = vec!["pane 7", "wA:p1", "w2:p1", "w1:pA", "w1:p2"];
         ids.sort_by_cached_key(|id| public_pane_sort_key(id));
         assert_eq!(ids, vec!["w1:p2", "w1:pA", "w2:p1", "wA:p1", "pane 7"]);
+    }
+
+    #[test]
+    fn failed_handoff_response_preserves_kind_without_parsing_diagnostic() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::InvalidInput, "invalid_input"),
+            (io::ErrorKind::TimedOut, "other"),
+            (io::ErrorKind::WouldBlock, "other"),
+            (io::ErrorKind::Other, "other"),
+        ] {
+            let err = io::Error::new(kind, "diagnostic prose can change");
+            let response = failed_handoff_response("typed-failure".into(), &err, &[]);
+            let json = serde_json::to_value(response).expect("serialize failed handoff");
+            assert_eq!(json["error"]["code"], "handoff_failed");
+            assert_eq!(json["error"]["kind"], expected);
+            assert!(json.get("result").is_none());
+            let old: api::schema::ErrorResponse =
+                serde_json::from_value(json).expect("existing clients ignore additive error.kind");
+            assert_eq!(old.error.message, "diagnostic prose can change");
+        }
     }
 
     #[test]
