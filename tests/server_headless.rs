@@ -170,14 +170,14 @@ fn spawn_server(
     }
 }
 
-/// Use the shared transport's connect-before-send timeout setup. The ten-second
-/// I/O bound matches the one-shot API helpers. Pathname connect is synchronous,
+/// Use the shared transport's connect-before-send setup with a caller-chosen
+/// I/O bound. Pathname connect is synchronous,
 /// and timeouts bound individual I/O operations rather than the whole exchange.
-fn ping_socket(socket_path: &Path) -> String {
+fn ping_socket(socket_path: &Path, timeout: Duration) -> String {
     support::json_api::request(
         socket_path,
         r#"{"id":"1","method":"ping","params":{}}"#,
-        Duration::from_secs(10),
+        timeout,
     )
     .expect("headless API ping")
     .trim()
@@ -189,9 +189,9 @@ fn ping_socket(socket_path: &Path) -> String {
 #[tokio::test]
 async fn headless_ping_fails_when_peer_stays_alive_and_silent() {
     const PROBE_SOCKET: &str = "FLOCK_TEST_HEADLESS_PING_SOCKET";
-    const CEILING: Duration = Duration::from_secs(20);
+    const CEILING: Duration = Duration::from_secs(5);
     if let Some(socket) = std::env::var_os(PROBE_SOCKET) {
-        let response = ping_socket(Path::new(&socket));
+        let response = ping_socket(Path::new(&socket), Duration::from_millis(100));
         assert!(
             response.contains("pong"),
             "ping did not return pong: {response}"
@@ -480,7 +480,7 @@ fn server_creates_both_sockets() {
     );
 
     // Verify the API socket works.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "ping should return pong: {response}"
@@ -525,7 +525,7 @@ fn server_api_responds_to_ping() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
     // Ping the API socket.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
@@ -590,7 +590,7 @@ fn server_cleans_up_stale_client_socket() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
     // The API should work.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
@@ -622,7 +622,7 @@ fn server_persists_after_client_disconnect() {
     thread::sleep(Duration::from_millis(200));
 
     // The server should still be running and the API should still respond.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should still respond after client disconnect: {response}"
@@ -867,7 +867,7 @@ fn no_hello_client_closed_within_five_seconds() {
     assert!(error.is_none());
 
     // API should still work.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "server should still respond to ping: {response}"
