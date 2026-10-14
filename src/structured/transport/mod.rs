@@ -4,6 +4,11 @@
 //! for pipe, queue or disk capacity. Stop/drop cancels workers without joining;
 //! the supervisor must observe both completions before releasing session files.
 //! Disk and transport failures are explicit completions, never turn results.
+//! Each durable record is buffered before one write_all. Reopen repairs a torn
+//! final record by truncating to the last good newline, logging discarded bytes
+//! and continuing its sequence; interior corruption remains an explicit error.
+//! Envelope origins distinguish transport summaries from stdout lookalikes.
+//! Any top-level result ends the input gate; its outcome remains adapter work.
 #![deny(missing_docs)]
 
 use super::claude::SessionEvent;
@@ -30,8 +35,18 @@ pub struct StreamLocation {
     pub data_dir: PathBuf,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
-    /// Session identifier with the same component restrictions.
+    /// Session identifier with the same restrictions; `queue` is reserved (any case).
     pub session: String,
+}
+
+/// Trusted source of the record, assigned by the transport, never by stdout JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordOrigin {
+    /// Original Claude stdout, including apparent flk marker names.
+    Claude,
+    /// A transport-generated oversize or invalid-UTF-8 summary.
+    Flk,
 }
 
 /// Lossless normal-line envelope; oversize/invalid UTF-8 lines use named summaries.
@@ -41,6 +56,10 @@ pub struct StreamRecord {
     pub seq: u64,
     /// Receive time in milliseconds since the Unix epoch.
     pub received_at_ms: u128,
+    /// Trusted origin, distinct from any similarly named field inside `raw`.
+    pub origin: RecordOrigin,
+    /// Top-level result subtype, retained even when S1 does not model it.
+    pub result_subtype: Option<Value>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
@@ -64,8 +83,8 @@ pub enum Completion {
 }
 
 /// Server handle. Inbound/outbound memory is bounded; there is at most one turn
-/// pending. Only a known result reopens the private idle gate. Unknown results
-/// fail closed. The supervisor owns socket refusal and process cleanup (#1462).
+/// pending. Any parsed top-level result reopens the private idle gate, including
+/// unmodelled subtypes. The supervisor owns socket refusal and process cleanup (#1462).
 pub struct Transport {
     input: Option<mpsc::SyncSender<Vec<u8>>>,
     output: mpsc::Receiver<Received>,
@@ -93,6 +112,15 @@ impl Transport {
             {
                 return Err(io::Error::other("invalid structured stream component"));
             }
+        }
+        if ["queue"]
+            .iter()
+            .any(|name| location.session.eq_ignore_ascii_case(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "structured_reserved_session_id",
+            ));
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
@@ -186,6 +214,9 @@ impl Transport {
 
     /// Request stdin closure, discarding any unfinished input. Never waits for a
     /// full pipe; the writer closes its descriptor within one polling interval.
+    /// An in-flight write may leave a partial JSON line before EOF. This is
+    /// acceptable only at stop: no further turn is delivered, and supervision
+    /// records stop intent before closure and never treats truncation as success.
     pub fn close_stdin(&mut self) {
         self.close.store(true, Ordering::Release);
         self.input.take();
@@ -268,6 +299,11 @@ fn write_inputs(
     }
 }
 
+/// Open an exclusively owned session stream. Records are serialized in memory
+/// and submitted with one write_all; short writes/crashes can still tear a tail.
+/// Recovery truncates only a malformed final record (including invalid JSON with
+/// a trailing LF), syncs the repair, logs discarded bytes and resumes the last
+/// good sequence. Interior corruption and non-dense sequences fail explicitly.
 fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
@@ -279,27 +315,61 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
-    let mut reader = BufReader::new(&mut file);
-    let mut seq = 0;
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            return Err(cancelled());
+    let length = file.metadata()?.len();
+    let mut good_bytes = 0;
+    let mut seq = 0_u64;
+    {
+        let mut reader = BufReader::new(&mut file);
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(cancelled());
+            }
+            let mut line = Vec::new();
+            let n = Read::by_ref(&mut reader)
+                .take(RECORD_LIMIT)
+                .read_until(b'\n', &mut line)? as u64;
+            if n == 0 {
+                break;
+            }
+            let record = serde_json::from_slice::<StreamRecord>(&line);
+            if line.ends_with(b"\n") && record.is_ok() {
+                let record = record.map_err(io::Error::other)?;
+                if Some(record.seq) != seq.checked_add(1) {
+                    return Err(io::Error::other("non-dense session sequence"));
+                }
+                seq = record.seq;
+                good_bytes += n;
+            } else {
+                if line.ends_with(b"\n") && good_bytes + n < length {
+                    return Err(io::Error::other("interior session corruption"));
+                }
+                // An oversized torn tail is scanned in bounded chunks. A newline
+                // before EOF would make it interior corruption, never a repair.
+                let mut position = good_bytes + n;
+                let mut chunk = [0; 8192];
+                loop {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(cancelled());
+                    }
+                    let n = reader.read(&mut chunk)?;
+                    if n == 0 {
+                        break;
+                    }
+                    for (index, byte) in chunk[..n].iter().enumerate() {
+                        if *byte == b'\n' && position + index as u64 + 1 != length {
+                            return Err(io::Error::other("interior session corruption"));
+                        }
+                    }
+                    position += n as u64;
+                }
+                break;
+            }
         }
-        let mut line = Vec::new();
-        let n = Read::by_ref(&mut reader)
-            .take(RECORD_LIMIT)
-            .read_until(b'\n', &mut line)?;
-        if n == 0 {
-            break;
-        }
-        if !line.ends_with(b"\n") {
-            return Err(io::Error::other("incomplete session record"));
-        }
-        let record: StreamRecord = serde_json::from_slice(&line)?;
-        if record.seq != seq + 1 {
-            return Err(io::Error::other("non-dense session sequence"));
-        }
-        seq = record.seq;
+    }
+    if good_bytes < length {
+        file.set_len(good_bytes)?;
+        file.sync_all()?;
+        crate::logging::structured_stream_repaired(length - good_bytes);
     }
     Ok((file, seq))
 }
@@ -364,6 +434,11 @@ fn emit(
     busy: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
+    let origin = if count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err() {
+        RecordOrigin::Flk
+    } else {
+        RecordOrigin::Claude
+    };
     let raw = if count > MAX_LINE_BYTES as u64 {
         serde_json::json!({"type":"flk_oversize", "bytes":count, "limit":MAX_LINE_BYTES, "prefix_base64":base64::engine::general_purpose::STANDARD.encode(&line[..line.len().min(256)])}).to_string()
     } else {
@@ -373,6 +448,18 @@ fn emit(
         }
     };
     let event = SessionEvent::parse(&raw, version);
+    let (ends_turn, result_subtype) = match &event {
+        SessionEvent::Success(_) => (true, Some(Value::String("success".into()))),
+        SessionEvent::ExecutionError(_) => {
+            (true, Some(Value::String("error_during_execution".into())))
+        }
+        SessionEvent::Unknown { value, .. }
+            if value.get("type").and_then(Value::as_str) == Some("result") =>
+        {
+            (true, value.get("subtype").cloned())
+        }
+        _ => (false, None),
+    };
     *seq = seq
         .checked_add(1)
         .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
@@ -382,15 +469,15 @@ fn emit(
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_millis(),
+        origin,
+        result_subtype,
         raw,
     };
-    serde_json::to_writer(&mut *file, &record)?;
-    file.write_all(b"\n")?;
+    let mut encoded = serde_json::to_vec(&record)?;
+    encoded.push(b'\n');
+    file.write_all(&encoded)?;
     file.sync_data()?;
-    if matches!(
-        event,
-        SessionEvent::Success(_) | SessionEvent::ExecutionError(_)
-    ) {
+    if ends_turn {
         busy.store(false, Ordering::Release);
     }
     let mut received = Received { record, event };

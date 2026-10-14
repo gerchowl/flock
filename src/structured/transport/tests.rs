@@ -45,14 +45,18 @@ fn start(root: &SessionConfigDir) -> (Transport, File, File) {
 }
 
 fn records(root: &SessionConfigDir) -> Vec<StreamRecord> {
-    fs::read_to_string(
+    let text = fs::read_to_string(
         root.path()
             .join("sessions/fixture-agent/fixture-session.jsonl"),
     )
-    .expect("durable stream")
-    .lines()
-    .map(|s| serde_json::from_str(s).expect("record"))
-    .collect()
+    .expect("durable stream");
+    assert!(
+        text.is_empty() || text.ends_with('\n'),
+        "torn session record"
+    );
+    text.lines()
+        .map(|s| serde_json::from_str(s).expect("complete session record"))
+        .collect()
 }
 
 fn user(text: &str) -> Value {
@@ -82,7 +86,7 @@ fn fixture_lines_reach_s1_and_durable_stream_including_final_line() {
         assert_eq!(received.record.seq, index as u64 + 1);
         assert_eq!(received.record.raw, *raw);
         assert_eq!(received.event, SessionEvent::parse(raw, "2.1.296"));
-        let persisted = records_if_ready(&root);
+        let persisted = records(&root);
         assert!(persisted.len() > index, "persistence precedes delivery");
         assert_eq!(persisted[index].raw, *raw);
         assert!(received.record.received_at_ms > 0);
@@ -129,7 +133,7 @@ fn large_lines_oversize_unknown_and_invalid_utf8_are_explicit() {
 }
 
 #[test]
-fn private_idle_gate_reopens_only_after_a_known_result() {
+fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
     let (transport, mut stdout, input) = start(&root);
     assert!(transport
@@ -153,26 +157,33 @@ fn private_idle_gate_reopens_only_after_a_known_result() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"new_result\"}\n")
         .expect("unknown result");
-    wait(|| transport.try_receive().ok());
+    let received = wait(|| transport.try_receive().ok());
+    assert!(matches!(received.event, SessionEvent::Unknown { .. }));
     assert_eq!(
-        transport
-            .try_submit(&user("second"))
-            .expect_err("unknown fails closed")
-            .kind(),
-        io::ErrorKind::WouldBlock
+        received.record.result_subtype,
+        Some(Value::String("new_result".into()))
+    );
+    transport
+        .try_submit(&user("second"))
+        .expect("unmodelled result ends turn");
+    line.clear();
+    input.read_line(&mut line).expect("second input");
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).expect("input"),
+        user("second")
     );
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\n")
         .expect("result");
     wait(|| transport.try_receive().ok());
     transport
-        .try_submit(&user("second"))
+        .try_submit(&user("third"))
         .expect("next idle submit");
     line.clear();
-    input.read_line(&mut line).expect("second input");
+    input.read_line(&mut line).expect("third input");
     assert_eq!(
         serde_json::from_str::<Value>(&line).expect("input"),
-        user("second")
+        user("third")
     );
 }
 
@@ -226,7 +237,14 @@ fn consumer_backpressure_is_bounded_and_cancellable() {
     stdout
         .write_all(b"one\ntwo\nthree\nfour\nfive\nsix\n")
         .expect("stdout");
-    wait(|| (records_if_ready(&root).len() == 5).then_some(()));
+    wait(|| {
+        (root
+            .path()
+            .join("sessions/fixture-agent/fixture-session.jsonl")
+            .exists()
+            && records(&root).len() == 5)
+            .then_some(())
+    });
     thread::sleep(Duration::from_millis(20));
     assert_eq!(
         records(&root).len(),
@@ -243,17 +261,6 @@ fn consumer_backpressure_is_bounded_and_cancellable() {
     assert_eq!(transport.output.try_iter().count(), 4);
 }
 
-fn records_if_ready(root: &SessionConfigDir) -> Vec<StreamRecord> {
-    fs::read_to_string(
-        root.path()
-            .join("sessions/fixture-agent/fixture-session.jsonl"),
-    )
-    .unwrap_or_default()
-    .lines()
-    .filter_map(|s| serde_json::from_str(s).ok())
-    .collect()
-}
-
 #[test]
 fn reopen_continues_sequence_and_refuses_corrupt_streams() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
@@ -267,10 +274,10 @@ fn reopen_continues_sequence_and_refuses_corrupt_streams() {
     let path = root
         .path()
         .join("sessions/fixture-agent/fixture-session.jsonl");
-    fs::write(&path, b"incomplete").expect("corrupt stream");
+    fs::write(&path, b"corrupt-interior\n{}").expect("corrupt stream");
     let (transport, _out, _input) = start(&root);
     assert!(reader_done(&transport).is_err());
-    assert_eq!(fs::read(path).expect("preserved"), b"incomplete");
+    assert_eq!(fs::read(path).expect("preserved"), b"corrupt-interior\n{}");
 }
 
 #[test]
@@ -366,4 +373,107 @@ fn existing_stream_links_and_unsafe_modes_are_refused() {
     symlink(&target, &path).expect("fixture symlink");
     assert!(open_stream(location(&root), &AtomicBool::new(false)).is_err());
     assert_eq!(fs::read(target).expect("preserved target"), b"untouched");
+}
+
+#[test]
+fn torn_last_record_is_truncated_and_sequence_continues() {
+    for tail in [b"{\"seq\":3".as_slice(), b"{not-json}\n".as_slice()] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+        let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+        let mut good = Vec::new();
+        for seq in 1..=2 {
+            let record = serde_json::json!({"seq":seq,"received_at_ms":1,"origin":"claude","result_subtype":null,"raw":"prior"});
+            serde_json::to_writer(&mut good, &record).expect("fixture record");
+            good.push(b'\n');
+        }
+        file.write_all(&good).expect("good records");
+        file.write_all(tail).expect("torn tail");
+        drop(file);
+        let (file, seq) =
+            open_stream(location(&root), &AtomicBool::new(false)).expect("repair tail");
+        assert_eq!(seq, 2);
+        assert_eq!(
+            file.metadata().expect("repaired size").len(),
+            good.len() as u64
+        );
+        drop(file);
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("sessions/fixture-agent/fixture-session.jsonl")
+            )
+            .expect("repaired content"),
+            good
+        );
+        let (transport, mut stdout, _input) = start(&root);
+        stdout.write_all(b"after-repair").expect("new final line");
+        drop(stdout);
+        assert_eq!(wait(|| transport.try_receive().ok()).record.seq, 3);
+        reader_done(&transport).expect("EOF");
+        assert_eq!(records(&root).len(), 3);
+    }
+}
+
+#[test]
+fn reserved_queue_session_names_have_a_named_refusal() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    for reserved in ["queue", "Queue", "QUEUE"] {
+        let (stdout, _out) = pipe();
+        let (_input, stdin) = pipe();
+        let mut loc = location(&root);
+        loc.session = reserved.into();
+        let error = Transport::start(stdout, stdin, loc, "2.1.296".into())
+            .err()
+            .expect("reserved id refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "structured_reserved_session_id");
+    }
+    assert!(
+        !root.path().join("sessions").exists(),
+        "refusal precedes file setup"
+    );
+}
+
+#[test]
+fn claude_cannot_spoof_transport_record_origin() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    let (transport, mut stdout, _input) = start(&root);
+    let producer = thread::spawn(move || {
+        stdout
+            .write_all(b"{\"type\":\"flk_oversize\",\"origin\":\"flk\",\"bytes\":999}\n")
+            .expect("spoofed marker");
+        stdout
+            .write_all(&vec![b'x'; MAX_LINE_BYTES + 1])
+            .expect("real oversize");
+        stdout.write_all(b"\n").expect("separator");
+    });
+    let spoof = wait(|| transport.try_receive().ok());
+    let genuine = wait(|| transport.try_receive().ok());
+    assert_eq!(spoof.record.origin, RecordOrigin::Claude);
+    assert_eq!(genuine.record.origin, RecordOrigin::Flk);
+    for received in [&spoof, &genuine] {
+        assert!(matches!(received.event, SessionEvent::Unknown { .. }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&received.record.raw).expect("marker")["type"],
+            "flk_oversize"
+        );
+    }
+    producer.join().expect("producer");
+    reader_done(&transport).expect("EOF");
+    let persisted = records(&root);
+    assert_eq!(persisted[0].origin, RecordOrigin::Claude);
+    assert_eq!(persisted[1].origin, RecordOrigin::Flk);
+}
+
+#[test]
+fn recovery_scans_an_oversized_torn_tail_without_accepting_it() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+    file.write_all(&vec![b'x'; RECORD_LIMIT as usize + 99])
+        .expect("oversized torn tail");
+    drop(file);
+    let (file, seq) =
+        open_stream(location(&root), &AtomicBool::new(false)).expect("repair oversized tail");
+    assert_eq!(seq, 0);
+    assert_eq!(file.metadata().expect("size").len(), 0);
 }
