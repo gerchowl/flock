@@ -701,22 +701,11 @@ impl App {
             }
             Err(reason) => crate::logging::mesh_custody_failed("offers_due", error_code(&reason)),
         }
+        self.refresh_mesh_routes();
         let route_generation = self.mesh_routes.table.generation();
         if self.mesh_forward_generation != Some(route_generation) {
-            let routes: std::collections::BTreeMap<_, _> = self
-                .mesh_routes
-                .table
-                .routes()
-                .into_iter()
-                .map(|route| (route.node, route.next_hop))
-                .collect();
-            let targets: Vec<_> = self
-                .mesh_routes
-                .table
-                .routes()
-                .into_iter()
-                .map(|route| route.node)
-                .collect();
+            let routes = self.custody_routes();
+            let targets: Vec<_> = routes.keys().cloned().collect();
             let after = self
                 .mesh_forward_cursor
                 .as_ref()

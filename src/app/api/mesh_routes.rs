@@ -163,6 +163,23 @@ impl App {
         }
     }
 
+    /// Custody paths include live pinned direct edges before reciprocal adverts.
+    /// Direct reachability takes precedence over any longer learned path.
+    /// Call after refreshing attachments so closed edges cannot retain mail.
+    pub(super) fn custody_routes(&self) -> BTreeMap<String, String> {
+        let mut routes: BTreeMap<_, _> = self
+            .mesh_routes
+            .table
+            .routes()
+            .into_iter()
+            .map(|route| (route.node, route.next_hop))
+            .collect();
+        for node in self.mesh_routes.live.keys() {
+            routes.insert(node.clone(), node.clone());
+        }
+        routes
+    }
+
     pub(super) fn handle_mesh_routes(
         &mut self,
         id: String,

@@ -193,13 +193,7 @@ impl App {
                 self.take_refusal_receipts(outbound, origin);
             }
             self.refresh_mesh_routes();
-            let routes = self
-                .mesh_routes
-                .table
-                .routes()
-                .into_iter()
-                .map(|route| (route.node, route.next_hop))
-                .collect();
+            let routes = self.custody_routes();
             with_store(|store| {
                 let mut refusals = Vec::new();
                 if let Collect::Outbound { outbound } = &query {
