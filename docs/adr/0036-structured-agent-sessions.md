@@ -1355,7 +1355,7 @@ ok" unless noted. Input-equivalent cost = `in + 0.1 × read + 2 × write`
 | 5d | control for 5c, server kept | 2 | 41,391 | 41 | 4 | 99.9 | 1,877 | 4,223 |
 | 5e | 5b, asked to use Read | 4 | 37,966 | 353 | 230 | 99.1 | 1,752 | 4,507 |
 | 5g | point of test 2 + MCP added, asked to call it | 4 | 38,283 | 559 | 80 | 98.6 | 1,163 | 4,950 |
-| 6 | day boundary | pending (#1305), A.7.2 | | | | | | |
+| 6 | base H, end of turn 1, 6 min later across local midnight (A.7.2) | 2 | 6,203 | 118 | 4 | 98.1 | 1,159 | 858 |
 | 7a | segment: fork at the first message after `/compact` | 2 | 5,195 | 2,266 | 4 | 69.6 | 683 | 5,054 |
 | 7b | slice of F's turn 1 (28 kB of text) as the first prompt of a fresh session | 2 | 5,195 | 13,808 | 6 | 27.3 | 1,588 | 28,138 |
 | 7c | `--resume-session-at` a preserved pre-compaction uuid | 2 | 5,195 | 2,153 | 3 | 70.7 | 1,139 | 4,828 |
@@ -1393,15 +1393,51 @@ input-equivalent tokens against 1,905 for the warm read. This is the rule
 
 #### A.7.2 Test 6, day boundary
 
-`CLAUDE_CODE_OVERRIDE_DATE=2026-10-14` on a fork at test 2's point read
-99.4% (18,913 / 116) but did not change the date: no date-change
-attachment appeared and the model answered 2026-10-13, so the override did
-not take effect on this path and the row proves nothing about a day
-boundary. A real run straddling local midnight (base at 23:56, fork at
-00:02) is scheduled and tracked as #1305. This record is accepted with it
-outstanding, because E13's expectation does not change the design
-(a fork across a day boundary that misses costs a cold write, which the
-cost guard of §9 shows either way).
+An earlier attempt with `CLAUDE_CODE_OVERRIDE_DATE=2026-10-14` on a fork at
+test 2's point read 99.4% (18,913 / 116) but did not change the date: no
+date-change attachment appeared and the model answered 2026-10-13. The
+override did not take effect on that path, so that row proves nothing about
+a day boundary.
+
+The real run straddled local midnight (CEST), Claude Code 2.1.296, Haiku,
+profile iso, same driver and flags as A.7.1. Base H (`86b52283`) ran three
+turns at 23:56:00–23:56:13 on 2026-10-13: read `big.txt` and give its last
+line; `ls` then Read `a.txt`, sequentially; a one-word reply. Its transcript
+holds `attachment{type: date, date: 2026-10-13}` in turn 1. H was forked at
+the end of its turn 1 (`c4697d6a`) twice with `--resume H
+--resume-session-at c4697d6a --fork-session`:
+
+| When | Prompt | in | read | write | out | read % | TTFT ms | input-eq |
+|---|---|---|---|---|---|---|---|---|
+| 00:02:03, 2026-10-14 | "Reply with exactly: ok" | 2 | 6,203 | 118 | 4 | 98.1 | 1,159 | 858 |
+| 00:03:08, 2026-10-14 | "What is today's date? Reply with only YYYY-MM-DD." | 2 | 6,203 | 130 | 481 | 97.9 | 3,170 | 882 |
+
+All writes were `ephemeral_1h_input_tokens`. In both forks Claude Code
+appended `attachment{type: date, date: 2026-10-14, changed: true}`, rendered
+as a system reminder ("The date has changed. Today's date is now
+2026-10-14. …"), after the new user prompt. The original date attachment
+in turn 1 was left as it was. The prefix up to the fork point therefore
+stays byte-identical across the day boundary and is read from cache. The
+writes are only the new prompt plus the date-change reminder. This matches
+E13's expectation: a fork across a day boundary keeps its cache. It does
+not contradict §9 or A.7.
+
+Caveats:
+
+- H is smaller than F and G (about 6.3k tokens at the fork point, not
+  19k): in turn 1 the model read `big.txt` with `tail -n 1` through Bash,
+  not with Read. The 6,203 tokens read is the shared system and tool block
+  (5,195, see the A.7 notes) plus H's whole turn 1. The prefix past the
+  shared block was a hit as well, not just the system prompt.
+- The gap from base to fork was 6 minutes, inside the 1-hour TTL (A.7.1).
+  This test isolates the date change. It is not a TTL test.
+- Model behaviour, not cache: in the second fork Haiku answered
+  `2026-10-13` even though the date-change reminder was in its input, and
+  added that "nothing in this conversation supports" the change. The
+  reminder reaches the model, but Haiku did not act on it here. flk should
+  not rely on the model noticing a date change on its own.
+
+Recorded on #1305 on 2026-10-14.
 
 ### A.8 Bytes
 
