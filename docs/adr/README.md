@@ -46,6 +46,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0034](0034-harness-hooks-and-question-routing.md) | Delegates never ask the human: flk owns one policy point per harness hook (including the shell command gate and mid-turn notices), a delegate's question becomes a structured question to its architect, only the root reaches the operator | Accepted |
 | [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Accepted |
 | [0036](0036-structured-agent-sessions.md) | An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary | Accepted |
+| [0037](0037-test-wait-liveness-and-hang-ceilings.md) | Condition waits fail on dead, unexpected or silent producers, with measured nextest termination ceilings for every binary | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
