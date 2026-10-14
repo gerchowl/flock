@@ -192,6 +192,14 @@ impl App {
             if let Collect::Outbound { outbound } = &mut query {
                 self.take_refusal_receipts(outbound, origin);
             }
+            self.refresh_mesh_routes();
+            let routes = self
+                .mesh_routes
+                .table
+                .routes()
+                .into_iter()
+                .map(|route| (route.node, route.next_hop))
+                .collect();
             with_store(|store| {
                 let mut refusals = Vec::new();
                 if let Collect::Outbound { outbound } = &query {
@@ -222,6 +230,7 @@ impl App {
                             .ok_or("mesh node identity unavailable")?,
                         origin,
                         outbound,
+                        &routes,
                         now_ms() as i64,
                     ),
                 }

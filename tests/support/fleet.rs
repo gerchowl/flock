@@ -357,7 +357,7 @@ impl Node {
     }
 }
 
-/// Hold mesh message deliveries on one edge while other traffic proceeds.
+/// Gate mesh deliveries or outbound leases while other traffic proceeds.
 /// Dropping the gate also releases it, including when a test assertion fails.
 pub struct MessageGate {
     path: PathBuf,
@@ -428,6 +428,16 @@ impl Fleet {
         self.node(from);
         self.node(to);
         let path = self.base.join(format!("gate-message-{from}-{to}"));
+        fs::create_dir(&path).unwrap();
+        MessageGate { path }
+    }
+
+    /// Inhibit outbound leases until release while topology exchanges still pass.
+    /// Entry and release markers share the message gate's bounded wait and cleanup.
+    pub fn gate_outbound_poll(&self, from: &str, to: &str) -> MessageGate {
+        self.node(from);
+        self.node(to);
+        let path = self.base.join(format!("gate-outbound-poll-{from}-{to}"));
         fs::create_dir(&path).unwrap();
         MessageGate { path }
     }

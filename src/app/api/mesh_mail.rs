@@ -703,13 +703,12 @@ impl App {
         }
         let route_generation = self.mesh_routes.table.generation();
         if self.mesh_forward_generation != Some(route_generation) {
-            let adjacent: Vec<_> = self
+            let routes: std::collections::BTreeMap<_, _> = self
                 .mesh_routes
                 .table
                 .routes()
                 .into_iter()
-                .filter(|route| route.hops == 1)
-                .map(|route| route.node)
+                .map(|route| (route.node, route.next_hop))
                 .collect();
             let targets: Vec<_> = self
                 .mesh_routes
@@ -725,7 +724,7 @@ impl App {
                 .map(|(_, key)| key);
             let keys = with_store(|store| {
                 store
-                    .withdraw_request_hops(&adjacent)
+                    .withdraw_request_hops(&routes)
                     .map_err(|e| e.to_string())?;
                 store
                     .routable_requests(&targets, after, 256)

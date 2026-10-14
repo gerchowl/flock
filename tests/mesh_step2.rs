@@ -648,9 +648,14 @@ fn laptop_collects_answer_through_a_different_hub() {
     // hub reconnects. A first hub that still believed its edge to nodea live
     // could take custody of the reply, then find its only route runs back
     // through the spoke, which refuses it as loop_detected (#866).
+    c.fleet.wait_route("nodea", "nodeb", false);
     c.fleet.wait_route("noded.example", "nodea", false);
     c.fleet.wait_route("nodeb", "nodea", false);
-    c.reply();
+    let reply = c.reply();
+    wait_unrouted_reply(
+        c.fleet.node("noded.example"),
+        reply["correlation_id"].as_str().unwrap(),
+    );
     reconnect(&c.fleet, "nodea", "nodec");
     c.fleet.wait_route("noded.example", "nodea", true);
     for node in &c.fleet.nodes {
@@ -660,6 +665,94 @@ fn laptop_collects_answer_through_a_different_hub() {
     let found = route(c.fleet.node("nodea"), c.fleet.node("noded.example"));
     assert_eq!(found["next_hop"], fleet::node_id(c.fleet.node("nodec")));
     once(c.fleet.node("noded.example"), "question");
+}
+
+// Withdrawal must invalidate a stored assignment even when its edge stays live.
+#[test]
+fn withdrawn_return_route_keeps_reply_at_spoke_until_second_hub_connects() {
+    let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");
+    cut(&c.fleet, "nodea", "nodec");
+    fleet::wait_until("spoke return route uses first hub", DEADLINE, || {
+        routes(c.fleet.node("noded.example"))
+            .iter()
+            .any(|r| {
+                r["node"] == fleet::node_id(c.fleet.node("nodea"))
+                    && r["next_hop"] == fleet::node_id(c.fleet.node("nodeb"))
+            })
+            .then_some(())
+    });
+    c.send();
+    fleet::wait_until(
+        "request imported before holding outbound poll",
+        DEADLINE,
+        || {
+            (scalar(
+                c.fleet.node("noded.example"),
+                "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='inbox'",
+            ) == 1)
+                .then_some(())
+        },
+    );
+    let gate = c.fleet.gate_outbound_poll("nodeb", "noded.example");
+    c.read_question();
+    gate.wait_entered(DEADLINE);
+    let reply = c.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let spoke = c.fleet.node("noded.example");
+    let assigned: String = db(spoke)
+        .query_row(
+            "SELECT next_hop FROM envelopes WHERE correlation=?1",
+            [correlation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(assigned, fleet::node_id(c.fleet.node("nodeb")));
+    cut(&c.fleet, "nodea", "nodeb");
+    c.fleet.wait_route("nodea", "nodeb", false);
+    c.fleet.wait_route("noded.example", "nodea", false);
+    c.fleet.wait_route("nodeb", "nodea", false);
+    gate.release();
+    fleet::wait_until("old hub poll passes released gate", DEADLINE, || {
+        api(c.fleet.node("nodeb"), "ping", json!({}));
+        c.fleet
+            .base
+            .join("gate-outbound-poll-nodeb-noded.example/passed")
+            .exists()
+            .then_some(())
+    });
+    wait_unrouted_reply(spoke, correlation);
+    assert_eq!(
+        scalar(
+            c.fleet.node("nodeb"),
+            "SELECT count(*) FROM envelopes WHERE kind='message' AND request_origin IS NOT NULL"
+        ),
+        0
+    );
+    reconnect(&c.fleet, "nodea", "nodec");
+    c.fleet.wait_route("noded.example", "nodea", true);
+    c.answer_once();
+    once(spoke, "question");
+}
+
+fn wait_unrouted_reply(node: &Node, correlation: &str) {
+    fleet::wait_until("reply held without a stale next hop", DEADLINE, || {
+        // A bounded API request checks the producer before each bounded DB probe.
+        api(node, "ping", json!({}));
+        let (state, hop): (String, String) = db(node)
+            .query_row(
+                "SELECT state,next_hop FROM envelopes WHERE correlation=?1",
+                [correlation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        match state.as_str() {
+            "held" => hop.is_empty().then_some(()),
+            other => panic!(
+                "reply custody moved before reconnection: {other}; {}",
+                custody(node)
+            ),
+        }
+    });
 }
 
 fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
