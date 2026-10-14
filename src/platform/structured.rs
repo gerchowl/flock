@@ -5,6 +5,23 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+/// Transfer owned child pipes into nonblocking-file transport without raw fd copies.
+pub(crate) fn child_pipes(child: &mut std::process::Child) -> io::Result<(File, File)> {
+    use std::os::fd::OwnedFd;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdin pipe"))?;
+    Ok((
+        File::from(OwnedFd::from(stdout)),
+        File::from(OwnedFd::from(stdin)),
+    ))
+}
+
 /// Open the token without following links or blocking on a FIFO, then validate
 /// the opened inode. Checking the path before opening would race replacement.
 pub(crate) fn open_token(path: &Path) -> io::Result<File> {

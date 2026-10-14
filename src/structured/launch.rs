@@ -168,13 +168,15 @@ impl VerifiedBinary {
 /// records, symlinks, special files and records over 1 MiB fail closed.
 /// #1438 checks this before writing the first user input.
 pub fn registry_has_messaging_socket(config_dir: &Path, pid: u32) -> io::Result<bool> {
-    let file = match private_fs::open_regular_file(
-        &config_dir.join("sessions").join(format!("{pid}.json")),
-    ) {
+    let path = config_dir.join("sessions").join(format!("{pid}.json"));
+    let file = match private_fs::open_regular_file(&path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err),
     };
+    if path.canonicalize()? != path {
+        return Err(io::Error::other("redirected session registry"));
+    }
     if file.metadata()?.len() > 1_048_576 {
         return Err(io::Error::other("session registry exceeds 1 MiB"));
     }

@@ -94,6 +94,28 @@ pub struct Transport {
     close: Arc<AtomicBool>,
 }
 
+/// Cloneable nonblocking shutdown requests for the process supervisor.
+#[derive(Clone)]
+pub(super) struct StopHandle {
+    cancel: Arc<AtomicBool>,
+    close: Arc<AtomicBool>,
+}
+
+impl StopHandle {
+    /// Close stdin; stop intent must already be recorded.
+    pub(super) fn close_stdin(&self) {
+        self.close.store(true, Ordering::Release);
+    }
+    /// Cancel I/O, including blocked notification delivery.
+    pub(super) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    /// Whether cancellation was requested, including by a failed worker.
+    pub(super) fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+}
+
 impl Transport {
     /// Start workers over owned pipe endpoints, without spawning a process.
     /// File setup/recovery happens on the reader worker. A startup error appears
@@ -103,6 +125,18 @@ impl Transport {
         stdin: File,
         location: StreamLocation,
         version: String,
+    ) -> io::Result<Self> {
+        Self::start_guarded(stdout, stdin, location, version, || Ok(()))
+    }
+
+    /// Run the registry refusal on the writer worker immediately before its
+    /// first input bytes. Failure is explicit Writer(Err), with no bytes written.
+    pub(super) fn start_guarded(
+        stdout: File,
+        stdin: File,
+        location: StreamLocation,
+        version: String,
+        before_first_write: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> io::Result<Self> {
         for component in [&location.agent, &location.session] {
             if component.is_empty()
@@ -144,7 +178,7 @@ impl Transport {
         if let Err(err) = thread::Builder::new()
             .name("session-stdin".into())
             .spawn(move || {
-                let result = write_inputs(stdin, input_rx, &c, &closed);
+                let result = write_inputs(stdin, input_rx, &c, &closed, before_first_write);
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
@@ -162,6 +196,19 @@ impl Transport {
             cancel,
             close,
         })
+    }
+
+    /// Share shutdown flags without sharing receivers or blocking on a mutex.
+    pub(super) fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            cancel: self.cancel.clone(),
+            close: self.close.clone(),
+        }
+    }
+
+    /// Whether an accepted input lacks any top-level result, including Unknown.
+    pub(super) fn input_inflight(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
 
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
@@ -265,7 +312,9 @@ fn write_inputs(
     rx: mpsc::Receiver<Vec<u8>>,
     cancel: &AtomicBool,
     close: &AtomicBool,
+    before_first_write: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut before_first_write = Some(before_first_write);
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -275,6 +324,9 @@ fn write_inputs(
         }
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
+                if let Some(check) = before_first_write.take() {
+                    check()?;
+                }
                 let mut remaining = bytes.as_slice();
                 while !remaining.is_empty() {
                     if cancel.load(Ordering::Acquire) {
