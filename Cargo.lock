@@ -727,6 +727,7 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.118",
  "sysinfo",
  "tokio",
  "toml",
