@@ -6,6 +6,9 @@
 //! it. Four cases moved to the codes ADR-0029 §2 assigns them (#1025), and
 //! [`MOVED`] names the code each one had before.
 
+mod constants;
+pub(crate) use constants::*;
+
 /// Whether a caller that got this exit status may simply run the call again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Retry {
@@ -52,41 +55,40 @@ pub(crate) struct Exit {
 }
 
 macro_rules! exits {
-    ($($name:ident = $code:literal, $retry:ident, $meaning:literal;)*) => {
-        $(pub(crate) const $name: i32 = $code;)*
+    ($($name:ident, $retry:ident, $meaning:literal;)*) => {
         /// Every registered exit status, in code order.
         pub(crate) const ALL: &[Exit] = &[
-            $(Exit { name: stringify!($name), code: $code, retry: Retry::$retry, meaning: $meaning },)*
+            $(Exit { name: stringify!($name), code: $name, retry: Retry::$retry, meaning: $meaning },)*
         ];
     };
 }
 
 exits! {
-    SUCCESS = 0, NotApplicable, "success, effect observed";
-    FAILURE = 1, Maybe, "unclassified failure (transport, internal)";
-    CONFIG_CHECK_ADVISORY = 1, Never, "config check: loaded with warnings";
-    USAGE = 2, Never, "usage error";
-    WORKTREE_NOT_LINKED = 2, Never, "worktree kill / delegate reap: not a linked worktree, or no such workspace";
-    CONFIG_CHECK_PARSE_FAILURE = 2, Never, "config check: the config did not load";
-    NO_ANSWER = 3, AfterInspecting, "msg / wait reply: no answer is coming (deferred, expired, gone)";
-    REPLY_BLOCKED = 3, AfterInspecting, "delegate wait: the agent answered BLOCKED";
-    NOT_SHOWN = 3, Later, "notification show: recorded but not shown";
-    WORKTREE_GATE_WOULD_FAIL = 3, Later, "worktree kill --dry-run: the merge gate would not pass";
-    GONE = 4, Never, "target not found or gone";
-    WORKTREE_NEEDS_FORCE = 4, AfterInspecting, "worktree kill / delegate reap: dirty or has submodules, --force clears it";
-    NO_SENTINEL = 5, AfterInspecting, "delegate wait: finished without the expected result";
-    AGENT_BLOCKED = 6, AfterHuman, "delegate wait: the agent needs a human";
-    WAIT_BLOCKED = 6, AfterHuman, "agent wait / wait agent-status: the agent is blocked on a dialog";
-    STALLED = 7, AfterInspecting, "waits, delegate wait: working, no progress past the stall window";
-    UNCONFIRMED = 8, AfterInspecting, "send: effect uncertain, text may be in the composer";
-    ABANDONED = 9, Yes, "send: effect abandoned, composer restored";
-    REFUSED = 10, Later, "refused before acting, nothing changed";
-    DELEGATE_NOT_STARTED = 11, AfterInspecting, "delegate start / wait: the delegate did not start";
-    MSG_REFUSED = 13, Never, "msg: the receiver refused the message";
-    POLICY_REFUSED = 13, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014), an agent widening a delegate's question policy, or a goal write the caller may not make (ADR-0030 §1)";
-    RECONNECT_GAVE_UP = 75, Later, "client gave up reconnecting to its server (EX_TEMPFAIL)";
-    PROTOCOL_GAP = 78, AfterHandoff, "client/server protocol gap";
-    TIMEOUT = 124, Yes, "timed out";
+    SUCCESS, NotApplicable, "success, effect observed";
+    FAILURE, Maybe, "unclassified failure (transport, internal)";
+    CONFIG_CHECK_ADVISORY, Never, "config check: loaded with warnings";
+    USAGE, Never, "usage error";
+    WORKTREE_NOT_LINKED, Never, "worktree kill / delegate reap: not a linked worktree, or no such workspace";
+    CONFIG_CHECK_PARSE_FAILURE, Never, "config check: the config did not load";
+    NO_ANSWER, AfterInspecting, "msg / wait reply: no answer is coming (deferred, expired, gone)";
+    REPLY_BLOCKED, AfterInspecting, "delegate wait: the agent answered BLOCKED";
+    NOT_SHOWN, Later, "notification show: recorded but not shown";
+    WORKTREE_GATE_WOULD_FAIL, Later, "worktree kill --dry-run: the merge gate would not pass";
+    GONE, Never, "target not found or gone";
+    WORKTREE_NEEDS_FORCE, AfterInspecting, "worktree kill / delegate reap: dirty or has submodules, --force clears it";
+    NO_SENTINEL, AfterInspecting, "delegate wait: finished without the expected result";
+    AGENT_BLOCKED, AfterHuman, "delegate wait: the agent needs a human";
+    WAIT_BLOCKED, AfterHuman, "agent wait / wait agent-status: the agent is blocked on a dialog";
+    STALLED, AfterInspecting, "waits, delegate wait: working, no progress past the stall window";
+    UNCONFIRMED, AfterInspecting, "send: effect uncertain, text may be in the composer";
+    ABANDONED, Yes, "send: effect abandoned, composer restored";
+    REFUSED, Later, "refused before acting, nothing changed";
+    DELEGATE_NOT_STARTED, AfterInspecting, "delegate start / wait: the delegate did not start";
+    MSG_REFUSED, Never, "msg: the receiver refused the message";
+    POLICY_REFUSED, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014), an agent widening a delegate's question policy, or a goal write the caller may not make (ADR-0030 §1)";
+    RECONNECT_GAVE_UP, Later, "client gave up reconnecting to its server (EX_TEMPFAIL)";
+    PROTOCOL_GAP, AfterHandoff, "client/server protocol gap";
+    TIMEOUT, Yes, "timed out";
 }
 
 /// The cases that moved code in #1025, as `(new, old)`. For one release a
