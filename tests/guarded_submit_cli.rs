@@ -2,10 +2,9 @@
 
 mod support;
 
-// Bin-only flock exposes no library. Read its registry directly, including the
-// notice writer that intentionally uses stderr under the CLI module lint policy.
-#[allow(dead_code, clippy::print_stderr)]
-#[path = "../src/cli/exit.rs"]
+// Bin-only flock shares only numeric constants, without the registry's tests.
+#[allow(dead_code)] // This test needs only the uncertain and abandoned exits.
+#[path = "../src/cli/exit/constants.rs"]
 mod exit;
 
 use serde_json::{json, Value};
@@ -15,7 +14,21 @@ use tokio::net::UnixListener;
 
 const CEILING: Duration = Duration::from_secs(10);
 
+/// Short socket reservation, independent of TMPDIR and PID reuse.
+/// Entropy, collision and filesystem errors fail immediately. Drop cleans normal
+/// exits, but abrupt process termination can leave this unique directory behind.
 struct SocketDir(std::path::PathBuf);
+
+impl SocketDir {
+    fn reserve() -> Self {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).expect("socket directory entropy");
+        // guardrails-ok(hermetic): Unix sockets need a short path on macOS too.
+        let path = std::path::PathBuf::from(format!("/tmp/gs-{:016x}", u64::from_ne_bytes(random)));
+        std::fs::create_dir(&path).expect("exclusive peer directory reservation");
+        Self(path)
+    }
+}
 
 impl Drop for SocketDir {
     fn drop(&mut self) {
@@ -64,8 +77,7 @@ async fn guarded_submit_cli_reports_exit_8_and_9_with_scripted_evidence() {
         ),
         (exit::ABANDONED, "abandoned", "operator_active", false),
     ] {
-        let dir = SocketDir(std::env::temp_dir().join(format!("gs-{}-{code}", std::process::id())));
-        std::fs::create_dir(&dir.0).expect("isolated peer directory");
+        let dir = SocketDir::reserve();
         let socket = dir.0.join("s");
         let listener = UnixListener::bind(&socket).expect("isolated peer socket");
         let response = json!({"id":"cli:agent:send","result":{
