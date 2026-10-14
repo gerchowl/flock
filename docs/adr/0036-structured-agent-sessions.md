@@ -907,6 +907,12 @@ files. No hand-written TS type may describe a wire shape.
 - **Shape key.** `shape = harness + harness_version + type + subtype +
   sorted top-level keys`. A known event whose `extra` is non-empty is also a
   new shape.
+- **S1 note (shape identity).** The canonical key also includes `event.type`,
+  `request.subtype` and `response.subtype`, alongside harness, observed harness
+  version, top-level `type`/`subtype` and sorted top-level keys. These nested
+  discriminators distinguish SSE and control envelopes that otherwise share
+  the same top-level shape. Missing discriminators are null. This refines the
+  key's representation without changing the owner decision.
 - **Rendering.** Every frontend renders `Unknown` (and a known event's
   `extra`) as a collapsible JSON dump with the shape key as its title. That
   rendering is part of the reference client and of the TUI's structured view.
