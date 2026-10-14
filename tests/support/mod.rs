@@ -9,6 +9,7 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod composer;
 pub mod fleet;
 pub mod json_api;
 pub mod process_table;

@@ -1,6 +1,5 @@
-#[path = "support/composer.rs"]
-mod composer;
 mod support;
+use support::composer::Composer;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -2692,10 +2691,16 @@ fn agent_send_and_pane_send_text_use_bracketed_paste() {
     let script = base.join("composer.py");
     let shell = base.join("composer-shell");
     let log = base.join("input.jsonl");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
     fs::write(
         &script,
         r#"import json, os, sys, time, tty
 from pathlib import Path
+import socket
+gate = socket.socket(socket.AF_UNIX)
+gate.connect(str(Path(__file__).with_name('gate.sock')))
+gate.sendall(b'boot\n')
+assert gate.recv(1) == b'G'
 tty.setraw(0)
 log = Path(__file__).with_name('input.jsonl')
 os.write(1, b'\x1b[?2004h\x1b[>9uREADY')
@@ -2724,6 +2729,7 @@ with log.open('w') as out:
         shell.to_str().unwrap(),
     );
 
+    let mut readiness = Composer::watch(&socket_path).unwrap();
     let created = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2733,24 +2739,7 @@ with log.open('w') as out:
         .to_string(),
     );
     let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let read = send_request(
-            &socket_path,
-            &serde_json::json!({
-                "id": "read", "method": "pane.read", "params": {"pane_id": pane, "source": "recent"}
-            })
-            .to_string(),
-        );
-        if read.to_string().contains("READY") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "fake composer never became ready: {read}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    readiness.wait(&gate, &socket_path, pane, false).unwrap();
     let pasted = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2894,6 +2883,7 @@ with log.open('w') as out:
         shell.to_str().unwrap(),
     );
 
+    let mut readiness = Composer::watch(&socket_path).unwrap();
     let created = send_request(
         &socket_path,
         &serde_json::json!({
@@ -2903,50 +2893,7 @@ with log.open('w') as out:
         .to_string(),
     );
     let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    // ADR-0037 §1: this is a failure ceiling for the whole protocol, rather
-    // than a startup timing assertion. The fixture cannot emit before subscribe.
-    let stages = composer::Stages::new(Duration::from_secs(120));
-    let mut producer = stages.accept(&gate).expect("composer did not connect");
-    stages.expect(&mut producer, "boot").unwrap();
-    let mut events = UnixStream::connect(&socket_path).unwrap();
-    writeln!(
-        events,
-        "{}",
-        serde_json::json!({
-            "id": "composer-ready", "method": "events.subscribe",
-            "params": {"subscriptions": [
-                {"type": "pane.output_matched", "pane_id": pane, "source": "recent",
-                 "lines": 40, "match": {"type": "substring", "value": "READY"}},
-                {"type": "pane.agent_status_changed", "pane_id": pane, "agent_status": "idle"}
-            ]}
-        })
-    )
-    .unwrap();
-    let ack: serde_json::Value = serde_json::from_str(&stages.line(&mut events).unwrap()).unwrap();
-    assert_eq!(ack["id"], "composer-ready", "{ack}");
-    assert_eq!(ack["result"]["type"], "subscription_started", "{ack}");
-    producer.write_all(b"G").unwrap();
-    let mut output_seen = false;
-    let mut idle_seen = false;
-    while !output_seen || !idle_seen {
-        let event: serde_json::Value =
-            serde_json::from_str(&stages.line(&mut events).unwrap()).unwrap();
-        assert_eq!(event["data"]["pane_id"], pane, "{event}");
-        match event["event"].as_str() {
-            Some("pane.output_matched") if !output_seen => {
-                assert!(event["data"]["read"]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("READY"));
-                output_seen = true;
-            }
-            Some("pane.agent_status_changed") if !idle_seen => {
-                assert_eq!(event["data"]["agent_status"], "idle", "{event}");
-                idle_seen = true;
-            }
-            _ => panic!("unexpected composer readiness stage: {event}"),
-        }
-    }
+    readiness.wait(&gate, &socket_path, pane, true).unwrap();
     let read_log = || -> Vec<serde_json::Value> {
         fs::read_to_string(&log)
             .unwrap_or_default()
@@ -3007,4 +2954,137 @@ with log.open('w') as out:
         enter_at - paste_at
     );
     cleanup_spawned_flock(child, base);
+}
+
+#[cfg(test)]
+mod composer_stages_tests {
+    use super::*;
+    use std::io;
+    use std::io::Write;
+    use support::readiness::Stages;
+
+    #[test]
+    fn producer_exit_fails() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        drop(writer);
+        assert_eq!(
+            Stages::new(Duration::from_secs(1))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn unexpected_stage_fails() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"wrong\n").unwrap();
+        assert_eq!(
+            Stages::new(Duration::from_secs(1))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn live_silent_producer_fails() {
+        let (mut reader, _live_writer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            Stages::new(Duration::from_millis(10))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn stage_arrival_succeeds() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"boot\n").unwrap();
+        Stages::new(Duration::from_secs(1))
+            .expect(&mut reader, "boot")
+            .unwrap();
+    }
+}
+
+/// Both pre-connect and post-release deaths must interrupt the 120s ceiling.
+fn assert_composer_death_is_observed(after_release: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let socket = runtime.join("flock.sock");
+    let script = base.join("composer.py");
+    let shell = base.join("composer-shell");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
+    let mut source = String::from("import os, signal, socket\nfrom pathlib import Path\n");
+    if after_release {
+        source.push_str("gate = socket.socket(socket.AF_UNIX)\ngate.connect(str(Path(__file__).with_name('gate.sock')))\ngate.sendall(b'boot\\n')\nassert gate.recv(1) == b'G'\n");
+    }
+    source.push_str("os.kill(os.getpid(), signal.SIGKILL)\n");
+    fs::write(&script, source).unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(&config, &runtime, &socket, shell.to_str().unwrap());
+    let mut readiness = Composer::watch(&socket).unwrap();
+    let created = send_request(
+        &socket,
+        &serde_json::json!({
+            "id":"create", "method":"workspace.create", "params":{"cwd":base,"focus":true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let exit_wait = support::timing::wait("composer fixture exit");
+    let error = readiness.wait(&gate, &socket, pane, false).unwrap_err();
+    let phase = if after_release {
+        "READY and idle/done"
+    } else {
+        "connecting"
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("fixture exited before {phase}")),
+        "{error}"
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    // Exit evidence must interrupt the wait with EOF, not its silence timeout.
+    drop(exit_wait);
+    cleanup_spawned_flock(child, base);
+}
+
+#[test]
+fn composer_killed_before_connect_fails_promptly() {
+    assert_composer_death_is_observed(false);
+}
+
+#[test]
+fn composer_killed_after_release_fails_promptly() {
+    assert_composer_death_is_observed(true);
+}
+
+#[test]
+fn composer_readiness_accepts_repeated_idle_and_done_before_output() {
+    for status in ["idle", "done"] {
+        let mut state = support::composer::ReadyState::new(true);
+        let event = serde_json::json!({"event":"pane.agent_status_changed", "data":{"pane_id":"w1:p1", "agent_status":status}});
+        assert!(!state.observe(&event, "w1:p1").unwrap());
+        assert!(!state.observe(&event, "w1:p1").unwrap());
+        let output = serde_json::json!({"event":"pane.output_matched", "data":{"pane_id":"w1:p1", "read":{"text":"READY"}}});
+        assert!(state.observe(&output, "w1:p1").unwrap());
+    }
 }
