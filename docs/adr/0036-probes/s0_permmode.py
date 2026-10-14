@@ -13,10 +13,11 @@ and the turn's `system/init.permissionMode`:
 4. mid-turn: the turn runs `sleep 4`, the driver switches to `acceptEdits`
    during the sleep, and the same turn then Writes,
 5. other values: `bypassPermissions` (the session was not started with
-   `--allow-dangerously-skip-permissions`), `plan`, and a bogus mode,
+   `--dangerously-skip-permissions`, as the refusal says), `plan`, and a
+   bogus mode,
 6. a plain reply, to read the mode the session is left in.
 
-    CLAUDE_PROFILE_DIR=~/.claude-profiles/work S0_OUT=/tmp/s0 \\
+    S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_permmode.py
 """
 

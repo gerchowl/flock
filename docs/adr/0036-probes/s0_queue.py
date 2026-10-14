@@ -19,7 +19,7 @@ harness reports M2 `queued`, and then sends one control request:
 It records the control response, every `command_lifecycle` of both inputs
 with times, the tool result of the sleep, and each `result`.
 
-    CLAUDE_PROFILE_DIR=~/.claude-profiles/work S0_OUT=/tmp/s0 \\
+    S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_queue.py [scenario ...]
 """
 

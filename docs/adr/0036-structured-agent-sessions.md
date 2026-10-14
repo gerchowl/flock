@@ -1483,10 +1483,9 @@ interrupts on both (read from the schemas only), and any live Codex
 Measured on 2026-10-14 against Claude Code 2.1.296 on sage (macOS, Apple
 Silicon), model alias `haiku`. Drivers are committed under
 `docs/adr/0036-probes/` (`s0lib.py` is the shared stream-json driver; every
-probe below names its script and can be re-run with
-`CLAUDE_PROFILE_DIR=<profile> python3 -I docs/adr/0036-probes/<script>`).
+probe below names its script; `README.md` there says how to re-run it).
 The raw captures are not committed, as in A (they hold account rate-limit
-state).
+state), so a figure below can be checked only by re-running its script.
 
 Every run removed every `FLOCK_*` and `CLAUDE_CODE_*` variable plus
 `CLAUDECODE`, `CLAUDE_PID` and `CLAUDE_EFFORT` from the child environment,
@@ -1495,8 +1494,22 @@ ran in a fresh temporary working directory holding `a.txt` and `b.txt`
 --output-format stream-json --verbose --replay-user-messages
 --include-hook-events --setting-sources local --strict-mcp-config
 --no-session-persistence --model haiku` plus the flags each section names.
-`CLAUDE_CONFIG_DIR` was the operator's work profile, for its login (E6); no
-flk server, pane or sccache server was started or reached. Totals over the
+No flk server, pane or sccache server was started or reached.
+
+**Isolation caveat.** The runs recorded here set `CLAUDE_CONFIG_DIR` to the
+operator's live work profile, for its keychain login (E6). That was not
+isolated enough: each session registered `sessions/<pid>.json`, an inbox
+key and a socket under it while it ran, left empty `projects/<cwd>/memory/`
+and `session-env/<session id>/` directories, and one A.15 run wrote a plan
+file into `plans/`. All of it was removed afterwards by the session ids and
+working directories in the captures (PR #1356 lists the paths). The
+drivers have since been changed to give every session a fresh temporary
+`CLAUDE_CONFIG_DIR`, deleted on close, with the login passed in as
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. They have not been
+re-run that way yet. Nothing measured here depends on the profile: user
+settings were already dropped by `--setting-sources local`.
+
+Totals over the
 63 `result`s of 38 sessions: input 228, cache read 603,138, cache write
 149,881, output 13,667 (766,914 tokens, 79% cache reads).
 
@@ -1620,10 +1633,23 @@ complete within 0.37 s of each other. Two runs per shape.
 | `touch`, then a pre-allowed MCP tool (`s0_mcpstub.py` `echo`, in `--allowedTools`) | Bash | — (no prompt); its result arrived 5 ms after the Bash answer, not before | — |
 | the MCP tool, then `touch` | Bash, after the MCP result (0.34–0.36 s) | — | — |
 
-Control requests are serial: one `can_use_tool` is open at a time, and a
-tool call later in the same message, prompting or not, does not run until
-the open one is answered. A pre-allowed MCP tool ordered before the
-prompting call runs first.
+What this shows: in a message of non-concurrency-safe calls (Bash
+`touch`, AskUserQuestion, and an MCP tool without a read-only hint), only
+one `can_use_tool` was ever open, and no call later in the message ran,
+prompting or not, until the open one was answered. A pre-allowed MCP call
+ordered before the prompting one ran first.
+
+What it does not show is why. Claude Code may simply run
+non-concurrency-safe tools one at a time, so a later call would wait
+behind any running earlier call, permission or not. The control is
+pending (needs a re-run with a model): `s0_parallel.py`'s
+`sleep_then_mcp` and `slowtouch_then_mcp` shapes put the same pre-allowed
+MCP call behind a pre-allowed `sleep 5` and a pre-allowed, writing
+`sleep 5 && touch`, with no permission open. If the MCP result waits for
+the Bash call there too, serial execution of non-concurrent tools is what
+holds it, and the open permission is just one way an earlier call can
+stay unfinished. Also untested: a concurrency-safe call (`Read`, or an MCP
+tool with `readOnlyHint`) behind an open permission.
 
 ### A.14 The harness's own queue in `-p` (§3)
 
@@ -1673,14 +1699,17 @@ Run twice; the runs agreed.
 | 2 | `set_permission_mode{mode: acceptEdits}` at idle | `{mode: acceptEdits}` | `acceptEdits` | no | yes |
 | 3 | `{mode: default}` at idle | `{mode: default}` | `default` | yes | no |
 | 4 | `{mode: acceptEdits}` during the turn's `sleep 4`, before its Write | `{mode: acceptEdits}` | `default` (emitted at turn start) | no | yes |
-| 5 | `{mode: bypassPermissions}` | `error: "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"`, `error_code: bypass_not_launched` | — | — | — |
-| 5 | `{mode: plan}` | `{mode: plan}` | `plan` in the next turn | — | — |
-| 5 | `{mode: bogus}` | `error: "Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"`, `error_code: invalid_mode` | — | — | — |
+| 5a | `{mode: bypassPermissions}` at idle | `error: "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"`, `error_code: bypass_not_launched` | — | — | — |
+| 5b | `{mode: plan}` at idle | `{mode: plan}` | — | — | — |
+| 5c | `{mode: bogus}` at idle | `error: "Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"`, `error_code: invalid_mode` | — | — | — |
+| 6 | none; the turn is "Reply with exactly: ok" (second run) | — | `plan` | — | — |
 
 The switch is in place and immediate: no respawn, and a switch during a
-turn applies to that turn's next tool call. In the first run a Write in
-`plan` mode wrote a plan file into `$CLAUDE_CONFIG_DIR/plans/` (the probe
-created that directory; it was removed); step 6 now only reads the mode.
+turn applies to that turn's next tool call. Step 6 shows `plan` stuck and
+the refused requests left it unchanged. In the first run step 6 was a
+Write, and in `plan` mode that wrote a plan file into
+`$CLAUDE_CONFIG_DIR/plans/` (the probe created that directory; it was
+removed). The second run's step 6 only reads the mode.
 
 ### A.16 `claude /login` for a macOS user with no GUI session (owner decision 1) — BLOCKED on the operator
 
@@ -1711,12 +1740,16 @@ find-generic-password` first.
 
 - `--no-session-persistence` keeps the transcript out of the profile but
   still creates `projects/<cwd>/memory/` and `session-env/<session id>/`
-  (both empty here); the probes' 32 and 22 of them were removed by
-  matching the captured session ids. Each running session also writes
-  `sessions/<pid>.json` and a key file there (A.11).
+  (both empty here). In these runs that was 33 and 23 directories in the
+  operator's profile, removed by matching the captured session ids and
+  working directories (see the isolation caveat above). Each running
+  session also writes `sessions/<pid>.json` and a key file there (A.11).
+  These are observations from the profile directory, not from a capture.
 - A permission prompt answered `deny` with a message is not a
   `system/permission_denied` event: in A.12 to A.15 none was emitted for
-  any stdio deny; only `result.permission_denials` records it.
+  any stdio deny; only `result.permission_denials` records it. This rests
+  on the uncommitted captures of `s0_carrier.py`, `s0_parallel.py` and
+  `s0_permmode.py`; re-running them reproduces it.
 
 ### S0 findings for the architect
 
@@ -1746,17 +1779,18 @@ not edited here.
    answered: …", which §2a's "the model cannot mistake it for the user's
    answer" argued against.
 3. **§2b case 1, owner decision 3 (asking while a permission is open).**
-   The harness holds every further control request behind an open
-   `can_use_tool`, so `AskUserQuestion` is unavailable then, as §2b
-   allowed for. But the stated way out does not hold: a pre-allowed MCP
-   tool later in the same message also waits for the open permission
-   (A.13). While a permission is open nothing after it in that message
-   runs, whatever the channel; only a call ordered before the prompting
-   one runs. The compiled-context advice ("use `flock_question_ask` while
-   a permission is open") cannot help within the blocked message. A
-   question that must not wait has to be asked before, or in a message
-   apart from, a call that prompts. It also means `waiting_on_human` (§1)
-   has at most one open control request per session.
+   An `AskUserQuestion` later in the same message as a prompting call did
+   not arrive while the permission was open, as §2b allowed for. Neither
+   did the result of a pre-allowed MCP tool (no read-only hint) ordered
+   after it (A.13), so the stated way out, `flock_question_ask`, did not
+   escape the block within that message. Only a call ordered before the
+   prompting one ran. Not yet known is whether the open permission or
+   serial execution of non-concurrency-safe tools holds the later call:
+   the controls in A.13 are pending. Until they run, §2b's advice should
+   read "ask before, or in a message apart from, a call that may prompt"
+   rather than "use the MCP tool while a permission is open". Only one
+   open control request per session was observed, but that may hold only
+   for non-concurrent calls.
 4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
    exists (`cancel_async_message{message_uuid}`, `queued` only), so
    `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the

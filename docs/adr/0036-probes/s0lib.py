@@ -10,11 +10,17 @@ Isolation, as Appendix A of ADR-0036 requires:
 - every `FLOCK_*`, `CLAUDE_CODE_*`, `CLAUDECODE`, `CLAUDE_PID` and
   `CLAUDE_EFFORT` variable is removed from the child's environment, so the
   session cannot reach a live flk server, pane or the calling Claude session,
-- `CLAUDE_CONFIG_DIR` is the profile named by `CLAUDE_PROFILE_DIR` (the
-  login lives in the keychain under that dir's hash, E6, so a fresh dir would
-  not be logged in); the profile's user-level hooks, permissions, plugins and
-  connectors are dropped by `--setting-sources local --strict-mcp-config`,
-  and `--no-session-persistence` keeps the transcript out of it,
+- `CLAUDE_CONFIG_DIR` is a fresh temporary directory per session (mode
+  0700), removed by `Session.close()`, so nothing the session writes
+  (session registry, inbox key, `session-env/`, `projects/`, `plans/`)
+  lands in a real profile,
+- the login is passed in as `CLAUDE_CODE_OAUTH_TOKEN`, the token
+  `claude setup-token` prints (an empty config dir is not logged in, E6).
+  It is read from the file named by `S0_OAUTH_TOKEN_FILE`, or from
+  `CLAUDE_CODE_OAUTH_TOKEN` in the driver's own environment. It is never
+  printed or written to a capture,
+- `--setting-sources local --strict-mcp-config --no-session-persistence`
+  as in Appendix A,
 - the working directory is a fresh temporary directory with two small files,
   deleted on exit.
 
@@ -49,7 +55,28 @@ BASE_FLAGS = [
 ]
 
 
-def clean_env(extra=None):
+def _oauth_token():
+    path = os.environ.get("S0_OAUTH_TOKEN_FILE")
+    if path:
+        with open(os.path.expanduser(path)) as f:
+            return f.read().strip()
+    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+
+
+# read before clean_env strips every CLAUDE_CODE_* variable
+OAUTH_TOKEN = _oauth_token()
+
+
+def require_login():
+    if not OAUTH_TOKEN:
+        raise SystemExit(
+            "s0lib: no login. Run `claude setup-token` once, save the token to a "
+            "0600 file and set S0_OAUTH_TOKEN_FILE to it (or export "
+            "CLAUDE_CODE_OAUTH_TOKEN). The probes never use a real profile."
+        )
+
+
+def clean_env(config_dir, extra=None):
     env = {
         k: v
         for k, v in os.environ.items()
@@ -59,9 +86,8 @@ def clean_env(extra=None):
             or k in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
         )
     }
-    profile = os.environ.get("CLAUDE_PROFILE_DIR")
-    if profile:
-        env["CLAUDE_CONFIG_DIR"] = profile
+    env["CLAUDE_CONFIG_DIR"] = config_dir
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH_TOKEN
     if extra:
         env.update(extra)
     return env
@@ -75,9 +101,11 @@ def out_dir():
 
 class Session:
     def __init__(self, name, flags, env_extra=None, cwd_files=None):
+        require_login()
         self.name = name
         self.t0 = time.monotonic()
         self.cwd = tempfile.mkdtemp(prefix="s0-cwd-")
+        self.config_dir = tempfile.mkdtemp(prefix="s0-cfg-")
         for fname, body in (cwd_files or {"a.txt": "alpha\n", "b.txt": "beta\n"}).items():
             with open(os.path.join(self.cwd, fname), "w") as f:
                 f.write(body)
@@ -90,7 +118,7 @@ class Session:
         self.proc = subprocess.Popen(
             self.argv,
             cwd=self.cwd,
-            env=clean_env(env_extra),
+            env=clean_env(self.config_dir, env_extra),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -198,6 +226,7 @@ class Session:
         self.log.write(json.dumps({"_exit": self.proc.returncode, "_stderr_tail": "".join(self.stderr)[-2000:]}) + "\n")
         self.log.close()
         shutil.rmtree(self.cwd, ignore_errors=True)
+        shutil.rmtree(self.config_dir, ignore_errors=True)
         return self.proc.returncode
 
 

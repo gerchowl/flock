@@ -12,9 +12,11 @@ tried (`touch` first in the prompt, and the question first), and also two
 parallel permission-needing calls (two `touch`es). The `*_mcp*` shapes pair
 the `touch` with a pre-allowed MCP tool (`s0_mcpstub.py`, standing in for
 `flock_question_ask`) and record whether its result arrives while the
-permission request is open.
+permission request is open. `sleep_then_mcp` is their control: the same MCP
+call behind a pre-allowed `sleep 5` (and behind a pre-allowed, writing
+`sleep 5 && touch`), with no permission open.
 
-    CLAUDE_PROFILE_DIR=~/.claude-profiles/work S0_OUT=/tmp/s0 \\
+    S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_parallel.py [runs] [hold_s]
 """
 
@@ -63,6 +65,57 @@ MCP_FLAGS = [
     "--mcp-config", json.dumps({"mcpServers": {"s0stub": {"command": "python3", "args": ["-I", STUB]}}}),
     "--allowedTools", "mcp__s0stub__echo",
 ]
+
+
+# The control for the shapes above (A.13, pending): the same MCP call behind a
+# pre-allowed, non-concurrency-safe Bash `sleep 5`, with NO permission open.
+# If the MCP result still waits for the sleep, what held it in
+# `touch_then_mcp` is serial execution of non-concurrent tools, not the open
+# permission request.
+CONTROLS = {
+    "sleep_then_mcp": (
+        "In ONE response, make exactly these two tool calls in parallel, in this order, "
+        "without waiting for either: (1) Bash: `sleep 5`; (2) mcp__s0stub__echo with text "
+        "'mcp-ok'. Then summarise both outcomes in one line.",
+        ["--mcp-config", MCP_FLAGS[1], "--allowedTools", "mcp__s0stub__echo", "Bash(sleep:*)"],
+    ),
+    # `sleep` alone may be classed read-only, and so concurrency-safe: this
+    # one is pre-allowed but writes, so it is not
+    "slowtouch_then_mcp": (
+        "In ONE response, make exactly these two tool calls in parallel, in this order, "
+        "without waiting for either: (1) Bash: `sleep 5 && touch s0-slow.txt`; (2) "
+        "mcp__s0stub__echo with text 'mcp-ok'. Then summarise both outcomes in one line.",
+        ["--mcp-config", MCP_FLAGS[1], "--allowedTools", "mcp__s0stub__echo", "Bash(sleep:*)", "Bash(touch:*)"],
+    ),
+}
+
+
+def run_control(shape, n):
+    prompt, extra = CONTROLS[shape]
+    sess = L.Session(f"parallel-{shape}-{n}", FLAGS + extra)
+    out = {"shape": shape, "run": n}
+    sess.user(prompt)
+    pos = 0
+    while True:
+        e = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120, start=pos)
+        if e is None or L.is_result(e):
+            res = e
+            break
+        out.setdefault("unexpected_prompts", []).append(e["request"].get("tool_name"))
+        sess.answer(e["request_id"], answer_for(e, "deny"))
+        pos = e["_i"] + 1
+    evs = sess.since(0)
+    uses = L.tool_uses(evs)
+    results = {x["tool_use_id"]: x["t"] for x in L.tool_results(evs)}
+    out["calls"] = [{"name": u["name"], "msg": u["msg"], "use_t": u["t"], "result_t": results.get(u["id"])} for u in uses]
+    sl = next((c for c in out["calls"] if c["name"] == "Bash"), None)
+    mc = next((c for c in out["calls"] if c["name"].startswith("mcp__")), None)
+    if sl and mc and sl["result_t"] and mc["result_t"]:
+        out["one_message"] = sl["msg"] == mc["msg"]
+        out["mcp_waited_for_sleep"] = mc["result_t"] >= sl["result_t"]
+    out["result"] = None if res is None else {"text": res.get("result"), "usage": L.usage(res)}
+    out["exit"] = sess.close()
+    return out
 
 
 def answer_for(req, label):
@@ -145,8 +198,8 @@ def run(shape, n, hold_s):
 def main():
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     hold_s = float(sys.argv[2]) if len(sys.argv) > 2 else 10
-    shapes = sys.argv[3:] or list(PROMPTS)
-    L.emit([run(s, i + 1, hold_s) for i in range(runs) for s in shapes])
+    shapes = sys.argv[3:] or list(PROMPTS) + list(CONTROLS)
+    L.emit([run_control(s, i + 1) if s in CONTROLS else run(s, i + 1, hold_s) for i in range(runs) for s in shapes])
 
 
 if __name__ == "__main__":

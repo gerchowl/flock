@@ -15,17 +15,18 @@ Variants: default; `--restricted`; `CLAUDE_CODE_RESTRICTED=1`,
 `--settings '{"crossSessionInbound":"refuse"}'`; and the same setting set to
 `hold`.
 
-    CLAUDE_PROFILE_DIR=~/.claude-profiles/work S0_OUT=/tmp/s0 \\
+    S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_socket.py [variant ...]
 """
 
 import glob
 import json
-import tempfile
 import os
+import shutil
 import socket
 import stat
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True  # importing s0lib must not leave a __pycache__ here
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,7 +44,9 @@ VARIANTS = {
 
 # `--restricted` with the rest of the §1 launch profile: does a hook passed
 # through `--settings` still run, and does an `--mcp-config` server attach?
-HOOK_MARK = os.path.join(tempfile.gettempdir(), "s0-restricted-stop-hook.mark")
+# the marker lives in a private temporary dir that main() removes
+HOOK_DIR = tempfile.mkdtemp(prefix="s0-hook-")
+HOOK_MARK = os.path.join(HOOK_DIR, "stop-hook.mark")
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "s0_mcpstub.py")
 VARIANTS["restricted_profile"] = ([
     "--restricted",
@@ -129,8 +132,10 @@ def run(name):
     }
     out["hook_events"] = sorted({f"{e.get('subtype')}:{e.get('hook_event')}" for e in sess.since(0) if str(e.get("subtype", "")).startswith("hook_")})
     out["stop_hook_mark"] = os.path.exists(HOOK_MARK)
+    if out["stop_hook_mark"]:
+        os.unlink(HOOK_MARK)
     pid = sess.proc.pid
-    cfg = os.environ.get("CLAUDE_PROFILE_DIR", "")
+    cfg = sess.config_dir
     out["registry"] = [describe(p) for p in sorted(glob.glob(os.path.join(cfg, "sessions", f"{pid}*")))]
     if sock:
         out["socket"] = describe(sock)
@@ -183,7 +188,10 @@ def run(name):
 
 def main():
     names = sys.argv[1:] or list(VARIANTS)
-    L.emit([run(n) for n in names])
+    try:
+        L.emit([run(n) for n in names])
+    finally:
+        shutil.rmtree(HOOK_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":

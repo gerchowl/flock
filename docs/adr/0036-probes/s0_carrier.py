@@ -16,7 +16,7 @@ further control request, the tool result the model saw, any
 delivers the answer as the §2a `reply` item (`Answer to <id>: blue`) in a
 second turn and records whether the model used it.
 
-    CLAUDE_PROFILE_DIR=~/.claude-profiles/work S0_OUT=/tmp/s0 \\
+    S0_OAUTH_TOKEN_FILE=<token file> S0_OUT=/tmp/s0 \\
         python3 -I docs/adr/0036-probes/s0_carrier.py [runs-per-carrier]
 """
 
