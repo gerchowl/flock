@@ -142,7 +142,11 @@ impl Stages {
 
     /// Read a line with this deadline, rejecting EOF and malformed output.
     pub fn line(&self, stream: &mut std::os::unix::net::UnixStream) -> io::Result<String> {
-        read_socket_line(stream, |fd| self.readable(&[fd]).map(|_| ()))
+        read_socket_line(
+            stream,
+            |fd| self.readable(&[fd]).map(|_| ()),
+            "stage producer closed",
+        )
     }
 
     /// Require the next protocol stage exactly.
@@ -164,9 +168,11 @@ impl Stages {
 
 /// Read a bounded UTF-8 line, checking readiness and liveness before each read.
 /// The injected wait must bound silence, including a partial line.
+/// Raw EOF uses the supplied reason; errors from the wait retain their source.
 pub fn read_socket_line(
     stream: &mut std::os::unix::net::UnixStream,
     mut wait: impl FnMut(std::os::fd::RawFd) -> io::Result<()>,
+    eof_reason: &str,
 ) -> io::Result<String> {
     use std::os::fd::AsRawFd;
     let mut bytes = Vec::new();
@@ -174,10 +180,7 @@ pub fn read_socket_line(
         wait(stream.as_raw_fd())?;
         let mut byte = [0];
         if stream.read(&mut byte)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "composer stage producer exited",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, eof_reason));
         }
         if byte[0] == b'\n' {
             return String::from_utf8(bytes)

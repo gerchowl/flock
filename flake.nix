@@ -143,7 +143,7 @@
             inherit pkgs;
             extra = with pkgs; [
               cargo
-              cargo-nextest
+              (callPackage ./nix/nextest.nix { })
               clippy
               cmake
               just

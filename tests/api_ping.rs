@@ -3088,3 +3088,59 @@ fn composer_readiness_accepts_repeated_idle_and_done_before_output() {
         assert!(state.observe(&output, "w1:p1").unwrap());
     }
 }
+
+#[test]
+fn composer_server_event_eof_is_not_fixture_exit() {
+    for close_exit_monitor in [false, true] {
+        let (exits, mut exit_writer) = UnixStream::pair().unwrap();
+        let (mut events, event_writer) = UnixStream::pair().unwrap();
+        let retained_writer = if close_exit_monitor {
+            writeln!(
+                exit_writer,
+                "{}",
+                serde_json::json!({
+                    "event":"pane_exited", "data":{"pane_id":"w2:p1"}
+                })
+            )
+            .unwrap();
+            drop(exit_writer);
+            event_writer
+        } else {
+            drop(event_writer);
+            exit_writer
+        };
+        let mut composer = Composer::with_exit_stream(
+            support::readiness::Stages::new(Duration::from_secs(1)),
+            exits,
+        );
+        let error = composer
+            .event_line(&mut events, "w1:p1", "READY")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "server event stream closed before READY");
+        drop(retained_writer);
+    }
+}
+
+#[test]
+fn composer_matching_exit_event_is_fixture_exit() {
+    let (exits, mut exit_writer) = UnixStream::pair().unwrap();
+    let (mut events, _event_writer) = UnixStream::pair().unwrap();
+    writeln!(
+        exit_writer,
+        "{}",
+        serde_json::json!({
+            "event":"pane_exited", "data":{"pane_id":"w1:p1"}
+        })
+    )
+    .unwrap();
+    let mut composer = Composer::with_exit_stream(
+        support::readiness::Stages::new(Duration::from_secs(1)),
+        exits,
+    );
+    let error = composer
+        .event_line(&mut events, "w1:p1", "READY")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.to_string(), "fixture exited before READY");
+}

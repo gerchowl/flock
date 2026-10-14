@@ -65,6 +65,12 @@ If your proposal changes the visual language, interaction model, workflow, persi
 
 ## Nix development environment
 
+Use cargo-nextest 0.9.145 or newer. Earlier runners can inherit a sibling
+test's capture pipe on macOS and falsely report leaked handles
+([upstream fix](https://github.com/nextest-rs/nextest/pull/3553)). The repository
+rejects older runners; the devShell provides 0.9.146. Leak detection and its
+timeout stay enabled.
+
 Run `nix develop` for the contributor toolchain. The devShell wraps sccache
 with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
 `$HOME/.cache/flock-sccache/flock.sock` server socket, shared across worktrees

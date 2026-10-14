@@ -26,9 +26,18 @@ impl Composer {
     pub fn watch(socket: &Path) -> io::Result<Self> {
         let stages = Stages::new(Duration::from_secs(120));
         let exits = Self::subscribe(socket, json!([{"type":"pane.exited"}]), |stream| {
-            stages.line(stream)
+            read_socket_line(
+                stream,
+                |fd| stages.readable(&[fd]).map(|_| ()),
+                "server event stream closed before exit subscription",
+            )
         })?;
-        Ok(Self { stages, exits })
+        Ok(Self::with_exit_stream(stages, exits))
+    }
+
+    /// Inject an owned exit stream and deadline, including EOF failure cases.
+    pub fn with_exit_stream(stages: Stages, exits: UnixStream) -> Self {
+        Self { stages, exits }
     }
 
     fn subscribe(
@@ -56,7 +65,14 @@ impl Composer {
             if self.stages.readable(&[self.exits.as_raw_fd(), fd])? == 1 {
                 return Ok(());
             }
-            let event: Value = serde_json::from_str(&self.stages.line(&mut self.exits)?)?;
+            let stages = &self.stages;
+            let reason = format!("server event stream closed before {phase}");
+            let line = read_socket_line(
+                &mut self.exits,
+                |fd| stages.readable(&[fd]).map(|_| ()),
+                &reason,
+            )?;
+            let event: Value = serde_json::from_str(&line)?;
             if event["event"] != "pane_exited" {
                 return Err(invalid(format!("unexpected fixture exit event: {event}")));
             }
@@ -69,14 +85,16 @@ impl Composer {
         }
     }
 
-    fn line(&mut self, stream: &mut UnixStream, pane: &str, phase: &str) -> io::Result<String> {
-        read_socket_line(stream, |fd| self.readable(fd, pane, phase)).map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                io::Error::new(error.kind(), format!("fixture exited before {phase}"))
-            } else {
-                error
-            }
-        })
+    /// Read a server event line while monitoring matching pane exit evidence.
+    /// A closed server stream is distinct from a reported fixture exit.
+    pub fn event_line(
+        &mut self,
+        stream: &mut UnixStream,
+        pane: &str,
+        phase: &str,
+    ) -> io::Result<String> {
+        let reason = format!("server event stream closed before {phase}");
+        read_socket_line(stream, |fd| self.readable(fd, pane, phase), &reason)
     }
 
     /// Wait for boot, subscribe to READY and optional idle/done, then release.
@@ -90,7 +108,11 @@ impl Composer {
     ) -> io::Result<()> {
         self.readable(gate.as_raw_fd(), pane, "connecting")?;
         let (mut producer, _) = gate.accept()?;
-        let boot = self.line(&mut producer, pane, "boot")?;
+        let boot = read_socket_line(
+            &mut producer,
+            |fd| self.readable(fd, pane, "boot"),
+            "fixture control stream closed before boot",
+        )?;
         if boot != "boot" {
             return Err(invalid(format!("expected boot, got {boot}")));
         }
@@ -102,13 +124,16 @@ impl Composer {
             }
         }
         let mut events = Self::subscribe(socket, json!(subscriptions), |stream| {
-            self.line(stream, pane, "readiness subscription")
+            self.event_line(stream, pane, "readiness subscription")
         })?;
         producer.write_all(b"G")?;
         let mut state = ReadyState::new(require_idle);
         loop {
-            let event: Value =
-                serde_json::from_str(&self.line(&mut events, pane, "READY and idle/done")?)?;
+            let event: Value = serde_json::from_str(&self.event_line(
+                &mut events,
+                pane,
+                "READY and idle/done",
+            )?)?;
             if state.observe(&event, pane)? {
                 return Ok(());
             }
