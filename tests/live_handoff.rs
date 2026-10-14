@@ -1795,7 +1795,10 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         failed.get("error").is_some(),
         "bad protocol handoff should fail: {failed}"
     );
-    assert_eq!(failed["error"]["kind"], "import_refused", "{failed}");
+    assert_eq!(
+        failed["error"]["data"]["kind"], "import_refused",
+        "{failed}"
+    );
     // #600: the exporter must surface WHY the import refused, not an opaque
     // "handoff stream closed while reading line". Both sides are post-fix in
     // this test, so the importer's `error: <reason>` round-trips into
@@ -1948,6 +1951,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         );
     }
     if failure_point == "stale_generation" {
+        assert_eq!(failed["error"]["code"], "handoff_failed", "{failed}");
+        assert_eq!(
+            failed["error"]["data"]["kind"], "import_refused",
+            "{failed}"
+        );
+        assert!(failed.get("result").is_none(), "{failed}");
         assert!(
             failed["error"]["message"]
                 .as_str()
@@ -2549,7 +2558,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
     // keeping timeouts and unexpected protocol failures outside this class.
     assert_eq!(failed["error"]["code"], "handoff_failed", "{failed}");
     assert!(failed.get("result").is_none(), "{failed}");
-    let kind = failed["error"]["kind"]
+    let kind = failed["error"]["data"]["kind"]
         .as_str()
         .expect("typed handoff kind");
     let peer_closed = matches!(kind, "broken_pipe" | "connection_reset");

@@ -2775,43 +2775,6 @@ pub struct ErrorBody {
     pub message: String,
 }
 
-/// Stable failure categories for `server.live_handoff`, independent of prose.
-/// Unclassified I/O errors remain `Other`; callers must still treat them as failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HandoffFailureKind {
-    /// The importer explicitly refused the handoff on the control stream.
-    ImportRefused,
-    /// A write encountered a closed peer.
-    BrokenPipe,
-    /// The peer reset the connection during a read or write.
-    ConnectionReset,
-    /// The operating system rejected an operation's arguments or socket state.
-    InvalidInput,
-    /// Any other failure, including deadlines and unexpected control messages.
-    Other,
-}
-
-/// A failed live-handoff response with an additive, stable error category.
-/// Existing `ErrorResponse` readers can ignore the extra `error.kind` field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandoffFailureResponse {
-    /// The request identifier echoed to the caller.
-    pub id: String,
-    /// Failure evidence, with no success result.
-    pub error: HandoffFailureBody,
-}
-
-/// The usual error code and diagnostic, plus a category for handoff clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandoffFailureBody {
-    /// Existing code and diagnostic fields retain their JSON locations.
-    #[serde(flatten)]
-    pub error: ErrorBody,
-    /// Stable cause category; it does not identify an ownership-commit stage.
-    pub kind: HandoffFailureKind,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeersEnrollResetParams {
     pub peer: String,
