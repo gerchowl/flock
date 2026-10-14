@@ -5,7 +5,10 @@ Omit `--download` to render the saved input again. Requires authenticated `gh` a
 
 Validate ceilings and override reachability: `python3 -I scripts/test_nextest_timings.py`.
 The test script also accepts an absolute path from any working directory (Python 3.11+).
-Shadow checks prove full coverage per setting for exact/substring binary/test selectors with `&`, `|` and parentheses.
+Shadow checks prove full coverage per setting for literal binary selectors and exact/substring test selectors with `&`, `|` and parentheses.
+Binary selectors default to globs: supported names without wildcards match exactly, with or without `=`.
+Partially shadowed overrides with a reachable OR arm are deliberately not flagged.
+Platform-only overrides without a filter are reported as unproved; their ceilings are still checked.
 Regexes, negation, other predicates and unequal platform scopes remain unproved, not rejected.
 
 Latest 20 completed dev CI runs at collection time, including cancelled runs.

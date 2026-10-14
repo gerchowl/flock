@@ -25,9 +25,12 @@ p99, report, samples = _timings.p99, _timings.report, _timings.samples
 def filter_clauses(expression):
     """Return DNF for binary/test literals, &, | and parentheses, or None.
 
-    Exact and substring selectors are supported. Negation, regexes and other
-    predicates are deliberately unproved, never guessed to be shadowed.
+    Binary selectors default to globs, so supported wildcard-free names are
+    exact, with or without '='. Test selectors default to substring matching.
+    Wildcards, negation, regexes and other predicates are deliberately unproved.
     """
+    if expression is None:
+        return None
     token = re.compile(r"\s*(?:(binary|test)\((=?[A-Za-z0-9_:.-]+)\)|([&|()]))")
     tokens = []
     position = 0
@@ -85,6 +88,8 @@ def clause_implies(later, earlier):
         prior_kind, prior_selector = prior
         if kind != prior_kind:
             return False
+        if kind == "binary":
+            return selector.removeprefix("=") == prior_selector.removeprefix("=")
         if prior_selector.startswith("="):
             return selector == prior_selector
         return prior_selector in selector.removeprefix("=")
@@ -100,7 +105,11 @@ class Timings(unittest.TestCase):
         An earlier unscoped rule covers every platform. A scoped rule proves
         coverage only for an identical scope. Unsupported filters remain
         unchecked by this proof, while the ceiling checks still inspect them.
+        Partially shadowed overrides with a reachable OR arm, such as the
+        original #1051 rule, are deliberately not flagged. Return diagnostics
+        for unproved filters, including platform-only overrides with no filter.
         """
+        unproved = []
         default = config["profile"]["default"].get("overrides", [])
         for profile, settings in config["profile"].items():
             overrides = settings.get("overrides", [])
@@ -108,8 +117,13 @@ class Timings(unittest.TestCase):
                 overrides = overrides + default
             earlier = []
             for index, override in enumerate(overrides):
-                clauses = filter_clauses(override["filter"])
-                if clauses is not None:
+                expression = override.get("filter")
+                clauses = filter_clauses(expression)
+                if clauses is None:
+                    reason = ("platform-only (no filter)" if expression is None
+                              else f"unsupported filter {expression!r}")
+                    unproved.append(f"{profile} override {index + 1} unproved: {reason}")
+                else:
                     for key in override.keys() - {"filter", "platform"}:
                         covered = []
                         for previous, prior_clauses in earlier:
@@ -123,6 +137,7 @@ class Timings(unittest.TestCase):
                             f"{profile} override {index + 1} shadowed {key}: {override['filter']}",
                         )
                 earlier.append((override, clauses))
+        return unproved
 
     def test_isolated_invocation_from_an_unrelated_directory(self):
         script = Path(__file__).resolve()
@@ -144,9 +159,59 @@ class Timings(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "shadowed.*slow-timeout"):
             self.assert_no_shadowed_overrides(config)
 
+    def test_binary_literal_selectors_are_exact(self):
+        for earlier in ["binary(live)", "binary(=live)"]:
+            for later in ["binary(live_handoff)", "binary(=live_handoff)"]:
+                with self.subTest(earlier=earlier, later=later):
+                    self.assert_no_shadowed_overrides({"profile": {"default": {
+                        "overrides": [
+                            {"filter": earlier, "retries": 0},
+                            {"filter": later + " & test(rollback)", "retries": 2},
+                        ],
+                    }}})
+            for later in ["binary(live)", "binary(=live)"]:
+                with self.subTest(earlier=earlier, later=later):
+                    with self.assertRaisesRegex(AssertionError, "shadowed retries"):
+                        self.assert_no_shadowed_overrides({"profile": {"default": {
+                            "overrides": [
+                                {"filter": earlier, "retries": 0},
+                                {"filter": later, "retries": 2},
+                            ],
+                        }}})
+
+    def test_platform_only_overrides_are_reported_as_unproved(self):
+        scoped = {"platform": "cfg(unix)", "slow-timeout": {}}
+        filtered = {"filter": "binary(=one)", "slow-timeout": {}}
+        for overrides, index in [([scoped, filtered], 1), ([filtered, scoped], 2)]:
+            with self.subTest(index=index):
+                unproved = self.assert_no_shadowed_overrides({"profile": {
+                    "default": {"overrides": overrides},
+                }})
+                self.assertIn(
+                    f"default override {index} unproved: platform-only (no filter)",
+                    unproved,
+                )
+
+    def test_binary_literal_ceiling_does_not_match_a_longer_name(self):
+        config = {"profile": {"default": {
+            "slow-timeout": {"period": "60s", "terminate-after": 7},
+            "overrides": [{"filter": "binary(live)",
+                           "slow-timeout": {"period": "60s", "terminate-after": 3}}],
+        }}}
+        self.assert_ceilings_fit(config, {"live_handoff": 420})
+
+    def test_platform_only_ceilings_are_still_checked(self):
+        config = {"profile": {"default": {
+            "slow-timeout": {"period": "60s", "terminate-after": 7},
+            "overrides": [{"platform": "cfg(unix)",
+                           "slow-timeout": {"period": "30s", "terminate-after": 3}}],
+        }}}
+        with self.assertRaises(AssertionError):
+            self.assert_ceilings_fit(config, {"one": 420})
+
     def test_shadow_proof_handles_unions_and_substrings(self):
         for earlier, later in [
-            ("binary(live)", "binary(=live_handoff) & test(rollback)"),
+            ("binary(live_handoff)", "binary(=live_handoff) & test(rollback)"),
             ("binary(=one) | binary(=two)",
              "(binary(=one) & test(=case)) | binary(=two)"),
             ("binary(=one) & test(rollback)",
@@ -178,7 +243,7 @@ class Timings(unittest.TestCase):
             ({"filter": "binary(=one) & test(=specific)", "retries": 0},
              {"filter": "binary(=one)", "retries": 2}),
             ({"filter": "binary(=one)", "retries": 0},
-             {"filter": "binary(one)", "retries": 2}),
+             {"filter": "binary(one_more)", "retries": 2}),
         ]:
             with self.subTest(earlier=earlier, later=later):
                 self.assert_no_shadowed_overrides({"profile": {
@@ -216,7 +281,8 @@ class Timings(unittest.TestCase):
                     self.assert_no_shadowed_overrides(config)
 
     def test_unknown_filter_syntax_is_not_guessed(self):
-        for expression in ["not binary(=one)", "binary(/one/)", "kind(test)",
+        for expression in [None, "binary(one*)", "binary(one?)", "binary([ab])",
+                           "not binary(=one)", "binary(/one/)", "kind(test)",
                            "binary(=one) &", "(binary(=one)"]:
             with self.subTest(expression=expression):
                 self.assertIsNone(filter_clauses(expression))
@@ -228,7 +294,8 @@ class Timings(unittest.TestCase):
     def test_real_overrides_have_no_fully_shadowed_settings(self):
         root = Path(__file__).resolve().parents[1]
         config = tomllib.loads((root / ".config/nextest.toml").read_text())
-        self.assert_no_shadowed_overrides(config)
+        for diagnostic in self.assert_no_shadowed_overrides(config):
+            sys.stderr.write(diagnostic + "\n")
 
     def test_nearest_rank_uses_test_durations(self):
         self.assertEqual(p99(list(range(1, 101))), 99)
@@ -271,7 +338,7 @@ class Timings(unittest.TestCase):
             for selector in selectors:
                 if not re.fullmatch(r"=?[A-Za-z0-9_-]+", selector):
                     return True
-                if (name == selector[1:] if selector.startswith("=") else selector in name):
+                if name == selector.removeprefix("="):
                     return True
             return False
 
@@ -280,8 +347,8 @@ class Timings(unittest.TestCase):
             ceiling = seconds(default["slow-timeout"])
             for override in default["overrides"]:
                 if ("slow-timeout" in override
-                        and re.fullmatch(binary_union, override["filter"])
-                        and matches(override["filter"], binary)):
+                        and re.fullmatch(binary_union, override.get("filter", ""))
+                        and matches(override.get("filter", ""), binary)):
                     ceiling = seconds(override["slow-timeout"])
                     break
             self.assertGreaterEqual(ceiling, minimum, binary)
@@ -289,10 +356,10 @@ class Timings(unittest.TestCase):
             # so a later filter reorder cannot expose an undersized ceiling.
             for profile in ["default", "ci"]:
                 for override in config["profile"].get(profile, {}).get("overrides", []):
-                    if "slow-timeout" in override and matches(override["filter"], binary):
+                    if "slow-timeout" in override and matches(override.get("filter", ""), binary):
                         self.assertGreaterEqual(
                             seconds(override["slow-timeout"]), minimum,
-                            f"{binary}: {profile} {override['filter']}",
+                            f"{binary}: {profile} {override.get('filter', '<platform-only>')}",
                         )
 
     def test_recorded_measurements_fit_every_configured_ceiling(self):
