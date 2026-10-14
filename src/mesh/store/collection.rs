@@ -390,12 +390,15 @@ impl<D: DiskSpace> Store<D> {
     /// Step-1 importers accept only local requests addressed to their neighbor.
     /// All-custody importers opt into offers and acks bound to the next hop.
     /// A lost ack reoffers the same immutable envelope for idempotent import.
+    /// All-custody offers require a current recipient-to-hop routing snapshot,
+    /// so a downstream withdrawal cannot lease mail to a still-adjacent hub.
     pub fn collect_outbound(
         &mut self,
         offer: Offer,
         local: &str,
         hub: &str,
         query: &crate::mesh::collect::OutboundCollect,
+        routes: &std::collections::BTreeMap<String, String>,
         wall_ms: i64,
     ) -> Result<Vec<crate::mesh::delivery::Deliver>> {
         if self.clock()?.paused {
@@ -515,6 +518,11 @@ impl<D: DiskSpace> Store<D> {
                 self.accept(&envelope, CUSTODY_TTL_MS, Admission::Held, wall_ms)?;
                 self.receipts_sent(&[receipt])?;
             }
+        }
+        // Settle valid acknowledgements before invalidating unsent assignments.
+        // Recheck at lease time, even before the next route-generation pass.
+        if offer == Offer::All {
+            self.withdraw_request_hops(routes)?;
         }
         let now = self.clock()?.advance(wall_ms);
         let keys = match offer {

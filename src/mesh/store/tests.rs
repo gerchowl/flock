@@ -37,6 +37,14 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(self.path.parent().unwrap());
     }
 }
+/// The common fictional recipient and receipt origin route through this fixture hub.
+fn fixture_routes_via(hub: &str) -> std::collections::BTreeMap<String, String> {
+    ["receiver.example", "origin.example"]
+        .into_iter()
+        .map(|recipient| (recipient.into(), hub.into()))
+        .collect()
+}
+
 fn envelope() -> Envelope {
     let key = MessageKey::mint("origin.example".into(), 1000).unwrap();
     Envelope {
@@ -2031,6 +2039,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
             "origin.example",
             "receiver.example",
             &poll,
+            &fixture_routes_via("receiver.example"),
             1,
         )
         .unwrap();
@@ -2045,6 +2054,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
                 "origin.example",
                 "receiver.example",
                 &poll,
+                &fixture_routes_via("receiver.example"),
                 5002
             )
             .unwrap()[0]
@@ -2074,6 +2084,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
                 receipts: Vec::new(),
                 ack: vec![good.clone(), bad]
             },
+            &fixture_routes_via("receiver.example"),
             3
         )
         .is_err());
@@ -2089,6 +2100,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
                 ack: vec![forged],
                 receipts: Vec::new()
             },
+            &fixture_routes_via("receiver.example"),
             3
         )
         .is_err());
@@ -2102,6 +2114,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
             "origin.example",
             "receiver.example",
             &ack,
+            &fixture_routes_via("receiver.example"),
             4
         )
         .unwrap()
@@ -2112,6 +2125,7 @@ fn spoke_custody_collection_scopes_outbox_and_validates_entire_ack_batch() {
             "origin.example",
             "receiver.example",
             &ack,
+            &fixture_routes_via("receiver.example"),
             5
         )
         .unwrap()
@@ -2169,6 +2183,7 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("receiver.example"),
             1,
         )
         .unwrap();
@@ -2181,6 +2196,7 @@ fn spoke_custody_backoff_survives_restart_and_cannot_starve_later_rows() {
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("receiver.example"),
             2,
         )
         .unwrap();
@@ -2546,6 +2562,7 @@ fn outbound_receipts_are_judged_per_record_and_never_fail_the_batch() {
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             3,
         )
         .expect("a pruned or forged receipt drops only itself");
@@ -2631,6 +2648,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
                 receipts: vec![receipt],
                 ack: Vec::new(),
             },
+            &fixture_routes_via("receiver.example"),
             1,
         )
         .unwrap();
@@ -2658,6 +2676,7 @@ fn a_receipt_for_a_still_held_row_survives_its_lost_ack() {
                 receipts: Vec::new(),
                 ack: vec![ack],
             },
+            &fixture_routes_via("receiver.example"),
             2,
         )
         .unwrap();
@@ -2807,6 +2826,7 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
             "origin.example",
             "receiver.example",
             &poll,
+            &fixture_routes_via("receiver.example"),
             1
         )
         .is_err());
@@ -2828,6 +2848,7 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
                 "origin.example",
                 "receiver.example",
                 &poll,
+                &fixture_routes_via("receiver.example"),
                 1
             )
             .unwrap()
@@ -2847,6 +2868,7 @@ fn spoke_outbound_leases_are_atomic_and_idle_polls_do_not_commit() {
             "origin.example",
             "receiver.example",
             &poll,
+            &fixture_routes_via("receiver.example"),
             2
         )
         .unwrap()
@@ -2872,6 +2894,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
             "origin.example",
             "receiver.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("receiver.example"),
             1,
         )
         .unwrap();
@@ -2901,6 +2924,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             2
         )
         .unwrap()
@@ -2912,6 +2936,7 @@ fn spoke_outbound_missing_ack_does_not_reject_live_ack() {
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             3
         )
         .unwrap()
@@ -3072,11 +3097,25 @@ fn collect_outbound_includes_forwarded_origins_for_authenticated_import() {
     s.set_next_hop(&foreign.key, "neighbor.example").unwrap();
     let query = OutboundCollect::default();
     assert!(s
-        .collect_outbound(Offer::All, "local.example", "receiver.example", &query, 0)
+        .collect_outbound(
+            Offer::All,
+            "local.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("neighbor.example"),
+            0
+        )
         .unwrap()
         .is_empty());
     let offered = s
-        .collect_outbound(Offer::All, "origin.example", "neighbor.example", &query, 0)
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "neighbor.example",
+            &query,
+            &fixture_routes_via("neighbor.example"),
+            0,
+        )
         .unwrap();
     assert_eq!(offered.len(), 3);
     assert!(s.get(&foreign.key).unwrap().unwrap().retry_at_ms > 0);
@@ -3104,11 +3143,25 @@ fn ack_from_wrong_neighbor_is_invalid() {
         receipts: Vec::new(),
     };
     assert!(matches!(
-        s.collect_outbound(Offer::All, "local.example", "receiver.example", &query, 0),
+        s.collect_outbound(
+            Offer::All,
+            "local.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("receiver.example"),
+            0
+        ),
         Err(Error::InvalidEnvelope)
     ));
-    s.collect_outbound(Offer::All, "local.example", "neighbor.example", &query, 0)
-        .unwrap();
+    s.collect_outbound(
+        Offer::All,
+        "local.example",
+        "neighbor.example",
+        &query,
+        &fixture_routes_via("neighbor.example"),
+        0,
+    )
+    .unwrap();
     assert_eq!(s.get(&e.key).unwrap().unwrap().state, "delivered");
 }
 
@@ -3294,6 +3347,7 @@ fn idle_step2_queries_make_no_commits() {
                 "origin.example",
                 "receiver.example",
                 &OutboundCollect::default(),
+                &fixture_routes_via("receiver.example"),
                 now
             )
             .unwrap()
@@ -3479,6 +3533,7 @@ fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased(
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             0,
         )
         .unwrap();
@@ -3488,7 +3543,14 @@ fn outbound_offer_mode_preserves_step1_requests_and_leaves_other_kinds_unleased(
         assert_eq!(s.get(&e.key).unwrap().unwrap().retry_at_ms, 0);
     }
     let offers = s
-        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("receiver.example"),
+            0,
+        )
         .unwrap();
     assert_eq!(offers.len(), 3);
     assert!(s.get(&forwarded.key).unwrap().unwrap().retry_at_ms > 0);
@@ -3524,13 +3586,21 @@ fn step1_ack_cannot_finish_answers_or_forwarded_requests() {
                 "origin.example",
                 "receiver.example",
                 &query,
+                &fixture_routes_via("receiver.example"),
                 0
             ),
             Err(Error::InvalidEnvelope)
         ));
         assert_eq!(s.get(&e.key).unwrap().unwrap().state, "held");
-        s.collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
-            .unwrap();
+        s.collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("receiver.example"),
+            0,
+        )
+        .unwrap();
         assert_eq!(s.get(&e.key).unwrap().unwrap().state, "delivered");
     }
 }
@@ -3896,6 +3966,7 @@ fn outbound_receipts_are_durable_and_acknowledged_individually() {
             "receiver.example",
             "origin.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("origin.example"),
             2,
         )
         .unwrap();
@@ -3924,6 +3995,7 @@ fn outbound_receipts_are_durable_and_acknowledged_individually() {
                 ack: vec![ack],
                 receipts: vec![]
             },
+            &fixture_routes_via("origin.example"),
             3
         )
         .unwrap()
@@ -3935,6 +4007,7 @@ fn outbound_receipts_are_durable_and_acknowledged_individually() {
             "receiver.example",
             "origin.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("origin.example"),
             4
         )
         .unwrap()
@@ -4000,13 +4073,27 @@ fn unacknowledged_receipt_for_unknown_original_stops_being_offered_at_its_own_tt
     let query = OutboundCollect::default();
     assert_eq!(
         store
-            .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 0)
+            .collect_outbound(
+                Offer::All,
+                "origin.example",
+                "receiver.example",
+                &query,
+                &fixture_routes_via("receiver.example"),
+                0
+            )
             .unwrap()
             .len(),
         1
     );
     assert!(store
-        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 1)
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("receiver.example"),
+            1
+        )
         .unwrap()
         .is_empty());
     assert_eq!(
@@ -4016,6 +4103,7 @@ fn unacknowledged_receipt_for_unknown_original_stops_being_offered_at_its_own_tt
                 "origin.example",
                 "receiver.example",
                 &query,
+                &fixture_routes_via("receiver.example"),
                 5_000
             )
             .unwrap()
@@ -4029,6 +4117,7 @@ fn unacknowledged_receipt_for_unknown_original_stops_being_offered_at_its_own_tt
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             60_000
         )
         .unwrap()
@@ -4376,6 +4465,7 @@ fn not_ready_receipt_does_not_block_other_mail_in_poll() {
                 }],
                 ack: vec![],
             },
+            &fixture_routes_via("receiver.example"),
             1,
         )
         .unwrap();
@@ -4593,7 +4683,14 @@ fn delivered_receipt_does_not_acknowledge_a_held_offer() {
         ack: Vec::new(),
     };
     let offered = store
-        .collect_outbound(Offer::All, "origin.example", "receiver.example", &query, 1)
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &query,
+            &fixture_routes_via("receiver.example"),
+            1,
+        )
         .unwrap();
     assert_eq!(offered.len(), 1);
     assert_eq!(offered[0].envelope.body, mail.body);
@@ -4604,6 +4701,7 @@ fn delivered_receipt_does_not_acknowledge_a_held_offer() {
             "origin.example",
             "receiver.example",
             &query,
+            &fixture_routes_via("receiver.example"),
             6001,
         )
         .unwrap();
@@ -4619,7 +4717,14 @@ fn delivered_receipt_does_not_acknowledge_a_held_offer() {
         }],
     };
     assert!(store
-        .collect_outbound(Offer::All, "origin.example", "receiver.example", &ack, 6002)
+        .collect_outbound(
+            Offer::All,
+            "origin.example",
+            "receiver.example",
+            &ack,
+            &fixture_routes_via("receiver.example"),
+            6002
+        )
         .unwrap()
         .is_empty());
     let settled = store.get(&mail.key).unwrap().unwrap();
@@ -4671,6 +4776,7 @@ fn expired_offer_lease_reports_its_hop_once_without_committing() {
             "hub.example",
             "next.example",
             &OutboundCollect::default(),
+            &fixture_routes_via("next.example"),
             1_000,
         )
         .unwrap();
@@ -4891,4 +4997,120 @@ fn recipient_signed_refusal_receipt_is_selected_and_routed_toward_the_origin() {
         Accepted::Duplicate
     );
     assert_eq!(store.connection.total_changes(), changes);
+}
+
+#[test]
+fn withdrawn_recipient_route_cannot_lease_through_a_live_hub() {
+    use crate::mesh::collect::OutboundCollect;
+    for replacement in [None, Some("second.example")] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store
+            .accept_origin(&mail, "hub.example", Admission::Held, 8, 0)
+            .unwrap();
+        // The hub stays adjacent, but no longer routes this recipient.
+        let mut routes =
+            std::collections::BTreeMap::from([("hub.example".into(), "hub.example".into())]);
+        if let Some(hop) = replacement {
+            routes.insert("receiver.example".into(), hop.into());
+        }
+        let offered = store
+            .collect_outbound(
+                Offer::All,
+                "origin.example",
+                "hub.example",
+                &OutboundCollect::default(),
+                &routes,
+                1,
+            )
+            .unwrap();
+        assert!(
+            offered.is_empty(),
+            "a live edge is insufficient to lease this recipient"
+        );
+        let held = store.get(&mail.key).unwrap().unwrap();
+        assert_eq!(held.state, "held");
+        assert_eq!(held.next_hop, "");
+        assert_eq!(held.envelope.body, mail.body);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT collect_attempts FROM envelopes WHERE id=?1",
+                    [&mail.key.message_id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        routes.insert("receiver.example".into(), "second.example".into());
+        store
+            .route_custody(&mail.key, "second.example", Admission::Held)
+            .unwrap();
+        let offered = store
+            .collect_outbound(
+                Offer::All,
+                "origin.example",
+                "second.example",
+                &OutboundCollect::default(),
+                &routes,
+                2,
+            )
+            .unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].envelope, mail);
+    }
+}
+
+#[test]
+fn recipient_hop_withdrawal_preserves_matching_routes_and_paused_custody() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept_origin(&mail, "hub.example", Admission::Held, 8, 0)
+        .unwrap();
+    let routes = fixture_routes_via("hub.example");
+    let before = store.connection.total_changes();
+    store.withdraw_request_hops(&routes).unwrap();
+    assert_eq!(
+        store.connection.total_changes(),
+        before,
+        "matching routes do not commit"
+    );
+    store.set_paused(true, 1).unwrap();
+    assert!(matches!(
+        store.withdraw_request_hops(&std::collections::BTreeMap::new()),
+        Err(Error::Paused)
+    ));
+    assert_eq!(
+        store.get(&mail.key).unwrap().unwrap().next_hop,
+        "hub.example"
+    );
+    store.set_paused(false, 2).unwrap();
+    store
+        .withdraw_request_hops(&std::collections::BTreeMap::new())
+        .unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().next_hop, "");
+}
+
+#[test]
+fn route_generation_clears_a_withdrawn_recipient_while_its_hub_stays_adjacent() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store
+        .accept_origin(&mail, "hub.example", Admission::Held, 8, 0)
+        .unwrap();
+    let routes = std::collections::BTreeMap::from([("hub.example".into(), "hub.example".into())]);
+    store.withdraw_request_hops(&routes).unwrap();
+    let held = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(held.next_hop, "");
+    assert_eq!(held.state, "held");
+    assert_eq!(held.envelope.body, mail.body);
+    assert!(store
+        .push_ready(1, 16, &["hub.example".into()])
+        .unwrap()
+        .is_empty());
 }
