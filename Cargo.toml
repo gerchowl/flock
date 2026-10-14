@@ -74,3 +74,5 @@ zeroize = { version = "1.9", features = ["serde"] }
 [dev-dependencies]
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.
 tokio = { version = "1", features = ["net", "io-util", "process"] }
+# Count SQLite VM operations in store complexity regression tests.
+rusqlite = { version = "0.40.2", features = ["hooks"] }

@@ -1,7 +1,9 @@
 # ADR 0036 — An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary
 
-- Status: Accepted (2026-10-13, owner decisions recorded)
-- Implemented: nothing yet; the slices are tracked in #1307.
+- Status: Accepted (2026-10-13, owner decisions recorded); amended
+  2026-10-14 with the S0 probe findings (#1324, "S0 findings for the
+  architect" says where each landed)
+- Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
   2026-10-13). Composes with ADR-0005 / ADR-0028 (the durable event log, seq
@@ -20,7 +22,8 @@
   the follow-up spike #1310 designs (§12). Extends `agent.fork` /
   `agent.lineage` (`flock_agent_fork`, `flock_agent_lineage`) rather than
   adding verbs. Designs the permission presets of #1321 (P25, §10b).
-- Follow-ups: #1307 (slice tracking), #1305 (cache test 6; test 4 is in A.7.1), #1308
+- Follow-ups: #1307 (slice tracking), #1305 (the cache tests; test 4 is
+  measured in A.7.1, test 6 in A.7.2), #1308
   (TUI parity gaps P16, P17), #1309 (live Codex and opencode runs), #1323
   (the Grafana Labs stack versus our own for the stream and history, §5).
 - Decision owner: operator.
@@ -152,8 +155,11 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
 - **E13 The date is a recorded message, not part of the system prompt.**
   "Today's date is …" is a `<system-reminder>` attachment in the transcript,
   and the binary carries a "The date has changed …" attachment for a later
-  date. That a fork across a day boundary therefore keeps its cache is the
-  expectation, not yet measured (A.7.2, #1305). (A.7)
+  date. A fork across a day boundary therefore keeps its cache: forked
+  across local midnight, it read 98.1% from cache, and the harness appended
+  a date-change reminder after the new prompt while the recorded date
+  stayed as it was (A.7.2). The model need not act on that reminder
+  (A.7.2, caveats). (A.7)
 - **E14 Hot reload is cheap without compaction and resets the prefix with
   it.** Resuming a 41k-token session with a new MCP server read 98.9% from
   cache (first-token time 2.26 s). After `/compact` (40,032 → 1,237 tokens)
@@ -167,10 +173,15 @@ Each line cites Appendix A. Items the issue marked "verify" are settled here.
   base input rate (5-minute writes 1.25×, reads 0.1×; "Prompt caching",
   docs.claude.com/en/docs/build-with-claude/prompt-caching, pricing table).
   (A.7)
-- **E16 The harness opens a messaging socket of its own.** Every `-p`
-  process opens a socket under `/tmp/cc-socks/` and reports it as
-  `system/init.messaging_socket_path`. What it accepts was not probed. flk
-  does not use it (§1, owner decision 5). (A.2)
+- **E16 The harness opens a messaging socket of its own, and
+  `--restricted` closes it.** Every `-p` process opens a socket under
+  `/tmp/cc-socks/` and reports it as `system/init.messaging_socket_path`.
+  On macOS it runs unauthenticated `user` lines from any process of the
+  session's uid as turns, and every child process of the session gets its
+  path and token. `--restricted` (or `CLAUDE_CODE_RESTRICTED=1`) binds no
+  socket and sets neither variable, while `--settings` hooks,
+  `--mcp-config` servers and the stdio prompt keep working. flk launches
+  with it and never uses the socket (§1, owner decision 5). (A.2, A.11)
 - **E17 Bytes.** Over all probe runs, tool results were 41.7% of stdout
   bytes, partial deltas 28.8%, `system/init` (repeated every turn) 10.6%,
   complete `assistant` events 7.8%. (A.8)
@@ -197,8 +208,8 @@ A structured agent is a child process of the flk server: `claude -p
 --input-format stream-json --output-format stream-json --verbose
 --include-partial-messages --replay-user-messages --include-hook-events
 --permission-prompt-tool stdio --setting-sources local --strict-mcp-config
---settings <flk file> --mcp-config <flk file> --session-id <uuid>` (or
-`--resume <id>`), started as the `flk-agent` user (§1a) with that user's
+--restricted --settings <flk file> --mcp-config <flk file> --session-id
+<uuid>` (or `--resume <id>`), started as the `flk-agent` user (§1a) with that user's
 private config dir for the agent's profile as `CLAUDE_CONFIG_DIR`, and the
 compiled context of ADR-0032 passed through `--append-system-prompt-file`
 and `--add-dir`. The server owns stdin and stdout exclusively.
@@ -217,7 +228,10 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   user-level hooks, permissions or plugins), `--strict-mcp-config` (no
   claude.ai connectors arriving late and shifting the tool set) and flk's
   own `--settings` and `--mcp-config`, so nothing that lands in the dir by
-  accident changes the session. Because user-level permission rules are
+  accident changes the session. `--restricted` closes the harness's
+  messaging socket (see "No second input door" below); it also reads no
+  user settings, turns off auto memory and refuses cloud sessions (A.11),
+  which this isolation wants anyway. Because user-level permission rules are
   dropped, flk passes the agent's permission policy explicitly, as the
   agent's permission preset (§10b). The fleet
   Stop hook never runs in a structured session; what it did there is done
@@ -236,8 +250,13 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   a started input is `crashed`, and the input is re-queued as `held` (§3),
   never silently retried.
 - **Stall and waiting.** `waiting_on_human` is exact: a `can_use_tool`
-  control request is open. Working is `system/status: requesting` or an
-  open `message_start`. A stall is a started input with no stdout event for
+  control request is open. S0 observed only one open at a time, and only
+  for non-concurrency-safe calls: no later call of the same message ran
+  until the open one was answered (A.13, §2b). Why is still open ("Open S0
+  items", item 1), so flk does not rely on it. It tracks open control
+  requests by `request_id`, and the agent stays `waiting_on_human` until
+  every one of them is answered. Working is `system/status: requesting` or
+  an open `message_start`. A stall is a started input with no stdout event for
   `[sessions] stall_ms` while no control request and no tool call is open;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
@@ -247,12 +266,19 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   stdin, so every input, from a human or from another agent, is an item of
   the one queue of §3. flk has no "messaging socket" concept: it never
   writes to the harness's socket, never advertises its path to agents, and
-  agent-to-agent messages travel as `msg.send` into the queue. The socket
-  itself still exists (E16). Probe slice S0 records what it accepts and its
-  owner and mode. If a supported switch disables it, the launch profile
-  passes the switch. If it accepts input and cannot be disabled, it is a
-  known limit (see "Failure modes"): it is reachable only by the
-  `flk-agent` uid, and nothing in flk sends to it.
+  agent-to-agent messages travel as `msg.send` into the queue. The
+  harness's own socket is closed by the launch profile: with `--restricted`
+  no socket is bound, `system/init` carries no `messaging_socket_path`, and
+  neither `CLAUDE_CODE_MESSAGING_SOCKET` nor `CLAUDE_CODE_MESSAGING_TOKEN`
+  reaches the agent's tool processes (A.11). Without it, the socket would
+  take unauthenticated `user` lines from any `flk-agent` process, so any
+  structured agent could start turns in any other one past the queue
+  (A.11). S3 diffs the `system/init` of the restricted profile against the
+  same profile without `--restricted` (tools, MCP servers, skills, slash
+  commands, capabilities, permission mode) and records the result before
+  it ships; S0 found `tools`, `slash_commands` and `capabilities`
+  unchanged (A.11). S3 also refuses to run a session whose `system/init`
+  reports a `messaging_socket_path` (see "Failure modes").
 - **Hot reload.** On a config change (MCP server, skill, settings) the
   server waits for idle (no started input, no open control request), closes
   stdin, waits for exit, and respawns with `--resume <id>` and the new
@@ -314,7 +340,7 @@ screen detector is not run.
 | `control_request{can_use_tool, tool_name: AskUserQuestion}` | a question record (§2a), `source: session`, options from `input.questions`; answered at once if the policy allows, otherwise held or deferred by the System-One check (§2a); routed per ADR-0034 §2 |
 | `control_request{can_use_tool}` (any other tool) | `hook.decide{point: permission.request}` (ADR-0034 §1); `pass` answers allow, `deny` answers deny with the reason; `defer` holds the request open and makes it a question |
 | `control_request{other subtype}` | answered with an error and logged as an unknown shape (§8) |
-| `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}`, except a deny flk itself issued to defer a question when `deny` is the placeholder carrier (§2a): flk records the `tool_use_id` of every deferral, and a denial with that id is not a permission denial and emits nothing here |
+| flk's own `deny` answer to a `can_use_tool`; `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}`, once per `tool_use_id`. A stdio `deny` that flk sends emits no `system/permission_denied` event (A.12, A.17), so for those the fact comes from flk's own answer; `system/permission_denied` and `result.permission_denials` add only the denials the harness made itself. Carve-out: the `deny` that carries a question deferral (§2a) is not a permission denial. flk records the `tool_use_id` of every deferral, and neither its answer nor that id's entry in `result.permission_denials` emits anything here |
 | `rate_limit_event{status != allowed}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
 | `result` | queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
 | process exit without `result` | `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
@@ -351,18 +377,28 @@ nothing else to do.
   canonical JSON (sorted keys, no whitespace) of `{agent, prompt, options,
   multi_select}`, with `prompt` and each option trimmed and their internal
   whitespace collapsed. It contains no time, counter or ask point. The same
-  question asked again in a later turn, in a fork or after a reload gets
-  the same id and the same record (an `ask_count` is bumped, nothing new is
-  opened). A re-ask of an answered question is answered at once from the
-  record (`via: record`); an agent that wants a new answer asks a different
-  question.
+  question asked again by the same agent, in a later turn or after a
+  reload, gets the same id and the same record (an `ask_count` is bumped,
+  nothing new is opened). A re-ask of an answered question is answered at
+  once from the record (`via: record`); an agent that wants a new answer
+  asks a different question.
+- **A fork is another agent, so its questions get their own ids.** `agent`
+  stays in the hash so that an id names one record on the whole server,
+  which the one answer verb (`question.answer { question_id }`, ADR-0028
+  §8a) relies on: the same words asked in a fork open a new record with a
+  new id. That costs the prompt cache nothing. A fork inherits its
+  parent's transcript prefix byte for byte, so the parent's question ids
+  and their rendered text are in the fork's prefix as they were, and the
+  fork's own asks come after the fork point, where the two transcripts no
+  longer share a prefix anyway. A question fork (`answers: question_id`,
+  below) names the parent's id explicitly and never needs to re-ask it.
 - **Byte-stable rendering.** Every text flk puts into the agent's context
   about a question is rendered from a fixed template with the id and the
   question's own text only: no timestamps, no counters, no ask count, no
   key order that can vary. The same question therefore yields the same
-  bytes in every turn, fork and resend, so a prefix that contains it stays
-  a prompt-cache hit (E10), and a fork of the parent at or after the ask
-  shares those bytes with it.
+  bytes in every turn and resend of the agent, so a prefix that contains
+  it stays a prompt-cache hit (E10), and a fork of the parent at or after
+  the ask shares those bytes with it.
 - **Hold or continue: the System-One check (owner decision 3a).** When the
   question policy (ADR-0034 §2) cannot answer an ask at once (a routed
   architect answering within `[questions] hold_ms`, as ADR-0034 §3 does),
@@ -402,13 +438,15 @@ nothing else to do.
   with `<question-id>` the stable id. On the MCP path (§2b) that is the
   tool's result. On stdio the harness only offers `allow` (with
   `updatedInput`) or `deny` (with a message) as the answer to an
-  `AskUserQuestion` control request. Two carriers are possible: `deny` with
-  the text as its message, or `allow` with every question's answer set to
-  the text. Probe slice S0 runs both and measures, for each, that the model
-  keeps working rather than ending its turn; S6b uses the one that does
-  (`deny` if both do, since the model cannot mistake it for the user's
-  answer). If `deny` is the carrier, the §2 carve-out applies: flk records
-  the `tool_use_id` of every deferral, and a denial with that id is not a
+  `AskUserQuestion` control request, and the carrier is `deny` with the
+  text as its message (S0, A.12). The model then sees an `is_error` tool
+  result whose content is the text byte for byte, goes on with the rest of
+  its work in the same turn, and uses the reply when it comes (4 of 4
+  runs). `allow` with the text as every answer kept the model working too,
+  but the harness frames it as "The user answered: …", so it tells the
+  model that the user replied, which is what this rule excludes. The §2
+  carve-out applies: flk records the `tool_use_id` of every deferral, and
+  neither that `deny` nor its entry in `result.permission_denials` is a
   permission denial. The turn continues, and the agent is `working` or
   `finished`, never `waiting_on_human` for a question it did not hold on.
   This is ADR-0034's `defer` verdict applied to a structured session.
@@ -460,16 +498,23 @@ verbs; they differ in what the agent can say and in what can block them.
   fields, and `AskUserQuestion` for a plain choice.
 - **When stdio can block, and what flk does about it.** The owner's concern
   is right in three cases:
-  1. *An open permission request.* It blocks the turn by design (§2a). If
-     the harness also holds every further control request behind it, a
-     question asked in a parallel tool call waits behind a permission the
-     operator has not answered. Probe slice S0 measures it: two parallel
-     tool calls, one needing permission, one `AskUserQuestion`, and whether
-     the second `control_request` arrives while the first is open and can
-     be answered first. If it is held, `AskUserQuestion` is not available
-     while a permission is open: the compiled context names
-     `flock_question_ask` as the way to ask then, and the MCP call does not
-     queue behind the prompt because it needs none.
+  1. *An open permission request.* It blocks the turn by design (§2a), and
+     S0 observed that it also blocks everything after it in the same
+     message (A.13): while a `can_use_tool` was open, no later tool call of
+     that message ran, whether it prompted (a second `touch`), asked
+     (`AskUserQuestion`) or was pre-allowed (an MCP tool without a
+     read-only hint, so `flock_question_ask` too). Only one control request
+     was ever open, and a pre-allowed call ordered before the prompting one
+     ran first. Why is not settled: the open permission may hold the later
+     call, or Claude Code may run non-concurrency-safe tools one at a time,
+     so that any unfinished earlier call holds it. The controls that decide
+     it, and the case of a concurrency-safe call behind an open permission,
+     are pending ("Open S0 items", item 1). Either way, a question that
+     must not wait behind a permission has to be asked before the call
+     that may prompt, or in a separate message, and the compiled context
+     (ADR-0032) tells the agent so. The MCP tool still never prompts
+     itself, but it gives no way past a prompt that is already open in the
+     same message.
   2. *flk not reading stdout.* A control request waits for flk. The stdout
      pump (S3) is its own task that never awaits a client, a System One
      call or a disk flush to read the next line; questions are answered or
@@ -512,10 +557,20 @@ same queue (owner decision 5): there is no second input path.
   deliver unless popped) or `drop`. The gate is the policy point;
   ADR-0035's rows and ADR-0034's question policy plug in here.
 - **Delivery and priority are independent fields.** `delivery` alone says
-  *when* an item is written (E4): `at_idle` only after the current `result`;
-  `steer` at once, and the harness folds it into the running turn;
-  `interrupt` after `control_request{interrupt}` and the cancelled
-  `result`. `priority` alone says *in which order* items that are waiting
+  *when* an item is written (E4, A.14). `at_idle`: only after the current
+  `result`. `steer`: at once, as a plain write; the harness reports it
+  `queued` and folds it into the running turn at the next model step, so it
+  waits out a running tool (7.25 s behind an 8 s `sleep` in A.14 "plain"),
+  and it can change what the running turn answers (in that run the turn's
+  one `result` answered the steered item, and the reply the first input
+  asked for was never written). `interrupt`: flk writes the item and sends
+  `control_request{interrupt, send_now: true, message_uuid}`, the
+  harness's own send-now; the running turn stops at once, a tool that is
+  mid-run included (it is rejected and its side effects so far stay), the
+  turn ends `error_during_execution` with `terminal_reason: aborted_tools`
+  (or `aborted_streaming` while text streams, A.5), its inputs are
+  `cancelled`, and the item starts as a new turn (A.14 "send_now").
+  `priority` alone says *in which order* items that are waiting
   for the same delivery point are written: all `urgent` items before all
   `normal` ones, each group in queue order. Priority never changes the
   delivery mode, and no value of one implies a value of the other: an
@@ -565,8 +620,8 @@ same queue (owner decision 5): there is no second input path.
   `[questions] s1_state_bytes`. The answer is written to the item's
   `relevant_now`. `[queue] relevance = off | suggest | force` (default
   `suggest`): `suggest` lets clients mark the item and offer "send now";
-  `force` also sends `strong` items now, as `send_now` does. An item that is
-  being edited is never forced.
+  `force` also sends `strong` items now, as `send_now` does. An item that
+  is being edited is never forced.
 - **Queue operations (owner decision 4).** All on the socket API and as
   `cmd` verbs (§5), scope `send`, for items still `queued`, `held` or
   `stashed`:
@@ -588,22 +643,39 @@ same queue (owner decision 5): there is no second input path.
     lines.
   - `queue.send_now { item_ids, interrupt? }` is the forced send: the items
     get `delivery: steer` (or `interrupt` when `interrupt: true`) and are
-    written at once, in the order given, as one batch.
-- **The harness's own queue (S0 first).** An item written with `steer`
-  reaches the harness's queue: `command_lifecycle{queued}` until the next
-  model step (E4). `system/init.capabilities` lists
-  `interrupt_cancel_queued_v1` and `interrupt_send_now_v1`, and the
-  interrupt's `control_response` carries `still_queued` (A.2, A.5), so the
-  harness appears to have a take-back and a send-now of its own. Probe
-  slice S0 finds the control requests behind them and runs them in `-p`:
-  whether a message that is still `queued` in the harness can be taken
-  back, whether it can be edited there, and what send-now does. If a
-  supported take-back exists, flk wraps it: `queue.take_back { item_id }`
-  returns a `steer` item that the harness still reports `queued` to flk's
-  queue, where it is editable again, and `send_now` uses the harness's
-  send-now where that saves a model step. If none exists, flk's queue is
-  the only editable surface: an item is editable until it is written, and
-  a `steer` or `send_now` write is final.
+    written at once, in the order given, as one batch. Without `interrupt`
+    the batch folds into the running turn at its next model step, with
+    the costs of `steer` above; with it, the running turn stops through the
+    harness's send-now.
+  - `queue.take_back { item_id }` withdraws a `steer` item that the
+    harness still reports `queued` (below).
+- **The harness's own queue (S0, A.14).** A written item stays `queued` in
+  flk until its `command_lifecycle{started}` (E3); in between it sits in
+  the harness's queue. The harness has a take-back there and no edit:
+  - *Take-back.* `control_request{cancel_async_message, message_uuid}`
+    withdraws an input that is still `queued` (`cancelled: true`, then
+    `command_lifecycle{cancelled}`) and answers `cancelled: false`, doing
+    nothing, once it has `started`. `queue.take_back` wraps it. On
+    `cancelled: true` the item stays `queued` in flk's queue with
+    `delivery: at_idle` and is editable again, and the harness's
+    `cancelled` for that uuid does not cancel the item; it is written again
+    later in a new message (a new `batch_id`), never under the uuid the
+    harness cancelled, since whether the harness accepts that uuid again
+    was not probed. On `cancelled: false` it is refused as too late and the
+    item runs. Items written in one batch share its uuid, so a take-back
+    of one of them withdraws the whole batch and every item in it returns
+    to `queued`.
+  - *Edit.* No control subtype edits a queued input, and an unknown subtype
+    is answered with an `error` naming it. flk's queue is the only edit
+    surface: an item is editable until it is written; once written, only a
+    successful take-back makes it editable again.
+  - *Send-now* is `interrupt{send_now: true, message_uuid}`. It is an
+    interrupt, so flk uses it for `interrupt` delivery (above); a `steer`
+    write needs no control request. Its response says
+    `stopped`, `delivering` (the input was already going) or
+    `nothing_waiting`. `interrupt{cancel_queued: true}` cancels every
+    input in the harness's queue and interrupts the running turn too, so
+    flk never uses it for a take-back.
 - **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
   "delivered" means the harness started it, not that bytes were written.
 - **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
@@ -699,7 +771,21 @@ sent. Between fleet nodes the mesh (ADR-0026) carries the same two things,
 state and messages, and nothing else: a client on node A that follows or
 commands an agent on node B talks to A's server only, A gets B's state and
 messages over the mesh, and a `cmd` for B's agent travels as a mesh message.
-No client hops into or out of another node's server. The one exception is
+No client hops into or out of another node's server.
+
+That mesh message does not exist yet. Mesh VERSION 5 envelopes have two
+kinds (ADR-0026; `Kind` in `src/mesh/store.rs`): `message`, mail for an
+agent's inbox that is delivered as text, and `receipt`, a delivery outcome
+sent back. Neither runs a verb: a `cmd` sent as `message` would reach B's
+agent as text, not as a `queue.update` or `question.answer` with its scope
+check and `ack`. A new `command` kind cannot be added within VERSION 5:
+`Kind` is a closed enum, so a VERSION 5 node fails to decode an envelope of
+a kind it does not know, and the mesh hello requires identical versions
+(ADR-0026, "Rollout"). It needs a VERSION bump with ADR-0026's
+coordinated upgrade, tracked with its design (how B authorises a principal
+that A authenticated, how the `ack` comes back) in #1380. Until then a
+`cmd` whose agent is on another node is refused with
+`unsupported_for_agent` before anything is sent. The one exception is
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
@@ -924,7 +1010,7 @@ render them from events. "Source" says where the data comes from.
 | P22 | Resume picker | flk's agent list | existing |
 | P23 | Harness, model and effort picker, for a new agent and for a switch at idle | per adapter, §10a | S17 |
 | P24 | Message view whose whole turns collapse and expand, not only tool output | turn boundaries from `command_lifecycle` and `result` | S18 |
-| P25 | Permission preset, picked at start and switched at runtime, beside the P23 picker (#1321) | `system/init.permissionMode`; `set_permission_mode` (S0) or a reload, §10b | S19 |
+| P25 | Permission preset, picked at start and switched at runtime, beside the P23 picker (#1321) | `system/init.permissionMode`; `set_permission_mode` in place, a reload for `bypassPermissions` (A.15, §10b) | S19 |
 
 P16 and P17 have no source in the stream today and are not promised;
 #1308 tracks finding one or deciding against them.
@@ -981,12 +1067,30 @@ P16 and P17 have no source in the stream today and are not promised;
   it beside harness, model and effort (P23), in the TUI and the web client.
 - **Switch at runtime.** `agent.set_permissions { preset }`. The rule part
   takes effect at the next `can_use_tool`. The mode part goes through the
-  SDK control request `set_permission_mode` if probe slice S0 confirms it
-  works over stdio in `-p` (in place, at once, no respawn); otherwise it
-  is a switch at idle through §1's reload with the new `--permission-mode`
-  (no compaction, so the prefix stays warm, E14). Either way it is recorded
-  as `agent.permissions_changed { from, to, by, mechanism: in_place |
-  reload }` and visible in the next `system/init.permissionMode`.
+  control request `set_permission_mode { mode }` over stdio (S0, A.15): in
+  place, at once, with no respawn, and also during a turn, where it
+  applies from that turn's next tool call. S0 switched at idle to
+  `acceptEdits`, `default` and `plan`, and during a turn to `acceptEdits`
+  only; switches to `auto` and `dontAsk`, and any switch during a turn to
+  a mode other than `acceptEdits`, were not probed, so S19 probes them
+  before it relies on them. The valid modes are `default`,
+  `acceptEdits`, `plan`, `auto`, `dontAsk` and `bypassPermissions`; any
+  other is refused with `error_code: invalid_mode`, and a refused request
+  leaves the mode as it was. `bypassPermissions` is the exception: it is
+  refused (`bypass_not_launched`) unless the session was launched with
+  `--dangerously-skip-permissions`, so a switch to a preset whose mode is
+  `bypassPermissions` is a switch at idle through §1's reload with that
+  launch flag (no compaction, so the prefix stays warm, E14). Every other
+  switch is in place. A switch away from `bypassPermissions` is expected to
+  be in place too, but it was not probed (S0 never launched with the
+  flag), so S19 probes it as well. It is
+  recorded as `agent.permissions_changed { from, to, by, mechanism:
+  in_place | reload }`; `system/init.permissionMode` shows the new mode
+  from the next turn on (it is emitted at turn start, so a switch during a
+  turn shows only in the next one). A switch to `plan` makes the harness
+  write plan files into the session's config dir (`$CLAUDE_CONFIG_DIR/plans/`,
+  §1's private dir per profile, A.15), so they stay with the profile after
+  the session ends.
 - **Escalation is operator-only.** A switch to a higher-ranked preset needs
   the local operator or an `operate`-scoped token (§1a, §5); anything else
   is refused with `operator_only` (exit 13). A switch down needs `send`
@@ -1045,7 +1149,9 @@ to this record:
 ## Failure modes and known limits
 
 - **Hidden flags move.** `--resume-session-at`, `--permission-prompt-tool
-  stdio` and `command_lifecycle` are undocumented in `--help`. The
+  stdio`, `command_lifecycle` and the control subtypes
+  `cancel_async_message` and `set_permission_mode` are undocumented in
+  `--help`. The
   capability probe of §9 and the unknown-shape log of §8 are how flk notices;
   the fallback is the rehydrate path, never a silent wrong fork.
 - **A removed tool stays visible (E12)** until compaction, and the model may
@@ -1058,10 +1164,23 @@ to this record:
   host, no structured agent starts there (§1a).
 - **`pty` agents still share the operator's uid (#1177)** and can read client
   tokens until O19a; see §5.
-- **The harness's messaging socket (E16)** stays open if S0 finds no
-  switch for it. Only the `flk-agent` uid can reach it, so another
-  structured agent could write to it past the queue; flk never does, and
-  S0 records what it accepts so the risk is known before S3 ships.
+- **`--restricted` and `CLAUDE_CODE_RESTRICTED=1` are the only switches
+  found that close the harness's messaging socket (E16, A.11).** The
+  launch profile uses the flag. Their effect on the socket is known from
+  one harness version (2.1.296) and the changelog line carried in it. If
+  a later version binds the socket despite the flag, `system/init` reports a
+  `messaging_socket_path` again, and S3 refuses to run that session
+  rather than give structured agents a door into each other past the
+  queue (§1).
+- **`interrupt` delivery stops the running turn (A.14).** A tool that is
+  mid-run is rejected, and what it did before that is not undone. A
+  `steer` write ("send now" without `interrupt`) does not stop it, but
+  waits for the next model step, so a long tool delays it, and it can
+  change what the running turn answers (§3).
+- **A question in the same message after a prompting call waits for the
+  prompt (A.13, §2b).** Not holding a question cannot help it there; the
+  compiled context tells agents to ask before, or apart from, a call that
+  may prompt.
 - **System One is advisory.** When it is not configured, times out or its
   breaker is open, questions are not held (§2a), batches are not joined and
   no item is marked relevant (§3): the defaults, never a stall.
@@ -1073,7 +1192,9 @@ to this record:
 The owner answered the open questions of the proposed record on 2026-10-13.
 Each item names the question, the answer, and where the body follows it.
 "As recommended" means the recommendation of the proposed record, which the
-body already carried.
+body already carried. An "S0 note" line (2026-10-14, #1324) records what
+the S0 probes found that bears on a decision. The notes record facts; they
+change no decision.
 
 1. **Isolation and login under `flk-agent` (#1177, ADR-0035 §6.3).** As
    recommended: `claude /login` once per profile as `flk-agent` into a
@@ -1095,6 +1216,11 @@ body already carried.
    reading (the pump never waits on anything), and the hidden flag
    disappearing (the launch profile falls back to an MCP permission tool).
    (§2b)
+   *S0 note:* in A.13 an open permission held every later call of the
+   same message, a pre-allowed MCP call included, while a call ordered
+   before the prompting one ran first. Whether the permission or serial
+   execution of non-concurrency-safe tools holds the later call is an open
+   S0 item. (§2b case 1)
    - 3a. **Non-blocking questions (#1301).** As recommended (questions are
      deferred, permission requests block), plus three additions now in
      §2a: an honest-blocker question, where the agent has nothing else to
@@ -1105,6 +1231,12 @@ body already carried.
      response will be relayed to you`; and each question has a stable id,
      a hash of the question, rendered in fixed bytes so the prompt cache
      keeps hitting across turns and forks. (§2a)
+     *S0 note:* both carriers kept the model working, and `allow` is
+     framed as "The user answered", so the not-held result travels as a
+     `deny` (A.12). A question asked in the same message after a call that
+     prompts was not asked until that prompt was answered (A.13, §2b). The
+     id is stable per agent; a fork's prefix carries its parent's ids
+     unchanged (§2a, #1324).
 4. **Delivery and the queue.** Not as recommended (human `steer` by
    default). The owner wants a full queue UX: queued messages wait for
    idle and stay editable; they can be deleted and reordered; there are
@@ -1116,6 +1248,15 @@ body already carried.
    edit surface; if it does, flk wraps it, otherwise flk's queue is the
    surface. The default delivery is now `at_idle` for every producer,
    humans included; `steer` is what "send now" sets. (§3)
+   *S0 note:* the harness has a take-back (`cancel_async_message`, for
+   inputs still `queued`), which `queue.take_back` wraps, and no edit, so
+   flk's queue is the only edit surface. The harness's own send-now
+   (`interrupt{send_now}`) is an interrupt: it rejects the tool in flight,
+   whose side effects so far persist, and starts the item as a new turn.
+   flk uses it for `send_now { interrupt: true }`. A `steer` write, which
+   "send now" sets, folds into the running turn at the next model step,
+   waits out a running tool, and can change what that turn answers.
+   (§3, A.14)
 5. **The messaging socket.** No separate concept. flk owns the session's
    input, so agent messages are queued exactly like human ones. The agent
    and human messages are not submitted together: FIFO across both, one
@@ -1124,6 +1265,9 @@ body already carried.
    as a fact about the harness; flk never uses that socket, and S0 records
    what it accepts. The socket is no longer a blocker for shipping. (§1,
    §3, E16, "Failure modes")
+   *S0 note:* the socket takes unauthenticated turns from any process of
+   the session's uid, and `--restricted` closes it; the launch profile
+   passes it, so the known limit is gone. (§1, E16, A.11)
 6. **Where the wire endpoint lives.** As recommended: `/v1/ws` in the
    server process, with `web` on in release builds as part of S7. The
    owner clarified the architecture, now stated in §5: with `-p` there is
@@ -1158,6 +1302,11 @@ body already carried.
     A preset is picked at start and switched at runtime, with a picker
     beside P23 and escalation for the operator only; probe slice S0 tries
     `set_permission_mode` over stdio. (§10b, P25)
+    *S0 note:* it works in place at idle for `acceptEdits`, `default` and
+    `plan`, and mid-turn for `acceptEdits`; `auto` and `dontAsk` were not
+    switched to. `bypassPermissions` is refused unless the session was
+    launched with `--dangerously-skip-permissions`, so it needs a reload
+    with that flag. (§10b, A.15)
 
 ## Slices
 
@@ -1166,17 +1315,17 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
-| S0 | Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
+| S0 | Not complete: the probes landed (#1356); open items, the A.13 controls and A.16 (pending on the owner), see "Open S0 items". Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
-| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile, session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (`--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
 | S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
-| S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now`, `take_back` if S0 finds a harness take-back (§3, owner decision 4) | S0, S5 | 300 |
-| S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance`, recorded for rating (§3, owner decisions 4 and 5) | S5 | 200 |
+| S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
+| S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |
 | S5b | Turn-end work through the queue: armed self-compact and its continuation on `result`, recap lift, wake of parked waits (§3a, #697) | S5 | 200 |
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
-| S7 | Wire endpoint in the server process (after #1323 reports): `/v1/ws` hello / sub / cmd, cursors, gap / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
+| S7 | Wire endpoint in the server process (after #1323 reports): `/v1/ws` hello / sub / cmd (a `cmd` for another node's agent is refused until #1380), cursors, gap / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
@@ -1184,7 +1333,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
 | S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
 | S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
-| S6b | Non-blocking questions: question records with stable hashed ids and fixed-template rendering, the placeholder result on the carrier S0 chose (with the §2 deny carve-out if it is `deny`), `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
+| S6b | Non-blocking questions: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
 | S6c | The MCP question path: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
 | S6d | The hold-or-continue System One check: state from the last turns, the question and the open task and work-package graph, hold on `strong` only, recorded for rating (§2a, owner decision 3a) | S6b | 200 |
 | S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
@@ -1192,7 +1341,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
 | S17 | Picker (P23): probe Claude's `supportedModels` / `set_model`, per-adapter model and effort lists merged with ADR-0021's registry, `agent.start` fields, `agent.reload{model, effort}` | S11 (S14, S15 for Codex and opencode lists) | 300 |
 | S18 | Collapsible turns (P24): turn grouping from `command_lifecycle` and `result`, the default collapse rule, one-line summaries, in the web client and the TUI view | S9a, S10 | 250 |
-| S19 | Permission presets (P25, #1321): ranked presets in config, `agent.start{permission_preset}`, `agent.set_permissions` in place through `set_permission_mode` or by reload, operator-only escalation, picker beside P23 | S0, S6, S11, S17 | 300 |
+| S19 | Permission presets (P25, #1321): ranked presets in config, `agent.start{permission_preset}`, `agent.set_permissions` in place through `set_permission_mode`, by reload for `bypassPermissions` (A.15), operator-only escalation, picker beside P23 | S0, S6, S11, S17 | 300 |
 
 The spike's demonstration ("one throwaway session rendered by both the TUI
 and a thin Bun client") is S9a plus S10 against S3; this record does not ship
@@ -1477,3 +1626,383 @@ loopback port (`GET /doc`: OpenAPI 3.1, 162 paths; `GET /event` SSE; one
 Not verified live: reasoning events, approvals, questions, errors and
 interrupts on both (read from the schemas only), and any live Codex
 `app-server` session; #1309 tracks those runs.
+
+## Appendix A, continued — S0 probes (2026-10-14, #1307)
+
+Measured on 2026-10-14 against Claude Code 2.1.296 on sage (macOS, Apple
+Silicon), model alias `haiku`. Drivers are committed under
+`docs/adr/0036-probes/` (`s0lib.py` is the shared stream-json driver; every
+probe below names its script; `README.md` there says how to re-run it).
+The raw captures are not committed, as in A (they hold account rate-limit
+state), so a figure below can be checked only by re-running its script.
+
+Every run removed every `FLOCK_*` and `CLAUDE_CODE_*` variable plus
+`CLAUDECODE`, `CLAUDE_PID` and `CLAUDE_EFFORT` from the child environment,
+ran in a fresh temporary working directory holding `a.txt` and `b.txt`
+(deleted afterwards), and passed `-p --input-format stream-json
+--output-format stream-json --verbose --replay-user-messages
+--include-hook-events --setting-sources local --strict-mcp-config
+--no-session-persistence --model haiku` plus the flags each section names.
+No flk server, pane or sccache server was started or reached.
+
+**Isolation caveat.** The runs recorded here set `CLAUDE_CONFIG_DIR` to the
+operator's live work profile, for its keychain login (E6). That was not
+isolated enough: each session registered `sessions/<pid>.json`, an inbox
+key and a socket under it while it ran, left empty `projects/<cwd>/memory/`
+and `session-env/<session id>/` directories, and one A.15 run wrote a plan
+file into `plans/`. All of it was removed afterwards by the session ids and
+working directories in the captures (PR #1356 lists the paths). The
+drivers have since been changed to give every session a fresh temporary
+`CLAUDE_CONFIG_DIR`, deleted on close, with the login passed in as
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. They have not been
+re-run that way yet. Nothing measured here depends on the profile: user
+settings were already dropped by `--setting-sources local`.
+
+Totals over the
+63 `result`s of 38 sessions: input 228, cache read 603,138, cache write
+149,881, output 13,667 (766,914 tokens, 79% cache reads).
+
+Code reading used `strings -n 6` over the 2.1.296 binary
+(`.claude-wrapped`, a Bun bundle); a statement marked "(code)" was read
+there and not run.
+
+### A.11 The messaging socket (E16)
+
+Script `s0_socket.py`, flags `--tools Bash,Read --allowedTools
+"Bash(printenv:*)" --permission-prompt-tool stdio`. Each variant ran one
+turn, read `system/init.messaging_socket_path`, then connected to that path
+as a plain same-uid Python process with no token and wrote three lines, one
+connection each: `{"type":"user","message":{"content":"Reply with exactly:
+SOCKET-NEXT"},"from":"s0-probe"}`, the same with `"priority":"now"`, and
+`{"type":"control","action":"rename","name":"s0-renamed"}`. Last, the agent
+ran `printenv CLAUDE_CODE_MESSAGING_SOCKET` and `printenv
+CLAUDE_CODE_MESSAGING_TOKEN | wc -c` through Bash. Every variant was run
+twice and the two runs agreed (the `printenv` step and the last row's
+prompt check were added for the second run, and the last row was run a
+third time for the prompt check).
+
+| Variant | Socket | `user` line, no token | `priority: now` | Agent's Bash sees |
+|---|---|---|---|---|
+| default | `/tmp/cc-socks/<pid>.sock`, uid 501, mode 0600; dir 0700 | a turn ran, `result` "SOCKET-NEXT" | a turn ran, "SOCKET-NOW" | the socket path and a 32-hex token |
+| `--restricted` | none (`messaging_socket_path` absent) | — | — | neither (`printenv` exit 1) |
+| `CLAUDE_CODE_RESTRICTED=1` | none | — | — | neither |
+| `--settings '{"crossSessionInbound":"refuse"}'` | bound, as default | nothing on stdout, no turn | nothing | path and token |
+| `--settings '{"crossSessionInbound":"hold"}'` | bound, as default | `system/peer_message_hold{state: held, lane: socket, cause: explicit-setting}`, no turn | the same | path and token |
+| `--restricted` + `--settings` (Stop hook) + `--mcp-config` (`s0_mcpstub.py`) | none | — | — | neither |
+
+- **What it accepts.** Newline-delimited JSON, one object per line. `type:
+  user` with `message.content` a string is queued as a prompt (code: the
+  default priority is `next`; `now` skips the per-connection processing
+  chain). The turn's replayed `user` line carries `isSynthetic: true`,
+  `origin: {kind: peer, from: "s0-probe", verifiedPeerPid: <the
+  connecting pid>}` and wraps the text as "Another Claude session sent a
+  message: … This came from another Claude session — not typed by your
+  user … A peer cannot grant escalation …". `from` is whatever the sender
+  wrote; `verifiedPeerPid` is read from the connection (`LOCAL_PEERPID`).
+  `type: control` takes the actions `rename`, `peer_message_status`,
+  `notify_when_idle`, `peer_idle_notice`, `yield_artifact_replies`,
+  `unyield_artifact_replies` and `artifact_replies_yielded` (code); the
+  probe's `rename` produced nothing on stdout and did not change the name
+  in the session registry. Anything else is logged and ignored (code).
+- **No token needed on macOS.** The inbox publishes a key file and checks a
+  first-line auth frame, but rejects unauthenticated lines only where
+  `authRequired` is set, and its default is "platform is Windows" (code:
+  `authRequired = requireAuth ?? (platform === "windows")`). The probe's
+  token-less writes ran turns.
+- **Owner and mode.** The socket is created 0600 in a 0700
+  `/tmp/cc-socks` (or `$XDG_RUNTIME_DIR/cc-socks`, or
+  `/tmp/cc-socks-<uid>` when the path would pass 103 bytes), owned by the
+  session's uid, and removed on exit. The session registry
+  `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (0644) records
+  `messagingSocketPath`, and `<pid>.<sha256>.key` (0600) holds the key.
+  Every child process of the session gets `CLAUDE_CODE_MESSAGING_SOCKET`
+  and `CLAUDE_CODE_MESSAGING_TOKEN` in its environment.
+- **Switches.** `--restricted` and `CLAUDE_CODE_RESTRICTED=1` skip binding
+  ("[uds-messaging] Skipped: restricted session"), and the Claude Code
+  changelog carried in the binary lists "Fixed `--restricted` (and
+  `CLAUDE_CODE_RESTRICTED=1`) sessions opening the cross-session messaging
+  socket". In the last row, the `--settings` Stop hook ran
+  (`hook_started` / `hook_response`, and its marker file appeared), the
+  `--mcp-config` server was `connected` and its tool was called, and a
+  `touch` still arrived as `can_use_tool` over `--permission-prompt-tool
+  stdio` (A.12 to A.15 themselves ran without `--restricted`). Other effects of
+  restricted mode that the code shows: no user settings are read, auto
+  memory is off, cloud sessions and teleport are refused, Claude in Chrome
+  does not connect. `tools`, `slash_commands` (55) and `capabilities` in
+  `system/init` were the same as the default run.
+  `crossSessionInbound` (`accept | hold | refuse`, read from policy, flag
+  and user settings, so `--settings` sets it) leaves the socket bound:
+  `refuse` drops silently, `hold` reports `peer_message_hold` and, at exit,
+  `state: dropped, outcome: discarded`.
+
+### A.12 The deferral carrier: `deny` versus `allow` (§2a)
+
+Script `s0_carrier.py`, flags `--tools Bash,Read,AskUserQuestion
+--permission-prompt-tool stdio`. Prompt: two independent tasks, "use the
+AskUserQuestion tool to ask me which colour I prefer for the report, red
+or blue", then "run `ls` … and count the files", finishing with one line
+per task. The driver answered the AskUserQuestion `can_use_tool` with the
+§2a text `q-6854666e9377 submitted for user feedback - the response will be
+relayed to you` (the id computed as §2a specifies over agent `s0-probe`,
+the prompt, the option labels and `multi_select`), carried as
+`{behavior: deny, message: <text>}` or as `{behavior: allow,
+updatedInput: {…input, answers: {<question>: <text>}}}`. A second turn then
+sent the §2a reply `Answer to q-6854666e9377: blue`. Four runs per carrier.
+
+| | `deny` (4 runs) | `allow` (4 runs) |
+|---|---|---|
+| tool result the model saw | `is_error: true`, content exactly the text | `is_error: false`, `The user answered: "Which colour do you prefer for the report: red or blue?"="q-6854666e9377 submitted for user feedback - the response will be relayed to you". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.` |
+| went on to run `ls` in the same turn | 4/4 | 4/4 |
+| re-asked, or any later control request | 0/4 | 0/4 |
+| turn end | one `result`, `success`, `end_turn`, `num_turns` 3 (one run 4) | one `result`, `success`, `end_turn`, `num_turns` 3 |
+| `result.permission_denials` | 1 entry: `AskUserQuestion` with its `tool_use_id` and input | empty |
+| `system/permission_denied` event | none | none |
+| final text on task A | "no answer has come back yet … submitted for your feedback" (4/4) | "returned a submission receipt / ID, not red or blue" (4/4) |
+| reply turn used "blue" | 4/4 | 4/4 |
+
+Both carriers keep the model working, so by §2a's rule S6b uses `deny`. Its
+tool result is the deferral text byte for byte; `allow`'s is the harness's
+"The user answered" frame around it.
+
+### A.13 Parallel control requests and an ask while a permission is open (§2b)
+
+Script `s0_parallel.py`, flags `--tools Bash,Read,AskUserQuestion
+--permission-prompt-tool stdio` (no `--allowedTools`, so `touch` prompts).
+The prompt asked for two tool calls in one response, in a given order. The
+driver left the first `can_use_tool` open for 10 s, then answered it
+(`deny` for Bash, `allow` with answers for AskUserQuestion). Every run
+produced both `tool_use` blocks in one API message (same `message.id`),
+complete within 0.37 s of each other. Two runs per shape.
+
+| Shape (order in the message) | First `can_use_tool` | Second, while the first was open | Second after the first was answered |
+|---|---|---|---|
+| `touch`, then AskUserQuestion | Bash | never in 10 s | AskUserQuestion, 5–6 ms after the answer |
+| AskUserQuestion, then `touch` | AskUserQuestion | never in 10 s | Bash, 12–16 ms after |
+| `touch`, `touch` | Bash | never in 10 s | Bash, 7–8 ms after |
+| `touch`, then a pre-allowed MCP tool (`s0_mcpstub.py` `echo`, in `--allowedTools`) | Bash | — (no prompt); its result arrived 5 ms after the Bash answer, not before | — |
+| the MCP tool, then `touch` | Bash, after the MCP result (0.34–0.36 s) | — | — |
+
+What this shows: in a message of non-concurrency-safe calls (Bash
+`touch`, AskUserQuestion, and an MCP tool without a read-only hint), only
+one `can_use_tool` was ever open, and no call later in the message ran,
+prompting or not, until the open one was answered. A pre-allowed MCP call
+ordered before the prompting one ran first.
+
+What it does not show is why. Claude Code may simply run
+non-concurrency-safe tools one at a time, so a later call would wait
+behind any running earlier call, permission or not. The control is
+pending (needs a re-run with a model): `s0_parallel.py`'s
+`sleep_then_mcp` and `slowtouch_then_mcp` shapes put the same pre-allowed
+MCP call behind a pre-allowed `sleep 5` and a pre-allowed, writing
+`sleep 5 && touch`, with no permission open. If the MCP result waits for
+the Bash call there too, serial execution of non-concurrent tools is what
+holds it, and the open permission is just one way an earlier call can
+stay unfinished. Also untested: a concurrency-safe call (`Read`, or an MCP
+tool with `readOnlyHint`) behind an open permission.
+
+### A.14 The harness's own queue in `-p` (§3)
+
+Script `s0_queue.py`, flags `--tools Bash --allowedTools "Bash(sleep:*)"
+--permission-prompt-tool stdio`. Input M1 "Run `sleep 8` with Bash, then
+reply with exactly: DONE-1" (flk-chosen uuid); one second after the
+`sleep` tool call, input M2 "Reply with exactly: M2-ANSWERED" (flk-chosen
+uuid), then the control request of each row. Times are seconds from start.
+The verbs come from the `-p` control loop in the binary (`print.ts`
+handles `interrupt`, `cancel_async_message`, `set_permission_mode`, …).
+
+| Scenario | Control request | Response | Lifecycle and outcome |
+|---|---|---|---|
+| plain | none | — | M2 `queued` 3.82; the sleep ends 11.07; M2 `started` 11.07; one `result` 12.92, text "M2-ANSWERED" (M1's "DONE-1" is never written); M2 then M1 `completed` |
+| takeback | `cancel_async_message{message_uuid: M2}` while M2 is `queued` | `{cancelled: true}` within 1 ms | M2 `cancelled` at once; the sleep runs to its end; one `result` "DONE-1" |
+| takeback_late | the same, after M2 reported `started` | `{cancelled: false}` | M2 runs; `result` "M2-ANSWERED" |
+| cancel_queued | `interrupt{cancel_queued: true}` | `{still_queued: [], cancelled: [M2]}` in 2 ms | M2 `cancelled`; the running sleep is rejected ("The user doesn't want to proceed with this tool use …"); `result{error_during_execution, terminal_reason: aborted_tools}`; M1 `cancelled` |
+| send_now | `interrupt{send_now: true, message_uuid: M2}` | `{still_queued: [M2], send_now: "stopped"}` in 1 ms | the sleep is rejected 1 s into its 8; `result{error_during_execution, aborted_tools}`; M1 `cancelled`; M2 `started` at once; a second `result` "M2-ANSWERED" 0.8 s later |
+| edit | `edit_queued_message{message_uuid, message}` (no such verb) | `{subtype: error, error: "Unsupported control request subtype: edit_queued_message"}` | M2 runs unchanged |
+
+- **Take-back** exists: `cancel_async_message` withdraws a `queued` input
+  and reports `command_lifecycle{cancelled}`; once the input has
+  `started` it answers `cancelled: false` and does nothing.
+- **Edit** does not exist. No control subtype in the binary edits a queued
+  input (the subtype list read by `strings` has none), and an unknown
+  subtype is answered with an `error` response naming it.
+- **Send-now is an interrupt.** `send_now` stops the running turn,
+  including a tool that is mid-run, cancels the turn's input, and starts
+  the named queued input as a new turn. Its `send_now` field is `stopped`,
+  `delivering` (the input is already going) or `nothing_waiting` (code).
+  It does not fold the input into the running turn: a plain write does
+  that (E4), but only at the next model step, so during a long tool the
+  write waits for the tool (row "plain": 7.25 s).
+- An interrupt during a tool ends `terminal_reason: aborted_tools`
+  (A.5's, during streaming, was `aborted_streaming`).
+
+### A.15 `set_permission_mode` over stdio (§10b, P25)
+
+Script `s0_permmode.py`, flags `--tools Bash,Write --allowedTools
+"Bash(sleep:*)" --permission-prompt-tool stdio`, started in `default`. Each
+step asked for one `Write` of a new file; every `can_use_tool` was denied.
+Run twice; the runs agreed.
+
+| Step | Request | Response | That turn's `system/init.permissionMode` | Write prompted | File written |
+|---|---|---|---|---|---|
+| 1 | — | — | `default` | yes | no |
+| 2 | `set_permission_mode{mode: acceptEdits}` at idle | `{mode: acceptEdits}` | `acceptEdits` | no | yes |
+| 3 | `{mode: default}` at idle | `{mode: default}` | `default` | yes | no |
+| 4 | `{mode: acceptEdits}` during the turn's `sleep 4`, before its Write | `{mode: acceptEdits}` | `default` (emitted at turn start) | no | yes |
+| 5a | `{mode: bypassPermissions}` at idle | `error: "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"`, `error_code: bypass_not_launched` | — | — | — |
+| 5b | `{mode: plan}` at idle | `{mode: plan}` | — | — | — |
+| 5c | `{mode: bogus}` at idle | `error: "Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"`, `error_code: invalid_mode` | — | — | — |
+| 6 | none; the turn is "Reply with exactly: ok" (second run) | — | `plan` | — | — |
+
+The switch is in place and immediate: no respawn, and a switch during a
+turn applies to that turn's next tool call. Step 6 shows `plan` stuck and
+the refused requests left it unchanged. In the first run step 6 was a
+Write, and in `plan` mode that wrote a plan file into
+`$CLAUDE_CONFIG_DIR/plans/` (the probe created that directory; it was
+removed). The second run's step 6 only reads the mode.
+
+### A.16 `claude /login` for a macOS user with no GUI session (owner decision 1) — BLOCKED on the operator
+
+Not run: it needs a second macOS user, and the probe brief forbids an
+agent creating one or using `sudo`. `s0_login_flk_agent.sh` is the
+runbook; the operator runs it as that user from a non-GUI shell
+(`ssh flk-agent@localhost` or `sudo -iu flk-agent`) and posts its output
+on #1307. It records the user's keychain state (`security
+default-keychain`, `list-keychains`, `show-keychain-info`, whether a
+`gui/<uid>` launchd domain exists), runs `claude auth login` with
+`CLAUDE_CONFIG_DIR=$HOME/.flk/claude/s0-login`, checks where the token
+landed without printing it, runs one `-p` turn, and says to repeat the turn
+from a new shell and after a reboot.
+
+What the code shows (code, not run): the OAuth blob is written with
+`security add-generic-password -U -a "$USER" -s "Claude
+Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>"` (the formula
+was checked against the work profile's existing item) into the user's
+default keychain. If that write fails and the failure is not "locked"
+(`security` exit 36) for an item the keychain already holds, the token is
+written to `.credentials.json` in the config dir instead (telemetry
+`plaintext_fallback_used`). A user with no unlocked login keychain would
+therefore most likely get the plaintext file, which is the Linux path of
+§1. Reading it back in a later session goes through `security
+find-generic-password` first.
+
+### Open S0 items
+
+S0 is not complete until these have run:
+
+1. **A.13 controls, pending a re-run.** `s0_parallel.py 2 10
+   sleep_then_mcp slowtouch_then_mcp` decides whether an open permission or
+   serial execution of non-concurrency-safe tools holds a later call
+   (finding 3). They need a login token in `S0_OAUTH_TOKEN_FILE`
+   (`claude setup-token`, docs/adr/0036-probes/README.md). The untested
+   case "a concurrency-safe call behind an open permission" belongs with
+   them.
+2. **A.16 `/login` as a user with no GUI session, BLOCKED on the
+   operator.** It needs a second macOS user. The operator runs
+   `s0_login_flk_agent.sh` as that user from a non-GUI shell and posts the
+   output on #1307.
+
+### A.17 Gotchas met while probing
+
+- `--no-session-persistence` keeps the transcript out of the profile but
+  still creates `projects/<cwd>/memory/` and `session-env/<session id>/`
+  (both empty here). In these runs that was 33 and 23 directories in the
+  operator's profile, removed by matching the captured session ids and
+  working directories (see the isolation caveat above). Each running
+  session also writes `sessions/<pid>.json` and a key file there (A.11).
+  These are observations from the profile directory, not from a capture.
+- A permission prompt answered `deny` with a message is not a
+  `system/permission_denied` event: in A.12 to A.15 none was emitted for
+  any stdio deny; only `result.permission_denials` records it. This rests
+  on the uncommitted captures of `s0_carrier.py`, `s0_parallel.py` and
+  `s0_permmode.py`; re-running them reproduces it.
+
+### S0 findings for the architect
+
+Each item names the body section whose assumption it changes. This list is
+kept as written by S0; the body was amended from it on 2026-10-14 (#1324),
+and each item ends with where.
+
+1. **§1 "No second input door", E16, "Failure modes" (the socket).** The
+   socket accepts unauthenticated `user` lines from any process of the
+   session's uid on macOS and runs them as turns (A.11), and the agent's own
+   Bash children are handed its path and token. Under §1a every structured
+   agent runs as `flk-agent`, so without a switch any structured agent
+   could start turns in any other one, past the queue. A supported switch
+   exists: `--restricted` (or `CLAUDE_CODE_RESTRICTED=1`) binds no socket
+   and sets neither variable, while `--settings` hooks, `--mcp-config`
+   servers and the stdio prompt keep working. The launch profile can pass
+   `--restricted`, and the "known limit" in "Failure modes" falls away.
+   Restricted mode also turns off auto memory, reads no user settings and
+   refuses cloud sessions (A.11), which fits §1's isolation, but S3 should
+   diff its `system/init` against the unrestricted profile once more.
+   *Applied in §1 (launch profile, isolation, "No second input door"),
+   E16, "Failure modes" and the S3 row; noted under owner decision 5.*
+2. **§2a placeholder result, §2 table.** Both carriers keep the model
+   working (8/8), so S6b uses `deny`. The §2 carve-out applies to
+   `result.permission_denials` only: no `system/permission_denied` event
+   is emitted for a deny flk sends over stdio (A.12, A.17), so the §2 row
+   "`system/permission_denied`, `result.permission_denials` →
+   `agent.permission_denied`" gets every stdio deny from flk's own answer,
+   not from that event. `allow` is framed by the harness as "The user
+   answered: …", which §2a's "the model cannot mistake it for the user's
+   answer" argued against.
+   *Applied in the §2 table, §2a "The placeholder result" and the S6b
+   row; noted under owner decision 3a.*
+3. **§2b case 1, owner decision 3 (asking while a permission is open).**
+   An `AskUserQuestion` later in the same message as a prompting call did
+   not arrive while the permission was open, as §2b allowed for. Neither
+   did the result of a pre-allowed MCP tool (no read-only hint) ordered
+   after it (A.13), so the stated way out, `flock_question_ask`, did not
+   escape the block within that message. Only a call ordered before the
+   prompting one ran. Not yet known is whether the open permission or
+   serial execution of non-concurrency-safe tools holds the later call:
+   the controls in A.13 are pending. Until they run, §2b's advice should
+   read "ask before, or in a message apart from, a call that may prompt"
+   rather than "use the MCP tool while a permission is open". Only one
+   open control request per session was observed, but that may hold only
+   for non-concurrent calls.
+   *Applied, as observed and pending the controls, in §1 "Stall and
+   waiting" (open requests tracked by id), §2b case 1 and "Failure
+   modes"; noted under owner decisions 3 and 3a.*
+4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
+   exists (`cancel_async_message{message_uuid}`, `queued` only), so
+   `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the
+   only edit surface. The harness's send-now (`interrupt{send_now: true,
+   message_uuid}`) is an interrupt that kills the running tool and starts
+   the item as a new turn: it matches §3's `delivery: interrupt`, not
+   `steer`, and cannot "save a model step" without costing the running
+   turn. `steer` stays a plain write, which folds only at the next model
+   step (it waits out a running tool, A.14 "plain"). In that row the
+   folded item also displaced M1's requested final reply, so a steered item
+   can change what the running turn answers. `interrupt{cancel_queued:
+   true}` cancels the harness's queued inputs and also interrupts the
+   running turn.
+   *Applied in §3 (the `steer` and `interrupt` delivery mechanics,
+   `queue.take_back`, "The harness's own queue"), "Failure modes" and the
+   S5c row; noted under owner decision 4, which is unchanged: "send now"
+   still sets `steer`, and the harness's send-now serves
+   `send_now { interrupt: true }`.*
+5. **§10b, S19 (permission presets).** `set_permission_mode` works over
+   stdio in `-p`, in place, at once, and mid-turn (A.15), so the mode
+   part of a preset switch is `mechanism: in_place` for every mode except
+   `bypassPermissions`, which is refused unless the session was launched
+   with `--dangerously-skip-permissions`; a preset that ranks it needs a
+   reload with that flag. Valid modes are `acceptEdits`, `auto`,
+   `bypassPermissions`, `default`, `dontAsk`, `plan`. A switch to `plan`
+   writes plan files into the agent's config dir.
+   *Applied in §10b (with the modes and directions S0 did not probe), P25
+   and the S19 row; noted under owner decision 15.*
+6. **Owner decision 1, §1 (login as `flk-agent`).** BLOCKED (A.16). If the
+   code reading holds, `/login` as a user without a GUI session stores the
+   token as a plaintext `.credentials.json` in the profile dir rather than
+   in a keychain. That is safe only because the dir is private to
+   `flk-agent` (§1); S3 should check its mode.
+   *Not applied: A.16 has not run ("Open S0 items", item 2); §1 and owner
+   decision 1 stand until it does.*
+7. **§9 capability probe.** An unsupported control subtype is answered at
+   once with `error: "Unsupported control request subtype: <name>"`
+   (A.14), so a capability probe can test a control verb such as
+   `cancel_async_message` with a harmless request instead of a dry
+   resume.
+   *Not applied: §9's probe is unchanged; this is an option for S12 to
+   weigh when it builds that probe.*

@@ -800,6 +800,19 @@ impl App {
     /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
     /// (headless).
     pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        self.dispatch_due_script_checks_with(now, |check| crate::checks::run_script(check).0)
+    }
+
+    /// Dispatch due checks using the supplied executor. Execution stays on a
+    /// worker, while completion is routed through the ordinary App event path.
+    fn dispatch_due_script_checks_with(
+        &mut self,
+        now: Instant,
+        execute: impl Fn(&crate::checks::config::ScriptCheck) -> crate::checks::Outcome
+            + Clone
+            + Send
+            + 'static,
+    ) -> bool {
         // Health (#295): stamp the tick BEFORE the pause early-return, so
         // "paused" does not look identical to "the loop stopped waking".
         // The runner tick is the app loop's checks branch — its liveness is
@@ -829,9 +842,10 @@ impl App {
             let runnable = self.checks_runner.next_runnable(now);
             for job in runnable {
                 let event_tx = self.event_tx.clone();
+                let execute = execute.clone();
                 std::thread::spawn(move || {
                     let start = Instant::now();
-                    let (outcome, _output) = crate::checks::run_script(&job.check);
+                    let outcome = execute(&job.check);
                     let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     let _ = event_tx.blocking_send(crate::events::AppEvent::CheckCompleted {
                         name: job.name,
@@ -1135,7 +1149,7 @@ impl App {
             let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
             let gate = branch.as_deref().map(|b| {
                 crate::worktree::branch_merge_gate(
-                    &crate::worktree::MergeGateContext::default(),
+                    &self.runtime_config.merge_gate,
                     &space.repo_root,
                     &space.checkout_path,
                     b,
@@ -2393,37 +2407,18 @@ mod tests {
         assert!(app.pending_agent_resume_deadline.is_none());
     }
 
-    /// #175 phase 4 end-to-end: a `[[checks.script]]` fixture wired through
-    /// the App tick emits `CheckRan { outcome = "fire" }` and (with
+    /// #175 phase 4: a dispatched check completion wired through the App
+    /// tick emits `CheckRan { outcome = "fire" }` and (with
     /// `debounce = 1`) a `CheckFired` on the event hub.
     #[tokio::test]
     async fn check_runner_ticks_emit_ran_and_fired_events_on_hub() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Fixture script: exit 0 → Fire on the runner's classification.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "flock-checks-runtime-{}-{}",
-            std::process::id(),
-            nanos
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script_path = dir.join("fire.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.checks.min_tick_secs = 1;
         config.checks.heartbeat_secs = 3600;
         config.checks.scripts = vec![crate::checks::config::ScriptCheck {
             name: "e2e".into(),
-            program: script_path.clone(),
+            program: std::env::temp_dir().join("unused-check-executor"),
             interval_secs: 1,
             timeout_secs: 5,
             debounce: 1,
@@ -2440,31 +2435,36 @@ mod tests {
             .force_due("e2e", Instant::now() - Duration::from_millis(1));
         app.checks_next_deadline = Some(Instant::now() - Duration::from_millis(1));
 
-        // Tick: dispatches the check on a worker thread.
-        assert!(app.dispatch_due_script_checks(Instant::now()));
+        // Hold completion until dispatch has returned. Executor mechanics are
+        // covered in checks::script, independently of the App event routing.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        assert!(
+            app.dispatch_due_script_checks_with(Instant::now(), move |check| {
+                assert_eq!(check.name, "e2e");
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test must release the check executor");
+                crate::checks::Outcome::Fire
+            })
+        );
+        assert_eq!(app.checks_run_count, 0);
+        release_tx.send(()).unwrap();
 
-        // Wait for the worker's `AppEvent::CheckCompleted` (fixture script
-        // is `exit 0` — should return within a few hundred ms). We poll the
-        // App's event channel and hand each event to the shared handler,
-        // stopping once the hub carries the CheckRan event.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(ev) = app.event_rx.try_recv() {
-                app.handle_internal_event(ev);
+        // Consume completion directly, without spending a scheduling interval
+        // on each unrelated App event. A silent live worker still fails.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = app.event_rx.recv().await.expect("check event channel closed");
+                let completed = matches!(&event, crate::events::AppEvent::CheckCompleted { name, .. } if name == "e2e");
+                app.handle_internal_event(event);
+                if completed {
+                    break;
+                }
             }
-            let events = app.event_hub.events_after(0);
-            let has_ran = events.iter().any(|(_, envelope)| {
-                matches!(
-                    &envelope.data,
-                    crate::api::schema::EventData::CheckRan { name, outcome, .. }
-                        if name == "e2e" && outcome == "fire"
-                )
-            });
-            if has_ran {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        }).await.expect("check worker did not complete");
 
         let events = app.event_hub.events_after(0);
         assert!(
@@ -2486,8 +2486,6 @@ mod tests {
         );
         assert_eq!(app.checks_run_count, 1);
         assert_eq!(app.checks_error_count, 0);
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Heartbeat: when the window elapses, `ChecksHeartbeat` lands on the

@@ -11,9 +11,14 @@
 # a runner-minutes problem.
 #
 # Fix: serialize the worst multi-process offenders so they never compete with
-# each other, and give every PTY-spawning integration binary a couple of
-# retries to absorb residual timing flakiness. Unit tests (lib/bin) stay fully
-# parallel and are not retried, so genuine logic failures still fail fast.
+# each other. Existing integration retry settings below are retained unchanged
+# by #1317. New flake fixes follow CONTRIBUTING.md: condition evidence and
+# producer liveness, with a measured termination ceiling only as a backstop.
+
+[profile.default]
+# #1317 backstop only: condition waits and producer liveness decide correctness.
+# docs/next/nextest-timings.md: all but mesh_delivery have p99 < 42s on both legs.
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 [test-groups]
 # At most one of these heavy, multi-process tests runs at a time across the
@@ -23,6 +28,9 @@ serial-pty = { max-threads = 1 }
 [[profile.default.overrides]]
 # Hang ceiling only (#1317): condition waits decide correctness, while a
 # silent live producer must eventually produce a named test failure in CI.
+# Retain the stricter 180s backstop: each binary's measured p99 is below 18s
+# where observed (docs/next/nextest-timings.md).
+# mesh_step2 (#1349) uses the default 420s: p99 36.409s requires >= 364.09s.
 filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binary(=cli_wrapper) | binary(=server_readiness) | binary(=live_handoff)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
@@ -33,14 +41,20 @@ filter = '(binary(=live_handoff) & test(=rollback_store_open_failure_preserves_p
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# Ubuntu mesh_delivery p99 = 63.390s, requiring >= 633.90s (#1317).
+# See docs/next/nextest-timings.md for runs and reproduction.
+filter = 'binary(=mesh_delivery)'
+slow-timeout = { period = "60s", terminate-after = 11 }
+
+[[profile.default.overrides]]
 # This end-to-end check intentionally observes the full 30-second startup grace.
 filter = 'binary(delegate_verdict) & test(delegate_idle_without_new_turn_reports_not_started_and_informs_s1)'
-slow-timeout = { period = "30s" }
+slow-timeout = { period = "30s", terminate-after = 14 }
 
 [[profile.default.overrides]]
 # The lost-brief resubmit (#828) waits out the same 30-second startup window.
 filter = 'binary(delegate_codex) & test(codex_delegate_start_resubmits_a_brief_lost_at_startup)'
-slow-timeout = { period = "60s" }
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 [[profile.default.overrides]]
 # Acceptance must expose flakes even without a command-line retry override.
@@ -75,6 +89,7 @@ filter = 'kind(test)'
 retries = 2
 
 [profile.ci]
+# Inherit the default 420s ceiling as well as every scoped ceiling (#1317).
 # CI's profile (#991). It inherits every `profile.default` override above —
 # the serial-pty group, the retries and the slow-timeouts — and only adds a
 # JUnit report, which `scripts/ci_shards.py summary` turns into the job

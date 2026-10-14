@@ -3949,12 +3949,34 @@ fn agent_result_reads_a_codex_rollout_after_session_start() {
         include_str!("fixtures/codex/finished.jsonl"),
     )
     .unwrap();
+    // The hook's acknowledged completion, rather than process start, makes
+    // the session-to-rollout binding observable by agent result.
+    let report = base.join("hook-report");
+    assert!(Command::new("mkfifo")
+        .arg(&report)
+        .status()
+        .unwrap()
+        .success());
+    let report_owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&report)
+        .unwrap();
+    let mut reader = report_owner.try_clone().unwrap();
+    let (reported_tx, reported_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        use std::io::Read;
+        let mut report = [0; 4];
+        let result = reader.read_exact(&mut report).map(|()| report);
+        let _ = reported_tx.send(result);
+    });
     let fake = base.join("codex");
     fs::write(
         &fake,
         concat!(
             "#!/bin/sh\n",
-            "printf '%s\\n' '{\"hook_event_name\":\"SessionStart\",\"session_id\":\"00000000-0000-4000-8000-000000000613\"}' | \"$FLOCK_BIN\" hook codex session\n",
+            "printf '%s\\n' '{\"hook_event_name\":\"SessionStart\",\"session_id\":\"00000000-0000-4000-8000-000000000613\"}' | \"$FLOCK_BIN\" hook codex session || exit $?\n",
+            "printf done > \"$FLOCK_TEST_HOOK_REPORT\"\n",
             "printf 'OpenAI Codex (v0.160.1)\\n\\n› Ask Codex to do anything\\n'\n",
             "while IFS= read -r line; do :; done\n"
         ),
@@ -3962,6 +3984,7 @@ fn agent_result_reads_a_codex_rollout_after_session_start() {
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("CODEX_HOME", &codex_home);
+    std::env::set_var("FLOCK_TEST_HOOK_REPORT", &report);
     let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
     let started = run_cli(
@@ -3982,20 +4005,20 @@ fn agent_result_reads_a_codex_rollout_after_session_start() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let info = loop {
-        let result = run_cli(&socket_path, &["agent", "result", "codex-fixture"]);
-        let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap_or_default();
-        if result.status.success() {
-            break json["result"]["result"].clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{json} {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        thread::sleep(Duration::from_millis(25));
-    };
+    let report = reported_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("Codex SessionStart hook did not report completion")
+        .expect("read Codex SessionStart completion");
+    assert_eq!(&report, b"done");
+    drop(report_owner);
+    let result = run_cli(&socket_path, &["agent", "result", "codex-fixture"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let info = json["result"]["result"].clone();
     assert_eq!(info["agent"], "codex", "{info}");
     assert_eq!(info["session_id"], "00000000-0000-4000-8000-000000000613");
     assert_eq!(info["finished"], true);
@@ -4005,6 +4028,7 @@ fn agent_result_reads_a_codex_rollout_after_session_start() {
     assert_eq!(info["at_ms"], 1_767_225_603_125_u64);
     cleanup_spawned_flock(flock, base);
     std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("FLOCK_TEST_HOOK_REPORT");
 }
 
 #[test]
