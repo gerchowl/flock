@@ -16,14 +16,16 @@ mod support;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use support::environment::Command;
+use support::socket_dir::SocketDir;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
     unregister_spawned_flock_pid, wait_for_socket,
@@ -87,7 +89,7 @@ fn isolation(socket: &Path) -> Vec<(&'static str, PathBuf)> {
     support::environment::isolated_env(&root, &root.join("run"))
 }
 
-fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Duration) {
+fn start_stub(socket: &Path, bin: &Path, hint: Option<&str>) -> FixtureChild {
     let mut command = Command::new("/bin/sh");
     command
         .arg(stub_path())
@@ -107,21 +109,246 @@ fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Durat
     if let Some(hint) = hint {
         command.env("FLOCK_QUESTIONS", hint);
     }
-    let started = Instant::now();
-    let mut child = command.spawn().unwrap();
+    let mut child = FixtureChild::spawn(command);
     child
+        .child()
         .stdin
         .take()
         .unwrap()
         .write_all(ASK.as_bytes())
         .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let elapsed = started.elapsed();
-    assert!(output.status.success(), "the stub never fails its agent");
-    (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        elapsed,
+    child
+}
+
+fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Duration) {
+    start_stub(socket, bin, hint).finish()
+}
+
+/// Own a new process group so failed fixture stages cannot leave descendants.
+struct FixtureChild {
+    child: Option<Child>,
+    group: libc::pid_t,
+    started: Instant,
+}
+
+impl FixtureChild {
+    fn spawn(mut command: Command) -> Self {
+        // Only this spawned child and its descendants enter the new group.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        let child = command.spawn().unwrap();
+        Self {
+            group: child.id() as libc::pid_t,
+            child: Some(child),
+            started,
+        }
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("fixture child")
+    }
+
+    /// The unchanged hook deadline must finish inside the fixture's ceiling.
+    fn finish(&mut self) -> (String, Duration) {
+        let stages = support::readiness::Stages::new(WITHIN);
+        while self.child().try_wait().unwrap().is_none() {
+            let output = self
+                .child()
+                .stdout
+                .as_ref()
+                .expect("fixture stdout")
+                .as_raw_fd();
+            stages
+                .readable(&[output])
+                .expect("hook child stayed silent without completing");
+        }
+        let output = self.child.take().unwrap().wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the stub never fails its agent: {output:?}"
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            self.started.elapsed(),
+        )
+    }
+}
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        // Only descendants of our explicitly created process group are signalled.
+        // Keep this guard through assertions, so cleanup cannot prove the kill.
+        unsafe {
+            libc::kill(-self.group, libc::SIGKILL);
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+        }
+    }
+}
+
+fn parse_fixture_pid(contents: &str) -> io::Result<libc::pid_t> {
+    contents
+        .trim()
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid fixture PID"))
+}
+
+/// Await a complete atomic PID publication, with a failure-only ceiling.
+/// Missing files are pending only while the child lives. Other I/O errors,
+/// malformed contents and child exit fail immediately; yielding adds no sleep.
+fn wait_for_pid_file(child: &mut Child, path: &Path) -> io::Result<libc::pid_t> {
+    wait_for_pid_file_with_probe(child, WITHIN, || fs::read_to_string(path))
+}
+
+fn wait_for_pid_file_with_probe(
+    child: &mut Child,
+    ceiling: Duration,
+    mut probe: impl FnMut() -> io::Result<String>,
+) -> io::Result<libc::pid_t> {
+    let deadline = Instant::now() + ceiling;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fixture PID publication stayed silent",
+            ));
+        }
+        match probe() {
+            Ok(contents) => return parse_fixture_pid(&contents),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("fixture exited before PID publication: {status}"),
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        thread::yield_now();
+    }
+}
+
+/// Publish inside one directory, so readers cannot see a truncated PID.
+fn publish_fixture_pid(pid_file: &Path) -> String {
+    format!(
+        r#"printf '%s\n' "$$" > '{0}.tmp' && mv '{0}.tmp' '{0}' || exit 3"#,
+        pid_file.display()
     )
+}
+
+/// The child's stdin gates atomic PID publication and keeps it alive afterward.
+fn gated_pid_publisher(dir: &Path, pid_file: &Path) -> FixtureChild {
+    let script = fake_flk(
+        dir,
+        "publisher",
+        &format!(
+            r#"printf partial > '{0}.tmp'
+IFS= read -r stage
+[ "$stage" = publish ] || exit 2
+{1}
+IFS= read -r stage"#,
+            pid_file.display(),
+            publish_fixture_pid(pid_file),
+        ),
+    );
+    let mut command = Command::new(script);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    FixtureChild::spawn(command)
+}
+
+#[test]
+fn pid_file_waits_for_a_gated_publisher() {
+    let directory = SocketDir::reserve("hqpid");
+    let pid_file = directory.path().join("publisher.pid");
+    let mut publisher = gated_pid_publisher(directory.path(), &pid_file);
+    let expected = publisher.child().id() as libc::pid_t;
+    let mut gate = publisher.child().stdin.take().unwrap();
+    let mut missing_seen = false;
+    let mut partial_seen = false;
+    let pid = wait_for_pid_file_with_probe(publisher.child(), WITHIN, || {
+        let result = fs::read_to_string(&pid_file);
+        if matches!(&result, Err(err) if err.kind() == io::ErrorKind::NotFound) {
+            missing_seen = true;
+            if !partial_seen {
+                match fs::read_to_string(pid_file.with_extension("pid.tmp")) {
+                    Ok(_) => {
+                        partial_seen = true;
+                        gate.write_all(b"publish\n").unwrap();
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => panic!("publisher stage: {err}"),
+                }
+            }
+        }
+        result
+    })
+    .expect("wait for atomic fixture PID publication");
+    assert!(missing_seen, "the gate must force the missing-file stage");
+    assert!(
+        partial_seen,
+        "the incomplete temp file must precede publication"
+    );
+    assert_eq!(pid, expected);
+}
+
+#[test]
+fn pid_file_wait_fails_at_once_when_the_publisher_exits() {
+    let directory = SocketDir::reserve("hqdead");
+    let path = directory.path().join("missing.pid");
+    let script = fake_flk(directory.path(), "exits", "exit 7");
+    let mut child = FixtureChild::spawn(Command::new(script));
+    child.child().wait().unwrap();
+    let mut probes = 0;
+    let err = wait_for_pid_file_with_probe(child.child(), WITHIN, || {
+        probes += 1;
+        fs::read_to_string(&path)
+    })
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    assert!(err.to_string().contains("before PID publication"));
+    assert_eq!(probes, 1, "a dead publisher must not wait for the ceiling");
+}
+
+#[test]
+fn pid_file_wait_fails_when_a_live_publisher_stays_silent() {
+    let directory = SocketDir::reserve("hqsilent");
+    let path = directory.path().join("missing.pid");
+    let mut child = gated_pid_publisher(directory.path(), &path);
+    let err = wait_for_pid_file_with_probe(child.child(), Duration::from_millis(50), || {
+        fs::read_to_string(&path)
+    })
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        child.child().try_wait().unwrap().is_none(),
+        "publisher must still be alive"
+    );
+}
+
+#[test]
+fn pid_file_wait_rejects_empty_partial_and_nonpositive_publications() {
+    let directory = SocketDir::reserve("hqinvalid");
+    let path = directory.path().join("invalid.pid");
+    let mut child = gated_pid_publisher(directory.path(), &path);
+    for contents in ["", "12partial", "0", "-1"] {
+        fs::write(&path, contents).unwrap();
+        let err = wait_for_pid_file(child.child(), &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{contents:?}");
+    }
 }
 
 fn fake_flk(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -305,30 +532,29 @@ fn a_missing_crashing_or_garbled_flk_refuses_a_hinted_delegate() {
 /// pid, so the test can show the watchdog really ended it.
 #[test]
 fn a_hanging_flk_is_killed_by_the_watchdog_and_the_delegate_refused() {
-    let dir = unique_dir("hang");
+    let directory = SocketDir::reserve("hqhang");
+    let dir = directory.path();
     let pid_file = dir.join("hang.pid");
     let hang = fake_flk(
-        &dir,
+        dir,
         "hang",
-        &format!("echo $$ > '{}'\nexec sleep 60", pid_file.display()),
+        &format!("{}\nexec sleep 60", publish_fixture_pid(&pid_file)),
     );
 
-    let (got, elapsed) = run_stub(&dir.join("unused.sock"), &hang, Some("ask_operator"));
+    let mut hook = start_stub(&dir.join("unused.sock"), &hang, Some("ask_operator"));
+    let pid = wait_for_pid_file(hook.child(), &pid_file)
+        .expect("fake flk must publish its PID while the hook is alive");
+    let (stdout, elapsed) = hook.finish();
+    let got = reason(&stdout);
 
     assert_eq!(got.as_deref(), Some(ASK_OPERATOR));
     assert!(
         elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(30),
         "the watchdog fired, not Claude's timeout: {elapsed:?}"
     );
-    let pid: libc::pid_t = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    // The stub reaped it, so signal 0 finds no such process.
+    // Assert before dropping the group guard: only the watchdog can prove this.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     assert!(!alive, "the hung flk ({pid}) outlived the hook");
-    cleanup_test_base(&dir);
 }
 
 // ---- the server half ----
