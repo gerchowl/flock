@@ -14,6 +14,7 @@ pub mod json_api;
 pub mod process_table;
 pub mod readiness;
 pub mod scripted;
+pub mod socket_dir;
 pub mod timing;
 
 pub mod environment;

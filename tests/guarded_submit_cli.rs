@@ -9,32 +9,11 @@ mod exit;
 
 use serde_json::{json, Value};
 use std::time::Duration;
+use support::socket_dir::SocketDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 const CEILING: Duration = Duration::from_secs(10);
-
-/// Short socket reservation, independent of TMPDIR and PID reuse.
-/// Entropy, collision and filesystem errors fail immediately. Drop cleans normal
-/// exits, but abrupt process termination can leave this unique directory behind.
-struct SocketDir(std::path::PathBuf);
-
-impl SocketDir {
-    fn reserve() -> Self {
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random).expect("socket directory entropy");
-        // guardrails-ok(hermetic): Unix sockets need a short path on macOS too.
-        let path = std::path::PathBuf::from(format!("/tmp/gs-{:016x}", u64::from_ne_bytes(random)));
-        std::fs::create_dir(&path).expect("exclusive peer directory reservation");
-        Self(path)
-    }
-}
-
-impl Drop for SocketDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Exactly ping, then agent.send. EOF, malformed requests and extra stages fail.
 /// The outer ceiling bounds accept, line reads, writes and CLI completion alike.
@@ -77,8 +56,8 @@ async fn guarded_submit_cli_reports_exit_8_and_9_with_scripted_evidence() {
         ),
         (exit::ABANDONED, "abandoned", "operator_active", false),
     ] {
-        let dir = SocketDir::reserve();
-        let socket = dir.0.join("s");
+        let dir = SocketDir::reserve("gs");
+        let socket = dir.path().join("s");
         let listener = UnixListener::bind(&socket).expect("isolated peer socket");
         let response = json!({"id":"cli:agent:send","result":{
             "type":"agent_send", "pane_id":"w1:p1", "outcome":outcome, "reason":reason,
