@@ -107,14 +107,16 @@ fn measured_binary_exceptions_keep_their_hang_ceilings() {
     let overrides = config["profile"]["default"]["overrides"]
         .as_array()
         .unwrap();
-    for (binary, periods) in [
-        ("delegate", 3),
-        ("agent_settled", 3),
-        ("api_ping", 3),
-        ("cli_wrapper", 3),
-        ("server_readiness", 3),
-        ("live_handoff", 3),
-        ("mesh_delivery", 11),
+    for (binary, test, periods) in [
+        ("delegate", None, 3),
+        ("agent_settled", None, 3),
+        ("api_ping", None, 3),
+        ("cli_wrapper", None, 3),
+        ("server_readiness", None, 3),
+        ("live_handoff", None, 3),
+        ("mesh_delivery", None, 11),
+        ("live_handoff", Some("rollback_store_open_failure_preserves_panes_and_original_error"), 3),
+        ("flk", Some("app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation"), 3),
     ] {
         let entry = overrides
             .iter()
@@ -123,6 +125,7 @@ fn measured_binary_exceptions_keep_their_hang_ceilings() {
                     .as_str()
                     .unwrap()
                     .contains(&format!("binary(={binary})"))
+                    && test.is_none_or(|test| entry["filter"].as_str().unwrap().contains(&format!("test(={test})")))
                     && entry.get("slow-timeout").is_some()
             })
             .expect("measured binary exception must remain explicit");

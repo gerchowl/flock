@@ -35,6 +35,12 @@ filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binar
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# Backstop every fixture wait in #1051, including child startup and CLI teardown.
+# Completion still depends on the worker reason or complete launch report.
+filter = '(binary(=live_handoff) & test(=rollback_store_open_failure_preserves_panes_and_original_error)) | (binary(=flk) & test(=app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation))'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # Ubuntu mesh_delivery p99 = 63.390s, requiring >= 633.90s (#1317).
 # See docs/next/nextest-timings.md for runs and reproduction.
 filter = 'binary(=mesh_delivery)'
