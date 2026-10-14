@@ -76,6 +76,9 @@ def report(root: Path) -> str:
         "This is an observed sample, not a guarantee about future load or absent binaries.",
         "p99 uses nearest rank per binary per platform. The larger platform p99 sets sizing.",
         "Ceilings round up to 60-second periods: at least 10× p99 and at least 180 seconds.", "",
+        "Platform gaps: macOS live_handoff is excluded by `.config/ci-shards.toml`.",
+        "Ubuntu session_health is unobserved because `tests/session_health.rs` is macOS-only",
+        '(`#![cfg(target_os = "macos")]`): it tests macOS session loss using `sandbox-exec` and mach-lookup denial.', "",
         "| Run | Created (UTC) | Result | Reports |", "| --- | --- | --- | ---: |",
     ]
     for run in runs:

@@ -1,12 +1,14 @@
 # ADR-0037: Test wait liveness and runner hang ceilings
 
-- Status: Accepted
+- Status: Accepted (2026-10-14)
 - Date: 2026-10-14
 - Issues: [#1317](https://github.com/gerchowl/flock/issues/1317)
-- Decision owner: repository owner, architect decision on #1317 (2026-10-14)
+- Decision owner: operator
 - Scope of acceptance: condition-wait policy and measured nextest backstop
 
 ## 1. Decision
+
+Owner accepted 2026-10-14 as proposed by the architect on #1317.
 
 Condition waits must fail when their producer dies, emits unexpected output,
 or stays silent. Use producer liveness checks, stage machines that reject

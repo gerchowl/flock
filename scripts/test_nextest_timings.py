@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 import tempfile
 import tomllib
 import unittest
@@ -33,26 +34,83 @@ class Timings(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no reports for run 42"):
                 samples(Path(directory), [{"databaseId": 42}])
 
+    def assert_ceilings_fit(self, config, minimums):
+        default = config["profile"]["default"]
+
+        def seconds(slow):
+            return int(slow["period"].removesuffix("s")) * slow["terminate-after"]
+
+        def matches(expression, binary):
+            selectors = re.findall(r"\bbinary\(([^)]*)\)", expression)
+            # Conservative for negation, regexes and filters without a binary:
+            # they may reach any binary. Per-test ceilings use binary-wide p99.
+            if not selectors or re.search(r"\bnot\b|!", expression):
+                return True
+            name = binary.removeprefix("bin/")
+            for selector in selectors:
+                if not re.fullmatch(r"=?[A-Za-z0-9_-]+", selector):
+                    return True
+                if (name == selector[1:] if selector.startswith("=") else selector in name):
+                    return True
+            return False
+
+        binary_union = r"\s*binary\(=?[A-Za-z0-9_-]+\)(?:\s*\|\s*binary\(=?[A-Za-z0-9_-]+\))*\s*"
+        for binary, minimum in minimums.items():
+            ceiling = seconds(default["slow-timeout"])
+            for override in default["overrides"]:
+                if ("slow-timeout" in override
+                        and re.fullmatch(binary_union, override["filter"])
+                        and matches(override["filter"], binary)):
+                    ceiling = seconds(override["slow-timeout"])
+                    break
+            self.assertGreaterEqual(ceiling, minimum, binary)
+            # Check every override, even one masked by an earlier binary rule,
+            # so a later filter reorder cannot expose an undersized ceiling.
+            for profile in ["default", "ci"]:
+                for override in config["profile"].get(profile, {}).get("overrides", []):
+                    if "slow-timeout" in override and matches(override["filter"], binary):
+                        self.assertGreaterEqual(
+                            seconds(override["slow-timeout"]), minimum,
+                            f"{binary}: {profile} {override['filter']}",
+                        )
+
     def test_recorded_measurements_fit_every_configured_ceiling(self):
         root = Path(__file__).resolve().parents[1]
         config = tomllib.loads((root / ".config/nextest.toml").read_text())
-        default = config["profile"]["default"]
-        def seconds(slow):
-            return int(slow["period"].removesuffix("s")) * slow["terminate-after"]
-        checked = 0
+        minimums = {}
         for row in (root / "docs/next/nextest-timings.md").read_text().splitlines():
-            if not row.startswith("| `"):
-                continue
-            cells = row.split("|")
-            binary = cells[1].strip().strip("`")
-            ceiling = seconds(default["slow-timeout"])
-            for override in default["overrides"]:
-                if f"binary(={binary})" in override["filter"] and "slow-timeout" in override:
-                    ceiling = seconds(override["slow-timeout"])
-                    break
-            self.assertGreaterEqual(ceiling, int(cells[-2]), binary)
-            checked += 1
-        self.assertGreater(checked, 50)
+            if row.startswith("| `"):
+                cells = row.split("|")
+                minimums[cells[1].strip().strip("`")] = int(cells[-2])
+        self.assertGreater(len(minimums), 50)
+        self.assert_ceilings_fit(config, minimums)
+
+    def test_short_per_test_ceiling_is_rejected_even_after_a_binary_override(self):
+        for expression in [
+            "binary(delegate_codex) & test(slow_case)",
+            "binary(=delegate_codex) & test(slow_case)",
+            "test(slow_case)",
+            "binary(/delegate_codex/) & test(slow_case)",
+            "not binary(=unrelated) & test(slow_case)",
+        ]:
+            for profile in ["default", "ci"]:
+                with self.subTest(expression=expression, profile=profile):
+                    config = {"profile": {
+                        "default": {
+                            "slow-timeout": {"period": "60s", "terminate-after": 7},
+                            "overrides": [{
+                                "filter": "binary(=delegate_codex)",
+                                "slow-timeout": {"period": "60s", "terminate-after": 7},
+                            }],
+                        },
+                        "ci": {"overrides": []},
+                    }}
+                    config["profile"][profile]["overrides"].append({
+                        "filter": expression,
+                        "slow-timeout": {"period": "30s", "terminate-after": 3},
+                    })
+                    with self.assertRaises(AssertionError):
+                        self.assert_ceilings_fit(config, {"delegate_codex": 420})
 
 
 if __name__ == "__main__":
