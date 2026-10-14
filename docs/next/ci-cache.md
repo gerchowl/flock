@@ -7,12 +7,23 @@ build caches. PRs, previews on other refs, and release tags can restore but
 cannot save Rust caches. Release tags do not need their own persistent caches
 because the next release has a different ref and cannot reuse them.
 
-Zig build caches are disabled in CI, preview, release, and manual artifact
-builds. The compiler installation still uses setup-zig's tool download path.
-A per-run suffix does not prevent prefix restoration, but continually saving
-new global/local Zig caches consumes the shared quota. Its `cache-key` input
-adds a component but does not remove the run-ID suffix. Artifact jobs explicitly
-remove their local Zig caches before building already.
+setup-zig's automatic build cache is disabled in every workflow. CI lint and
+build instead restore the same `.zig-cache` directory through the SHA-pinned
+`actions/cache/restore` action and save it through `actions/cache/save` only
+from dev, after successful compilation. Keys include the compiler version,
+OS, architecture, job, vendored Zig sources, and build script, with no run ID.
+Prefix restoration can reuse previous generations, including the existing dev
+setup-zig caches. An exact stable-key hit does not save again. The compiler
+installation still uses setup-zig's separate stable download cache.
+
+The choice is measured: latest dev Linux lint took 113 seconds with Zig cached.
+The first PR run (38635993968) took 192 seconds with Zig disabled even though it
+restored the exact same dev Rust key. Its lint step alone rose from 62 to 169
+seconds. Linux build also rose from 201 to 279 seconds with an exact Rust hit. Retaining Zig reuse with stable keys avoids that cold-build cost while
+removing per-run saves. setup-zig's `cache-key` input only adds a component and
+cannot remove its run-ID suffix, hence the separate restore/save actions.
+Artifact jobs continue without Zig build caching because they remove the local
+cache before compiling. The preview check also leaves automatic caching off.
 
 The Nix job restores an Actions-backed store cache after installing Nix.
 The key covers the runner OS, flake lock, flake definition, and Nix expressions.
@@ -37,7 +48,7 @@ An empty cache set succeeds, while API/authentication failures fail the job.
 ## Verification
 
 `python3 -m unittest scripts.test_actions_cache` checks every cache writer,
-Zig opt-out, Nix inputs, and cleanup permissions, and executes the cleanup
+Zig opt-out and stable CI keys, Nix inputs, and cleanup permissions, and executes the cleanup
 command against a fake CLI to verify scope and failure propagation. These tests
 run in the existing `just script-tests` discovery suite.
 

@@ -35,6 +35,38 @@ class ActionsCachePolicy(unittest.TestCase):
                         self.assertIs(step['with'].get('use-cache'), False)
         self.assertEqual(count, 7)
 
+    def test_ci_zig_cache_has_stable_keys_and_dev_only_save(self):
+        for name in ('lint', 'build'):
+            job = workflow('ci-leg.yml')['jobs'][name]
+            restore, = [s for s in job['steps']
+                        if s.get('uses', '').startswith('actions/cache/restore@')]
+            save, = [s for s in job['steps']
+                     if s.get('uses', '').startswith('actions/cache/save@')]
+            with self.subTest(job=name):
+                self.assertRegex(restore['uses'], r'@[a-f0-9]{40}$')
+                self.assertRegex(save['uses'], r'@[a-f0-9]{40}$')
+                self.assertNotIn('if', restore)
+                inputs = restore['with']
+                self.assertIn('github.job', inputs['key'])
+                self.assertIn('runner.arch', inputs['key'])
+                self.assertIn('runner.os', inputs['key'])
+                self.assertIn("hashFiles('vendor/libghostty-vt/**', 'build.rs')", inputs['key'])
+                self.assertNotIn('github.run', inputs['key'])
+                self.assertNotIn('github.sha', inputs['key'])
+                self.assertNotIn('github.ref', inputs['key'])
+                self.assertEqual(inputs['path'], '${{ github.workspace }}/.zig-cache')
+                self.assertEqual(save['with']['path'], inputs['path'])
+                self.assertEqual(save['with']['key'], '${{ steps.zig-cache.outputs.cache-primary-key }}')
+                self.assertEqual(save['if'],
+                                 "github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'")
+                self.assertEqual(inputs['key'].split('--dev-')[0] + '--', inputs['restore-keys'])
+                restore_index = job['steps'].index(restore)
+                save_index = job['steps'].index(save)
+                compile_index = next(i for i, step in enumerate(job['steps'])
+                                     if step.get('run', '').startswith(('just lint', 'just ci-archive')))
+                self.assertLess(restore_index, compile_index)
+                self.assertLess(compile_index, save_index)
+
     def test_rust_caches_restore_on_prs_and_only_save_on_dev(self):
         count = 0
         for name in ('ci-leg.yml', 'preview.yml', 'release.yml'):
