@@ -623,6 +623,8 @@ pub enum SystemOneTier {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.
+    pub structured: crate::structured::launch::StructuredConfig,
     /// Friendly display name for THIS node (#42), shown on the local status
     /// line, self server row, and reported to peers — overriding the OS
     /// `gethostname()`. Empty falls back to the OS host name. Useful on
