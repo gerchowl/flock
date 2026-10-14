@@ -233,7 +233,9 @@ error_codes! {
     AfterHuman:
         ClaudeFolderTrust = "claude_folder_trust",
         CodexFolderTrust = "codex_folder_trust",
-        CodexHookReview = "codex_hook_review";
+        CodexHookReview = "codex_hook_review",
+        StructuredHarnessVersionUnsupported = "structured_harness_version_unsupported",
+        StructuredNeedsAgentUser = "structured_needs_agent_user";
     AfterHandoff:
         MailStoreSchemaTooNew = "mail_store_schema_too_new",
         MeshVersionMismatch = "mesh_version_mismatch",
@@ -276,14 +278,14 @@ mod tests {
             ("yes", "timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready no_result self_submit_unconfirmed session_mismatch"),
-            ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review"),
+            ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review structured_harness_version_unsupported structured_needs_agent_user"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible server_version_gap"),
         ]
         .into_iter()
         .map(|(class, codes)| (class, codes.to_string()))
         .collect();
         assert_eq!(actual, expected);
-        assert_eq!(ErrorCode::ALL.len(), 172);
+        assert_eq!(ErrorCode::ALL.len(), 174);
     }
 
     #[test]
