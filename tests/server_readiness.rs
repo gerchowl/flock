@@ -77,19 +77,44 @@ fn readiness_wording_and_order_match_print_ready_message() {
 }
 
 #[test]
-fn readiness_binaries_have_a_runner_hang_ceiling() {
+fn every_binary_has_a_runner_hang_ceiling_in_both_profiles() {
+    let config: toml::Value = toml::from_str(include_str!("../.config/nextest.toml")).unwrap();
+    let default = &config["profile"]["default"];
+    assert_eq!(default["slow-timeout"]["period"].as_str(), Some("60s"));
+    assert_eq!(
+        default["slow-timeout"]["terminate-after"].as_integer(),
+        Some(7)
+    );
+    // CI inherits the default ceiling rather than replacing it with warnings only.
+    assert!(config["profile"]["ci"].get("slow-timeout").is_none());
+    for profile in ["default", "ci"] {
+        if let Some(overrides) = config["profile"][profile].get("overrides") {
+            for entry in overrides.as_array().unwrap() {
+                if let Some(slow) = entry.get("slow-timeout") {
+                    assert!(
+                        slow["terminate-after"].as_integer().is_some_and(|n| n > 0),
+                        "{profile} override can disable the hang ceiling: {entry}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn measured_binary_exceptions_keep_their_hang_ceilings() {
     let config: toml::Value = toml::from_str(include_str!("../.config/nextest.toml")).unwrap();
     let overrides = config["profile"]["default"]["overrides"]
         .as_array()
         .unwrap();
-    for binary in [
-        "delegate",
-        "agent_settled",
-        "api_ping",
-        "cli_wrapper",
-        "server_readiness",
-        "live_handoff",
-        "mesh_step2",
+    for (binary, periods) in [
+        ("delegate", 3),
+        ("agent_settled", 3),
+        ("api_ping", 3),
+        ("cli_wrapper", 3),
+        ("server_readiness", 3),
+        ("live_handoff", 3),
+        ("mesh_delivery", 11),
     ] {
         let entry = overrides
             .iter()
@@ -98,15 +123,13 @@ fn readiness_binaries_have_a_runner_hang_ceiling() {
                     .as_str()
                     .unwrap()
                     .contains(&format!("binary(={binary})"))
-                    && entry
-                        .get("slow-timeout")
-                        .is_some_and(|slow| slow.get("terminate-after").is_some())
+                    && entry.get("slow-timeout").is_some()
             })
-            .expect("every readiness reader needs a runner hang ceiling");
+            .expect("measured binary exception must remain explicit");
         assert_eq!(entry["slow-timeout"]["period"].as_str(), Some("60s"));
         assert_eq!(
             entry["slow-timeout"]["terminate-after"].as_integer(),
-            Some(3)
+            Some(periods)
         );
     }
 }
