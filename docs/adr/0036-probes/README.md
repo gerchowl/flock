@@ -40,6 +40,5 @@ arguments and have no `--help`: any argument is run as a scenario.
 
 The numbers in A.11 to A.15 were recorded before this isolation was in
 place, with `CLAUDE_CONFIG_DIR` set to the operator's profile (see the
-Appendix A S0 preamble). Of them, only A.13's `sleep_then_mcp` and
-`slowtouch_then_mcp` controls have been re-run under the token path
-(2026-10-14).
+Appendix A S0 preamble). Of them, only A.13's have been re-run under the
+token path (2026-10-14: every `s0_parallel.py` shape, in `default`).

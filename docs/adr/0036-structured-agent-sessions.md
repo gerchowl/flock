@@ -253,13 +253,11 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   a started input is `crashed`, and the input is re-queued as `held` (§3),
   never silently retried.
 - **Stall and waiting.** `waiting_on_human` is exact: a `can_use_tool`
-  control request is open. S0 observed only one open at a time, and only
-  for non-concurrency-safe calls: no later call of the same message ran
-  until the open one was answered (A.13, §2b). The controls showed that
-  this comes from serial execution of non-concurrency-safe tools, not from
-  the permission (A.13); a concurrency-safe call behind an open permission
-  is still untested ("Open S0 items"), so flk does not rely on one open
-  request at a time. It tracks open control
+  control request is open. S0 observed only one open at a time: no later
+  call of the same message ran until the open one was answered, a
+  concurrency-safe `Read` included (A.13, §2b). flk still does not rely on
+  one open request at a time, because the probed shapes are few. It
+  tracks open control
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is a started input with no stdout event for
@@ -511,13 +509,11 @@ verbs; they differ in what the agent can say and in what can block them.
      (`AskUserQuestion`) or was pre-allowed (an MCP tool without a
      read-only hint, so `flock_question_ask` too). Only one control request
      was ever open, and a pre-allowed call ordered before the prompting one
-     ran first. The controls settled why: with no permission open, a
-     pre-allowed MCP call still waited for a slow pre-allowed Bash call
-     ordered before it (A.13), so Claude Code runs non-concurrency-safe
-     tools one at a time and any unfinished earlier call holds the later
-     one; the open permission is one way to stay unfinished. A
-     concurrency-safe call behind an open permission is still untested
-     ("Open S0 items"). Either way, a question that
+     ran first. A concurrency-safe `Read` after the prompting call did not
+     run either until the permission was answered (A.13). Separately, with
+     no permission open, a pre-allowed MCP call still waited for a slow
+     pre-allowed Bash call ordered before it (A.13): an unfinished
+     non-concurrency-safe call holds later ones too. So a question that
      must not wait behind a permission has to be asked before the call
      that may prompt, or in a separate message, and the compiled context
      (ADR-0032) tells the agent so. The MCP tool still never prompts
@@ -1240,10 +1236,9 @@ decision by the owner.
    (§2b)
    *S0 note:* in A.13 an open permission held every later call of the
    same message, a pre-allowed MCP call included, while a call ordered
-   before the prompting one ran first. The controls showed that serial
-   execution of non-concurrency-safe tools holds the later call, with or
-   without a permission open; a concurrency-safe call behind an open
-   permission is an open S0 item. (§2b case 1, A.13)
+   before the prompting one ran first. A concurrency-safe `Read` behind
+   the open permission was held too, and with no permission open a slow
+   non-concurrency-safe call still held a later one. (§2b case 1, A.13)
    - 3a. **Non-blocking questions (#1301).** As recommended (questions are
      deferred, permission requests block), plus three additions now in
      §2a: an honest-blocker question, where the agent has nothing else to
@@ -1338,7 +1333,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
-| S0 | Not complete: the probes landed (#1356), and the A.13 controls and A.16 ran (#1404); open: a concurrency-safe call behind an open permission (A.13), see "Open S0 items". Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
+| S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
 | S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
@@ -1667,7 +1662,8 @@ ran in a fresh temporary working directory holding `a.txt` and `b.txt`
 --include-hook-events --setting-sources local --strict-mcp-config
 --no-session-persistence --model haiku` plus the flags each section names.
 No flk server, pane or sccache server was started or reached. None of the
-runs recorded here passed `--permission-mode`. The drivers now pass
+runs recorded here passed `--permission-mode`, except A.13's re-runs in
+`default`. The drivers now pass
 `--permission-mode default` (#1404): under the token path, with an empty
 config dir, every session started in `auto` (A.13, A.17).
 
@@ -1681,8 +1677,8 @@ working directories in the captures (PR #1356 lists the paths). The
 drivers have since been changed to give every session a fresh temporary
 `CLAUDE_CONFIG_DIR`, deleted on close, with the login passed in as
 `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Of the figures
-below, only the A.13 controls were measured that way (2026-10-14); the
-others have not been re-run. Nothing measured here depends on the profile: user
+below, only A.13's re-runs were measured that way (2026-10-14); A.11,
+A.12, A.14 and A.15 have not been re-run. Nothing measured here depends on the profile: user
 settings were already dropped by `--setting-sources local`.
 
 Totals over the
@@ -1815,53 +1811,89 @@ one `can_use_tool` was ever open, and no call later in the message ran,
 prompting or not, until the open one was answered. A pre-allowed MCP call
 ordered before the prompting one ran first.
 
-**Controls, 2026-10-14 (no permission open).** `s0_parallel.py 2 10
-sleep_then_mcp slowtouch_then_mcp`, run on the token path of the S0
-preamble (a fresh `CLAUDE_CONFIG_DIR` per session, the login passed as
-`CLAUDE_CODE_OAUTH_TOKEN` from `S0_OAUTH_TOKEN_FILE`), Claude Code 2.1.296,
-model `haiku`. Both shapes put the same pre-allowed MCP call behind a
+**Re-run on the token path, 2026-10-14.** Every shape below ran on the
+token path of the S0 preamble (a fresh `CLAUDE_CONFIG_DIR` per session,
+the login passed as `CLAUDE_CODE_OAUTH_TOKEN` from `S0_OAUTH_TOKEN_FILE`),
+Claude Code 2.1.296 (from each capture's `system/init`), model `haiku`,
+two runs each. All runs exited 0 and no token appeared in the output.
+Times are seconds from session start.
+
+*Controls, no permission open.* `s0_parallel.py 2 10 sleep_then_mcp
+slowtouch_then_mcp`. Both shapes put the same pre-allowed MCP call behind a
 pre-allowed Bash call: `sleep 5` (in `--allowedTools` as `Bash(sleep:*)`),
 and `sleep 5 && touch` (also `Bash(touch:*)`), which writes and so is not
 concurrency-safe even if `sleep` alone were classed read-only. No
-`can_use_tool` was sent. Every session's `system/init.permissionMode` was
-`auto`, not `default` (no `--permission-mode` was passed then, A.17);
-both Bash calls matched an allow rule, so neither needed the mode to be
-allowed. A re-run in `default` has not been done. All four runs exited 0,
-and no token appeared in the output. Times are seconds from session start, `tool_use` → `tool_result`
-(#1307, comment 6165573342).
+`can_use_tool` was sent. They ran twice: first with no `--permission-mode`,
+when `system/init.permissionMode` was `auto` (A.17, #1406; #1307, comment
+6165573342), then with `--permission-mode default`. Both calls were in one
+API message in every run. `tool_use` → `tool_result`:
 
-| Control | Run | One message | MCP result after the Bash result | Bash | MCP `echo` |
+| Control | Mode | Run | Bash | MCP `echo` |
+|---|---|---|---|---|
+| `sleep 5`, then MCP | `auto` | 1 | 2.62 → 8.42 | 2.70 → 8.43 |
+| `sleep 5`, then MCP | `auto` | 2 | 1.91 → 7.21 | 1.99 → 7.21 |
+| `sleep 5 && touch`, then MCP | `auto` | 1 | 2.25 → 7.55 | 2.35 → 7.56 |
+| `sleep 5 && touch`, then MCP | `auto` | 2 | 2.11 → 7.41 | 2.21 → 7.42 |
+| `sleep 5`, then MCP | `default` | 1 | 1.980 → 7.256 | 2.077 → 7.260 |
+| `sleep 5`, then MCP | `default` | 2 | 2.187 → 7.461 | 2.284 → 7.465 |
+| `sleep 5 && touch`, then MCP | `default` | 1 | 2.469 → 7.739 | 2.481 → 7.743 |
+| `sleep 5 && touch`, then MCP | `default` | 2 | 2.794 → 8.057 | 2.806 → 8.061 |
+
+In all eight runs the MCP result came only after the slow Bash result, 4 ms
+behind it: with no permission open, a later call waits for an unfinished
+non-concurrency-safe call before it.
+
+*The shapes of the first table, in `default`.* `s0_parallel.py 2 10
+touch_then_ask ask_then_touch touch_then_mcp mcp_then_touch touch_touch`.
+The first `can_use_tool` was held open for 10 s, except in `mcp_then_touch`,
+where it was answered at once.
+
+| Shape | Run | First `can_use_tool` | While it was open | Answered | Next, after the answer |
 |---|---|---|---|---|---|
-| `sleep 5`, then MCP | 1 | yes | yes | 2.62 → 8.42 | 2.70 → 8.43 |
-| `sleep 5`, then MCP | 2 | yes | yes | 1.91 → 7.21 | 1.99 → 7.21 |
-| `sleep 5 && touch`, then MCP | 1 | yes | yes | 2.25 → 7.55 | 2.35 → 7.56 |
-| `sleep 5 && touch`, then MCP | 2 | yes | yes | 2.11 → 7.41 | 2.21 → 7.42 |
+| `touch`, then AskUserQuestion | 1 | Bash, 1.919 | nothing | 11.929 | AskUserQuestion prompt, 4 ms |
+| `touch`, then AskUserQuestion | 2 | Bash, 2.104 | nothing | 12.113 | AskUserQuestion prompt, 4 ms |
+| AskUserQuestion, then `touch` | 1 | AskUserQuestion, 2.302 | nothing | 12.310 | Bash prompt, 16 ms |
+| AskUserQuestion, then `touch` | 2 | AskUserQuestion, 2.348 | nothing | 12.358 | Bash prompt, 12 ms |
+| `touch`, then MCP | 1 | Bash, 3.017 | no MCP result | 13.018 | MCP result, 9 ms |
+| `touch`, then MCP | 2 | Bash, 3.449 | no MCP result | 13.520 | MCP result, 11 ms |
+| `touch`, `touch` | 1 | Bash, 2.680 | nothing | 12.687 | Bash prompt, 7 ms |
+| `touch`, `touch` | 2 | Bash, 2.047 | nothing | 12.057 | Bash prompt, 8 ms |
+| MCP, then `touch` | 1 | Bash, 2.381, after the MCP result at 2.082 | — | 2.381 | — |
+| MCP, then `touch` | 2 | Bash, 2.679, after the MCP result at 2.517 | — | 2.679 | — |
 
-**Reading.** With no permission request open, the later MCP call of the
-same message still finished only after the slow Bash call, about 4 ms
-behind it (within 0.01 s at this table's resolution). So the hold in the
-first table comes from serial execution of non-concurrency-safe tools
-(Bash, and an MCP tool without a read-only hint), and is not specific to
-permissions: an open permission is one way an earlier call stays
-unfinished, and a long-running tool is another. Not shown by these shapes:
-what the harness does with a concurrency-safe call in that position, and
-whether more than one control request can be open at once when the calls
-are concurrency-safe.
+This repeats the first table under the token path: one `can_use_tool` at a
+time, nothing later in the message before the answer, and a pre-allowed call
+ordered first ran first.
 
-**A concurrency-safe call behind an open permission: pending a run.**
-`s0_parallel.py 2 10 read_behind_permission` asks for a Bash `touch`
-(which prompts) and then a `Read` of `a.txt` (which does not prompt in
-the default mode) in one message, holds the `touch` permission open for
-10 s, and records whether the `Read` result arrives before the permission
-is answered (`read_result_before_permission_answered`), plus any other
-prompt that arrived while it was open. A first run on 2026-10-14 (two
-runs, Claude Code 2.1.296, token path) did not test it: the sessions
-started in `auto` mode, the `touch` was allowed with no `can_use_tool`,
-and the driver stopped with `no control request`. Both calls were in one
-message and both results were ok. The driver now passes `--permission-mode
-default` and records `init_permission_mode`. Untested until it runs again
-(see "Open S0 items"). An MCP tool with `readOnlyHint` in the same
-position is not probed.
+*A concurrency-safe call behind an open permission.* `s0_parallel.py 2 10
+read_behind_permission` asks for a Bash `touch` (which prompts) and then a
+`Read` of `a.txt` (which does not prompt in `default`) in one message, and
+holds the `touch` permission open for 10 s.
+
+| Run | One message | Bash `can_use_tool` | `Read` `tool_use` | Other prompts while open | Answered (`deny`) | Bash result | `Read` result |
+|---|---|---|---|---|---|---|---|
+| 1 | yes | 2.230 | 2.470 | none | 12.480 | 12.484 | 12.492 |
+| 2 | yes | 2.438 | 2.792 | none | 12.793 | 12.797 | 12.804 |
+
+The `Read` result did not arrive while the permission was open in either run
+(`read_result_before_permission_answered: false`). It came 7 to 8 ms after
+the Bash result. A first attempt, with no `--permission-mode`, started in
+`auto`. Its `touch` raised no `can_use_tool`, so it did not test this case
+(A.17).
+
+**Reading.** Nothing in a message ran past an open permission. That held
+for a prompting call, an AskUserQuestion, a pre-allowed MCP call without a
+read-only hint and a concurrency-safe `Read`. Only one `can_use_tool` was
+ever open, and a call ordered before the prompting one ran first. Finding
+3's caveat that one open request "may hold only for non-concurrent calls"
+is resolved in the strong direction: an open permission held a
+concurrency-safe call behind it too. Separately, the controls show that an
+unfinished non-concurrency-safe call holds later calls with no permission
+open. Not separated: whether the `Read` waited on the permission itself or
+on the earlier Bash call in message order. A `Read` behind a slow,
+pre-allowed Bash with no permission open was not probed. Also not probed:
+an MCP tool with `readOnlyHint` in that position, and a concurrency-safe
+call ordered before the prompting one.
 
 ### A.14 The harness's own queue in `-p` (§3)
 
@@ -1968,17 +2000,12 @@ that user.
 
 ### Open S0 items
 
-S0 is complete once item 1 is recorded.
-
-1. **A.13: a concurrency-safe call behind an open permission, pending a
-   run.** `s0_parallel.py 2 10 read_behind_permission` (A.13). It needs a
-   login token in `S0_OAUTH_TOKEN_FILE` (`claude setup-token`,
-   docs/adr/0036-probes/README.md). Its result is recorded in A.13.
-
-Closed on 2026-10-14: the A.13 controls (no permission open; the hold is
-serial execution of non-concurrency-safe tools, A.13) and A.16 (`/login`
-cannot persist a login for a user with no GUI session; the token path
-works, A.16; owner decision 1 narrowed).
+None. S0 completed on 2026-10-14 (#1404). The A.13 controls, the A.13 shapes
+on the token path and the concurrency-safe call behind an open permission
+are recorded in A.13. A.16 (`/login` cannot persist a login for a user with
+no GUI session, and the token path works) is recorded in A.16, and owner
+decision 1 is narrowed. The launch profile's permission mode is a design
+question for S3, #1406.
 
 ### A.17 Gotchas met while probing
 
@@ -2057,9 +2084,10 @@ and each item ends with where.
    for non-concurrent calls.
    *Applied, as observed and pending the controls, in §1 "Stall and
    waiting" (open requests tracked by id), §2b case 1 and "Failure
-   modes"; noted under owner decisions 3 and 3a. The controls ran on
-   2026-10-14 (#1404): serial execution holds the later call, not the
-   permission (A.13); §1, §2b and decision 3's note say so.*
+   modes"; noted under owner decisions 3 and 3a. Resolved on 2026-10-14
+   (#1404): an open permission held a concurrency-safe `Read` behind it
+   too, and with no permission open a slow non-concurrency-safe call held
+   a later one (A.13). §1, §2b and decision 3's note say so.*
 4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
    exists (`cancel_async_message{message_uuid}`, `queued` only), so
    `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the
