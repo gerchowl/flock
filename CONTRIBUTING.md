@@ -134,6 +134,34 @@ just ci
 
 Do not open a PR that bypasses failing tests, formatting, or build errors.
 
+## Test waits and flake policy
+
+Follow [ADR-0037 §1](docs/adr/0037-test-wait-liveness-and-hang-ceilings.md#1-decision):
+wait for the actual condition and fail when its producer dies, emits unexpected
+output, or stays silent. Check liveness, reject unexpected stage transitions,
+and use failure-only bounded receives. Do not fix flakes with sleeps, retries,
+widened windows, or loosened thresholds. Examples:
+[#1314](https://github.com/gerchowl/flock/pull/1314),
+[#1334](https://github.com/gerchowl/flock/pull/1334),
+[#1342](https://github.com/gerchowl/flock/pull/1342), and
+[#1349](https://github.com/gerchowl/flock/pull/1349).
+
+The [#1317](https://github.com/gerchowl/flock/issues/1317) nextest ceiling is a
+backstop that names hung tests. It never makes a slow test pass. Both default
+and CI profiles cover every binary: 420 seconds normally, 660 for mesh_delivery,
+and 180 for the readiness binaries. Keep `terminate-after` in every timeout
+override, including overrides that only change the slow-warning period.
+
+Sizing uses at least 10× each binary's larger platform p99 from roughly 20 recent
+dev CI runs, never below 180 seconds. See the [measurements and reproduction
+command](docs/next/nextest-timings.md) and [ADR-0037 §2](docs/adr/0037-test-wait-liveness-and-hang-ceilings.md#2-sizing-and-limits).
+Before resizing, investigate the producer and condition, recollect with
+`scripts/nextest_timings.py`, and commit the evidence and regression checks.
+Run `nix develop --command python3 scripts/probe_nextest_ceiling.py` to inject a
+live silent producer and verify named termination in both profiles (about seven
+minutes). Partial runs and unobserved binaries must remain explicit. A new binary inherits
+the default ceiling and needs CI duration measurements before choosing an exception.
+
 ## Issue references in commits
 
 If your PR relates to a GitHub issue, reference it in the commit body with `refs #<issue-number>`.
