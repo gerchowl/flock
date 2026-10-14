@@ -111,3 +111,22 @@ fn a_refused_message_exits_13_and_names_4() {
     let stdout: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
     assert_eq!(stdout["result"]["outcome"], "refused", "{stdout}");
 }
+
+/// The caller owns cleanup, including assertion failures during a test.
+#[test]
+fn scripted_peer_removes_its_socket_directory_on_drop_and_unwind() {
+    for unwind in [false, true] {
+        let (socket, server) = scripted_server("cleanup", refuse);
+        let directory = socket.parent().unwrap().to_path_buf();
+        assert!(directory.is_dir());
+        let output = flk(&socket, &["agent", "get", "worker"]);
+        assert_eq!(output.status.code(), Some(1));
+        // Only cleanup is observed after this owned handle crosses unwinding.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _server = server;
+            assert!(!unwind, "exercise peer cleanup during unwinding");
+        }));
+        assert_eq!(result.is_err(), unwind);
+        assert!(!directory.exists(), "peer directory remains: {directory:?}");
+    }
+}

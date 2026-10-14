@@ -8,7 +8,16 @@ use std::process::Output;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::environment::Command;
+use super::{environment::Command, socket_dir::SocketDir};
+
+/// Owns the socket reservation for a scripted peer. Dropping this guard removes
+/// its directory even if the test unwinds. The peer thread remains detached, as
+/// before, with its existing ten-second accept window and request handling.
+/// Drop does not wait for peer I/O or join the thread.
+pub struct ScriptedServer {
+    _directory: SocketDir,
+    _thread: thread::JoinHandle<()>,
+}
 
 /// A socket that answers every request with `answer(request)`, and the protocol
 /// check a state-changing verb sends first (#868) with this build's protocol
@@ -16,12 +25,11 @@ use super::environment::Command;
 pub fn scripted_server(
     name: &str,
     answer: fn(&serde_json::Value) -> serde_json::Value,
-) -> (PathBuf, thread::JoinHandle<()>) {
-    let dir = std::env::temp_dir().join(format!("flk-scripted-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("s.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+) -> (PathBuf, ScriptedServer) {
+    let directory = SocketDir::reserve("flk-scripted");
+    let socket = directory.path().join("s.sock");
+    let listener = UnixListener::bind(&socket)
+        .unwrap_or_else(|error| panic!("bind scripted peer {name}: {error}"));
     listener.set_nonblocking(true).unwrap();
     let handle = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -56,7 +64,13 @@ pub fn scripted_server(
             let _ = writeln!(stream, "{reply}");
         }
     });
-    (socket, handle)
+    (
+        socket,
+        ScriptedServer {
+            _directory: directory,
+            _thread: handle,
+        },
+    )
 }
 
 pub fn flk(socket: &PathBuf, args: &[&str]) -> Output {
