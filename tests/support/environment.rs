@@ -199,6 +199,11 @@ impl Command {
         }
         assert_command_isolated(&self.0);
     }
+    /// Preserve the sandbox preparation when an async harness needs kill-on-drop.
+    pub fn into_std(mut self) -> std::process::Command {
+        self.prepare();
+        self.0
+    }
     pub fn spawn(&mut self) -> std::io::Result<std::process::Child> {
         self.prepare();
         self.0.spawn()

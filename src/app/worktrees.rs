@@ -631,6 +631,7 @@ impl App {
             // One resolver for branch + merge gate + #121 protection, shared
             // with the sweep, `worktree.kill` and `worktree.list --scan`.
             let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                &crate::worktree::MergeGateContext::default(),
                 repo_root.clone(),
                 checkout.clone(),
                 &protected_branches,
@@ -797,6 +798,7 @@ impl App {
             let integration_branches = self.state.config.worktrees.integration_branches.clone();
             std::thread::spawn(move || {
                 let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                    &crate::worktree::MergeGateContext::default(),
                     repo_root.clone(),
                     checkout.clone(),
                     &protected_branches,

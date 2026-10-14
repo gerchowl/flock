@@ -72,5 +72,5 @@ toml_edit = "0.25.15"
 zeroize = { version = "1.9", features = ["serde"] }
 
 [dev-dependencies]
-# Await fixture FIFO reports without blocking the async restart test's runtime.
-tokio = { version = "1", features = ["net", "io-util"] }
+# Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.
+tokio = { version = "1", features = ["net", "io-util", "process"] }
