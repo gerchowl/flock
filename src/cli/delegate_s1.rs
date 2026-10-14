@@ -146,6 +146,35 @@ pub(super) fn tail(screen: &str) -> &str {
     &screen[start..]
 }
 
+/// Advice keeps its own budget, but a caller deadline also caps subprocess
+/// grace. The injected clock keeps these limits testable without real I/O.
+struct AdviceBudget {
+    end: Instant,
+    caller: Option<Instant>,
+}
+
+impl AdviceBudget {
+    fn new(timeout: Duration, caller: Option<Instant>, now: Instant) -> Option<Self> {
+        let own = now.checked_add(timeout)?;
+        let end = caller.map_or(own, |caller| caller.min(own));
+        (end > now).then_some(Self { end, caller })
+    }
+
+    /// A caller's exhausted budget is not evidence that its endpoint is down.
+    fn accepts_response(&self, now: Instant) -> bool {
+        self.caller.is_none_or(|caller| now < caller)
+    }
+
+    fn limits(&self, now: Instant) -> Option<(Duration, Duration)> {
+        let remaining = self.end.checked_duration_since(now)?;
+        let grace = remaining.saturating_add(Duration::from_millis(500));
+        let process = self.caller.map_or(grace, |caller| {
+            grace.min(caller.saturating_duration_since(now))
+        });
+        (!remaining.is_zero() && !process.is_zero()).then_some((remaining, process))
+    }
+}
+
 pub(super) struct Client {
     urls: Vec<String>,
     timeout: Duration,
@@ -191,8 +220,59 @@ impl Client {
         }
     }
 
-    // Called by event emission only. The total budget covers ordered failover.
-    pub fn judge(&self, command: &str, screen: &str) -> Option<Advice> {
+    /// Advisory work cannot renew a caller's deadline, including curl's grace.
+    /// Responses arriving at or after it return no advice and do not update
+    /// endpoint health, whether they succeeded or failed.
+    pub fn judge_before(
+        &self,
+        command: &str,
+        screen: &str,
+        caller: Option<Instant>,
+    ) -> Option<Advice> {
+        self.judge_before_with(
+            command,
+            screen,
+            caller,
+            Instant::now,
+            |set, url, body, remaining, process_timeout| {
+                crate::process::TracedCommand::new("curl", "delegate_s1")
+                    .args([
+                        "--disable",
+                        "--silent",
+                        "--show-error",
+                        "--write-out",
+                        "\n%{http_code} %{num_connects}",
+                        "--proto",
+                        "=http,https",
+                        "--max-time",
+                        &remaining.as_secs_f64().to_string(),
+                        "--header",
+                        "Content-Type: application/json",
+                        "--data-binary",
+                        "@-",
+                        "--url",
+                        url,
+                    ])
+                    // The grace lets curl's own `--max-time` fire first, so a slow
+                    // answer is reported with its trailer as busy, not as down.
+                    // A caller deadline caps that grace too.
+                    .output_traced_with_stdin_and_timeout(body, process_timeout)
+                    .map_or(Err(Failure::Down), |output| {
+                        outcome(set, output.status.success(), &output.stdout)
+                    })
+            },
+        )
+    }
+
+    /// Inject time and transport while retaining the real breaker lifecycle.
+    fn judge_before_with(
+        &self,
+        command: &str,
+        screen: &str,
+        caller: Option<Instant>,
+        mut now: impl FnMut() -> Instant,
+        mut request: impl FnMut(&Questions, &str, &[u8], Duration, Duration) -> Result<f64, Failure>,
+    ) -> Option<Advice> {
         if self.urls.is_empty() {
             return None;
         }
@@ -201,12 +281,12 @@ impl Client {
             "state": format!("Command: {command}\n(The exit status is not shown.)\nLast output:\n{}", tail(screen)),
             "questions": set.questions,
         })).ok()?;
-        let deadline = Instant::now().checked_add(self.timeout)?;
+        let budget = AdviceBudget::new(self.timeout, caller, now())?;
         for url in &self.urls {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 continue;
             }
-            let remaining = deadline.checked_duration_since(Instant::now())?;
+            budget.limits(now())?;
             // The lock serialises calls per endpoint across every flk process
             // on this host: a call that finds one in flight skips the endpoint
             // without counting a failure, so a burst of delegates finishing
@@ -214,33 +294,12 @@ impl Client {
             let Some(mut breaker) = Breaker::acquire(&self.state_dir, url, self.timeout) else {
                 continue;
             };
-            let response = crate::process::TracedCommand::new("curl", "delegate_s1")
-                .args([
-                    "--disable",
-                    "--silent",
-                    "--show-error",
-                    "--write-out",
-                    "\n%{http_code} %{num_connects}",
-                    "--proto",
-                    "=http,https",
-                    "--max-time",
-                    &remaining.as_secs_f64().to_string(),
-                    "--header",
-                    "Content-Type: application/json",
-                    "--data-binary",
-                    "@-",
-                    "--url",
-                    url,
-                ])
-                // The grace lets curl's own `--max-time` fire first, so a slow
-                // answer is reported with its trailer as busy, not as down.
-                .output_traced_with_stdin_and_timeout(
-                    &body,
-                    remaining.saturating_add(Duration::from_millis(500)),
-                )
-                .map_or(Err(Failure::Down), |output| {
-                    outcome(&set, output.status.success(), &output.stdout)
-                });
+            let (remaining, process_timeout) = budget.limits(now())?;
+            let response = request(&set, url, &body, remaining, process_timeout);
+            // Do not turn our caller's cancellation into an endpoint outage.
+            if !budget.accepts_response(now()) {
+                return None;
+            }
             match &response {
                 Ok(_) => breaker.record(true),
                 Err(failure) if failure.counts_against_breaker() => breaker.record(false),
@@ -353,6 +412,96 @@ impl Drop for Breaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_s1_advice_and_process_grace_respect_the_caller_budget() {
+        let now = Instant::now();
+        let own = Duration::from_secs(4);
+        let unbounded = AdviceBudget::new(own, None, now).unwrap();
+        assert_eq!(
+            unbounded.limits(now),
+            Some((own, Duration::from_millis(4500)))
+        );
+        let caller = now + Duration::from_secs(2);
+        let bounded = AdviceBudget::new(own, Some(caller), now).unwrap();
+        assert_eq!(
+            bounded.limits(now),
+            Some((Duration::from_secs(2), Duration::from_secs(2)))
+        );
+        assert_eq!(
+            bounded.limits(now + Duration::from_secs(1)),
+            Some((Duration::from_secs(1), Duration::from_secs(1)))
+        );
+        assert!(bounded.accepts_response(now));
+        assert!(!bounded.accepts_response(caller));
+        assert!(!bounded.accepts_response(caller + Duration::from_secs(1)));
+        assert!(unbounded.accepts_response(now + Duration::from_secs(10)));
+        assert_eq!(bounded.limits(caller), None);
+        assert_eq!(bounded.limits(caller + Duration::from_secs(1)), None);
+        assert!(AdviceBudget::new(own, Some(now), now).is_none());
+        let later = AdviceBudget::new(own, Some(now + Duration::from_secs(10)), now).unwrap();
+        assert_eq!(later.limits(now), unbounded.limits(now));
+    }
+
+    #[test]
+    fn delegate_s1_discards_late_responses_without_recording_endpoint_health() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate_s1_late_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let client = Client::new(
+            Some("http://s1.invalid"),
+            &SystemOneConfig::default(),
+            dir.clone(),
+        );
+        let mut breaker = Breaker::acquire(&dir, &client.urls[0], client.timeout).unwrap();
+        breaker.record(false);
+        let path = breaker.path.clone();
+        let original = std::fs::read(&path).unwrap();
+        drop(breaker);
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        for response in [Ok(0.25), Err(Failure::Down)] {
+            let mut response = Some(response);
+            let clock = std::cell::Cell::new(start);
+            let mut requests = 0;
+            let advice = client.judge_before_with(
+                "command",
+                "screen",
+                Some(deadline),
+                || clock.get(),
+                |_, _, _, _, _| {
+                    requests += 1;
+                    clock.set(deadline);
+                    response.take().unwrap()
+                },
+            );
+            assert_eq!(requests, 1, "response must reach the discard path");
+            assert_eq!(advice, None);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "late success must not reset health; late failure must not count"
+            );
+            assert!(
+                Breaker::acquire(&dir, &client.urls[0], client.timeout).is_some(),
+                "discard must release the endpoint lock"
+            );
+        }
+        // A timely response still updates the same persisted breaker state.
+        let advice = client.judge_before_with(
+            "command",
+            "screen",
+            Some(deadline),
+            || start,
+            |_, _, _, _, _| Ok(0.25),
+        );
+        assert_eq!(advice.unwrap().fused, 0.25);
+        let state: BreakerState = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(state.fails, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn delegate_s1_fusion_uses_every_scored_answer_and_preserves_utf8_tail() {
