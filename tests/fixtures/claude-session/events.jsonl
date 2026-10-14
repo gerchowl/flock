@@ -1,0 +1,35 @@
+{"type":"assistant","message":{"id":"msg-example","role":"assistant","content":[{"type":"text","text":"ok"}]},"parent_tool_use_id":null,"session_id":"session-example","uuid":"event-example"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-example","is_error":true,"content":"q-example submitted for user feedback - the response will be relayed to you"}]},"isSynthetic":true,"session_id":"session-example","uuid":"event-example"}
+{"type":"command_lifecycle","command_uuid":"input-example","state":"queued","session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"init","model":"claude-haiku-5-5","claude_code_version":"2.1.296","tools":["Bash","Read","AskUserQuestion"],"permissionMode":"default","capabilities":["interrupt_cancel_queued_v1","interrupt_send_now_v1"],"session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"status","status":"requesting","user_message_uuids":["input-example"],"session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":42,"estimated_tokens_delta":2,"session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":40032,"post_tokens":1237,"duration_ms":7140},"session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"tool-example","message":"Denied","decision_reason_type":"policy","session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"hook_started","hook_event":"Stop","hook_id":"hook-example","hook_name":"example","session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"hook_response","hook_event":"Stop","hook_id":"hook-example","hook_name":"example","exit_code":0,"outcome":"success","output":"","stdout":"","stderr":"","session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"peer_message_hold","state":"held","lane":"socket","cause":"explicit-setting","session_id":"session-example","uuid":"event-example"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":0,"rateLimitType":"example"},"session_id":"session-example","uuid":"event-example"}
+{"type":"control_request","request_id":"request-example","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which colour?","options":[{"label":"red"},{"label":"blue"}],"multiSelect":false}]},"tool_use_id":"tool-example","requires_user_interaction":true,"permission_suggestions":[]},"session_id":"session-example","uuid":"event-example"}
+{"type":"control_response","response":{"subtype":"success","request_id":"request-example","response":{"still_queued":[],"cancelled":["input-example"]}},"session_id":"session-example","uuid":"event-example"}
+{"type":"control_response","response":{"subtype":"error","request_id":"request-example","error":"Unsupported control request subtype: edit_queued_message"},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-example","content":[]}},"api_message_id":"msg-example","ttft_ms":1114,"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"message_stop"},"session_id":"session-example","uuid":"event-example"}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","terminal_reason":"end_turn","num_turns":3,"permission_denials":[{"tool_name":"AskUserQuestion","tool_use_id":"tool-example","tool_input":{}}],"usage":{"input_tokens":4,"cache_read_input_tokens":5102,"cache_creation_input_tokens":5214,"output_tokens":87},"session_id":"session-example","uuid":"event-example"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"errors":[],"terminal_reason":"aborted_streaming","session_id":"session-example","uuid":"event-example"}
+{"type":"command_lifecycle","command_uuid":"input-example","state":"started","session_id":"session-example","uuid":"event-example"}
+{"type":"command_lifecycle","command_uuid":"input-example","state":"completed","session_id":"session-example","uuid":"event-example"}
+{"type":"command_lifecycle","command_uuid":"input-example","state":"cancelled","session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"status","status":null,"session_id":"session-example","uuid":"event-example"}
+{"type":"system","subtype":"status","status":"compacting","session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"example"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"example"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"example"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use"}},"session_id":"session-example","uuid":"event-example"}
+{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":404,"session_id":"session-example","uuid":"event-example"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"errors":[],"terminal_reason":"aborted_tools","session_id":"session-example","uuid":"event-example"}
