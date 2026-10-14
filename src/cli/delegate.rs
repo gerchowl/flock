@@ -5072,8 +5072,11 @@ impl Await<'_> {
         match end {
             RoundEnd::Report { outcome, info } => {
                 let code = outcome.exit_code();
-                let screen = without_retries(|| detection_screen(&self.entry.pane_id, None))
-                    .unwrap_or_else(|| monitor.screen.clone());
+                let screen = without_retries(|| {
+                    report_screen_with(self.deadline, &monitor.screen, |deadline| {
+                        detection_screen(&self.entry.pane_id, deadline)
+                    })
+                });
                 let verdict = matches!(outcome, Outcome::Stalled)
                     .then(|| monitor.latest.clone())
                     .flatten()
@@ -5088,7 +5091,8 @@ impl Await<'_> {
                         retry_after_ms: None,
                         last_line: super::delegate_verdict::last_line(&screen),
                     });
-                let observation = event_observation(&self.entry.name, &screen, &verdict);
+                let observation =
+                    event_observation(&self.entry.name, &screen, &verdict, self.deadline);
                 save_observation(self.entry, &observation);
                 let mut info = info.unwrap_or_else(|| serde_json::json!({}));
                 for (key, value) in observation.as_object().into_iter().flatten() {
@@ -5528,20 +5532,69 @@ fn detection_screens_with(
     Some((text.clone(), text))
 }
 
+/// Reporting uses the last observed screen once the caller's budget is spent.
+/// A fresh read, when allowed, carries that same deadline to the transport.
+fn report_screen_with(
+    deadline: Option<Instant>,
+    cached: &str,
+    read: impl FnOnce(Option<Instant>) -> Option<String>,
+) -> String {
+    if expired(deadline) {
+        return cached.to_string();
+    }
+    read(deadline).unwrap_or_else(|| cached.to_string())
+}
+
 fn event_observation(
     name: &str,
     screen: &str,
     verdict: &super::delegate_verdict::Verdict,
+    deadline: Option<Instant>,
+) -> serde_json::Value {
+    event_observation_with(
+        name,
+        screen,
+        verdict,
+        deadline,
+        |command, screen, deadline| {
+            super::delegate_s1::Client::from_config().judge_before(command, screen, deadline)
+        },
+    )
+}
+
+/// Optional advice never delays the decided outcome. Absent advice retains
+/// `s1: null` and adds `s1_skipped: "deadline"` when the caller budget expired,
+/// or `"unavailable"` when no endpoint supplied advice. Successful advice has
+/// no skip reason. Reporting reuses cached screen evidence after expiry.
+/// The injected advice call lets tests prove that expired reports do no I/O.
+fn event_observation_with(
+    name: &str,
+    screen: &str,
+    verdict: &super::delegate_verdict::Verdict,
+    deadline: Option<Instant>,
+    judge: impl FnOnce(&str, &str, Option<Instant>) -> Option<super::delegate_s1::Advice>,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(verdict).unwrap_or_else(|_| serde_json::json!({}));
-    value["s1"] = serde_json::to_value(super::delegate_s1::Client::from_config().judge(
-        &format!(
-            "flk delegate {name}\nObserved outcome: {}; reason: {}",
-            verdict.verdict, verdict.reason
-        ),
-        screen,
-    ))
-    .unwrap_or(serde_json::Value::Null);
+    let advice = if expired(deadline) {
+        None
+    } else {
+        judge(
+            &format!(
+                "flk delegate {name}\nObserved outcome: {}; reason: {}",
+                verdict.verdict, verdict.reason
+            ),
+            screen,
+            deadline,
+        )
+    };
+    if advice.is_none() {
+        value["s1_skipped"] = serde_json::json!(if expired(deadline) {
+            "deadline"
+        } else {
+            "unavailable"
+        });
+    }
+    value["s1"] = serde_json::to_value(advice).unwrap_or(serde_json::Value::Null);
     value
 }
 
@@ -5586,7 +5639,7 @@ fn emit_ready_timeout(
         _ => "unknown",
     };
     let verdict = super::delegate_verdict::readiness(&screen, status);
-    let mut value = event_observation(name, &screen, &verdict);
+    let mut value = event_observation(name, &screen, &verdict, None);
     if let Some(entry) = entry {
         save_observation(entry, &value);
     }
@@ -5645,7 +5698,7 @@ fn emit_outcome(
                 "session_id": text("session_id"),
                 "verdict": text("verdict"), "reason": text("reason"),
                 "retry_after_ms": text("retry_after_ms"), "last_line": text("last_line"),
-                "s1": text("s1"),
+                "s1": text("s1"), "s1_skipped": text("s1_skipped"),
                 "settled_with_background_shells": text("settled_with_background_shells"),
             })
         );
@@ -5680,6 +5733,56 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_report_uses_cached_screen_without_io_or_advice() {
+        let deadline = Some(Instant::now());
+        let screen = report_screen_with(deadline, "cached evidence", |_| panic!("late screen I/O"));
+        assert_eq!(screen, "cached evidence");
+        let verdict = super::super::delegate_verdict::Verdict {
+            verdict: "timeout".into(),
+            reason: "round_end".into(),
+            retry_after_ms: None,
+            last_line: "cached evidence".into(),
+        };
+        let report = event_observation_with("delegate", &screen, &verdict, deadline, |_, _, _| {
+            panic!("late advice I/O")
+        });
+        assert_eq!(report["verdict"], "timeout");
+        assert_eq!(report["last_line"], "cached evidence");
+        assert!(report["s1"].is_null());
+        assert_eq!(report["s1_skipped"], "deadline");
+    }
+
+    #[test]
+    fn report_enrichment_forwards_the_same_deadline() {
+        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        let screen = report_screen_with(deadline, "cached", |end| {
+            assert_eq!(end, deadline);
+            Some("fresh evidence".into())
+        });
+        let verdict = super::super::delegate_verdict::Verdict {
+            verdict: "done".into(),
+            reason: "round_end".into(),
+            retry_after_ms: None,
+            last_line: screen.clone(),
+        };
+        let report =
+            event_observation_with("delegate", &screen, &verdict, deadline, |_, text, end| {
+                assert_eq!(end, deadline);
+                assert_eq!(text, "fresh evidence");
+                Some(super::super::delegate_s1::Advice {
+                    fused: 0.25,
+                    verdict: "not_failing".into(),
+                })
+            });
+        assert_eq!(report["s1"]["fused"], 0.25);
+        assert!(report.get("s1_skipped").is_none());
+        let unavailable =
+            event_observation_with("delegate", &screen, &verdict, None, |_, _, _| None);
+        assert!(unavailable["s1"].is_null());
+        assert_eq!(unavailable["s1_skipped"], "unavailable");
+    }
 
     /// #959 / #868: the label defaults to the delegate's name, goes only to a
     /// server that advertises it, and a server that does not (an older one,

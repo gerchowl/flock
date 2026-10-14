@@ -621,7 +621,7 @@ fn delegate_ready_timeout_names_the_prompt_and_last_line_without_typing() {
 }
 
 #[test]
-fn delegate_s1_is_called_once_at_round_end_and_never_on_polls() {
+fn delegate_s1_is_skipped_at_deadline_and_never_called_on_polls() {
     let pane = Pane::new("working", "still running");
     let s1 = S1::new(200);
     let child = pane
@@ -657,11 +657,10 @@ fn delegate_s1_is_called_once_at_round_end_and_never_on_polls() {
         String::from_utf8_lossy(&out.stderr)
     );
     let value = Pane::json(&out);
-    assert!(value["s1"]["fused"].as_f64().unwrap() >= 0.5);
-    assert_eq!(s1.calls.load(Ordering::SeqCst), 1);
-    let body = &s1.bodies.lock().unwrap()[0];
-    assert_eq!(body["questions"].as_object().unwrap().len(), 10);
-    assert!(body["state"].as_str().unwrap().ends_with("still running"));
+    assert_eq!(value["outcome"], "timeout");
+    assert!(value["s1"].is_null());
+    assert_eq!(value["s1_skipped"], "deadline");
+    assert_eq!(s1.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -688,6 +687,9 @@ fn delegate_s1_advice_is_the_same_from_kev_and_clef_shaped_answers() {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        let body = &s1.bodies.lock().unwrap()[0];
+        assert_eq!(body["questions"].as_object().unwrap().len(), 10);
+        assert!(body["state"].as_str().unwrap().ends_with("same screen"));
         advice.push(Pane::json(&out)["s1"].clone());
     }
     assert!(advice[0]["fused"].as_f64().unwrap() >= 0.5);
