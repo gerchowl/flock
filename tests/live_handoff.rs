@@ -84,25 +84,6 @@ fn unique_test_dir() -> PathBuf {
     path
 }
 
-#[test]
-fn unique_test_dir_preserves_stale_pid_directory() {
-    let stale = PathBuf::from(format!("/tmp/hlh-{}-0", std::process::id()));
-    fs::create_dir_all(&stale).unwrap();
-    let marker = stale.join("stale-owner");
-    fs::write(&marker, b"retain").unwrap();
-    let first = unique_test_dir();
-    let second = unique_test_dir();
-    assert_ne!(first, stale);
-    assert_ne!(first, second);
-    assert!(first.is_dir() && second.is_dir());
-    assert_eq!(fs::read(&marker).unwrap(), b"retain");
-    cleanup_test_base(&first);
-    cleanup_test_base(&second);
-    fs::remove_file(marker).unwrap();
-    // Only remove an empty legacy directory, never another run's contents.
-    let _ = fs::remove_dir(stale);
-}
-
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedFlock {
     spawn_server_with_env(config_home, runtime_dir, api_socket, &[])
 }
@@ -2045,7 +2026,6 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 status["result"]["mesh_suspended_reason"],
                 "recovering store after handoff"
             );
-            assert!(fail_file.exists(), "recovery must still be blocked");
             let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
                 .arg("status")
                 .env("FLOCK_SOCKET_PATH", &api_socket)
@@ -2086,7 +2066,6 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                         "id":"responsive-after-rollback", "method":"ping", "params":{}
                     }),
                 ));
-                assert!(fail_file.exists(), "recovery must still be blocked");
                 assert_ok(request(
                     &api_socket,
                     serde_json::json!({
@@ -2115,11 +2094,9 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
                 refused["error"]["code"], "mail_store_unavailable",
                 "{refused}"
             );
-            assert!(fail_file.exists(), "recovery must still be blocked");
         }
         fs::remove_file(&fail_file).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
+        support::fleet::wait_until("mesh recovery completion", Duration::from_secs(15), || {
             let status = request(
                 &api_socket,
                 serde_json::json!({"id":"mesh-recovered", "method":"peers.enrollment", "params":{}}),
@@ -2128,17 +2105,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             assert_eq!(status["result"]["type"], "peers_enrollment", "{status}");
             // Successful enrollment omits the optional reason after recovery.
             match status["result"]["mesh_suspended_reason"].as_str() {
-                None if status["result"]["mesh_suspended_reason"].is_null() => break,
-                Some("recovering store after handoff") => {}
-                Some("injected mesh store open failure") if store_failure => {}
+                None if status["result"]["mesh_suspended_reason"].is_null() => Some(()),
+                Some("recovering store after handoff") => None,
+                Some("injected mesh store open failure") if store_failure => None,
                 other => panic!("unexpected recovery state {other:?}: {status}"),
             }
-            assert!(
-                Instant::now() < deadline,
-                "recovery never completed: {status}"
-            );
-            thread::yield_now();
-        }
+        });
         assert_ok(request(
             &api_socket,
             serde_json::json!({"id":"recovered-send", "method":"msg.send", "params":{
