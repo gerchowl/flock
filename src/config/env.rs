@@ -57,10 +57,13 @@ use super::Config;
 ///   and this entry never fires. It records that the omission is a decision —
 ///   a per-invocation env poke declaring which variables cross into a child's
 ///   environment would be the wrong layer for that decision anyway.
+/// - `structured`             — the operator uid exception and credential-file
+///   selection require an explicit file policy, never an inherited env poke.
 const BLOCKLIST_PREFIXES: &[&str] = &[
     "keys",
     "peers",
     "spawn.env",
+    "structured",
     "theme.custom",
     "ui.agent_aliases",
     "ui.disk_path",
@@ -596,8 +599,11 @@ mod tests {
         assert!(is_blocklisted("theme.custom"));
         assert!(is_blocklisted("theme.custom.accent"));
         assert!(is_blocklisted("ui.sound.path"));
+        assert!(is_blocklisted("structured.run_as"));
+        assert!(is_blocklisted("structured.token_file"));
         // Segment-aligned: "keysfoo" is NOT blocked by "keys".
         assert!(!is_blocklisted("keysfoo"));
+        assert!(!is_blocklisted("structuredfoo"));
         assert!(!is_blocklisted("ui.sound.enabled"));
         assert!(!is_blocklisted("theme.name"));
     }

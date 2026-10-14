@@ -25,6 +25,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "session",
     "slots",
     "spawn",
+    "structured",
     "systemone",
     "terminal",
     "theme",

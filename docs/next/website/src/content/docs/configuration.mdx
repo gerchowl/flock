@@ -5,6 +5,26 @@ description: Configure Flock keybindings, themes, sidebar behavior, notification
 
 Flock works without a config file. Add one when you want custom keys, themes, sidebar settings, notifications, or advanced behavior.
 
+## Structured launch policy (preparation only)
+
+The structured Claude launch profile is being built in stages. This release adds preparation and validation only (#1437); it does not start structured processes or add a start flag. Process supervision follows in #1438. Lease-based caller identity (#1426) must land before #1439 enables structured start.
+
+The file-only policy defaults to `run_as = "flk-agent"`. Preparation in that mode fails with `structured_needs_agent_user` until the dedicated-user launcher in #1208 is available, even if a user with that name already exists. An explicit operator-mode policy is accepted and emits a warning on every preparation:
+
+```toml
+[structured]
+run_as = "operator"
+token_file = "/absolute/path/to/dedicated-setup-token"
+```
+
+Use a dedicated, revocable token from `claude setup-token`. The file must be a regular file owned by the launching user with permissions exactly `0600`; symlinks, relative paths, malformed tokens and files over 16 KiB are refused. The token is redacted in debug output and kept out of argv, settings and MCP files. It is intended for `CLAUDE_CODE_OAUTH_TOKEN` in the child environment. The token is readable by the agent in both modes; operator mode also permits tools to read files accessible to the operator, including the token file. This opt-in accepts that access.
+
+Preparation requires a canonical absolute Claude binary path and a successful `--version` result of at least **2.1.290**. Older or unrecognised versions fail with `structured_harness_version_unsupported`: older Claude releases can open a messaging socket despite `--restricted`. The runtime must also check the session registry for `messagingSocketPath` before input, and refuse `system/init.messaging_socket_path` (#1438). An absent registry is no evidence of readiness. Registry checks refuse malformed records, symlinks, special files and files over 1 MiB.
+
+Each prepared session owns a fresh `0700` config directory with `0600` JSON files. Settings contain only `permissions.defaultMode = "default"` and empty `allow` and `deny` lists; MCP config contains an empty `mcpServers` map; isolated flock MCP registration is tracked in #1441. The profile explicitly passes stream-json input/output, `--restricted`, `--permission-mode default` and `--permission-prompt-tool stdio`. Session persistence is enabled for later resume support. The environment allowlist contains only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL` and `TMPDIR` when provided, plus the isolated `CLAUDE_CONFIG_DIR` and dedicated token. The runtime must apply it with `env_clear()`.
+
+Permission requests will only be streamed by #1438 and remain open until S6 supplies answers. The deny carrier for deferred questions belongs to S6b and is not a launch setting. The directory guard removes the whole directory on drop, including unwinding; the runtime must retain it until descendants have exited. Abrupt termination such as SIGKILL or a filesystem failure can prevent cleanup, and removal errors are logged.
+
 ## Config file
 
 Flock reads config from:
