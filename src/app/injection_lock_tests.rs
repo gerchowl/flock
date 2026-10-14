@@ -422,6 +422,69 @@ async fn esc_or_ctrl_c_interrupts_the_injection_at_once() {
     }
 }
 
+/// ADR-0029 §1: an operator event before the first Enter abandons the send.
+/// The test owns the advancement gate: no app-loop tick runs until Esc has
+/// synchronously traversed the real client-input path and reached the PTY.
+#[tokio::test]
+async fn guarded_submit_operator_before_enter_preserves_interruption_evidence() {
+    for lock in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CODEX);
+        app.state.config.ui.injection_lock.enabled = lock;
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = crate::app::Mode::Terminal;
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "failure prompt", None, Duration::ZERO, now, false)
+            .expect("submit begins");
+        let mut writes = drain(&mut pty);
+        assert!(
+            !writes.is_empty(),
+            "the prompt was typed before interruption"
+        );
+        paint(&app, &CODEX, "failure prompt");
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::empty(),
+                ),
+            )],
+            false,
+        );
+        let interrupted = drain(&mut pty);
+        assert_eq!(
+            interrupted,
+            vec![b"\x1b".to_vec()],
+            "Esc passes through with lock={lock}"
+        );
+        writes.extend(interrupted);
+        // Only the test can release this gate by calling advancement, even
+        // when the host delays us beyond the production first-Enter timer.
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(Outcome::Abandoned("operator_active"))
+        );
+        writes.extend(drain(&mut pty));
+        assert!(
+            !writes.iter().any(|write| write.contains(&b'\r')),
+            "{writes:?}"
+        );
+        assert!(!attempt.evidence.attempt_id.is_empty());
+        assert_eq!(attempt.evidence.state, "abandoned");
+        assert_eq!(attempt.evidence.reason.as_deref(), Some("operator_active"));
+        assert!(attempt.evidence.submit_sent_at_ms.is_none());
+        assert!(attempt.evidence.finished_at_ms.is_some());
+        assert!(!attempt.evidence.retried);
+        assert_eq!(app.delivery_attempts().last(), Some(&attempt.evidence));
+    }
+}
+
 /// #1011 review: when the pane refuses the replay of held operator keys, the
 /// attempt's outcome says they were not written.
 #[tokio::test]

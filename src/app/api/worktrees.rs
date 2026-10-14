@@ -853,6 +853,7 @@ impl App {
         // independent implementation calls a squash-merged branch unmerged
         // (#287).
         let verdict = crate::worktree::resolve_kill_verdict(
+            &crate::worktree::MergeGateContext::default(),
             &target.repo_root,
             &target.checkout,
             &self.state.config.worktrees.protected_branches,
@@ -1563,6 +1564,7 @@ impl App {
             })
             .collect();
         let verdicts = crate::worktree::resolve_kill_verdicts_bounded(
+            &crate::worktree::MergeGateContext::default(),
             &jobs,
             &self.state.config.worktrees.protected_branches,
             &self.state.config.worktrees.integration_branches,
