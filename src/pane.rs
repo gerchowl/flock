@@ -954,11 +954,26 @@ impl PaneRuntimeIo {
     }
 
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_with_receipt(bytes, false).map(|_| ())
+    }
+
+    fn try_send_with_receipt(
+        &self,
+        bytes: Bytes,
+        tracked: bool,
+    ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
+    {
         match self {
             #[cfg(unix)]
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            PaneRuntimeIo::Actor(actor) => {
+                if tracked {
+                    actor.try_write_tracked_input(bytes).map(Some)
+                } else {
+                    actor.try_write_user_input(bytes).map(|_| None)
+                }
+            }
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes).map(|_| None),
         }
     }
 }
@@ -2431,6 +2446,16 @@ impl PaneRuntime {
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.has_been_typed_into.set(true);
         self.io.try_send_bytes(bytes)
+    }
+
+    /// Queue a paste and retain the actor's final-write timestamp.
+    pub(crate) fn try_send_flock_authored_tracked(
+        &self,
+        bytes: Bytes,
+    ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
+    {
+        self.has_been_typed_into.set(true);
+        self.io.try_send_with_receipt(bytes, true)
     }
 
     /// When operator input last reached this pane, if it ever has.
