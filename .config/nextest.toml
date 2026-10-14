@@ -30,6 +30,7 @@ serial-pty = { max-threads = 1 }
 # silent live producer must eventually produce a named test failure in CI.
 # Retain the stricter 180s backstop: each binary's measured p99 is below 18s
 # where observed (docs/next/nextest-timings.md).
+# mesh_step2 (#1349) uses the default 420s: p99 36.409s requires >= 364.09s.
 filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binary(=cli_wrapper) | binary(=server_readiness) | binary(=live_handoff)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
