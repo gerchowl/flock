@@ -413,6 +413,36 @@ impl Drop for Breaker {
 mod tests {
     use super::*;
 
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn delegate_s1_test_dir_is_removed_during_unwind() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate_s1_unwind_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let cleanup = TestDir(dir.clone());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("fixture"), b"endpoint health").unwrap();
+        let failed = std::panic::catch_unwind(move || {
+            let _cleanup = cleanup;
+            panic!("fixture assertion failed");
+        });
+        assert!(failed.is_err());
+        let leaked = dir.exists();
+        if leaked {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert!(!leaked, "failed test must remove its fixture directory");
+    }
+
     #[test]
     fn delegate_s1_advice_and_process_grace_respect_the_caller_budget() {
         let now = Instant::now();
@@ -450,6 +480,7 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
+        let _cleanup = TestDir(dir.clone());
         let client = Client::new(
             Some("http://s1.invalid"),
             &SystemOneConfig::default(),
@@ -500,7 +531,6 @@ mod tests {
         assert_eq!(advice.unwrap().fused, 0.25);
         let state: BreakerState = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(state.fails, 0);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
