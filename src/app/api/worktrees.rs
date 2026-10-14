@@ -853,7 +853,7 @@ impl App {
         // independent implementation calls a squash-merged branch unmerged
         // (#287).
         let verdict = crate::worktree::resolve_kill_verdict(
-            &crate::worktree::MergeGateContext::default(),
+            &self.runtime_config.merge_gate,
             &target.repo_root,
             &target.checkout,
             &self.state.config.worktrees.protected_branches,
@@ -1564,7 +1564,7 @@ impl App {
             })
             .collect();
         let verdicts = crate::worktree::resolve_kill_verdicts_bounded(
-            &crate::worktree::MergeGateContext::default(),
+            &self.runtime_config.merge_gate,
             &jobs,
             &self.state.config.worktrees.protected_branches,
             &self.state.config.worktrees.integration_branches,
@@ -1808,8 +1808,27 @@ mod tests {
     }
 
     fn test_app_with_event_hub(event_hub: crate::api::EventHub) -> App {
+        test_app_with_merge_gate(
+            event_hub,
+            crate::worktree::MergeGateContext {
+                gh_program: unique_temp_path("missing-gh"),
+            },
+        )
+    }
+
+    fn test_app_with_merge_gate(
+        event_hub: crate::api::EventHub,
+        merge_gate: crate::worktree::MergeGateContext,
+    ) -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&Config::default(), true, None, api_rx, event_hub)
+        App::new_with_runtime_config(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub,
+            crate::app::AppRuntimeConfig { merge_gate },
+        )
     }
 
     fn app_with_parent(repo: &Path) -> App {
@@ -3200,7 +3219,7 @@ mod tests {
                 checkout.to_str().unwrap(),
             ],
         );
-        // A stub `gh` ahead of the real one: every `gh pr view` says OPEN.
+        // The injected GitHub CLI reports an open PR for every query.
         let stub = unique_temp_path("api-kill-open-pr-gh");
         std::fs::create_dir_all(&stub).unwrap();
         std::fs::write(
@@ -3213,13 +3232,40 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![stub.clone()];
-        paths.extend(std::env::split_paths(&original_path));
-        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
-
-        let mut app = app_with_parent(&repo);
+        let mut app = app_with_parent_on(
+            test_app_with_merge_gate(
+                crate::api::EventHub::default(),
+                crate::worktree::MergeGateContext {
+                    gh_program: stub.join("gh"),
+                },
+            ),
+            &repo,
+        );
         let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        // The bounded scan workers must inherit the same fixture as the kill.
+        let response = app.handle_api_request(Request {
+            id: "scan".into(),
+            method: crate::api::schema::Method::WorktreeList(WorktreeListParams {
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                cwd: None,
+                scan: true,
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeList { worktrees, .. } = success.result else {
+            panic!("expected worktree_list: {response}");
+        };
+        let scanned = worktrees
+            .iter()
+            .find(|row| row.branch.as_deref() == Some("feature/under-review"))
+            .unwrap()
+            .kill_verdict
+            .as_ref()
+            .expect("scan carries merge evidence");
+        assert_eq!(scanned.verdict, "open_pr");
+        assert!(scanned.evidence.is_none());
+        assert!(!scanned.timed_out);
+
         let kill = |dry_run: bool, keep_branch: bool| {
             crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
                 workspace_id: Some(ws_id.clone()),
@@ -3283,7 +3329,6 @@ mod tests {
         assert!(removed && open_pr && !branch_deleted);
         assert!(branch_exists(&repo, "feature/under-review"));
 
-        std::env::set_var("PATH", original_path);
         let _ = std::fs::remove_dir_all(&stub);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -3319,12 +3364,15 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        let original_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![stub.clone()];
-        paths.extend(std::env::split_paths(&original_path));
-        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
-
-        let mut app = app_with_parent(&repo);
+        let mut app = app_with_parent_on(
+            test_app_with_merge_gate(
+                crate::api::EventHub::default(),
+                crate::worktree::MergeGateContext {
+                    gh_program: stub.join("gh"),
+                },
+            ),
+            &repo,
+        );
         let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
         let kill = |dry_run: bool| {
             crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
@@ -3368,7 +3416,6 @@ mod tests {
         assert!(checkout.exists(), "nothing moved");
         assert!(branch_exists(&repo, "feature/landed-maybe"));
 
-        std::env::set_var("PATH", original_path);
         let _ = std::fs::remove_dir_all(&stub);
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);

@@ -627,11 +627,12 @@ impl App {
         let event_tx = self.event_tx.clone();
         let protected_branches = self.state.config.worktrees.protected_branches.clone();
         let integration_branches = self.state.config.worktrees.integration_branches.clone();
+        let merge_gate = self.runtime_config.merge_gate.clone();
         std::thread::spawn(move || {
             // One resolver for branch + merge gate + #121 protection, shared
             // with the sweep, `worktree.kill` and `worktree.list --scan`.
             let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
-                &crate::worktree::MergeGateContext::default(),
+                &merge_gate,
                 repo_root.clone(),
                 checkout.clone(),
                 &protected_branches,
@@ -796,9 +797,10 @@ impl App {
             let event_tx = self.event_tx.clone();
             let protected_branches = self.state.config.worktrees.protected_branches.clone();
             let integration_branches = self.state.config.worktrees.integration_branches.clone();
+            let merge_gate = self.runtime_config.merge_gate.clone();
             std::thread::spawn(move || {
                 let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
-                    &crate::worktree::MergeGateContext::default(),
+                    &merge_gate,
                     repo_root.clone(),
                     checkout.clone(),
                     &protected_branches,
@@ -2122,12 +2124,17 @@ mod tests {
     }
 
     fn app_for_worktree_tests() -> App {
-        App::new(
+        App::new_with_runtime_config(
             &crate::config::Config::default(),
             true,
             None,
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
+            crate::app::AppRuntimeConfig {
+                merge_gate: crate::worktree::MergeGateContext {
+                    gh_program: crate::test_support::unique_temp_path("missing-gh"),
+                },
+            },
         )
     }
 

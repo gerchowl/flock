@@ -1523,11 +1523,13 @@ enum PrQuery {
 /// Commands used to resolve merge evidence, explicitly carried into workers.
 ///
 /// Production callers use the default bare `gh`, resolved on their normal PATH.
-/// A caller may supply an executable path, including a nonexistent path to
-/// exercise missing-tool behavior. No process or thread environment changes.
+/// An explicit executable path selects the GitHub CLI used for merge evidence.
+/// An unavailable executable retains the normal missing-tool classification.
+/// The context does not change the process or thread environment.
 #[derive(Clone)]
 pub(crate) struct MergeGateContext {
-    gh_program: PathBuf,
+    /// GitHub CLI executable, resolved relative to PATH unless absolute.
+    pub(crate) gh_program: PathBuf,
 }
 
 impl Default for MergeGateContext {
