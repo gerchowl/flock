@@ -1135,7 +1135,7 @@ impl App {
             let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
             let gate = branch.as_deref().map(|b| {
                 crate::worktree::branch_merge_gate(
-                    &crate::worktree::MergeGateContext::default(),
+                    &self.runtime_config.merge_gate,
                     &space.repo_root,
                     &space.checkout_path,
                     b,

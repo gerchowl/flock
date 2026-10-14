@@ -153,7 +153,18 @@ struct ParkedApiRequest {
 /// cannot stall a turn on a slow store reopen.
 pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 
+/// Process dependencies selected once when the app is constructed.
+///
+/// These are runtime configuration, not persisted user settings. Defaults
+/// preserve normal command lookup through the server's PATH.
+#[derive(Default)]
+pub(crate) struct AppRuntimeConfig {
+    /// Command used by every app merge-evidence query, including workers.
+    pub(crate) merge_gate: crate::worktree::MergeGateContext,
+}
+
 pub struct App {
+    pub(crate) runtime_config: AppRuntimeConfig,
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -492,6 +503,26 @@ impl App {
         config_diagnostic: Option<String>,
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
+    ) -> Self {
+        Self::new_with_runtime_config(
+            config,
+            no_session,
+            config_diagnostic,
+            api_rx,
+            event_hub,
+            AppRuntimeConfig::default(),
+        )
+    }
+
+    /// Construct an app with explicit process dependencies. Missing executables
+    /// retain the merge gate's normal failure classification, without fallback.
+    pub(crate) fn new_with_runtime_config(
+        config: &Config,
+        no_session: bool,
+        config_diagnostic: Option<String>,
+        api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+        event_hub: crate::api::EventHub,
+        runtime_config: AppRuntimeConfig,
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
@@ -919,6 +950,7 @@ impl App {
         });
 
         let mut this = Self {
+            runtime_config,
             delivery_attempt_registry: std::cell::RefCell::new(
                 delivery_attempts::DeliveryAttempts::new(event_hub.current_sequence()),
             ),
@@ -2276,6 +2308,15 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn production_app_uses_plain_gh_for_merge_evidence() {
+        let app = test_app();
+        assert_eq!(
+            app.runtime_config.merge_gate.gh_program,
+            std::path::Path::new("gh")
+        );
     }
 
     #[derive(Clone, Default)]
