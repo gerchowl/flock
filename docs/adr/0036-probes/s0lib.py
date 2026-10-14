@@ -42,8 +42,14 @@ import uuid
 CLAUDE = os.environ.get("S0_CLAUDE", "claude")
 MODEL = os.environ.get("S0_MODEL", "haiku")
 
+# `--permission-mode default` is explicit because without it the startup
+# mode is not decided by the flags alone: under the token path, with an empty
+# config dir, 2.1.296 started every session in `auto`, and there a Bash
+# `touch` ran with no `can_use_tool` (#1404). The A.15 runs in
+# the operator's profile, with the same flags, started in `default`.
 BASE_FLAGS = [
     "-p",
+    "--permission-mode", "default",
     "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--verbose",
@@ -344,6 +350,11 @@ def tool_results(events):
                             body = " ".join(x.get("text", "") for x in body if isinstance(x, dict))
                         out.append({"t": e["_t"], "tool_use_id": b["tool_use_id"], "is_error": b.get("is_error", False), "content": str(body)[:300]})
     return out
+
+
+def init_permission_modes(events):
+    """The `permissionMode` of every `system/init` in `events`."""
+    return [e.get("permissionMode") for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
 
 
 def usage(res):
