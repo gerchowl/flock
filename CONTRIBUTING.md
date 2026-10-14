@@ -63,6 +63,47 @@ If there is no reproduction yet, start a discussion instead.
 
 If your proposal changes the visual language, interaction model, workflow, persistence, architecture, or product direction, start a discussion instead.
 
+## Nix development environment
+
+Run `nix develop` for the contributor toolchain. The devShell wraps sccache
+with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
+`$HOME/.cache/flock-sccache/flock.sock` server socket, shared across worktrees
+for the same user. This implements the stable-directory/separate-endpoint design
+accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
+
+Artifact storage keeps sccache's existing configuration or platform default, including
+`~/Library/Caches/Mozilla.sccache` on macOS, so existing caches remain warm.
+The wrapper preserves an explicit `SCCACHE_DIR` and uses its `tmp` subdirectory
+and `flock.sock` for daemon runtime state instead of the default runtime root.
+[sccache 0.15 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage),
+while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.15.0/docs/Configuration.md#disk-local).
+There is no server-only temporary-directory setting, so the wrapper sets
+`TMPDIR` for each sccache invocation, including compiler subprocesses. Other
+shell commands retain their own `TMPDIR`. Persistent runtime storage avoids
+scratch cleanup breaking later builds, at the cost of retaining daemon temporary
+files. The separate socket avoids reusing a daemon on port 4226 that inherited
+a disposable directory.
+
+Explicit `SCCACHE_SERVER_UDS` or `SCCACHE_SERVER_PORT` overrides the default
+socket. Ensure that endpoint's daemon was also started through the wrapper.
+Keep runtime paths absolute, persistent, and writable, and do not delete them
+while their daemon runs. Unix socket path limits apply (roughly 104 bytes on
+macOS), so choose a shorter persistent `SCCACHE_DIR` or an explicit private
+port for a long home path. An unset HOME requires an explicit `SCCACHE_DIR`.
+Directory-creation failure prints the path and fails the build.
+`RUSTC_WRAPPER=""` disables Rust caching, and custom wrappers remain intact.
+
+Run `nix develop --command just test-sccache` to check deleted startup temp
+directories, explicit and lazy restarts, and hits from a platform-default cache
+warmed by an unwrapped daemon. The probe always supplies and asserts private
+endpoints. Outside the devShell it exits before contacting any server with
+`run inside nix develop (the wrapper is not active)`. The endpoint guard also
+remains active under `python3 -O`. The probe isolates HOME and
+XDG paths, so it exercises platform default cache selection without accessing
+or stopping the host's shared cache server. Nix CI executes this check on Linux
+and evaluates Darwin checks without building them. The Darwin probe can be
+built locally with `nix build .#checks.aarch64-darwin.sccache --no-link`.
+
 ## Documentation for unreleased changes
 
 The root `README.md`, root `CHANGELOG.md`, and website docs describe the latest released version of flock. Do not update root `README.md`, root `CHANGELOG.md`, or `website/src/content/docs/` for normal PRs.
