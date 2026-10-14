@@ -3,6 +3,11 @@
 Reproduce: `python3 scripts/nextest_timings.py .local/nextest-timings --download > docs/next/nextest-timings.md`.
 Omit `--download` to render the saved input again. Requires authenticated `gh` and Python 3.
 
+Validate ceilings and override reachability: `python3 -I scripts/test_nextest_timings.py`.
+The test script also accepts an absolute path from any working directory (Python 3.11+).
+Shadow checks prove full coverage per setting for exact/substring binary/test selectors with `&`, `|` and parentheses.
+Regexes, negation, other predicates and unequal platform scopes remain unproved, not rejected.
+
 Latest 20 completed dev CI runs at collection time, including cancelled runs.
 Recorded executions: 240,138; binaries: 52.
 Partial runs contribute only recorded executions, never zeroes for missing tests.

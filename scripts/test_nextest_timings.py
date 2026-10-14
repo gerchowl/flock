@@ -1,14 +1,235 @@
+"""Check ADR-0037 ceilings and provable first-match shadowing.
+
+Run from any directory with `python3 -I /path/to/scripts/test_nextest_timings.py`,
+or use repository-root unittest discovery (`just script-tests`).
+"""
+import importlib.util
 import json
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
 
-from scripts.nextest_timings import p99, report, samples
+# Resolve the sibling explicitly: isolated Python omits the script directory.
+_spec = importlib.util.spec_from_file_location(
+    "nextest_timings", Path(__file__).resolve().with_name("nextest_timings.py"),
+)
+_timings = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_timings)
+p99, report, samples = _timings.p99, _timings.report, _timings.samples
+
+
+def filter_clauses(expression):
+    """Return DNF for binary/test literals, &, | and parentheses, or None.
+
+    Exact and substring selectors are supported. Negation, regexes and other
+    predicates are deliberately unproved, never guessed to be shadowed.
+    """
+    token = re.compile(r"\s*(?:(binary|test)\((=?[A-Za-z0-9_:.-]+)\)|([&|()]))")
+    tokens = []
+    position = 0
+    while position < len(expression.rstrip()):
+        match = token.match(expression, position)
+        if match is None:
+            return None
+        kind, selector, operator = match.groups()
+        tokens.append((kind, selector) if kind else operator)
+        position = match.end()
+    index = 0
+
+    def primary():
+        nonlocal index
+        item = tokens[index]
+        index += 1
+        if item == "(":
+            clauses = union()
+            if tokens[index] != ")":
+                raise ValueError("unclosed filter group")
+            index += 1
+            return clauses
+        if isinstance(item, tuple):
+            return [frozenset([item])]
+        raise ValueError("expected filter literal")
+
+    def intersection():
+        nonlocal index
+        clauses = primary()
+        while index < len(tokens) and tokens[index] == "&":
+            index += 1
+            right = primary()
+            clauses = [left | other for left in clauses for other in right]
+        return clauses
+
+    def union():
+        nonlocal index
+        clauses = intersection()
+        while index < len(tokens) and tokens[index] == "|":
+            index += 1
+            clauses += intersection()
+        return clauses
+
+    try:
+        clauses = union()
+        return clauses if index == len(tokens) else None
+    except (IndexError, ValueError):
+        return None
+
+
+def clause_implies(later, earlier):
+    """Prove each earlier literal using a more restrictive later literal."""
+    def implies(current, prior):
+        kind, selector = current
+        prior_kind, prior_selector = prior
+        if kind != prior_kind:
+            return False
+        if prior_selector.startswith("="):
+            return selector == prior_selector
+        return prior_selector in selector.removeprefix("=")
+
+    return all(any(implies(current, prior) for current in later) for prior in earlier)
+
 
 
 class Timings(unittest.TestCase):
+    def assert_no_shadowed_overrides(self, config):
+        """Check each setting independently, with CI overrides before defaults.
+
+        An earlier unscoped rule covers every platform. A scoped rule proves
+        coverage only for an identical scope. Unsupported filters remain
+        unchecked by this proof, while the ceiling checks still inspect them.
+        """
+        default = config["profile"]["default"].get("overrides", [])
+        for profile, settings in config["profile"].items():
+            overrides = settings.get("overrides", [])
+            if profile != "default":
+                overrides = overrides + default
+            earlier = []
+            for index, override in enumerate(overrides):
+                clauses = filter_clauses(override["filter"])
+                if clauses is not None:
+                    for key in override.keys() - {"filter", "platform"}:
+                        covered = []
+                        for previous, prior_clauses in earlier:
+                            if (key in previous and prior_clauses is not None
+                                    and ("platform" not in previous
+                                         or previous["platform"] == override.get("platform"))):
+                                covered += prior_clauses
+                        self.assertFalse(
+                            all(any(clause_implies(clause, prior) for prior in covered)
+                                for clause in clauses),
+                            f"{profile} override {index + 1} shadowed {key}: {override['filter']}",
+                        )
+                earlier.append((override, clauses))
+
+    def test_isolated_invocation_from_an_unrelated_directory(self):
+        script = Path(__file__).resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-I", str(script),
+                 "Timings.test_nearest_rank_uses_test_durations"],
+                cwd=directory, capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 1 test", result.stderr)
+
+    def test_fully_shadowed_ceiling_is_rejected(self):
+        config = {"profile": {"default": {"overrides": [
+            {"filter": "binary(=live_handoff)", "slow-timeout": {}},
+            {"filter": "binary(=live_handoff) & test(=rollback_case)",
+             "slow-timeout": {}},
+        ]}}}
+        with self.assertRaisesRegex(AssertionError, "shadowed.*slow-timeout"):
+            self.assert_no_shadowed_overrides(config)
+
+    def test_shadow_proof_handles_unions_and_substrings(self):
+        for earlier, later in [
+            ("binary(live)", "binary(=live_handoff) & test(rollback)"),
+            ("binary(=one) | binary(=two)",
+             "(binary(=one) & test(=case)) | binary(=two)"),
+            ("binary(=one) & test(rollback)",
+             "binary(=one) & test(=rollback_case)"),
+        ]:
+            with self.subTest(earlier=earlier, later=later):
+                config = {"profile": {"default": {"overrides": [
+                    {"filter": earlier, "retries": 0},
+                    {"filter": later, "retries": 2},
+                ]}}}
+                with self.assertRaisesRegex(AssertionError, "shadowed retries"):
+                    self.assert_no_shadowed_overrides(config)
+
+    def test_separate_rules_can_collectively_shadow_a_union(self):
+        config = {"profile": {"default": {"overrides": [
+            {"filter": "binary(=one)", "slow-timeout": {}},
+            {"filter": "binary(=two)", "slow-timeout": {}},
+            {"filter": "binary(=one) | binary(=two)", "slow-timeout": {}},
+        ]}}}
+        with self.assertRaisesRegex(AssertionError, "shadowed slow-timeout"):
+            self.assert_no_shadowed_overrides(config)
+
+    def test_partial_coverage_and_different_settings_are_allowed(self):
+        for earlier, later in [
+            ({"filter": "binary(=one)", "slow-timeout": {}},
+             {"filter": "binary(=one)", "test-group": "serial"}),
+            ({"filter": "binary(=one)", "slow-timeout": {}},
+             {"filter": "binary(=one) | binary(=two)", "slow-timeout": {}}),
+            ({"filter": "binary(=one) & test(=specific)", "retries": 0},
+             {"filter": "binary(=one)", "retries": 2}),
+            ({"filter": "binary(=one)", "retries": 0},
+             {"filter": "binary(one)", "retries": 2}),
+        ]:
+            with self.subTest(earlier=earlier, later=later):
+                self.assert_no_shadowed_overrides({"profile": {
+                    "default": {"overrides": [earlier, later]},
+                }})
+
+    def test_each_setting_is_checked_even_if_another_is_reachable(self):
+        config = {"profile": {"default": {"overrides": [
+            {"filter": "binary(=one)", "slow-timeout": {}},
+            {"filter": "binary(=one)", "slow-timeout": {}, "retries": 0},
+        ]}}}
+        with self.assertRaisesRegex(AssertionError, "shadowed slow-timeout"):
+            self.assert_no_shadowed_overrides(config)
+
+    def test_platform_scopes_and_profile_inheritance(self):
+        for prior_scope, later_scope, shadowed in [
+            (None, "cfg(unix)", True),
+            ("cfg(unix)", "cfg(unix)", True),
+            ("cfg(unix)", None, False),
+            ("cfg(unix)", "cfg(windows)", False),
+        ]:
+            earlier = {"filter": "binary(=one)", "retries": 0}
+            later = {"filter": "binary(=one)", "retries": 2}
+            if prior_scope:
+                earlier["platform"] = prior_scope
+            if later_scope:
+                later["platform"] = later_scope
+            config = {"profile": {"default": {"overrides": [later]},
+                                  "ci": {"overrides": [earlier]}}}
+            with self.subTest(prior_scope=prior_scope, later_scope=later_scope):
+                if shadowed:
+                    with self.assertRaisesRegex(AssertionError, "ci.*shadowed retries"):
+                        self.assert_no_shadowed_overrides(config)
+                else:
+                    self.assert_no_shadowed_overrides(config)
+
+    def test_unknown_filter_syntax_is_not_guessed(self):
+        for expression in ["not binary(=one)", "binary(/one/)", "kind(test)",
+                           "binary(=one) &", "(binary(=one)"]:
+            with self.subTest(expression=expression):
+                self.assertIsNone(filter_clauses(expression))
+                self.assert_no_shadowed_overrides({"profile": {"default": {"overrides": [
+                    {"filter": expression, "retries": 0},
+                    {"filter": "binary(=one)", "retries": 2},
+                ]}}})
+
+    def test_real_overrides_have_no_fully_shadowed_settings(self):
+        root = Path(__file__).resolve().parents[1]
+        config = tomllib.loads((root / ".config/nextest.toml").read_text())
+        self.assert_no_shadowed_overrides(config)
+
     def test_nearest_rank_uses_test_durations(self):
         self.assertEqual(p99(list(range(1, 101))), 99)
         self.assertEqual(p99([31]), 31)
