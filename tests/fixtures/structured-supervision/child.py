@@ -1,34 +1,44 @@
-"""Owned supervision fixture. No harness, model, socket server or network use."""
+"""Owned supervision fixture driven by signals; no model or network use."""
 import os
 import pathlib
 import signal
 import sys
-import time
 
 root = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
-signal.signal(signal.SIGTERM, lambda *_: (root / "term").write_text("term"))
+events = {signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2, signal.SIGCHLD}
+signal.pthread_sigmask(signal.SIG_BLOCK, events)
 if mode == "tree":
+    ready_read, ready_write = os.pipe()
     grandchild = os.fork()
     if grandchild == 0:
+        os.close(ready_read)
         os.setsid()
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         (root / "grandchild").write_text(str(os.getpid()))
+        os.write(ready_write, b"ready")
+        os.close(ready_write)
+        # TERM's default action ends this owned descendant, even before sigwait.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
         while True:
-            time.sleep(0.01)
+            signal.pause()
+    os.close(ready_write)
+    assert os.read(ready_read, 5) == b"ready"
+    os.close(ready_read)
 else:
     grandchild = None
-(root / "ready").write_text(str(os.getpid()))
+print("ready", flush=True)
 while True:
-    if (root / "crash").exists():
+    event = signal.sigwait(events)
+    if event == signal.SIGTERM:
+        (root / "term").write_text("term")
+    elif event == signal.SIGUSR2:
         os._exit(7)
-    if (root / "finish").exists():
+    elif event == signal.SIGUSR1:
         if grandchild is not None:
             os.kill(grandchild, signal.SIGTERM)
             os.waitpid(grandchild, 0)
         sys.exit(0)
-    if grandchild is not None:
+    elif event == signal.SIGCHLD and grandchild is not None:
         waited, _ = os.waitpid(grandchild, os.WNOHANG)
         if waited:
             sys.exit(0)
-    time.sleep(0.01)

@@ -165,7 +165,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             & 0o777,
         0o700
     );
-    for name in ["settings.json", "mcp.json"] {
+    for name in ["settings.json", "mcp.json", "owner.json"] {
         let path = dir.join(name);
         assert_eq!(
             fs::metadata(&path)
@@ -179,7 +179,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             .expect("no secret file")
             .contains(FAKE_TOKEN));
     }
-    assert_eq!(fs::read_dir(dir).expect("session files").count(), 2);
+    assert_eq!(fs::read_dir(dir).expect("session files").count(), 3);
 }
 
 #[test]

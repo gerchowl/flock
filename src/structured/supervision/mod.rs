@@ -76,6 +76,7 @@ pub struct ExitReport {
 #[derive(Serialize, Deserialize)]
 struct Owner {
     owner: ProcessIdentity,
+    supervisor: ProcessIdentity,
     uncertain: bool,
     profile: Option<PathBuf>,
     tree: Vec<ProcessIdentity>,
@@ -153,6 +154,7 @@ pub fn prepare_session_files(state: &Path) -> io::Result<SessionConfigDir> {
     let owner = ProcessIdentity::capture(std::process::id())?;
     Owner {
         owner,
+        supervisor: owner,
         uncertain: false,
         profile: None,
         tree: vec![owner],
@@ -172,6 +174,8 @@ pub fn arm_session_files(files: &mut SessionConfigDir) -> io::Result<()> {
 
 /// Supervise an owned child on a dedicated runtime worker. The caller must arm
 /// files before spawn. `close_stdin` must be a nonblocking transport request.
+/// After tree termination, `finish_io` must cancel/drain and observe both I/O
+/// completions within a bound. Its failure retains files; it runs on this worker.
 /// Snapshots persist for crash recovery. EOF grace precedes TERM, a live-tree
 /// snapshot precedes KILL, and cleanup waits for confirmed identity disappearance.
 pub fn supervise(
@@ -180,10 +184,13 @@ pub fn supervise(
     profile: PathBuf,
     stop: StopRequest,
     close_stdin: impl FnOnce(),
+    finish_io: impl FnOnce() -> io::Result<()>,
 ) -> ExitReport {
     files.retain();
-    let root = match ProcessIdentity::capture(child.id()) {
-        Ok(root) => root,
+    let (root, supervisor) = match ProcessIdentity::capture(child.id()).and_then(|root| {
+        ProcessIdentity::capture(std::process::id()).map(|supervisor| (root, supervisor))
+    }) {
+        Ok(identities) => identities,
         Err(error) => {
             return ExitReport {
                 status: child.try_wait().ok().flatten(),
@@ -194,6 +201,7 @@ pub fn supervise(
     };
     let mut owner = Owner {
         owner: root,
+        supervisor,
         uncertain: false,
         profile: Some(profile),
         tree: vec![root],
@@ -222,8 +230,8 @@ pub fn supervise(
             }
         }
         if status.is_some() && owner.living().is_empty() {
-            let cleanup = failure
-                .map_or_else(|| cleanup_transient(&owner, files.path()), Err)
+            let cleanup = finish_io()
+                .and_then(|()| failure.map_or_else(|| cleanup_transient(&owner, files.path()), Err))
                 .and_then(|()| files.remove_after_reap());
             return ExitReport {
                 status,
@@ -324,7 +332,7 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
     private_fs::remove_transient(&path, None)
 }
 
-/// Startup sweep on a worker: only dead, known owners are eligible. Live owners
+/// Startup sweep on a worker: only dead, known supervisors are eligible. Live supervisors
 /// are untouched. Uncertain/malformed records fail explicitly and retain files.
 /// Recorded descendants are killed by matching birth identity before deletion.
 pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
@@ -346,13 +354,16 @@ pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
             continue;
         }
         private_fs::ensure_private_dir(&entry.path())?;
-        let owner = Owner::read(&entry.path())?;
-        if owner.owner.alive() {
+        let mut owner = Owner::read(&entry.path())?;
+        if owner.supervisor.alive() {
             continue;
         }
         if owner.uncertain {
             return Err(io::Error::other("uncertain session spawn retained"));
         }
+        // Surviving recorded parents can have children newer than the saved tree.
+        owner.snapshot();
+        owner.write(&entry.path())?;
         owner.signal(Signal::Kill);
         let deadline = Instant::now() + KILL_GRACE;
         while !owner.living().is_empty() {
