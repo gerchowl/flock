@@ -1534,10 +1534,39 @@ fn mailbox_full_retry_vs_24h_inbox_expiry() {
     assert_eq!(read(owner, &c.receiver.pane), json!([]));
     // The fixture advanced inbox expiry, so advance the origin's collection
     // schedule too instead of waiting for its normal 60-second idle backoff.
+    let gate = c.fleet.base.join("gate-delivery-ack-nodea-nodeb");
+    fs::create_dir(&gate).unwrap();
     due(c.fleet.node("nodea"));
-    state(c.fleet.node("nodea"), "fill-0", "expired");
+    fleet::wait_until("retry acknowledgement held", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
     c.read_question();
     once(owner, "question");
+    // Inbox import/read precedes the sender's completion event. Hold the real
+    // acknowledgement to exercise that ordering, then await durable completion
+    // before inspecting leases (ADR-0026, durable outbox/acknowledgement).
+    assert_eq!(
+        scalar(
+            c.fleet.node("nodea"),
+            "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='custody' AND lease_until>retry_at"
+        ),
+        1
+    );
+    fs::write(gate.join("release"), b"").unwrap();
+    fleet::wait_until("sender retry acknowledgement committed", DEADLINE, || {
+        let sender_state: String = db(c.fleet.node("nodea"))
+            .query_row(
+                "SELECT state FROM envelopes WHERE correlation='question'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        match sender_state.as_str() {
+            "custody" => None,
+            "delivered" => Some(()),
+            other => panic!("unexpected retry completion state: {other}"),
+        }
+    });
     assert_eq!(
         scalar(
             c.fleet.node("nodea"),
@@ -1545,6 +1574,7 @@ fn mailbox_full_retry_vs_24h_inbox_expiry() {
         ),
         0
     );
+    state(c.fleet.node("nodea"), "fill-0", "expired");
 }
 
 #[test]
