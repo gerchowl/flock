@@ -8,11 +8,14 @@ const VARIANTS: &str = include_str!("../../../tests/fixtures/claude-session/vari
 fn every_fixture_parses_to_its_expected_variant() {
     assert_eq!(FIXTURES.lines().count(), VARIANTS.lines().count());
     for (line, expected) in FIXTURES.lines().zip(VARIANTS.lines()) {
-        let event = SessionEvent::parse(line, "2.1.296").unwrap();
+        let event = SessionEvent::parse(line, "2.1.296");
         let actual = format!("{event:?}");
         assert!(actual.starts_with(&format!("{expected}(")), "{actual}");
-        let via_serde: SessionEvent = serde_json::from_str(line).unwrap();
-        assert_eq!(event, via_serde);
+        assert!(event.extra().unwrap().is_empty(), "{actual}");
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::from_str::<Value>(line).unwrap()
+        );
     }
 }
 
@@ -21,7 +24,7 @@ fn every_known_variant_round_trips_extra_and_nested_fields() {
     for line in FIXTURES.lines() {
         let mut raw: Value = serde_json::from_str(line).unwrap();
         raw["future_field"] = json!({"nested": [null, true, 7, "future"]});
-        let event = SessionEvent::parse(&raw.to_string(), "2.1.296").unwrap();
+        let event = SessionEvent::parse(&raw.to_string(), "2.1.296");
         assert!(!matches!(event, SessionEvent::Unknown { .. }));
         assert_eq!(serde_json::to_value(event).unwrap(), raw);
     }
@@ -49,11 +52,17 @@ fn unknown_pairs_and_incompatible_payloads_preserve_raw() {
         json!(42),
         json!("text"),
     ] {
-        let event = SessionEvent::parse(&raw.to_string(), "2.1.296").unwrap();
-        let SessionEvent::Unknown { raw: kept, shape } = &event else {
+        let event = SessionEvent::parse(&raw.to_string(), "2.1.296");
+        let SessionEvent::Unknown {
+            raw: kept,
+            value: parsed,
+            shape,
+        } = &event
+        else {
             panic!("unexpected known event: {event:?}");
         };
-        assert_eq!(kept, &raw);
+        assert_eq!(kept, &raw.to_string());
+        assert_eq!(parsed, &raw);
         assert_eq!(shape, &ShapeKey::derive(&raw, "2.1.296"));
         assert_eq!(serde_json::to_value(event).unwrap(), raw);
     }
@@ -96,14 +105,24 @@ fn shape_key_is_stable_sorted_versioned_and_unambiguous() {
 
 #[test]
 fn known_extra_changes_shape_without_losing_known_variant() {
-    let raw = json!({"type":"assistant", "message":{}});
-    let extended = json!({"type":"assistant", "message":{}, "future":null});
+    let raw = json!({"type":"assistant", "message":{}, "session_id":"session-example", "uuid":"event-example", "parent_tool_use_id":null, "request_id":"request-example"});
+    assert!(SessionEvent::parse(&raw.to_string(), "v")
+        .extra()
+        .unwrap()
+        .is_empty());
+    let mut changed_value = raw.clone();
+    changed_value["request_id"] = json!("other-request-example");
+    assert_eq!(
+        ShapeKey::derive(&raw, "v"),
+        ShapeKey::derive(&changed_value, "v")
+    );
+    let mut extended = raw.clone();
+    extended["future"] = Value::Null;
     assert_ne!(
         ShapeKey::derive(&raw, "v"),
         ShapeKey::derive(&extended, "v")
     );
-    let SessionEvent::Assistant(payload) = SessionEvent::parse(&extended.to_string(), "v").unwrap()
-    else {
+    let SessionEvent::Assistant(payload) = SessionEvent::parse(&extended.to_string(), "v") else {
         panic!("extended assistant must stay known");
     };
     assert_eq!(
@@ -113,9 +132,82 @@ fn known_extra_changes_shape_without_losing_known_variant() {
 }
 
 #[test]
-fn malformed_json_is_a_typed_json_error() {
-    for line in ["{", "not json", "", "{} {}"] {
-        let error: serde_json::Error = SessionEvent::parse(line, "v").unwrap_err();
-        assert!(error.is_syntax() || error.is_eof());
+fn non_json_lines_are_unknown_with_exact_raw_and_string_value() {
+    for line in ["{", "not json", "", "{} {}", " \t diagnostic \r"] {
+        let event = SessionEvent::parse(line, "2.1.296");
+        let SessionEvent::Unknown { raw, value, shape } = &event else {
+            panic!("expected Unknown");
+        };
+        assert_eq!(raw, line);
+        assert_eq!(value, &Value::String(line.to_owned()));
+        assert_eq!(shape, &ShapeKey::derive(value, "2.1.296"));
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            Value::String(line.to_owned())
+        );
+    }
+}
+
+#[test]
+fn review_non_json_is_unknown_with_exact_raw() {
+    let line = " \t diagnostic, not JSON \r";
+    let event = SessionEvent::parse(line, "2.1.296");
+    let SessionEvent::Unknown { raw, .. } = event else {
+        panic!("expected Unknown")
+    };
+    assert_eq!(raw, line);
+}
+
+#[test]
+fn review_unknown_json_retains_wire_bytes() {
+    let line = " { \"z\" : 1.00e+2, \"type\" : \"future\", \"a\" : 0 } ";
+    let event = SessionEvent::parse(line, "2.1.296");
+    let SessionEvent::Unknown { raw, value, .. } = &event else {
+        panic!("expected Unknown")
+    };
+    assert_eq!(raw, line);
+    assert_ne!(value.to_string(), line);
+    assert_eq!(serde_json::to_string(&event).unwrap(), line.trim());
+}
+
+#[test]
+fn review_catalogue_envelope_is_not_extra() {
+    let event = SessionEvent::parse(FIXTURES.lines().nth(3).unwrap(), "2.1.296");
+    let SessionEvent::Init(payload) = event else {
+        panic!("expected Init")
+    };
+    assert!(payload.extra.is_empty(), "{:?}", payload.extra);
+}
+
+#[test]
+fn every_parse_path_requires_and_retains_the_supplied_version() {
+    for line in [
+        r#"{"type":"future"}"#,
+        r#"{"type":"assistant","message":42}"#,
+        "not JSON",
+    ] {
+        let a = SessionEvent::parse(line, "2.1.296");
+        let b = SessionEvent::parse(line, "2.1.297");
+        let (SessionEvent::Unknown { shape: a, .. }, SessionEvent::Unknown { shape: b, .. }) =
+            (a, b)
+        else {
+            panic!("expected Unknown");
+        };
+        assert_ne!(a, b);
+        let identity: Value = serde_json::from_str(&a.0).unwrap();
+        assert_eq!(identity[1], "2.1.296");
+    }
+}
+
+#[test]
+fn optional_envelope_fields_preserve_absence_and_explicit_null() {
+    for raw in [
+        json!({"type":"assistant", "message":{}}),
+        json!({"type":"assistant", "message":{}, "session_id":"session-example", "uuid":"event-example", "parent_tool_use_id":null, "timestamp":null}),
+        json!({"type":"assistant", "message":{}, "parent_tool_use_id":"tool-example"}),
+    ] {
+        let event = SessionEvent::parse(&raw.to_string(), "2.1.296");
+        assert!(event.extra().unwrap().is_empty());
+        assert_eq!(serde_json::to_value(event).unwrap(), raw);
     }
 }

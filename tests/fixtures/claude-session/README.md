@@ -13,3 +13,5 @@ Includes all catalogue envelopes, four lifecycle states, nullable status,
 four delta types, three block types, API failure with success subtype,
 and streaming/tool interruption. A.11 peer holds and A.14–A.15 control
 success/error replies supplement the earlier A.2 catalogue.
+
+Replacement with sanitized real S0 captures is tracked in [#1385](https://github.com/gerchowl/flock/issues/1385).
