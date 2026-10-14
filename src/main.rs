@@ -91,6 +91,9 @@ mod server_icons;
 mod session;
 mod sound;
 mod spawn;
+// ADR-0036 S1 supplies event types before runtime integration (#1379).
+#[allow(dead_code)]
+mod structured;
 mod switch_progress;
 mod system_stats;
 mod terminal;
