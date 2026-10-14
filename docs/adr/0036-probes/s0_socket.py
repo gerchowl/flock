@@ -107,83 +107,83 @@ def turn_after(sess, start, timeout):
 
 def run(name):
     flags, env = VARIANTS[name]
-    sess = L.Session(f"socket-{name}", FLAGS + flags, env_extra=env)
-    out = {"variant": name, "flags": flags, "env": env}
-    if os.path.exists(HOOK_MARK):
-        os.unlink(HOOK_MARK)
-    sess.user(FIRST.get(name, "Reply with exactly: ready"))
-    init = sess.wait(L.is_type("system", "init"), timeout=60)
-    res = sess.wait(L.is_result, timeout=90)
-    out["first_turn"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error")}
-    if init is None:
-        out["init"] = None
-        out["stderr"] = "".join(sess.stderr)[-1500:]
-        sess.close()
-        return out
-    sock = init.get("messaging_socket_path")
-    out["init"] = {
-        "messaging_socket_path": sock,
-        "capabilities": init.get("capabilities"),
-        "permissionMode": init.get("permissionMode"),
-        "tools": init.get("tools"),
-        "slash_commands_n": len(init.get("slash_commands") or []),
-        "claude_code_version": init.get("claude_code_version"),
-        "mcp_servers": init.get("mcp_servers"),
-    }
-    out["hook_events"] = sorted({f"{e.get('subtype')}:{e.get('hook_event')}" for e in sess.since(0) if str(e.get("subtype", "")).startswith("hook_")})
-    out["stop_hook_mark"] = os.path.exists(HOOK_MARK)
-    if out["stop_hook_mark"]:
-        os.unlink(HOOK_MARK)
-    pid = sess.proc.pid
-    cfg = sess.config_dir
-    out["registry"] = [describe(p) for p in sorted(glob.glob(os.path.join(cfg, "sessions", f"{pid}*")))]
-    if sock:
-        out["socket"] = describe(sock)
-        out["socket_dir"] = describe(os.path.dirname(sock))
-        tests = [
-            ("user_no_token", [{"type": "user", "message": {"content": "Reply with exactly: SOCKET-NEXT"}, "from": "s0-probe"}]),
-            ("user_now_no_token", [{"type": "user", "priority": "now", "message": {"content": "Reply with exactly: SOCKET-NOW"}, "from": "s0-probe"}]),
-            ("control_rename", [{"type": "control", "action": "rename", "name": "s0-renamed"}]),
-        ]
-        out["writes"] = {}
-        for label, lines in tests:
+    with L.Session(f"socket-{name}", FLAGS + flags, env_extra=env) as sess:
+        out = {"variant": name, "flags": flags, "env": env}
+        if os.path.exists(HOOK_MARK):
+            os.unlink(HOOK_MARK)
+        sess.user(FIRST.get(name, "Reply with exactly: ready"))
+        init = sess.wait(L.is_type("system", "init"), timeout=60)
+        res = sess.wait(L.is_result, timeout=90)
+        out["first_turn"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error")}
+        if init is None:
+            out["init"] = None
+            out["stderr"] = "".join(sess.stderr)[-1500:]
+            sess.close()
+            return out
+        sock = init.get("messaging_socket_path")
+        out["init"] = {
+            "messaging_socket_path": sock,
+            "capabilities": init.get("capabilities"),
+            "permissionMode": init.get("permissionMode"),
+            "tools": init.get("tools"),
+            "slash_commands_n": len(init.get("slash_commands") or []),
+            "claude_code_version": init.get("claude_code_version"),
+            "mcp_servers": init.get("mcp_servers"),
+        }
+        out["hook_events"] = sorted({f"{e.get('subtype')}:{e.get('hook_event')}" for e in sess.since(0) if str(e.get("subtype", "")).startswith("hook_")})
+        out["stop_hook_mark"] = os.path.exists(HOOK_MARK)
+        if out["stop_hook_mark"]:
+            os.unlink(HOOK_MARK)
+        pid = sess.proc.pid
+        cfg = sess.config_dir
+        out["registry"] = [describe(p) for p in sorted(glob.glob(os.path.join(cfg, "sessions", f"{pid}*")))]
+        if sock:
+            out["socket"] = describe(sock)
+            out["socket_dir"] = describe(os.path.dirname(sock))
+            tests = [
+                ("user_no_token", [{"type": "user", "message": {"content": "Reply with exactly: SOCKET-NEXT"}, "from": "s0-probe"}]),
+                ("user_now_no_token", [{"type": "user", "priority": "now", "message": {"content": "Reply with exactly: SOCKET-NOW"}, "from": "s0-probe"}]),
+                ("control_rename", [{"type": "control", "action": "rename", "name": "s0-renamed"}]),
+            ]
+            out["writes"] = {}
+            for label, lines in tests:
+                start = sess.mark()
+                conn = send_lines(sock, lines)
+                seen = turn_after(sess, start, timeout=45 if label != "control_rename" else 8)
+                out["writes"][label] = {"conn": conn, **seen}
+            out["registry_after"] = []
+            for p in sorted(glob.glob(os.path.join(cfg, "sessions", f"{pid}*"))):
+                d = describe(p)
+                if p.endswith(".json"):
+                    try:
+                        with open(p) as f:
+                            rec = json.load(f)
+                        d["keys"] = sorted(rec.keys())
+                        d["name"] = rec.get("name")
+                        d["messagingSocketPath"] = rec.get("messagingSocketPath")
+                    except (OSError, ValueError) as e:
+                        d["read_error"] = str(e)
+                out["registry_after"].append(d)
+        if name == "restricted_profile":
+            # does the stdio permission prompt still reach the host?
             start = sess.mark()
-            conn = send_lines(sock, lines)
-            seen = turn_after(sess, start, timeout=45 if label != "control_rename" else 8)
-            out["writes"][label] = {"conn": conn, **seen}
-        out["registry_after"] = []
-        for p in sorted(glob.glob(os.path.join(cfg, "sessions", f"{pid}*"))):
-            d = describe(p)
-            if p.endswith(".json"):
-                try:
-                    with open(p) as f:
-                        rec = json.load(f)
-                    d["keys"] = sorted(rec.keys())
-                    d["name"] = rec.get("name")
-                    d["messagingSocketPath"] = rec.get("messagingSocketPath")
-                except (OSError, ValueError) as e:
-                    d["read_error"] = str(e)
-            out["registry_after"].append(d)
-    if name == "restricted_profile":
-        # does the stdio permission prompt still reach the host?
+            sess.user("Run `touch s0-restricted.txt` with Bash, then say done.")
+            req = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=90, start=start)
+            out["stdio_prompt"] = None if req is None or L.is_result(req) else req["request"].get("tool_name")
+            if out["stdio_prompt"]:
+                sess.answer(req["request_id"], {"behavior": "deny", "message": "denied by the S0 probe"})
+            sess.wait(L.is_result, timeout=90, start=start)
+        # does the agent's own Bash inherit the socket path (and a token)?
         start = sess.mark()
-        sess.user("Run `touch s0-restricted.txt` with Bash, then say done.")
-        req = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=90, start=start)
-        out["stdio_prompt"] = None if req is None or L.is_result(req) else req["request"].get("tool_name")
-        if out["stdio_prompt"]:
-            sess.answer(req["request_id"], {"behavior": "deny", "message": "denied by the S0 probe"})
-        sess.wait(L.is_result, timeout=90, start=start)
-    # does the agent's own Bash inherit the socket path (and a token)?
-    start = sess.mark()
-    sess.user("Run `printenv CLAUDE_CODE_MESSAGING_SOCKET` with Bash, then `printenv CLAUDE_CODE_MESSAGING_TOKEN | wc -c`, "
-              "and reply with the two outputs only.")
-    res = sess.wait(L.is_result, timeout=90, start=start)
-    out["bash_child_env"] = [x["content"] for x in L.tool_results(sess.since(start))]
-    out["exit"] = sess.close()
-    if sock:
-        out["socket_after_exit"] = os.path.exists(sock)
-    out["stderr_tail"] = "".join(sess.stderr)[-600:]
-    return out
+        sess.user("Run `printenv CLAUDE_CODE_MESSAGING_SOCKET` with Bash, then `printenv CLAUDE_CODE_MESSAGING_TOKEN | wc -c`, "
+                  "and reply with the two outputs only.")
+        res = sess.wait(L.is_result, timeout=90, start=start)
+        out["bash_child_env"] = [x["content"] for x in L.tool_results(sess.since(start))]
+        out["exit"] = sess.close()
+        if sock:
+            out["socket_after_exit"] = os.path.exists(sock)
+        out["stderr_tail"] = "".join(sess.stderr)[-600:]
+        return out
 
 
 def main():

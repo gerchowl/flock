@@ -61,78 +61,78 @@ def receipt(qid):
 
 
 def run(carrier, n):
-    sess = L.Session(f"carrier-{carrier}-{n}", FLAGS)
-    out = {"carrier": carrier, "run": n}
-    sess.user(PROMPT)
-    init = sess.wait(L.is_type("system", "init"), timeout=60)
-    out["ask_tool_listed"] = init is not None and "AskUserQuestion" in (init.get("tools") or [])
-    req = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
-    if req is None or L.is_result(req):
-        out["error"] = "no AskUserQuestion control request"
-        out["result"] = None if req is None else req.get("result")
-        sess.close()
-        return out
-    r = req["request"]
-    out["control_request"] = {
-        "tool_name": r.get("tool_name"),
-        "requires_user_interaction": r.get("requires_user_interaction"),
-        "tool_use_id": r.get("tool_use_id"),
-        "t": req["_t"],
-    }
-    if r.get("tool_name") != "AskUserQuestion":
-        out["error"] = f"first control request was for {r.get('tool_name')}"
-        sess.answer(req["request_id"], {"behavior": "deny", "message": "not part of this probe"})
-        sess.close()
-        return out
-    qs = r.get("input", {}).get("questions", [])
-    qid = question_id("s0-probe", qs[0]) if qs else "q-000000000000"
-    text = receipt(qid)
-    out["question_id"] = qid
-    out["questions"] = [q.get("question") for q in qs]
-    mark = sess.mark()
-    if carrier == "deny":
-        sess.answer(req["request_id"], {"behavior": "deny", "message": text})
-    else:
-        answers = {q.get("question"): text for q in qs}
-        sess.answer(req["request_id"], {"behavior": "allow", "updatedInput": {**r.get("input", {}), "answers": answers}})
-    res = sess.wait(lambda e: L.is_result(e) or L.is_can_use_tool(e), timeout=180, start=mark)
-    evs = sess.since(mark)
-    later_requests = [e for e in evs if L.is_can_use_tool(e)]
-    while res is not None and L.is_can_use_tool(res):
-        # anything else that asks after the carrier: refuse and keep going
-        sess.answer(res["request_id"], {"behavior": "deny", "message": "not part of this probe"})
-        res = sess.wait(lambda e: L.is_result(e) or L.is_can_use_tool(e), timeout=180, start=res["_i"] + 1)
-    evs = sess.since(mark)
-    uses = L.tool_uses(evs)
-    out["after_carrier"] = {
-        "tool_result_seen": [x for x in L.tool_results(evs) if x["tool_use_id"] == r.get("tool_use_id")],
-        "later_tool_calls": [{"name": u["name"], "input": u["input"]} for u in uses],
-        "ran_ls": any(u["name"] == "Bash" and "ls" in json.dumps(u["input"]) for u in uses),
-        "re_asked": any(u["name"] == "AskUserQuestion" for u in uses),
-        "later_control_requests": [e["request"].get("tool_name") for e in later_requests],
-        "permission_denied_events": [
-            {k: e.get(k) for k in ("tool_name", "tool_use_id", "decision_reason_type", "message")}
-            for e in evs if e.get("type") == "system" and e.get("subtype") == "permission_denied"
-        ],
-    }
-    if res is not None:
-        out["result"] = {
-            "subtype": res.get("subtype"),
-            "is_error": res.get("is_error"),
-            "stop_reason": res.get("stop_reason"),
-            "terminal_reason": res.get("terminal_reason"),
-            "num_turns": res.get("num_turns"),
-            "permission_denials": res.get("permission_denials"),
-            "text": res.get("result"),
-            "usage": L.usage(res),
+    with L.Session(f"carrier-{carrier}-{n}", FLAGS) as sess:
+        out = {"carrier": carrier, "run": n}
+        sess.user(PROMPT)
+        init = sess.wait(L.is_type("system", "init"), timeout=60)
+        out["ask_tool_listed"] = init is not None and "AskUserQuestion" in (init.get("tools") or [])
+        req = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
+        if req is None or L.is_result(req):
+            out["error"] = "no AskUserQuestion control request"
+            out["result"] = None if req is None else req.get("result")
+            sess.close()
+            return out
+        r = req["request"]
+        out["control_request"] = {
+            "tool_name": r.get("tool_name"),
+            "requires_user_interaction": r.get("requires_user_interaction"),
+            "tool_use_id": r.get("tool_use_id"),
+            "t": req["_t"],
         }
-    # the §2a reply item, delivered at idle as its own turn
-    mark = sess.mark()
-    sess.user(f"Answer to {qid}: blue")
-    res2 = sess.wait(L.is_result, timeout=120, start=mark)
-    out["reply_turn"] = None if res2 is None else {"text": res2.get("result"), "uses_blue": "blue" in str(res2.get("result")).lower(), "usage": L.usage(res2)}
-    out["exit"] = sess.close()
-    return out
+        if r.get("tool_name") != "AskUserQuestion":
+            out["error"] = f"first control request was for {r.get('tool_name')}"
+            sess.answer(req["request_id"], {"behavior": "deny", "message": "not part of this probe"})
+            sess.close()
+            return out
+        qs = r.get("input", {}).get("questions", [])
+        qid = question_id("s0-probe", qs[0]) if qs else "q-000000000000"
+        text = receipt(qid)
+        out["question_id"] = qid
+        out["questions"] = [q.get("question") for q in qs]
+        mark = sess.mark()
+        if carrier == "deny":
+            sess.answer(req["request_id"], {"behavior": "deny", "message": text})
+        else:
+            answers = {q.get("question"): text for q in qs}
+            sess.answer(req["request_id"], {"behavior": "allow", "updatedInput": {**r.get("input", {}), "answers": answers}})
+        res = sess.wait(lambda e: L.is_result(e) or L.is_can_use_tool(e), timeout=180, start=mark)
+        evs = sess.since(mark)
+        later_requests = [e for e in evs if L.is_can_use_tool(e)]
+        while res is not None and L.is_can_use_tool(res):
+            # anything else that asks after the carrier: refuse and keep going
+            sess.answer(res["request_id"], {"behavior": "deny", "message": "not part of this probe"})
+            res = sess.wait(lambda e: L.is_result(e) or L.is_can_use_tool(e), timeout=180, start=res["_i"] + 1)
+        evs = sess.since(mark)
+        uses = L.tool_uses(evs)
+        out["after_carrier"] = {
+            "tool_result_seen": [x for x in L.tool_results(evs) if x["tool_use_id"] == r.get("tool_use_id")],
+            "later_tool_calls": [{"name": u["name"], "input": u["input"]} for u in uses],
+            "ran_ls": any(u["name"] == "Bash" and "ls" in json.dumps(u["input"]) for u in uses),
+            "re_asked": any(u["name"] == "AskUserQuestion" for u in uses),
+            "later_control_requests": [e["request"].get("tool_name") for e in later_requests],
+            "permission_denied_events": [
+                {k: e.get(k) for k in ("tool_name", "tool_use_id", "decision_reason_type", "message")}
+                for e in evs if e.get("type") == "system" and e.get("subtype") == "permission_denied"
+            ],
+        }
+        if res is not None:
+            out["result"] = {
+                "subtype": res.get("subtype"),
+                "is_error": res.get("is_error"),
+                "stop_reason": res.get("stop_reason"),
+                "terminal_reason": res.get("terminal_reason"),
+                "num_turns": res.get("num_turns"),
+                "permission_denials": res.get("permission_denials"),
+                "text": res.get("result"),
+                "usage": L.usage(res),
+            }
+        # the §2a reply item, delivered at idle as its own turn
+        mark = sess.mark()
+        sess.user(f"Answer to {qid}: blue")
+        res2 = sess.wait(L.is_result, timeout=120, start=mark)
+        out["reply_turn"] = None if res2 is None else {"text": res2.get("result"), "uses_blue": "blue" in str(res2.get("result")).lower(), "usage": L.usage(res2)}
+        out["exit"] = sess.close()
+        return out
 
 
 def main():

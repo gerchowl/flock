@@ -1736,6 +1736,22 @@ therefore most likely get the plaintext file, which is the Linux path of
 §1. Reading it back in a later session goes through `security
 find-generic-password` first.
 
+### Open S0 items
+
+S0 is not complete until these have run:
+
+1. **A.13 controls, pending a re-run.** `s0_parallel.py 2 10
+   sleep_then_mcp slowtouch_then_mcp` decides whether an open permission or
+   serial execution of non-concurrency-safe tools holds a later call
+   (finding 3). They need a login token in `S0_OAUTH_TOKEN_FILE`
+   (`claude setup-token`, docs/adr/0036-probes/README.md). The untested
+   case "a concurrency-safe call behind an open permission" belongs with
+   them.
+2. **A.16 `/login` as a user with no GUI session, BLOCKED on the
+   operator.** It needs a second macOS user. The operator runs
+   `s0_login_flk_agent.sh` as that user from a non-GUI shell and posts the
+   output on #1307.
+
 ### A.17 Gotchas met while probing
 
 - `--no-session-persistence` keeps the transcript out of the profile but

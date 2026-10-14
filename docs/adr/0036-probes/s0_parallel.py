@@ -92,30 +92,30 @@ CONTROLS = {
 
 def run_control(shape, n):
     prompt, extra = CONTROLS[shape]
-    sess = L.Session(f"parallel-{shape}-{n}", FLAGS + extra)
-    out = {"shape": shape, "run": n}
-    sess.user(prompt)
-    pos = 0
-    while True:
-        e = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120, start=pos)
-        if e is None or L.is_result(e):
-            res = e
-            break
-        out.setdefault("unexpected_prompts", []).append(e["request"].get("tool_name"))
-        sess.answer(e["request_id"], answer_for(e, "deny"))
-        pos = e["_i"] + 1
-    evs = sess.since(0)
-    uses = L.tool_uses(evs)
-    results = {x["tool_use_id"]: x["t"] for x in L.tool_results(evs)}
-    out["calls"] = [{"name": u["name"], "msg": u["msg"], "use_t": u["t"], "result_t": results.get(u["id"])} for u in uses]
-    sl = next((c for c in out["calls"] if c["name"] == "Bash"), None)
-    mc = next((c for c in out["calls"] if c["name"].startswith("mcp__")), None)
-    if sl and mc and sl["result_t"] and mc["result_t"]:
-        out["one_message"] = sl["msg"] == mc["msg"]
-        out["mcp_waited_for_sleep"] = mc["result_t"] >= sl["result_t"]
-    out["result"] = None if res is None else {"text": res.get("result"), "usage": L.usage(res)}
-    out["exit"] = sess.close()
-    return out
+    with L.Session(f"parallel-{shape}-{n}", FLAGS + extra) as sess:
+        out = {"shape": shape, "run": n}
+        sess.user(prompt)
+        pos = 0
+        while True:
+            e = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120, start=pos)
+            if e is None or L.is_result(e):
+                res = e
+                break
+            out.setdefault("unexpected_prompts", []).append(e["request"].get("tool_name"))
+            sess.answer(e["request_id"], answer_for(e, "deny"))
+            pos = e["_i"] + 1
+        evs = sess.since(0)
+        uses = L.tool_uses(evs)
+        results = {x["tool_use_id"]: x["t"] for x in L.tool_results(evs)}
+        out["calls"] = [{"name": u["name"], "msg": u["msg"], "use_t": u["t"], "result_t": results.get(u["id"])} for u in uses]
+        sl = next((c for c in out["calls"] if c["name"] == "Bash"), None)
+        mc = next((c for c in out["calls"] if c["name"].startswith("mcp__")), None)
+        if sl and mc and sl["result_t"] and mc["result_t"]:
+            out["one_message"] = sl["msg"] == mc["msg"]
+            out["mcp_waited_for_sleep"] = mc["result_t"] >= sl["result_t"]
+        out["result"] = None if res is None else {"text": res.get("result"), "usage": L.usage(res)}
+        out["exit"] = sess.close()
+        return out
 
 
 def answer_for(req, label):
@@ -129,70 +129,70 @@ def answer_for(req, label):
 
 
 def run(shape, n, hold_s):
-    sess = L.Session(f"parallel-{shape}-{n}", FLAGS + (MCP_FLAGS if "mcp" in shape else []))
-    out = {"shape": shape, "run": n, "hold_s": hold_s}
-    sess.user(PROMPTS[shape])
-    first = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
-    if first is None or L.is_result(first):
-        out["error"] = "no control request"
-        sess.close()
+    with L.Session(f"parallel-{shape}-{n}", FLAGS + (MCP_FLAGS if "mcp" in shape else [])) as sess:
+        out = {"shape": shape, "run": n, "hold_s": hold_s}
+        sess.user(PROMPTS[shape])
+        first = sess.wait(lambda e: L.is_can_use_tool(e) or L.is_result(e), timeout=120)
+        if first is None or L.is_result(first):
+            out["error"] = "no control request"
+            sess.close()
+            return out
+        uses = L.tool_uses(sess.since(0))
+        out["tool_calls_in_first_message"] = [
+            {"name": u["name"], "id": u["id"]} for u in uses if u["msg"] == (uses[0]["msg"] if uses else None)
+        ]
+        out["first_request"] = {"tool": first["request"].get("tool_name"), "tool_use_id": first["request"].get("tool_use_id"), "t": first["_t"]}
+        if "mcp" in shape:
+            # the MCP call never prompts: did its result arrive while the
+            # permission request is open?
+            got = sess.wait(lambda e: any(u["name"].startswith("mcp__") for u in L.tool_uses([e])), timeout=10)
+            mid = None if got is None else [u["id"] for u in L.tool_uses([got]) if u["name"].startswith("mcp__")][0]
+            res_ev = None if mid is None else sess.wait(
+                lambda e: any(x["tool_use_id"] == mid for x in L.tool_results([e])), timeout=hold_s)
+            out["mcp_result_while_permission_open"] = None if res_ev is None else {
+                "t": res_ev["_t"], "content": [x["content"] for x in L.tool_results([res_ev]) if x["tool_use_id"] == mid]}
+            mres = [x for x in L.tool_results(sess.since(0)) if x["tool_use_id"] == mid]
+            out["mcp_result_before_permission"] = bool(mres) and mres[0]["t"] < first["_t"]
+        second = sess.wait(L.is_can_use_tool, timeout=0 if "mcp" in shape else hold_s, start=first["_i"] + 1)
+        out["second_while_first_open"] = None if second is None else {
+            "tool": second["request"].get("tool_name"), "tool_use_id": second["request"].get("tool_use_id"), "t": second["_t"],
+            "gap_s": round(second["_t"] - first["_t"], 3),
+        }
+        answered = set()
+
+        def reply(req, how="deny"):
+            answered.add(req["request_id"])
+            sess.answer(req["request_id"], answer_for(req, how))
+
+        if second is not None:
+            reply(second)
+            tid = second["request"].get("tool_use_id")
+            got = sess.wait(lambda e: any(x["tool_use_id"] == tid for x in L.tool_results([e])), timeout=hold_s, start=second["_i"] + 1)
+            out["second_result_while_first_open"] = None if got is None else {"t": got["_t"], "content": [x for x in L.tool_results([got]) if x["tool_use_id"] == tid]}
+            out["first_answered_at"] = sess.now()
+            reply(first)
+        else:
+            out["first_answered_at"] = sess.now()
+            reply(first)
+        pos = first["_i"] + 1
+        while True:
+            e = sess.wait(lambda e: (L.is_can_use_tool(e) and e["request_id"] not in answered) or L.is_result(e), timeout=120, start=pos)
+            if e is None or L.is_result(e):
+                res = e
+                break
+            if second is None and "second_after_first_answered" not in out:
+                out["second_after_first_answered"] = {"tool": e["request"].get("tool_name"), "t": e["_t"],
+                                                      "gap_after_answer_s": round(e["_t"] - out["first_answered_at"], 3)}
+            reply(e)
+            pos = e["_i"] + 1
+        evs = sess.since(0)
+        out["timeline"] = [
+            {"t": e["_t"], "ev": f"can_use_tool:{e['request'].get('tool_name')}"} for e in evs if L.is_can_use_tool(e)
+        ] + [{"t": x["t"], "ev": f"tool_result:{x['tool_use_id'][-6:]}:{'err' if x['is_error'] else 'ok'}"} for x in L.tool_results(evs)]
+        out["timeline"].sort(key=lambda x: x["t"])
+        out["result"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error"), "num_turns": res.get("num_turns"), "usage": L.usage(res)}
+        out["exit"] = sess.close()
         return out
-    uses = L.tool_uses(sess.since(0))
-    out["tool_calls_in_first_message"] = [
-        {"name": u["name"], "id": u["id"]} for u in uses if u["msg"] == (uses[0]["msg"] if uses else None)
-    ]
-    out["first_request"] = {"tool": first["request"].get("tool_name"), "tool_use_id": first["request"].get("tool_use_id"), "t": first["_t"]}
-    if "mcp" in shape:
-        # the MCP call never prompts: did its result arrive while the
-        # permission request is open?
-        got = sess.wait(lambda e: any(u["name"].startswith("mcp__") for u in L.tool_uses([e])), timeout=10)
-        mid = None if got is None else [u["id"] for u in L.tool_uses([got]) if u["name"].startswith("mcp__")][0]
-        res_ev = None if mid is None else sess.wait(
-            lambda e: any(x["tool_use_id"] == mid for x in L.tool_results([e])), timeout=hold_s)
-        out["mcp_result_while_permission_open"] = None if res_ev is None else {
-            "t": res_ev["_t"], "content": [x["content"] for x in L.tool_results([res_ev]) if x["tool_use_id"] == mid]}
-        mres = [x for x in L.tool_results(sess.since(0)) if x["tool_use_id"] == mid]
-        out["mcp_result_before_permission"] = bool(mres) and mres[0]["t"] < first["_t"]
-    second = sess.wait(L.is_can_use_tool, timeout=0 if "mcp" in shape else hold_s, start=first["_i"] + 1)
-    out["second_while_first_open"] = None if second is None else {
-        "tool": second["request"].get("tool_name"), "tool_use_id": second["request"].get("tool_use_id"), "t": second["_t"],
-        "gap_s": round(second["_t"] - first["_t"], 3),
-    }
-    answered = set()
-
-    def reply(req, how="deny"):
-        answered.add(req["request_id"])
-        sess.answer(req["request_id"], answer_for(req, how))
-
-    if second is not None:
-        reply(second)
-        tid = second["request"].get("tool_use_id")
-        got = sess.wait(lambda e: any(x["tool_use_id"] == tid for x in L.tool_results([e])), timeout=hold_s, start=second["_i"] + 1)
-        out["second_result_while_first_open"] = None if got is None else {"t": got["_t"], "content": [x for x in L.tool_results([got]) if x["tool_use_id"] == tid]}
-        out["first_answered_at"] = sess.now()
-        reply(first)
-    else:
-        out["first_answered_at"] = sess.now()
-        reply(first)
-    pos = first["_i"] + 1
-    while True:
-        e = sess.wait(lambda e: (L.is_can_use_tool(e) and e["request_id"] not in answered) or L.is_result(e), timeout=120, start=pos)
-        if e is None or L.is_result(e):
-            res = e
-            break
-        if second is None and "second_after_first_answered" not in out:
-            out["second_after_first_answered"] = {"tool": e["request"].get("tool_name"), "t": e["_t"],
-                                                  "gap_after_answer_s": round(e["_t"] - out["first_answered_at"], 3)}
-        reply(e)
-        pos = e["_i"] + 1
-    evs = sess.since(0)
-    out["timeline"] = [
-        {"t": e["_t"], "ev": f"can_use_tool:{e['request'].get('tool_name')}"} for e in evs if L.is_can_use_tool(e)
-    ] + [{"t": x["t"], "ev": f"tool_result:{x['tool_use_id'][-6:]}:{'err' if x['is_error'] else 'ok'}"} for x in L.tool_results(evs)]
-    out["timeline"].sort(key=lambda x: x["t"])
-    out["result"] = None if res is None else {"text": res.get("result"), "is_error": res.get("is_error"), "num_turns": res.get("num_turns"), "usage": L.usage(res)}
-    out["exit"] = sess.close()
-    return out
 
 
 def main():

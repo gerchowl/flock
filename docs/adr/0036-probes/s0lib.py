@@ -28,6 +28,7 @@ Raw captures go to `$S0_OUT` (default: a temporary directory). They hold
 account rate-limit state, so they are not committed.
 """
 
+import atexit
 import json
 import os
 import shutil
@@ -99,32 +100,75 @@ def out_dir():
     return d
 
 
+# Every temporary cwd and config dir a Session makes is registered here and
+# removed at interpreter exit if close() did not get to it (an exception
+# outside a `with`, Ctrl-C between sessions). SIGKILL still leaks them.
+_LIVE_DIRS = set()
+
+
+def _mkdtemp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix)
+    _LIVE_DIRS.add(d)
+    return d
+
+
+def _rmdir(d):
+    shutil.rmtree(d, ignore_errors=True)
+    _LIVE_DIRS.discard(d)
+
+
+@atexit.register
+def _remove_leftover_dirs():
+    for d in list(_LIVE_DIRS):
+        _rmdir(d)
+
+
 class Session:
+    """One throwaway session. Use it as a context manager:
+
+        with s0lib.Session(name, flags) as sess:
+            ...
+
+    Leaving the block (normally, by an exception or by Ctrl-C) closes the
+    session and removes its temporary dirs.
+    """
+
     def __init__(self, name, flags, env_extra=None, cwd_files=None):
         require_login()
         self.name = name
         self.t0 = time.monotonic()
-        self.cwd = tempfile.mkdtemp(prefix="s0-cwd-")
-        self.config_dir = tempfile.mkdtemp(prefix="s0-cfg-")
-        for fname, body in (cwd_files or {"a.txt": "alpha\n", "b.txt": "beta\n"}).items():
-            with open(os.path.join(self.cwd, fname), "w") as f:
-                f.write(body)
-        self.events = []
-        self.cond = threading.Condition()
-        self.out_path = os.path.join(out_dir(), f"{name}.jsonl")
-        self.log = open(self.out_path, "w")
-        self.argv = [CLAUDE] + BASE_FLAGS + list(flags)
-        self.log.write(json.dumps({"_argv": self.argv, "_cwd": self.cwd}) + "\n")
-        self.proc = subprocess.Popen(
-            self.argv,
-            cwd=self.cwd,
-            env=clean_env(self.config_dir, env_extra),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        self.proc = None
+        self.log = None
+        self._closed = False
+        self._returncode = None
+        self.cwd = _mkdtemp("s0-cwd-")
+        self.config_dir = _mkdtemp("s0-cfg-")
+        try:
+            for fname, body in (cwd_files or {"a.txt": "alpha\n", "b.txt": "beta\n"}).items():
+                with open(os.path.join(self.cwd, fname), "w") as f:
+                    f.write(body)
+            self.events = []
+            self.cond = threading.Condition()
+            self.out_path = os.path.join(out_dir(), f"{name}.jsonl")
+            self.log = open(self.out_path, "w")
+            self.argv = [CLAUDE] + BASE_FLAGS + list(flags)
+            self.log.write(json.dumps({"_argv": self.argv, "_cwd": self.cwd}) + "\n")
+            self.proc = subprocess.Popen(
+                self.argv,
+                cwd=self.cwd,
+                env=clean_env(self.config_dir, env_extra),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except BaseException:
+            if self.log is not None:
+                self.log.close()
+            _rmdir(self.cwd)
+            _rmdir(self.config_dir)
+            raise
         self.stderr = []
         threading.Thread(target=self._pump, daemon=True).start()
         threading.Thread(target=self._pump_err, daemon=True).start()
@@ -212,22 +256,49 @@ class Session:
         with self.cond:
             return list(self.events[start:])
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
     def close(self, timeout=30):
+        """Stop the session's own child and remove its dirs. Idempotent.
+
+        Only `self.proc`, the child this Session started, is ever signalled.
+        The dirs are removed in `finally`, whatever the waits do.
+        """
+        if self._closed:
+            return self._returncode
+        self._closed = True
         try:
-            self.proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            self.proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.proc.terminate()
-            self.proc.wait(timeout=10)
-        self.wait(lambda e: e.get("type") == "_eof", timeout=5)
-        self.log.write(json.dumps({"_exit": self.proc.returncode, "_stderr_tail": "".join(self.stderr)[-2000:]}) + "\n")
-        self.log.close()
-        shutil.rmtree(self.cwd, ignore_errors=True)
-        shutil.rmtree(self.config_dir, ignore_errors=True)
-        return self.proc.returncode
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            self.wait(lambda e: e.get("type") == "_eof", timeout=5)
+            self._returncode = self.proc.returncode
+            self.log.write(json.dumps({"_exit": self._returncode, "_stderr_tail": "".join(self.stderr)[-2000:]}) + "\n")
+        finally:
+            try:
+                self.log.close()
+            finally:
+                _rmdir(self.cwd)
+                _rmdir(self.config_dir)
+        return self._returncode
 
 
 def is_type(t, subtype=None):

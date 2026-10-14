@@ -63,23 +63,23 @@ def set_mode(sess, mode, **extra):
 
 
 def main():
-    sess = L.Session("permmode", FLAGS)
-    steps = []
-    steps.append({"step": "1 default", **turn(sess, "Use the Write tool to create one.txt containing 1. Do nothing else.")})
-    steps.append({"step": "2 set acceptEdits", "switch": set_mode(sess, "acceptEdits"),
-                  **turn(sess, "Use the Write tool to create two.txt containing 2. Do nothing else.")})
-    steps.append({"step": "3 set default", "switch": set_mode(sess, "default"),
-                  **turn(sess, "Use the Write tool to create three.txt containing 3. Do nothing else.")})
-    steps.append({"step": "4 mid-turn acceptEdits",
-                  **turn(sess, "Run `sleep 4` with Bash. After it finishes, use the Write tool to create four.txt containing 4.",
-                         during=lambda s: set_mode(s, "acceptEdits"))})
-    steps.append({"step": "5 refused values", "switches": [set_mode(sess, m) for m in ("bypassPermissions", "plan", "bogus")]})
-    # a plain reply only reads the mode: a Write in plan mode would write a
-    # plan file into the profile's plans/ directory
-    steps.append({"step": "6 after refusals", **turn(sess, "Reply with exactly: ok")})
-    files = sorted(f for f in os.listdir(sess.cwd) if f.endswith(".txt") and f not in ("a.txt", "b.txt"))
-    code = sess.close()
-    L.emit({"steps": steps, "files_created": files, "exit": code})
+    with L.Session("permmode", FLAGS) as sess:
+        steps = []
+        steps.append({"step": "1 default", **turn(sess, "Use the Write tool to create one.txt containing 1. Do nothing else.")})
+        steps.append({"step": "2 set acceptEdits", "switch": set_mode(sess, "acceptEdits"),
+                      **turn(sess, "Use the Write tool to create two.txt containing 2. Do nothing else.")})
+        steps.append({"step": "3 set default", "switch": set_mode(sess, "default"),
+                      **turn(sess, "Use the Write tool to create three.txt containing 3. Do nothing else.")})
+        steps.append({"step": "4 mid-turn acceptEdits",
+                      **turn(sess, "Run `sleep 4` with Bash. After it finishes, use the Write tool to create four.txt containing 4.",
+                             during=lambda s: set_mode(s, "acceptEdits"))})
+        steps.append({"step": "5 refused values", "switches": [set_mode(sess, m) for m in ("bypassPermissions", "plan", "bogus")]})
+        # a plain reply only reads the mode: a Write in plan mode would write a
+        # plan file into the profile's plans/ directory
+        steps.append({"step": "6 after refusals", **turn(sess, "Reply with exactly: ok")})
+        files = sorted(f for f in os.listdir(sess.cwd) if f.endswith(".txt") and f not in ("a.txt", "b.txt"))
+        code = sess.close()
+        L.emit({"steps": steps, "files_created": files, "exit": code})
 
 
 if __name__ == "__main__":
