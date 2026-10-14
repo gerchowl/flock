@@ -10,7 +10,6 @@
 mod support;
 
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -129,19 +128,12 @@ fn create_workspace(api_socket: &Path, cwd: &Path) {
 /// correctly refuses it with `pane_not_found` — so the id has to come from the
 /// API rather than be composed.
 fn create_workspace_reporting_pane(api_socket: &Path, cwd: &Path) -> String {
-    let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
     let request = format!(
         "{{\"id\":\"test:ws\",\"method\":\"workspace.create\",\"params\":{{\"cwd\":\"{}\",\"focus\":true}}}}\n",
         cwd.display()
     );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = std::io::BufReader::new(stream);
-    let mut response = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+    let response = support::json_api::request(api_socket, &request, Duration::from_secs(10))
+        .expect("API exchange should complete");
     assert!(
         response.contains("\"result\""),
         "workspace.create failed: {response}"
@@ -897,7 +889,6 @@ fn the_agent_field_reaches_a_real_frame_in_both_sections_and_all_three_modes() {
 /// Tell a sandboxed server that `pane_id` is running `agent`, through the same
 /// socket verb a hook integration uses.
 fn report_agent(api_socket: &Path, pane_id: &str, agent: &str) {
-    let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
     // The source is DELIBERATELY not `flock:claude`. That spelling is a RESERVED
     // native source — `is_reserved_native_state_source` matches it — and a
     // report under a reserved source is routed to the session-reference store,
@@ -909,14 +900,8 @@ fn report_agent(api_socket: &Path, pane_id: &str, agent: &str) {
          \"pane_id\":\"{pane_id}\",\"source\":\"test:agent-field\",\"agent\":\"{agent}\",\
          \"state\":\"working\"}}}}\n"
     );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = std::io::BufReader::new(stream);
-    let mut response = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+    let response = support::json_api::request(api_socket, &request, Duration::from_secs(10))
+        .expect("API exchange should complete");
     assert!(
         response.contains("\"result\""),
         "pane.report_agent failed: {response}"
