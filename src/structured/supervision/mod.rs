@@ -126,19 +126,13 @@ impl Owner {
             }
         }
     }
-    fn living(&self) -> Vec<u32> {
-        self.tree
-            .iter()
-            .filter(|p| p.alive())
-            .map(|p| p.pid)
-            .collect()
+    fn has_living(&self) -> bool {
+        self.tree.iter().any(|identity| identity.alive())
     }
     fn signal(&self, signal: Signal) {
         // Recheck birth immediately before each signal; never signal an unknown pid.
-        for identity in self.tree.iter().rev() {
-            if identity.alive() {
-                platform::signal_processes(&[identity.pid], signal);
-            }
+        for identity in self.tree.iter().rev().filter(|identity| identity.alive()) {
+            platform::signal_processes(&[identity.pid], signal);
         }
     }
 }
@@ -229,7 +223,7 @@ pub fn supervise(
                 }
             }
         }
-        if status.is_some() && owner.living().is_empty() {
+        if status.is_some() && !owner.has_living() {
             let cleanup = finish_io()
                 .and_then(|()| failure.map_or_else(|| cleanup_transient(&owner, files.path()), Err))
                 .and_then(|()| files.remove_after_reap());
@@ -312,6 +306,9 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
     let mut bytes = Vec::new();
     match private_fs::open_regular_file(&path) {
         Ok(file) => {
+            if path.canonicalize()? != path {
+                return Err(io::Error::other("redirected Claude registry"));
+            }
             file.take(65_537).read_to_end(&mut bytes)?;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -335,13 +332,18 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
 /// Startup sweep on a worker: only dead, known supervisors are eligible. Live supervisors
 /// are untouched. Uncertain/malformed records fail explicitly and retain files.
 /// Recorded descendants are killed by matching birth identity before deletion.
+/// The state root must exist; aliases to that root are resolved, while linked
+/// namespace ancestors are refused before cleanup.
 pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
-    let parent = state.join("structured/sessions");
+    let parent = state.canonicalize()?.join("structured/sessions");
     let entries = match fs::read_dir(&parent) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
+    if parent.canonicalize()? != parent {
+        return Err(io::Error::other("redirected structured namespace"));
+    }
     private_fs::ensure_private_dir(&parent)?;
     let mut removed = 0;
     for entry in entries {
@@ -366,7 +368,7 @@ pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
         owner.write(&entry.path())?;
         owner.signal(Signal::Kill);
         let deadline = Instant::now() + KILL_GRACE;
-        while !owner.living().is_empty() {
+        while owner.has_living() {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

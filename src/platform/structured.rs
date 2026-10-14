@@ -147,6 +147,7 @@ pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Resu
         } else {
             !meta.is_file()
         })
+        || path.canonicalize()? != path
     {
         return Err(io::Error::other("unsafe Claude transient type/owner"));
     }
@@ -158,7 +159,6 @@ pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Resu
         if !path.is_absolute()
             || path.file_name() != Some(std::ffi::OsStr::new(&format!("{pid}.sock")))
             || !(name == Some("cc-socks") || name == Some(format!("cc-socks-{uid}").as_str()))
-            || parent.canonicalize()? != parent
         {
             return Err(io::Error::other("unsafe Claude socket path"));
         }

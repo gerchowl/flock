@@ -354,6 +354,21 @@ fn transient_cleanup_is_scoped_and_preserves_persistent_profile() {
     owner.write(&dir).expect("dead owner record");
     files.retain();
     drop(files);
+    let original = fixture.profile.join("original-sessions");
+    fs::rename(fixture.profile.join("sessions"), &original).expect("move registry fixture");
+    symlink(&original, fixture.profile.join("sessions")).expect("linked registry parent");
+    assert!(
+        sweep_stale_sessions(fixture.root.path()).is_err(),
+        "redirected registry refused"
+    );
+    assert!(original.join(format!("{}.json", identity.pid)).exists());
+    assert!(
+        socket.exists(),
+        "no socket unlink through redirected registry"
+    );
+    assert!(dir.exists());
+    fs::remove_file(fixture.profile.join("sessions")).expect("remove fixture link");
+    fs::rename(original, fixture.profile.join("sessions")).expect("restore registry parent");
     assert_eq!(sweep_stale_sessions(fixture.root.path()).expect("sweep"), 1);
     assert!(!registry.exists());
     assert!(!socket.exists());
@@ -500,4 +515,46 @@ fn failed_io_finalization_retains_files_after_tree_is_reaped() {
         0
     );
     assert!(path.exists(), "sweep cannot bypass live I/O ownership");
+}
+
+#[test]
+fn stale_sweep_refuses_a_linked_namespace_ancestor_without_deleting_files() {
+    let fixture = Fixture::new();
+    let mut files = prepare_session_files(fixture.root.path()).expect("files");
+    let name = files.path().file_name().expect("session name").to_owned();
+    let current = ProcessIdentity::capture(std::process::id()).expect("fixture identity");
+    let dead = ProcessIdentity {
+        birth: current.birth.wrapping_add(1),
+        ..current
+    };
+    Owner {
+        owner: dead,
+        supervisor: dead,
+        uncertain: false,
+        profile: None,
+        tree: vec![dead],
+    }
+    .write(files.path())
+    .expect("fictional dead supervisor");
+    files.retain();
+    drop(files);
+    let structured = fixture.root.path().join("structured");
+    let moved = fixture.root.path().join("moved-structured");
+    fs::rename(&structured, &moved).expect("move owned namespace");
+    symlink(&moved, &structured).expect("linked namespace ancestor");
+    assert!(
+        sweep_stale_sessions(fixture.root.path()).is_err(),
+        "redirected namespace refused"
+    );
+    assert!(moved
+        .join("sessions")
+        .join(&name)
+        .join("owner.json")
+        .exists());
+    fs::remove_file(&structured).expect("remove namespace link");
+    fs::rename(&moved, &structured).expect("restore owned namespace");
+    assert_eq!(
+        sweep_stale_sessions(fixture.root.path()).expect("valid sweep"),
+        1
+    );
 }
