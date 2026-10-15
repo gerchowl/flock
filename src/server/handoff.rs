@@ -297,6 +297,21 @@ pub(crate) fn accept_and_validate_on(
     Ok(stream)
 }
 
+/// Typed importer refusal retained inside `io::Error` through rollback.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(super) struct ImportRefusal(String);
+
+#[cfg(unix)]
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "handoff import refused: {}", self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ImportRefusal {}
+
 /// Read one line from the importer and require it to be `expected`. A line
 /// carrying [`IMPORT_REFUSAL_PREFIX`] is the importer naming why it refused,
 /// and surfaces as `handoff import refused: <reason>` at whichever step the
@@ -309,9 +324,7 @@ fn expect_line(stream: &mut UnixStream, expected: &str, what: &str) -> io::Resul
         return Ok(());
     }
     if let Some(reason) = trimmed.strip_prefix(IMPORT_REFUSAL_PREFIX) {
-        return Err(io::Error::other(format!(
-            "handoff import refused: {reason}"
-        )));
+        return Err(io::Error::other(ImportRefusal(reason.to_owned())));
     }
     Err(io::Error::other(format!(
         "{what}: unexpected response {trimmed:?}"
@@ -985,6 +998,9 @@ mod tests {
             err.to_string(),
             "handoff import refused: pane restore failed"
         );
+        assert!(err
+            .get_ref()
+            .is_some_and(|cause| cause.is::<ImportRefusal>()));
 
         let (mut importer_side, mut exporter_side) =
             UnixStream::pair().expect("socketpair available");
@@ -1228,6 +1244,53 @@ mod tests {
         drop(sender);
         drop(receiver);
         assert_all_write_ends_closed(&reads);
+    }
+
+    /// The receiver can stop reading after a batch while originals remain
+    /// owned by the exporter. No scheduling race is needed to produce EPIPE.
+    #[test]
+    fn closed_reader_after_first_fd_batch_returns_broken_pipe_and_keeps_originals() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socketpair");
+        sender
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write ceiling");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read ceiling");
+        let (reads, writes) = pipes(150);
+        send_fd_batch(&sender, &writes[..64]).expect("first batch");
+        let imported = recv_fds(&receiver, 64).expect("first batch received");
+        assert_eq!(imported.len(), 64);
+        close_fds(&imported);
+        receiver
+            .shutdown(std::net::Shutdown::Read)
+            .expect("close read side");
+        let half_closed = send_fd_batch(&sender, &writes[64..128])
+            .expect_err("a half-closed reader cannot receive the next batch");
+        assert!(
+            matches!(half_closed.raw_os_error(), Some(libc::EPIPE | libc::EINVAL)),
+            "unexpected half-close error: {half_closed}"
+        );
+        drop(receiver);
+        let err = send_fds_and_wait_restored(&mut sender, &writes[64..])
+            .expect_err("the next batch cannot reach a closed reader");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        for (&read, &write) in reads.iter().zip(&writes) {
+            let byte = b'x';
+            assert_eq!(
+                unsafe { libc::write(write, (&byte as *const u8).cast(), 1) },
+                1
+            );
+            let mut got = 0u8;
+            assert_eq!(
+                unsafe { libc::read(read, (&mut got as *mut u8).cast(), 1) },
+                1
+            );
+            assert_eq!(got, byte, "every original descriptor remains usable");
+        }
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        close_fds(&reads);
     }
 
     #[test]
