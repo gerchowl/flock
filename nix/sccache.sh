@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# sccache 0.15 has no server-only TMPDIR setting. Apply it on every invocation
+# sccache 0.18 has no server-only TMPDIR setting. Apply it on every invocation
 # so automatic startup, explicit startup, and idle restarts use the same root.
 # Leave artifact storage unset by default so sccache keeps its platform cache.
 if [ -n "${SCCACHE_DIR:-}" ]; then
