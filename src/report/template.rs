@@ -11,7 +11,7 @@
 //! would additionally pull a YAML parser into `[build-dependencies]` (the lock
 //! file has none today, and the maintained options are thin).
 //!
-//! So the table lives here, and [`tests::table_matches_the_checked_in_forms`]
+//! So the table lives here, and the test `tests::table_matches_the_checked_in_forms`
 //! is the drift gate: it re-reads the real YAML and fails if the two disagree.
 //! The check degrades to a skip when `.github` is absent, which is exactly the
 //! sandboxed-build case — CI and every developer checkout do have it.

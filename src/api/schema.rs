@@ -4843,7 +4843,7 @@ pub struct PeerWorkspaceSummary {
     /// Workspace display name (custom name or derived label).
     pub workspace: String,
     /// Machine-independent project identity (normalized origin URL or
-    /// "dir:<name>"), used to fold remote rows into local project groups.
+    /// `dir:<name>`), used to fold remote rows into local project groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     /// Repo folder name, labels remote-only project groups.
@@ -4890,14 +4890,6 @@ pub struct PeerAgentSummary {
     pub status: AgentStatus,
 }
 
-/// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
-///
-/// Provenance is explicit via [`origin`](Self::origin): the SHORT HOST NAME of
-/// the polling server that last talked to this peer. Loop prevention rides on
-/// this field — a receiver drops any relayed entry whose `origin` equals its
-/// own short host, and the answering server NEVER re-relays entries it received
-/// via relay (only its own polled peers). Result: entries travel exactly one
-/// hop.
 /// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
 ///
 /// Gossip otherwise flows only UP: a poller learns what its pollee relays. A
@@ -4923,6 +4915,14 @@ pub struct PeersHubFleetParams {
     pub hub_self: Option<Box<RelayedFleetPeer>>,
 }
 
+/// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
+///
+/// Provenance is explicit via [`origin`](Self::origin): the SHORT HOST NAME of
+/// the polling server that last talked to this peer. Loop prevention rides on
+/// this field — a receiver drops any relayed entry whose `origin` equals its
+/// own short host, and the answering server NEVER re-relays entries it received
+/// via relay (only its own polled peers). Result: entries travel exactly one
+/// hop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedFleetPeer {
     #[serde(default, skip_serializing_if = "Option::is_none")]

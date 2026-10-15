@@ -3604,7 +3604,7 @@ fn slot_death_hook(
     })
 }
 
-/// Build the active slot's [`SlotWriter`] (always) and, when `[slots] enabled`,
+/// Build the active slot's [`slots::SlotWriter`] (always) and, when `[slots] enabled`,
 /// the connection-slots manager owning that same writer as its active
 /// connection plus the warm-all target list. Takes ownership of the active
 /// write stream (moved into the writer thread); the reader was already spawned

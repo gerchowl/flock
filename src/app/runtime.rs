@@ -800,7 +800,16 @@ impl App {
     /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
     /// (headless).
     pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
-        self.dispatch_due_script_checks_with(now, |check| crate::checks::run_script(check).0)
+        self.dispatch_due_script_checks_with(now, |check| {
+            let (outcome, output) = crate::checks::run_script(check);
+            (
+                outcome,
+                crate::checks::script::CaptureNotes {
+                    stdout: output.stdout_note,
+                    stderr: output.stderr_note,
+                },
+            )
+        })
     }
 
     /// Dispatch due checks using the supplied executor. Execution stays on a
@@ -808,7 +817,9 @@ impl App {
     fn dispatch_due_script_checks_with(
         &mut self,
         now: Instant,
-        execute: impl Fn(&crate::checks::config::ScriptCheck) -> crate::checks::Outcome
+        execute: impl Fn(
+                &crate::checks::config::ScriptCheck,
+            ) -> (crate::checks::Outcome, crate::checks::script::CaptureNotes)
             + Clone
             + Send
             + 'static,
@@ -845,12 +856,13 @@ impl App {
                 let execute = execute.clone();
                 std::thread::spawn(move || {
                     let start = Instant::now();
-                    let outcome = execute(&job.check);
+                    let (outcome, capture_notes) = execute(&job.check);
                     let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     let _ = event_tx.blocking_send(crate::events::AppEvent::CheckCompleted {
                         name: job.name,
                         outcome,
                         duration_ms,
+                        capture_notes,
                     });
                 });
                 changed = true;
@@ -910,7 +922,15 @@ impl App {
         name: String,
         outcome: crate::checks::Outcome,
         duration_ms: u64,
+        capture_notes: crate::checks::script::CaptureNotes,
     ) {
+        if self.checks_runner.capture_warning(&name, &capture_notes) {
+            crate::logging::check_capture_failed(
+                &name,
+                capture_notes.stdout.as_deref(),
+                capture_notes.stderr.as_deref(),
+            );
+        }
         self.checks_run_count = self.checks_run_count.saturating_add(1);
         let outcome_label = match &outcome {
             crate::checks::Outcome::Fire => "fire",
@@ -1296,7 +1316,7 @@ impl App {
     }
 
     /// Snapshot every live pane's blocked-alert relevant fields, and hand
-    /// them to the [`BlockedAlertFold`]. Any fires are dispatched through
+    /// them to the [`crate::checks::BlockedAlertFold`]. Any fires are dispatched through
     /// the same Notify + `CheckFired` path used by script checks so the
     /// `[ui.toast]` policy applies uniformly and one code path emits the
     /// durable event.
@@ -2407,6 +2427,67 @@ mod tests {
         assert!(app.pending_agent_resume_deadline.is_none());
     }
 
+    #[tokio::test]
+    async fn capture_warnings_follow_worker_completion_state_changes() {
+        use crate::checks::script::CaptureNotes;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.min_tick_secs = 1;
+        config.checks.scripts = vec![crate::checks::config::ScriptCheck {
+            name: "capture-e2e".into(),
+            program: std::env::temp_dir().join("unused-capture-executor"),
+            debounce: 1,
+            ..crate::checks::config::ScriptCheck::default()
+        }];
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        for (stdout, stderr, warnings) in [
+            (Some("held pipe"), Some("held pipe"), 1),
+            (Some("held pipe"), Some("held pipe"), 0),
+            (Some("held pipe"), Some("reader failed"), 1),
+            (None, None, 0),
+            (Some("held pipe"), Some("held pipe"), 1),
+        ] {
+            let notes = CaptureNotes {
+                stdout: stdout.map(str::to_owned),
+                stderr: stderr.map(str::to_owned),
+            };
+            app.checks_runner.force_due("capture-e2e", Instant::now());
+            app.checks_next_deadline = Some(Instant::now());
+            assert!(
+                app.dispatch_due_script_checks_with(Instant::now(), move |_| {
+                    (crate::checks::Outcome::Fire, notes.clone())
+                })
+            );
+            let event = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let event = app.event_rx.recv().await.expect("worker channel closed");
+                    if matches!(&event, crate::events::AppEvent::CheckCompleted { name, .. } if name == "capture-e2e") {
+                        break event;
+                    }
+                    app.handle_internal_event(event);
+                }
+            }).await.expect("capture worker did not complete");
+            let logs = crate::logging::capture_logs(|| app.handle_internal_event(event));
+            assert_eq!(
+                logs.matches("check.capture.failed").count(),
+                warnings,
+                "{logs}"
+            );
+            if warnings != 0 {
+                assert!(
+                    logs.contains("stdout_reason") && logs.contains("stderr_reason"),
+                    "{logs}"
+                );
+            }
+        }
+        assert_eq!(app.checks_run_count, 5);
+        assert_eq!(
+            app.checks_error_count, 0,
+            "capture must not reclassify the script"
+        );
+    }
+
     /// #175 phase 4: a dispatched check completion wired through the App
     /// tick emits `CheckRan { outcome = "fire" }` and (with
     /// `debounce = 1`) a `CheckFired` on the event hub.
@@ -2447,7 +2528,10 @@ mod tests {
                     .unwrap()
                     .recv_timeout(Duration::from_secs(30))
                     .expect("test must release the check executor");
-                crate::checks::Outcome::Fire
+                (
+                    crate::checks::Outcome::Fire,
+                    crate::checks::script::CaptureNotes::default(),
+                )
             })
         );
         assert_eq!(app.checks_run_count, 0);

@@ -299,10 +299,14 @@ impl ProfileConfigDir {
 
 /// Owns a fresh 0700 directory for generated session settings and MCP files,
 /// distinct from the persistent CLAUDE_CONFIG_DIR. Recursively removes it on drop,
-/// including during unwinding. Keep it until the child process group is gone.
+/// including during unwinding, unless armed for a spawn. Armed guards retain files
+/// until supervision confirms the descendant tree is gone.
 /// SIGKILL and filesystem failures cannot be recovered by a Rust destructor.
 #[derive(Debug)]
-pub struct SessionConfigDir(PathBuf);
+pub struct SessionConfigDir {
+    path: PathBuf,
+    retained: bool,
+}
 
 impl SessionConfigDir {
     /// Create under an existing parent, using OS entropy and atomic creation.
@@ -313,16 +317,29 @@ impl SessionConfigDir {
         let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let path = parent.canonicalize()?.join(format!("flk-claude-{suffix}"));
         private_fs::create_private_dir(&path)?;
-        Ok(Self(path))
+        Ok(Self {
+            path,
+            retained: false,
+        })
     }
 
     /// Temporary directory for this session's generated `--settings`/`--mcp-config`.
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// Retain files until the supervisor confirms descendants and transients are gone.
+    pub(super) fn retain(&mut self) {
+        self.retained = true;
+    }
+    /// Remove generated files explicitly after verified reaping; report disk errors.
+    pub(super) fn remove_after_reap(mut self) -> io::Result<()> {
+        self.retained = true;
+        fs::remove_dir_all(&self.path)
     }
 
     fn write(&self, name: &str, value: &impl Serialize) -> io::Result<PathBuf> {
-        let path = self.0.join(name);
+        let path = self.path.join(name);
         let file = private_fs::create_private_file(&path)?;
         serde_json::to_writer(file, value)?;
         Ok(path)
@@ -331,14 +348,17 @@ impl SessionConfigDir {
 
 impl Drop for SessionConfigDir {
     fn drop(&mut self) {
-        if let Err(err) = fs::remove_dir_all(&self.0) {
+        if self.retained {
+            return;
+        }
+        if let Err(err) = fs::remove_dir_all(&self.path) {
             crate::logging::structured_config_cleanup_failed(&err);
         }
     }
 }
 
 /// Prepared argv, typed settings and owned secrets, with no spawn side effects.
-/// Dropping a partially or fully prepared profile removes its session files.
+/// Dropping an unarmed profile removes its session files; arm before spawning.
 #[derive(Debug)]
 pub struct LaunchProfile {
     args: Vec<OsString>,
@@ -366,7 +386,7 @@ impl LaunchProfile {
                 .ok_or_else(|| io::Error::other("structured.token_file is required"))?,
         )?;
         let profile_directory = ProfileConfigDir::for_operator(state_dir, &config.profile)?;
-        let directory = SessionConfigDir::create(state_dir)?;
+        let directory = super::supervision::prepare_session_files(state_dir)?;
         let settings = LaunchSettings::default();
         let settings_path = directory.write("settings.json", &settings)?;
         let mcp_path = directory.write("mcp.json", &McpConfig::default())?;
@@ -408,6 +428,16 @@ impl LaunchProfile {
             profile_directory,
             directory,
         })
+    }
+
+    /// Arm generated files before attempting spawn, retaining uncertain lifetimes.
+    pub fn arm_session(&mut self) -> io::Result<()> {
+        super::supervision::arm_session_files(&mut self.directory)
+    }
+
+    /// Transfer generated-file ownership to supervision after spawn. Arm first.
+    pub fn into_session_files(self) -> SessionConfigDir {
+        self.directory
     }
 
     /// Arguments after the `claude` executable. No credential is on argv.

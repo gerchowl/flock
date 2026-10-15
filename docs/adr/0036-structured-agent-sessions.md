@@ -2136,3 +2136,26 @@ from them on 2026-10-14 (#1324, #1404), and each item ends with where.
    resume.
    *Not applied: §9's probe is unchanged; this is an option for S12 to
    weigh when it builds that probe.*
+
+
+### Amendment: Uncertain spawn records
+
+Owner decision, 2026-10-15 (#1461 review round 2): persist `uncertain=true`
+before spawn, then capture and persist the child's birth identity immediately
+when the owning supervisor receives the child, before enumerating descendants.
+A failed identity capture is explicit; an authoritative wait on our own child
+records its reaped status, including an immediate exit. Unknown descendants
+still prevent automatic cleanup.
+
+If a dead supervisor left no persisted child birth identity, quarantine the
+record with its first timestamp and reason. A sweep reports that directory as
+a distinct outcome, never signals a process or deletes the directory, and never
+retries its recovery. Later sweeps report the stored quarantine unchanged.
+Malformed or unsafe entries are retained and reported individually; they cannot
+prevent recovery of other eligible sessions. A namespace-level containment
+failure still refuses the whole scan.
+
+Operator cleanup is explicit: inspect the retained directory and associated
+processes, establish that none still uses it, then remove the directory by hand.
+No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
+operator tooling is a follow-up owned by the architect.
