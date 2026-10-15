@@ -194,10 +194,7 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
         _ => None,
     };
     let well_formed_agent_target = matches!(&method, Method::MsgSend(params)
-        if matches!(&params.to,
-            crate::api::schema::MessageTarget::Agent { agent: target }
-                | crate::api::schema::MessageTarget::Pane { pane: target }
-                if crate::terminal::AgentId::is_well_formed(target)));
+        if params.to.is_well_formed_agent_id());
     let flock_result = call_flock(method, flock).map_err(|mut error| {
         if name == "flock_msg_send" {
             if let Some(data) = error.data.as_mut() {

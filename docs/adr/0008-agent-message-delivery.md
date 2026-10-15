@@ -229,8 +229,11 @@ Resolution is intent-aware, shared by API, CLI, supervisors and reap paths:
 
 Ship this before native cross-node handoff. A local move commits the source
 record's durable lifecycle `moved` and an explicit successor reference
-`(successor_agent_id, successor_terminal_id, successor_pane_id, generation)`
-together with the local placement/alias update. Successor terminal/pane ids
+`(successor_server_id, successor_agent_id, successor_terminal_id,
+successor_pane_id, observed_generation)` together with the local placement/alias
+update. `successor_server_id` is an authenticated node identity, not a host label;
+terminal/pane ids are scoped to that server. `observed_generation` may be unknown
+for a legacy destination and never supplies ownership authority. Successor terminal/pane ids
 identify the different placement even when the AgentId is preserved. Ordinary
 hibernate remains a separate state: it must not create this marker implicitly.
 The marker survives restart and old snapshot replay through a durable local
@@ -258,6 +261,75 @@ may record the known successor as historical refusal data, never as authority
 for routing, starting, renaming or deleting it. Different existing AgentIds stay
 different pending explicit reconciliation. This first slice does not claim
 native-session exclusivity across hosts or implement identity transfer.
+
+#### Proposed command and baseline incident reproduction
+
+The slice-1 command is **proposed**, not present in the current CLI:
+`flk agent move <source> --successor-pane <local-pane-id>`. It commits the source's
+moved fence, successor reference and alias/placement projection in one local
+transaction. The source must already be stopped with its owned process tree
+confirmed gone; a live/uncertain source refuses. The successor must exist and
+be operator-verified as the intended conversation. Preserve the move contract
+for a managed same-identity placement transfer. For legacy independently minted
+AgentIds, this command records explicit retirement and a historical successor
+link only; it does not merge identities, mail or histories. A source-generation
+compare-and-set rejects stale or competing operations; revalidate the selected
+successor's AgentId, terminal and placement in that same transaction. An explicit
+pane selects the successor even when both placements preserve one AgentId. Ordinary hibernate alone
+must not imply a move, and the command grants no worktree deletion authority.
+
+The bug proof must not depend on this command existing. In an owned instance,
+use a fixture harness with a reported native session to create `worker`, then:
+
+```sh
+flk agent hibernate worker
+flk agent start moved-worker -- "$FIXTURE_HARNESS" --resume "$NATIVE_SESSION"
+flk agent send worker "probe"
+```
+
+These are existing verbs; "spawn" here means `agent start`, not an invented
+`agent spawn` CLI. Assert the baseline resolver selects the hibernated source
+and never addresses `moved-worker`. "Reaches" means stale target selection, not
+successful byte delivery: the existing submit guard can refuse the stopped
+runtime. Do not bypass that guard to manufacture a send into a dead PTY.
+
+For a failing-before **resolver regression**, preserve that command-produced
+incident snapshot and add the proposed durable retirement fact as fixture input
+in the separate move ledger. The old build can load the same existing snapshot
+and ignores the extra ledger; execute the existing `agent send worker "probe"`
+on both builds. The old build still selects the stale source or gives its generic
+inactive refusal, failing the assertion for `agent_moved`, `retry: never` and the
+successor reference. The fixed build loads the fence and gives that refusal with
+zero input to either pane. This tests ignored retirement, not CLI parse failure.
+A separate command-to-ledger test must drive the proposed `agent move` on the
+fixed build and prove it produces the same durable fact, survives restart and
+old-snapshot replay, and enforces the source/successor preconditions. An old
+build's missing-command error is interface evidence only, never the bug proof.
+
+#### Operator-verified successor on another server (slice 1)
+
+The proposed source-side operation is
+`flk agent move <source> --verified-successor @<receipt.json>`. It is operator-only
+and records a historical refusal hint. The receipt contains an authenticated
+`server_id`, the destination's stable `agent_id`, its opaque `terminal_id` and
+`pane_id`, an optional `observed_generation`, and verification provenance. Obtain
+that inventory on the destination through an explicitly configured, authenticated
+peer connection; a copied label, hostname or matching session-id string alone
+is insufficient. The operator confirms the source/destination session lineage
+and the stopped source before committing the link. The receipt is not a transfer
+certificate, dialing instruction or credential container.
+
+Persist the server identity with every successor id; a destination pane `1-1`
+is not the source server's pane `1-1`. Return the server-scoped tuple unchanged
+in `agent_moved` details, without looking up the remote pane/terminal locally.
+Unknown legacy generation remains unknown, never invented as an authoritative
+zero. A link must not rename or adopt the destination, publish a v5 ownership
+update, auto-route the send, authorize remote resume/reap, or merge its inbox.
+If the destination later disappears or verification becomes stale, retain the
+source fence, report the hint as unavailable/unverified and require explicit
+reconciliation. Never fall back to waking the old pane. This gives the incident's
+source names a useful destination hint before slice 3 while preserving both
+existing copies and the source's resource claims.
 
 ### Durable native-session exclusivity
 
@@ -314,6 +386,57 @@ requires the authenticated cross-node transfer below. Until that capability is
 approved and deployed, managed cross-node reuse is refused, and out-of-band
 harness launches remain outside this guarantee. Existing duplicate copies are
 protected, not killed or silently "fixed", by the migration policy below.
+
+#### Claim retirement and release (slice 2)
+
+Hibernation, a crash, ordinary process exit, pane detachment and a planned restart
+retain the claim and its resume rights. Deliberate agent removal or permanent
+pane close initiates claim retirement, not immediate key deletion. Persist the
+retirement intent and fence the current generation before removing its visible
+projection; cancel pending launches and invalidate its managed resume plan.
+Only the authoritative current owner may finalize release, after proving its
+exact owned process tree gone and proving that no pending launch/transfer or
+newer generation owns the session. A pane close that leaves a detached runner
+or a retained resume binding does not satisfy these conditions. Missing/uncertain
+identity retains/quarantines the claim for reconciliation.
+
+For an intentionally retained stopped record, an operator-only explicit-release
+operation supplies the full native-session claim key, owning AgentId and expected
+generation to the same fence and checks. Resolve that exact claim in the registry,
+including retired records, without requiring a live pane projection. It refuses a live, uncertain or foreign-owned claim; it does not kill by an
+unverified PID or offer a force takeover. Confirmed removal/close can finalize
+release automatically once teardown supplies the required evidence; a crash
+between retirement and release replays that intent and the evidence checks.
+Explicit release discards the old binding's managed resume rights. It does not
+delete native session data, messages, histories or worktrees.
+
+A released key becomes available for an explicitly admitted new atomic
+acquisition under the existing identity/reconciliation rules, but its durable
+retired-generation fence/counter remains. Old snapshots, retry plans and delayed
+remove/close events cannot recreate a claim or free a newer owner's claim.
+Release is idempotent for the exact owner/generation. Removing a moved source
+record never releases the destination's transferred claim, and an offline source
+cannot release another server's claim. Cross-node release still requires slice
+3's authenticated authority; the existing owner recovery decisions stand.
+
+#### Fresh launch compatibility decision (#1548, tracked in #1500)
+
+**Owner decision required:** for a harness that cannot accept a reserved native
+session id, choose whether the managed fresh-spawn path refuses or is explicitly
+unguarded. Recommendation: **refuse managed guarded fresh spawns** until an
+adapter can reserve a unique native id before launch. Do not silently fall back
+to an unguarded launch or label it protected. Discovering the native id after
+starting a process cannot prevent a duplicate process from already running.
+
+Cost: such harnesses lose managed fresh-spawn support in this rollout, even if
+their existing ordinary fresh-launch workflow works today. They need harness or
+adapter support before entering the guarantee. Existing unmanaged sessions stay
+protected by the legacy inventory/reconciliation policy; this recommendation
+does not authorize automatic shutdown or adoption. An owner-approved explicit
+unguarded mode could preserve fresh-launch usability, but would offer no durable
+exclusivity guarantee and must never be used as a resume/move fallback. This is
+an additional compatibility decision, not a change to the four existing owner
+decisions below; no launch behavior is changed by this documentation PR.
 
 ### Atomicity and failure recovery
 
@@ -455,9 +578,13 @@ against the baseline, then pass with the accepted change, using owned fakes:
 
 | Criterion | Required failing-before proof |
 | --- | --- |
-| Local moved refusal, mesh v5 unchanged (slice 1) | On one server create a named hibernated source and a successor pane; commit a local move, restart and replay an old snapshot. Explicit old pane/terminal and source-only historical name/label mutations return `agent_moved`, `retry: never`, `GONE` and the successor id with zero bytes/spawns/wakes/reaps. A transferred name/current AgentId resolves to the successor instead; never select the old record first. Without the fence the stale source resolves or resumes. Assert mesh VERSION 5 and unchanged normal v5 mail behavior. |
+| Existing-step incident and moved refusal, mesh v5 unchanged (slice 1) | Hibernate `worker`, start `moved-worker` on the same native session through the existing `agent start`, then `agent send worker "probe"`. Baseline selects the hibernated source, not the running copy; assert target selection, not successful bytes. Seed the separate retirement-ledger fixture beside this existing snapshot and restart both builds. The unchanged send command must return `agent_moved`, `retry: never`, `GONE` and the successor tuple with zero input. Old code ignores the fence and fails this assertion by selecting/refusing the stale source. Explicit old pane/terminal also refuses; a committed transferred current name/AgentId resolves to its successor. Mesh VERSION stays 5. |
+| Local move command produces the fence (slice 1) | On the fixed build, drive proposed `flk agent move <source> --successor-pane <local-pane-id>` from the same incident setup. Assert durable source retirement, successor/alias consistency, refusal after restart/old-snapshot replay, and zero mutation for a live/uncertain source or missing/mismatched successor. Legacy different AgentIds/histories remain distinct. This covers the command-to-ledger seam; missing-command errors on the baseline do not count as the resolver bug proof. |
+| Operator-verified remote successor link (slice 1) | Create the incident across two owned servers with colliding local pane/terminal ids. Record a verified destination inventory using proposed `flk agent move <source> --verified-successor @<receipt.json>`. After restart/snapshot replay, existing `agent send <source-name>` and explicit old targets refuse with `agent_moved`, `retry: never`, authenticated destination server id plus opaque remote agent/terminal/pane ids. A legacy unknown generation stays unknown. Assert zero bytes/spawns/renames/reaps on either server and no v5 ownership update or mail/history merge. Reject unverified/mismatched inventory before mutation; lose the destination afterward and assert the source remains fenced with an unavailable hint. The equivalent ledger fixture fails the old resolver without relying on the new command's absence. |
 | Native-session exclusivity (slice 2) | Use an owned fake harness and one session namespace/id. Race resume and spawn into distinct panes, including a `moved-` label and a store alias: one durable claim wins and at most one process starts; the other returns `native_session_claimed`. Reopen the registry after restart and repeat. Without the guard both launch. |
 | Claim crash recovery and legacy protection (slice 2) | Crash after reservation, spawn-before-child-record, child record and hibernation. A proven stopped owner can explicitly resume; uncertain identity and a live different owner retain/refuse. Seed legacy source plus running guest-copy records with no new claims; rollout preserves both histories/resources and the current process, marks the conflict, and refuses another launch. Restoring a stale snapshot or waiting cannot clear the claim. Without these checks a duplicate launch or destructive adoption occurs. |
+| Claim release on deliberate retirement (slice 2) | Acquire a session, then independently exercise agent removal, permanent pane close and explicit release of the exact native-session key/owner/generation. Each fences the exact owner/generation, rejects further old resume, and frees the key only after confirmed teardown and no pending transfer/launch. A new owner can acquire it afterward. Hibernate, crash, detached runner, uncertain birth identity and foreign/moved-source removal retain/refuse. Crash between retirement and release, replay the old snapshot, and deliver a delayed old close after a new acquisition: no old resurrection, premature release or release of the new claim. Old missing release handling fails by keeping a confirmed retired key claimed; unsafe eager release fails by permitting concurrent ownership. |
+| Fresh-spawn compatibility (slice 2, owner decision pending) | With a harness incapable of caller-selected ids, the recommended guarded mode refuses before creating any process or claim and reports the unsupported capability; no unguarded fallback. A capable owned fake reserves the id before launch and acquires exactly once. Test whichever explicit policy the owner accepts; an existing ordinary launch succeeding must not be counted as guarded exclusivity evidence. |
 | Name and AgentId address the current episode (slice 3) | Begin with a named hibernated source on one server and a differently placed guest destination; transfer, restart both, resolve/send the original identity, and assert only the destination receives bytes. This cross-node assertion is not acceptance evidence for slice 1 alone. |
 | No ambiguous/inactive mutation | Duplicate names/current claims and explicit historical targets refuse with candidate/current hints and zero input, including focus/resume and reap. |
 | Atomic handoff and recovery (slice 3) | Fault each durable phase and lose each acknowledgement; replay and race two moves. Disconnect the source in prepare: destination cancels prepare and starts no process. Exercise uncertain release separately: both sides retain fences pending durable proof. Assert at most one authorized process/alias, stable generation and no source wake after release. A silent producer still fails at a bounded liveness-aware ceiling. |
