@@ -94,6 +94,19 @@ fn claude_idle_for_at(app: &mut App, idle_for: Duration, now: Instant) {
     }
 }
 
+/// Observe the completed write through App, then anchor simulated time to its
+/// timestamp. The enqueue clock cannot define the type-then-Enter interval.
+fn observe_paste_write(
+    app: &App,
+    pane: &str,
+    attempt: &mut super::super::guarded_submit::Attempt,
+    queued: Instant,
+) -> Instant {
+    assert_eq!(app.advance_guarded_submit(pane, attempt, queued), None);
+    assert!(!attempt.sent, "completion observation must precede Enter");
+    attempt.due - GAP
+}
+
 fn settled() -> Duration {
     Duration::from_secs(30)
 }
@@ -664,10 +677,10 @@ async fn reading_the_inbox_inside_the_gap_drops_the_enter() {
     read_inbox(&mut app, &pane);
     tick_past_gap(&mut app);
     assert!(drain(&mut pty).is_empty());
-    assert_eq!(app.delivery_attempts()[0].state, "abandoned");
+    assert_eq!(app.delivery_attempts()[0].state, "unconfirmed");
     assert_eq!(
         app.delivery_attempts()[0].reason.as_deref(),
-        Some("inbox_read")
+        Some("paste_written")
     );
 }
 
@@ -778,6 +791,7 @@ async fn guarded_submit_retries_only_enter_once_and_reports_unconfirmed() {
         runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
         assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
         assert!(drain(&mut pty).is_empty());
+        let now = attempt.due - GAP;
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
             None
@@ -826,6 +840,7 @@ async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
             .unwrap();
         drain(&mut pty);
         runtime(&app).test_process_pty_bytes(fixture.as_bytes());
+        let now = observe_paste_write(&app, &pane, &mut attempt, now);
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
             None
@@ -911,6 +926,7 @@ async fn guarded_submit_never_retypes_when_composer_clears_or_dialog_appears() {
             .unwrap();
         drain(&mut pty);
         runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        let now = observe_paste_write(&app, &pane, &mut attempt, now);
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
             None
@@ -969,7 +985,7 @@ async fn guarded_submit_refuses_drafts_and_concurrent_input() {
     drain(&mut pty);
     assert_eq!(
         app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-        Some(Outcome::Abandoned("operator_active"))
+        Some(Outcome::Unconfirmed("paste_written"))
     );
     assert!(drain(&mut pty).is_empty());
 }
@@ -996,6 +1012,7 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
             .begin_guarded_submit(&pane, text, None, Duration::ZERO, now, false)
             .unwrap();
         drain(&mut pty);
+        let now = observe_paste_write(&app, &pane, &mut attempt, now);
         if sent {
             runtime(&app).test_process_pty_bytes(&claude_screen(text));
             assert_eq!(
@@ -1047,7 +1064,7 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
                 }
             ),
             Some(if !sent {
-                Outcome::Abandoned("turn_started_before_enter")
+                Outcome::Unconfirmed("paste_written")
             } else if hook {
                 Outcome::Accepted
             } else {
@@ -1059,7 +1076,7 @@ async fn guarded_submit_confirms_matching_prompt_and_short_working_turn() {
         assert_eq!(
             evidence[0].state,
             if !sent {
-                "abandoned"
+                "unconfirmed"
             } else if hook {
                 "accepted"
             } else {
@@ -1157,6 +1174,7 @@ async fn guarded_client_rechecks_session_and_settle_before_enter() {
             .unwrap();
         assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
         runtime(&app).test_process_pty_bytes(&claude_screen("hello"));
+        let now = observe_paste_write(&app, &pane, &mut attempt, now);
         if session_change {
             assert!(app
                 .handle_api_request(report("second-session", 2))
@@ -1176,11 +1194,7 @@ async fn guarded_client_rechecks_session_and_settle_before_enter() {
         }
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-            Some(Outcome::Abandoned(if session_change {
-                "session_mismatch"
-            } else {
-                "not_settled"
-            }))
+            Some(Outcome::Unconfirmed("paste_written"))
         );
         assert!(drain(&mut pty).is_empty());
     }
@@ -1232,8 +1246,8 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
     app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
     let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
-    assert_eq!(response["result"]["outcome"], "abandoned");
-    assert_eq!(response["result"]["attempt"]["reason"], "operator_active");
+    assert_eq!(response["result"]["outcome"], "unconfirmed");
+    assert_eq!(response["result"]["attempt"]["reason"], "paste_written");
     assert_eq!(response["result"]["attempt"]["pane"], pane);
     assert!(response["result"]["attempt"]["attempt_id"].is_string());
 }
@@ -1523,7 +1537,7 @@ async fn delivery_attempt_read_during_verification_is_success() {
 }
 
 #[tokio::test]
-async fn delivery_attempt_disable_resets_tracker_and_digest_reports_abandonment() {
+async fn delivery_attempt_disable_resets_tracker_and_digest_reports_uncertainty() {
     let Rig {
         mut app,
         pane,
@@ -1536,8 +1550,8 @@ async fn delivery_attempt_disable_resets_tracker_and_digest_reports_abandonment(
     app.tick_idle_wakes(Instant::now());
     assert!(app.idle_wake.panes.is_empty());
     let attempts = app.delivery_attempts();
-    assert_eq!(attempts[0].state, "abandoned");
-    assert_eq!(attempts[0].reason.as_deref(), Some("idle_wake_disabled"));
+    assert_eq!(attempts[0].state, "unconfirmed");
+    assert_eq!(attempts[0].reason.as_deref(), Some("paste_written"));
     let events = app.event_hub.events_after(0);
     let digest = crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
     let row = digest
@@ -1545,7 +1559,7 @@ async fn delivery_attempt_disable_resets_tracker_and_digest_reports_abandonment(
         .iter()
         .find(|row| row.kind == "delivery_attempt_updated")
         .unwrap();
-    assert_eq!(row.summary, "abandoned: idle_wake_disabled");
+    assert_eq!(row.summary, "unconfirmed: paste_written");
     assert!(row
         .context
         .contains(&("attempt_id".into(), attempts[0].attempt_id.clone())));
@@ -1948,6 +1962,7 @@ async fn guarded_submit_confirms_a_codex_turn_running_past_the_weekly_notice() {
             .unwrap();
         assert_eq!(drain(&mut pty), vec![brief.as_bytes().to_vec()]);
         runtime(&app).test_process_pty_bytes(&codex(brief));
+        let now = observe_paste_write(&app, &pane, &mut attempt, now);
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
             None
@@ -2376,6 +2391,42 @@ async fn stalled_guarded_submit_operator_interrupt_records_written_effect_withou
             Some(expected)
         );
         assert_released_paste(&app, &completion, written, "operator_active");
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn idle_wake_finishes_each_terminal_attempt_once() {
+    use super::super::guarded_submit::tests::FINISH_CALLS;
+    use std::sync::atomic::Ordering;
+    for suppressed in [false, true] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "single-finalizer", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        if suppressed {
+            app.fleet_pause.paused = true;
+        } else {
+            runtime(&app).test_stamp_operator_input_at(Instant::now());
+        }
+        let before = FINISH_CALLS.load(Ordering::Relaxed);
+        assert!(matches!(
+            app.submit_idle_wake(&pane, Instant::now() + GAP),
+            super::Decision::Abandoned(_)
+        ));
+        assert_eq!(
+            FINISH_CALLS.load(Ordering::Relaxed) - before,
+            1,
+            "suppressed={suppressed}: terminal attempt must finish exactly once"
+        );
+        let attempts = app.delivery_attempts();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].finished_at_ms.is_some());
+        assert!(app.idle_wake.panes[&pane].in_flight.is_none());
         assert!(drain(&mut pty).is_empty());
     }
 }

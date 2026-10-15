@@ -53,6 +53,9 @@ mod events;
 mod ghostty;
 mod github;
 mod handoff_runtime;
+#[cfg(test)]
+#[path = "../tests/support/socket_dir.rs"]
+mod test_socket_dir;
 // #295: source-scoped health primitive for periodic in-process pollers.
 mod health;
 mod input;

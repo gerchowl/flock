@@ -77,12 +77,30 @@ with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
 for the same user. This implements the stable-directory/separate-endpoint design
 accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
 
+The pinned sccache 0.18.0 carries the startup fix approved in
+[issue #1411](https://github.com/gerchowl/flock/issues/1411). Unix socket startup
+takes an exclusive lock on `<socket>.lock`, probes for a live listener, and only
+reclaims an owned stale socket after connection refusal or absence. A concurrent
+starter finding a live listener succeeds without replacing it. Compilation does
+not hold this lock, so compiler parallelism and the endpoint stay unchanged.
+The lock file must be an owner-only regular file and persists across restarts
+and crashes. Do not delete it while starters can run. Unsafe paths, permissions,
+and inconclusive probes fail visibly without removing the endpoint. TCP and
+abstract Unix sockets retain upstream behavior. A version assertion requires
+re-evaluating the patch whenever the pinned sccache changes; drop the patch when
+an upstream release fixes the unlink+bind race reported in
+[mozilla/sccache#2906](https://github.com/mozilla/sccache/issues/2906).
+
+Each dev shell picks up the patched binary on its next `nix develop`. A running
+shared server keeps its old binary until it next restarts naturally. Nobody
+restarts it deliberately for this rollout.
+
 Artifact storage keeps sccache's existing configuration or platform default, including
 `~/Library/Caches/Mozilla.sccache` on macOS, so existing caches remain warm.
 The wrapper preserves an explicit `SCCACHE_DIR` and uses its `tmp` subdirectory
 and `flock.sock` for daemon runtime state instead of the default runtime root.
-[sccache 0.15 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage),
-while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.15.0/docs/Configuration.md#disk-local).
+[sccache 0.18 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.18.0/README.md#usage),
+while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Configuration.md#disk-local).
 There is no server-only temporary-directory setting, so the wrapper sets
 `TMPDIR` for each sccache invocation, including compiler subprocesses. Other
 shell commands retain their own `TMPDIR`. Persistent runtime storage avoids
@@ -100,7 +118,9 @@ Directory-creation failure prints the path and fails the build.
 `RUSTC_WRAPPER=""` disables Rust caching, and custom wrappers remain intact.
 
 Run `nix develop --command just test-sccache` to check deleted startup temp
-directories, explicit and lazy restarts, and hits from a platform-default cache
+directories, 20 rounds of four concurrent automatic starts, live-listener
+preservation, stale sockets left by a killed private server, unsafe paths,
+explicit and lazy restarts, and hits from a platform-default cache
 warmed by an unwrapped daemon. The probe always supplies and asserts private
 endpoints. Outside the devShell it exits before contacting any server with
 `run inside nix develop (the wrapper is not active)`. The endpoint guard also

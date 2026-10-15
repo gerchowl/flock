@@ -542,13 +542,15 @@ fn pane_read(
         },
     })?;
     if value.get("error").is_some() {
-        return serde_json::from_value(value).map_err(|_| ErrorResponse {
-            id: request_id,
-            error: ErrorBody {
-                code: "internal_error".into(),
-                message: "failed to decode pane read error".into(),
-            },
-        });
+        return Err(
+            serde_json::from_value::<ErrorResponse>(value).unwrap_or_else(|_| ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "internal_error".into(),
+                    message: "failed to decode pane read error".into(),
+                },
+            }),
+        );
     }
     serde_json::from_value(value["result"]["read"].clone()).map_err(|_| ErrorResponse {
         id: request_id,
@@ -583,13 +585,15 @@ fn pane_get(
         },
     })?;
     if value.get("error").is_some() {
-        return serde_json::from_value(value).map_err(|_| ErrorResponse {
-            id: request_id,
-            error: ErrorBody {
-                code: "internal_error".into(),
-                message: "failed to decode pane get error".into(),
-            },
-        });
+        return Err(
+            serde_json::from_value::<ErrorResponse>(value).unwrap_or_else(|_| ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "internal_error".into(),
+                    message: "failed to decode pane get error".into(),
+                },
+            }),
+        );
     }
     serde_json::from_value(value["result"]["pane"].clone()).map_err(|_| ErrorResponse {
         id: request_id,
@@ -606,6 +610,78 @@ mod tests {
 
     use super::*;
     use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
+
+    fn probe_error(read: bool, response: serde_json::Value) -> ErrorResponse {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let message = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("probe request did not arrive")
+                    .expect("probe producer closed")
+            });
+            assert_eq!(message.request.id, "probe");
+            assert!(matches!(
+                (&message.request.method, read),
+                (Method::PaneRead(_), true) | (Method::PaneGet(_), false)
+            ));
+            message.respond_to.send(response.to_string()).unwrap();
+        });
+        let error = if read {
+            pane_read(
+                "probe".into(),
+                "pane_1",
+                crate::api::schema::ReadSource::Recent,
+                None,
+                true,
+                &tx,
+            )
+            .unwrap_err()
+        } else {
+            pane_get("probe".into(), "pane_1", &tx).unwrap_err()
+        };
+        responder.join().unwrap();
+        error
+    }
+
+    #[test]
+    fn pane_preflight_preserves_typed_errors() {
+        for read in [false, true] {
+            for code in ["pane_not_found", "invalid_params"] {
+                let expected = ErrorResponse {
+                    id: "probe".into(),
+                    error: ErrorBody {
+                        code: code.into(),
+                        message: "original diagnostic".into(),
+                    },
+                };
+                assert_eq!(
+                    probe_error(read, serde_json::to_value(&expected).unwrap()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_preflight_rejects_malformed_errors() {
+        for read in [false, true] {
+            let error = probe_error(read, serde_json::json!({"id": "probe", "error": {}}));
+            assert_eq!(error.id, "probe");
+            assert_eq!(error.error.code, "internal_error");
+            assert_eq!(
+                error.error.message,
+                format!(
+                    "failed to decode pane {} error",
+                    if read { "read" } else { "get" }
+                )
+            );
+        }
+    }
 
     fn status_event(custom_status: Option<&str>) -> EventEnvelope {
         EventEnvelope {

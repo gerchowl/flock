@@ -522,7 +522,7 @@ impl FleetSnapshotState {
     /// Re-encode for the next leap, excluding the hop target itself (it
     /// becomes the self row on the receiving end) and any entry matching the
     /// origin — the home row owns that slot, so a hub that lists itself in
-    /// [[peers]] must not render twice. Ages are recomputed so time spent on
+    /// `[[peers]]` must not render twice. Ages are recomputed so time spent on
     /// this server keeps counting against freshness. Peer count is bounded:
     /// the snapshot rides an env var between attach legs, and an unbounded
     /// fleet could brush ARG_MAX and kill the leg spawn.

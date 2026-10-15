@@ -178,6 +178,27 @@ fn msg_send_error_is_an_envelope() {
     }
 }
 
+/// Server target details survive the CLI envelope without parsing its wording.
+#[test]
+fn message_ambiguity_candidates_survive_cli_json() {
+    fn ambiguous(_: &Value) -> Value {
+        json!({"error":{"code":"msg_target_ambiguous","message":"choose a recipient",
+            "data":{"kind":"msg_target_ambiguous","expected":[{"type":"pane","pane":"<pane>"}],
+            "candidates":[{"terminal_id":"terminal-fixture","pane_id":"w1:p1",
+                "workspace_id":"w1","tab_id":"w1:t1","cwd":null,"agent_status":"idle"}]}}})
+    }
+    let (socket, _server) = scripted_server("envelope-candidates", ambiguous);
+    let output = flk(&socket, &["msg", "send", "reviewer", "hi", "--json"]);
+    let value = envelope(&output, 1);
+    assert_eq!(
+        value["error"]["data"],
+        ambiguous(&Value::Null)["error"]["data"]
+    );
+    assert_eq!(value["error"]["exit"], 1);
+    assert_eq!(value["error"]["retry"], "never");
+    one_human_line(&output, "msg_target_ambiguous");
+}
+
 /// A delegate usage error (`not a delegate`) is `invalid_params`, exit 2.
 #[test]
 fn delegate_not_a_delegate_is_an_envelope() {

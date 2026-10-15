@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// v16: `Hello` carries an optional `notice` — a top-right action notice the
 /// launcher injects when a server switch fails and it re-attaches the
-/// previous leg (#63: "switch to <name> failed: <reason>", never strand at a
+/// previous leg (#63: `switch to <name> failed: <reason>`, never strand at a
 /// shell). Additive field on a positional wire — deliberate bump.
 ///
 /// v17: `FleetSnapshot` carries an optional `origin_summary` — the hub's OWN

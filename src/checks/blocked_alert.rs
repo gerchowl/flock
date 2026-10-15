@@ -176,7 +176,7 @@ impl BlockedAlertFold {
     }
 }
 
-/// Human-friendly duration for the notification title ("blocked 30m: <pane>").
+/// Human-friendly duration for the notification title (`blocked 30m: <pane>`).
 pub(crate) fn format_blocked_duration(secs: u64) -> String {
     if secs >= 3_600 {
         let hours = secs / 3_600;
