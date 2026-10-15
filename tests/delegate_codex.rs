@@ -1390,7 +1390,8 @@ fn worktree_create_base_is_refreshed_from_the_remote() {
     assert_eq!(rev(&repo, "wt/tag"), tagged);
 }
 
-/// #1479: replay the two Codex spinner frames without running a model.
+/// #1552: replay three Codex working frames and an identical hollow repeat,
+/// plus idle and finished frames, without running a model.
 #[test]
 fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
     let server = start_server_with_rows(40);
@@ -1415,7 +1416,7 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
          draw() {{ printf '\\033[3J\\033[2J\\033[H'; cat '{base}/'$1.txt; }}\n\
          draw idle\n\
          while IFS= read -r frame; do\n\
-           case \"$frame\" in idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
+           case \"$frame\" in repeated-hollow) draw hollow ;; idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
          done\n",
         base = server.base.display()
     );
@@ -1473,9 +1474,15 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         ("filled", "• Working (", "working"),
         ("idle", "Bring your unfinished thoughts.", "idle"),
         ("second-hollow", "◦ Working (21m 27s", "working"),
+        ("idle", "Bring your unfinished thoughts.", "idle"),
+        // Reuse the original file: both the text and spinner timestamp repeat.
+        ("repeated-hollow", "◦ Working (21m 26s", "working"),
         ("finished", "• DONE: fixture turn finished", "idle"),
     ] {
         if status == "working" {
+            // Guard the replay sequence if an idle-reset step is removed: the
+            // old working hold could otherwise satisfy the next glyph wait.
+            // Both idle and done represent the same settled terminal state.
             let before = listed_agent();
             assert!(
                 matches!(before["agent_status"].as_str(), Some("idle" | "done")),
