@@ -473,17 +473,17 @@ impl App {
         let outcome = if let Some(suppression) =
             self.wake_suppression(pane, super::api::messages::now_ms())
         {
-            Some(super::guarded_submit::Outcome::Abandoned(
-                suppression.reason,
+            Some(self.conclude_guarded_attempt(
+                pane,
+                &mut attempt,
+                &super::guarded_submit::Outcome::Abandoned(suppression.reason),
             ))
         } else {
             self.advance_guarded_submit(pane, &mut attempt, now)
         };
-        let outcome = outcome.map(|outcome| {
-            let outcome = self.conclude_guarded_attempt(pane, &mut attempt, &outcome);
+        if outcome.is_some() {
             self.surface_kept_drafts();
-            outcome
-        });
+        }
         let enter_sent = before != (attempt.sent, attempt.retried);
         let next = now + Duration::from_millis(50);
         if outcome.is_none() {
