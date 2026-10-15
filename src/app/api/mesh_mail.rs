@@ -266,7 +266,7 @@ impl App {
         };
         let (ws, pane) = match self
             .resolve_message_target(&target)
-            .map_err(|(code, reason)| format!("{code}: {reason}"))?
+            .map_err(|error| format!("{}: {}", error.code.as_str(), error.message))?
         {
             ResolvedTarget::Local(ws, pane) => (ws, pane),
             ResolvedTarget::Remote(_) => return Err("recipient_offline".into()),
