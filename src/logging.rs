@@ -1285,6 +1285,21 @@ pub(crate) fn remote_install_declined(target: &str, dest: &str) {
     );
 }
 
+/// Report changed script capture diagnostics. The check runner owns suppression
+/// and recovery state; both streams are reported in one warning per transition.
+pub(crate) fn check_capture_failed(check_name: &str, stdout: Option<&str>, stderr: Option<&str>) {
+    tracing::warn!(
+        target: "checks",
+        event = "check.capture.failed",
+        check_name,
+        stdout_failed = stdout.is_some(),
+        stderr_failed = stderr.is_some(),
+        stdout_reason = stdout.unwrap_or(""),
+        stderr_reason = stderr.unwrap_or(""),
+        "script output capture incomplete"
+    );
+}
+
 // --- process family (logging redesign PR-3) --------------------------------
 // One traced funnel: every external process flock spawns emits its command
 // line here so the "what did flock actually run?" question is answerable from

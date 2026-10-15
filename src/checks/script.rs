@@ -57,7 +57,7 @@ pub(crate) enum Outcome {
 }
 
 /// Bounded stdout/stderr and capture diagnostics from a completed run.
-/// Capture failures mark the affected stream incomplete and emit a warning;
+/// Capture failures mark the affected stream incomplete; the runner warns on changes.
 /// they never change exit classification, even when the caller discards output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CapturedOutput {
@@ -73,6 +73,13 @@ pub(crate) struct CapturedOutput {
     pub stdout_note: Option<String>,
     /// Why stderr capture failed; absence alone does not rule out byte truncation.
     pub stderr_note: Option<String>,
+}
+
+/// Failure diagnostics for one capture run, independent of the script outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CaptureNotes {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
 }
 
 /// Run one script check to completion (or timeout). See the module doc for
@@ -154,8 +161,8 @@ fn run_script_with_executor(
     // Attempt both collectors even if one fails, so a completed stream survives.
     let stdout = stdout_rx.map(|rx| executor.collect(rx)).transpose();
     let stderr = stderr_rx.map(|rx| executor.collect(rx)).transpose();
-    let (stdout, stdout_truncated, stdout_note) = finish_capture(&check.name, "stdout", stdout);
-    let (stderr, stderr_truncated, stderr_note) = finish_capture(&check.name, "stderr", stderr);
+    let (stdout, stdout_truncated, stdout_note) = finish_capture(stdout);
+    let (stderr, stderr_truncated, stderr_note) = finish_capture(stderr);
     let output = CapturedOutput {
         stdout,
         stderr,
@@ -195,28 +202,16 @@ fn run_script_with_executor(
     }
 }
 
-/// Preserve a completed stream, or mark failed capture and report its reason.
-/// The runtime consumes only `Outcome`, so the warning keeps diagnostics visible
-/// even when the returned output is discarded. Neither path classifies a check.
+/// Preserve a completed stream, or mark failed capture and retain its reason.
+/// The runner reports changed capture diagnostics once per check. Neither path
+/// classifies a check.
 fn finish_capture(
-    check_name: &str,
-    stream: &str,
     result: Result<Option<(Vec<u8>, bool)>, String>,
 ) -> (Vec<u8>, bool, Option<String>) {
     match result {
         Ok(Some((bytes, truncated))) => (bytes, truncated, None),
         Ok(None) => (Vec::new(), false, None),
-        Err(reason) => {
-            tracing::warn!(
-                target: "checks",
-                event = "check.capture.failed",
-                check_name,
-                stream,
-                reason = reason.as_str(),
-                "script output capture incomplete"
-            );
-            (Vec::new(), true, Some(reason))
-        }
+        Err(reason) => (Vec::new(), true, Some(reason)),
     }
 }
 
@@ -325,8 +320,9 @@ where
 }
 
 /// Collect one stream with the unchanged one-second production bound. A late,
-/// disconnected, or failed reader becomes an output note and warning through
-/// `finish_capture`, never a different `Outcome`. The other stream is retained.
+/// disconnected, or failed reader becomes an output note through
+/// `finish_capture`, never a different `Outcome`. The runner reports changed
+/// notes once per check. The other stream is retained.
 /// Reader threads can outlive the run until pipe EOF; this bound does not
 /// terminate descendants that inherited the pipe. Failed reads do not expose
 /// partial bytes as complete output.
@@ -377,6 +373,26 @@ mod tests {
         fn collect(&self, rx: CaptureReceiver) -> Result<(Vec<u8>, bool), String> {
             rx.recv_timeout(FAILURE_CEILING)
                 .map_err(|err| format!("capture producer failed: {err}"))?
+        }
+    }
+
+    /// Use completion evidence for the script and the real capture watchdog.
+    /// A background descendant may hold a pipe open after its parent exits.
+    #[derive(Default)]
+    struct CompletionWithWatchdogCapture {
+        waits: std::cell::Cell<usize>,
+        collects: std::cell::Cell<usize>,
+    }
+
+    impl ScriptExecutor for CompletionWithWatchdogCapture {
+        fn wait(&self, child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool), String> {
+            self.waits.set(self.waits.get() + 1);
+            Completion.wait(child, timeout)
+        }
+
+        fn collect(&self, rx: CaptureReceiver) -> Result<(Vec<u8>, bool), String> {
+            self.collects.set(self.collects.get() + 1);
+            Watchdog.collect(rx)
         }
     }
 
@@ -718,10 +734,8 @@ exit {code}
             for path in [&release_path, &ready_path, &pid_path] {
                 check.args.push(path.to_string_lossy().into_owned());
             }
-            let mut result = None;
-            let logs = crate::logging::capture_logs(|| {
-                result = Some(run_script(&check));
-            });
+            let executor = CompletionWithWatchdogCapture::default();
+            let result = run_script_with_executor(&check, &executor);
             // The ready handshake proves this owned descendant opened its
             // release pipe before the script exited. The OS reaps this orphan
             // after termination, as for real background descendants.
@@ -732,14 +746,19 @@ exit {code}
                 .unwrap();
             send_signal(pid, libc::SIGKILL);
             drop(release);
-            let (outcome, output) = result.unwrap();
+            let (outcome, output) = result;
             assert_eq!(outcome, expected);
             assert!(output.stdout_truncated);
             assert!(output
                 .stdout_note
                 .as_deref()
                 .is_some_and(|note| note.contains("timed out")));
-            assert!(logs.contains("check.capture.failed"), "{logs}");
+            assert_eq!(executor.waits.get(), 1, "script must use completion wait");
+            assert_eq!(
+                executor.collects.get(),
+                2,
+                "both streams use watchdog collection"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
