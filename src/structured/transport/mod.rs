@@ -84,7 +84,9 @@ pub enum Completion {
 
 /// Server handle. Inbound/outbound memory is bounded; there is at most one turn
 /// pending. Any parsed top-level result reopens the private idle gate, including
-/// unmodelled subtypes. The supervisor owns socket refusal and process cleanup (#1462).
+/// unmodelled subtypes. A lossy result header also opens it without claiming turn
+/// success. Indeterminate loss surfaces `structured_turn_end_unknown` until a
+/// result confirms the boundary. The supervisor owns socket refusal and cleanup.
 pub struct Transport {
     input: InputHandle,
     output: mpsc::Receiver<Received>,
@@ -96,6 +98,7 @@ pub struct Transport {
 pub(super) struct InputHandle {
     input: Option<mpsc::SyncSender<Vec<u8>>>,
     busy: Arc<AtomicBool>,
+    uncertain: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     close: Arc<AtomicBool>,
 }
@@ -168,13 +171,19 @@ impl Transport {
         let (output_tx, output) = mpsc::sync_channel(4);
         let (done, completion) = mpsc::sync_channel(2);
         let busy = Arc::new(AtomicBool::new(false));
+        let uncertain = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
         let close = Arc::new(AtomicBool::new(false));
-        let (b, c, d) = (busy.clone(), cancel.clone(), done.clone());
+        let (b, u, c, d) = (
+            busy.clone(),
+            uncertain.clone(),
+            cancel.clone(),
+            done.clone(),
+        );
         thread::Builder::new()
             .name("session-stdout".into())
             .spawn(move || {
-                let result = pump(stdout, location, &version, output_tx, &b, &c);
+                let result = pump(stdout, location, &version, output_tx, &b, &u, &c);
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
@@ -198,6 +207,7 @@ impl Transport {
             input: InputHandle {
                 input: Some(input),
                 busy,
+                uncertain,
                 cancel,
                 close,
             },
@@ -225,6 +235,7 @@ impl Transport {
     }
 
     /// Offer a bounded user envelope at idle; WouldBlock means input is in flight.
+    /// Indeterminate loss returns `structured_turn_end_unknown` instead of busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.input.try_submit(user)
     }
@@ -275,12 +286,17 @@ impl InputHandle {
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Only this method can reach the private stdin sender; no control bypass.
+    /// Loss with no identifiable event type yields `structured_turn_end_unknown`
+    /// until a real result confirms the boundary; never retry it as ordinary busy.
     pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "transport closed",
             ));
+        }
+        if self.uncertain.load(Ordering::Acquire) {
+            return Err(io::Error::other("structured_turn_end_unknown"));
         }
         if user.get("type").and_then(Value::as_str) != Some("user") {
             return Err(io::Error::other("stdin accepts only user envelopes"));
@@ -454,6 +470,7 @@ fn pump(
     version: &str,
     tx: mpsc::SyncSender<Received>,
     busy: &AtomicBool,
+    uncertain: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let (mut file, mut seq) = open_stream(location, cancel)?;
@@ -476,7 +493,7 @@ fn pump(
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, cancel,
+                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
                 )?;
                 line.clear();
                 count = 0;
@@ -490,12 +507,41 @@ fn pump(
         if n == 0 {
             if count > 0 {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, cancel,
+                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
                 )?;
             }
             return Ok(());
         }
     }
+}
+
+/// Inspect a bounded JSON object prefix structurally, never matching nested
+/// text. The harness's top-level type header precedes its potentially lost body.
+/// A deliberate parse abort after that header tolerates a truncated/invalid tail.
+fn prefix_type(prefix: &[u8]) -> Option<String> {
+    struct Header<'a>(&'a mut Option<String>);
+    impl<'de> serde::de::Visitor<'de> for Header<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("event object prefix")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    *self.0 = Some(map.next_value()?);
+                    return Err(serde::de::Error::custom("event header inspected"));
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut kind = None;
+    let _ = serde::de::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(prefix),
+        Header(&mut kind),
+    );
+    kind
 }
 
 fn emit(
@@ -506,6 +552,7 @@ fn emit(
     version: &str,
     tx: &mpsc::SyncSender<Received>,
     busy: &AtomicBool,
+    uncertain: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let origin = if count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err() {
@@ -513,12 +560,22 @@ fn emit(
     } else {
         RecordOrigin::Claude
     };
+    let kind = if origin == RecordOrigin::Flk {
+        prefix_type(&line[..line.len().min(256)])
+    } else {
+        None
+    };
+    let turn_end = match kind.as_deref() {
+        Some("result") => "result",
+        Some(_) => "not_result",
+        None => "unknown",
+    };
     let raw = if count > MAX_LINE_BYTES as u64 {
-        serde_json::json!({"type":"flk_oversize", "bytes":count, "limit":MAX_LINE_BYTES, "prefix_base64":base64::engine::general_purpose::STANDARD.encode(&line[..line.len().min(256)])}).to_string()
+        serde_json::json!({"type":"flk_oversize", "bytes":count, "limit":MAX_LINE_BYTES, "prefix_base64":base64::engine::general_purpose::STANDARD.encode(&line[..line.len().min(256)]), "turn_end":turn_end}).to_string()
     } else {
         match std::str::from_utf8(line) {
             Ok(text) => text.to_owned(),
-            Err(_) => serde_json::json!({"type":"flk_invalid_utf8", "base64":base64::engine::general_purpose::STANDARD.encode(line)}).to_string(),
+            Err(_) => serde_json::json!({"type":"flk_invalid_utf8", "base64":base64::engine::general_purpose::STANDARD.encode(line), "turn_end":turn_end}).to_string(),
         }
     };
     let event = SessionEvent::parse(&raw, version);
@@ -551,8 +608,11 @@ fn emit(
     encoded.push(b'\n');
     file.write_all(&encoded)?;
     file.sync_data()?;
-    if ends_turn {
+    if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
+        uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
+    } else if origin == RecordOrigin::Flk && turn_end == "unknown" && busy.load(Ordering::Acquire) {
+        uncertain.store(true, Ordering::Release);
     }
     let mut received = Received { record, event };
     loop {

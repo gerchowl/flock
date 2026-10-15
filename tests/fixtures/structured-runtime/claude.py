@@ -121,6 +121,23 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "later-lossy-result":
+    emit({"type": "result", "padding": "x" * (2 * 1024 * 1024)})
+    assert json.loads(sys.stdin.readline())["type"] == "user"
+    emit(find("result", "success"))
+    sys.stdin.read()
+    sys.exit(0)
+if mode in ("later-oversize", "later-invalid-utf8", "later-init-socket"):
+    if mode == "later-init-socket":
+        emit(dict(init, messaging_socket_path=None))
+    elif mode == "later-oversize":
+        emit({"type": "assistant", "padding": "x" * (2 * 1024 * 1024)})
+    else:
+        sys.stdout.buffer.write(b'{"type":"assistant","padding":"\xff"}\n')
+        sys.stdout.buffer.flush()
+    emit(find("system", "status"))
+    sys.stdin.read()
+    sys.exit(0)
 if mode == "idle-turns":
     emit(find("result", "success"))
     while sys.stdin.readline():

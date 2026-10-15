@@ -65,6 +65,8 @@ pub struct Runtime {
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
+    /// `structured_turn_end_unknown` means loss concealed the boundary; await a
+    /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.transport.try_submit(user)
     }
@@ -273,10 +275,11 @@ fn startup_failed(
         },
         supervision::Schedule::default(),
     );
-    LaunchError::Io(io::Error::other(format!(
-        "{error}; cleanup: {:?}",
-        report.cleanup
-    )))
+    let cleanup = match report.cleanup {
+        Ok(()) => "cleanup confirmed".to_owned(),
+        Err(error) => format!("cleanup failed: {error}"),
+    };
+    LaunchError::Io(io::Error::other(format!("{error}; {cleanup}")))
 }
 
 #[derive(Default)]
@@ -287,6 +290,11 @@ struct Facts {
     delivery_cancelled: bool,
 }
 
+/// E1 keeps successive turns (and init events) in one process; E16 binds its
+/// messaging socket at startup. After a clean first init and the pre-input
+/// registry guard, a lossy later line cannot introduce a new socket for that
+/// process. Keep its data-loss evidence; still refuse every inspectable socket
+/// report, including subsequent init events (ADR-0036 E1/E16).
 fn collect(
     transport: &Transport,
     stop: &StopRequest,
@@ -296,6 +304,7 @@ fn collect(
     let mut facts = Facts::default();
     let mut done = [false; 2];
     let mut pending = None;
+    let mut init_inspected = false;
     loop {
         loop {
             let completion = match transport.try_completion() {
@@ -340,18 +349,20 @@ fn collect(
         if pending.is_none() {
             match transport.try_receive() {
                 Ok(received) => {
-                    // A lossy record can conceal init metadata anywhere in the
-                    // discarded bytes. Refuse all trusted loss summaries.
-                    let uninspectable = received.record.origin == RecordOrigin::Flk;
-                    if uninspectable
-                        || serde_json::from_str::<Value>(&received.record.raw).is_ok_and(|value| {
-                            value["type"] == "system"
-                                && value["subtype"] == "init"
-                                && value.as_object().is_some_and(|object| {
-                                    object.contains_key("messaging_socket_path")
-                                })
-                        })
-                    {
+                    let init = serde_json::from_str::<Value>(&received.record.raw)
+                        .ok()
+                        .filter(|value| value["type"] == "system" && value["subtype"] == "init");
+                    let forbidden = init.as_ref().is_some_and(|value| {
+                        value
+                            .as_object()
+                            .is_some_and(|object| object.contains_key("messaging_socket_path"))
+                    });
+                    let uninspectable =
+                        received.record.origin == RecordOrigin::Flk && !init_inspected;
+                    if init.is_some() && !forbidden {
+                        init_inspected = true;
+                    }
+                    if uninspectable || forbidden {
                         facts.refusal = Some(
                             if uninspectable {
                                 "structured_uninspectable_output"

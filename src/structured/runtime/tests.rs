@@ -333,6 +333,113 @@ fn non_utf8_init_cannot_bypass_socket_refusal() {
     assert_uninspectable_init_refused("init-invalid-utf8");
 }
 
+fn assert_later_loss_keeps_session_running(mode: &str) {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch(mode, "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    running.receive();
+    assert!(matches!(
+        running.receive().event,
+        super::super::claude::SessionEvent::Init(_)
+    ));
+    let loss = running.receive();
+    assert_eq!(loss.record.origin, RecordOrigin::Flk);
+    assert!(matches!(
+        loss.event,
+        super::super::claude::SessionEvent::Unknown { .. }
+    ));
+    // The producer emits this after the loss, then remains alive on stdin.
+    running.receive();
+    assert!(root.alive());
+    assert_eq!(
+        running
+            .runtime
+            .try_submit(&serde_json::json!({"type":"user"}))
+            .expect_err("same turn is still active")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(matches!(
+        running.result.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(running.generated.exists());
+    let durable = fs::read_to_string(fixture.stream()).expect("durable evidence");
+    assert!(durable.contains("\"origin\":\"flk\""));
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+}
+
+#[test]
+fn oversized_line_after_clean_init_is_data_loss_not_refusal() {
+    assert_later_loss_keeps_session_running("later-oversize");
+}
+
+#[test]
+fn non_utf8_line_after_clean_init_is_data_loss_not_refusal() {
+    assert_later_loss_keeps_session_running("later-invalid-utf8");
+}
+
+#[test]
+fn oversized_result_after_clean_init_accepts_the_next_runtime_turn() {
+    let fixture = Fixture::new();
+    let mut running = fixture
+        .launch("later-lossy-result", "2.1.296")
+        .expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    running.receive();
+    running.receive();
+    let loss = running.receive();
+    assert_eq!(loss.record.origin, RecordOrigin::Flk);
+    assert!(matches!(
+        loss.event,
+        super::super::claude::SessionEvent::Unknown { .. }
+    ));
+    assert_eq!(
+        serde_json::from_str::<Value>(&loss.record.raw).expect("summary")["turn_end"],
+        "result"
+    );
+    running
+        .runtime
+        .try_submit(&serde_json::json!({"type":"user","message":{"content":"next"}}))
+        .expect("lossy result reopens runtime input");
+    assert!(matches!(
+        running.receive().event,
+        super::super::claude::SessionEvent::Success(_)
+    ));
+    assert!(root.alive());
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert!(!exit.input_inflight);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+}
+
+#[test]
+fn later_inspectable_init_with_socket_is_still_refused() {
+    let fixture = Fixture::new();
+    let mut running = fixture
+        .launch("later-init-socket", "2.1.296")
+        .expect("launch");
+    running.receive();
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Refused, "{exit:?}");
+    assert!(exit
+        .error
+        .expect("refusal")
+        .contains("structured_messaging_socket_forbidden"));
+    assert!(!running.generated.exists());
+}
+
 #[test]
 fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
     let fixture = Fixture::new();
@@ -358,6 +465,7 @@ fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
     let error = platform::structured::child_pipes(&mut child).expect_err("no piped endpoints");
     let error = startup_failed(child, files, persistent.clone(), error, true);
     assert!(error.to_string().contains("missing stdout pipe"));
+    assert!(error.to_string().contains("cleanup confirmed"));
     assert!(!root.alive());
     assert!(!generated.exists());
     assert!(persistent.is_dir());
