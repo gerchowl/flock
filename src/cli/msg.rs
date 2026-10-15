@@ -437,9 +437,9 @@ fn await_reply_for(
 /// a known repo (from the live workspace list); otherwise the whole string
 /// is a bare pane target.
 fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
-    let Some((left, right)) = target.split_once(':') else {
-        return Ok(MessageTarget::Pane { pane: target });
-    };
+    if !target.contains(':') {
+        return Ok(MessageTarget::from_bare(target));
+    }
     let known_repos = super::send_request(&Request {
         id: "cli:msg:repos".into(),
         method: Method::WorkspaceList(EmptyParams {}),
@@ -464,14 +464,21 @@ fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
             })
     })
     .unwrap_or_default();
-    if known_repos.iter().any(|repo| repo == left) {
-        Ok(MessageTarget::RepoPane {
-            repo: left.to_string(),
-            pane: right.to_string(),
-        })
-    } else {
-        Ok(MessageTarget::Pane { pane: target })
+    Ok(shorthand_with_repos(target, &known_repos))
+}
+
+/// Resolve the CLI's legacy repo shorthand against an explicit directory.
+/// Keeping this pure lets tests exercise address selection without a socket.
+fn shorthand_with_repos(target: String, known_repos: &[String]) -> MessageTarget {
+    if let Some((left, right)) = target.split_once(':') {
+        if known_repos.iter().any(|repo| repo == left) {
+            return MessageTarget::RepoPane {
+                repo: left.into(),
+                pane: right.into(),
+            };
+        }
     }
+    MessageTarget::from_bare(target)
 }
 
 /// Parse `flk msg reply`'s argv into `(intent, positional)`.
@@ -754,6 +761,32 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn bare_message_targets_keep_the_same_identity_as_mcp() {
+        for (target, expected) in [
+            (
+                "w3:p2",
+                crate::api::schema::MessageTarget::Pane {
+                    pane: "w3:p2".into(),
+                },
+            ),
+            (
+                "reviewer",
+                crate::api::schema::MessageTarget::Pane {
+                    pane: "reviewer".into(),
+                },
+            ),
+            (
+                "agent_atlas_6f21c4",
+                crate::api::schema::MessageTarget::Agent {
+                    agent: "agent_atlas_6f21c4".into(),
+                },
+            ),
+        ] {
+            assert_eq!(super::shorthand_with_repos(target.into(), &[]), expected);
+        }
     }
 
     #[test]
