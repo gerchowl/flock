@@ -18,7 +18,7 @@ pub(super) enum ResolvedTarget {
     Remote(Box<crate::app::directory::AgentLocation>),
 }
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_with_data, encode_success};
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -189,7 +189,17 @@ impl App {
         }
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            Err((code, message)) => return encode_error(id, code, message),
+            Err((code, message)) => {
+                return encode_error_with_data(
+                    id,
+                    code,
+                    format!(
+                        "{message}; expected {}",
+                        crate::api::schema::MESSAGE_TARGET_EXPECTED
+                    ),
+                    serde_json::json!({"kind":code,"expected":MessageTarget::expected_shapes()}),
+                );
+            }
         };
         let (to_ws_idx, to_pane_id) = match resolved {
             ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
