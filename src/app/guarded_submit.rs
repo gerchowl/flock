@@ -133,6 +133,24 @@ fn composer_rows<'a>(
             let (start, end) = crate::detect::codex_composer_region(screen)?;
             let mut rows = vec![lines[start].trim_start().trim_start_matches('›').trim()];
             rows.extend(lines[start + 1..end].iter().map(|line| line.trim()));
+            let typed: Vec<_> = unfaint.lines().collect();
+            if typed.len() != lines.len() {
+                return None;
+            }
+            // Only the known hint may disappear with faint cells blanked (#1581).
+            let prompt_clear = typed[start]
+                .trim_start()
+                .strip_prefix('›')?
+                .trim()
+                .is_empty();
+            if prompt_clear
+                && typed[start + 1..end]
+                    .iter()
+                    .all(|row| row.trim().is_empty())
+                && codex_hint_prefix(&rows)
+            {
+                rows.clear();
+            }
             (rows, start, end)
         }
         Agent::OpenCode => {
@@ -163,6 +181,24 @@ fn composer_rows<'a>(
     Some((rows, body_start, body_end))
 }
 
+// Match the known hint across rows. Arbitrary faint text remains a draft.
+fn codex_hint_prefix(rows: &[&str]) -> bool {
+    let mut rest = "Ask Codex to do anything";
+    let mut seen = false;
+    for row in rows
+        .iter()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty())
+    {
+        let Some(tail) = rest.strip_prefix(row) else {
+            return false;
+        };
+        rest = tail.trim_start();
+        seen = true;
+    }
+    seen
+}
+
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
 pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
     composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
@@ -183,7 +219,7 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
     composer_unfaint(agent, screen, screen, text)
 }
 
-/// `composer` with Claude's editor read from `unfaint` (see `composer_rows`).
+/// `composer` with styled hints read from `unfaint` (see `composer_rows`).
 pub(crate) fn composer_unfaint(agent: Agent, screen: &str, unfaint: &str, text: &str) -> Composer {
     let Some((rows, body_start, body_end)) = composer_rows(agent, screen, unfaint) else {
         return Composer::Unknown;
@@ -1374,6 +1410,81 @@ pub(super) mod tests {
                 ),
                 Outcome::Unconfirmed("paste_write_incomplete")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_dim_hint_1581_replays_captured_26_column_screen() {
+        let bytes = include_bytes!("../../tests/fixtures/codex-hint-1581/26-cols.ansi");
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(26, 31, bytes);
+        let (screen, unfaint) = runtime.detection_text_and_unfaint();
+        assert!(screen.contains("Ask Codex to do anythin"));
+        assert!(!unfaint.contains("Ask Codex"));
+        assert_eq!(
+            runtime_composer(Agent::Codex, &runtime, "brief"),
+            Composer::Empty
+        );
+        assert!(editor_is_empty(Agent::Codex, &runtime));
+        assert_eq!(
+            composer_contents(Agent::Codex, &screen, &unfaint).as_deref(),
+            Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_dim_hint_1581_recognizes_known_faint_hint_prefixes() {
+        for cols in [18, 22, 26] {
+            let hint: String = "Ask Codex to do anything".chars().take(cols - 3).collect();
+            let frame = |body: &str| format!("OpenAI Codex\r\n› {body}\r\n  ? for shortcuts");
+            let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                cols as u16,
+                31,
+                frame(&format!("\x1b[2m{hint}\x1b[0m")).as_bytes(),
+            );
+            assert_eq!(
+                runtime_composer(Agent::Codex, &runtime, "brief"),
+                Composer::Empty,
+                "{cols}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_dim_hint_1581_preserves_plain_mixed_and_unrelated_faint_drafts() {
+        for cols in [18, 22, 26] {
+            let hint: String = "Ask Codex to do anything".chars().take(cols - 3).collect();
+            let frame = |body: &str| format!("OpenAI Codex\r\n› {body}\r\n  ? for shortcuts");
+            for draft in [
+                hint.clone(),
+                "real draft".into(),
+                "\x1b[2mreal draft\x1b[0m".into(),
+                format!("\x1b[2m{hint}\x1b[0m x"),
+            ] {
+                let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                    cols as u16,
+                    31,
+                    frame(&draft).as_bytes(),
+                );
+                assert_eq!(
+                    runtime_composer(Agent::Codex, &runtime, "brief"),
+                    Composer::Other,
+                    "{cols}: {draft:?}"
+                );
+                assert!(!editor_is_empty(Agent::Codex, &runtime));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_dim_hint_1581_does_not_authorize_missing_or_dialog_controls() {
+        let shown = "› Ask Codex\n? for shortcuts";
+        assert_eq!(
+            composer_unfaint(Agent::Codex, shown, "›", "brief"),
+            Composer::Unknown
+        );
+        for screen in ["› \x1b[2mAsk Codex\x1b[0m", "› \x1b[2mAsk Codex\x1b[0m\r\nenter to confirm", "Hooks need review\r\n› \x1b[2mAsk Codex\x1b[0m\r\n? for shortcuts\r\nenter confirm · esc skip"] {
+            let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(26, 31, screen.as_bytes());
+            assert_eq!(runtime_composer(Agent::Codex, &runtime, "brief"), Composer::Unknown);
         }
     }
 

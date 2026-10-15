@@ -1523,3 +1523,6 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         }
     }
 }
+
+#[path = "delegate_codex/hint_1581.rs"]
+mod hint_1581;
