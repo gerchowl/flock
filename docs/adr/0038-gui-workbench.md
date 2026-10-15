@@ -129,34 +129,48 @@ The client must never derive:
 - goal or work state;
 - anything sent to an agent other than a `cmd`.
 
-**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters.
+**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters: heartbeat interval, liveness window and backoff caps.
 
 ```text
-Disconnected ──connect──▶ Connecting ──open──▶ Hello ──welcome──▶ Syncing ──caught up──▶ Live
-     ▲                         │                 │  ╲                │                       │
-     │                         │ fail            │   ╲ protocol gap  │ gap{from,to}          │ heartbeat missed /
-     │                         ▼                 │    ▼              ▼                       │ socket error
-     └──────backoff────── Reconnecting ◀─────────┘  ReadOnly    snapshot fetch ──▶ Live      ▼
-                               ▲                                                       Stale ──▶ Reconnecting
-                               └───────────────────── auth refused ──▶ NeedsToken (user action)
+                 ┌──────────────── backoff ─────────────────┐
+                 ▼                                          │
+Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─caught up─▶ Live
+                 │                   │  │             │  ▲                 │
+                 │ fail              │  │ client      │  │ snapshot done   │ heartbeat missed /
+                 ▼                   │  │ newer       ▼  │                 │ socket error
+            Reconnecting ◀───────────┘  ▼          Snapshot ◀── gap ───────┤
+                 ▲                   ReadOnly ──upgrade/reload──▶ Connecting│
+                 │                      │ socket lost ──▶ Reconnecting      ▼
+                 └──────────────────────────────────────────────────── Stale
+            auth refused (from Hello or any later frame) ──▶ NeedsToken ──new token──▶ Connecting
 ```
 
 - **Hello.**
   - It sends `hello { protocol, client, token }`.
   - On `welcome`, it records `capabilities` and `principal`.
-  - A server protocol newer or older than the client's puts the client in **ReadOnly**: it can view but not send commands, as ADR-0036 §5's protocol gating requires.
-- **Syncing.**
-  - For every open tile's streams, it sends `sub { stream, after: cursor }` with the stored cursor.
-  - The replay applies through the same reducers as live events.
-  - `gap` triggers the stream's snapshot path (ADR-0036 §4 queue snapshots). `lagged` re-subscribes from `skipped_to`.
-- **Live.**
-  - It dedupes on `(stream, seq)` and advances each cursor only after its reducer has applied.
+  - **Version skew follows ADR-0036 §5 exactly.**
+    - Only a client **newer** than the server enters **ReadOnly**: the server's `welcome` carries read-only capabilities. The client can view, but cannot send verbs the server doesn't know.
+    - A client **older** than the server keeps working normally. Event types it doesn't know arrive in the §8 unknown wrapper and render as the JSON dump.
+- **ReadOnly.**
+  - Subscriptions and rendering work as in Live.
+  - The outbox is **held**, not sent and not dropped, and the composer and answer controls are disabled with a banner naming the version gap.
+  - ReadOnly exits:
+    - to **Connecting** when the user reloads after the server is upgraded;
+    - to **Reconnecting** when the socket is lost; the next `welcome` decides again.
+- **Syncing and Live** handle the same stream signals. They differ only in that Syncing has not yet caught up on every subscribed stream.
+  - **`ev`:** dedupe on `(stream, seq)`. Apply through the stream's reducer. Advance that stream's cursor **only after** the reducer has applied the event.
+  - **`lagged { skipped_to }`:** the server dropped events for a slow subscriber. Re-subscribe with `after: <cursor>`, the last applied seq, so the log replays everything after it. Never jump to `skipped_to`, because that would skip replayable entries.
+  - **`gap { from, to }`:** the log no longer holds that range.
+    - For streams with a snapshot (`queue/<id>`, ADR-0036 §4, and the `fleet`, `inbox`, `artifacts` and `work` streams of §5), go to **Snapshot**. Fetch the stream's snapshot, replace that stream's entities, set the cursor to the snapshot's seq, and return to the state it came from.
+    - **`agent/<id>` has no snapshot.** The client marks the transcript "history before seq `to + 1` is unavailable" at that point and continues from `to + 1`. A session's full history comes from the stored stream (ADR-0036 §4), so a gap here is an operator-visible retention fact, not a hole the client papers over.
+- **`*/live` streams** (partial deltas, no cursor) are re-subscribed after every reconnect, with no `after`. In-flight blocks are dropped (§4).
 - **Stale.**
-  - Entered when no frame or heartbeat has arrived within the liveness window, which #1546 sets.
-  - Tiles keep their content with a visible stale marker. Commands queue in the outbox and are not sent.
+  - Entered when no frame or heartbeat has arrived within the liveness window.
+  - Tiles keep their content with a visible stale marker. The outbox is **held**.
   - Reconnecting uses backoff with jitter and a cap. It also reconnects immediately on network-change or foreground events.
 - **NeedsToken.**
-  - Entered on a refused token: the client clears the stored token and asks the user.
+  - Entered on a refused token, at Hello or on any later auth error. The client clears the stored token and asks the user.
+  - The outbox is **held** until a new token connects. If the new principal differs from the old one, the outbox is **dropped** and the user is told, because commands must not run under another identity.
   - A Tauri shell may unlock a stored token with biometrics (§6).
 
 **The store.**
@@ -165,7 +179,7 @@ Disconnected ──connect──▶ Connecting ──open──▶ Hello ──w
 - Ephemeral state lives in the store but is not persisted: in-flight streaming blocks (§4) and the outbox's sent-but-unacked set.
 
 **The command outbox.**
-- Every `cmd` gets a `cmd_id` (UUIDv7), is stored with its `verb`, `args` and `created`, and is sent when Live.
+- Every `cmd` gets a `cmd_id` (UUIDv7), is stored with its `verb`, `args`, `created` and the principal that queued it, and is sent only in Live.
 - Each command's state goes `pending`, then `sent`, then `acked` or `failed`.
 - On reconnect, every `sent` command is resent with the same `cmd_id`. The server's idempotency window (ADR-0036 §5) returns the first `ack`.
 - A command older than the window is not resent. It is shown as "unknown outcome" with the server state at hand, and the user re-issues it deliberately.
@@ -190,6 +204,10 @@ wire ev ─▶ reducer(kind) ─▶ store (normalised) ─▶ selector(tile) ─
   - **`ArtifactVM`:** title, version list, sandbox URL or blob handle, comments by anchor, and open feedback requests.
   - **`InboxVM`:** ordered items, each with its kind, source agent, blocking flag and the actions the server allows.
   - **`FleetVM`**, **`GoalTreeVM`** and **`QueueVM`**.
+- **Which source feeds a transcript tile (reconciling ADR-0012).**
+  - A `structured` agent's tile reads ADR-0036's session stream. Its events are the canonical entries ADR-0012 §1 asked for, with stable ids and an unknown-event fallback.
+  - A `pty` agent's tile uses the terminal view (ADR-0011 §7) until ADR-0012's canonical entries and derived index are built for its harness. Then the same `TranscriptVM` renders them, and the client doesn't care which producer made them.
+  - ADR-0012 §6's rule, that reads are authorization-scoped, is applied by the server per stream through the token's scopes (ADR-0036 §5).
 - **Streaming text.**
   - `agent/<id>/live` deltas append to an in-flight block keyed by `(message uuid, block index)`.
   - When the complete `assistant` event arrives on `agent/<id>`, it replaces the in-flight block (ADR-0036 §4: deltas are not persisted).
@@ -280,9 +298,14 @@ Layout and tile state have **no wire type** (§2).
     - DevTools are gated in release builds.
     - Builds are signed and notarised.
 - **One transport.** ADR-0011 §3's desktop path, Tauri IPC straight to `flock.sock`, is **superseded** by the WebSocket and client tokens of ADR-0036 §5 for every shell (owner decision 1). There is one code path, one auth model and one set of tests. A desktop app on the server's host mints its own token through `flk client open`, as a browser does.
-- **Identity.**
-  - ADR-0011 §4's tailnet identity gate becomes optional defence in depth: a client token is required either way.
-  - Its funnel refusal and loopback default stand.
+- **Identity, and exactly what changes in ADR-0011.**
+  - **Superseded for the GUI:** ADR-0011 §4's requirement that a WSS *gateway* (#150) authenticate GUI clients by a non-empty `allowed_users` list and the `Tailscale-User-Login` header, and propagate that login as the request principal. For the `/v1/ws` endpoint, the principal is the client token's (ADR-0036 §5), on any network.
+  - **Kept:**
+    - the loopback default and the funnel refusal;
+    - the terminal bridge's own `allowed_users` check (`src/web/mod.rs`, ADR-0001), which serves `pty` terminal attach and is unchanged;
+    - ADR-0011 §7's rules for proxying terminal attach.
+  - A deployment may still put `/v1/ws` behind `tailscale serve` as defence in depth.
+  - **No migration is needed.** ADR-0011's gateway, the IPC transport and the use-case layer were never built: there is no `src/usecase/`, no `src/gui/` and no `RpcTransport` in the tree on 2026-10-15. Nothing in use changes.
 
 ### 7. Artifacts, and the artifact MCP
 
@@ -292,8 +315,8 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 
 | Tool | Input | Result |
 |---|---|---|
-| `flock_artifact_publish` | `title`, `kind`, `content` (inline, up to the size limit) or `path` (a file in the agent's worktree), `supersedes?` (artifact id: becomes a new version), `about?` (work or issue ref), `interactive?` (default false) | `{ artifact_id, version, sha256 }` |
-| `flock_artifact_request_feedback` | `artifact_id`, `version?` (default latest), `prompt`, `choices?`, `blocking?` (default false), `context?` | It opens a question record whose `about` is the artifact (ADR-0036 §2a). Non-blocking returns the §2a placeholder at once. Blocking waits like `flock_question_ask`. |
+| `flock_artifact_publish` | `title`, `kind`, `content` (inline, up to the size limit) or `path` (a file inside the agent's worktree: the server resolves it with symlinks followed and refuses any canonical path outside the worktree root, or any non-regular file), `supersedes?` (artifact id: becomes a new version), `about?` (work or issue ref), `interactive?` (default false) | `{ artifact_id, version, sha256 }` |
+| `flock_artifact_request_feedback` | `artifact_id`, `version?` (default latest), `prompt`, `choices?`, `blocking?` (default false), `context?`, `recipient?` (ADR-0034 routing: the operator by default, or a named agent or owner) | It opens a question record whose `about` is the artifact (ADR-0036 §2a), routed by ADR-0034 like any question. An agent recipient answers it through its own question tools. Non-blocking returns the §2a placeholder at once. Blocking waits like `flock_question_ask`. |
 | `flock_artifact_comments` | `artifact_id`, `since?` | anchored comments with authors, in order |
 | `flock_artifact_list` | `about?`, `mine?` | records |
 
@@ -306,11 +329,16 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 - A version is immutable, and a published artifact is its hash.
 
 **Rendering and isolation.**
-- The client renders an artifact only inside `<iframe sandbox>` **without** `allow-same-origin`. The frame's origin is opaque, so it has no cookies, no storage, no access to the parent and no access to the client token.
+- The client renders an artifact only inside `<iframe sandbox>` **without** `allow-same-origin`, `allow-top-navigation*`, `allow-popups`, `allow-forms` or `allow-modals`. The frame's origin is opaque, so it has no cookies, no storage, no access to the parent and no access to the client token.
 - The content goes in through `srcdoc` (HTML) or a `blob:` URL (other kinds), with a CSP `<meta>` injected first:
-  - Static artifacts (the default) get ADR-0011 §5's policy unchanged: `default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'`.
-  - **Interactive** artifacts add `allow-scripts` to the sandbox and `script-src 'unsafe-inline'`. `connect-src 'none'` stays, so a script can draw and react but cannot reach any network.
-- This **replaces ADR-0011 §5's distinct hostname** (owner decision 3). An opaque origin gives a stronger boundary than a separate site, and it works the same in Tauri, which has no hostname.
+  - Static artifacts (the default) get ADR-0011 §5's policy: `default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'`.
+  - With no script, no forms and no top navigation, a static artifact has no way to make a request beyond the inline data it carries.
+  - **Interactive** artifacts add `allow-scripts` to the sandbox and `script-src 'unsafe-inline'`. `connect-src 'none'` stays.
+- **Residual risk of interactive artifacts: navigation of the frame itself.** A script can navigate its own frame (`location = …`, a meta refresh, a link) and so leak data in a URL as a beacon. CSP has no widely shipped `navigate-to`, so the sandbox flags cannot fully stop this.
+  - The mitigation is the frame's own CSP plus `default-src 'none'`, so the navigated-to page cannot load anything in the same frame. A beacon is still one outbound GET.
+  - That is why interactive artifacts are opt-in per publish, carry a visible "interactive" badge, and are owner decision 2.
+- **Tauri.** The shell's own policy is `default-src 'self'`, so it adds `frame-src blob: 'self'` so that `srcdoc` and `blob:` frames load. The frame's injected CSP still governs what runs inside it.
+- This **replaces ADR-0011 §5's distinct hostname** (owner decision 3). An opaque origin is a stronger boundary than a separate site, and it works the same in Tauri, which has no hostname.
 - **Untrusted chrome.** The frame always sits under visible chrome naming the publishing agent and "untrusted content". It is never full-window and never `window.open`.
 - **The TUI** shows the text fallback (ADR-0036 §12 item 3): title, version, size, a `flk artifact open <id>` hint, and the comments.
 
@@ -325,9 +353,13 @@ An **artifact** is agent-authored content that a person looks at and answers: an
   - That action calls `expand_into_second(artifact, origin = the question's tile or the agent's transcript)`.
   - The answer, a choice or text, goes through `inbox.answer`, which is atomic.
 - **Interactive artifacts** may post exactly one message shape to the parent: `{ type: "flock.feedback", block_id?, value: <JSON ≤ 16 KiB> }`.
-  - The parent validates it against the record's `interactive` flag and the size limit.
+  - Every opaque frame posts with origin `null`, so the parent identifies the sender by `event.source === iframe.contentWindow` for the artifact's own frame, never by origin. Messages from any other source are dropped.
+  - The parent validates the message against the record's `interactive` flag and the size limit.
   - It shows the user what will be sent, and sends it as an `artifact.comment` only on the user's confirmation.
   - Nothing the frame posts reaches an agent without a person confirming it.
+- **Which path, and why.**
+  - Comments and confirmed interactive posts go through the **queue** (ADR-0036 §3) as input items. They are unsolicited information the agent should take at its next idle point, and the queue's gate and FIFO rules already apply.
+  - Answers to a feedback request go through the **question** path (`inbox.answer`). They resolve something the agent asked, possibly while blocked, and need the atomic verify-then-apply.
 
 ### 8. Goals and work
 
@@ -342,11 +374,12 @@ An **artifact** is agent-authored content that a person looks at and answers: an
   - Events: `work.created`, `work.updated`, `work.edge_added`, `work.edge_removed`, `work.closed`.
   - Each event carries the actor principal, so history is the log itself: who changed what, and when.
   - Architects and owners write it through MCP tools (`flock_work_*`, designed in its slice) instead of private files. ADR-0036 S6d's hold-or-continue check reads it.
-- **No embedded versioned graph engine** in this record.
-  - A content-addressed, branchable graph store was evaluated. Branching and three-way merge of the work graph would let agents plan on a branch and merge.
-  - But flock's needs today are append, fold and project. The event log already is the version history. And such an engine brings its own crash-safety, reclamation and growth risks into the server process.
-  - The record shapes above keep that option open: every change is an event with an actor and typed edges.
-  - Owner decision 8.
+- **No separate graph storage engine** in this record. flock's needs for goals and work today are append, fold and project. The durable event log already gives what a work graph needs:
+  - typed nodes and edges, as event payloads;
+  - an actor on every change;
+  - full history, because the log is the history.
+
+  A versioned graph engine, for example one that lets agents plan on a branch and merge, stays a future option. The record shapes above keep it open: every change is an actor-attributed event with typed edges, so a later engine could be fed from the log or replace the fold. Owner decision 8.
 
 ### 9. Mesh
 
@@ -361,22 +394,25 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 
 | # | Slice | Depends on | Before S3? | Est. |
 |---|---|---|---|---|
-| G1 | Client shell skeleton (Bun + Solid), with a fixture transport replaying recorded S1 session fixtures (#1379) through generated types | S8a | yes | 400 TS |
-| S8a | `ts` feature and ts-rs derives for the existing socket API types (agents, workspaces, panes, questions); drift test, `just gen-ts`. This splits S8 so the client can start before S7. | — | yes | 200 |
+| S8a | `ts` feature and ts-rs derives for types that exist today: the socket API types the client needs first (agents, workspaces, panes, questions) and ADR-0036 S1's `SessionEvent` (landed). Drift test, `just gen-ts`. This splits ADR-0036 S8. | — | yes | 200 |
+| S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `gap`, `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1323 decided, #1546 settled | yes | 200 |
+| G1 | Client shell skeleton (Bun + Solid), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
 | G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode | G1 | yes | 400 TS |
-| G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server (connect, gap, lagged, stale, protocol gap, token refusal) | G1, #1546 settled | yes | 400 TS |
-| S7 | Wire endpoint (ADR-0036), with #1546's liveness | S3 (S3a #1518/#1439, S3b #1426), #1323 decided | no | 400 |
-| S8b | Remaining ts derives for the session events and the S7 wire messages | S7, S8a | no | 150 |
-| G4 | `fleet` stream and the sidebar *Fleet* and *Projects* trees, merging nodes by `node_id` (#1076) | S7 | no | 350 |
+| G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server built on S7a's types (connect, gap, lagged, stale, protocol gap, token refusal) | G1, S7a | yes | 400 TS |
+| S7 | The wire endpoint (ADR-0036), implementing S7a's types, with #1546's liveness | S3 (S3a #1518/#1439, S3b #1426), S7a | no | 350 |
+| S8b | ts derives for the cmd params and result types and the §5 stream payloads the endpoint adds | S7 | no | 150 |
+| G4 | The `fleet` stream and the sidebar *Fleet* and *Projects* trees, merging nodes by `node_id` (#1076) | S7 | no | 350 |
 | S9a | Transcript tile (ADR-0036 S9a) on G2/G3 | S8b, G2, G3 | no | 400 TS |
-| G5 | `inbox` stream and inbox tile, with atomic `inbox.answer` | S7, S6b | no | 350 |
-| G6 | Artifact records, blobs, limits, retention; the `flock_artifact_publish`, `_list` and `_comments` tools; the `artifacts` stream | S7 (records only need S3) | partly | 400 |
-| G7 | Artifact tile: sandbox, CSP injection, block anchors, comments, `expand_into_second`; `flock_artifact_request_feedback` | G6, G5, S6c | no | 400 (TS + Rust) |
-| G8 | `work` stream, phase 1 projection, goal tree tile | S7 | no | 350 |
+| G5 | The `inbox` stream and inbox tile, with atomic `inbox.answer` | S7, S6b | no | 350 |
+| G6 | Artifact records, blobs, limits, retention; the `flock_artifact_publish`, `_list` and `_comments` tools; the `artifacts` stream | S3b #1426 (the blob store), S7 | no | 400 |
+| G7 | Artifact tile: sandbox, CSP injection, block anchors, comments, `expand_into_second`; `flock_artifact_request_feedback` with ADR-0034 routing | G6, G5, S6c | no | 400 (TS + Rust) |
+| G8 | The `work` stream, phase 1 projection, goal tree tile | S7 | no | 350 |
 | G9 | Tauri v2 desktop shell: config, keychain token, accessory bar, deep links, tray | G1–G3 | yes (shell only) | 300 + config |
 | G10 | Tauri mobile and push, if decided | G9, owner decision 6 | no | — |
 | G11 | Artifact carriage over the mesh | G6, ADR-0026 | no | 300 |
 | G12 | `work` records, phase 2 (§8) | G8, owner decision 7 | no | 400 |
+
+Before S3 means a slice depends on nothing in the -p chain's runtime (S3a, S3b). S8a, S7a, G1, G2, G3 and the G9 shell qualify. Everything that serves live data needs S7 and therefore S3.
 
 The first end-to-end milestone is **"a structured agent in a browser tile"**: G1 + G2 + G3 + S7 + S8b + S9a, against the -p MVP's runtime. It follows the MVP and does not compete with it.
 
@@ -386,12 +422,12 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 |---|---|---|---|
 | 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | Yes | A desktop app on the server host needs a token. `flk client open` already makes one. |
 | 2 | Allow opt-in **interactive** artifacts: scripts in an opaque-origin sandbox, no network, and posts confirmed by a person (ADR-0011 §5 requires an ADR for any script relaxation) | Yes, opt-in per publish, off by default | One more security surface to review. Agents can render live plots and forms. |
-| 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | Yes | Its boundary is the browser's sandbox, which is well tested. No second DNS name or listener. |
+| 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | Yes | Isolation rests on correct sandbox flags and injected CSP in every shell. A client bug, such as a stray `allow-same-origin`, would expose the client token, so it needs a security test per shell (G7). Interactive artifacts keep the navigation-beacon risk of §7. Artifacts can't be opened as standalone URLs: they render only inside the client. |
 | 4 | Solid web client vs GPUI (#1401) | Solid, as ADR-0036 decided. GPUI has no HTML engine for artifacts and no browser reach. | The Bun/TS toolchain stays. |
 | 5 | #1323 (Grafana stack) gates S7 | Decide "ours" now for the live wire and history, revisiting Loki for long-term history later | We keep the JSONL and blob store we already have. |
 | 6 | A push relay for mobile background notifications | Defer. Mobile v1 is foreground only. | No pings while the app is closed. |
 | 7 | `work` records as first-class flk state (§8 phase 2) | Yes, after phase 1 has been used | Architects move their task files into flk. |
-| 8 | Adopt an embedded versioned graph engine for goals and work | Not now. Revisit when branch-and-merge planning is a real need and a candidate engine is mature. | No branch and merge of plans for now. |
+| 8 | A separate versioned graph engine for goals and work | Not now. The event log covers typed nodes and edges, actors and history. Revisit when branch-and-merge planning is a real need. | No branch and merge of plans for now. |
 | 9 | Layout persistence | Client-local per device now; server-synced named layouts later | A layout doesn't follow you between devices. |
 
 ## Failure modes and known limits
@@ -415,7 +451,7 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ## Consequences
 
-- The client becomes testable against a scripted fake server before S7 exists (G1–G3 with S8a).
+- The client becomes testable against a scripted fake server before S7 exists (G1–G3 with S8a and S7a).
 - Agents get one way to show a person something and get it answered, through the question and queue machinery that already exists.
 - Goals and work become visible without new storage (phase 1). Phase 2 moves planning state out of private files into flk's log.
 - ADR-0011 §3, §4 and §5 are partly superseded if decisions 1 and 3 are accepted. ADR-0011 will need a status note.
