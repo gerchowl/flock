@@ -12,6 +12,7 @@ use crate::mesh::routes::{Adjacency, Advert, Route, RouteTable};
 pub(crate) struct Routes {
     pub table: RouteTable,
     workers: crate::app::message_relay::MessageRelays,
+    /// Snapshot for the last published local advert, not the current attachments.
     live: BTreeMap<String, String>,
     sent: BTreeMap<String, (u64, u64)>,
     busy: BTreeSet<String>,
@@ -487,9 +488,25 @@ mod tests {
             .mesh_routes
             .live
             .contains_key(&mail.return_binding.recipient_node));
-        assert!(!app
-            .custody_routes()
-            .contains_key(&mail.return_binding.recipient_node));
+        let routes = app.custody_routes();
+        assert!(!routes.contains_key(&mail.return_binding.recipient_node));
+        // Forwarding pauses without identity. Once it returns, the next route
+        // pass must consume the invalidation and clear the durable assignment.
+        app.node_id = Some(mail.key.origin_node.clone());
+        app.retry_mesh_mail();
+        let record = crate::mesh::hello::with_store(|store| {
+            store
+                .collection_record(&mail.key, super::super::messages::now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            record.next_hop.is_empty(),
+            "closed edge retained assignment {}",
+            record.next_hop
+        );
+        assert_eq!(record.envelope.key, mail.key, "custody must be retained");
     }
 
     #[test]
