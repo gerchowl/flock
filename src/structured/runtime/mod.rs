@@ -97,11 +97,13 @@ impl Drop for Runtime {
 /// channel. This API does not expose agent.start or supply a lease.
 pub fn run(
     state: &Path,
-    mut profile: LaunchProfile,
+    profile: LaunchProfile,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
-    supervision::sweep_stale_sessions(state)?;
+    for entry in supervision::sweep_stale_sessions(state)? {
+        crate::logging::structured_sweep_outcome(&entry);
+    }
     let checked = VerifiedBinary::check(profile.binary(), |path, args| {
         let mut command = TracedCommand::new(path, "structured-version");
         command.args(args).env_clear().stdin(Stdio::null());
@@ -128,8 +130,7 @@ pub fn run(
     profile.configure_environment(|key, value| {
         command.env(key, value);
     });
-    profile.arm_session()?;
-    let mut child = command.spawn_traced()?;
+    let (mut child, profile) = profile.try_spawn(|| command.spawn_traced())?;
     let config = profile.config_dir().to_owned();
     let files = profile.into_session_files();
     let pid = child.id();
@@ -219,6 +220,7 @@ pub fn run(
             }
             facts.error.take().map_or(Ok(()), Err)
         },
+        supervision::Schedule::default(),
     );
     control.cancel();
     let cleanup = report.cleanup.err().map(|error| error.to_string());
@@ -263,6 +265,7 @@ fn startup_failed(
         stop,
         || {},
         || Err(io::Error::other("startup I/O ownership unconfirmed")),
+        supervision::Schedule::default(),
     );
     LaunchError::Io(io::Error::other(format!(
         "{error}; resources retained: {:?}",

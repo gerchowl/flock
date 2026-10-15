@@ -31,6 +31,10 @@ if sys.argv[1:] == ["--version"]:
         sys.exit(9)
     if case.get("version") == "fail":
         sys.exit(7)
+    if case.get("version") == "remove":
+        (root / "claude").unlink()
+        print("2.1.296 (Claude Code)", flush=True)
+        sys.exit(0)
     print(case.get("version", "2.1.296") + " (Claude Code)", flush=True)
     sys.exit(0)
 assert sys.argv[1:] == json.loads((root / "argv.json").read_text()), "argv drift"
@@ -93,7 +97,7 @@ if not line:
 assert json.loads(line)["type"] == "user", "private user envelope seam"
 (root / "input-received").write_text("input")
 emit(find("system", "hook_response"))
-init = find("system", "init")
+init = json.loads((root / "restricted-init.json").read_text())
 if mode.startswith("init-socket"):
     if mode.endswith("string"):
         sockets = root / "cc-socks"

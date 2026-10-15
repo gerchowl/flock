@@ -39,6 +39,11 @@ impl Fixture {
             include_bytes!("../../../tests/fixtures/claude-session/events.jsonl"),
             0o600,
         );
+        fixture.file(
+            "restricted-init.json",
+            include_bytes!("../../../tests/fixtures/structured-runtime/restricted-init.json"),
+            0o600,
+        );
         let python = TracedCommand::new("python3", "fixture-python")
             .args(["-c", "import sys; print(sys.executable)"])
             .output_traced()
@@ -285,6 +290,32 @@ fn real_fake_launch_checks_env_argv_hooks_large_line_final_line_and_cleanup() {
     assert_eq!(
         records.iter().map(|record| record.seq).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5, 6]
+    );
+}
+
+#[test]
+fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile("normal", "remove");
+    let persistent = profile.config_dir().to_owned();
+    let error = run(
+        fixture.root.path(),
+        profile,
+        StreamLocation {
+            data_dir: fixture.root.path().to_owned(),
+            agent: "fixture-agent".into(),
+            session: SESSION.into(),
+        },
+        |_| panic!("failed spawn published a runtime"),
+    )
+    .expect_err("removed executable cannot spawn");
+    assert!(matches!(error, LaunchError::Io(ref error) if error.kind() == io::ErrorKind::NotFound));
+    assert!(persistent.is_dir());
+    assert_eq!(
+        fs::read_dir(fixture.root.path().join("structured/sessions"))
+            .expect("session listing")
+            .count(),
+        0
     );
 }
 

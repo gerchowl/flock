@@ -12,6 +12,17 @@ const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
+/// Surface retained recovery entries without reading session contents.
+pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::SweepEntry) {
+    use crate::structured::supervision::SweepOutcome;
+    if matches!(
+        entry.outcome,
+        SweepOutcome::Quarantined { .. } | SweepOutcome::Retained(_)
+    ) {
+        tracing::warn!(event = "structured.session.retained", directory = %entry.directory.display(), outcome = ?entry.outcome, "structured session requires manual inspection");
+    }
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
