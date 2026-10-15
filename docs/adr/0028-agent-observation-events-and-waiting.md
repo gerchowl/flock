@@ -818,11 +818,15 @@ No full screen text is copied into receipts or emitted in telemetry.
 #### Runtime lifetime, restart and handoff
 
 **Owner decision required — recommendation: invalidate rather than persist.**
-Mint a fresh observation epoch for each owned runtime at server startup, pane
-respawn, and ownership transfer during live handoff. Preserve normal pane/agent
-identity as today, but reset these two counters to zero in the new epoch. Do not
-restore a receipt as proof that the new owner has sampled anything. The importer
-must capture and apply its own first observation. Old-owner late messages are
+Mint a fresh cryptographically random 128-bit observation epoch for each owned
+runtime at server startup, pane respawn, and ownership transfer during live
+handoff. Epochs must be unique across process lifetimes, not just within one
+process: never derive them from a process-local counter, pane id or timestamp
+alone, and never restore an old epoch from persisted state. Fail runtime
+observation initialization if secure randomness is unavailable; do not fall back
+to a reusable value. Preserve normal pane/agent identity as today, but reset
+these two counters to zero in the new epoch. Do not restore a receipt as proof
+that the new owner has sampled anything. The importer must capture and apply its own first observation. Old-owner late messages are
 rejected by epoch, even if their numeric counters are larger.
 
 This deliberately does not promise a globally increasing integer across runtime
@@ -845,24 +849,50 @@ Advertise this contract with an additive `detection_samples_v1` capability.
 
 Recommend a new read-only method, `pane.wait_for_sample`, and CLI
 `flk pane wait-for-sample <pane> --after-sample <D> --min-output <O>
---timeout <duration>`. An `agent wait-for-sample` alias may resolve an agent and
-call the same method. Parameters are a pinned pane identity, mandatory
-`after_sample`, optional `min_output`, and a mandatory finite `timeout_ms`.
-For example, a test may keep its existing 5000 ms failure ceiling. The success
-predicate is both `sample > D` and, when supplied, `sampled_output >= O`, all
-within the same epoch. Already committed matching receipts may return at once.
-Return the receipt and its effective status together. `classified` is required
-when a caller wants a fresh classification; skipped/unidentified observations
-are returned as such and cannot be read as a Working assertion.
+--require-classified --timeout <duration>`. An `agent wait-for-sample` alias
+may resolve an agent and call the same method. Parameters are a pinned pane identity, mandatory
+`after_sample`, optional `min_output`, optional `require_classified` (default
+false), and mandatory integer `timeout_ms` in `1..=540000`. Reject zero or a
+value above 540000 with `invalid_sample_timeout` / CLI `USAGE` before admission;
+never clamp it. The maximum is §6's 540 s read-wait ceiling, leaving 60 s below
+the 600 s MCP cap. Tests retain a smaller per-stage failure ceiling (for example
+5000 ms), within their ADR-0037 binary termination ceiling; the API maximum is
+not permission to widen a test deadline. The success predicate is both
+`sample > D` and, when supplied, `sampled_output >= O`, all within the same
+epoch, plus `outcome == classified` when `require_classified` is true. Already
+committed matching receipts may return at once. Return the receipt and its
+effective status together. With the flag false, skipped/unidentified
+observations can return as such; they cannot be read as a Working assertion.
 
-This is a registered, server-woken bounded wait (§5, ADR-0037 §1), not a client
-poll loop. Use the existing wait registry's caller/identity rules and a per-pane
-condition wakeup. Under one synchronization boundary, register then recheck the
-latest receipt, producer liveness and epoch, avoiding a lost wakeup between read
-and registration. Cancellation/disconnect removes the waiter. A live silent
-producer reaches the finite failure ceiling. Death or replacement fails promptly;
-neither EOF nor missing observations can imply success. Wakeups are hints to
-recheck the predicate and cannot themselves satisfy it.
+This is a registered, server-woken bounded wait (§5, ADR-0037 §1), with no
+polling loop in the client or server. It owns admission and wakeup independently
+of `WaitRegistry`: that registry records nothing for callers outside agent panes,
+has no held-read admission cap, and its predicate wakeup awaits E6 (#1032).
+Sample waits do not depend on E6 or treat registration as a wake mechanism.
+
+Recommend at most **8 pending sample waits per pane incarnation and 256 globally
+per server**, counting every caller, including operator CLI, tests and unattested
+socket clients. Validate subject, epoch, parameters and producer liveness first.
+An already matching receipt returns immediately without consuming a pending slot.
+Otherwise atomically check both counts and register, or refuse immediately with
+`sample_wait_limit_exceeded` / CLI `REFUSED` if either cap would be exceeded.
+Never queue for admission or allocate an unbounded list of blocked requests.
+Registration and a recheck of the latest receipt, epoch and liveness share the
+receipt-commit synchronization boundary, preventing a lost wakeup. A slot owns
+both counts and releases them on every completion, timeout, cancellation,
+disconnect, producer loss, subject removal or epoch replacement.
+
+Use a dedicated per-pane notification fired by the detection pass's app-side
+receipt commit, after classification and effective-state arbitration, including
+unchanged passes. Notify all registered waiters for that pane, not just one. The waiter suspends on that notification, disconnect/liveness
+signals and its single monotonic deadline. Producer death, pane removal and epoch
+replacement signal pending waiters directly rather than waiting for another
+sample. Wakeups only cause a predicate/liveness recheck; they cannot satisfy the
+wait themselves. Arm notification and recheck atomically with registration (and
+on resuspension), so a commit between checks cannot be lost. There is no periodic
+receipt scan, timer-based retry or client read loop. A live silent producer or a
+stream of nonmatching outcomes fails at the original deadline; neither EOF nor
+missing observations implies success.
 
 Proposed failures are typed `observation_reset` / `subject_replaced` (CLI
 `REFUSED`), `detection_producer_gone` / removed pane (`GONE`), `timeout`
@@ -884,17 +914,23 @@ the new request shape, checking the latest released tag at implementation time.
 There is no `DetectionSampled` durable or global-ring event. Updating sample
 metadata does not change `state_seq`, working entries, turn cursor, derived
 phase events, seen state, settle/dwell timestamps, or render dirtiness. Repeated
-samples must not restart a settle window or manufacture progress for stall checks. Only registered local sample
-waiters are notified. These condition wakeups reuse the server wait registry;
-they are not a second event broker or a replayable stream. A disconnected
-waiter must read current cursors and register again, not resume from hub `seq`.
-Ordinary wait registration/closure retains the registry's existing audit rules.
+samples must not restart a settle window or manufacture progress for stall checks.
+Only registered local sample waiters are notified. The dedicated per-pane
+notification is neither a second event broker nor a replayable stream. A
+disconnected waiter must read current cursors and register again, not resume
+from hub `seq`. An attested agent caller may additionally use the existing wait
+registry's attribution/audit rules for registration/closure; this optional record
+provides neither admission nor wakeup. Unattested callers have the same sample
+wait limits and liveness guarantees without an agent-state record.
 
 #### Settle the legacy `revision` contract
 
 **Owner decision required — recommendation: deprecate the legacy field.**
 Keep serializing existing numeric `revision` fields as zero on every old response
-shape. Do not reinterpret them as detection samples or suddenly mix a new writer
+shape. This explicitly includes `EventData::PaneOutputChanged.revision`
+(`src/api/schema.rs`), alongside pane/agent info, read and output-match fields;
+retain that legacy event field/schema without adding a new producer for it. Do
+not reinterpret these fields as detection samples or suddenly mix a new writer
 with old zero read handlers. Add the real parser-progress writer only for
 `output_cursor`, with the snapshot semantics above. New clients use the two new
 cursors; they must not infer capability from a nonzero legacy integer.
@@ -920,14 +956,16 @@ internal applications/second. This is an analytic rate, not a measured benchmark
 Reuse each pass's existing snapshot and classification; add counters and a small
 fixed-size latest receipt, not a new screen parse/hash or full-state copy. Keep
 metadata below 1 KiB per pane as an initial budget, roughly 100 KiB for 100 panes,
-plus the existing bounded wait-registry entries. No history grows with uptime.
+plus the separately capped sample-wait entries (at most 8 per pane and 256
+server-wide). The implementation must measure and report bytes per pending
+wait and total memory at the global cap. No history grows with uptime.
 Output revisions reuse the parser lock already held for writes/snapshots.
 
 No waiters means no sample network traffic, disk I/O, hub sequences, diagnostic
 line per pass or UI redraw. Wake only that pane's registered waiters, and return
-one receipt per satisfied request. Bound waiter admission by the existing wait
-registry limits, release on timeout/disconnect, and do not queue every missed
-sample for slow clients. A later receipt covering the minimum output suffices;
+one receipt per satisfied request. Enforce the dedicated admission caps above,
+release slots on every termination path, and do not queue every missed sample
+for slow clients. A later receipt covering the minimum output suffices;
 this is latest-observation progress, not an every-sample delivery guarantee.
 
 **Owner decision required — recommendation:** approve these lifetime/exposure/
@@ -950,11 +988,13 @@ fail before implementation. Preserve these failures once as regression evidence.
 | Causal race | Hold a classification of output R, paint R+1, then release the old result. `min_output=R+1` must remain pending despite a newer sample number, and only open after a pass covering R+1. |
 | Application boundary | Hold app-side receipt application after capture; no read/wait may advertise the sample as applied yet. Release it and receive one coherent receipt. |
 | Snapshot race / stale producer | Write during capture, reorder queued observations, and deliver an old owner's receipt after handoff. Never attach a newer output cursor to old text or apply stale results. |
-| #1570 redraw | With input echo off, place a unique marker in scrollback, then redraw identical Working detection text. Assert marker appears in `recent`, is absent from `detection`, and detection text equals the original. Capture the output cursor with the completed frame, wait after the prior sample with that minimum output, then require a classified Working receipt. No status read or marker match alone is completion evidence. |
+| #1570 redraw | Save prior detection cursor D. With input echo off, issue marker plus the complete identical Working redraw in **one PTY write**. An output match on the unique marker **and redraw tail** in `recent` returns the atomically captured output cursor O. Prove marker absent from `detection` and detection text equal to the original. Call `pane.wait_for_sample` with `after_sample=D`, `min_output=O`, `require_classified=true` and a bounded timeout, then assert the receipt is classified Working. No sleep is needed; the output match acknowledges the entire redraw and the sample wait acknowledges its classification. Neither a status read nor marker alone proves completion. |
 | Marker isolation | Current-screen detection includes all visible rows. The fixture must prove its marker is in scrollback and absent from the detector snapshot; a header assumed to be outside 24 rows is not sufficient. |
 | Real turn end | After a real completed/aborted-turn source, normal authority rules still settle; samples do not revive Working or retire a binding (§1a). Test raw Working with authoritative lifecycle idle separately. |
 | Skipped and unidentified | Blank/skipped/unidentified passes acknowledge their honest outcomes without presenting retained state as fresh classified evidence. |
 | Lifecycle boundaries | Respawn, restart and live handoff issue a new epoch, invalidate open waits, reject old cursors/late receipts and require a fresh applied pass. Rename/move within the runtime does not reset it. |
+| Pre-restart cursor | Save D and O before stopping the server, restart it with counters reset, then submit a wait using those saved cursors. Return typed `observation_reset` / `REFUSED` immediately, even if new counters later exceed the old ones; never return satisfied. Repeat for respawn and handoff, and assert epochs differ across process lifetimes. |
+| Admission / timeout bounds | Keep 8 unmatched waits open on one pane; the ninth returns `sample_wait_limit_exceeded` / `REFUSED`. Reach 256 across distinct panes; the next returns the same refusal. Repeat with unattested operator/test callers. Verify each termination path releases both counts; immediate matches consume no slot. Zero, 540001 and `u64::MAX` timeouts return `invalid_sample_timeout` / `USAGE`; 540000 is admitted when capacity exists, and tests use their smaller failure ceiling. |
 | Liveness / lost wake | Producer dies, peer/subject disappears, a live producer stays silent, caller disconnects, and commit races registration. Each fails/cancels within its existing ceiling or succeeds on an actual matching receipt; never hangs or misses a committed match. |
 | Mixed versions | New client/old server fails with protocol gap; old client/new server still parses zero legacy revision; missing fields never become success. Verify legacy filter refusal and previous-release log readability. |
 | Overflow / identity | Counter exhaustion changes epoch without wrapping; reused pane/agent names cannot satisfy an earlier subject's wait. |
@@ -1382,8 +1422,10 @@ in ADR-0030 §8.
 
 ## Owner decisions
 
-Decided by the operator on 2026-10-11 (PR #1006): every item below was
+Decided by the operator on 2026-10-11 (PR #1006): items 1–6 below were
 accepted as recommended. The rejected alternative is kept for the record.
+Items 7–9 are new §1b proposals and require a separate owner decision; the
+earlier acceptance does not cover them.
 
 1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
@@ -1410,3 +1452,21 @@ accepted as recommended. The rejected alternative is kept for the record.
    plain message answers the oldest open one); `flk question list` / `answer`
    and MCP equivalents; first answer wins, every answer recorded with its
    source. Slices E9a–E9c.
+7. **Observation lifetime (§1b). Owner decision required.** Recommend per-runtime
+   sample/output cursors with fresh cryptographically random 128-bit epochs
+   across process lifetimes. Restart, respawn and handoff invalidate cursors and
+   pending waits; persist no receipts and never silently rebase old cursors.
+8. **Sample wait and event policy (§1b). Owner decision required.** Recommend a
+   dedicated capability-gated `pane.wait_for_sample`, additive local reads, no
+   global/durable sample event, and per-pane receipt-commit notifications
+   independent of E6. Cap pending waits at 8 per pane and 256 per server, with
+   `sample_wait_limit_exceeded` / `REFUSED`; cap timeout at 540000 ms, with
+   `invalid_sample_timeout` / `USAGE` outside `1..=540000`. Approve these bounds
+   and the proposed memory/CPU measurement gate before implementation.
+9. **Legacy revision (§1b). Owner decision required.** Recommend deprecating all
+   legacy numeric revision fields, explicitly including
+   `EventData::PaneOutputChanged.revision`, retaining zero and compatible wire
+   schemas/log readability, and refusing the unfinished `min_revision` filter
+   with `unsupported_legacy_revision` / `PROTOCOL_GAP`. Approve that named
+   behavior change with a release note; removal requires separate major-wire
+   approval. Give only the new output cursor a parser-progress writer.
