@@ -1390,7 +1390,7 @@ fn worktree_create_base_is_refreshed_from_the_remote() {
     assert_eq!(rev(&repo, "wt/tag"), tagged);
 }
 
-/// #1552: replay three Codex working frames and an identical hollow repeat,
+/// #1552: replay three Codex working frames and identical hollow repeats,
 /// plus idle and finished frames, without running a model.
 #[test]
 fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
@@ -1411,12 +1411,14 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         fs::write(server.base.join(format!("{name}.txt")), frame).unwrap();
     }
     // This producer blocks on input; each frame is requested, never timed.
+    // Disable input echo so commands cannot become intervening screen frames.
     let script = format!(
         "#!/bin/sh\n\
          draw() {{ printf '\\033[3J\\033[2J\\033[H'; cat '{base}/'$1.txt; }}\n\
+         stty -echo || exit 43\n\
          draw idle\n\
          while IFS= read -r frame; do\n\
-           case \"$frame\" in repeated-hollow) draw hollow ;; idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
+           case \"$frame\" in repeated-hollow|consecutive-hollow) draw hollow ;; idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
          done\n",
         base = server.base.display()
     );
@@ -1469,6 +1471,8 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
     wait_status("idle", "startup");
     for (frame, needle, status) in [
         ("hollow", "◦ Working (21m 26s", "working"),
+        // No intervening frame: an identical redraw stays working (ADR-0028 §1a).
+        ("consecutive-hollow", "◦ Working (21m 26s", "working"),
         // Observe settled idle so the working hold cannot satisfy the next step.
         ("idle", "Bring your unfinished thoughts.", "idle"),
         ("filled", "• Working (", "working"),
@@ -1484,10 +1488,14 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
             // old working hold could otherwise satisfy the next glyph wait.
             // Both idle and done represent the same settled terminal state.
             let before = listed_agent();
-            assert!(
-                matches!(before["agent_status"].as_str(), Some("idle" | "done")),
-                "every glyph must start settled idle before {frame}: {before}"
-            );
+            if frame == "consecutive-hollow" {
+                assert_eq!(before["agent_status"], "working", "{frame}: {before}");
+            } else {
+                assert!(
+                    matches!(before["agent_status"].as_str(), Some("idle" | "done")),
+                    "every independent glyph must start settled idle before {frame}: {before}"
+                );
+            }
         }
         let sent = request(
             &server,
