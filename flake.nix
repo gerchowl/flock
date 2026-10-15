@@ -27,11 +27,19 @@
       ];
       forAllSystems = lib.genAttrs systems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      patchedSccacheFor =
+        pkgs:
+        assert lib.assertMsg (
+          pkgs.sccache.version == "0.15.0"
+        ) "Re-evaluate the #1411 startup patch when sccache changes version";
+        pkgs.sccache.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/patches/sccache-0.15.0-startup.patch ];
+        });
       stableSccacheFor =
         pkgs:
         pkgs.writeShellScriptBin "sccache" ''
           set -eu
-          SCCACHE_REAL=${pkgs.sccache}/bin/sccache
+          SCCACHE_REAL=${patchedSccacheFor pkgs}/bin/sccache
           ${builtins.readFile ./nix/sccache.sh}
         '';
     in
@@ -82,7 +90,7 @@
                 ];
                 RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
                 FLOCK_TEST_SCCACHE_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
-                FLOCK_TEST_SCCACHE_RAW = "${pkgs.sccache}/bin/sccache";
+                FLOCK_TEST_SCCACHE_RAW = "${patchedSccacheFor pkgs}/bin/sccache";
               }
               ''
                 python3 ${./scripts/probe_sccache.py}
@@ -169,7 +177,7 @@
               export PATH="${stableSccache}/bin:$PATH"
               # The isolated cache-reuse probe also needs the unwrapped binary.
               export FLOCK_TEST_SCCACHE_WRAPPER="${stableSccache}/bin/sccache"
-              export FLOCK_TEST_SCCACHE_RAW="${pkgs.sccache}/bin/sccache"
+              export FLOCK_TEST_SCCACHE_RAW="${patchedSccacheFor pkgs}/bin/sccache"
               case "$RUSTC_WRAPPER" in
                 sccache|*/sccache)
                   export RUSTC_WRAPPER="${stableSccache}/bin/sccache"

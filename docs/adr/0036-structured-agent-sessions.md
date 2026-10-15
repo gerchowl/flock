@@ -1653,8 +1653,8 @@ interrupts on both (read from the schemas only), and any live Codex
 
 ## Appendix A, continued — S0 probes (2026-10-14, #1307)
 
-Measured on 2026-10-14 against Claude Code 2.1.296 on sage (macOS, Apple
-Silicon), model alias `haiku`. Drivers are committed under
+Measured on 2026-10-14 against Claude Code 2.1.296 on a fleet host (macOS,
+Apple Silicon), model alias `haiku`. Drivers are committed under
 `docs/adr/0036-probes/` (`s0lib.py` is the shared stream-json driver; every
 probe below names its script; `README.md` there says how to re-run it).
 The raw captures are not committed, as in A (they hold account rate-limit
@@ -1668,8 +1668,9 @@ ran in a fresh temporary working directory holding `a.txt` and `b.txt`
 --include-hook-events --setting-sources local --strict-mcp-config
 --no-session-persistence --model haiku` plus the flags each section names.
 No flk server, pane or sccache server was started or reached. None of the
-runs recorded here passed `--permission-mode`, except A.13's re-runs in
-`default`. The drivers now pass
+original runs passed `--permission-mode`. A.13's token-path re-runs include
+controls in `auto` (no flag), followed by controls and permission shapes
+with `--permission-mode default`. The drivers now pass
 `--permission-mode default` (#1404): under the token path, with an empty
 config dir, every session started in `auto` (A.13, A.17).
 
@@ -1845,8 +1846,8 @@ API message in every run. `tool_use` → `tool_result`:
 | `sleep 5 && touch`, then MCP | `default` | 1 | 2.469 → 7.739 | 2.481 → 7.743 |
 | `sleep 5 && touch`, then MCP | `default` | 2 | 2.794 → 8.057 | 2.806 → 8.061 |
 
-In all eight runs the MCP result came only after the slow Bash result, 4 ms
-behind it: with no permission open, a later call waits for an unfinished
+In all eight runs the MCP result came only after the slow Bash result, 4 to
+5 ms behind it: with no permission open, a later call waits for an unfinished
 non-concurrency-safe call before it.
 
 *The shapes of the first table, in `default`.* `s0_parallel.py 2 10
@@ -2045,9 +2046,9 @@ question for S3, #1406.
 
 ### S0 findings for the architect
 
-Each item names the body section whose assumption it changes. This list is
-kept as written by S0; the body was amended from it on 2026-10-14 (#1324),
-and each item ends with where.
+Each item names the body section whose assumption it changes. This list
+records S0's findings and the completed follow-ups; the body was amended
+from them on 2026-10-14 (#1324, #1404), and each item ends with where.
 
 1. **§1 "No second input door", E16, "Failure modes" (the socket).** The
    socket accepts unauthenticated `user` lines from any process of the
@@ -2081,19 +2082,17 @@ and each item ends with where.
    did the result of a pre-allowed MCP tool (no read-only hint) ordered
    after it (A.13), so the stated way out, `flock_question_ask`, did not
    escape the block within that message. Only a call ordered before the
-   prompting one ran. Not yet known is whether the open permission or
-   serial execution of non-concurrency-safe tools holds the later call:
-   the controls in A.13 are pending. Until they run, §2b's advice should
-   read "ask before, or in a message apart from, a call that may prompt"
-   rather than "use the MCP tool while a permission is open". Only one
-   open control request per session was observed, but that may hold only
-   for non-concurrent calls.
-   *Applied, as observed and pending the controls, in §1 "Stall and
-   waiting" (open requests tracked by id), §2b case 1 and "Failure
-   modes"; noted under owner decisions 3 and 3a. Resolved on 2026-10-14
-   (#1404): an open permission held a concurrency-safe `Read` behind it
-   too, and with no permission open a slow non-concurrency-safe call held
-   a later one (A.13). §1, §2b and decision 3's note say so.*
+   prompting one ran. The completed A.13 controls show that a slow
+   non-concurrency-safe call held a later call with no permission open;
+   an open permission also held a concurrency-safe `Read` behind it.
+   The latter run did not separate waiting on the permission from waiting
+   on the earlier Bash call in message order. §2b's advice is therefore
+   "ask before, or in a message apart from, a call that may prompt". Only
+   one open control request per session was observed in the probed shapes.
+   *Applied in §1 "Stall and waiting" (open requests tracked by id), §2b
+   case 1 and "Failure modes"; noted under owner decisions 3 and 3a.
+   The completed controls and `Read` run (2026-10-14, #1404) are reflected
+   in §1, §2b and decision 3's note.*
 4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
    exists (`cancel_async_message{message_uuid}`, `queued` only), so
    `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the
@@ -2122,15 +2121,14 @@ and each item ends with where.
    writes plan files into the agent's config dir.
    *Applied in §10b (with the modes and directions S0 did not probe), P25
    and the S19 row; noted under owner decision 15.*
-6. **Owner decision 1, §1 (login as `flk-agent`).** BLOCKED (A.16). If the
-   code reading holds, `/login` as a user without a GUI session stores the
-   token as a plaintext `.credentials.json` in the profile dir rather than
-   in a keychain. That is safe only because the dir is private to
-   `flk-agent` (§1); S3 should check its mode.
-   *Superseded by the run (A.16, 2026-10-14): on 2.1.287, with no keychain,
-   `/login` wrote no plaintext file and failed. The owner narrowed
-   decision 1 to `setup-token` for agent users (#1404); applied in §1 and
-   the S3 row.*
+6. **Owner decision 1, §1 (login as `flk-agent`).** The completed A.16 run
+   on 2.1.287, as a user without a GUI session or keychain, found that
+   `/login` failed and wrote no plaintext `.credentials.json`. The
+   `setup-token` path worked with a 0600 token file and a fresh config dir.
+   This supersedes the earlier plaintext-fallback hypothesis from reading
+   the 2.1.296 code; that version was not run as the user (A.16).
+   *The owner narrowed decision 1 to `setup-token` for agent users
+   (2026-10-14, #1404); applied in §1 and the S3 row.*
 7. **§9 capability probe.** An unsupported control subtype is answered at
    once with `error: "Unsupported control request subtype: <name>"`
    (A.14), so a capability probe can test a control verb such as

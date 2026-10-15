@@ -2,6 +2,8 @@
 
 Download with --download, then render the same input again without network access.
 Missing artifacts fail the download rather than silently shrinking the sample.
+Repository policy is stricter than ADR-0037 §2: CI must inherit the default ceiling,
+with exceptions only in scoped [[profile.default.overrides]].
 """
 from __future__ import annotations
 
