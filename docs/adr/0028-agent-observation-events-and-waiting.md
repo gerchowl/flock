@@ -15,6 +15,9 @@
   Codex lifecycle authority; its source/continuity contract is proposed for
   review before implementation; format/version policy awaits an owner
   decision (§1a).
+- Proposed amendment (2026-10-15, #1574): §1b specifies detection-sample
+  receipts, output cursors and legacy revision deprecation. Owner decision
+  required; this subsection is not accepted or implemented.
 - Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
@@ -719,6 +722,243 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
 The code PR must include captured-frame provenance, the deterministic failing
 baseline, source-loss diagnostics and these results. This docs PR implements
 no reader, hook, detector, protocol field or configuration setting.
+
+### 1b. Proposed: detection-sample receipts and output cursors (#1574)
+
+**Status: Proposed — Owner decision required.** This subsection is a design
+proposal, not part of this ADR's accepted implementation contract yet. Approval
+and implementation are tracked by [#1574](https://github.com/gerchowl/flock/issues/1574).
+No product behavior changes with this amendment. The existing `turn_cursor`,
+lifecycle authority (§1a), and durable event `seq` (§3) retain their meanings.
+
+#### Problem and historical evidence
+
+The consecutive hollow-spinner replay in #1570 can match text already on screen
+and read the old Working status before a detector samples the redraw. A paint
+acknowledgement is insufficient: a detector pass already in flight can later
+publish a result computed from an older snapshot. An unchanged screen also needs
+an acknowledgement, so a content-change counter alone cannot solve the problem.
+
+`git log -S 'revision'` traces the wire field to
+[`fd1e3b8b`](https://github.com/gerchowl/flock/commit/fd1e3b8b056b2937fc0a5c90bf482e01d269f6b2)
+(2026-03-29, initial socket API). That commit introduced `PaneInfo.revision`,
+`PaneReadResult.revision`, `OutputMatched.revision`, and
+`PaneOutputChanged { min_revision }`; its live replies in `src/app/mod.rs`
+already returned zero. The read/wait/filter relationship suggests an output
+snapshot revision, not a detector-sample counter. This is an inference from the
+schema and its consumers, rather than a recovered explicit design decision.
+
+`86adf883` (2026-05-17) forwarded pane revision through the new agent facade;
+`a36da363` extracted `TerminalState.revision`, initialized to zero, and
+`866aaf74` (2026-05-21) retained zero in the split read handlers. Searches with
+`git log -S` and `git log -G` for incrementing writers, plus inspection of these
+commits, found no implemented advancing writer. Today
+`src/app/api/panes.rs` and `src/app/api/agents.rs` hardcode read revision zero;
+`src/app/agents.rs` forwards the terminal field. This is an unfinished output
+revision contract, with no evidence here of a recently removed detection writer.
+
+`turn_cursor` counts execution/state/working transitions, not observations.
+`emit_pane_state_update` emits a status event only when status or presentation
+changes. Neither proves that a stable Working screen was sampled. The current
+screen detector reads the entire current terminal screen: the 24-row constant
+is a geometry fallback, not a guaranteed region in which a visible header is
+ignored (`src/pane/terminal.rs::ghostty_detection_text`).
+
+#### Recommended signal and its causal boundary
+
+Use two distinct opaque cursors, scoped to one local pane runtime incarnation:
+
+| Value | Advances when | Does not mean |
+| --- | --- | --- |
+| `output_cursor` | The parser accepts a nonempty PTY byte batch, including identical redraw bytes, or a resize/restore/style mutation changes inputs available to detection. | A detection pass completed, a turn ended, or an operator viewport changed. |
+| `detection_cursor` | A completed pass captures a snapshot and its result is applied to this pane's server state, including passes over unchanged content. | Content changed, state changed, or lifecycle authority changed. |
+
+Each cursor contains a version, runtime observation epoch, and unsigned 64-bit
+counter; the API represents it as an opaque string, not a JSON number susceptible
+to precision loss. Illustrative forms are `o1:<epoch>:<counter>` and
+`d1:<epoch>:<counter>`. Clients pass these strings back, not parse or compare
+their internal fields. Counter zero means no output/pass yet; it is not a
+completed sample. Counter overflow rotates the observation epoch and invalidates
+old cursors, never wraps or silently saturates.
+
+The scope is the pane's owned terminal runtime, not an agent label, session
+binding or workspace. Renaming an agent or moving its pane within the same
+runtime does not reset the cursors. An agent-facing wait resolves and pins the
+agent identity and pane incarnation at registration; it cannot follow a reused
+name to another agent. A sample does not validate or retire a lifecycle binding.
+
+Capture detection text, relevant styles/geometry and `output_cursor` under the
+same parser lock. Advance the output counter at the parser commit boundary,
+not at socket accept, queued input, or a later API read. Operator scrolling does
+not advance it: detection remains anchored to the bottom, independent of the
+user-visible viewport. The cursor describes parser progress, not equality of
+all possible transformed `pane.read` outputs. Read handlers return the output
+cursor captured with their returned text; they must not fetch a newer cursor
+after releasing the snapshot lock.
+
+After classification, send an internal observation carrying the captured output
+cursor, outcome and raw detector facts. Each producer has an ordered capture
+ordinal within its epoch; discard stale-epoch or out-of-order observations before
+they mutate state. Increment `detection_cursor` only after the app applies that
+observation and arbitrates effective state. Publish one immutable receipt:
+
+- detection cursor and the output cursor actually sampled;
+- classified agent/terminal identity and the existing turn cursor;
+- outcome: `classified`, `skipped`, `unidentified`, or `process_exited`;
+- raw screen state when classified, effective agent status, and its authority.
+
+The receipt is one committed observation, not a mixture of a new cursor and old
+status. Blank or intentionally skipped content still completes a pass and
+advances the detection cursor with its honest outcome; it cannot certify that a
+retained Working state was freshly classified. A pass that fails before capture
+or application does not advance anything. Failure/worker death is surfaced to
+waiters. Both ordinary and adopted-pane detection loops must use this boundary.
+No full screen text is copied into receipts or emitted in telemetry.
+
+#### Runtime lifetime, restart and handoff
+
+**Owner decision required — recommendation: invalidate rather than persist.**
+Mint a fresh observation epoch for each owned runtime at server startup, pane
+respawn, and ownership transfer during live handoff. Preserve normal pane/agent
+identity as today, but reset these two counters to zero in the new epoch. Do not
+restore a receipt as proof that the new owner has sampled anything. The importer
+must capture and apply its own first observation. Old-owner late messages are
+rejected by epoch, even if their numeric counters are larger.
+
+This deliberately does not promise a globally increasing integer across runtime
+replacement. It promises monotonic comparison within an incarnation and explicit
+invalidation across incarnations. Pending waits fail on handoff/restart/respawn,
+producer loss or identity replacement; a caller must re-read and explicitly
+register a new wait. No silent cursor rebasing or automatic successful resume.
+The observation counters are ephemeral: no per-pass session-file writes, fsync,
+or durable event replay. This is independent of ADR-0005's restart-stable `seq`.
+
+#### Reads, waits and mixed versions
+
+Add optional `output_cursor`, `detection_cursor` and `last_detection_sample` to
+local `pane.get` / `agent.get` and their corresponding local list records.
+Before the first applied pass, the detection cursor is zero and the last sample
+is absent. Add `output_cursor` to `pane.read` / `agent.read` and output-match
+replies, captured atomically with the returned text. Remote/fleet summaries
+omit observation fields; absence means unsupported, never a zero sample.
+Advertise this contract with an additive `detection_samples_v1` capability.
+
+Recommend a new read-only method, `pane.wait_for_sample`, and CLI
+`flk pane wait-for-sample <pane> --after-sample <D> --min-output <O>
+--timeout <duration>`. An `agent wait-for-sample` alias may resolve an agent and
+call the same method. Parameters are a pinned pane identity, mandatory
+`after_sample`, optional `min_output`, and a mandatory finite `timeout_ms`.
+For example, a test may keep its existing 5000 ms failure ceiling. The success
+predicate is both `sample > D` and, when supplied, `sampled_output >= O`, all
+within the same epoch. Already committed matching receipts may return at once.
+Return the receipt and its effective status together. `classified` is required
+when a caller wants a fresh classification; skipped/unidentified observations
+are returned as such and cannot be read as a Working assertion.
+
+This is a registered, server-woken bounded wait (§5, ADR-0037 §1), not a client
+poll loop. Use the existing wait registry's caller/identity rules and a per-pane
+condition wakeup. Under one synchronization boundary, register then recheck the
+latest receipt, producer liveness and epoch, avoiding a lost wakeup between read
+and registration. Cancellation/disconnect removes the waiter. A live silent
+producer reaches the finite failure ceiling. Death or replacement fails promptly;
+neither EOF nor missing observations can imply success. Wakeups are hints to
+recheck the predicate and cannot themselves satisfy it.
+
+Proposed failures are typed `observation_reset` / `subject_replaced` (CLI
+`REFUSED`), `detection_producer_gone` / removed pane (`GONE`), `timeout`
+(`TIMEOUT`), malformed cursors (`USAGE`), and unsupported capability/method
+(`PROTOCOL_GAP`). Register any new codes in `src/api/error_code.rs`; reuse
+ADR-0029's named exits, not new numeric literals. An unavailable detector is
+not a permanent quiet wait. Epoch mismatch fails even if the new counter is
+numerically greater. An agent identity change cannot retarget an open wait.
+
+**Owner decision required — recommendation: dedicated method, no new global
+sample event.** Do not extend an old method with silently ignorable wait fields:
+an old server might ignore them and return stale success. A new method is
+refused by old servers and normalized as `server_version_gap` / exit 78 (§3a).
+New clients must fail closed if capability or required response fields are
+missing; no fallback to text matches, sleep or ordinary status waits. Old clients
+ignore additive response fields. Follow §3a's one protocol bump per release for
+the new request shape, checking the latest released tag at implementation time.
+
+There is no `DetectionSampled` durable or global-ring event. Updating sample
+metadata does not change `state_seq`, working entries, turn cursor, derived
+phase events, seen state, settle/dwell timestamps, or render dirtiness. Repeated
+samples must not restart a settle window or manufacture progress for stall checks. Only registered local sample
+waiters are notified. These condition wakeups reuse the server wait registry;
+they are not a second event broker or a replayable stream. A disconnected
+waiter must read current cursors and register again, not resume from hub `seq`.
+Ordinary wait registration/closure retains the registry's existing audit rules.
+
+#### Settle the legacy `revision` contract
+
+**Owner decision required — recommendation: deprecate the legacy field.**
+Keep serializing existing numeric `revision` fields as zero on every old response
+shape. Do not reinterpret them as detection samples or suddenly mix a new writer
+with old zero read handlers. Add the real parser-progress writer only for
+`output_cursor`, with the snapshot semantics above. New clients use the two new
+cursors; they must not infer capability from a nonzero legacy integer.
+
+Document the deprecation in unreleased API docs/changelog when #1574 implements
+it. Retain the field, wire type, legacy event schemas and old log readability
+through compatible releases; actual removal requires a separately approved major
+wire change. No removal is authorized by this proposal. Legacy
+`PaneOutputChanged.min_revision` is not a detection barrier and has no live
+producer today. A capable server must reject requests relying on that unfinished
+contract with `unsupported_legacy_revision` / `PROTOCOL_GAP`, rather than silently
+translate it or leave it waiting as if it could be satisfied. This named behavior
+change also needs the owner's approval and a release note. Old clients that just
+read revision continue to receive zero; old filter users get a visible refusal.
+Mixed-version and downgrade tests must use released clients/servers, not assume
+that unknown fields or error codes are accepted. No sample events enter old logs.
+
+#### Cost and implementation acceptance
+
+At the current 300 ms detection cadence, N owned panes produce about `3.33 × N`
+receipts/second, even with unchanged content. For 100 panes that is about 333
+internal applications/second. This is an analytic rate, not a measured benchmark.
+Reuse each pass's existing snapshot and classification; add counters and a small
+fixed-size latest receipt, not a new screen parse/hash or full-state copy. Keep
+metadata below 1 KiB per pane as an initial budget, roughly 100 KiB for 100 panes,
+plus the existing bounded wait-registry entries. No history grows with uptime.
+Output revisions reuse the parser lock already held for writes/snapshots.
+
+No waiters means no sample network traffic, disk I/O, hub sequences, diagnostic
+line per pass or UI redraw. Wake only that pane's registered waiters, and return
+one receipt per satisfied request. Bound waiter admission by the existing wait
+registry limits, release on timeout/disconnect, and do not queue every missed
+sample for slow clients. A later receipt covering the minimum output suffices;
+this is latest-observation progress, not an every-sample delivery guarantee.
+
+**Owner decision required — recommendation:** approve these lifetime/exposure/
+legacy-compatibility choices and a benchmark gate of less than 1% of one core
+additional idle CPU for 100 owned panes, plus the memory bound above, on a
+specified reference environment. Record before/after measurements in the
+implementation PR; the number is a proposed gate, not a performance claim.
+If it fails, revise this proposal rather than dropping unchanged-pass sampling
+or adding unbounded coalescing that hides the requested causal boundary.
+
+Implementation and all cases below belong to #1574. This docs PR neither adds
+those tests nor claims their success. The present baseline lacks the capability,
+method, receipts and advancing output cursor, so the new contract checks must
+fail before implementation. Preserve these failures once as regression evidence.
+
+| Acceptance case | Required evidence / negative control |
+| --- | --- |
+| Unchanged passes | Two captured identical screens advance the sample counter while raw/effective Working, turn cursor and durable `seq` stay unchanged. Current API has no sample field/method. |
+| Parser output progress | Identical PTY bytes advance output cursor although detection text is identical; read text and cursor describe the same locked snapshot. Current read revision remains zero. |
+| Causal race | Hold a classification of output R, paint R+1, then release the old result. `min_output=R+1` must remain pending despite a newer sample number, and only open after a pass covering R+1. |
+| Application boundary | Hold app-side receipt application after capture; no read/wait may advertise the sample as applied yet. Release it and receive one coherent receipt. |
+| Snapshot race / stale producer | Write during capture, reorder queued observations, and deliver an old owner's receipt after handoff. Never attach a newer output cursor to old text or apply stale results. |
+| #1570 redraw | With input echo off, place a unique marker in scrollback, then redraw identical Working detection text. Assert marker appears in `recent`, is absent from `detection`, and detection text equals the original. Capture the output cursor with the completed frame, wait after the prior sample with that minimum output, then require a classified Working receipt. No status read or marker match alone is completion evidence. |
+| Marker isolation | Current-screen detection includes all visible rows. The fixture must prove its marker is in scrollback and absent from the detector snapshot; a header assumed to be outside 24 rows is not sufficient. |
+| Real turn end | After a real completed/aborted-turn source, normal authority rules still settle; samples do not revive Working or retire a binding (§1a). Test raw Working with authoritative lifecycle idle separately. |
+| Skipped and unidentified | Blank/skipped/unidentified passes acknowledge their honest outcomes without presenting retained state as fresh classified evidence. |
+| Lifecycle boundaries | Respawn, restart and live handoff issue a new epoch, invalidate open waits, reject old cursors/late receipts and require a fresh applied pass. Rename/move within the runtime does not reset it. |
+| Liveness / lost wake | Producer dies, peer/subject disappears, a live producer stays silent, caller disconnects, and commit races registration. Each fails/cancels within its existing ceiling or succeeds on an actual matching receipt; never hangs or misses a committed match. |
+| Mixed versions | New client/old server fails with protocol gap; old client/new server still parses zero legacy revision; missing fields never become success. Verify legacy filter refusal and previous-release log readability. |
+| Overflow / identity | Counter exhaustion changes epoch without wrapping; reused pane/agent names cannot satisfy an earlier subject's wait. |
+| Cost / quiet state | Benchmark cadence and memory at 100 panes with and without waiters; no per-sample fsync, hub traffic, render invalidation or unbounded backlog. |
 
 ### 2. Supervisor events are derived facts, persisted once, in the existing log
 
