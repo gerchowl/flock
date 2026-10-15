@@ -322,7 +322,9 @@ Layout and tile state have **no wire type** (§2).
 ### 6. Shells: one bundle, two hosts, one transport
 
 - **One bundle.**
-  - `web/client` builds to static assets once, with `bun build` as ADR-0036 §7 specifies.
+  - `web/client` builds to static assets once, with **Vite and `vite-plugin-solid`** (owner decision, 2026-10-16; §11 item 10). Vite gives hot reload in development and is the standard Tauri v2 front-end setup.
+  - **Bun stays** the package manager and test runner, with `bun.lock` pinning unchanged. ADR-0036 §7's build bullet is amended to match.
+  - The output is still static assets: embedded by the `web` feature with `rust-embed` and served by `flk`, and loaded unchanged by the Tauri v2 shell.
   - The bundle has no same-origin assumption: the server URL and token come from shell config. #1402's first spike item becomes a requirement here.
 - **Browser.**
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
@@ -441,7 +443,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 |---|---|---|---|---|
 | S8a | `ts` feature and ts-rs derives for types that exist today: the socket API types the client needs first (agents, workspaces, panes, questions) and ADR-0036 S1's `SessionEvent` (landed). Drift test, `just gen-ts`. This splits ADR-0036 S8. | — | yes | 200 |
 | S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `gap`, `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1546 settled | yes | 200 |
-| G1 | Client shell skeleton (Bun + Solid), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
+| G1 | Client shell skeleton (Solid, built with Vite + `vite-plugin-solid`, Bun as package manager and test runner), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
 | G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode | G1 | yes | 400 TS |
 | G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server built on S7a's types (connect, gap, lagged, stale, protocol gap, token refusal) | G1, S7a | yes | 400 TS |
 | S7 | The wire endpoint (ADR-0036), implementing S7a's types, with #1546's liveness | S3 (S3a #1518/#1439, S3b #1426), S7a | no | 350 |
@@ -464,7 +466,7 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-All nine were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation.
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day.
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
@@ -477,6 +479,7 @@ All nine were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow t
 | 7 | `work` records as first-class flk state (§8 phase 2) | **Decided: yes**, after phase 1 has been used | Architects move their task files into flk. |
 | 8 | A separate versioned graph engine for goals and work | **Decided: not now.** The event log covers typed nodes and edges, actors and history. | No branch and merge of plans for now. |
 | 9 | Layout persistence | **Decided: client-local per device**; server-synced named layouts later | A layout doesn't follow you between devices. |
+| 10 | Client build tool (added 2026-10-16) | **Decided: Vite with `vite-plugin-solid`.** Bun remains the package manager and test runner. Output stays static assets embedded by `rust-embed`, and the Tauri v2 shell loads the same bundle. | Hot reload in development and the standard Tauri v2 setup. A Vite config joins the toolchain, pinned through `bun.lock`. ADR-0036 §7 is amended to match. |
 
 ## Failure modes and known limits
 

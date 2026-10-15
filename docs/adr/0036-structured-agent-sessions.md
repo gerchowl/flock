@@ -890,13 +890,17 @@ files. No hand-written TS type may describe a wire shape.
   queue, questions), `src/unknown.ts` (§8). The views use Solid (owner
   decision 8): its fine-grained reactivity updates one text node or one
   queue row per streamed event without re-rendering a transcript, which is
-  the load of P1 and P9. Solid's JSX transform runs as a Bun build plugin
-  (`babel-preset-solid`), pinned in `bun.lock` like every other
-  dependency.
-- **Build.** `bun build` produces static assets that the `web` feature embeds
-  with `rust-embed`, as it embeds the terminal bridge's assets today. CI runs
-  `bun install --frozen-lockfile`, `bun test` and the build; the nix package
-  builds the assets in a fixed-output step pinned by `bun.lock`.
+  the load of P1 and P9. Solid's JSX transform runs through
+  `vite-plugin-solid` (`babel-preset-solid`), pinned in `bun.lock` like
+  every other dependency.
+- **Build.** Vite with `vite-plugin-solid` produces static assets that the
+  `web` feature embeds with `rust-embed`, as it embeds the terminal bridge's
+  assets today. Amended 2026-10-16 (owner decision, ADR-0038 §6, #1606): Vite
+  replaced `bun build` because it gives hot reload in development and is the
+  standard Tauri v2 front-end setup. Bun stays the package manager and test
+  runner. CI runs `bun install --frozen-lockfile`, `bun test` and the Vite
+  build; the nix package builds the assets in a fixed-output step pinned by
+  `bun.lock`.
 - **Release.** The assets ship inside the `flk` binary of a build with the
   `web` feature; there is no separate artefact to version.
 
