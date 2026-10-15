@@ -1149,7 +1149,7 @@ fn a28_a_frozen_server_cannot_hold_start_in_readiness() {
         .expect("CLI entered readiness");
     let paused = PausedServer::new(&server);
     proxy.release_frozen();
-    a28_readiness::prove_abandonment(&events, &stages, || proxy.seal())
+    a28_readiness::prove_abandonment(&events, &stages, READY_TIMEOUT, || proxy.seal())
         .expect("finite capped requests abandoned without server responses, then CLI exit");
     let out = child.finish();
     drop(paused);
