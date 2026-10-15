@@ -30,6 +30,7 @@ pub(crate) struct Attempt {
     pub(crate) due: Instant,
     deadline: Instant,
     paste_write: Option<crate::pty::write_receipt::WriteReceipt>,
+    paste_written: bool,
     pub(crate) sent: bool,
     pub(crate) retried: bool,
     wake: bool,
@@ -620,6 +621,7 @@ impl App {
             due,
             deadline,
             paste_write: if draft.is_none() { paste_write } else { None },
+            paste_written: false,
             sent: false,
             retried: false,
             wake,
@@ -644,14 +646,11 @@ impl App {
             }
             _ => self
                 .advance_guarded_submit_inner(pane, attempt, now)
-                .and_then(|outcome| {
-                    let outcome = attempt.cancel_pending_paste(outcome);
-                    self.begin_draft_restore(pane, attempt, outcome, now)
-                }),
+                .and_then(|outcome| self.begin_draft_restore(pane, attempt, outcome, now)),
         };
-        if let Some(ref outcome) = outcome {
-            self.conclude_guarded_attempt(pane, attempt, outcome);
-        } else if attempt.sent
+        let outcome = outcome.map(|outcome| self.conclude_guarded_attempt(pane, attempt, &outcome));
+        if outcome.is_none()
+            && attempt.sent
             && (attempt.evidence.state != "submit_sent"
                 || attempt.evidence.retried != attempt.retried)
         {
@@ -931,15 +930,21 @@ impl App {
         attempt: &mut Attempt,
         outcome: &Outcome,
     ) -> Outcome {
-        let outcome = attempt.cancel_pending_paste(*outcome);
-        self.release_guarded_attempt(pane, attempt);
+        let disposition = self.release_guarded_attempt(pane, attempt);
+        let outcome = attempt.outcome_after_release(*outcome, disposition);
         self.finish_delivery_attempt(attempt, &outcome);
         outcome
     }
 
     /// A draft that did not come back exactly goes to the pane's stash, then
     /// the lease ends and its held keystrokes replay. Safe to repeat.
-    pub(crate) fn release_guarded_attempt(&self, pane: &str, attempt: &mut Attempt) {
+    pub(crate) fn release_guarded_attempt(
+        &self,
+        pane: &str,
+        attempt: &mut Attempt,
+    ) -> Option<crate::pty::write_receipt::WriteDisposition> {
+        // Cancel before replaying held operator input on every release path.
+        let disposition = attempt.paste_write.as_ref().map(|receipt| receipt.cancel());
         let target = self.parse_pane_id(pane).and_then(|(ws, pane_id)| {
             Some((
                 self.terminal_for_pane(ws, pane_id)?,
@@ -978,6 +983,7 @@ impl App {
                 attempt.evidence.held_input_not_written = true;
             }
         }
+        disposition
     }
 
     fn pane_runtimes(&self) -> Vec<&crate::terminal::TerminalRuntime> {
@@ -1201,16 +1207,22 @@ impl App {
 
 impl Attempt {
     /// ADR-0029 §1 permits abandonment only when retrying cannot duplicate text.
-    fn cancel_pending_paste(&self, outcome: Outcome) -> Outcome {
-        if matches!(outcome, Outcome::Abandoned(_))
-            && self
-                .paste_write
-                .as_ref()
-                .is_some_and(|receipt| !receipt.cancel_unstarted())
-        {
-            Outcome::Unconfirmed("paste_write_incomplete")
-        } else {
-            outcome
+    pub(super) fn outcome_after_release(
+        &self,
+        outcome: Outcome,
+        disposition: Option<crate::pty::write_receipt::WriteDisposition>,
+    ) -> Outcome {
+        use crate::pty::write_receipt::WriteDisposition;
+        // After Enter, the existing turn/execution verdict owns the outcome.
+        // This classification covers paste interruption before submission.
+        if self.sent || !matches!(outcome, Outcome::Abandoned(_)) {
+            return outcome;
+        }
+        match disposition {
+            Some(WriteDisposition::Partial) => Outcome::Unconfirmed("paste_write_incomplete"),
+            Some(WriteDisposition::Completed) => Outcome::Unconfirmed("paste_written"),
+            None if self.paste_written => Outcome::Unconfirmed("paste_written"),
+            _ => outcome,
         }
     }
 
@@ -1222,6 +1234,7 @@ impl Attempt {
         match receipt.try_completed() {
             Ok(at) => {
                 self.paste_write = None;
+                self.paste_written = true;
                 self.due = at + crate::cli::pane::PANE_RUN_SUBMIT_GAP;
                 Ok(now < self.due)
             }
@@ -1229,13 +1242,8 @@ impl Attempt {
                 self.due = (now + POLL).min(self.deadline);
                 Ok(true)
             }
-            Err(_) => Err(if receipt.cancel_unstarted() {
-                Outcome::Abandoned("write_failed")
-            } else {
-                // ADR-0029 §1: a partial paste is unsafe to retry, even if its
-                // remaining bytes have not reached the composer yet.
-                Outcome::Unconfirmed("paste_write_incomplete")
-            }),
+            Err(_) => Err(self
+                .outcome_after_release(Outcome::Abandoned("write_failed"), Some(receipt.cancel()))),
         }
     }
 }
@@ -1253,6 +1261,7 @@ impl Attempt {
             due: Instant::now(),
             deadline: Instant::now() + CONFIRM_WINDOW,
             paste_write: None,
+            paste_written: false,
             sent: false,
             retried: false,
             wake: false,
@@ -1264,8 +1273,28 @@ impl Attempt {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// Replace the writer boundary after a real App submission, retaining the
+    /// receipt while the producer stalls with zero, some, or all bytes written.
+    pub(crate) fn stalled_paste(
+        attempt: &mut Attempt,
+        written: usize,
+    ) -> crate::pty::write_receipt::WriteCompletion {
+        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        attempt.paste_write = Some(receipt);
+        if written > 0 {
+            assert_eq!(
+                completion.write(5, || Ok(written)).unwrap().unwrap(),
+                written
+            );
+        }
+        if written == 5 {
+            completion.send(Instant::now()).unwrap();
+        }
+        completion
+    }
 
     #[test]
     fn guarded_submit_enter_follows_completed_paste_by_at_least_100ms() {
@@ -1310,7 +1339,7 @@ mod tests {
             );
             if let Some(completion) = completion {
                 assert!(completion
-                    .write(|| panic!("abandoned paste reached resumed writer"))
+                    .write(5, || panic!("abandoned paste reached resumed writer"))
                     .is_none());
             }
         }
@@ -1322,7 +1351,7 @@ mod tests {
             let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
             let mut attempt = Attempt::test_new();
             attempt.paste_write = Some(receipt);
-            assert_eq!(completion.write(|| Ok(2)).unwrap().unwrap(), 2);
+            assert_eq!(completion.write(5, || Ok(2)).unwrap().unwrap(), 2);
             let mut completion = Some(completion);
             if disconnected {
                 drop(completion.take());
@@ -1332,7 +1361,10 @@ mod tests {
                 Err(Outcome::Unconfirmed("paste_write_incomplete"))
             );
             assert_eq!(
-                attempt.cancel_pending_paste(Outcome::Abandoned("operator_active")),
+                attempt.outcome_after_release(
+                    Outcome::Abandoned("operator_active"),
+                    attempt.paste_write.as_ref().map(|receipt| receipt.cancel())
+                ),
                 Outcome::Unconfirmed("paste_write_incomplete")
             );
         }

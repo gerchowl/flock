@@ -918,7 +918,7 @@ impl PtyIoActorRunner {
                 .and_then(|(_, tx)| tx.take());
             let chunk = &bytes[self.current_write_offset..];
             let result = match &completion {
-                Some(tx) => tx.write(|| self.write_chunk(chunk)),
+                Some(tx) => tx.write(chunk.len(), || self.write_chunk(chunk)),
                 None => Some(self.write_chunk(chunk)),
             };
             if let Some((_, tx)) = self.pending_writes.front_mut() {
@@ -1605,7 +1605,7 @@ mod tests {
         runner.flush_pending_writes_once();
         assert_eq!(receipt.try_completed(), Err(std_mpsc::TryRecvError::Empty));
         assert!(
-            receipt.cancel_unstarted(),
+            receipt.cancel() == crate::pty::write_receipt::WriteDisposition::Cancelled,
             "deadline retracts an untouched paste"
         );
         runner.write_hook = None;
@@ -1642,7 +1642,7 @@ mod tests {
         }));
         runner.flush_pending_writes_once();
         assert!(
-            !receipt.cancel_unstarted(),
+            receipt.cancel() != crate::pty::write_receipt::WriteDisposition::Cancelled,
             "partial writes require an uncertain outcome"
         );
         runner.write_hook = None;
