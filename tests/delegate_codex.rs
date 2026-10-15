@@ -1472,6 +1472,9 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
     for (frame, needle, status) in [
         ("hollow", "◦ Working (21m 26s", "working"),
         // No intervening frame: an identical redraw stays working (ADR-0028 §1a).
+        // This guards only against a transient clear or a misread of the redrawn
+        // frame. It cannot prove a detection cycle processed the redraw until
+        // #1574 adds a detection-sample signal; then wait on that signal here.
         ("consecutive-hollow", "◦ Working (21m 26s", "working"),
         // Observe settled idle so the working hold cannot satisfy the next step.
         ("idle", "Bring your unfinished thoughts.", "idle"),
