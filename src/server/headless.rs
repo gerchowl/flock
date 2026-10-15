@@ -1043,6 +1043,16 @@ impl HeadlessServer {
         start_pending_agent_resumes: bool,
     ) {
         if self.foreground_client_id.is_none() {
+            // An unlaid-out active pane still needs its first resizing render (#262).
+            if self.app.state.active.is_none() || !self.app.state.view.pane_infos.is_empty() {
+                // Refresh spawn geometry while preserving already-running PTY sizes.
+                let (cols, rows) = self.effective_size;
+                crate::ui::compute_view_without_resizing_panes(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    Rect::new(0, 0, cols, rows),
+                );
+            }
             return;
         }
         let Some(client_id) = self.foreground_client_id else {
@@ -4910,6 +4920,165 @@ mod tests {
         // Before any client has ever attached there is nothing to hold.
         server.last_client_size = None;
         assert_eq!(server.detached_size(), (MIN_COLS, MIN_ROWS));
+    }
+
+    #[tokio::test]
+    async fn detach_refreshes_spawn_geometry_without_resizing_live_ptys() {
+        for cols in [15, 200] {
+            let mut server = test_headless_server();
+            let mut workspace = crate::workspace::Workspace::test_new("geometry");
+            let pane = workspace.focused_pane_id().unwrap();
+            workspace.insert_test_runtime(
+                pane,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+            );
+            let hidden = workspace.test_add_tab(Some("hidden"));
+            let hidden_pane = workspace.tabs[hidden].root_pane;
+            workspace.tabs[hidden].runtimes.insert(
+                hidden_pane,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+            );
+            server.app.state.workspaces = vec![workspace];
+            server.app.state.active = Some(0);
+            server.app.state.selected = 0;
+            server.app.state.mode = crate::app::Mode::Terminal;
+            let (writer, _control_rx, _render_rx) = test_client_writer();
+            server.clients.insert(
+                1,
+                ClientConnection::new(
+                    (cols, 40),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    1,
+                    RenderEncoding::SemanticFrame,
+                    Some(writer),
+                ),
+            );
+            server.foreground_client_id = Some(1);
+            server.sync_foreground_client_state();
+            server.resize_shared_runtime_to_effective_size();
+            let attached_pty = server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                .unwrap()
+                .current_size();
+            let hidden_pty = server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, hidden_pane)
+                .unwrap()
+                .current_size();
+            assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 1 }));
+            assert_eq!(server.effective_size, (cols.max(MIN_COLS), 40));
+            let detached_estimate = server.app.state.estimate_pane_size();
+            let (width, height) = server.effective_size;
+            crate::ui::compute_view_without_resizing_panes(
+                &mut server.app.state,
+                &server.app.terminal_runtimes,
+                Rect::new(0, 0, width, height),
+            );
+            assert_eq!(
+                detached_estimate,
+                server.app.state.estimate_pane_size(),
+                "detach must refresh geometry before the next spawn for client width {cols}"
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                    .unwrap()
+                    .current_size(),
+                attached_pty,
+                "detaching must preserve already-running PTYs"
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .runtime_for_pane(&server.app.terminal_runtimes, hidden_pane)
+                    .unwrap()
+                    .current_size(),
+                hidden_pty,
+                "detaching must also preserve hidden-tab PTYs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_geometry_refresh_preserves_first_runtime_resize() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("bootstrap");
+        let pane = workspace.focused_pane_id().unwrap();
+        workspace.insert_test_runtime(
+            pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        assert!(server.app.state.view.pane_infos.is_empty());
+        server.resize_shared_runtime_to_effective_size();
+        assert!(
+            server.app.state.view.pane_infos.is_empty(),
+            "the first unattended render must still establish runtime geometry"
+        );
+        server.render_and_stream();
+        let rect = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane)
+            .unwrap()
+            .inner_rect;
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                .unwrap()
+                .current_size(),
+            (rect.height, rect.width),
+            "first render must resize the initial runtime"
+        );
+    }
+
+    #[test]
+    fn detach_without_active_workspace_refreshes_allocations() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces.clear();
+        server.app.state.active = None;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (15, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        assert_eq!(server.app.state.estimate_pane_size().1, 13);
+        assert!(server.app.state.view.pane_infos.is_empty());
+        assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 1 }));
+        assert_eq!(server.effective_size, (80, 40));
+        assert_eq!(server.app.state.estimate_pane_size().1, 52);
+        assert!(
+            server.app.state.view.pane_infos.is_empty(),
+            "new workspaces still need a first resizing render"
+        );
     }
 
     fn assert_frame_data_eq(actual: &FrameData, expected: &FrameData) {
