@@ -89,6 +89,13 @@ jobs:
               continue
             fi
 
+            # Evaluate outside the condition so malformed metadata fails safely.
+            EXCLUDED="$(jq -f scripts/release_issue_excluded.jq <<<"$data")"
+            if [ "$EXCLUDED" = "true" ]; then
+              echo "Skipping #$issue because it is a tracking issue or epic."
+              continue
+            fi
+
             ISSUE_STATE="$(jq -r '.state' <<<"$data")"
 
             HAS_NEXT_RELEASE_LABEL="$(jq -r --arg label "$NEXT_RELEASE_LABEL" 'any(.labels[].name; . == $label)' <<<"$data")"
