@@ -466,10 +466,11 @@ impl App {
         } else {
             self.advance_guarded_submit(pane, &mut attempt, now)
         };
-        if let Some(ref outcome) = outcome {
-            self.conclude_guarded_attempt(pane, &mut attempt, outcome);
+        let outcome = outcome.map(|outcome| {
+            let outcome = self.conclude_guarded_attempt(pane, &mut attempt, &outcome);
             self.surface_kept_drafts();
-        }
+            outcome
+        });
         let enter_sent = before != (attempt.sent, attempt.retried);
         let next = now + Duration::from_millis(50);
         if outcome.is_none() {

@@ -644,7 +644,10 @@ impl App {
             }
             _ => self
                 .advance_guarded_submit_inner(pane, attempt, now)
-                .and_then(|outcome| self.begin_draft_restore(pane, attempt, outcome, now)),
+                .and_then(|outcome| {
+                    let outcome = attempt.cancel_pending_paste(outcome);
+                    self.begin_draft_restore(pane, attempt, outcome, now)
+                }),
         };
         if let Some(ref outcome) = outcome {
             self.conclude_guarded_attempt(pane, attempt, outcome);
@@ -927,9 +930,11 @@ impl App {
         pane: &str,
         attempt: &mut Attempt,
         outcome: &Outcome,
-    ) {
+    ) -> Outcome {
+        let outcome = attempt.cancel_pending_paste(*outcome);
         self.release_guarded_attempt(pane, attempt);
-        self.finish_delivery_attempt(attempt, outcome);
+        self.finish_delivery_attempt(attempt, &outcome);
+        outcome
     }
 
     /// A draft that did not come back exactly goes to the pane's stash, then
@@ -1195,6 +1200,20 @@ impl App {
 }
 
 impl Attempt {
+    /// ADR-0029 §1 permits abandonment only when retrying cannot duplicate text.
+    fn cancel_pending_paste(&self, outcome: Outcome) -> Outcome {
+        if matches!(outcome, Outcome::Abandoned(_))
+            && self
+                .paste_write
+                .as_ref()
+                .is_some_and(|receipt| !receipt.cancel_unstarted())
+        {
+            Outcome::Unconfirmed("paste_write_incomplete")
+        } else {
+            outcome
+        }
+    }
+
     /// ADR-0028's type-then-Enter gap starts after the final PTY write, not enqueue.
     fn wait_for_paste_write(&mut self, now: Instant) -> Result<bool, Outcome> {
         let Some(receipt) = &self.paste_write else {
@@ -1210,7 +1229,13 @@ impl Attempt {
                 self.due = (now + POLL).min(self.deadline);
                 Ok(true)
             }
-            Err(_) => Err(Outcome::Abandoned("write_failed")),
+            Err(_) => Err(if receipt.cancel_unstarted() {
+                Outcome::Abandoned("write_failed")
+            } else {
+                // ADR-0029 §1: a partial paste is unsafe to retry, even if its
+                // remaining bytes have not reached the composer yet.
+                Outcome::Unconfirmed("paste_write_incomplete")
+            }),
         }
     }
 }
@@ -1282,6 +1307,33 @@ mod tests {
             assert_eq!(
                 attempt.wait_for_paste_write(at),
                 Err(Outcome::Abandoned("write_failed"))
+            );
+            if let Some(completion) = completion {
+                assert!(completion
+                    .write(|| panic!("abandoned paste reached resumed writer"))
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn partial_paste_at_deadline_is_unconfirmed_even_if_writer_disconnects() {
+        for disconnected in [false, true] {
+            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+            let mut attempt = Attempt::test_new();
+            attempt.paste_write = Some(receipt);
+            assert_eq!(completion.write(|| Ok(2)).unwrap().unwrap(), 2);
+            let mut completion = Some(completion);
+            if disconnected {
+                drop(completion.take());
+            }
+            assert_eq!(
+                attempt.wait_for_paste_write(attempt.deadline),
+                Err(Outcome::Unconfirmed("paste_write_incomplete"))
+            );
+            assert_eq!(
+                attempt.cancel_pending_paste(Outcome::Abandoned("operator_active")),
+                Outcome::Unconfirmed("paste_write_incomplete")
             );
         }
     }
