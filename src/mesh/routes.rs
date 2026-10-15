@@ -142,6 +142,11 @@ impl RouteTable {
         self.own.as_ref()
     }
 
+    /// Current authenticated attachments, independent of the last signed advert.
+    pub(crate) fn live_edges(&self) -> &BTreeSet<String> {
+        &self.live_edges
+    }
+
     pub fn set_live_edges(&mut self, edges: BTreeSet<String>) {
         if self.live_edges != edges {
             self.live_edges = edges;
