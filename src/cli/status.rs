@@ -388,12 +388,12 @@ fn installed_status_at(
     status
 }
 
-/// Run the installed binary's identity-only `--version` command.
+/// Run the installed binary's identity-only `--version` command with null stdin.
 ///
+/// Stdin is fixed inside this executor. The caller supplies the output timeout.
 /// Production supplies this executor to [`probe_installed_version`], which
 /// performs canonicalization before invoking it. Tests can inject controlled
-/// output instead. Collect output with the caller's timeout and null stdin,
-/// never by running a harness's arbitrary configured MCP command.
+/// output instead. Never run a harness's arbitrary configured MCP command.
 fn execute_installed_version(
     path: &std::path::Path,
     timeout: std::time::Duration,

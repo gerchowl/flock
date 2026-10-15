@@ -180,7 +180,7 @@ impl Scrubber {
 /// and argv already sit in the same record: a failed command's stderr tail
 /// (#418). The identity rules of [`Scrubber::scrub`] exist for a report that
 /// leaves the machine, and applied here they would erase the very host and
-/// path an operator needs to read ("connect to host <host>: refused").
+/// path an operator needs to read (`connect to host <host>: refused`).
 pub(crate) fn mask_credentials(value: &str) -> String {
     let masked = secret_token_re().replace_all(value, "<redacted-token>");
     labeled_secret_re()

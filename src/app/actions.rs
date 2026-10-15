@@ -295,7 +295,7 @@ impl AppState {
     }
 
     /// Cycle the prompt-history panel's detail level to the next of
-    /// [`TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
+    /// [`crate::agent_transcript::TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
     /// target whose transcript the caller must re-read at the new level, or
     /// `None` when the panel is closed or the focused pane has no known
     /// Claude session yet (#246).
@@ -622,7 +622,7 @@ impl AppState {
     }
 
     /// Geometry for the open prompt-history panel over `info`. Mirrors the
-    /// renderer's [`ui::panes::prompt_history_panel_rect`] so mouse routing
+    /// renderer's [`crate::ui::prompt_history_panel_rect`] so mouse routing
     /// and rendering speak the same coordinates.
     pub(crate) fn prompt_history_panel_rect_for(
         &self,
@@ -2617,7 +2617,7 @@ impl AppState {
     /// `remote.is_none()` rows in render order). Remote rows are interleaved
     /// with locals by the panel sort, so the pressed digit and the number
     /// rendered on the row would otherwise disagree — quick-jump routes here
-    /// so the mapping matches [`nth_local_agent_entry_index`], which the
+    /// so the mapping matches [`crate::ui::nth_local_agent_entry_index`], which the
     /// render also uses to number local rows contiguously.
     pub fn focus_local_agent_entry(&mut self, n: usize) -> bool {
         let Some(idx) = crate::ui::nth_local_agent_entry_index(self, n) else {
@@ -2802,7 +2802,7 @@ impl AppState {
     }
 
     /// Close every member of `ws_idx`'s space, or just `ws_idx` when it has no
-    /// space membership. The index-named twin of [`Self::close_selected_space`].
+    /// space membership. The test-only `close_selected_space` delegates here.
     pub(crate) fn close_space_of(&mut self, ws_idx: usize) {
         if ws_idx >= self.workspaces.len() {
             return;
