@@ -89,7 +89,8 @@ retries = 2
 [[profile.default.overrides]]
 # The remaining integration binaries also spawn the real `flock` process; let
 # them run in parallel but retry to ride out timing hiccups under CI load.
-filter = 'kind(test)'
+# #1371's rollback handshake and receiver checks need no retry.
+filter = 'kind(test) & !(binary(=delegate) & (test(a11_) | test(rollback_fixture_)))'
 retries = 2
 
 [profile.ci]
