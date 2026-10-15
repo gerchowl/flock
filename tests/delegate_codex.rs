@@ -1541,3 +1541,6 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         }
     }
 }
+
+#[path = "delegate_codex/geometry_1139.rs"]
+mod geometry_1139;
