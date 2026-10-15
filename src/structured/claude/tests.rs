@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::json;
 
+mod optional_fields;
+
 const FIXTURES: &str = include_str!("../../../tests/fixtures/claude-session/events.jsonl");
 const VARIANTS: &str = include_str!("../../../tests/fixtures/claude-session/variants.txt");
 
@@ -258,6 +260,9 @@ fn assert_optional_nulls(variant: &str, paths: &[&str]) {
 
 macro_rules! optional_null_tests {
     ($($name:ident($variant:literal, [$($path:literal),*]);)*) => {
+        const OPTIONAL_NULL_CASES: &[(&str, &[&str])] = &[
+            $(($variant, &[$($path),*]),)*
+        ];
         $(#[test] fn $name() { assert_optional_nulls($variant, &[$($path),*]); })*
     };
 }
