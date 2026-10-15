@@ -311,5 +311,7 @@ pub enum AppEvent {
         name: String,
         outcome: crate::checks::Outcome,
         duration_ms: u64,
+        /// Capture diagnostics travel with completion, independently of exit classification.
+        capture_notes: crate::checks::script::CaptureNotes,
     },
 }

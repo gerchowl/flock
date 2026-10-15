@@ -77,6 +77,23 @@ with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
 for the same user. This implements the stable-directory/separate-endpoint design
 accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
 
+The pinned sccache 0.15.0 carries the startup fix approved in
+[issue #1411](https://github.com/gerchowl/flock/issues/1411). Unix socket startup
+takes an exclusive lock on `<socket>.lock`, probes for a live listener, and only
+reclaims an owned stale socket after connection refusal or absence. A concurrent
+starter finding a live listener succeeds without replacing it. Compilation does
+not hold this lock, so compiler parallelism and the endpoint stay unchanged.
+The lock file must be an owner-only regular file and persists across restarts
+and crashes. Do not delete it while starters can run. Unsafe paths, permissions,
+and inconclusive probes fail visibly without removing the endpoint. TCP and
+abstract Unix sockets retain upstream behavior. A version assertion requires
+re-evaluating the patch whenever the pinned sccache changes; drop the patch when
+upstream fixes the unlink+bind race.
+
+Each dev shell picks up the patched binary on its next `nix develop`. A running
+shared server keeps its old binary until it next restarts naturally. Nobody
+restarts it deliberately for this rollout.
+
 Artifact storage keeps sccache's existing configuration or platform default, including
 `~/Library/Caches/Mozilla.sccache` on macOS, so existing caches remain warm.
 The wrapper preserves an explicit `SCCACHE_DIR` and uses its `tmp` subdirectory
@@ -100,7 +117,9 @@ Directory-creation failure prints the path and fails the build.
 `RUSTC_WRAPPER=""` disables Rust caching, and custom wrappers remain intact.
 
 Run `nix develop --command just test-sccache` to check deleted startup temp
-directories, explicit and lazy restarts, and hits from a platform-default cache
+directories, 20 rounds of four concurrent automatic starts, live-listener
+preservation, stale sockets left by a killed private server, unsafe paths,
+explicit and lazy restarts, and hits from a platform-default cache
 warmed by an unwrapped daemon. The probe always supplies and asserts private
 endpoints. Outside the devShell it exits before contacting any server with
 `run inside nix develop (the wrapper is not active)`. The endpoint guard also
@@ -180,7 +199,19 @@ fix: handle pane focus
 refs #128
 ```
 
-Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Flock closes released issues after a release is published, not when unreleased commits land on `main`.
+Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits.
+
+`Refs #N` is for the issue being fixed. When that commit lands on `dev`, automation
+adds `pending-release` and closes the issue with an unreleased notice. Release
+automation later records the published version.
+
+For a tracking issue or epic, write `Part of #N`, never `Refs #N`. Both automation
+paths exclude issues with a `tracking` or `epic` label, or a title ending in
+`(tracking)`, case-insensitively. The shared rule lives in
+[`scripts/release_issue_excluded.jq`](scripts/release_issue_excluded.jq).
+Existing labels and closed state on trackers are left untouched, so this does
+not reopen trackers closed by older automation. If evaluating the exclusion
+rule fails, the step fails before editing, commenting on, or closing that issue.
 
 ## PR scope
 

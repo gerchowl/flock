@@ -1,11 +1,17 @@
 """Real devShell regression probe. Run with `nix develop --command just test-sccache`."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 
 
@@ -33,6 +39,138 @@ def require_wrapper():
     ):
         raise SystemExit('run inside nix develop (the wrapper is not active)')
     return expected
+
+
+@contextmanager
+def startup_sandbox():
+    """Own every endpoint and process group, including failed startup children."""
+    wrapper = require_wrapper()
+    with tempfile.TemporaryDirectory(prefix='sc-start-', dir='/tmp') as directory:
+        root = Path(directory)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('SCCACHE_', 'FLOCK_'))}
+        env.update(HOME=directory, TMPDIR=directory,
+                   XDG_CONFIG_HOME=str(root / 'config'),
+                   SCCACHE_DIR=str(root / 'cache'),
+                   SCCACHE_SERVER_UDS=str(root / 'server.sock'),
+                   SCCACHE_NO_DAEMON='1', SCCACHE_IDLE_TIMEOUT='0',
+                   SCCACHE_LOG='info')
+        processes = []
+
+        def start(*args, foreground=False):
+            assert_private_endpoint(env, root, None)
+            child_env = dict(env)
+            if foreground:
+                child_env['SCCACHE_START_SERVER'] = '1'
+            log = tempfile.NamedTemporaryFile(
+                mode='w', prefix='client-', suffix='.log', dir=root, delete=False)
+            try:
+                child = subprocess.Popen(
+                    [wrapper, *args], env=child_env, start_new_session=True,
+                    stdout=subprocess.PIPE if foreground else log,
+                    stderr=subprocess.STDOUT if foreground else log,
+                )
+                processes.append(child)
+            finally:
+                log.close()
+            return child
+
+        try:
+            yield root, start
+        finally:
+            for child in processes:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for child in processes:
+                child.wait(timeout=10)
+                if child.stdout:
+                    child.stdout.close()
+
+
+class SccacheStartupProbe(unittest.TestCase):
+    def test_twenty_rounds_of_four_automatic_starters_preserve_live_server(self):
+        for trial in range(20):
+            with self.subTest(trial=trial), startup_sandbox() as (root, start):
+                barrier = threading.Barrier(4)
+
+                def launch(_):
+                    barrier.wait(timeout=10)
+                    return start('--zero-stats').wait(timeout=60)
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    codes = list(pool.map(launch, range(4)))
+                logs = ''.join(path.read_text() for path in root.glob('client-*.log'))
+                self.assertEqual(codes, [0] * 4, logs)
+                self.assertEqual(logs.count('server started, listening on'), 1, logs)
+                endpoint = root / 'server.sock'
+                inode = endpoint.stat().st_ino
+                lock = root / 'server.sock.lock'
+                self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+                lock_inode = lock.stat().st_ino
+                self.assertEqual(start('--start-server').wait(timeout=60), 0)
+                self.assertEqual(endpoint.stat().st_ino, inode)
+                self.assertEqual(lock.stat().st_ino, lock_inode)
+                self.assertEqual(start('--zero-stats').wait(timeout=60), 0)
+                print(f'Concurrent startup round {trial + 1}: 4/4, live socket preserved',
+                      flush=True)
+
+    def test_reclaims_socket_left_by_killed_server(self):
+        with startup_sandbox() as (root, start):
+            server = start(foreground=True)
+            deadline = time.monotonic() + 60
+            observed = b''
+            while b'server started, listening on' not in observed:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, observed.decode(errors='replace'))
+                ready, _, _ = select.select([server.stdout], [], [], remaining)
+                self.assertTrue(ready, observed.decode(errors='replace'))
+                chunk = os.read(server.stdout.fileno(), 4096)
+                self.assertTrue(chunk, f'server exited before readiness: {observed!r}')
+                observed += chunk
+                self.assertNotIn(b' ERROR ', observed)
+                self.assertNotIn(b'server already running', observed)
+                self.assertIsNone(server.poll(), observed.decode(errors='replace'))
+            endpoint = root / 'server.sock'
+            lock_inode = (root / 'server.sock.lock').stat().st_ino
+            server.kill()
+            server.wait(timeout=10)
+            self.assertTrue(endpoint.is_socket())
+            with socket.socket(socket.AF_UNIX) as probe:
+                with self.assertRaises(ConnectionRefusedError):
+                    probe.connect(str(endpoint))
+            self.assertEqual(start('--zero-stats').wait(timeout=60), 0)
+            self.assertEqual((root / 'server.sock.lock').stat().st_ino, lock_inode)
+            with socket.socket(socket.AF_UNIX) as probe:
+                probe.connect(str(endpoint))
+
+    def test_preserves_non_socket_paths_and_rejects_unsafe_locks(self):
+        for kind in ('file', 'symlink', 'lock-mode', 'lock-symlink'):
+            with self.subTest(kind=kind), startup_sandbox() as (root, start):
+                endpoint = root / 'server.sock'
+                lock = root / 'server.sock.lock'
+                data = root / 'data'
+                data.write_text('preserve this data')
+                if kind == 'file':
+                    endpoint.write_text('preserve this endpoint')
+                elif kind == 'symlink':
+                    endpoint.symlink_to(data)
+                elif kind == 'lock-mode':
+                    lock.touch(mode=0o644)
+                    lock.chmod(0o644)
+                else:
+                    lock.symlink_to(data)
+                self.assertNotEqual(start('--start-server').wait(timeout=60), 0)
+                self.assertEqual(data.read_text(), 'preserve this data')
+                if kind == 'file':
+                    self.assertEqual(endpoint.read_text(), 'preserve this endpoint')
+                elif kind == 'symlink':
+                    self.assertTrue(endpoint.is_symlink())
+                elif kind == 'lock-mode':
+                    self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
+                else:
+                    self.assertTrue(lock.is_symlink())
 
 
 class SccacheProbe(unittest.TestCase):

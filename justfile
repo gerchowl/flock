@@ -56,6 +56,10 @@ lint:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
 
+# Build internal API docs and reject broken links, markup and other warnings.
+doc-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
+
 # Run PR CI checks
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never

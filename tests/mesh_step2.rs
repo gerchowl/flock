@@ -510,11 +510,32 @@ fn lost_offer_on_one_way_edge_is_reoffered_after_backoff(how: &str) {
     // A 5 s lease plus up to 1 s of jitter, with wide room for a loaded CI
     // runner, yet far below the 299 s idle poll this used to wait for.
     let messages = fleet::wait_until("re-offered inbox delivery", Duration::from_secs(60), || {
-        let messages = read(c.fleet.node("nodea"), &c.sender.pane);
+        // Consuming here can let a read receipt overtake delivery confirmation.
+        let messages = api(
+            c.fleet.node("nodea"),
+            "msg.list",
+            json!({"pane":c.sender.pane}),
+        )["messages"]
+            .clone();
         (!messages.as_array()?.is_empty()).then_some(messages)
     });
     assert_eq!(messages[0]["correlation_id"], "reverse");
+    let recipient_state: String = db(c.fleet.node("nodea"))
+        .query_row(
+            "SELECT state FROM envelopes WHERE correlation='reverse' AND kind='message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        recipient_state, "inbox",
+        "observing the re-offer must not consume it before the delivery acknowledgement"
+    );
     state(c.fleet.node("nodeb"), "reverse", "delivered");
+    assert_eq!(
+        read(c.fleet.node("nodea"), &c.sender.pane)[0]["correlation_id"],
+        "reverse"
+    );
     once(c.fleet.node("nodea"), "reverse");
 }
 

@@ -216,7 +216,7 @@ impl NotificationLog {
     ///
     /// Derived, never stored: `len() == MAX_NOTIFICATIONS` *is* the condition
     /// under which the very next filed record evicts one, and the evictions
-    /// themselves emit nothing (see [`AppState::file_notification`]). The TUI
+    /// themselves emit nothing (see [`crate::app::state::AppState::file_notification`]). The TUI
     /// panel (#516) reads this so it can say the list it is showing is a
     /// window rather than the whole history, instead of implying completeness
     /// it cannot know about.

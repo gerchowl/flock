@@ -14,6 +14,12 @@
 // The shared fixture is copied whole; not every helper is used here.
 #![allow(dead_code)]
 
+#[path = "support/a28_readiness.rs"]
+mod a28_readiness;
+#[path = "../src/cli/delegate_timeouts.rs"]
+mod delegate_timeouts;
+#[path = "../src/cli/exit/constants.rs"]
+mod exit;
 mod support;
 
 use std::fs;
@@ -520,12 +526,27 @@ fn work_dir(server: &Server) -> String {
 }
 
 fn start_cwd(server: &Server, name: &str, brief_path: &str, extra: &[&str]) -> Child {
+    start_cwd_via(server, name, brief_path, extra, &server.socket)
+}
+
+fn start_cwd_via(
+    server: &Server,
+    name: &str,
+    brief_path: &str,
+    extra: &[&str],
+    socket: &Path,
+) -> Child {
     let work = work_dir(server);
     let mut args = vec![
         "delegate", "start", name, "--brief", brief_path, "--cwd", &work, "--settle", SETTLE,
     ];
     args.extend_from_slice(extra);
-    cli_spawn(server, &args)
+    command(server, &args)
+        .env("FLOCK_SOCKET_PATH", socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -1057,37 +1078,89 @@ fn a27_a_frozen_server_reap_refuses_then_retries() {
     assert!(entry_file(&server, "d1").is_none(), "and removed the entry");
 }
 
-/// a28 (P578 r4-4): a server that freezes during READINESS cannot hold `start`.
-/// The agent has launched but never reported ready; with the server stopped,
-/// `start` must end on its own (`--ready-timeout` plus one 2 s cap plus slack)
-/// with exit 1, and write no registry entry.
+/// Resume only this fixture's owned server, including on assertion failure.
+struct PausedServer<'a>(&'a Server);
+
+impl<'a> PausedServer<'a> {
+    fn new(server: &'a Server) -> Self {
+        let pid = server.child.process_id().expect("owned server pid") as libc::pid_t;
+        // The borrowed Server owns this unreaped child for the guard's lifetime.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGSTOP) },
+            0,
+            "stop owned server"
+        );
+        Self(server)
+    }
+}
+
+impl Drop for PausedServer<'_> {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.child.process_id() {
+            // Server ownership outlives this guard, including while unwinding.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
+        }
+    }
+}
+
+/// a28: the frozen server answers nothing. Start abandons its readiness
+/// subscription, two diagnostic reads and rollback's identity read, then exits
+/// with ready_timeout and no registry entry (ADR-0037 §1, #1490 decision).
 #[test]
 fn a28_a_frozen_server_cannot_hold_start_in_readiness() {
+    const READY_TIMEOUT: Duration = Duration::from_secs(3);
+    // Four times the documented readiness + three wind-down caps. Failure
+    // backstop only: protocol evidence, never speed, decides success.
+    const CEILING: Duration = READY_TIMEOUT
+        .saturating_add(delegate_timeouts::REQUEST_TIMEOUT.saturating_mul(3))
+        .saturating_mul(4);
     let server = start_server();
     operator_workspace(&server);
     let b = brief(&server, "task.md", "x\n");
-    let mut child = start_cwd(&server, "d1", &b, &["--ready-timeout", "3000"]);
-    let appeared = Instant::now() + WITHIN;
-    while agent_get(&server, "d1").is_none() {
-        assert!(
-            Instant::now() < appeared,
-            "the delegate's agent never appeared"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    thread::sleep(Duration::from_millis(300));
-    let pid = server.child.process_id().expect("server pid") as libc::pid_t;
-    let frozen = Instant::now();
-    unsafe { libc::kill(pid, libc::SIGSTOP) };
-    let status = exited_within(&mut child, Duration::from_secs(20));
-    let elapsed = frozen.elapsed();
-    unsafe { libc::kill(pid, libc::SIGCONT) };
-    let status = status.expect("start must end on its own while the server is frozen");
-    let out = finish(child);
-    assert_eq!(status.code(), Some(1), "stderr {}", stderr(&out));
+    let stages = std::sync::Arc::new(support::readiness::Stages::new(CEILING));
+    let (notice, events) = std::sync::mpsc::channel();
+    let mut proxy = a28_readiness::ApiProxy::new(
+        &server.socket,
+        server.base.join("a28-api.sock"),
+        notice.clone(),
+        stages.clone(),
+    );
+    let timeout = READY_TIMEOUT.as_millis().to_string();
+    let child = a28_readiness::Cli::new(
+        start_cwd_via(
+            &server,
+            "d1",
+            &b,
+            &["--ready-timeout", &timeout, "--json"],
+            proxy.path(),
+        ),
+        notice,
+    );
+    a28_readiness::expect_phase(
+        &events,
+        a28_readiness::Phase::StartResponseCaptured,
+        &stages,
+    )
+    .expect("agent.start response");
+    a28_readiness::expect_phase(&events, a28_readiness::Phase::ReadinessRequested, &stages)
+        .expect("CLI entered readiness");
+    let paused = PausedServer::new(&server);
+    proxy.release_frozen();
+    a28_readiness::prove_abandonment(&events, &stages, || proxy.seal())
+        .expect("finite capped requests abandoned without server responses, then CLI exit");
+    let out = child.finish();
+    drop(paused);
+    assert_eq!(
+        out.status.code(),
+        Some(exit::FAILURE),
+        "stderr {}",
+        stderr(&out)
+    );
+    assert_eq!(stdout_json(&out)["outcome"], "ready_timeout");
     assert!(
-        elapsed < Duration::from_secs(10),
-        "start ended within ready-timeout + one cap + slack: {elapsed:?}"
+        stderr(&out).contains("rollback also failed: could not establish whether workspace"),
+        "stderr {}",
+        stderr(&out)
     );
     assert!(
         entry_file(&server, "d1").is_none(),

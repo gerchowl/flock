@@ -1,4 +1,6 @@
 //! Request routing uses node identities and only authenticated adjacent edges.
+use std::collections::BTreeMap;
+
 use super::messages::now_ms;
 use crate::{
     app::App,
@@ -28,7 +30,18 @@ impl NextHop {
 impl App {
     pub(super) fn request_next_hop(&mut self, owner: &str) -> NextHop {
         self.refresh_mesh_routes();
-        let node = self.custody_routes().remove(owner).unwrap_or_default();
+        self.request_next_hop_from_routes(owner, &self.custody_routes())
+    }
+
+    /// Resolve a row using the route pass's single attachment snapshot.
+    /// This snapshot may become stale within the pass: an edge that closes
+    /// mid-pass is caught by lease-time validation or the next route generation.
+    pub(super) fn request_next_hop_from_routes(
+        &self,
+        owner: &str,
+        routes: &BTreeMap<String, String>,
+    ) -> NextHop {
+        let node = routes.get(owner).cloned().unwrap_or_default();
         let peer = self
             .outbound_reply_peer(&node)
             .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned");

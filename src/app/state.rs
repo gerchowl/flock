@@ -2315,13 +2315,13 @@ pub struct AppState {
     /// a sidebar banner disappears when the sidebar is collapsed, and the whole
     /// point is that this fault is invisible until you are told.
     pub session_warning: Option<String>,
-    /// Sidebar display aliases for agent labels ([ui] agent_aliases).
+    /// Sidebar display aliases for agent labels (`[ui] agent_aliases`).
     pub agent_aliases: std::collections::HashMap<String, String>,
     /// Auto-adopt external linked worktrees into managed groups.
     pub adopt_external_worktrees: bool,
     /// One-shot pivot prompt injected into a branched Claude fork (#106).
     pub branch_pivot_message: String,
-    /// Configured federated peer servers ([[peers]]), config-owned.
+    /// Configured federated peer servers (`[[peers]]`), config-owned.
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,

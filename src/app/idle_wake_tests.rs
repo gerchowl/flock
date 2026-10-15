@@ -76,7 +76,10 @@ fn terminal(app: &mut App) -> &mut crate::terminal::TerminalState {
 /// Claude, showing its idle prompt box, since `idle_for` ago, and seen just
 /// now — the state an idle wake is for.
 fn claude_idle_for(app: &mut App, idle_for: Duration) {
-    let now = Instant::now();
+    claude_idle_for_at(app, idle_for, Instant::now());
+}
+
+fn claude_idle_for_at(app: &mut App, idle_for: Duration, now: Instant) {
     let terminal = terminal(app);
     for at in [now - idle_for, now] {
         terminal.set_detected_state_with_screen_signals_at(
@@ -2203,8 +2206,8 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
 #[path = "injection_lock_tests.rs"]
 mod injection_lock_tests;
 
-/// #1019 from the socket: `agent.get` and `agent.list` carry the `state`
-/// a real detector report produces, and the local `fleet` row repeats it.
+/// #1019: detector state reaches `agent.get` through the API and `agent.list`
+/// through its clock-injected handler; the local `fleet` row repeats it.
 #[tokio::test]
 async fn agent_records_carry_the_state_object_from_the_detector() {
     let call = |app: &mut App, method| -> serde_json::Value {
@@ -2228,20 +2231,151 @@ async fn agent_records_carry_the_state_object_from_the_detector() {
     assert!(state["held_ms"].as_u64().unwrap() >= 3_000);
     // The idle start only moves on a change, so the settled case is a fresh pane.
     let Rig { mut app, .. } = rig();
-    claude_idle_for(&mut app, settled());
-    let list = call(
-        &mut app,
-        Method::AgentList(crate::api::schema::EmptyParams {}),
-    );
+    let now = Instant::now();
+    claude_idle_for_at(&mut app, settled(), now);
+    // A second observation would advance by exactly 1 ms without sleeping.
+    let mut clock_reads = 0u64;
+    let list: serde_json::Value =
+        serde_json::from_str(&app.handle_agent_list_with_clock("state".into(), || {
+            let at = now + Duration::from_millis(clock_reads);
+            clock_reads += 1;
+            at
+        }))
+        .unwrap();
     let agent = &list["result"]["agents"][0];
     assert_eq!(
         (&agent["agent_status"], &agent["state"]["phase"]),
         (&"idle".into(), &"unknown".into())
     );
-    let held = agent["state"]["held_ms"].as_u64().unwrap();
-    assert!(
-        (10_000..settled().as_millis() as u64).contains(&held),
-        "{held}"
-    );
+    assert_eq!(agent["state"]["held_ms"], 10_000);
     assert_eq!(list["result"]["fleet"][0]["state"], agent["state"]);
+    assert_eq!(clock_reads, 1, "one state snapshot per response");
+    // The public request path must use the same snapshot-preserving handler.
+    let list = call(
+        &mut app,
+        Method::AgentList(crate::api::schema::EmptyParams {}),
+    );
+    assert_eq!(
+        list["result"]["fleet"][0]["state"],
+        list["result"]["agents"][0]["state"]
+    );
+}
+
+fn assert_released_paste(
+    app: &App,
+    completion: &crate::pty::write_receipt::WriteCompletion,
+    written: usize,
+    untouched_reason: &str,
+) {
+    let evidence = app.delivery_attempts().pop().expect("recorded attempt");
+    let (state, reason) = match written {
+        0 => ("abandoned", untouched_reason),
+        5 => ("unconfirmed", "paste_written"),
+        _ => ("unconfirmed", "paste_write_incomplete"),
+    };
+    assert_eq!(evidence.state, state);
+    assert_eq!(evidence.reason.as_deref(), Some(reason));
+    assert!(evidence.finished_at_ms.is_some());
+    if written == 0 {
+        assert!(completion
+            .write(5, || panic!("released paste reached resumed writer"))
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn stalled_idle_wake_inbox_read_cancels_paste_and_records_effect() {
+    for written in [0, 2, 5] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "stalled-read", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        let attempt = app
+            .idle_wake
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .in_flight
+            .as_mut()
+            .unwrap()
+            .attempt
+            .as_mut()
+            .unwrap();
+        let completion = super::super::guarded_submit::tests::stalled_paste(attempt, written);
+        read_inbox(&mut app, &pane);
+        assert_released_paste(&app, &completion, written, "inbox_read");
+        assert!(!app.idle_wake.panes.contains_key(&pane));
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stalled_idle_wake_leaving_idle_cancels_paste_and_records_effect() {
+    for written in [0, 2, 5] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "stalled-busy", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        let flight = app
+            .idle_wake
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .in_flight
+            .as_mut()
+            .unwrap();
+        let completion = super::super::guarded_submit::tests::stalled_paste(
+            flight.attempt.as_mut().unwrap(),
+            written,
+        );
+        // Exercise the release of an in-flight marker without a pending timer.
+        flight.submit_at = None;
+        terminal(&mut app).state = AgentState::Working;
+        app.tick_idle_wakes(Instant::now());
+        assert_released_paste(&app, &completion, written, "turn_started_before_enter");
+        assert!(app.idle_wake.panes[&pane].in_flight.is_none());
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stalled_guarded_submit_operator_interrupt_records_written_effect_without_poll_race() {
+    use super::super::guarded_submit::Outcome;
+    for (written, polled) in [(0, false), (2, false), (5, false), (5, true)] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        let completion = super::super::guarded_submit::tests::stalled_paste(&mut attempt, written);
+        if polled {
+            assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+        }
+        runtime(&app).test_stamp_operator_input_at(Instant::now());
+        let expected = match written {
+            0 => Outcome::Abandoned("operator_active"),
+            5 => Outcome::Unconfirmed("paste_written"),
+            _ => Outcome::Unconfirmed("paste_write_incomplete"),
+        };
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(expected)
+        );
+        assert_released_paste(&app, &completion, written, "operator_active");
+        assert!(drain(&mut pty).is_empty());
+    }
 }

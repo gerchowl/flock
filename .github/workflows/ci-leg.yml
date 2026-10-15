@@ -5,7 +5,7 @@ name: CI leg
 # once per platform and reports `check (<leg>)` from the result, so a red
 # shard on one platform never fails the other platform's required check.
 #
-#   lint    fmt and clippy, from the start, alongside build
+#   lint    fmt, clippy and rustdoc, from the start, alongside build
 #   build   compile every test binary once into a nextest archive, and fail
 #           unless the shards partition the leg's tests exactly
 #   test    one job per shard of .config/ci-shards.toml: the serial ones
@@ -49,18 +49,40 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
+
+      # setup-zig's own cache adds a run ID. Reuse its directory and old
+      # dev entries, but save only one key per compiler/source generation.
+      - name: Restore Zig build cache
+        id: zig-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
+          restore-keys: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--
 
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: brew install cmake ninja
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-bin: false
 
       - name: Lint
         run: just lint
+
+      - name: Check Rust documentation
+        run: just doc-check
+
+      - name: Save Zig build cache from dev
+        if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
 
       # Maintenance-script unittests and the platform test-gap ratchet (#597).
       # Ubuntu only: pure Python plus git fixtures, so one platform is enough.
@@ -102,19 +124,38 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
+
+      # setup-zig's own cache adds a run ID. Reuse its directory and old
+      # dev entries, but save only one key per compiler/source generation.
+      - name: Restore Zig build cache
+        id: zig-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
+          restore-keys: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--
 
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: brew install cmake ninja
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-bin: false
 
       - name: Build test archive and verify the shard partition
         id: archive
         run: just ci-archive '${{ inputs.leg }}' nextest-archive.tar.zst
+
+      - name: Save Zig build cache from dev
+        if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
 
       - name: Upload test archive
         uses: actions/upload-artifact@v7

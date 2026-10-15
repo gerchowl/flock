@@ -134,18 +134,22 @@ impl App {
         }
     }
 
-    /// The agent read its inbox: whatever was in flight has landed. A wake
-    /// whose Enter was still pending is dropped here, and that is logged like
-    /// every other withheld Enter — its sentence is still in the prompt.
+    /// An inbox read stops the in-flight wake. It proves the mail was read,
+    /// but cannot prove that an outstanding paste reached the composer.
     pub(crate) fn idle_wake_on_read(&mut self, pane: &str) {
         let flight = self
             .idle_wake
             .panes
             .remove(pane)
             .and_then(|entry| entry.in_flight);
+        let pending_attempt = flight
+            .as_ref()
+            .and_then(|flight| flight.attempt.as_ref())
+            .filter(|attempt| attempt.evidence.submit_sent_at_ms.is_none())
+            .map(|attempt| attempt.evidence.attempt_id.clone());
         if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
             // A draft still mid-restore goes to the stash (#850).
-            self.release_guarded_attempt(pane, &mut attempt);
+            let disposition = self.release_guarded_attempt(pane, &mut attempt);
             self.surface_kept_drafts();
             if attempt.evidence.submit_sent_at_ms.is_some() {
                 attempt.evidence.state = "read".into();
@@ -153,15 +157,20 @@ impl App {
                 attempt.evidence.finished_at_ms = Some(super::api::messages::now_ms());
                 self.record_delivery_attempt(&attempt.evidence);
             } else {
-                self.finish_delivery_attempt(
-                    &mut attempt,
-                    &super::guarded_submit::Outcome::Abandoned("inbox_read"),
+                let outcome = attempt.outcome_after_release(
+                    super::guarded_submit::Outcome::Abandoned("inbox_read"),
+                    disposition,
                 );
+                self.finish_delivery_attempt(&mut attempt, &outcome);
                 crate::logging::idle_wake_abandoned(pane, "inbox_read");
             }
         }
         for mut attempt in self.delivery_attempts() {
-            if attempt.wake && attempt.pane == pane && attempt.state == "unconfirmed" {
+            if attempt.wake
+                && attempt.pane == pane
+                && attempt.state == "unconfirmed"
+                && pending_attempt.as_deref() != Some(&attempt.attempt_id)
+            {
                 attempt.state = "read".into();
                 attempt.reason = Some("inbox_read".into());
                 attempt.finished_at_ms = Some(super::api::messages::now_ms());
@@ -318,7 +327,11 @@ impl App {
                 .get_mut(pane)
                 .and_then(|entry| entry.in_flight.take());
             if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
-                self.release_guarded_attempt(pane, &mut attempt);
+                self.conclude_guarded_attempt(
+                    pane,
+                    &mut attempt,
+                    &super::guarded_submit::Outcome::Abandoned("turn_started_before_enter"),
+                );
             }
         }
 
@@ -466,10 +479,11 @@ impl App {
         } else {
             self.advance_guarded_submit(pane, &mut attempt, now)
         };
-        if let Some(ref outcome) = outcome {
-            self.conclude_guarded_attempt(pane, &mut attempt, outcome);
+        let outcome = outcome.map(|outcome| {
+            let outcome = self.conclude_guarded_attempt(pane, &mut attempt, &outcome);
             self.surface_kept_drafts();
-        }
+            outcome
+        });
         let enter_sent = before != (attempt.sent, attempt.retried);
         let next = now + Duration::from_millis(50);
         if outcome.is_none() {

@@ -12,6 +12,7 @@ use crate::mesh::routes::{Adjacency, Advert, Route, RouteTable};
 pub(crate) struct Routes {
     pub table: RouteTable,
     workers: crate::app::message_relay::MessageRelays,
+    /// Snapshot for the last published local advert, not the current attachments.
     live: BTreeMap<String, String>,
     sent: BTreeMap<String, (u64, u64)>,
     busy: BTreeSet<String>,
@@ -165,7 +166,9 @@ impl App {
 
     /// Custody paths include live pinned direct edges before reciprocal adverts.
     /// Direct reachability takes precedence over any longer learned path.
-    /// Call after refreshing attachments so closed edges cannot retain mail.
+    /// Refresh attachments before taking this snapshot. Closed attachments are
+    /// excluded even if publishing the new advert fails or has no node identity.
+    /// Lease-time validation rechecks assignments after later topology changes.
     pub(super) fn custody_routes(&self) -> BTreeMap<String, String> {
         let mut routes: BTreeMap<_, _> = self
             .mesh_routes
@@ -174,7 +177,7 @@ impl App {
             .into_iter()
             .map(|route| (route.node, route.next_hop))
             .collect();
-        for node in self.mesh_routes.live.keys() {
+        for node in self.mesh_routes.table.live_edges() {
             routes.insert(node.clone(), node.clone());
         }
         routes
@@ -399,6 +402,120 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assigned_direct_custody() -> (App, crate::mesh::store::Envelope, crate::config::PeerConfig) {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let identity = crate::mesh::identity::NodeIdentity::load().unwrap();
+        app.node_id = Some(identity.node_id());
+        let recipient = crate::mesh::identity::NodeIdentity::fixture([9; 32]);
+        let peer = crate::config::PeerConfig {
+            name: "direct.example".into(),
+            ssh: "custody-edge-test.invalid".into(),
+            ..Default::default()
+        };
+        crate::peer_stream::test_enroll(&peer, &recipient.node_id());
+        app.state.peers = vec![peer.clone()];
+        app.refresh_mesh_routes();
+        assert_eq!(app.mesh_routes.seq, 1);
+        assert!(app.mesh_routes.live.contains_key(&recipient.node_id()));
+        app.mesh_forward_generation = Some(app.mesh_routes.table.generation());
+        let mut mail = crate::mesh::sign::tests::signed();
+        mail.key.origin_node = identity.node_id();
+        mail.return_binding.request = mail.key.clone();
+        mail.return_binding.recipient_node = recipient.node_id();
+        crate::mesh::sign::seal(&mut mail, &identity);
+        crate::mesh::hello::with_store(|store| {
+            store
+                .accept_origin(
+                    &mail,
+                    &recipient.node_id(),
+                    crate::mesh::store::Admission::Held,
+                    8,
+                    super::super::messages::now_ms() as i64,
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        (app, mail, peer)
+    }
+
+    #[tokio::test]
+    async fn failed_advert_after_edge_close_clears_custody_assignment() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, mail, peer) = assigned_direct_custody();
+        // Exhausting the sequence is a real advert-build failure, without a hook.
+        app.mesh_routes.seq = u32::MAX;
+        crate::peer_stream::reset_enrollment(&peer.name);
+        app.retry_mesh_mail();
+        assert_eq!(app.mesh_routes.seq, u32::MAX);
+        assert!(
+            app.mesh_routes
+                .live
+                .contains_key(&mail.return_binding.recipient_node),
+            "failed publication must leave the old advert snapshot in place"
+        );
+        let record = crate::mesh::hello::with_store(|store| {
+            store
+                .collection_record(&mail.key, super::super::messages::now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            record.next_hop.is_empty(),
+            "closed edge retained assignment {}",
+            record.next_hop
+        );
+        assert_eq!(record.envelope.key, mail.key, "custody must be retained");
+    }
+
+    #[tokio::test]
+    async fn missing_node_identity_after_edge_close_excludes_direct_custody_route() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, mail, peer) = assigned_direct_custody();
+        let record = crate::mesh::hello::with_store(|store| {
+            store
+                .collection_record(&mail.key, super::super::messages::now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!record.next_hop.is_empty());
+        app.node_id = None;
+        crate::peer_stream::reset_enrollment(&peer.name);
+        app.refresh_mesh_routes();
+        assert_eq!(app.mesh_routes.seq, 1);
+        assert!(app
+            .mesh_routes
+            .live
+            .contains_key(&mail.return_binding.recipient_node));
+        let routes = app.custody_routes();
+        assert!(!routes.contains_key(&mail.return_binding.recipient_node));
+        // Forwarding pauses without identity. Once it returns, the next route
+        // pass must consume the invalidation and clear the durable assignment.
+        app.node_id = Some(mail.key.origin_node.clone());
+        app.retry_mesh_mail();
+        let record = crate::mesh::hello::with_store(|store| {
+            store
+                .collection_record(&mail.key, super::super::messages::now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            record.next_hop.is_empty(),
+            "closed edge retained assignment {}",
+            record.next_hop
+        );
+        assert_eq!(record.envelope.key, mail.key, "custody must be retained");
+    }
 
     #[test]
     fn wake_or_new_generation_supersedes_even_the_longest_backoff() {

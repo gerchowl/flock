@@ -1,0 +1,194 @@
+Flock #1411: coordinate sccache 0.15.0 Unix socket startup.
+Upstream base: v0.15.0 (c2e4b4c), src/server.rs probe/unlink/bind.
+Keep the current endpoint and parallel compilation. Never unlink the lock inode.
+Removal condition: drop when upstream fixes the unlink+bind race.
+
+diff --git a/src/server.rs b/src/server.rs
+index be49c1d..19e8b9a 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -489,56 +489,136 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
+         _ => raw_storage,
+     };
+ 
+-    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
+-        match addr {
+-            crate::net::SocketAddr::Net(addr) => {
+-                trace!("binding TCP {addr}");
+-                let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
+-                let srv =
+-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+-                Ok((
+-                    srv.local_addr().unwrap(),
+-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+-                ))
+-            }
+-            #[cfg(unix)]
+-            crate::net::SocketAddr::Unix(path) => {
+-                trace!("binding unix socket {}", path.display());
+-                // Unix socket will report addr in use on any unlink file.
+-                let _ = std::fs::remove_file(path);
+-                let l = {
+-                    let _guard = runtime.enter();
+-                    tokio::net::UnixListener::bind(path)?
+-                };
+-                let srv =
+-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+-                Ok((
+-                    srv.local_addr().unwrap(),
+-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+-                ))
+-            }
+-            #[cfg(any(target_os = "linux", target_os = "android"))]
+-            crate::net::SocketAddr::UnixAbstract(p) => {
+-                trace!("binding abstract unix socket {}", p.escape_ascii());
+-                let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
+-                let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
+-                l.set_nonblocking(true)?;
+-                let l = {
+-                    let _guard = runtime.enter();
+-                    tokio::net::UnixListener::from_std(l)?
+-                };
+-                let srv =
+-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+-                Ok((
+-                    srv.local_addr()
+-                        .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
+-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+-                ))
++    // Flock #1411: serialize only Unix startup, never compiler requests.
++    #[cfg(unix)]
++    let mut startup_lock = None;
++    let res: io::Result<Option<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)>> =
++        (|| {
++            match addr {
++                crate::net::SocketAddr::Net(addr) => {
++                    trace!("binding TCP {addr}");
++                    let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
++                    let srv =
++                        SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
++                    Ok(Some((
++                        srv.local_addr().unwrap(),
++                        Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
++                    )))
++                }
++                #[cfg(unix)]
++                crate::net::SocketAddr::Unix(path) => {
++                    trace!("binding unix socket {}", path.display());
++                    use std::os::fd::AsRawFd;
++                    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
++                    let mut lock_path = path.as_os_str().to_os_string();
++                    lock_path.push(".lock");
++                    let lock = std::fs::OpenOptions::new()
++                        .read(true)
++                        .write(true)
++                        .create(true)
++                        .mode(0o600)
++                        .custom_flags(libc::O_NOFOLLOW)
++                        .open(&lock_path)?;
++                    let metadata = lock.metadata()?;
++                    // The persistent inode is never unlinked, including after a crash.
++                    if !metadata.is_file()
++                        || metadata.uid() != unsafe { libc::geteuid() }
++                        || metadata.mode() & 0o077 != 0
++                    {
++                        return Err(io::Error::new(
++                            io::ErrorKind::PermissionDenied,
++                            "sccache startup lock must be an owner-only regular file",
++                        ));
++                    }
++                    // The fd remains open through probe, stale-path removal and bind.
++                    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
++                        return Err(io::Error::last_os_error());
++                    }
++                    startup_lock = Some(lock);
++                    match runtime.block_on(async {
++                        tokio::time::timeout(
++                            Duration::from_secs(10),
++                            tokio::net::UnixStream::connect(path),
++                        )
++                        .await
++                    }) {
++                        Ok(Ok(_live)) => {
++                            info!("server already running at {}", path.display());
++                            return Ok(None);
++                        }
++                        Ok(Err(error))
++                            if matches!(
++                                error.kind(),
++                                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
++                            ) => {}
++                        Ok(Err(error)) => return Err(error),
++                        Err(_) => {
++                            return Err(io::Error::new(
++                                io::ErrorKind::TimedOut,
++                                "sccache socket ownership probe timed out; path preserved",
++                            ))
++                        }
++                    }
++                    match std::fs::symlink_metadata(path) {
++                        Ok(metadata)
++                            if metadata.file_type().is_socket()
++                                && metadata.uid() == unsafe { libc::geteuid() } =>
++                        {
++                            std::fs::remove_file(path)?;
++                        }
++                        Ok(_) => {
++                            return Err(io::Error::new(
++                                io::ErrorKind::PermissionDenied,
++                                "refusing to remove a non-socket or foreign-owned sccache path",
++                            ))
++                        }
++                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++                        Err(error) => return Err(error),
++                    }
++                    let l = {
++                        let _guard = runtime.enter();
++                        tokio::net::UnixListener::bind(path)?
++                    };
++                    let srv =
++                        SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
++                    Ok(Some((
++                        srv.local_addr().unwrap(),
++                        Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
++                    )))
++                }
++                #[cfg(any(target_os = "linux", target_os = "android"))]
++                crate::net::SocketAddr::UnixAbstract(p) => {
++                    trace!("binding abstract unix socket {}", p.escape_ascii());
++                    let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
++                    let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
++                    l.set_nonblocking(true)?;
++                    let l = {
++                        let _guard = runtime.enter();
++                        tokio::net::UnixListener::from_std(l)?
++                    };
++                    let srv =
++                        SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
++                    Ok(Some((
++                        srv.local_addr()
++                            .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
++                        Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
++                    )))
++                }
+             }
+-        }
+-    })();
++        })();
++    #[cfg(unix)]
++    drop(startup_lock);
+     match res {
+-        Ok((addr, run)) => {
++        Ok(None) => {
++            notify_server_startup(
++                notify.as_ref(),
++                ServerStartup::Ok {
++                    addr: addr.to_string(),
++                },
++            )?;
++            Ok(())
++        }
++        Ok(Some((addr, run))) => {
+             info!("server started, listening on {addr}");
+             notify_server_startup(
+                 notify.as_ref(),
