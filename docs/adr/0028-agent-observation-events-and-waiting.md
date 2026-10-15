@@ -11,9 +11,10 @@
 - Builds on: ADR-0005 (durable event log), ADR-0008 / ADR-0018 / ADR-0019 (mail,
   wake, channel push), ADR-0026 (mesh custody), #850 (injection lock).
 - Decision owner: operator.
-- Amendment (2026-10-15, #1479): §1a records accepted Codex lifecycle authority;
-  its source/continuity contract is proposed for review before implementation;
-  format/version policy awaits an owner decision (§1a).
+- Amendment (2026-10-15, #1479, clarified by #1519): §1a records accepted
+  Codex lifecycle authority; its source/continuity contract is proposed for
+  review before implementation; format/version policy awaits an owner
+  decision (§1a).
 - Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
@@ -265,6 +266,7 @@ Evidence: [hook names](https://github.com/openai/codex/blob/rust-v0.160.1/codex-
 [persistence policy](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/policy.rs#L94-L119),
 and [newline/write/flush](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L2072-L2095).
 
+The following reducer rules apply only after binding validation succeeds.
 For `type: event_msg`, consume `payload.type: task_started` / `task_complete`,
 including the documented aliases `turn_started` / `turn_complete`. Start means
 working; completion with the matching `turn_id` means idle. Terminal non-abort
@@ -320,7 +322,23 @@ Thus a launch, resume or clear can sit at its prompt without any SessionStart.
 Do not require that hook to permit the prompt that causes it. On the first
 SessionStart, validate and bind, catch up the rollout and normally report
 working from that turn's already-written start. From then on lifecycle has
-precedence; validation failure after a binding claim yields unknown.
+precedence. Scope lifecycle trust to the pane's **launch generation**, as in the
+binding key above: track whether that generation has held a successfully validated
+binding. An explicit retirement through a known launch or resume ends that scope
+and resets trust for the new generation. A new SessionStart claim, binding
+generation or rebind request alone does not reset it.
+Pending validation yields unknown. If binding validation fails before lifecycle
+has been trusted in the current launch generation, reject the claim and its
+queued callbacks,
+publish `unavailable: binding_validation_failed` with the failure reason, and
+return to the existing screen fallback. A Working screen therefore means working;
+unclassifiable evidence remains unknown. This fallback does not manufacture idle
+or require another SessionStart before screen-based submission can be eligible.
+Without a known retirement, failed revalidation or unexplained loss of a
+currently-bound validated authority yields unknown; a rejected claim cannot erase
+that generation's trust history to regain fallback. This same split applies to
+all binding-validation and attribution failures below. Only a freshly validated
+binding can establish lifecycle authority again.
 
 **Every SessionStart rebinds**, even within one OS launch and even when the
 reported thread ID has not changed. Increment the binding generation and revoke
@@ -341,31 +359,59 @@ An index may assist validation, not choose a different file over the hook's
 path. A missing path needs an explicit unavailable-source explanation or leaves
 an expected local source initializing; never guess a file by name/cwd or search
 an unrelated profile. Do not follow remote-reported paths. Ambiguous writers
-or mismatched metadata yield unknown.
+or mismatched metadata fail binding validation: use screen fallback if the current
+launch generation has not trusted lifecycle, or unknown after validation without
+an explicit known retirement.
 
-On a known launch/resume or confirmed thread replacement (`/new`, `/clear`),
-retire the old binding and discard its queued callbacks, then return to
-`unavailable: awaiting_first_turn` and screen fallback until the next
-SessionStart. Use an attributed runtime replacement confirmation, not typed
-command text, an idle composer, a label or a timeout, as replacement evidence.
-**Observability limit:** today's Codex integration [installs only SessionStart](../../src/integration/mod.rs#L1831-L1838);
-it does not receive an immediate clear/new confirmation. For a command entered
-inside the TUI that flk cannot observe as a confirmed replacement, retirement
-cannot occur before the next SessionStart. Keep the old binding until that
-report atomically retires it and claims the new binding; do not pretend a
-pre-hook fallback transition was observed. Known launch/resume generation
-changes are observable to flk before the hook and do enter fallback immediately.
-An observed source failure without replacement evidence still yields unknown,
-never this bootstrap fallback. The implementation must expose this limitation
-and test both confirmed and initially unobserved replacement paths.
+Known launch/resume generation changes are observable to flk before the hook:
+retire the old binding, discard its queued callbacks and reset lifecycle trust for
+the new launch generation, then return to `unavailable: awaiting_first_turn` and
+screen fallback until the next SessionStart. If that new claim fails validation,
+use diagnosed screen fallback: authority in the retired generation cannot strand
+the new launch at unknown.
+
+**Future work, not a current producer (#1479):** an attributed runtime confirmation
+of an in-TUI thread replacement would permit the same retirement. Today's Codex
+integration [installs only SessionStart](../../src/integration/mod.rs#L1831-L1838);
+it has no real producer of immediate clear/new/resume/fork confirmation. Typed
+command text, an idle composer, a label and a timeout are not confirmation.
+A model test of this future contract must not be presented as a working runtime
+replacement path.
+
+**Observability limit and false idle:** after an in-TUI `/clear`, `/new`, `/resume`
+or `/fork` without confirmation, keep the old binding until the next SessionStart
+atomically replaces it. If the old binding is idle, it still wins over the new
+thread's first visible Working frame during the deferred-hook window. If the hook
+report is lost, for example during a socket restart or hook-command timeout,
+this false idle can persist for the whole new thread. Do not claim that an early
+retirement or pre-hook fallback was observed.
+
+Publish the lifecycle/screen disagreement diagnostic for this idle-versus-Working
+case, including the old binding generation/thread ID, last lifecycle boundary,
+verified file identity/cursor, latest successful EOF observation and the classified
+screen evidence. Publish it when disagreement is observed and keep the current
+diagnostic available while it persists, including when no new hook ever arrives.
+These facts expose possible stale attribution; they do not prove replacement.
+
+**Retirement decision:** Working chrome plus an unchanged bound file is
+insufficient to retire a binding. It also occurs after a real completion with
+stale Working chrome, and an empty read is normal. Preserve the binding, its
+lifecycle idle and the diagnostic in both cases. Neither elapsed time nor repeated
+EOF checks may turn this into fallback or a new thread claim. A later validated
+SessionStart replaces the generation; an operator-requested rebind must validate
+attribution before publishing another lifecycle decision. Test both indistinguishable
+cases and the lost-report case explicitly. Unexplained loss of authority trusted
+in the current launch generation still yields unknown, rather than bootstrap
+fallback.
 
 For a resume, record the pre-launch file identity, verified prefix and complete
 byte offset, and buffer appended records until binding validation succeeds.
 At the deferred SessionStart, use the new writer's attributable start after that
 snapshot, not an inherited unfinished turn or old completion, as the current
 boundary. A copied snapshot also needs destination verification and local
-ownership. Missing/bad paths or metadata, ambiguous writers and discontinuity
-after the binding claim yield unknown. No empty-history or pre-launch completion
+ownership. Missing/bad paths or metadata and ambiguous writers fail validation
+under the current-generation untrusted versus validated rule above. Discontinuity
+after validation yields unknown. No empty-history or pre-launch completion
 boundary establishes lifecycle idle.
 
 For a copied fork, the boundary after imported history is the child's
@@ -377,13 +423,17 @@ Copied parent settings retain their parent ID. Begin child boundary reduction
 after the verified child settings record; this record is an attribution delimiter,
 not a turn end. In referenced history, inherited records remain behind
 `session_meta.history_base`; the same child settings record begins local history.
-If the delimiter/owner cannot be verified, yield unknown rather than treating
-imported starts or completions as the child's turn.
+If the delimiter/owner cannot be verified before lifecycle trust in the current
+launch generation, reject the claim and use screen fallback with
+`binding_validation_failed` and the attribution reason. If this failure instead
+invalidates authority already validated in this generation without known
+retirement, yield unknown. Neither branch treats imported starts or completions
+as the child's turn.
 
 A reducer state may transfer only with proven continuity of the same local
 writer, thread, file and cursor; equal thread IDs alone do not suffice. In
-particular, SessionStart `compact` during a running turn preserves working when
-that continuity is proven. Otherwise it yields unknown with
+particular, SessionStart `compact` during a running turn from a validated binding
+preserves working when that continuity is proven. Otherwise it yields unknown with
 `codex_compaction_continuity_unproven`; compaction is not a fresh-session idle
 boundary. Delayed records from a revoked binding are discarded, including
 within one launch after `/new` or `/clear`.
@@ -393,8 +443,11 @@ new launch generation. Rebind to the destination's **local** writer and Codex
 home; copied history remains history. Replace the pane/socket integration
 environment with the destination's route. The old hibernated record cannot
 consume destination events. Reject a report routed only by an old name/alias.
-Known duplicate live ownership of a thread is ambiguous and yields unknown
-until resolved, never last-callback-wins. These are the adapter's requirements
+Known duplicate live ownership of a thread fails attribution. Before lifecycle
+has been trusted in the destination's launch generation, reject that claim and
+use diagnosed screen fallback. If it invalidates a currently validated binding
+without known retirement, yield unknown until resolved. Never use
+last-callback-wins. These are the adapter's requirements
 on #1500's move transaction; name lookup, move UI and narrow resumed panes
 remain outside this amendment. A rollout copy alone grants no authority.
 
@@ -452,8 +505,10 @@ and [distinct history/ephemeral fields](https://github.com/openai/codex/blob/rus
 | Screen approval/question prompt (`needs_human`), even with lifecycle idle | Attention wins: `turn: unknown`, `attention: needs_human`, `phase: needs_human`, per §1. Preserve the underlying lifecycle boundary for when attention clears. |
 | Available, synchronized start without a matching end | Working until matching end or observed source loss; ignore hook/screen idle, DONE text and hidden Working chrome. |
 | Available, synchronized matching complete/abort, no attention | Idle despite stale Working chrome; background remains independent. |
-| No binding yet, or old binding retired on confirmed replacement | Screen fallback with `awaiting_first_turn`; no lifecycle claim until SessionStart. |
-| Expected/claimed but validating, lost, unreadable, discontinuous or ambiguous | Unknown with source and reason; hook/screen cannot conceal source loss. |
+| No binding yet, or old binding retired on a known launch/resume change (future: attributed in-TUI replacement confirmation) | Screen fallback with `awaiting_first_turn`; no lifecycle claim until SessionStart. |
+| Binding validation failed before this launch generation held a validated lifecycle binding, including after known launch/resume retirement | Reject the claim; screen fallback with `binding_validation_failed`, its reason and selected source. Screen Working stays working; unclassifiable evidence stays unknown. |
+| Claimed and still validating, or current-generation validated source lost, unreadable, discontinuous or ambiguous without known retirement | Unknown with source and reason; hook/screen cannot conceal source loss. |
+| Validated old binding idle, visible Working, file unchanged, no replacement report | Retain lifecycle idle and binding; publish the disagreement diagnostic. This covers the new-thread false-idle window and stale Working chrome. |
 | Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the proposed policy) | Hook then screen fallback for absent/disabled adapters; the proposed unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
 
 **No silence lease.** The last validated lifecycle boundary holds, however old,
@@ -468,9 +523,12 @@ plus source health and degradation reason. Consumers must not reinterpret age as
 a lease or a second idle/unknown timeout. Reader supervision checks flk's own
 progress, including successful EOF checks, not Codex event frequency. Observed
 source loss yields unknown immediately; an idle composer cannot override it.
-After a claimed source is lost it cannot quietly become unavailable for fallback.
-Confirmed launch/thread replacement is the explicit exception: retire ownership
-and return to awaiting-first-turn fallback as specified above.
+After a validated source is lost it cannot quietly become unavailable for fallback.
+Failed initial binding validation in an untrusted launch generation is the
+bootstrap exception above. Known launch/resume retirement explicitly ends the old
+trust scope and returns the new generation to awaiting-first-turn fallback;
+rejected claims without that retirement cannot hide source loss. Confirmed in-TUI
+replacement remains future work.
 Explicit version/config unavailability is diagnosed at binding, under the pending
 policy above. Rebind again to switch policy/version, rather than reinterpret an
 active binding's cached state.
@@ -487,9 +545,10 @@ or a non-contiguous sequence of turn IDs. Legacy files cannot prove that an
 upstream producer silently omitted a well-formed record; this format limitation
 belongs to the owner decision. **Residual risks:** if the writer remains alive
 but its end record is lost, the last start holds working indefinitely. Publish
-a diagnostic when lifecycle and screen disagree, exposing both observations
-and the active boundary so an operator can request a rebind. Neither the
-diagnostic nor requesting a rebind changes state on its own: rebind must validate
+a diagnostic when lifecycle and screen disagree in either direction, including
+the false-idle new-thread window and lost SessionStart report described above.
+Expose both observations and the active boundary so an operator can request a
+rebind. Neither the diagnostic nor requesting a rebind changes state on its own: rebind must validate
 and reconstruct a trustworthy current boundary before publishing a new decision.
 A resume of a file whose last turn never ended is a second residual risk:
 before SessionStart, screen fallback shows the current prompt as idle when the
@@ -497,9 +556,11 @@ existing detector classifies it idle (or working/unknown from its actual screen
 evidence), rather than inheriting the old unmatched start. Submission remains
 eligible under today's screen/composer gates, so that history cannot deadlock
 bootstrap. On binding, the verified new writer's start establishes working;
-ambiguous attribution remains unknown. Revalidation must not conceal an observed
-gap; resynchronize and require a trustworthy current boundary before publishing
-state.
+if attribution fails before validation in this new launch generation, reject the
+candidate and use diagnosed screen fallback. If ambiguity invalidates a currently
+validated authority without known retirement, yield unknown. Revalidation must
+not conceal an observed gap in that authority; resynchronize and require a
+trustworthy current boundary before publishing state.
 
 Background remains independent (§1). A child process or terminal count cannot
 supply missing turn evidence. Completion with a live child remains idle with
@@ -535,13 +596,21 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
    before and passes after implementation through agent get/list, events and waits.
 2. Long tool call with no records and a live writer yields working after hours
    of supplied-clock advance. Silence after completion yields idle after hours.
-   A claimed but unverified binding yields unknown. Writer exit yields unknown;
+   A claimed binding still validating yields unknown. Failed first binding
+   validation before lifecycle trust in this launch generation rejects the claim
+   and returns to screen:
+   test Working, idle and unclassifiable screens independently, plus submission
+   eligibility with no later SessionStart. After a validated binding, a rejected
+   claim without known retirement yields unknown even if that new claim was never
+   validated; changing binding generations must not erase the current launch's
+   trust. Writer exit yields unknown;
    PID reuse yields unknown; a supervised wedged/dead reader yields unknown;
    replacement or truncation yields unknown. Bounded integration waits must name
    a missing condition rather than hang. Test idle wake, self-compact, guarded
    submit, mail delivery and idle waits on quiet known idle: each remains eligible
    under its existing gates. For source-loss unknown, each follows the table above.
-3. Exercise each reducer case independently, with one expected turn state:
+3. After successful binding validation, exercise each reducer case independently,
+   with one expected turn state:
 
    | Input and prior state | Expected turn |
    | --- | --- |
@@ -580,32 +649,64 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
      as working. Cover completed history and a last turn that never ended,
      including verified copied history; neither supplies a bootstrap idle
      lifecycle boundary or blocks screen-based submission.
-   - Confirmed `/clear` or `/new` during a session: retire the old binding,
-     enter screen fallback, then the next turn's SessionStart binds as working.
-     Delayed old callbacks cannot affect the fallback or new active turn.
-   - A manually entered clear/new without observable replacement confirmation
-     retains the old binding until the next SessionStart atomically replaces it.
-     Assert this observability limitation rather than inventing an early signal.
+   - Known resume after lifecycle trust: explicitly retire the old binding,
+     advance the launch generation and reset trust. If the new SessionStart fails
+     validation, publish `binding_validation_failed` and use screen fallback,
+     not unknown. Test Working, idle and unclassifiable screen evidence; no later
+     SessionStart is required to leave the rejected claim. Old callbacks cannot
+     affect the new generation.
+   - Counter-case: a validated binding followed by a rejected SessionStart claim
+     without a known retirement keeps the same launch-generation trust scope and
+     yields unknown. A binding-generation change alone cannot authorize fallback.
+   - Future model-only contract, with no real producer today: an attributed
+     in-TUI replacement confirmation retires the old binding, enters screen
+     fallback, then the next turn's SessionStart binds as working. Delayed old
+     callbacks cannot affect fallback or the new turn. Track the producer in
+     #1479; do not claim this simulated path is runtime integration evidence.
+   - For each in-TUI `/clear`, `/new`, `/resume` and `/fork` without confirmation,
+     start from an old validated idle binding. Feed a new Working screen while
+     the bound file remains unchanged: retain old lifecycle idle and generation,
+     and publish the diagnostic with both observations and the verified cursor.
+     Deliver the deferred SessionStart and validate the new start: only then
+     retire the old generation and report working for the new binding.
+   - Lose that SessionStart report while the writer remains alive. Advance the
+     supplied clock and repeat successful EOF checks: false idle and the
+     diagnostic persist; no silence-based retirement or guessed rebind occurs.
+     Replay the same observations after a real completion with stale Working
+     chrome: the same binding-retention decision must hold.
    - Fork: imported parent completion precedes the child's owned
      thread_settings_applied delimiter; only the child's subsequent start
-     establishes working. Missing/ambiguous delimiter yields unknown.
+     establishes working. Cover missing and ambiguous delimiters separately in
+     both trust scopes: in an untrusted launch generation (including after known
+     retirement), reject the claim and queued callbacks, publish
+     `binding_validation_failed` with the attribution reason and use screen
+     fallback. Test Working, idle and unclassifiable screens plus submission
+     eligibility without another SessionStart. After authority validated in the
+     current generation, the same failures without known retirement yield unknown;
+     changing the binding generation cannot regain fallback. Imported parent
+     boundaries cannot establish child state in either branch.
 
    Same-name/cwd panes with different thread IDs remain isolated: starting only
    pane A yields working for A and idle for an already completed B. Each claimed
-   but unvalidated SessionStart binding yields unknown. Compaction during an
+   but still-validating SessionStart binding yields unknown. Failed initial
+   validation uses screen fallback when the current launch generation is untrusted,
+   including after known launch/resume retirement. Rejection after current-generation
+   trust without known retirement yields unknown. Compaction during an
    active turn with proven writer/thread/file/cursor continuity stays working;
    unproven continuity yields unknown with
    `codex_compaction_continuity_unproven`. A stale callback while the rebound turn
    runs leaves working. After a move the old pane remains hibernated; the
    destination starts in screen fallback until its own deferred hook binds.
-   Duplicate live writers yield unknown. A mismatched transcript_path/meta pair
-   yields unknown. Another thread's end through fork/revert metadata leaves the
-   current active turn working. Private guardian child completions, including
-   their deferred dispatch, cannot complete the parent turn.
+   Duplicate live writers and a mismatched transcript_path/meta pair fail binding
+   validation: untrusted launch generations use screen fallback; current-generation
+   validated authority without known retirement yields unknown. Another thread's
+   end through fork/revert metadata leaves the current active turn working. Private
+   guardian child completions, including their deferred dispatch, cannot complete
+   the parent turn.
 5. Lifecycle start against hook/screen idle yields working. Lifecycle complete
    against stale Working chrome yields idle. A screen approval prompt against
    lifecycle idle yields `phase: needs_human` with turn unknown; clearing that
-   prompt restores idle from the retained completion. Claimed source loss against
+   prompt restores idle from the retained completion. Validated source loss against
    screen idle yields unknown. Unsupported version with a visible Working screen
    yields working from screen with `unsupported_codex_version`; with unclassifiable
    screen it yields unknown. Resume with tested creation metadata but an untested
