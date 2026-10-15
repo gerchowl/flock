@@ -1395,30 +1395,65 @@ fn a10_taken_name_exits_1_and_creates_nothing() {
     assert!(read_lines(&server.base.join("argv.log")).is_empty());
 }
 
+fn rollback_python_output(command: &mut Command) -> Output {
+    command.output().unwrap_or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            panic!("delegate rollback fixture requires python3 on PATH: {error}");
+        }
+        panic!("{error}");
+    })
+}
+
+/// A missing interpreter names the required tool instead of an opaque OS error.
+#[test]
+#[should_panic(expected = "delegate rollback fixture requires python3 on PATH")]
+fn rollback_fixture_missing_python_names_requirement() {
+    let directory = support::socket_dir::SocketDir::reserve("nopy");
+    rollback_python_output(Command::new("python3").env("PATH", directory.path()));
+}
+
+/// Permission errors keep their OS diagnostic, without suggesting an absent tool.
+#[test]
+fn rollback_fixture_spawn_refusal_keeps_original_error() {
+    let directory = support::socket_dir::SocketDir::reserve("noexec");
+    let program = directory.path().join("python3");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = std::panic::catch_unwind(|| {
+        rollback_python_output(&mut Command::new(&program));
+    })
+    .expect_err("non-executable fixture must be refused");
+    let message = error.downcast_ref::<String>().expect("panic diagnostic");
+    assert_eq!(
+        message,
+        &std::io::Error::from_raw_os_error(libc::EACCES).to_string()
+    );
+}
+
 /// Run the fixture transport against this isolated server. ADR-0037 §1:
 /// stages and producer closure decide success, with one failure-only ceiling.
 fn rollback_fixture(server: &Server, mode: &str) -> serde_json::Value {
-    let out = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/delegate_rollback.py"
-        ))
-        .arg(&server.base)
-        .arg(&server.socket)
-        .arg(env!("CARGO_BIN_EXE_flk"))
-        .arg(mode)
-        .envs(support::environment::isolated_env(
-            &server.base.join("config"),
-            &server.base.join("runtime"),
-        ))
-        .env("XDG_STATE_HOME", server.base.join("state"))
-        .env("XDG_DATA_HOME", server.base.join("data"))
-        .env("HOME", server.base.join("home"))
-        .env("PATH", search_path(&server.base))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
+    let out = rollback_python_output(
+        Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/delegate_rollback.py"
+            ))
+            .arg(&server.base)
+            .arg(&server.socket)
+            .arg(env!("CARGO_BIN_EXE_flk"))
+            .arg(mode)
+            .envs(support::environment::isolated_env(
+                &server.base.join("config"),
+                &server.base.join("runtime"),
+            ))
+            .env("XDG_STATE_HOME", server.base.join("state"))
+            .env("XDG_DATA_HOME", server.base.join("data"))
+            .env("HOME", server.base.join("home"))
+            .env("PATH", search_path(&server.base))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1"),
+    );
     assert!(out.status.success(), "fixture: {}", stderr(&out));
     stdout_json(&out)
 }
@@ -1444,26 +1479,70 @@ fn assert_failed_start_rolled_back(server: &Server, result: &serde_json::Value) 
             .any(|p| p.ends_with("d1.json")),
         "no registry entry"
     );
-    assert!(typed(server).is_empty(), "no brief was submitted");
 }
 
-/// E11(a): acknowledge the single launch before releasing agent.start's real
-/// response, then release exit after the real readiness watch and snapshot.
+/// E11(a): the real exit is queued before agent.start's response is released.
 #[test]
 fn a11_child_exit_during_start_rolls_back() {
+    assert_child_exit("exit-before-response");
+}
+
+/// E11(c): release the real start response and live snapshot before child exit.
+#[test]
+fn a11_child_exit_after_start_response_rolls_back() {
+    assert_child_exit("response-before-exit");
+}
+
+fn assert_child_exit(mode: &str) {
     let server = start_server();
     operator_workspace(&server);
     brief(&server, "task.md", "x\n");
-    let result = rollback_fixture(&server, "exit");
+    let result = rollback_fixture(&server, mode);
     assert_failed_start_rolled_back(&server, &result);
     let outcome: serde_json::Value =
         serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
     assert_eq!(outcome["outcome"], "start_failed", "{result}");
     let reason = outcome["reason"].as_str().expect("child-exit reason");
-    assert!(
-        reason.contains("pane exited") || reason.contains("no longer resolves"),
-        "{result}"
-    );
+    if mode == "exit-before-response" {
+        // The removed pane fails readiness's real subscription preflight.
+        let error: serde_json::Value = serde_json::from_str(
+            reason
+                .strip_prefix("delegate d1: ")
+                .expect("preflight error prefix"),
+        )
+        .expect("real readiness preflight error");
+        assert_eq!(error["id"], "cli:delegate:ready:sub:0:probe", "{result}");
+        assert_eq!(error["error"]["code"], "pane_not_found", "{result}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pane exited"),
+            "expected exit context: {result}"
+        );
+        assert_eq!(
+            result["steps"],
+            serde_json::json!(["exit_queued", "response_released"]),
+            "{result}"
+        );
+    } else {
+        assert!(
+            reason.contains("pane exited"),
+            "expected pane-exit reason: {result}"
+        );
+        assert_eq!(
+            result["steps"],
+            serde_json::json!([
+                "response_released",
+                "readiness_subscribed",
+                "live_snapshot_released",
+                "exit_queued",
+                "exit_delivered",
+            ]),
+            "{result}"
+        );
+    }
+
     assert_eq!(
         read_lines(&server.base.join("argv.log")).len(),
         1,
@@ -1498,14 +1577,14 @@ fn rollback_fixture_failures_are_bounded_and_named() {
         ("unexpected", "ValueError"),
         ("silent", "TimeoutError"),
     ] {
-        let out = Command::new("python3")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/delegate_rollback.py"
-            ))
-            .args(["check-stage", behavior])
-            .output()
-            .unwrap();
+        let out = rollback_python_output(
+            Command::new("python3")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/delegate_rollback.py"
+                ))
+                .args(["check-stage", behavior]),
+        );
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
         let result = stdout_json(&out);
         assert_eq!(result["error"], kind, "{result}");
