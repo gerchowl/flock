@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use super::delegate_timeouts::REQUEST_TIMEOUT;
 
 use super::support::readiness::{read_socket_line, Stages};
 
@@ -27,19 +30,29 @@ const FROZEN_METHODS: [&str; 4] = [
     "workspace.get",
 ];
 
+/// Ordered startup evidence preceding the frozen-server proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// The backend committed the agent, before its reply reaches the CLI.
     StartResponseCaptured,
+    /// The proxy received the readiness subscription, held until SIGSTOP.
     ReadinessRequested,
 }
 
+/// Proxy and child-liveness evidence, consumed by the strict proof machine.
 #[derive(Debug)]
 pub enum Event {
+    /// The startup protocol reached the named phase.
     Phase(Phase),
+    /// The next frozen request arrived, indexed by FROZEN_METHODS.
     Requested(usize),
-    Abandoned(usize),
+    /// Client EOF for a request, with elapsed time since its request arrived.
+    Abandoned(usize, Duration),
+    /// The owned CLI terminated, without reaping or releasing its PID.
     Exited,
+    /// CLI exit was followed by backlog drain and every worker joining.
     Sealed(usize),
+    /// A proxy worker or child observer failed instead of producing evidence.
     Failed(String),
 }
 
@@ -106,6 +119,7 @@ impl ApiProxy {
                         // Read headers in accept order. Worker scheduling must not
                         // reorder the sequence after the CLI abandons a request.
                         let request = line(&mut client, &stop, &stages)?;
+                        let requested_at = Instant::now();
                         let value: serde_json::Value = serde_json::from_str(&request)?;
                         let method = value["method"]
                             .as_str()
@@ -125,7 +139,7 @@ impl ApiProxy {
                             } else {
                                 send(&notice, Event::Requested(index))?;
                             }
-                            Some(index)
+                            Some((index, requested_at))
                         } else {
                             None
                         };
@@ -274,10 +288,10 @@ fn forward(
     stop: &UnixStream,
     notice: &mpsc::Sender<Event>,
     permitted: &Mutex<Option<mpsc::Receiver<()>>>,
-    index: Option<usize>,
+    index: Option<(usize, Instant)>,
     stages: &Stages,
 ) -> io::Result<()> {
-    if index == Some(0) {
+    if matches!(index, Some((0, _))) {
         permitted
             .lock()
             .expect("permission lock")
@@ -288,9 +302,9 @@ fn forward(
     }
     let mut upstream = UnixStream::connect(backend)?;
     writeln!(upstream, "{request}")?;
-    if let Some(index) = index {
+    if let Some((index, requested_at)) = index {
         abandoned(&mut client, &upstream, stop, stages)?;
-        return send(notice, Event::Abandoned(index));
+        return send(notice, Event::Abandoned(index, requested_at.elapsed()));
     }
     let response = line(&mut upstream, stop, stages)?;
     let value: serde_json::Value = serde_json::from_str(&request)?;
@@ -333,8 +347,11 @@ pub fn expect_phase(
 }
 
 /// Require every documented request, client EOF for each, CLI exit and a sealed
-/// backlog. Call after ReadinessRequested and SIGSTOP. EOF/exit notifications
-/// may race across workers, but cannot be lost.
+/// backlog. Every request must remain open for at least the documented poll
+/// cap: EOF alone would accept an immediate-give-up regression. The readiness
+/// subscription has a longer caller budget. There is no success upper bound.
+/// Call after ReadinessRequested and SIGSTOP. EOF/exit notifications may race
+/// across workers, but cannot be lost.
 pub fn prove_abandonment(
     events: &mpsc::Receiver<Event>,
     stages: &Stages,
@@ -346,7 +363,7 @@ pub fn prove_abandonment(
     loop {
         match receive(events, stages)? {
             Event::Requested(index) if index == requested && index < FROZEN_METHODS.len() => requested += 1,
-            Event::Abandoned(index) if index < requested && !abandoned[index] => abandoned[index] = true,
+            Event::Abandoned(index, elapsed) if index < requested && !abandoned[index] && elapsed >= REQUEST_TIMEOUT => abandoned[index] = true,
             Event::Exited if !exited => { exited = true; seal(); }
             Event::Sealed(count) if exited && count == FROZEN_METHODS.len() && requested == count && abandoned.iter().all(|&yes| yes) => return Ok(()),
             event => return Err(invalid(format!("incomplete or unexpected frozen proof: {event:?}; requests={requested}, abandoned={abandoned:?}, exited={exited}"))),
@@ -428,13 +445,13 @@ mod tests {
         // Exit may race the final EOF observer, but sealing follows worker join.
         vec![
             Event::Requested(1),
-            Event::Abandoned(0),
+            Event::Abandoned(0, REQUEST_TIMEOUT),
             Event::Requested(2),
             Event::Requested(3),
-            Event::Abandoned(2),
+            Event::Abandoned(2, REQUEST_TIMEOUT),
             Event::Exited,
-            Event::Abandoned(1),
-            Event::Abandoned(3),
+            Event::Abandoned(1, REQUEST_TIMEOUT),
+            Event::Abandoned(3, REQUEST_TIMEOUT),
             Event::Sealed(4),
         ]
     }
@@ -459,11 +476,29 @@ mod tests {
     }
 
     #[test]
+    fn every_request_must_wait_out_its_cap() {
+        for index in 0..FROZEN_METHODS.len() {
+            let mut events = complete();
+            for event in &mut events {
+                if let Event::Abandoned(observed, elapsed) = event {
+                    if *observed == index {
+                        *elapsed = Duration::ZERO;
+                    }
+                }
+            }
+            assert!(
+                proof(events).is_err(),
+                "request {index} gave up immediately"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_extra_reordered_and_failed_requests_are_rejected() {
         for bad in [
             Event::Requested(4),
             Event::Requested(2),
-            Event::Abandoned(3),
+            Event::Abandoned(3, REQUEST_TIMEOUT),
             Event::Failed("worker died".into()),
             Event::Sealed(0),
         ] {
@@ -472,7 +507,7 @@ mod tests {
             assert!(proof(events).is_err());
         }
         let mut events = complete();
-        events.insert(2, Event::Abandoned(0));
+        events.insert(2, Event::Abandoned(0, REQUEST_TIMEOUT));
         assert!(proof(events).is_err());
     }
 
