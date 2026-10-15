@@ -1,13 +1,13 @@
-Flock #1411: coordinate sccache 0.15.0 Unix socket startup.
-Upstream base: v0.15.0 (c2e4b4c), src/server.rs probe/unlink/bind.
+Flock #1547: coordinate sccache 0.18.0 Unix socket startup (original fix #1411).
+Upstream base: v0.18.0 (01c35e69b97f516c2ebfbdb418b5cd6277bde280).
+Upstream report: https://github.com/mozilla/sccache/issues/2906
 Keep the current endpoint and parallel compilation. Never unlink the lock inode.
-Removal condition: drop when upstream fixes the unlink+bind race.
+Removal condition: drop when an upstream release contains a fix for the unlink+bind race.
 
 diff --git a/src/server.rs b/src/server.rs
-index be49c1d..19e8b9a 100644
 --- a/src/server.rs
 +++ b/src/server.rs
-@@ -489,56 +489,136 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
+@@ -492,56 +492,136 @@
          _ => raw_storage,
      };
  
@@ -56,6 +56,9 @@ index be49c1d..19e8b9a 100644
 -                        .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
 -                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
 -                ))
+-            }
+-        }
+-    })();
 +    // Flock #1411: serialize only Unix startup, never compiler requests.
 +    #[cfg(unix)]
 +    let mut startup_lock = None;
@@ -171,9 +174,7 @@ index be49c1d..19e8b9a 100644
 +                        Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
 +                    )))
 +                }
-             }
--        }
--    })();
++            }
 +        })();
 +    #[cfg(unix)]
 +    drop(startup_lock);
