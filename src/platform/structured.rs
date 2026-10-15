@@ -3,7 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Open the token without following links or blocking on a FIFO, then validate
 /// the opened inode. Checking the path before opening would race replacement.
@@ -131,8 +131,17 @@ pub(crate) fn open_append_file(path: &Path) -> io::Result<File> {
 }
 
 /// Remove a validated Claude transient. Sockets must use the observed cc-socks
-/// namespace, a private canonical parent, and the dead session's exact pid name.
+/// namespace under the temp/runtime roots and the dead session's exact pid name.
+/// Root aliases such as /tmp are resolved; linked namespace/final entries fail.
 pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Result<()> {
+    let mut roots = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+    if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+        roots.push(root.into());
+    }
+    remove_transient_in(path, socket_pid, &roots)
+}
+
+fn remove_transient_in(path: &Path, socket_pid: Option<u32>, roots: &[PathBuf]) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -147,7 +156,7 @@ pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Resu
         } else {
             !meta.is_file()
         })
-        || path.canonicalize()? != path
+        || (socket_pid.is_none() && path.canonicalize()? != path)
     {
         return Err(io::Error::other("unsafe Claude transient type/owner"));
     }
@@ -163,6 +172,29 @@ pub(crate) fn remove_transient(path: &Path, socket_pid: Option<u32>) -> io::Resu
             return Err(io::Error::other("unsafe Claude socket path"));
         }
         ensure_private_dir(parent)?;
+        let canonical = path.canonicalize()?;
+        let root = parent
+            .parent()
+            .ok_or_else(|| io::Error::other("socket root missing"))?
+            .canonicalize()?;
+        if !roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|allowed| root.starts_with(allowed))
+            || canonical
+                != root
+                    .join(
+                        parent
+                            .file_name()
+                            .ok_or_else(|| io::Error::other("socket namespace missing"))?,
+                    )
+                    .join(
+                        path.file_name()
+                            .ok_or_else(|| io::Error::other("socket name missing"))?,
+                    )
+        {
+            return Err(io::Error::other("Claude socket outside allowed roots"));
+        }
     }
     fs::remove_file(path)
 }
@@ -240,5 +272,62 @@ mod tests {
             result.1.expect_err("non-regular registry").kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn socket_cleanup_resolves_root_aliases_but_refuses_escape_and_namespace_links() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut entropy = [0u8; 6];
+        getrandom::fill(&mut entropy).expect("fixture entropy");
+        let suffix: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let root = Root(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("temp root")
+                .join(suffix),
+        );
+        create_private_dir(&root.0).expect("short owned root");
+        let real = root.0.join("real");
+        create_private_dir(&real).expect("real root");
+        let sockets = real.join("cc-socks");
+        create_private_dir(&sockets).expect("socket namespace");
+        let alias = root.0.join("alias");
+        symlink(&real, &alias).expect("root alias like temporary directory alias");
+        let socket = sockets.join("77.sock");
+        let listener = UnixListener::bind(&socket).expect("short fixture socket");
+        assert!(remove_transient_in(
+            &alias.join("cc-socks/77.sock"),
+            Some(77),
+            &[root.0.join("outside")]
+        )
+        .is_err());
+        assert!(socket.exists(), "outside allowed root preserved");
+        remove_transient_in(
+            &alias.join("cc-socks/77.sock"),
+            Some(77),
+            std::slice::from_ref(&alias),
+        )
+        .expect("root alias accepted");
+        assert!(!socket.exists());
+        drop(listener);
+        let outside = root.0.join("outside");
+        create_private_dir(&outside).expect("outside namespace");
+        fs::remove_dir(&sockets).expect("remove empty namespace");
+        symlink(&outside, &sockets).expect("redirected namespace");
+        let listener = UnixListener::bind(outside.join("77.sock")).expect("outside socket");
+        assert!(remove_transient_in(
+            &alias.join("cc-socks/77.sock"),
+            Some(77),
+            std::slice::from_ref(&alias)
+        )
+        .is_err());
+        assert!(outside.join("77.sock").exists());
+        drop(listener);
     }
 }

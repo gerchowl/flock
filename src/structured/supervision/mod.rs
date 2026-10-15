@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TICK: Duration = Duration::from_millis(20);
 const SNAPSHOT: Duration = Duration::from_millis(100);
@@ -73,11 +73,30 @@ pub struct ExitReport {
     pub cleanup: io::Result<()>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Quarantine {
+    at: u64,
+    reason: String,
+}
+impl Quarantine {
+    fn new(reason: String) -> io::Result<Self> {
+        Ok(Self {
+            at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_secs(),
+            reason,
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Owner {
     owner: ProcessIdentity,
     supervisor: ProcessIdentity,
     uncertain: bool,
+    #[serde(default)]
+    quarantine: Option<Quarantine>,
     profile: Option<PathBuf>,
     tree: Vec<ProcessIdentity>,
 }
@@ -126,6 +145,19 @@ impl Owner {
             }
         }
     }
+    fn refresh(&mut self, dir: &Path) -> io::Result<()> {
+        let before = self.tree.clone();
+        self.snapshot();
+        if self.tree != before {
+            self.write(dir)?;
+        }
+        Ok(())
+    }
+    fn snapshot_and_signal(&mut self, dir: &Path, signal: Signal) -> io::Result<()> {
+        let result = self.refresh(dir);
+        self.signal(signal);
+        result
+    }
     fn has_living(&self) -> bool {
         self.tree.iter().any(|identity| identity.alive())
     }
@@ -150,6 +182,7 @@ pub fn prepare_session_files(state: &Path) -> io::Result<SessionConfigDir> {
         owner,
         supervisor: owner,
         uncertain: false,
+        quarantine: None,
         profile: None,
         tree: vec![owner],
     }
@@ -181,27 +214,21 @@ pub fn supervise(
     finish_io: impl FnOnce() -> io::Result<()>,
 ) -> ExitReport {
     files.retain();
-    let (root, supervisor) = match ProcessIdentity::capture(child.id()).and_then(|root| {
-        ProcessIdentity::capture(std::process::id()).map(|supervisor| (root, supervisor))
-    }) {
-        Ok(identities) => identities,
-        Err(error) => {
-            return ExitReport {
-                status: child.try_wait().ok().flatten(),
-                stop_requested: stop.requested(),
-                cleanup: Err(error),
+    // Bind and persist immediately, before the first process-tree enumeration.
+    let (mut owner, mut failure) =
+        match bind_child(&mut child, &files, profile, &stop, ProcessIdentity::capture) {
+            Ok(bound) => bound,
+            Err(error) => {
+                return ExitReport {
+                    status: reap_owned(&mut child, &stop).ok(),
+                    stop_requested: stop.requested(),
+                    cleanup: Err(error),
+                }
             }
-        }
-    };
-    let mut owner = Owner {
-        owner: root,
-        supervisor,
-        uncertain: false,
-        profile: Some(profile),
-        tree: vec![root],
-    };
-    owner.snapshot();
-    let mut failure = owner.write(files.path()).err();
+        };
+    if let Err(error) = owner.refresh(files.path()) {
+        failure.get_or_insert(error);
+    }
     let mut status = None;
     let mut close = Some(close_stdin);
     let mut phase = 0;
@@ -209,8 +236,7 @@ pub fn supervise(
     let mut snapshot = Instant::now();
     loop {
         if snapshot.elapsed() >= SNAPSHOT {
-            owner.snapshot();
-            if let Err(error) = owner.write(files.path()) {
+            if let Err(error) = owner.refresh(files.path()) {
                 failure.get_or_insert(error);
             }
             snapshot = Instant::now();
@@ -245,20 +271,16 @@ pub fn supervise(
             deadline = Instant::now() + EOF_GRACE;
         }
         if phase == 1 && Instant::now() >= deadline {
-            owner.snapshot();
-            if let Err(error) = owner.write(files.path()) {
+            if let Err(error) = owner.snapshot_and_signal(files.path(), Signal::Terminate) {
                 failure.get_or_insert(error);
             }
-            owner.signal(Signal::Terminate);
             phase = 2;
             deadline = Instant::now() + TERM_GRACE;
         }
         if phase == 2 && Instant::now() >= deadline {
-            owner.snapshot();
-            if let Err(error) = owner.write(files.path()) {
+            if let Err(error) = owner.snapshot_and_signal(files.path(), Signal::Kill) {
                 failure.get_or_insert(error);
             }
-            owner.signal(Signal::Kill);
             phase = 3;
             deadline = Instant::now() + KILL_GRACE;
         }
@@ -278,6 +300,49 @@ pub fn supervise(
             }
         }
         std::thread::sleep(TICK);
+    }
+}
+
+fn bind_child(
+    child: &mut Child,
+    files: &SessionConfigDir,
+    profile: PathBuf,
+    stop: &StopRequest,
+    capture: impl FnOnce(u32) -> io::Result<ProcessIdentity>,
+) -> io::Result<(Owner, Option<io::Error>)> {
+    let mut owner = Owner::read(files.path())?;
+    match capture(child.id()) {
+        Ok(root) => {
+            owner.owner = root;
+            owner.supervisor = ProcessIdentity::capture(std::process::id())?;
+            owner.uncertain = false;
+            owner.profile = Some(profile);
+            owner.tree = vec![root];
+        }
+        Err(error) => {
+            // Unknown descendants prevent cleanup even after authoritative reaping.
+            let status = reap_owned(child, stop)?;
+            let reason = format!(
+                "structured_child_identity_unavailable: {error}; owned child reaped: {status}"
+            );
+            owner.quarantine = Some(Quarantine::new(reason.clone())?);
+            owner.write(files.path())?;
+            return Err(io::Error::other(reason));
+        }
+    }
+    let failure = owner.write(files.path()).err();
+    Ok((owner, failure))
+}
+
+fn reap_owned(child: &mut Child, stop: &StopRequest) -> io::Result<ExitStatus> {
+    stop.request();
+    // The unreaped Child owns its pid; kill/wait cannot target a reused pid.
+    match child.try_wait()? {
+        Some(status) => Ok(status),
+        None => {
+            child.kill()?;
+            child.wait()
+        }
     }
 }
 
@@ -303,22 +368,34 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
     let path = profile
         .join("sessions")
         .join(format!("{}.json", owner.owner.pid));
-    let mut bytes = Vec::new();
-    match private_fs::open_regular_file(&path) {
+    let sessions = path
+        .parent()
+        .ok_or_else(|| io::Error::other("registry parent missing"))?;
+    match sessions.canonicalize() {
+        Ok(canonical) if canonical == sessions => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        _ => return Err(io::Error::other("redirected Claude registry directory")),
+    }
+    let registry: Option<serde_json::Value> = match private_fs::open_regular_file(&path) {
         Ok(file) => {
             if path.canonicalize()? != path {
                 return Err(io::Error::other("redirected Claude registry"));
             }
+            let mut bytes = Vec::new();
             file.take(65_537).read_to_end(&mut bytes)?;
+            if bytes.len() > 65_536 {
+                return Err(io::Error::other("oversize Claude registry"));
+            }
+            Some(serde_json::from_slice(&bytes)?)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    if bytes.len() > 65_536 {
-        return Err(io::Error::other("oversize Claude registry"));
-    }
-    let registry: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if let Some(socket) = registry.get("messagingSocketPath").filter(|v| !v.is_null()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(socket) = registry
+        .as_ref()
+        .and_then(|registry| registry.get("messagingSocketPath"))
+        .filter(|v| !v.is_null())
+    {
         let socket = socket
             .as_str()
             .ok_or_else(|| io::Error::other("invalid socket path"))?;
@@ -326,28 +403,78 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
             private_fs::remove_transient(Path::new(socket), Some(owner.owner.pid))?;
         }
     }
+    for entry in fs::read_dir(sessions)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(hash) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&format!("{}.", owner.owner.pid)))
+            .and_then(|name| name.strip_suffix(".key"))
+        else {
+            continue;
+        };
+        if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            private_fs::remove_transient(&entry.path(), None)?;
+        }
+    }
     private_fs::remove_transient(&path, None)
 }
 
-/// Startup sweep on a worker: only dead, known supervisors are eligible. Live supervisors
-/// are untouched. Uncertain/malformed records fail explicitly and retain files.
-/// Recorded descendants are killed by matching birth identity before deletion.
-/// The state root must exist; aliases to that root are resolved, while linked
-/// namespace ancestors are refused before cleanup.
-pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
+/// Outcome for one contained session directory; failures never abort other entries.
+#[derive(Debug)]
+pub struct SweepEntry {
+    /// Absolute session directory inspected.
+    pub directory: PathBuf,
+    /// Why it was preserved, quarantined or removed.
+    pub outcome: SweepOutcome,
+}
+
+/// Recovery facts; a quarantine never grants permission to signal or delete.
+#[derive(Debug)]
+pub enum SweepOutcome {
+    /// The owning supervisor still holds the session.
+    Live,
+    /// Known descendants and transients were confirmed gone and files removed.
+    Removed,
+    /// Stable quarantine across restarts; inspect before removing the dir by hand.
+    Quarantined {
+        /// First quarantine time, in Unix seconds.
+        at: u64,
+        /// Original reason, preserved without retrying recovery.
+        reason: String,
+    },
+    /// Unsafe/malformed entry or cleanup failure; files retained for inspection.
+    Retained(String),
+}
+
+/// Sweep on a worker, returning an outcome for every session. Only namespace-level
+/// failures abort the scan. Uncertain spawns are durably quarantined, never reaped
+/// or retried; inspect their files/processes, then remove the directory by hand.
+/// Live supervisors are preserved. Confirmed identities precede all other reaping.
+/// Root aliases resolve; linked structured namespace ancestors remain refused.
+pub fn sweep_stale_sessions(state: &Path) -> io::Result<Vec<SweepEntry>> {
     let parent = state.canonicalize()?.join("structured/sessions");
     let entries = match fs::read_dir(&parent) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     if parent.canonicalize()? != parent {
         return Err(io::Error::other("redirected structured namespace"));
     }
     private_fs::ensure_private_dir(&parent)?;
-    let mut removed = 0;
+    let mut outcomes = Vec::new();
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                outcomes.push(SweepEntry {
+                    directory: parent.clone(),
+                    outcome: SweepOutcome::Retained(format!("directory entry unreadable: {error}")),
+                });
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(suffix) = name.to_str().and_then(|s| s.strip_prefix("flk-claude-")) else {
             continue;
@@ -355,33 +482,51 @@ pub fn sweep_stale_sessions(state: &Path) -> io::Result<usize> {
         if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
-        private_fs::ensure_private_dir(&entry.path())?;
-        let mut owner = Owner::read(&entry.path())?;
-        if owner.supervisor.alive() {
-            continue;
-        }
-        if owner.uncertain {
-            return Err(io::Error::other("uncertain session spawn retained"));
-        }
-        // Surviving recorded parents can have children newer than the saved tree.
-        owner.snapshot();
-        owner.write(&entry.path())?;
-        owner.signal(Signal::Kill);
-        let deadline = Instant::now() + KILL_GRACE;
-        while owner.has_living() {
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "stale descendants survived",
-                ));
-            }
-            std::thread::sleep(TICK);
-        }
-        cleanup_transient(&owner, &entry.path())?;
-        fs::remove_dir_all(entry.path())?;
-        removed += 1;
+        let directory = entry.path();
+        let outcome = sweep_entry(&directory)
+            .unwrap_or_else(|error| SweepOutcome::Retained(error.to_string()));
+        outcomes.push(SweepEntry { directory, outcome });
     }
-    Ok(removed)
+    Ok(outcomes)
+}
+
+fn sweep_entry(directory: &Path) -> io::Result<SweepOutcome> {
+    private_fs::ensure_private_dir(directory)?;
+    let mut owner = Owner::read(directory)?;
+    if let Some(quarantine) = &owner.quarantine {
+        return Ok(SweepOutcome::Quarantined {
+            at: quarantine.at,
+            reason: quarantine.reason.clone(),
+        });
+    }
+    if owner.supervisor.alive() {
+        return Ok(SweepOutcome::Live);
+    }
+    if owner.uncertain {
+        let quarantine =
+            Quarantine::new("uncertain spawn: child birth identity was not persisted".into())?;
+        let outcome = SweepOutcome::Quarantined {
+            at: quarantine.at,
+            reason: quarantine.reason.clone(),
+        };
+        owner.quarantine = Some(quarantine);
+        owner.write(directory)?;
+        return Ok(outcome);
+    }
+    owner.snapshot_and_signal(directory, Signal::Kill)?;
+    let deadline = Instant::now() + KILL_GRACE;
+    while owner.has_living() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stale descendants survived",
+            ));
+        }
+        std::thread::sleep(TICK);
+    }
+    cleanup_transient(&owner, directory)?;
+    fs::remove_dir_all(directory)?;
+    Ok(SweepOutcome::Removed)
 }
 
 #[cfg(test)]
