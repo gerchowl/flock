@@ -18,6 +18,10 @@
 - Proposed amendment (2026-10-15, #1574): §1b specifies detection-sample
   receipts, output cursors and legacy revision deprecation. Owner decision
   required; this subsection is not accepted or implemented.
+- Amendment (2026-10-16, #1052): §5a records the architect's decision that
+  input `Ok` means completed PTY write. Error/deadline/capability details are
+  proposed for review, with **Owner decision required** items named below.
+  No implementation is claimed by this amendment.
 - Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
@@ -1164,6 +1168,208 @@ Rules:
 - **Polling is unsupported, not forbidden.** `agent get` and `pane read` stay,
   but the docs, skills and briefs stop teaching loops over them (§9).
 
+### 5a. Completed PTY write acknowledgements (#1052)
+
+**Part of #1052. Design first; implementation follows approval.** The architect
+accepted the completed-write contract on 2026-10-16. The details explicitly
+marked **Owner decision required** below are proposals, not implemented policy.
+This section composes with injection priority (§5), guarded-submit write
+receipts (#1463, #1517, #1522), and ADR-0037 §1's condition-wait rules.
+
+#### Decision and scope
+
+A successful input `Ok` means **every encoded byte of that request reached the
+PTY master through successful write syscalls**. It does not mean the child read
+those bytes, a key was acted on, a command ran, or an agent accepted a turn.
+Queue admission, an actor wake, and a healthy writer flag are insufficient.
+Existing guarded submission still requires its separate harness evidence.
+
+Apply this boundary to `pane.send_input`, `pane.send_keys`, and any successful
+input acknowledgement from `pane.send_text`, non-submit `agent.send`, and the
+raw type/Enter steps used by `pane run`. Existing paste/guarded result envelopes
+retain their meanings; none may claim successful writing before its receipt.
+Internal admission may return an explicitly queued ticket, never a completed
+write acknowledgement. An admitted lease-held raw request remains pending,
+including paths that currently return `held_by_injection` early; its payload
+must not survive a terminal no-write response. Terminal-generated replies are
+not caller input.
+
+Reject **queue acceptance followed by a failure event**: it leaves each caller
+to discover that earlier success was false. No new public or persisted event
+kind is required for this contract. Existing guarded-submit events remain.
+
+#### One request, one cancellable write owner
+
+Retain request identity, response ownership, absolute deadline, ordered encoded
+payloads, and a cumulative successful-write byte count from admission through
+lease holding, backlog, `data_rx`, pending writes, and the final syscall.
+Count bytes after text/key/bracketed-paste encoding, not Unicode characters or
+key names; multiple payloads share one request's count and terminal outcome.
+Use a unique internal admission ticket: JSON request IDs can repeat across
+connections and are not a global ownership key.
+Keep existing FIFO and operator/injection priority. Do not merge payloads in a
+way that loses cancellation, byte accounting, or originating request identity.
+
+Extend the existing writer-owned receipt/cancellation gate. A nonblocking write,
+its byte-count update, completion, and cancellation serialize through that gate.
+No actor dequeue or syscall may bypass it. The request resolves exactly once;
+response ownership may not fall between queue and worker. Keep admission and
+pending-reply retention bounded, including requests outside the actor channel;
+never create a blocking worker/thread per input request.
+
+At success, the receipt contains the final-write timestamp and total byte count.
+A later writer failure cannot revoke a completed write. A partially written or
+untouched request is pending and must not become successful when its channel is
+closed, its queue is discarded, or its producer disappears.
+
+#### Deadline, lease and cancellation
+
+The server derives one monotonic deadline at request admission. Queue, lease,
+backlog and write time all consume that same budget; moving a request never
+restarts it. Waiting is event-driven and leaves the app loop responsive.
+
+- If expiry/cancellation wins before the first write, remove **the payload**
+  from every queue/lease/backlog and retire its ticket before replying. Report
+  `bytes_written: 0` and guarantee it can never be written later, including
+  after a lease releases, the actor drains `data_rx`, or the writer rearms.
+- A channel that cannot physically remove an entry may retain only an inert,
+  cancelled ticket: no live bytes and no authority to write. Keeping bytes
+  queued and merely promising to skip them eventually does not meet removal.
+- If some bytes reached the PTY, cancel under the same writer gate and discard
+  the remainder before replying. Never roll back or silently replay the prefix.
+- Check expiry before each syscall and compare final completion time with the
+  deadline. Completion by the deadline succeeds; a late final syscall is an
+  error with the actual count, which can equal the total. This late-completion
+  case does not justify another syscall or a false zero-byte guarantee.
+- Observed caller disconnect, pane death/restart and handoff invalidate pending tickets:
+  cancel them under the same gate, release payloads/quotas, and prevent an old
+  owner from writing after the transition. Handoff must resolve or cancel each
+  pending request before releasing ownership, not migrate an uncorrelated write.
+
+**Owner decision required — deadline interface and bounds.** Propose optional
+`write_timeout_ms` on the affected raw input requests, default `10000`, valid
+`1..=30000`. An omitted field uses the bounded default. Invalid values are
+refused before admission. The CLI's bounded response wait must outlast this
+server deadline and its cancellation reply; propose a `1000` ms reply margin.
+A client timeout alone is not proof of cancellation. Propose at most 32
+outstanding input requests per pane and 1024 per server, counting held, queued
+and writing requests together, alongside existing actor admission limits;
+preserve any existing payload-size restrictions.
+Admission at either limit returns zero-byte cancellation before retaining input.
+Approve these deadline, reply-margin and admission limits before implementation.
+
+#### Typed results and retry policy
+
+**Owner decision required — error names, details and exit mappings.** Reuse
+existing numeric CLI exits, but propose two precise server error codes and one
+client-side uncertainty code. Current `pane_send_failed` and `write_failed`
+have retry class `maybe`; reclassifying them globally would change unrelated
+callers. They cannot stand in for the new guarantees. Existing target, key and
+policy errors remain unchanged when refused before admission.
+
+| Result/code | Required evidence | Retry rule | CLI exit |
+| --- | --- | --- | --- |
+| Existing `Ok` | Final successful write by deadline; all encoded bytes counted | Do not resend | `SUCCESS` (0) |
+| New `input_write_cancelled` | `bytes_written = 0`; payload removed and ticket irrevocably cancelled | `later`: safe to retry the full request once the reported condition clears | `REFUSED` (10) |
+| New `input_write_failed` | Exact positive `bytes_written`; remainder discarded; includes a fully written request that missed its deadline | `after_inspecting`: never automatically retry the full request | `UNCONFIRMED` (8) |
+| New local `input_write_unknown` | Connection/server loss without an authoritative final receipt | `after_inspecting`: count/effect unknown, never assume zero or automatically resend | `UNCONFIRMED` (8) |
+| Existing `invalid_params` | Invalid write deadline, no admission/effect | `never`; correct the call | Existing `FAILURE` (1); CLI argument validation uses `USAGE` (2) |
+| Existing `server_version_gap` | Required write contract absent; no payload sent | `after_handoff`; upgrade the other endpoint | `PROTOCOL_GAP` (78) |
+
+Register the proposed codes in `src/api/error_code.rs`. Give their exits explicit
+registry mappings so both guarded and ordinary send helpers, JSON output and
+MCP agree; a send-like-only override is insufficient for ordinary key sends.
+Do not use generic `TIMEOUT` (124, retry `yes`) for uncertain or partial input.
+
+Propose additive optional `error.data.input_write` with `bytes_written`,
+`bytes_total`, `reason` and `remainder_discarded`. Counts are exact nonnegative
+encoded-byte integers for server cancellation/write failures, and
+`remainder_discarded` is true only after cancellation has completed. Reasons
+include `deadline`, `writer_broken`, `pane_gone`, `owner_changed` and
+`admission_limit`; the code
+and fields, not prose, decide retry safety. A local unknown-outcome error uses
+null counts and makes no no-ghost-write claim. This is a proposed extension to
+`ErrorBody`, which currently contains only `code` and `message`.
+
+A partial prefix may include an escape sequence, a multibyte character, or a
+submitted key. The caller must inspect the pane and re-establish its input
+state before issuing a new operation. Sending the nominal suffix is not a
+universal safe retry: it may target a different parser/composer state. Automatic
+suffix or full-request retries are unsupported. A lost success response is
+also uncertain even if the server actually completed all bytes; this design
+does not add idempotency or exactly-once execution.
+
+If the writer breaks while requests remain in `data_rx` or pending writes,
+each incomplete request gets its own typed zero/positive-byte failure. Clearing
+a queue or dropping a completion sender must resolve the saved response owner,
+not log and forget it. Already completed requests retain their honest success.
+
+#### Wire compatibility and rollout
+
+**Owner decision required — write method names, capability and additive schema.** Propose
+`ServerCapabilities.pane_input_write_ack`, absent/default false on older
+servers. Its true value attests this entire cancellation/count/deadline
+contract, not merely that some guarded writes have receipts. Also propose
+`pane.write_text`, `pane.write_keys` and `pane.write_input`, sharing the input
+semantics/parameters of the corresponding `pane.send_*` methods plus the write
+deadline. Existing names remain available and get the stronger acknowledgement
+on a new server. New method tags bind the stronger contract to the operation
+that performs the write, not just a separate preflight observation.
+
+An older client may keep sending the same JSON request and accepting the same
+`Ok` envelope. A new server provides stronger success evidence with the bounded
+default; an old client treating `Ok` as accepted remains correct. Error fields
+are additive: tolerant clients ignore unfamiliar details; an older CLI treats
+an unknown error code as failure (1), never success. That older client cannot
+claim exact counts or the new retry classification. Raw JSON consumers that
+reject unknown error fields need updating; do not promise compatibility with
+strict third-party schemas. An older client with a shorter socket timeout can
+lose the reply while bytes are being written; it must inspect rather than
+blindly retry. Stronger success does not make transport-timeout retries safe.
+
+A new client requiring completed-write guarantees checks the capability and
+uses only the new write method tags. If the capability is absent it returns
+`server_version_gap` / 78 before issuing a write request. An old server also
+rejects the new method tag before writing, so a stale capability observation
+across restart/handoff cannot produce an old queue-level `Ok`; normalize that
+specific unknown-method refusal to `server_version_gap`. The current API reads
+one initial request per connection, so a separate ping is not a connection-bound
+attestation. A cached capability by socket pathname is not sufficient by itself.
+
+Do not fall back to a legacy send method or put a mandatory-looking field on it:
+an older server can ignore unknown parameter fields and still enqueue input.
+After any transport failure following dispatch, report unknown effect, not safe
+cancellation. Disable generic transport retries for these state-changing calls.
+
+This proposes NDJSON request/capability/error additions with unchanged success
+shapes, not a new bincode input message. Do not change protocol constants in
+this design PR. If implementation changes binary wire shapes, apply the normal
+latest-release version comparison and compatibility/golden-fixture rules; do
+not allocate a second unreleased bump or conflate it with mesh VERSION.
+
+#### Acceptance cases for the implementation PR
+
+| Controlled case | Required observation; the old behaviour must fail |
+| --- | --- |
+| #1052 reproduction | Sender gets queue-level `Ok` with 25 bytes still in `data_rx`; close a native socket peer before actor drain. Current code clears all bytes and only logs. New code returns typed cancellation, zero written, and no `Ok`. |
+| Healthy and empty writes | No success while bytes remain queued; exactly one success after final write. An empty encoded request resolves as a zero-byte completed operation without a syscall. |
+| Lease/backlog expiry | Hold the actual lease or consumer, enqueue, expire the request through the deadline path, receive zero-byte cancellation, then release and drain. No cancelled bytes arrive; later live input still arrives in FIFO order. |
+| Partial failure | Fill/gate a real nonblocking socket to allow an observed prefix, then break it. Error count equals the bytes observed; no suffix is written after error or recovery. No product test write hook. |
+| Deadline after prefix/final syscall | Control write/cancellation order. Check exact positive count, including the late-full-write case, one terminal response, and no further writes. |
+| Many queued requests at break | Mix queued and pending requests; each incomplete request answers once with its own count. A completed request stays successful, and later refused input does not hang. |
+| Competing completion/cancel | Exercise both gate orders. Cancellation before any byte proves permanent removal; completion wins only with timely final-write evidence. |
+| Caller/pane/owner loss | Disconnect caller, close/restart pane and hand off with requests outstanding. Retire response/ticket ownership and payloads; no stale-owner or lease-release ghost writes. |
+| Live silent producer | Hold a live writer without progress; the existing request deadline produces typed cancellation/failure, not success or an unbounded wait (ADR-0037 §1). |
+| API/CLI compatibility | Start at real request dispatch, not a prefilled receipt. Check success/failure codes, byte fields and exits; new client refuses an old server before PTY input (also after a stale capability/restart race), old client reads new-server `Ok`, typed errors are not retried, lost replies become unknown. |
+
+The first row was demonstrated on dev `5c315be5`: two native actor fixtures ran,
+with the untracked loss assertion failing and the tracked-receipt control
+passing, nextest exit 100 (0.032 s total). The replayable fixture and final log are
+referenced by the #1052 round-1 receipt. Other rows are required red/green controls
+for the implementation PR, not claims of completed verification. Fixtures use
+real channels/sockets, explicit gates and bounded receives, with no sleeps,
+product test hooks, widened windows or application side effects on a live server.
+
 ### 6. Settle, coalesce and wake thresholds are configuration with measured defaults
 
 | Key | Default | Why |
@@ -1425,7 +1631,8 @@ in ADR-0030 §8.
 Decided by the operator on 2026-10-11 (PR #1006): items 1–6 below were
 accepted as recommended. The rejected alternative is kept for the record.
 Items 7–9 are new §1b proposals and require a separate owner decision; the
-earlier acceptance does not cover them.
+earlier acceptance does not cover them. Item 10 records the #1052 architect
+decision; item 11 lists its proposed details requiring owner approval.
 
 1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
@@ -1470,3 +1677,13 @@ earlier acceptance does not cover them.
    with `unsupported_legacy_revision` / `PROTOCOL_GAP`. Approve that named
    behavior change with a release note; removal requires separate major-wire
    approval. Give only the new output cursor a parser-progress writer.
+
+10. **Input acknowledgement (§5a, #1052).** Decided by the architect on
+    2026-10-16: `Ok` means completed PTY write using writer-owned receipts.
+    Deadline expiry before any write removes the input permanently; partial
+    failures disclose the byte count and never write the remainder. Rejected:
+    queue acceptance followed by a failure event that callers must reconcile.
+11. **Write-ack details (§5a). Owner decision required.** Approve the proposed
+    deadline field/default/range and client reply margin, pending-request bounds,
+    error codes/details/CLI exit mappings, write method names, and capability/compatibility rollout.
+    Core acceptance in item 10 does not approve these proposed schema details.
