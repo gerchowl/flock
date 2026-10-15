@@ -87,6 +87,11 @@ test-group = 'serial-pty'
 retries = 2
 
 [[profile.default.overrides]]
+# #1490 proves the finite frozen-readiness request sequence and client EOF.
+filter = 'binary(=delegate_r4) & test(=a28_a_frozen_server_cannot_hold_start_in_readiness)'
+retries = 0
+
+[[profile.default.overrides]]
 # The remaining integration binaries also spawn the real `flock` process; let
 # them run in parallel but retry to ride out timing hiccups under CI load.
 filter = 'kind(test)'
