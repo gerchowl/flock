@@ -229,14 +229,7 @@ impl App {
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
             Err(error) => {
-                let include_shape_hint = match &params.to {
-                    MessageTarget::Pane { pane: target }
-                    | MessageTarget::Agent { agent: target } => {
-                        !crate::terminal::AgentId::is_well_formed(target)
-                    }
-                    MessageTarget::RepoPane { .. } => true,
-                };
-                return error.encode(id, include_shape_hint);
+                return error.encode(id, !params.to.is_well_formed_agent_id());
             }
         };
         let (to_ws_idx, to_pane_id) = match resolved {

@@ -1471,6 +1471,22 @@ pub(crate) const MESSAGE_TARGET_EXPECTED: &str =
      or a tagged pane, repo_pane or agent object";
 
 impl MessageTarget {
+    /// Whether an unscoped address has a well-formed agent id (ADR-0029 §5).
+    ///
+    /// Both `Pane` and `Agent` fields can contain an agent id. `RepoPane` is
+    /// always repo-scoped, even when its pane text looks like an agent id.
+    /// This checks format only, not existence or routing; server and MCP use
+    /// it to avoid suggesting a new shape for an unknown but valid id.
+    /// Format and length limits come from [`crate::terminal::AgentId::is_well_formed`].
+    pub(crate) fn is_well_formed_agent_id(&self) -> bool {
+        match self {
+            Self::Pane { pane: target } | Self::Agent { agent: target } => {
+                crate::terminal::AgentId::is_well_formed(target)
+            }
+            Self::RepoPane { .. } => false,
+        }
+    }
+
     /// Accepted argument forms for CLI/socket/MCP target refusals.
     pub(crate) fn expected_shapes() -> serde_json::Value {
         serde_json::json!([
@@ -5065,6 +5081,37 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_target_agent_id_check_accepts_only_unscoped_well_formed_ids() {
+        let oversized = format!("agent_atlas_{}", "a".repeat(200));
+        for (raw, expected) in [
+            ("agent_atlas_123abc", true),
+            ("agent_atlas_ABC-123", true),
+            ("", false),
+            ("agent_", false),
+            ("reviewer", false),
+            ("w3:p2", false),
+            ("term_fixture", false),
+            ("agent_atlas_1\n", false),
+            ("agent_atlas_1 value", false),
+            ("agent_atlas_é", false),
+            ("agent_atlas_/1", false),
+            (oversized.as_str(), false),
+        ] {
+            for target in [
+                MessageTarget::Pane { pane: raw.into() },
+                MessageTarget::Agent { agent: raw.into() },
+            ] {
+                assert_eq!(target.is_well_formed_agent_id(), expected, "{target:?}");
+            }
+            let scoped = MessageTarget::RepoPane {
+                repo: "fixture-repo".into(),
+                pane: raw.into(),
+            };
+            assert!(!scoped.is_well_formed_agent_id(), "{scoped:?}");
+        }
+    }
 
     #[test]
     fn request_round_trips_for_pane_read() {
