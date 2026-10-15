@@ -7,6 +7,10 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Live handoff
+
+`server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
+
 ## Mesh edge enrollment
 
 `mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
@@ -916,6 +920,21 @@ Errors look like this:
   }
 }
 ```
+
+Structured failure details use `error.data`, for example:
+
+```json
+{
+  "id": "handoff_1",
+  "error": {
+    "code": "handoff_failed",
+    "message": "Connection reset by peer",
+    "data": { "kind": "connection_reset" }
+  }
+}
+```
+
+The CLI JSON envelope preserves `data` and adds `retry` and `exit` alongside it.
 
 ## Protocol stability
 

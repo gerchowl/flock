@@ -106,11 +106,13 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
       - name: Restore cargo cache
         if: steps.plan.outputs.should_publish == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-bin: false
 
       - name: Run checks
@@ -163,6 +165,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
       - name: Prefer official Ubuntu mirrors over Azure
         if: runner.os == 'Linux'
@@ -191,8 +194,9 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=$GITHUB_WORKSPACE/scripts/zig-cross/ar" >> $GITHUB_ENV
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           key: preview-${{ matrix.target }}
 
       - name: Remove Zig caches

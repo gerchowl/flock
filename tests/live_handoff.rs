@@ -1795,6 +1795,10 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         failed.get("error").is_some(),
         "bad protocol handoff should fail: {failed}"
     );
+    assert_eq!(
+        failed["error"]["data"]["kind"], "import_refused",
+        "{failed}"
+    );
     // #600: the exporter must surface WHY the import refused, not an opaque
     // "handoff stream closed while reading line". Both sides are post-fix in
     // this test, so the importer's `error: <reason>` round-trips into
@@ -1947,6 +1951,12 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         );
     }
     if failure_point == "stale_generation" {
+        assert_eq!(failed["error"]["code"], "handoff_failed", "{failed}");
+        assert_eq!(
+            failed["error"]["data"]["kind"], "import_refused",
+            "{failed}"
+        );
+        assert!(failed.get("result").is_none(), "{failed}");
         assert!(
             failed["error"]["message"]
                 .as_str()
@@ -2473,6 +2483,15 @@ fn live_handoff_carries_more_panes_than_one_fd_batch() {
 
 #[test]
 fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() {
+    assert_failed_fd_transfer_keeps_old_server(false);
+}
+
+#[test]
+fn live_handoff_closed_fd_reader_leaves_every_pane_with_the_old_server() {
+    assert_failed_fd_transfer_keeps_old_server(true);
+}
+
+fn assert_failed_fd_transfer_keeps_old_server(close_reader: bool) {
     let _lock = test_lock();
     let directory = SocketDir::reserve("hlh");
     let base = directory.path().to_path_buf();
@@ -2497,15 +2516,62 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
     let panes = create_many_panes(&api_socket);
     wait_for_server_ptmx_fd_count(server_pid, MANY_PANES, Duration::from_secs(30));
 
+    let mut params = serde_json::json!({});
+    if close_reader {
+        // Shut down receipt before validation releases the exporter. Every fd
+        // send must fail, independent of which process runs next.
+        let importer = base.join("closed-reader.py");
+        fs::write(
+            &importer,
+            r#"import json
+from pathlib import Path
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+    peer.settimeout(30)
+    peer.connect(sys.argv[3])
+    peer.sendall((sys.argv[4] + "\n").encode())
+    manifest = json.loads(peer.makefile("rb").readline())
+    assert len(manifest["panes"]) == 150, manifest
+    peer.shutdown(socket.SHUT_RD)
+    Path(__file__).with_suffix(".stage").write_text("reader closed after manifest")
+    peer.sendall(b"validated\n")
+"#,
+        )
+        .unwrap();
+        let launcher = base.join("closed-reader");
+        fs::write(
+            &launcher,
+            format!("#!/bin/sh\nexec python3 '{}' \"$@\"\n", importer.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        params["import_exe"] = serde_json::json!(launcher);
+    }
     let failed = request(
         &api_socket,
-        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
+        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":params}),
     );
-    let message = failed["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("test handoff import failure after 64 of 150 fds"),
-        "{failed}"
-    );
+    // Peer closure can surface on send or read. Classify its typed kind,
+    // keeping timeouts and unexpected protocol failures outside this class.
+    assert_eq!(failed["error"]["code"], "handoff_failed", "{failed}");
+    assert!(failed.get("result").is_none(), "{failed}");
+    let kind = failed["error"]["data"]["kind"]
+        .as_str()
+        .expect("typed handoff kind");
+    let peer_closed = matches!(kind, "broken_pipe" | "connection_reset");
+    if close_reader {
+        assert_eq!(
+            fs::read_to_string(base.join("closed-reader.stage")).expect("importer reached stage"),
+            "reader closed after manifest"
+        );
+        // Read shutdown before peer exit can also reject SCM_RIGHTS with EINVAL.
+        assert!(peer_closed || kind == "invalid_input", "{failed}");
+    } else {
+        assert!(peer_closed || kind == "import_refused", "{failed}");
+    }
 
     wait_for_api(&api_socket, Duration::from_secs(10));
     assert_eq!(
@@ -2514,8 +2580,8 @@ fn live_handoff_failing_mid_fd_transfer_leaves_every_pane_with_the_old_server() 
         "the old server must survive a refused handoff"
     );
     wait_for_server_ptmx_fd_count(server_pid, MANY_PANES, Duration::from_secs(10));
-    for idx in [0, 63, 64, MANY_PANES - 1] {
-        assert_pane_answers(&api_socket, &panes[idx], idx);
+    for (idx, pane) in panes.iter().enumerate() {
+        assert_pane_answers(&api_socket, pane, idx);
     }
 
     let _ = request(

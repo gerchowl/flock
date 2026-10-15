@@ -734,8 +734,10 @@ impl App {
                     let Ok(Some(record)) = record else {
                         continue;
                     };
-                    let next =
-                        self.request_next_hop(&record.envelope.return_binding.recipient_node);
+                    let next = self.request_next_hop_from_routes(
+                        &record.envelope.return_binding.recipient_node,
+                        &routes,
+                    );
                     // A node this mail already crossed refuses it as a loop.
                     // Leave it unrouted until the routes offer another hop (#866),
                     // or the loop outlasts its grace and is reported (#928).
