@@ -12,6 +12,12 @@ const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
+/// Report failed structured-session cleanup without reading session contents.
+pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
+    tracing::error!(event = "structured.config.cleanup_failed", error = %err,
+        "failed to remove structured session config directory");
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
