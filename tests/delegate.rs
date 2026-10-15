@@ -1396,9 +1396,12 @@ fn a10_taken_name_exits_1_and_creates_nothing() {
 }
 
 fn rollback_python_output(command: &mut Command) -> Output {
-    command
-        .output()
-        .expect("delegate rollback fixture requires python3 on PATH")
+    command.output().unwrap_or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            panic!("delegate rollback fixture requires python3 on PATH: {error}");
+        }
+        panic!("{error}");
+    })
 }
 
 /// A missing interpreter names the required tool instead of an opaque OS error.
@@ -1407,6 +1410,24 @@ fn rollback_python_output(command: &mut Command) -> Output {
 fn rollback_fixture_missing_python_names_requirement() {
     let directory = support::socket_dir::SocketDir::reserve("nopy");
     rollback_python_output(Command::new("python3").env("PATH", directory.path()));
+}
+
+/// Permission errors keep their OS diagnostic, without suggesting an absent tool.
+#[test]
+fn rollback_fixture_spawn_refusal_keeps_original_error() {
+    let directory = support::socket_dir::SocketDir::reserve("noexec");
+    let program = directory.path().join("python3");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = std::panic::catch_unwind(|| {
+        rollback_python_output(&mut Command::new(&program));
+    })
+    .expect_err("non-executable fixture must be refused");
+    let message = error.downcast_ref::<String>().expect("panic diagnostic");
+    assert_eq!(
+        message,
+        &std::io::Error::from_raw_os_error(libc::EACCES).to_string()
+    );
 }
 
 /// Run the fixture transport against this isolated server. ADR-0037 §1:
@@ -1460,17 +1481,16 @@ fn assert_failed_start_rolled_back(server: &Server, result: &serde_json::Value) 
     );
 }
 
-/// E11(a): acknowledge the single launch before releasing agent.start's real
-/// response only after the real server has observed its pane exit.
+/// E11(a): the real exit is queued before agent.start's response is released.
 #[test]
 fn a11_child_exit_during_start_rolls_back() {
-    assert_child_exit("exit");
+    assert_child_exit("exit-before-response");
 }
 
-/// Fault injection holds pane-exit delivery beyond the unchanged 5 s deadline.
+/// E11(c): release the real start response and live snapshot before child exit.
 #[test]
-fn a11_child_exit_before_readiness_survives_delayed_delivery() {
-    assert_child_exit("exit-delayed");
+fn a11_child_exit_after_start_response_rolls_back() {
+    assert_child_exit("response-before-exit");
 }
 
 fn assert_child_exit(mode: &str) {
@@ -1478,20 +1498,47 @@ fn assert_child_exit(mode: &str) {
     operator_workspace(&server);
     brief(&server, "task.md", "x\n");
     let result = rollback_fixture(&server, mode);
-    if mode == "exit-delayed" {
-        assert!(
-            result["exit_delivery_delay"].as_f64().unwrap() > 5.0,
-            "{result}"
-        );
-    }
     assert_failed_start_rolled_back(&server, &result);
     let outcome: serde_json::Value =
         serde_json::from_str(result["stdout"].as_str().unwrap()).unwrap();
     assert_eq!(outcome["outcome"], "start_failed", "{result}");
-    assert_eq!(
-        result["exit_observed"], true,
-        "real pane-exit handshake: {result}"
-    );
+    let reason = outcome["reason"].as_str().expect("child-exit reason");
+    if mode == "exit-before-response" {
+        // The removed pane fails readiness's real subscription preflight.
+        let error: serde_json::Value = serde_json::from_str(
+            reason
+                .strip_prefix("delegate d1: ")
+                .expect("preflight error prefix"),
+        )
+        .expect("real readiness preflight error");
+        assert_eq!(error["id"], "cli:delegate:ready:sub:0:probe", "{result}");
+        assert_eq!(error["error"]["code"], "internal_error", "{result}");
+        assert_eq!(
+            error["error"]["message"], "failed to decode pane get error",
+            "{result}"
+        );
+        assert_eq!(
+            result["steps"],
+            serde_json::json!(["exit_queued", "response_released"]),
+            "{result}"
+        );
+    } else {
+        assert!(
+            reason.contains("pane exited"),
+            "expected pane-exit reason: {result}"
+        );
+        assert_eq!(
+            result["steps"],
+            serde_json::json!([
+                "response_released",
+                "readiness_subscribed",
+                "live_snapshot_released",
+                "exit_queued",
+                "exit_delivered",
+            ]),
+            "{result}"
+        );
+    }
 
     assert_eq!(
         read_lines(&server.base.join("argv.log")).len(),

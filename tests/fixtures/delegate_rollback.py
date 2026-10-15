@@ -1,9 +1,10 @@
 """Real-server failed-start fixture for #1371 (ADR-0037 §1).
 
-Only agent.start's real response is gated, before the CLI starts its readiness
-clock. All requests and subscription events are relayed unchanged. The child
-acknowledges launch and exits before readiness is requested, or stays gated
-before logging until rollback kills it. One failure-only deadline covers the
+Real replies and events are forwarded unchanged, with their ordering controlled
+by child launch/exit and readiness subscription/snapshot stages. The child
+acknowledges launch and exits either before the start response is released or
+after the real readiness watch and live snapshot. The timeout child stays
+gated before logging until rollback kills it. One failure-only deadline covers the
 protocol and CLI; no timing sleep or product hook determines success. Python
 is already required by just check.
 """
@@ -93,27 +94,9 @@ def request(protocol, path, method, params):
         return json.loads(protocol.line(stream))
 
 
-def delay_exit_delivery(protocol):
-    """Inject >5 s transport latency using a bounded live-silent receive.
-
-    This fault is deliberately longer than the unchanged readiness deadline.
-    It is never used to establish the child-exit condition or make a test pass.
-    """
-    receiver, producer = socket.socketpair()
-    with receiver, producer:
-        receiver.settimeout(min(6, protocol.remaining()))
-        started = time.monotonic()
-        try:
-            receiver.recv(1)
-        except TimeoutError:
-            elapsed = time.monotonic() - started
-            if elapsed <= 5:
-                raise ValueError("exit delivery injection did not exceed readiness deadline")
-            return elapsed
-        raise ValueError("silent transport injection unexpectedly produced output")
-
-
 def run(base, server, binary, mode):
+    if mode not in {"exit-before-response", "response-before-exit", "timeout"}:
+        raise ValueError(f"unexpected rollback mode: {mode}")
     protocol = Protocol()
     base = Path(base)
     gate_path = base / "rollback-gate.sock"
@@ -121,14 +104,21 @@ def run(base, server, binary, mode):
     controls = []
     failures = []
     stage_finished = threading.Event()
-    exit_observed = False
-    exit_delivery_delay = 0
+    steps = []
+    subscribed = threading.Event()
+    release_lock = threading.Lock()
+    exit_released = False
+    target_pane_id = None
+    delivery_rx, delivery_tx = socket.socketpair()
     proxy = listener(proxy_path)
     gate = listener(gate_path)
     exits = socket.socket(socket.AF_UNIX)
     exits.settimeout(protocol.remaining())
     exits.connect(server)
-    exits.sendall(b'{"id":"rollback-watch","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.exited"}]}}\n')
+    exits.sendall(json.dumps({
+        "id": "rollback-watch", "method": "events.subscribe",
+        "params": {"subscriptions": [{"type": "pane.exited"}]},
+    }).encode() + b"\n")
     ack = json.loads(protocol.line(exits))
     if ack.get("result", {}).get("type") != "subscription_started":
         raise ValueError(f"unexpected exit subscription: {ack}")
@@ -137,8 +127,17 @@ def run(base, server, binary, mode):
     (base / "bin" / "opencode").write_text(launcher)
     (base / "bin" / "opencode").chmod(0o755)
 
+    def observe_exit(pane_id):
+        while True:
+            event = json.loads(protocol.line(exits))
+            if event.get("event") != "pane_exited":
+                raise ValueError(f"unexpected exit-monitor event: {event}")
+            if event["data"]["pane_id"] == pane_id:
+                steps.append("exit_queued")
+                return
+
     def relay(client):
-        nonlocal exit_delivery_delay, exit_observed
+        nonlocal exit_released, target_pane_id
         subscription = False
         try:
             with client, socket.socket(socket.AF_UNIX) as upstream:
@@ -150,6 +149,7 @@ def run(base, server, binary, mode):
                 reply = protocol.line(upstream)
                 if json.loads(message)["method"] == "agent.start":
                     agent = json.loads(reply)["result"]["agent"]
+                    target_pane_id = agent["pane_id"]
                     while True:
                         readable, _, _ = select.select([gate, exits], [], [], protocol.remaining())
                         if not readable:
@@ -168,36 +168,58 @@ def run(base, server, binary, mode):
                     control.sendall(b"H" if mode == "timeout" else b"L")
                     if mode != "timeout":
                         protocol.expect(control, "launched")
+                    if mode == "exit-before-response":
                         control.sendall(b"X")
                         protocol.eof(control)
-                        # Observe the real server exit before returning agent.start.
-                        # The readiness clock cannot run while this response is gated.
-                        while True:
-                            event = json.loads(protocol.line(exits))
-                            if event.get("event") != "pane_exited":
-                                raise ValueError(f"unexpected exit-monitor event: {event}")
-                            if event["data"]["pane_id"] == agent["pane_id"]:
-                                break
-                        exit_observed = True
-                        if mode == "exit-delayed":
-                            exit_delivery_delay = delay_exit_delivery(protocol)
+                        observe_exit(agent["pane_id"])
                         stage_finished.set()
-                    else:
+                    elif mode == "timeout":
                         stage_finished.set()
+                    steps.append("response_released")
+                if subscription and mode == "response-before-exit":
+                    if json.loads(reply).get("result", {}).get("type") != "subscription_started":
+                        raise ValueError(f"unexpected readiness subscription: {reply}")
+                    steps.append("readiness_subscribed")
+                    subscribed.set()
                 client.sendall(reply.encode() + b"\n")
+                if (
+                    mode == "response-before-exit" and subscribed.is_set()
+                    and json.loads(message)["method"] == "agent.get"
+                ):
+                    with release_lock:
+                        release = not exit_released
+                        exit_released = True
+                    if release:
+                        agent = json.loads(reply).get("result", {}).get("agent")
+                        if not agent:
+                            raise ValueError(f"missing live snapshot before exit: {reply}")
+                        steps.append("live_snapshot_released")
+                        controls[0].sendall(b"X")
+                        protocol.eof(controls[0])
+                        observe_exit(agent["pane_id"])
+                        stage_finished.set()
+                        delivery_tx.sendall(b"exit_queued\n")
                 if subscription and "error" not in json.loads(reply):
                     while True:
-                        upstream.settimeout(protocol.remaining())
-                        chunk = upstream.recv(65536)
-                        if not chunk:
-                            return
-                        client.sendall(chunk)
+                        event = protocol.line(upstream)
+                        value = json.loads(event)
+                        if (
+                            mode == "response-before-exit" and value.get("event") == "pane_exited"
+                            and value["data"]["pane_id"] == target_pane_id
+                        ):
+                            # The actual monitor event releases this actual delivery.
+                            # EOF, malformed stages and silence fail via Protocol.
+                            protocol.expect(delivery_rx, "exit_queued")
+                            steps.append("exit_delivered")
+                        client.sendall(event.encode() + b"\n")
         except (BrokenPipeError, ConnectionResetError):
             # A subscription consumer closes normally when the CLI finishes.
             if not subscription or not stage_finished.is_set():
                 failures.append("unexpected connection closure during fixture transport")
+                delivery_tx.shutdown(socket.SHUT_WR)
         except Exception as error:
             failures.append(str(error))
+            delivery_tx.shutdown(socket.SHUT_WR)
 
     def accept():
         try:
@@ -226,7 +248,7 @@ def run(base, server, binary, mode):
             raise ValueError(f"fixture transport failed: {failures}")
         after = request(protocol, server, "workspace.list", {})
         print(json.dumps({"code": child.returncode, "stdout": stdout, "stderr": stderr,
-            "before": before, "after": after, "exit_delivery_delay": exit_delivery_delay, "exit_observed": exit_observed}), flush=True)
+            "before": before, "after": after, "steps": steps}), flush=True)
     finally:
         if child.poll() is None:
             child.kill()
@@ -234,6 +256,8 @@ def run(base, server, binary, mode):
         proxy.close()
         gate.close()
         exits.close()
+        delivery_rx.close()
+        delivery_tx.close()
         for control in controls:
             control.close()
 
