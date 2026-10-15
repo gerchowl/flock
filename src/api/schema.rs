@@ -1465,6 +1465,34 @@ pub enum MessageTarget {
     Agent { agent: String },
 }
 
+/// Accepted human-facing message addresses (ADR-0029 §5).
+pub(crate) const MESSAGE_TARGET_EXPECTED: &str =
+    "a pane id, terminal id, unique agent name or fleet agent id as a string, \
+     or a tagged pane, repo_pane or agent object";
+
+impl MessageTarget {
+    /// Accepted argument forms for CLI/socket/MCP target refusals.
+    pub(crate) fn expected_shapes() -> serde_json::Value {
+        serde_json::json!([
+            "a pane id, terminal id, unique agent name or fleet agent id as a string",
+            {"type": "pane", "pane": "<pane>"},
+            {"type": "repo_pane", "repo": "<repo>", "pane": "<pane>"},
+            {"type": "agent", "agent": "<agent_id>"},
+        ])
+    }
+
+    /// Convert CLI/MCP shorthand to the existing wire shape. Fleet identities
+    /// retain their routing semantics instead of becoming server-local panes
+    /// (ADR-0008, Mesh amendment). Other strings use the shared pane resolver.
+    pub(crate) fn from_bare(target: String) -> Self {
+        if crate::terminal::AgentId::is_well_formed(&target) {
+            Self::Agent { agent: target }
+        } else {
+            Self::Pane { pane: target }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgSendParams {
     pub to: MessageTarget,
