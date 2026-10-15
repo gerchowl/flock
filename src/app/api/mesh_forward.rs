@@ -28,7 +28,16 @@ impl NextHop {
 impl App {
     pub(super) fn request_next_hop(&mut self, owner: &str) -> NextHop {
         self.refresh_mesh_routes();
-        let node = self.custody_routes().remove(owner).unwrap_or_default();
+        self.request_next_hop_from_routes(owner, &self.custody_routes())
+    }
+
+    /// Resolve a row using the route pass's single attachment snapshot.
+    pub(super) fn request_next_hop_from_routes(
+        &self,
+        owner: &str,
+        routes: &std::collections::BTreeMap<String, String>,
+    ) -> NextHop {
+        let node = routes.get(owner).cloned().unwrap_or_default();
         let peer = self
             .outbound_reply_peer(&node)
             .filter(|peer| crate::peer_stream::enrollment(peer).state == "pinned");
