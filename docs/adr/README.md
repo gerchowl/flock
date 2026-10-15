@@ -47,6 +47,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Accepted |
 | [0036](0036-structured-agent-sessions.md) | An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary | Accepted |
 | [0037](0037-test-wait-liveness-and-hang-ceilings.md) | Condition waits fail on dead, unexpected or silent producers, with measured nextest termination ceilings for every binary | Accepted (2026-10-14) |
+| [0038](0038-gui-workbench.md) | The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log | Proposed |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
