@@ -1,11 +1,12 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed
-- Date: 2026-10-15
-- Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546), [#1076](https://github.com/gerchowl/flock/issues/1076)
+- Status: Proposed; the §11 owner decisions were taken on 2026-10-16 (recorded on #1591)
+- Date: 2026-10-15, amended 2026-10-16 (#1606)
+- Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546), [#1076](https://github.com/gerchowl/flock/issues/1076)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
 - Wireframes: [`0038-gui/wireframes.html`](0038-gui/wireframes.html) (static, self-contained; open it in a browser)
-- Implemented: nothing. This is a design proposal for the owner.
+- Implemented: nothing.
+- Prior art: vig-os/revkit (review surface: anchored comments, agent question UIs; see "Prior art"); vig-os/vigil (telemetry, see §4a)
 
 ## Summary
 
@@ -87,7 +88,7 @@ A **tile** shows one subject:
 
 ```text
 Tile { id, kind, subject: EntityRef, mode: Expanded | Collapsed | Rail, origin: Option<TileId> }
-kind ∈ transcript | terminal | artifact | queue | inbox | goal_tree | work_graph | node | diff* | context*
+kind ∈ transcript | terminal | artifact | queue | inbox | goal_tree | work_graph | node | trace | logs | audit | diff* | context*
 ```
 
 The starred kinds are reserved: `diff` for review, and `context` for what an agent sees, from ADR-0032's compiled context. Each gets a design when it is sliced.
@@ -129,21 +130,31 @@ The client must never derive:
 - goal or work state;
 - anything sent to an agent other than a `cmd`.
 
-**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters: heartbeat interval, liveness window and backoff caps.
+**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters: heartbeat interval, liveness window and backoff caps. The diagram shows the main path. The table is complete and wins where they differ.
 
 ```text
-                 ┌──────────────── backoff ─────────────────┐
-                 ▼                                          │
 Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─caught up─▶ Live
-                 │                   │  │             │  ▲                 │
-                 │ fail              │  │ client      │  │ snapshot done   │ heartbeat missed /
-                 ▼                   │  │ newer       ▼  │                 │ socket error
-            Reconnecting ◀───────────┘  ▼          Snapshot ◀── gap ───────┤
-                 ▲                   ReadOnly ──upgrade/reload──▶ Connecting│
-                 │                      │ socket lost ──▶ Reconnecting      ▼
-                 └──────────────────────────────────────────────────── Stale
-            auth refused (from Hello or any later frame) ──▶ NeedsToken ──new token──▶ Connecting
+                  ▲    │ fail        │ │               ▲   │ gap             │ gap
+                  │    ▼             │ │ client newer  │   ▼                 ▼
+                  │  Reconnecting ◀──┘ ▼               └─ Resync ◀───────────┘
+                  └── backoff ──┘    ReadOnly         (inline snapshot lines)
+   from Hello, Syncing, Resync, Live, ReadOnly: socket lost ──▶ Reconnecting
+   from Syncing, Resync, Live: heartbeat missed ──▶ Stale ──▶ Reconnecting
+   from any state: auth refused ──▶ NeedsToken ──new token──▶ Connecting
 ```
+
+| State | Exits |
+|---|---|
+| Disconnected | `connect` → Connecting |
+| Connecting | socket open → Hello; failure → Reconnecting |
+| Hello | `welcome`, client not newer → Syncing; `welcome`, client newer → ReadOnly; auth refused → NeedsToken; socket lost → Reconnecting |
+| Syncing | every subscribed stream caught up → Live; `gap` on a snapshot stream → Resync; socket lost → Reconnecting; heartbeat missed → Stale; auth refused → NeedsToken |
+| Resync | the snapshot is applied (the first frame on that stream that is not a snapshot line, or the stream is caught up) → the state it came from (Syncing or Live); socket lost → Reconnecting, after which the `sub` from the stored cursor gets the `gap` and the snapshot again; heartbeat missed → Stale; auth refused → NeedsToken |
+| Live | `gap` on a snapshot stream → Resync; socket lost → Reconnecting; heartbeat missed → Stale; auth refused → NeedsToken |
+| ReadOnly | user reload after a server upgrade → Connecting; socket lost → Reconnecting (the next `welcome` decides again); auth refused → NeedsToken |
+| Stale | → Reconnecting at once (it is entered only to mark tiles while reconnect begins) |
+| Reconnecting | backoff elapsed, network-change or foreground event → Connecting |
+| NeedsToken | new token → Connecting |
 
 - **Hello.**
   - It sends `hello { protocol, client, token }`.
@@ -161,8 +172,17 @@ Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─c
   - **`ev`:** dedupe on `(stream, seq)`. Apply through the stream's reducer. Advance that stream's cursor **only after** the reducer has applied the event.
   - **`lagged { skipped_to }`:** the server dropped events for a slow subscriber. Re-subscribe with `after: <cursor>`, the last applied seq, so the log replays everything after it. Never jump to `skipped_to`, because that would skip replayable entries.
   - **`gap { from, to }`:** the log no longer holds that range.
-    - For streams with a snapshot (`queue/<id>`, ADR-0036 §4, and the `fleet`, `inbox`, `artifacts` and `work` streams of §5), go to **Snapshot**. Fetch the stream's snapshot, replace that stream's entities, set the cursor to the snapshot's seq, and return to the state it came from.
-    - **`agent/<id>` has no snapshot.** The client marks the transcript "history before seq `to + 1` is unavailable" at that point and continues from `to + 1`. A session's full history comes from the stored stream (ADR-0036 §4), so a gap here is an operator-visible retention fact, not a hole the client papers over.
+    - **Streams with snapshots** follow ADR-0036 §4 unchanged: `queue/<id>`, and this record's §5 streams (`fleet`, `inbox`, `artifacts`, `work`). The server sends the snapshot inline, right after the `gap`. Its lines take the next seqs and carry the full current state of every item. The client enters **Resync**:
+      - it marks that stream's entities as unconfirmed;
+      - it applies the snapshot lines through the normal reducer, advancing the cursor as usual;
+      - when the snapshot ends, it drops every entity still unconfirmed, because an item the snapshot doesn't mention no longer exists.
+      - The snapshot ends at the first frame on that stream that is not a snapshot line, or when the stream is caught up.
+      - Rendering stays batched per animation frame, so a snapshot delivered in one burst never shows an empty list.
+      - There is no client-side fetch: the snapshot comes on the same stream as everything else.
+    - **`agent/<id>` has no snapshot and no other source.** It is the stored session stream itself (ADR-0036 §4). A gap there means flk no longer holds those lines, for example after retention removed them (ADR-0036 S16). Nothing else holds them either: the harness's native transcript is a disposable working copy that flk does not serve.
+      - The client renders a fixed marker: "events `from`–`to` of this session are no longer stored".
+      - It continues from `to + 1` and never implies the transcript is complete.
+      - Recovery for a reader who needs the missing turns is outside the client: the operator restores the session stream from a backup, if one exists. Otherwise the range is gone.
 - **`*/live` streams** (partial deltas, no cursor) are re-subscribed after every reconnect, with no `after`. In-flight blocks are dropped (§4).
 - **Stale.**
   - Entered when no frame or heartbeat has arrived within the liveness window.
@@ -219,13 +239,37 @@ wire ev ─▶ reducer(kind) ─▶ store (normalised) ─▶ selector(tile) ─
   - Virtualised: only visible turns hold DOM.
   - Collapsed turns render their one-line summary from the turn boundaries the server sends.
 
+### 4a. Observability: trace and log views on vigil's output
+
+The owner chose vig-os/vigil for flk's telemetry (§11 item 5). vigil bridges `tracing` into OpenTelemetry and writes OTLP/JSON Lines files: one `LogsData`, `MetricsData` or `TracesData` per line, one signal per file. Its opt-in `audit` feature adds a hash-chained, signed trail. #1614 decides what flk emits, where the files live and the retention; this record decides only how the GUI shows them.
+
+- **The server reads; the client never touches files.** The flk server exposes read-only, scope-gated views over vigil's files on the same wire:
+  - `telemetry/traces` (a `sub` with a filter: trace id, agent id or time range);
+  - `telemetry/logs` (filter: level, target, agent id, time range);
+  - `audit` (verification status per segment).
+  - Each needs the `read` scope. `audit` is operator-only, because it names actors.
+  - Clients get records already decoded from OTLP/JSON into the same generated-type discipline as §5. There are no hand-written shapes.
+- **Correlation, not a second history.**
+  - Spans carry the agent id, session, `cmd_id` and turn as attributes (decided in #1614).
+  - A transcript turn or a tool card shows "trace" when a trace id is attached, and opens a **trace tile** (`kind = trace`): a span waterfall for that turn, with tool calls, queue delivery and mesh hops.
+  - The session stream stays the transcript of record. Telemetry explains timing and failures; it is not a copy of content.
+- **Tiles.**
+  - `trace`: the waterfall.
+  - `logs`: a filtered, virtualised list that follows new lines.
+  - `node` gains health metrics from `MetricsData`.
+  - `audit`: the chain's verification status (verified up to segment N, or a broken link at segment M), and actor and action rows.
+  - All are ordinary tiles: they collapse to the rail and open beside a transcript.
+- **No content in telemetry.** Message bodies, comment text and tokens never enter spans or logs (#1614, item 4), so the telemetry views need no artifact-style sandboxing.
+- **External tools stay optional.** Loki, Prometheus or any OTLP consumer can read the same files. The GUI does not depend on them.
+- **Slice:** G13 (§10). It waits for vigil's first release and for #1614.
+
 ### 5. Contracts: what the wire gains
 
 All types are Rust types with `ts_rs::TS` derives behind the `ts` feature (S8) and appear in `web/client/src/gen`. Each release that adds a stream or event kind bumps `WIRE_JSON_VERSION` once. Older clients fall back to §8's unknown rendering.
 
 **New streams**, alongside ADR-0036 §5's `agent/<id>`, `agent/<id>/live`, `queue/<id>`, `events` and `terminal/<pane>`:
 
-| Stream | Seq | Carries | Snapshot on `gap` |
+| Stream | Seq | Carries | Inline snapshot after `gap` (ADR-0036 §4 rule) |
 |---|---|---|---|
 | `fleet` | yes | node, project and agent summary upserts and removals in the client's scope | full summary set |
 | `inbox` | yes | open questions, permission prompts and feedback requests across agents in scope: opened, updated, closed | open items |
@@ -255,8 +299,9 @@ pub struct ArtifactRecord { artifact_id: ArtifactId, version: u32, agent_id: Age
                             created_ms: u64, interactive: bool, about: Option<EntityRef> }
 pub enum ArtifactKind { Html, Markdown, Svg, Image { mime: String }, Json }
 pub struct ArtifactComment { comment_id: CommentId, artifact_id: ArtifactId, version: u32,
-                             anchor: Option<BlockAnchor>, text: String, author: Principal,
-                             created_ms: u64, delivered: DeliveryState }
+                             anchor: Option<BlockAnchor>, quote: Option<String>, revision: Sha256,
+                             anchor_state: AnchorState /* exact | reanchored | orphaned */,
+                             text: String, author: Principal, created_ms: u64, delivered: DeliveryState }
 
 pub struct WorkNode { work_id: WorkId, kind: WorkKind /* goal | package | task | issue | pr */,
                       title: String, state: WorkState, parent: Option<WorkId>,
@@ -395,7 +440,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | # | Slice | Depends on | Before S3? | Est. |
 |---|---|---|---|---|
 | S8a | `ts` feature and ts-rs derives for types that exist today: the socket API types the client needs first (agents, workspaces, panes, questions) and ADR-0036 S1's `SessionEvent` (landed). Drift test, `just gen-ts`. This splits ADR-0036 S8. | — | yes | 200 |
-| S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `gap`, `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1323 decided, #1546 settled | yes | 200 |
+| S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `gap`, `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1546 settled | yes | 200 |
 | G1 | Client shell skeleton (Bun + Solid), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
 | G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode | G1 | yes | 400 TS |
 | G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server built on S7a's types (connect, gap, lagged, stale, protocol gap, token refusal) | G1, S7a | yes | 400 TS |
@@ -405,30 +450,33 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | S9a | Transcript tile (ADR-0036 S9a) on G2/G3 | S8b, G2, G3 | no | 400 TS |
 | G5 | The `inbox` stream and inbox tile, with atomic `inbox.answer` | S7, S6b | no | 350 |
 | G6 | Artifact records, blobs, limits, retention; the `flock_artifact_publish`, `_list` and `_comments` tools; the `artifacts` stream | S3b #1426 (the blob store), S7 | no | 400 |
-| G7 | Artifact tile: sandbox, CSP injection, block anchors, comments, `expand_into_second`; `flock_artifact_request_feedback` with ADR-0034 routing | G6, G5, S6c | no | 400 (TS + Rust) |
+| G7 | Artifact tile: sandbox, CSP injection, block anchors, comments with dual anchors and re-anchoring across versions (orphaned, never dropped), escaped untrusted framing toward the agent, `expand_into_second`; `flock_artifact_request_feedback` with ADR-0034 routing | G6, G5, S6c | no | 400 (TS + Rust) |
 | G8 | The `work` stream, phase 1 projection, goal tree tile | S7 | no | 350 |
 | G9 | Tauri v2 desktop shell: config, keychain token, accessory bar, deep links, tray | G1–G3 | yes (shell only) | 300 + config |
 | G10 | Tauri mobile and push, if decided | G9, owner decision 6 | no | — |
 | G11 | Artifact carriage over the mesh | G6, ADR-0026 | no | 300 |
 | G12 | `work` records, phase 2 (§8) | G8, owner decision 7 | no | 400 |
+| G13 | Telemetry views (§4a): `telemetry/traces`, `telemetry/logs` and `audit` reads in the server; trace, logs and audit tiles | S7, #1614, a vigil release (#1300) | no | 400 |
 
 Before S3 means a slice depends on nothing in the -p chain's runtime (S3a, S3b). S8a, S7a, G1, G2, G3 and the G9 shell qualify. Everything that serves live data needs S7 and therefore S3.
 
 The first end-to-end milestone is **"a structured agent in a browser tile"**: G1 + G2 + G3 + S7 + S8b + S9a, against the -p MVP's runtime. It follows the MVP and does not compete with it.
 
-### 11. Owner decisions required
+### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-| # | Decision | Recommendation | Cost |
+All nine were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation.
+
+| # | Decision | Outcome | Consequence |
 |---|---|---|---|
-| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | Yes | A desktop app on the server host needs a token. `flk client open` already makes one. |
-| 2 | Allow opt-in **interactive** artifacts: scripts in an opaque-origin sandbox, no network, and posts confirmed by a person (ADR-0011 §5 requires an ADR for any script relaxation) | Yes, opt-in per publish, off by default | One more security surface to review. Agents can render live plots and forms. |
-| 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | Yes | Isolation rests on correct sandbox flags and injected CSP in every shell. A client bug, such as a stray `allow-same-origin`, would expose the client token, so it needs a security test per shell (G7). Interactive artifacts keep the navigation-beacon risk of §7. Artifacts can't be opened as standalone URLs: they render only inside the client. |
-| 4 | Solid web client vs GPUI (#1401) | Solid, as ADR-0036 decided. GPUI has no HTML engine for artifacts and no browser reach. | The Bun/TS toolchain stays. |
-| 5 | #1323 (Grafana stack) gates S7 | Decide "ours" now for the live wire and history, revisiting Loki for long-term history later | We keep the JSONL and blob store we already have. |
-| 6 | A push relay for mobile background notifications | Defer. Mobile v1 is foreground only. | No pings while the app is closed. |
-| 7 | `work` records as first-class flk state (§8 phase 2) | Yes, after phase 1 has been used | Architects move their task files into flk. |
-| 8 | A separate versioned graph engine for goals and work | Not now. The event log covers typed nodes and edges, actors and history. Revisit when branch-and-merge planning is a real need. | No branch and merge of plans for now. |
-| 9 | Layout persistence | Client-local per device now; server-synced named layouts later | A layout doesn't follow you between devices. |
+| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | **Decided: yes** | A desktop app on the server host gets its token through `flk client open`. |
+| 2 | Opt-in **interactive** artifacts: scripts in an opaque-origin sandbox, no network, posts confirmed by a person | **Decided: yes**, opt-in per publish, off by default | One more security surface, reviewed in G7. Agents can render live plots and forms. |
+| 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | **Decided: yes** | Isolation rests on correct sandbox flags and injected CSP in every shell. A client bug such as a stray `allow-same-origin` would expose the client token, so G7 carries a security test per shell. Interactive artifacts keep §7's navigation-beacon risk. Artifacts render only inside the client. |
+| 4 | Solid web client vs GPUI (#1401) | **Decided: Solid**; #1401 is closed | The Bun/TS toolchain stays. |
+| 5 | Telemetry and history backend (was: does #1323's Grafana evaluation gate S7?) | **Decided: vig-os/vigil.** Log, metric and trace output goes through vigil's OTLP/JSON Lines files and its optional signed audit trail, not Grafana and not a separate pipeline. **#1323 no longer gates S7.** The live wire and history stay ADR-0036 §4/§5's own streams and blobs. | §4a describes the GUI's views on vigil's output. The integration ADR is #1614, adoption is #1300, and vigil is pre-alpha, so the views wait for it. |
+| 6 | A push relay for mobile background notifications | **Decided: defer.** Mobile v1 is foreground only. | No pings while the app is closed. |
+| 7 | `work` records as first-class flk state (§8 phase 2) | **Decided: yes**, after phase 1 has been used | Architects move their task files into flk. |
+| 8 | A separate versioned graph engine for goals and work | **Decided: not now.** The event log covers typed nodes and edges, actors and history. | No branch and merge of plans for now. |
+| 9 | Layout persistence | **Decided: client-local per device**; server-synced named layouts later | A layout doesn't follow you between devices. |
 
 ## Failure modes and known limits
 
@@ -441,6 +489,29 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 - **A stale command after the idempotency window** is shown as "unknown outcome", never resent automatically.
 - **Cross-node commands** are refused until #1380. The UI shows the refusal in place.
 - **Layout loss.** Clearing browser storage resets the layout. Server state is unaffected.
+
+## Prior art: vig-os/revkit
+
+vig-os/revkit (Apache-2.0) is an HTML-first review surface: rendered docs and ADRs with persistent anchored comments, a GitHub PR round-trip, and rich question UIs for agents. Its design is accepted, but no code is runnable yet. It overlaps with §7 and the inbox. What this record takes from it, and what not:
+
+- **Adopt: dual anchors with re-anchoring (revkit ADR-0006).**
+  - A comment stores its block id, a text-quote selector and the revision (content hash) it was made on.
+  - When an artifact gets a new version, the comment is re-anchored:
+    - the diff decides where the anchor maps;
+    - quote similarity only decides whether it still matches;
+    - otherwise the comment is **orphaned, kept and never dropped**.
+  - This fills a gap in §7, where comments were tied to one version. G7's acceptance gains it.
+- **Adopt: untrusted framing on the way to the agent (revkit ADR-0007 amendment).**
+  - Comment bodies and quotes are untrusted input to the agent. Before flk queues a comment or a confirmed interactive post (§7), it escapes every user-supplied field so it cannot close or forge the framing the harness wraps it in, and it caps the size.
+  - A comment is a request from a person, not an instruction, and the agent may decline it.
+  - This applies to ADR-0036 §3 input items from the GUI generally.
+- **Adopt, later: question widget vocabulary.** revkit's agent questions go beyond choice lists: choices with previews, ranking, sliders, and pick-a-region on a plot. The inbox (G5) starts with ADR-0036 §2a's choices and text. Richer widgets are a follow-up that extends `Choice` in §5. Each widget has a text fallback, per ADR-0036 §12 item 3.
+- **Shared stack.** Solid, with Kobalte primitives in revkit, matches ADR-0036 §7's choice. A future shared component package is possible but is not assumed here.
+- **Not adopted, and why.**
+  - revkit renders authored docs through a static-site build (Astro and Starlight) and hosts them on a Cloudflare Worker with a GitHub App. flk's artifacts are runtime blobs rendered by the client, and flk has no hosted tier.
+  - revkit's local daemon has its own cookie session. flk's wire already has client tokens (ADR-0036 §5).
+  - revkit's delivery modes (`handover`, `live`, `quiet`) map onto ADR-0036 §3's `at_idle`, `steer` and the queue's gate, so no new mode is needed.
+  - Depending on revkit itself waits until it ships. The integration point, if one ever exists, would be an artifact kind that is a revkit-rendered document.
 
 ## Alternatives considered
 
