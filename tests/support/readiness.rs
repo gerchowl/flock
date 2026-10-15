@@ -100,6 +100,12 @@ impl Stages {
         }
     }
 
+    /// Remaining failure-only budget, shared by socket and channel waits.
+    pub fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
     /// Wait for any descriptor, preferring earlier entries when several fire.
     /// EOF and descriptor errors wake poll too, so callers can report liveness.
     pub fn readable(&self, descriptors: &[std::os::fd::RawFd]) -> io::Result<usize> {
