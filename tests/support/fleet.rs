@@ -35,10 +35,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Deserialize;
 
-use super::{read_server_message, register_runtime_dir, register_spawned_flock_pid, wait_for_file};
+use super::{read_server_message, register_runtime_dir};
 
 /// ServerMessage bincode variant indices (declaration order in wire.rs).
 pub const VARIANT_FRAME: u32 = 1;
@@ -135,8 +135,7 @@ pub struct Node {
     mesh: MeshMode,
     push_concurrency: Option<usize>,
     loop_grace_ms: Option<u64>,
-    _master: Option<Box<dyn MasterPty + Send>>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    startup: Option<super::server_startup::ServerStartup>,
 }
 
 impl Drop for Node {
@@ -148,41 +147,23 @@ impl Drop for Node {
 
 impl Node {
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let pid = child.process_id();
-            let group = pid.expect("fleet node pid") as i32;
-            // Edges deliberately own separate groups, so stop them while the
-            // server can still reap its ssh children, then stop the server.
+        if let Some(mut startup) = self.startup.take() {
+            // Edges own separate groups. Stop them while the server can reap
+            // its ssh children, then stop the owned unreaped server group.
             kill_edges(
                 self.shim_dir.parent().unwrap(),
                 Some(&format!("{}-", self.name)),
             );
-            unsafe {
-                libc::kill(-group, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_millis(400);
-            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            // The leader may already be gone while another group member lives.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
-            }
-            let _ = child.wait();
+            startup.stop();
             kill_edges(
                 self.shim_dir.parent().unwrap(),
                 Some(&format!("{}-", self.name)),
             );
-            super::unregister_spawned_flock_pid(pid);
         }
-        self._master = None;
     }
 
     pub fn process_id(&self) -> u32 {
-        self.child
-            .as_ref()
-            .and_then(|child| child.process_id())
-            .expect("running node")
+        self.startup.as_ref().expect("running node").process_id()
     }
 
     /// Restart only this sandbox server, preserving its config and state.
@@ -251,42 +232,25 @@ impl Node {
         cmd.env("PATH", format!("{}:{outer_path}", self.shim_dir.display()));
         super::environment::assert_pty_isolated(&cmd);
         let child = super::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
-        let pid = child.process_id().expect("fleet node pid") as i32;
-        assert_eq!(
-            unsafe { libc::getpgid(pid) },
-            pid,
-            "node owns its process group"
-        );
-        register_spawned_flock_pid(child.process_id());
         drop(pair.slave);
-        // Drain output so a full PTY cannot block a headless fixture server.
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
-        });
-        self.child = Some(child);
-        self._master = Some(pair.master);
+        self.startup = Some(
+            super::server_startup::ServerStartup::new(
+                pair.master,
+                child,
+                &self.api_socket,
+                Duration::from_secs(30),
+            )
+            .expect("own fleet startup observers"),
+        );
     }
 
-    fn wait_ready(&self) {
-        wait_until("server ping", Duration::from_secs(30), || {
-            let mut stream = UnixStream::connect(&self.api_socket).ok()?;
-            stream
-                .set_read_timeout(Some(Duration::from_millis(200)))
-                .ok()?;
-            stream
-                .set_write_timeout(Some(Duration::from_millis(200)))
-                .ok()?;
-            stream
-                .write_all(b"{\"id\":\"ready\",\"method\":\"ping\",\"params\":{}}\n")
-                .ok()?;
-            let mut response = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut response)
-                .ok()?;
-            let value: serde_json::Value = serde_json::from_str(&response).ok()?;
-            value.get("result").map(|_| ())
-        });
-        wait_for_file(&self.client_socket, Duration::from_secs(30));
+    fn wait_ready(&mut self) {
+        let _timing = super::timing::wait("server startup announcement");
+        self.startup
+            .as_mut()
+            .expect("started node")
+            .wait_responsive()
+            .unwrap_or_else(|error| panic!("server startup for {} failed: {error}", self.name));
     }
 
     /// Attach a protocol client and complete the handshake. Returns the
@@ -702,8 +666,7 @@ pub fn spawn_with_startup_probe(
                 mesh: spec.mesh,
                 push_concurrency: spec.push_concurrency,
                 loop_grace_ms: spec.loop_grace_ms,
-                _master: None,
-                child: None,
+                startup: None,
             }
         })
         .collect();
