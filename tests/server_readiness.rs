@@ -449,6 +449,15 @@ struct StartupPeer {
 
 impl StartupPeer {
     fn spawn(api: &Path, response: Option<&'static str>, exit_child: Option<u32>) -> Self {
+        Self::spawn_controlled(api, response, exit_child, None)
+    }
+
+    fn spawn_controlled(
+        api: &Path,
+        response: Option<&'static str>,
+        exit_child: Option<u32>,
+        pong_gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    ) -> Self {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
         let listener = std::os::unix::net::UnixListener::bind(api).unwrap();
@@ -476,14 +485,29 @@ impl StartupPeer {
                 "startup request EOF",
             )?;
             let request: serde_json::Value = serde_json::from_str(&request)?;
-            assert_eq!(request["id"], "startup-ready");
+            if pong_gate.is_none() {
+                assert_eq!(request["id"], "startup-ready");
+            }
             assert_eq!(request["method"], "ping");
             observed.fetch_add(1, Ordering::SeqCst);
             if let Some(pid) = exit_child {
                 // The fixture retains this owned child's unreaped PID.
                 assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
             }
-            if let Some(response) = response {
+            if let Some((observed, release)) = pong_gate {
+                observed.send(()).map_err(io::Error::other)?;
+                release
+                    .recv_timeout(STARTUP_CEILING)
+                    .map_err(io::Error::other)?;
+                let pong = serde_json::json!({"id": request["id"], "result": {"type": "pong"}});
+                // The negative control closes its first connection at 200 ms.
+                // Keep that healthy late response distinct from a fixture error.
+                match writeln!(stream, "{pong}") {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(response) = response {
                 writeln!(stream, "{response}")?;
             } else {
                 // Hold the response writer until its owner cancels and joins us.
@@ -583,4 +607,56 @@ fn owned_startup_dead_child_cannot_hide_behind_a_live_api_writer() {
     assert!(fixture.server.has_exited().unwrap());
     fixture.server.stop();
     peer.finish();
+}
+
+/// A healthy pong held past the former probe timeout still completes the actual
+/// fleet readiness path. The gate opens only after observing the ping and
+/// proving readiness remains pending; no sleep controls the producer.
+#[test]
+fn fleet_startup_accepts_a_healthy_pong_after_the_old_probe_timeout() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let mut fleet = support::fleet::spawn(
+        "startup-gated-pong",
+        &[support::fleet::NodeSpec::new("nodea", "alpha", &[])],
+    );
+    let node = fleet.node_mut("nodea");
+    node.stop();
+    let (output, mut writer) = UnixStream::pair().unwrap();
+    let fixture = StartupFixture::spawn("read ignored", STARTUP_CEILING, Some(output));
+    let api = fixture._directory.path().join("api.sock");
+    let client = fixture._directory.path().join("client.sock");
+    let _client_listener = std::os::unix::net::UnixListener::bind(&client).unwrap();
+    let (observed_tx, observed_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut peer = StartupPeer::spawn_controlled(&api, None, None, Some((observed_tx, release_rx)));
+    announce_fixture(&fixture, &mut writer);
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                node.observe_startup_fixture(fixture.server, api, client);
+            }));
+            let _ = done_tx.send(result);
+        });
+        observed_rx.recv_timeout(STARTUP_CEILING).unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(350)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "readiness must wait for the gated pong beyond the old 200 ms cap"
+        );
+        release_tx.send(()).unwrap();
+        // This is a generous failure backstop after releasing an already read
+        // request, well inside the shared 30-second startup ceiling.
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("healthy gated pong must complete readiness without short probes")
+            .unwrap();
+        worker.join().unwrap();
+    });
+    peer.finish();
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+    fleet.node_mut("nodea").stop();
 }

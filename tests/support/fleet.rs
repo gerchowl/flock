@@ -244,6 +244,24 @@ impl Node {
         );
     }
 
+    /// Exercise the normal fleet readiness path with an owned fault fixture.
+    /// The node must be stopped first; its usual drop guard retains cleanup.
+    pub fn observe_startup_fixture(
+        &mut self,
+        startup: super::server_startup::ServerStartup,
+        api_socket: PathBuf,
+        client_socket: PathBuf,
+    ) {
+        assert!(
+            self.startup.is_none(),
+            "stop the node before replacing startup"
+        );
+        self.api_socket = api_socket;
+        self.client_socket = client_socket;
+        self.startup = Some(startup);
+        self.wait_ready();
+    }
+
     fn wait_ready(&mut self) {
         let _timing = super::timing::wait("server startup announcement");
         self.startup
@@ -251,6 +269,12 @@ impl Node {
             .expect("started node")
             .wait_responsive()
             .unwrap_or_else(|error| panic!("server startup for {} failed: {error}", self.name));
+        // HeadlessServer::new binds the client listener before run_server prints
+        // the readiness announcement. No second socket-existence wait is needed.
+        assert!(
+            self.client_socket.exists(),
+            "ready client listener must exist"
+        );
     }
 
     /// Attach a protocol client and complete the handshake. Returns the
