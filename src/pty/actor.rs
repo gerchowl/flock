@@ -190,7 +190,7 @@ pub(crate) struct PtyIoActorConfig {
 
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
-    WriteTrackedInput(Bytes, std_mpsc::Sender<Instant>),
+    WriteTrackedInput(Bytes, crate::pty::write_receipt::WriteCompletion),
 }
 
 struct BeginHandoffRequest {
@@ -579,7 +579,7 @@ struct PtyIoActorRunner {
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
-    pending_writes: VecDeque<(Bytes, Option<std_mpsc::Sender<Instant>>)>,
+    pending_writes: VecDeque<(Bytes, Option<crate::pty::write_receipt::WriteCompletion>)>,
     current_write_offset: usize,
     /// Consecutive zero-byte writes of a non-empty buffer (#1011).
     zero_write_streak: u32,
@@ -912,7 +912,24 @@ impl PtyIoActorRunner {
                 self.complete_front_write(Instant::now());
                 continue;
             }
-            match self.write_chunk(&bytes[self.current_write_offset..]) {
+            let completion = self
+                .pending_writes
+                .front_mut()
+                .and_then(|(_, tx)| tx.take());
+            let chunk = &bytes[self.current_write_offset..];
+            let result = match &completion {
+                Some(tx) => tx.write(chunk.len(), || self.write_chunk(chunk)),
+                None => Some(self.write_chunk(chunk)),
+            };
+            if let Some((_, tx)) = self.pending_writes.front_mut() {
+                *tx = completion;
+            }
+            let Some(result) = result else {
+                self.pending_writes.pop_front();
+                self.current_write_offset = 0;
+                continue;
+            };
+            match result {
                 Ok(0) => {
                     self.note_zero_write();
                     return;
@@ -1574,6 +1591,68 @@ mod tests {
         let mut tail = [0; 3];
         peer.read_exact(&mut tail).unwrap();
         assert_eq!(&tail, b"ste");
+    }
+
+    #[test]
+    fn cancelled_stalled_paste_cannot_land_when_writer_resumes_after_deadline() {
+        let (mut runner, mut peer, _) = socket_pair_runner();
+        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
+            Bytes::from_static(b"paste"),
+            completion,
+        ));
+        runner.write_hook = Some(Box::new(|_| Err(std::io::ErrorKind::WouldBlock.into())));
+        runner.flush_pending_writes_once();
+        assert_eq!(receipt.try_completed(), Err(std_mpsc::TryRecvError::Empty));
+        assert!(
+            receipt.cancel() == crate::pty::write_receipt::WriteDisposition::Cancelled,
+            "deadline retracts an untouched paste"
+        );
+        runner.write_hook = None;
+        runner.push_pending(Bytes::from_static(b"after"));
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 5];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"after", "the abandoned paste must never arrive");
+        assert!(runner.pending_writes.is_empty());
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut observed).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn partial_stalled_paste_cannot_be_reported_as_cancelled() {
+        let (mut runner, mut peer, _) = socket_pair_runner();
+        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
+            Bytes::from_static(b"paste"),
+            completion,
+        ));
+        let mut first_writer = runner.file.try_clone().unwrap();
+        let mut calls = 0;
+        runner.write_hook = Some(Box::new(move |chunk| {
+            calls += 1;
+            if calls == 1 {
+                first_writer.write(&chunk[..2])
+            } else {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }));
+        runner.flush_pending_writes_once();
+        assert!(
+            receipt.cancel() != crate::pty::write_receipt::WriteDisposition::Cancelled,
+            "partial writes require an uncertain outcome"
+        );
+        runner.write_hook = None;
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 5];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"paste");
+        receipt
+            .try_completed()
+            .expect("remaining bytes may still arrive");
     }
 
     #[test]
