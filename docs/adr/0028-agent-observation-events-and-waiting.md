@@ -266,6 +266,7 @@ Evidence: [hook names](https://github.com/openai/codex/blob/rust-v0.160.1/codex-
 [persistence policy](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/policy.rs#L94-L119),
 and [newline/write/flush](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L2072-L2095).
 
+The following reducer rules apply only after binding validation succeeds.
 For `type: event_msg`, consume `payload.type: task_started` / `task_complete`,
 including the documented aliases `turn_started` / `turn_complete`. Start means
 working; completion with the matching `turn_id` means idle. Terminal non-abort
@@ -422,13 +423,17 @@ Copied parent settings retain their parent ID. Begin child boundary reduction
 after the verified child settings record; this record is an attribution delimiter,
 not a turn end. In referenced history, inherited records remain behind
 `session_meta.history_base`; the same child settings record begins local history.
-If the delimiter/owner cannot be verified, yield unknown rather than treating
-imported starts or completions as the child's turn.
+If the delimiter/owner cannot be verified before lifecycle trust in the current
+launch generation, reject the claim and use screen fallback with
+`binding_validation_failed` and the attribution reason. If this failure instead
+invalidates authority already validated in this generation without known
+retirement, yield unknown. Neither branch treats imported starts or completions
+as the child's turn.
 
 A reducer state may transfer only with proven continuity of the same local
 writer, thread, file and cursor; equal thread IDs alone do not suffice. In
-particular, SessionStart `compact` during a running turn preserves working when
-that continuity is proven. Otherwise it yields unknown with
+particular, SessionStart `compact` during a running turn from a validated binding
+preserves working when that continuity is proven. Otherwise it yields unknown with
 `codex_compaction_continuity_unproven`; compaction is not a fresh-session idle
 boundary. Delayed records from a revoked binding are discarded, including
 within one launch after `/new` or `/clear`.
@@ -551,7 +556,7 @@ existing detector classifies it idle (or working/unknown from its actual screen
 evidence), rather than inheriting the old unmatched start. Submission remains
 eligible under today's screen/composer gates, so that history cannot deadlock
 bootstrap. On binding, the verified new writer's start establishes working;
-If attribution fails before validation in this new launch generation, reject the
+if attribution fails before validation in this new launch generation, reject the
 candidate and use diagnosed screen fallback. If ambiguity invalidates a currently
 validated authority without known retirement, yield unknown. Revalidation must
 not conceal an observed gap in that authority; resynchronize and require a
@@ -604,7 +609,8 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
    a missing condition rather than hang. Test idle wake, self-compact, guarded
    submit, mail delivery and idle waits on quiet known idle: each remains eligible
    under its existing gates. For source-loss unknown, each follows the table above.
-3. Exercise each reducer case independently, with one expected turn state:
+3. After successful binding validation, exercise each reducer case independently,
+   with one expected turn state:
 
    | Input and prior state | Expected turn |
    | --- | --- |
@@ -670,7 +676,15 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
      chrome: the same binding-retention decision must hold.
    - Fork: imported parent completion precedes the child's owned
      thread_settings_applied delimiter; only the child's subsequent start
-     establishes working. Missing/ambiguous delimiter yields unknown.
+     establishes working. Cover missing and ambiguous delimiters separately in
+     both trust scopes: in an untrusted launch generation (including after known
+     retirement), reject the claim and queued callbacks, publish
+     `binding_validation_failed` with the attribution reason and use screen
+     fallback. Test Working, idle and unclassifiable screens plus submission
+     eligibility without another SessionStart. After authority validated in the
+     current generation, the same failures without known retirement yield unknown;
+     changing the binding generation cannot regain fallback. Imported parent
+     boundaries cannot establish child state in either branch.
 
    Same-name/cwd panes with different thread IDs remain isolated: starting only
    pane A yields working for A and idle for an already completed B. Each claimed
@@ -685,9 +699,10 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
    destination starts in screen fallback until its own deferred hook binds.
    Duplicate live writers and a mismatched transcript_path/meta pair fail binding
    validation: untrusted launch generations use screen fallback; current-generation
-   validated authority without known retirement yields unknown. Another thread's end through fork/revert metadata leaves the
-   current active turn working. Private guardian child completions, including
-   their deferred dispatch, cannot complete the parent turn.
+   validated authority without known retirement yields unknown. Another thread's
+   end through fork/revert metadata leaves the current active turn working. Private
+   guardian child completions, including their deferred dispatch, cannot complete
+   the parent turn.
 5. Lifecycle start against hook/screen idle yields working. Lifecycle complete
    against stale Working chrome yields idle. A screen approval prompt against
    lifecycle idle yields `phase: needs_human` with turn unknown; clearing that
