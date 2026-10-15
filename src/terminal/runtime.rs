@@ -375,6 +375,14 @@ impl TerminalRuntime {
         self.0.try_send_flock_authored(bytes)
     }
 
+    pub(crate) fn try_send_flock_authored_tracked(
+        &self,
+        bytes: Bytes,
+    ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
+    {
+        self.0.try_send_flock_authored_tracked(bytes)
+    }
+
     /// When operator input last reached this pane, if it ever has.
     pub fn last_operator_input_at(&self) -> Option<std::time::Instant> {
         self.0.last_operator_input_at()

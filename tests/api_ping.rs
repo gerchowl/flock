@@ -2831,7 +2831,7 @@ with log.open('w') as out:
 }
 
 #[test]
-fn guarded_submit_enter_follows_socket_paste_by_at_least_100ms() {
+fn guarded_submit_socket_paste_precedes_enter_and_starts_turn() {
     use std::os::unix::fs::PermissionsExt;
 
     let _lock = test_lock();
@@ -2849,7 +2849,7 @@ fn guarded_submit_enter_follows_socket_paste_by_at_least_100ms() {
     let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
     fs::write(
         &script,
-        r#"import json, os, sys, time, tty
+        r#"import json, os, sys, tty
 from pathlib import Path
 import socket
 gate = socket.socket(socket.AF_UNIX)
@@ -2864,7 +2864,7 @@ with log.open('w') as out:
         data = os.read(0, 4096)
         if not data:
             break
-        out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
+        out.write(json.dumps({'bytes': list(data)}) + '\n')
         out.flush()
         if b'\r' in data: os.write(1, b'\x1b[2J\x1b[HOpenAI Codex\r\n\xe2\x80\xa2 Working (1s \xe2\x80\xa2 esc to interrupt)\r\n\xe2\x80\xba socket prompt\r\n  ? for shortcuts\r\n')
 "#,
@@ -2926,33 +2926,8 @@ with log.open('w') as out:
     );
     let rows = read_log();
     assert_eq!(bytes(&rows), b"\x1b[200~socket prompt\x1b[201~\r");
-    let paste_at = rows
-        .iter()
-        .find(|row| {
-            row["bytes"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(b's'))
-        })
-        .unwrap()["at"]
-        .as_f64()
-        .unwrap();
-    let enter_at = rows
-        .iter()
-        .find(|row| {
-            row["bytes"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(13))
-        })
-        .unwrap()["at"]
-        .as_f64()
-        .unwrap();
-    assert!(
-        enter_at - paste_at >= 0.100,
-        "Enter followed paste after {} seconds",
-        enter_at - paste_at
-    );
+    // Child read times include scheduling delay. The write-to-Enter interval
+    // is checked at the actor receipt seam in guarded_submit's clock test.
     cleanup_spawned_flock(child, base);
 }
 

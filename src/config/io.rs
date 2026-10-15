@@ -25,6 +25,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "session",
     "slots",
     "spawn",
+    "structured",
     "systemone",
     "terminal",
     "theme",
@@ -522,6 +523,14 @@ fn load_live_config_from_table(
         }
     }
 
+    load_live_section(
+        &table,
+        "structured",
+        "structured launch config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.structured = section,
+    );
     load_live_section(
         &table,
         "theme",
@@ -1516,6 +1525,30 @@ mouse_capture = false
                  — add it there AND wire it into load_live_config_from_table"
             );
         }
+    }
+
+    #[test]
+    fn structured_section_survives_live_reload() {
+        let _lock = crate::config::test_config_env_guard();
+        let dir = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir())
+            .expect("config fixture directory");
+        let base = dir.path().join("config.toml");
+        let token = dir.path().join("token");
+        std::fs::write(
+            &base,
+            format!(
+                "[structured]\nrun_as = 'operator'\ntoken_file = {token:?}\nprofile = 'work'\n"
+            ),
+        )
+        .expect("live config fixture");
+        let loaded = load_live_config_with_base(&base);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(
+            loaded.config.structured.run_as,
+            crate::structured::launch::RunAs::Operator
+        );
+        assert_eq!(loaded.config.structured.token_file, Some(token));
+        assert_eq!(loaded.config.structured.profile, "work");
     }
 
     #[test]

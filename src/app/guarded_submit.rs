@@ -23,12 +23,13 @@ const CLEAR_SLACK: usize = 8;
 pub(crate) struct Attempt {
     pub(crate) evidence: crate::api::schema::DeliveryAttempt,
     pub(crate) text: String,
-    cursor: String,
+    cursor: Box<str>,
     child_pid: Option<u32>,
     operator_input: Option<Instant>,
     prompt_generation: u64,
     pub(crate) due: Instant,
     deadline: Instant,
+    paste_write: Option<crate::pty::write_receipt::WriteReceipt>,
     pub(crate) sent: bool,
     pub(crate) retried: bool,
     wake: bool,
@@ -579,14 +580,17 @@ impl App {
             Some(draft) => clear_keys(runtime, draft),
             None => bytes,
         };
-        if runtime.try_send_flock_authored(Bytes::from(first)).is_err() {
-            // Nothing reached the pane, so a draft is still where it was.
-            if !runtime.end_injection_lease(&evidence.attempt_id) {
-                evidence.held_input_not_written = true;
+        let paste_write = match runtime.try_send_flock_authored_tracked(Bytes::from(first)) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                // Nothing reached the pane, so a draft is still where it was.
+                if !runtime.end_injection_lease(&evidence.attempt_id) {
+                    evidence.held_input_not_written = true;
+                }
+                abandon(evidence, "write_failed");
+                return Err("write_failed");
             }
-            abandon(evidence, "write_failed");
-            return Err("write_failed");
-        }
+        };
         if draft.is_none() {
             evidence.state = "typed".into();
             evidence.typed_at_ms = Some(super::api::messages::now_ms());
@@ -609,12 +613,13 @@ impl App {
         Ok(Attempt {
             evidence,
             text: text.to_owned(),
-            cursor: terminal.turn_cursor(),
+            cursor: terminal.turn_cursor().into_boxed_str(),
             child_pid: runtime.child_pid(),
             operator_input: runtime.last_operator_input_at(),
             prompt_generation: terminal.prompt_report_generation,
             due,
             deadline,
+            paste_write: if draft.is_none() { paste_write } else { None },
             sent: false,
             retried: false,
             wake,
@@ -723,6 +728,11 @@ impl App {
         {
             return Some(Outcome::ObservedAccepted);
         }
+        match attempt.wait_for_paste_write(now) {
+            Ok(true) => return None,
+            Err(outcome) => return Some(outcome),
+            Ok(false) => {}
+        }
         if now < attempt.due {
             return None;
         }
@@ -818,9 +828,10 @@ impl App {
             return Some(Outcome::Abandoned("draft_not_cleared"));
         }
         let bytes = super::api_helpers::encode_api_text(runtime, &attempt.text);
-        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
-            return Some(Outcome::Abandoned("write_failed"));
-        }
+        attempt.paste_write = match runtime.try_send_flock_authored_tracked(Bytes::from(bytes)) {
+            Ok(receipt) => receipt,
+            Err(_) => return Some(Outcome::Abandoned("write_failed")),
+        };
         if let Some(stash) = attempt.stash.as_mut() {
             stash.phase = StashPhase::Held;
         }
@@ -1183,6 +1194,27 @@ impl App {
     }
 }
 
+impl Attempt {
+    /// ADR-0028's type-then-Enter gap starts after the final PTY write, not enqueue.
+    fn wait_for_paste_write(&mut self, now: Instant) -> Result<bool, Outcome> {
+        let Some(receipt) = &self.paste_write else {
+            return Ok(false);
+        };
+        match receipt.try_completed() {
+            Ok(at) => {
+                self.paste_write = None;
+                self.due = at + crate::cli::pane::PANE_RUN_SUBMIT_GAP;
+                Ok(now < self.due)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) if now < self.deadline => {
+                self.due = (now + POLL).min(self.deadline);
+                Ok(true)
+            }
+            Err(_) => Err(Outcome::Abandoned("write_failed")),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Attempt {
     pub(crate) fn test_new() -> Self {
@@ -1195,6 +1227,7 @@ impl Attempt {
             prompt_generation: 0,
             due: Instant::now(),
             deadline: Instant::now() + CONFIRM_WINDOW,
+            paste_write: None,
             sent: false,
             retried: false,
             wake: false,
@@ -1208,6 +1241,50 @@ impl Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_submit_enter_follows_completed_paste_by_at_least_100ms() {
+        let queued = Instant::now();
+        let written = queued + Duration::from_millis(400);
+        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        let mut attempt = Attempt::test_new();
+        attempt.due = queued + crate::cli::pane::PANE_RUN_SUBMIT_GAP;
+        attempt.deadline = queued + CONFIRM_WINDOW;
+        attempt.paste_write = Some(receipt);
+        // The old enqueue deadline has expired while the actor is still busy.
+        assert_eq!(attempt.wait_for_paste_write(written), Ok(true));
+        completion.send(written).unwrap();
+        let early = written + Duration::from_millis(99);
+        assert_eq!(attempt.wait_for_paste_write(early), Ok(true));
+        assert_eq!(attempt.due, written + crate::cli::pane::PANE_RUN_SUBMIT_GAP);
+        assert!(attempt.due.duration_since(written) >= Duration::from_millis(100));
+        assert!(early < attempt.due);
+        assert_eq!(attempt.wait_for_paste_write(attempt.due), Ok(false));
+    }
+
+    #[test]
+    fn pending_paste_write_has_a_bounded_failure_and_rejects_disconnection() {
+        let now = Instant::now();
+        for disconnected in [false, true] {
+            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+            let mut attempt = Attempt::test_new();
+            attempt.paste_write = Some(receipt);
+            attempt.deadline = now + CONFIRM_WINDOW;
+            let mut completion = Some(completion);
+            let at = if disconnected {
+                drop(completion.take());
+                now
+            } else {
+                // The producer stays alive and silent through the failure ceiling.
+                assert_eq!(attempt.wait_for_paste_write(now), Ok(true));
+                attempt.deadline
+            };
+            assert_eq!(
+                attempt.wait_for_paste_write(at),
+                Err(Outcome::Abandoned("write_failed"))
+            );
+        }
+    }
 
     #[test]
     fn codex_startup_passive_banners_leave_composer_ready() {
