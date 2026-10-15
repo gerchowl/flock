@@ -142,11 +142,19 @@ supplies policy identity; a host label is never dialing authority.
 
 ### Observed failure and code evidence
 
-The incident reports an original name resolving to its hibernated old pane,
-while a new `moved-` name resolves to the resumed pane. The migration driver's
-exact commands and a before/after identity capture are not available in #1500.
-Do not infer that the two panes have the same AgentId merely because they resume
-one native conversation. Source inspection explains how this state can persist:
+The reported migration left the old agent records hibernated on the source
+host. Their native sessions were resumed inside a workspace guest under new
+panes labelled `moved-<name>`. The original names still resolved to the
+hibernated source panes, rather than the running guest panes. This is the
+incident topology, not a generic example: copying/resuming session data created
+second placements without retiring the original routable records.
+
+The migration driver's exact commands and a before/after identity capture are
+not available in #1500. The topology is confirmed by the owner, but the two
+records' exact AgentIds are not established by a shared native conversation.
+The design must fix both stale addressing and duplicate native-session use;
+renaming either pane alone fixes neither. Source inspection explains how this
+state can persist:
 
 | Code | What it establishes |
 | --- | --- |
@@ -195,8 +203,13 @@ Resolution is intent-aware, shared by API, CLI, supervisors and reap paths:
 - A unique committed current binding resolves to its live placement. An ordinary
   current hibernated binding remains inspectable/resumable, but send refuses
   `agent_not_ready` before writing. Resume is explicit and checks the move fence.
-- A historical moved target refuses mutation with structured current AgentId,
-  owner, generation and placement hints. It never wakes the old pane. At the
+- A historical moved target refuses mutation with proposed `agent_moved`,
+  registered as `Retry::Never` in `src/api/error_code.rs`. CLI refusal uses the
+  existing `cli::exit::GONE` constant and ADR-0029 classification, never a new
+  numeric exit or the transient `agent_not_ready` class. Structured details name
+  the successor AgentId, terminal/pane, owner and generation. Never retry the
+  same stale target, silently redirect input, or wake its old pane. The caller
+  must inspect the successor and explicitly address it in a new operation. At the
   destination, the transferred original name resolves to the current binding.
   On the source, the original name can report the move without claiming it is
   locally live. Remote action requires explicit configured-peer routing; labels
@@ -211,6 +224,96 @@ Resolution is intent-aware, shared by API, CLI, supervisors and reap paths:
   not identity and never redirects a destructive request to another workspace.
   Existing stable error strings come from `src/api/error_code.rs`; any new
   move-specific codes require registration and ADR-0029 exit classification.
+
+### First slice: local moved records, compatible with mesh v5
+
+Ship this before native cross-node handoff. A local move commits the source
+record's durable lifecycle `moved` and an explicit successor reference
+`(successor_agent_id, successor_terminal_id, successor_pane_id, generation)`
+together with the local placement/alias update. Successor terminal/pane ids
+identify the different placement even when the AgentId is preserved. Ordinary
+hibernate remains a separate state: it must not create this marker implicitly.
+The marker survives restart and old snapshot replay through a durable local
+fence. A restored source projection cannot override that fence.
+
+The common resolver checks the marker for name, label, AgentId and explicit
+terminal/pane targets before mutation. It returns `agent_moved`, `retry: never`
+and the successor details, writes zero bytes and performs no focus, resume,
+spawn, wake or reap side effect. History inspection remains possible. If the
+same AgentId now resolves through a committed current binding, it addresses that
+binding; an explicit old pane always refuses. Lookup checks the committed current
+binding before historical aliases; retired provenance cannot shadow that binding
+or count as another active name conflict. Two genuinely current claims still
+refuse as ambiguous. A source-only original name gives
+the successor hint instead of appearing usable. Removing an active source alias
+must therefore retain a historical lookup that produces this refusal.
+
+This is local persistence and resolver work only: mesh VERSION stays **5**,
+normal v5 mail/owner hints keep their current contract, and no new cross-node
+ownership assertion is published. It prevents the incident's original-name
+lookup from selecting an obsolete pane once that source is explicitly retired.
+It does not automatically find the guest successor or make two servers share a
+transaction. For existing cross-node `moved-` copies, an operator-verified link
+may record the known successor as historical refusal data, never as authority
+for routing, starting, renaming or deleting it. Different existing AgentIds stay
+different pending explicit reconciliation. This first slice does not claim
+native-session exclusivity across hosts or implement identity transfer.
+
+### Durable native-session exclusivity
+
+A placement fence alone would still let a second pane issue a harness resume
+against the conversation used by the first. Add a durable exclusive claim keyed
+by `(harness kind, native-store/account namespace, native_session_id)`, not by
+pane name, cwd or hostname. The namespace identifies the actual session lineage
+and authenticated store/profile boundary without persisting credentials. Paths
+are locators, not identity: aliases of one store must resolve to the same key,
+and a verified export/import carries its origin namespace so copying a store
+cannot silently mint a new claim key. Unverifiable namespace equivalence refuses
+reuse rather than guessing from the session-id string alone.
+
+The local claim registry serializes atomic durable compare-and-set operations.
+Each claim records logical AgentId, placement, generation, pending launch/move
+id and lifecycle; runtime evidence records the owned child birth identity when
+available. Reserve and sync the claim **before** any native session process is
+started. Both public `resume` and `spawn` paths, plus pending-resume/restart and
+migration launch paths, use this same guard. No direct harness-spawn path may
+bypass it. `spawn` with an existing native session is reuse, even under a new
+pane or `moved-` label. Fresh sessions need a reserved unique id passed to the
+harness before launch; a harness unable to do that cannot offer this guarded
+launch mode. A later self-reported id cannot retroactively make a duplicate
+spawn safe.
+
+A claim owned by another current or pending placement refuses with proposed
+`native_session_claimed` (`Retry::Never`) and non-secret owner/generation hints,
+without spawning, sending input, replacing its name or stealing its claim.
+Concurrent spawn/resume requests cannot both win. The same binding may resume
+only through an atomic transition from its own hibernated/stopped claim to a
+new pending generation. Hibernation keeps the reservation: a stopped process is
+not permission for another identity to adopt its conversation. The move
+transaction transfers this claim together with the binding; a release fence
+prevents source resume while the destination owns the next generation.
+
+Crash recovery replays the registry before enabling any launch. If the recorded
+child birth identity is still live, keep the claim. If the exact owned process
+tree is proven gone and no release or competing generation committed, recover
+a pending launch to stopped under the **same owner**, then allow an explicit
+same-owner resume. PID absence alone, elapsed time, an empty pane or an expired
+lease never frees the session. Missing/uncertain child identity, orphaned owner,
+conflicting imports or damaged ledger means retained/quarantined claim and
+structured refusal for operator reconciliation, never automatic deletion or
+reap. A confirmed pre-spawn failure can roll back its own pending reservation;
+an uncertain spawn retains it. Rollback restores a pre-existing stopped claim;
+only a newly reserved, never-started fresh session can become unclaimed.
+Explicit retirement/reassignment needs durable
+proof that the previous claim is fenced and its runner gone, not a new name.
+
+This prevents the incident's second pane from acquiring a session already
+claimed by a local live/hibernated record. A local registry alone cannot exclude
+an independently running source host from a copied store in the guest: that
+requires the authenticated cross-node transfer below. Until that capability is
+approved and deployed, managed cross-node reuse is refused, and out-of-band
+harness launches remain outside this guarantee. Existing duplicate copies are
+protected, not killed or silently "fixed", by the migration policy below.
 
 ### Atomicity and failure recovery
 
@@ -235,9 +338,15 @@ remains in upstream/source custody rather than entering the frozen inbox export.
 The later proof routes that custody without rewriting immutable envelopes.
 
 There can be a period with no running process, but never two authorized runners.
-A crash before release can abort preparation and unquiesce the source only after
-proving no release committed. A crash after release keeps the source fenced even
-if activation fails or the acknowledgement is lost. Reconciliation queries the
+Loss of the source during prepare aborts that prepare: the destination durably
+cancels its reservation/staged activation and never starts the session. A
+cancelled move id cannot activate on replay or a delayed certificate; a new
+prepare needs a new move id. It cannot infer a release from silence or a copied profile. If release might have
+committed, retain the uncertain reservation/fence and reconcile the ledger;
+never unquiesce or activate on a guessed phase. A crash before a proven release
+can abort preparation and unquiesce the source only after proving no release
+committed and no destination activation is authorized. A crash after release
+keeps the source fenced even if activation fails or the acknowledgement is lost. Reconciliation queries the
 move id and committed generation, not wall clocks or name availability. An
 unreachable owner means blocked/offline, not permission to take over. Returning
 to the source after release is a new reverse handoff with a new generation.
@@ -288,11 +397,45 @@ Existing name-based scripts keep the original name on the destination. Source
 scripts receive an explicit refusal and current-location hint rather than sending
 to a dead pane. Scripts should store AgentId plus generation and discover current
 placement for each operation; stale pane/workspace references remain stale.
-Existing `moved-` copies are not silently adopted: inventory both AgentIds,
-sessions, names, outstanding mail and resource claims, then require an explicit
-operator reconciliation. Do not automatically merge histories/inboxes from two
-independently created agents. ADR-0029's exit constants remain authoritative;
+Existing `moved-` copies are protected during migration. Inventory both source
+and guest AgentIds, session namespaces/ids, names, runtime birth identities,
+outstanding mail and resource claims before enabling claims or rewriting aliases.
+Register disputed session keys as retained/conflicted and refuse additional
+resume/spawn attempts. Preserve the existing running guest pane, parked source,
+transcripts, inboxes and worktree claims; do not auto-kill, reap, rename, overwrite
+or restart either copy. A migration must not treat a missing newly introduced
+claim as proof that the old session is unused. Operator reconciliation selects
+the authoritative record and proves the other runner stopped/fenced before any
+claim transfer or name reassignment. Record the historical source's successor
+explicitly; keep both independent histories/inboxes intact. The incident's
+already-created `moved-` pane is therefore not collateral damage of rollout.
+Do not automatically merge histories/inboxes from two independently created
+agents. ADR-0029's exit constants remain authoritative;
 a move/refusal is not a successful send or reap.
+
+### Ordered implementation slices and incident coverage (#1500)
+
+All slices remain proposed work tracked by #1500, not implemented in this PR.
+
+1. **Local retirement and refusal, v5 unchanged.** Persist `moved` plus its
+   successor; enforce `agent_moved`/never in the shared resolver and mutation
+   paths, including restart/snapshot recovery. This addresses original names
+   selecting hibernated source panes. It cannot establish guest ownership.
+2. **Local native-session claim and protected rollout, v5 unchanged.** Guard
+   spawn and resume with the same durable claim, including recovery and existing
+   record inventory/conflict retention. This blocks another local pane from
+   resuming the claimed conversation under `moved-<name>` and protects the
+   already running copies. It does not exclude an independent remote runner.
+3. **Approved cross-node protocol/capability rollout, then fenced handoff.**
+   Subject to the owner decisions below, deploy authenticated generations,
+   native-session claim transfer, mail/resource admission and source-loss abort
+   before enabling native cross-node moves. This is the slice that prevents the
+   source-host/guest split from producing two authorized runners and transfers
+   the original name/identity. Until then, cross-node reuse fails closed.
+4. **Independent symptom verification and any evidenced fixes.** Run the
+   geometry/composer investigations below on owned instances; require a captured
+   failing reproduction before a fix. Neither stale routing nor exclusivity is
+   evidence of a particular width/detector cause in the resumed guest pane.
 
 ### Separate symptom hypotheses and verification
 
@@ -312,9 +455,12 @@ against the baseline, then pass with the accepted change, using owned fakes:
 
 | Criterion | Required failing-before proof |
 | --- | --- |
-| Name and AgentId address the current episode | Begin with a named hibernated source and a differently placed destination; move, restart both, resolve/send the original identity, and assert only the destination receives bytes. |
+| Local moved refusal, mesh v5 unchanged (slice 1) | On one server create a named hibernated source and a successor pane; commit a local move, restart and replay an old snapshot. Explicit old pane/terminal and source-only historical name/label mutations return `agent_moved`, `retry: never`, `GONE` and the successor id with zero bytes/spawns/wakes/reaps. A transferred name/current AgentId resolves to the successor instead; never select the old record first. Without the fence the stale source resolves or resumes. Assert mesh VERSION 5 and unchanged normal v5 mail behavior. |
+| Native-session exclusivity (slice 2) | Use an owned fake harness and one session namespace/id. Race resume and spawn into distinct panes, including a `moved-` label and a store alias: one durable claim wins and at most one process starts; the other returns `native_session_claimed`. Reopen the registry after restart and repeat. Without the guard both launch. |
+| Claim crash recovery and legacy protection (slice 2) | Crash after reservation, spawn-before-child-record, child record and hibernation. A proven stopped owner can explicitly resume; uncertain identity and a live different owner retain/refuse. Seed legacy source plus running guest-copy records with no new claims; rollout preserves both histories/resources and the current process, marks the conflict, and refuses another launch. Restoring a stale snapshot or waiting cannot clear the claim. Without these checks a duplicate launch or destructive adoption occurs. |
+| Name and AgentId address the current episode (slice 3) | Begin with a named hibernated source on one server and a differently placed guest destination; transfer, restart both, resolve/send the original identity, and assert only the destination receives bytes. This cross-node assertion is not acceptance evidence for slice 1 alone. |
 | No ambiguous/inactive mutation | Duplicate names/current claims and explicit historical targets refuse with candidate/current hints and zero input, including focus/resume and reap. |
-| Atomic handoff and recovery | Fault each durable phase and lose each acknowledgement; replay and race two moves. Assert at most one authorized process/alias, stable generation and no source wake after release. A silent producer still fails at a bounded liveness-aware ceiling. |
+| Atomic handoff and recovery (slice 3) | Fault each durable phase and lose each acknowledgement; replay and race two moves. Disconnect the source in prepare: destination cancels prepare and starts no process. Exercise uncertain release separately: both sides retain fences pending durable proof. Assert at most one authorized process/alias, stable generation and no source wake after release. A silent producer still fails at a bounded liveness-aware ceiling. |
 | Mail and resources survive | Queue unread/read/in-flight mail, move, replay an old owner update, and retry a lost receipt. Preserve keys/dedupe/read state/TTL; an old workspace reap cannot remove a destination-claimed checkout. |
 | Version/script compatibility | An unsupported peer refuses without partial release; v5 normal mail still follows its existing contract. Legacy references give a useful refusal, never success at a retired pane. |
 | Geometry and composer symptoms | Drive real client resize/layout/native fake resume, capture recent buffers, and compare the two hypotheses above. Do not create detector fixtures from invented incidental text. |
@@ -328,10 +474,11 @@ against the baseline, then pass with the accepted change, using owned fakes:
    extension (recommended v6) for native cross-node handoff. If VERSION must stay
    5, limit this work to local fencing/refusal and same-node moves; do not claim
    an atomic native cross-node move or change v5 custody authority silently.
-3. **Owner decision required:** approve fail-closed recovery after source loss.
-   Forced takeover without the source's durable release needs a separate approved
-   authority/recovery mechanism; it is outside this proposal's guarantees and
-   remains part of #1500's decision record.
+3. **Owner decision required:** any future forced takeover needs a separately
+   approved authority/recovery mechanism under #1500. This proposal already
+   specifies fail-closed source loss: abort a pre-release prepare, retain an
+   uncertain release, and never activate from silence. Forced takeover without
+   the source's durable release is outside its guarantees.
 4. **Owner decision required:** choose whether migrated resource claims can
    authorize eventual source-checkout cleanup, and how shared storage is attested.
    Until accepted, moving alone grants no automatic worktree deletion authority.
