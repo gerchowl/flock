@@ -9,7 +9,7 @@ pub struct GitSpaceMetadata {
     pub repo_root: PathBuf,
     pub is_linked_worktree: bool,
     /// Machine-independent project identity: the normalized origin URL
-    /// (e.g. "github.com/owner/repo"), or a "dir:<name>" fallback when the
+    /// (e.g. "github.com/owner/repo"), or a `dir:<name>` fallback when the
     /// repo has no origin remote. Folds checkouts of the same project across
     /// federated peer servers.
     pub project_key: String,
@@ -100,7 +100,7 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
 }
 
 /// Machine-independent project key: normalized origin URL from the repo's
-/// git config, falling back to "dir:<label>" for origin-less repos.
+/// git config, falling back to `dir:<label>` for origin-less repos.
 ///
 /// #102 hardening:
 /// - Prefer `remote.origin.pushurl` when set (it's the fresher target,

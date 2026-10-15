@@ -418,6 +418,48 @@ fn handoff_ready_error(cause: io::Error, restore_error: Option<io::Error>) -> io
     )
 }
 
+/// Leaf operations for the production commit-recovery closure.
+trait HandoffCommitRecovery {
+    fn cleanup_importer(&mut self);
+    fn restore_public_sockets(&mut self) -> io::Result<()>;
+    fn rollback(&mut self);
+}
+
+/// Share the production order so rollback also runs when restoration fails.
+fn commit_recovery(
+    recovery: &mut impl HandoffCommitRecovery,
+) -> impl FnOnce() -> io::Result<()> + '_ {
+    || {
+        recovery.cleanup_importer();
+        let restore_result = recovery.restore_public_sockets();
+        recovery.rollback();
+        restore_result
+    }
+}
+
+struct ServerCommitRecovery<'a> {
+    server: &'a mut HeadlessServer,
+    importer: &'a mut std::process::Child,
+    socket_path: &'a Path,
+    paused_terminal_ids: &'a [crate::terminal::TerminalId],
+}
+
+impl HandoffCommitRecovery for ServerCommitRecovery<'_> {
+    fn cleanup_importer(&mut self) {
+        crate::server::handoff::cleanup_failed_import_child(self.importer);
+    }
+
+    fn restore_public_sockets(&mut self) -> io::Result<()> {
+        self.server
+            .wait_then_restore_public_sockets_after_failed_handoff()
+    }
+
+    fn rollback(&mut self) {
+        self.server
+            .rollback_handoff_before_commit(self.socket_path, self.paused_terminal_ids);
+    }
+}
+
 /// Finish commit or recover the old server, preserving both failure diagnostics.
 fn finish_handoff_commit(
     commit_result: io::Result<()>,
@@ -1388,12 +1430,13 @@ impl HeadlessServer {
         } else {
             crate::server::handoff::report_committed(&mut stream)
         };
-        finish_handoff_commit(commit_result, || {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            let restore_result = self.wait_then_restore_public_sockets_after_failed_handoff();
-            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-            restore_result
-        })?;
+        let mut recovery = ServerCommitRecovery {
+            server: self,
+            importer: &mut import_child,
+            socket_path: &socket_path,
+            paused_terminal_ids: &paused_terminal_ids,
+        };
+        finish_handoff_commit(commit_result, commit_recovery(&mut recovery))?;
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
@@ -4347,6 +4390,92 @@ mod tests {
         }
     }
 
+    fn commit_restore_fixture() -> (crate::test_socket_dir::SocketDir, UnixListener, PathBuf) {
+        let directory = crate::test_socket_dir::SocketDir::reserve("hcr");
+        let socket_path = directory.path().join("restore.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        (directory, listener, socket_path)
+    }
+
+    #[test]
+    fn commit_restore_fixture_is_removed_on_unwind() {
+        let mut fixture_path = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (directory, _listener, socket_path) = commit_restore_fixture();
+            fixture_path = Some(directory.path().to_path_buf());
+            assert!(socket_path.exists());
+            panic!("fixture assertion failed");
+        }));
+        assert!(panic.is_err());
+        let path = fixture_path.unwrap();
+        assert!(
+            !path.exists(),
+            "fixture directory leaked on panic: {}",
+            path.display()
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordedCommitRecovery {
+        steps: Vec<&'static str>,
+        restore_fails: bool,
+    }
+
+    impl HandoffCommitRecovery for RecordedCommitRecovery {
+        fn cleanup_importer(&mut self) {
+            self.steps.push("cleanup");
+        }
+        fn restore_public_sockets(&mut self) -> io::Result<()> {
+            self.steps.push("restore");
+            if self.restore_fails {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "fixture restore failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rollback(&mut self) {
+            self.steps.push("rollback");
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_orders_cleanup_restore_rollback() {
+        for restore_fails in [false, true] {
+            let mut recovery = RecordedCommitRecovery {
+                restore_fails,
+                ..Default::default()
+            };
+            let err = finish_handoff_commit(
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "commit failed")),
+                commit_recovery(&mut recovery),
+            )
+            .unwrap_err();
+            assert_eq!(recovery.steps, ["cleanup", "restore", "rollback"]);
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            if restore_fails {
+                let context = err
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<HandoffRollbackError>()
+                    .unwrap();
+                assert_eq!(
+                    context.restore_error.as_ref().unwrap().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_is_unused_after_commit_success() {
+        let mut recovery = RecordedCommitRecovery::default();
+        finish_handoff_commit(Ok(()), commit_recovery(&mut recovery)).unwrap();
+        assert!(recovery.steps.is_empty());
+    }
+
     #[test]
     fn commit_and_socket_restore_failures_preserve_original_kind_and_source() {
         let (mut exporter, importer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -4360,15 +4489,12 @@ mod tests {
             original_kind,
             io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
         ));
-        let socket_path =
-            std::env::temp_dir().join(format!("commit-restore-{}.sock", std::process::id()));
-        let _occupied = UnixListener::bind(&socket_path).unwrap();
+        let (_directory, _occupied, socket_path) = commit_restore_fixture();
         let mut recovery_attempted = false;
         let result = finish_handoff_commit(commit_result, || {
             recovery_attempted = true;
             UnixListener::bind(&socket_path).map(drop)
         });
-        fs::remove_file(&socket_path).unwrap();
         let err = result.unwrap_err();
         assert!(recovery_attempted);
         assert_eq!(err.kind(), original_kind);

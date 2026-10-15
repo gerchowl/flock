@@ -1109,11 +1109,14 @@ impl Drop for PausedServer<'_> {
 #[test]
 fn a28_a_frozen_server_cannot_hold_start_in_readiness() {
     const READY_TIMEOUT: Duration = Duration::from_secs(3);
-    // Four times the documented readiness + three wind-down caps. Failure
-    // backstop only: protocol evidence, never speed, decides success.
-    const CEILING: Duration = READY_TIMEOUT
-        .saturating_add(delegate_timeouts::REQUEST_TIMEOUT.saturating_mul(3))
-        .saturating_mul(4);
+    // cap_for in delegate.rs allows 60 seconds for agent.start before the
+    // frozen phase. Add that start budget to four times the documented
+    // readiness + three wind-down caps. This bounds failure only (ADR-0037 §1).
+    const CEILING: Duration = Duration::from_secs(60).saturating_add(
+        READY_TIMEOUT
+            .saturating_add(delegate_timeouts::REQUEST_TIMEOUT.saturating_mul(3))
+            .saturating_mul(4),
+    );
     let server = start_server();
     operator_workspace(&server);
     let b = brief(&server, "task.md", "x\n");
@@ -1146,7 +1149,7 @@ fn a28_a_frozen_server_cannot_hold_start_in_readiness() {
         .expect("CLI entered readiness");
     let paused = PausedServer::new(&server);
     proxy.release_frozen();
-    a28_readiness::prove_abandonment(&events, &stages, || proxy.seal())
+    a28_readiness::prove_abandonment(&events, &stages, READY_TIMEOUT, || proxy.seal())
         .expect("finite capped requests abandoned without server responses, then CLI exit");
     let out = child.finish();
     drop(paused);

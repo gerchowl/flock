@@ -11,9 +11,13 @@
 - Builds on: ADR-0005 (durable event log), ADR-0008 / ADR-0018 / ADR-0019 (mail,
   wake, channel push), ADR-0026 (mesh custody), #850 (injection lock).
 - Decision owner: operator.
-- Amendment (2026-10-15, #1479): §1a records accepted Codex lifecycle authority;
-  its source/continuity contract is proposed for review before implementation;
-  format/version policy awaits an owner decision (§1a).
+- Amendment (2026-10-15, #1479, clarified by #1519): §1a records accepted
+  Codex lifecycle authority; its source/continuity contract is proposed for
+  review before implementation; format/version policy awaits an owner
+  decision (§1a).
+- Proposed amendment (2026-10-15, #1574): §1b specifies detection-sample
+  receipts, output cursors and legacy revision deprecation. Owner decision
+  required; this subsection is not accepted or implemented.
 - Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
@@ -265,6 +269,7 @@ Evidence: [hook names](https://github.com/openai/codex/blob/rust-v0.160.1/codex-
 [persistence policy](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/policy.rs#L94-L119),
 and [newline/write/flush](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L2072-L2095).
 
+The following reducer rules apply only after binding validation succeeds.
 For `type: event_msg`, consume `payload.type: task_started` / `task_complete`,
 including the documented aliases `turn_started` / `turn_complete`. Start means
 working; completion with the matching `turn_id` means idle. Terminal non-abort
@@ -320,7 +325,23 @@ Thus a launch, resume or clear can sit at its prompt without any SessionStart.
 Do not require that hook to permit the prompt that causes it. On the first
 SessionStart, validate and bind, catch up the rollout and normally report
 working from that turn's already-written start. From then on lifecycle has
-precedence; validation failure after a binding claim yields unknown.
+precedence. Scope lifecycle trust to the pane's **launch generation**, as in the
+binding key above: track whether that generation has held a successfully validated
+binding. An explicit retirement through a known launch or resume ends that scope
+and resets trust for the new generation. A new SessionStart claim, binding
+generation or rebind request alone does not reset it.
+Pending validation yields unknown. If binding validation fails before lifecycle
+has been trusted in the current launch generation, reject the claim and its
+queued callbacks,
+publish `unavailable: binding_validation_failed` with the failure reason, and
+return to the existing screen fallback. A Working screen therefore means working;
+unclassifiable evidence remains unknown. This fallback does not manufacture idle
+or require another SessionStart before screen-based submission can be eligible.
+Without a known retirement, failed revalidation or unexplained loss of a
+currently-bound validated authority yields unknown; a rejected claim cannot erase
+that generation's trust history to regain fallback. This same split applies to
+all binding-validation and attribution failures below. Only a freshly validated
+binding can establish lifecycle authority again.
 
 **Every SessionStart rebinds**, even within one OS launch and even when the
 reported thread ID has not changed. Increment the binding generation and revoke
@@ -341,31 +362,59 @@ An index may assist validation, not choose a different file over the hook's
 path. A missing path needs an explicit unavailable-source explanation or leaves
 an expected local source initializing; never guess a file by name/cwd or search
 an unrelated profile. Do not follow remote-reported paths. Ambiguous writers
-or mismatched metadata yield unknown.
+or mismatched metadata fail binding validation: use screen fallback if the current
+launch generation has not trusted lifecycle, or unknown after validation without
+an explicit known retirement.
 
-On a known launch/resume or confirmed thread replacement (`/new`, `/clear`),
-retire the old binding and discard its queued callbacks, then return to
-`unavailable: awaiting_first_turn` and screen fallback until the next
-SessionStart. Use an attributed runtime replacement confirmation, not typed
-command text, an idle composer, a label or a timeout, as replacement evidence.
-**Observability limit:** today's Codex integration [installs only SessionStart](../../src/integration/mod.rs#L1831-L1838);
-it does not receive an immediate clear/new confirmation. For a command entered
-inside the TUI that flk cannot observe as a confirmed replacement, retirement
-cannot occur before the next SessionStart. Keep the old binding until that
-report atomically retires it and claims the new binding; do not pretend a
-pre-hook fallback transition was observed. Known launch/resume generation
-changes are observable to flk before the hook and do enter fallback immediately.
-An observed source failure without replacement evidence still yields unknown,
-never this bootstrap fallback. The implementation must expose this limitation
-and test both confirmed and initially unobserved replacement paths.
+Known launch/resume generation changes are observable to flk before the hook:
+retire the old binding, discard its queued callbacks and reset lifecycle trust for
+the new launch generation, then return to `unavailable: awaiting_first_turn` and
+screen fallback until the next SessionStart. If that new claim fails validation,
+use diagnosed screen fallback: authority in the retired generation cannot strand
+the new launch at unknown.
+
+**Future work, not a current producer (#1479):** an attributed runtime confirmation
+of an in-TUI thread replacement would permit the same retirement. Today's Codex
+integration [installs only SessionStart](../../src/integration/mod.rs#L1831-L1838);
+it has no real producer of immediate clear/new/resume/fork confirmation. Typed
+command text, an idle composer, a label and a timeout are not confirmation.
+A model test of this future contract must not be presented as a working runtime
+replacement path.
+
+**Observability limit and false idle:** after an in-TUI `/clear`, `/new`, `/resume`
+or `/fork` without confirmation, keep the old binding until the next SessionStart
+atomically replaces it. If the old binding is idle, it still wins over the new
+thread's first visible Working frame during the deferred-hook window. If the hook
+report is lost, for example during a socket restart or hook-command timeout,
+this false idle can persist for the whole new thread. Do not claim that an early
+retirement or pre-hook fallback was observed.
+
+Publish the lifecycle/screen disagreement diagnostic for this idle-versus-Working
+case, including the old binding generation/thread ID, last lifecycle boundary,
+verified file identity/cursor, latest successful EOF observation and the classified
+screen evidence. Publish it when disagreement is observed and keep the current
+diagnostic available while it persists, including when no new hook ever arrives.
+These facts expose possible stale attribution; they do not prove replacement.
+
+**Retirement decision:** Working chrome plus an unchanged bound file is
+insufficient to retire a binding. It also occurs after a real completion with
+stale Working chrome, and an empty read is normal. Preserve the binding, its
+lifecycle idle and the diagnostic in both cases. Neither elapsed time nor repeated
+EOF checks may turn this into fallback or a new thread claim. A later validated
+SessionStart replaces the generation; an operator-requested rebind must validate
+attribution before publishing another lifecycle decision. Test both indistinguishable
+cases and the lost-report case explicitly. Unexplained loss of authority trusted
+in the current launch generation still yields unknown, rather than bootstrap
+fallback.
 
 For a resume, record the pre-launch file identity, verified prefix and complete
 byte offset, and buffer appended records until binding validation succeeds.
 At the deferred SessionStart, use the new writer's attributable start after that
 snapshot, not an inherited unfinished turn or old completion, as the current
 boundary. A copied snapshot also needs destination verification and local
-ownership. Missing/bad paths or metadata, ambiguous writers and discontinuity
-after the binding claim yield unknown. No empty-history or pre-launch completion
+ownership. Missing/bad paths or metadata and ambiguous writers fail validation
+under the current-generation untrusted versus validated rule above. Discontinuity
+after validation yields unknown. No empty-history or pre-launch completion
 boundary establishes lifecycle idle.
 
 For a copied fork, the boundary after imported history is the child's
@@ -377,13 +426,17 @@ Copied parent settings retain their parent ID. Begin child boundary reduction
 after the verified child settings record; this record is an attribution delimiter,
 not a turn end. In referenced history, inherited records remain behind
 `session_meta.history_base`; the same child settings record begins local history.
-If the delimiter/owner cannot be verified, yield unknown rather than treating
-imported starts or completions as the child's turn.
+If the delimiter/owner cannot be verified before lifecycle trust in the current
+launch generation, reject the claim and use screen fallback with
+`binding_validation_failed` and the attribution reason. If this failure instead
+invalidates authority already validated in this generation without known
+retirement, yield unknown. Neither branch treats imported starts or completions
+as the child's turn.
 
 A reducer state may transfer only with proven continuity of the same local
 writer, thread, file and cursor; equal thread IDs alone do not suffice. In
-particular, SessionStart `compact` during a running turn preserves working when
-that continuity is proven. Otherwise it yields unknown with
+particular, SessionStart `compact` during a running turn from a validated binding
+preserves working when that continuity is proven. Otherwise it yields unknown with
 `codex_compaction_continuity_unproven`; compaction is not a fresh-session idle
 boundary. Delayed records from a revoked binding are discarded, including
 within one launch after `/new` or `/clear`.
@@ -393,8 +446,11 @@ new launch generation. Rebind to the destination's **local** writer and Codex
 home; copied history remains history. Replace the pane/socket integration
 environment with the destination's route. The old hibernated record cannot
 consume destination events. Reject a report routed only by an old name/alias.
-Known duplicate live ownership of a thread is ambiguous and yields unknown
-until resolved, never last-callback-wins. These are the adapter's requirements
+Known duplicate live ownership of a thread fails attribution. Before lifecycle
+has been trusted in the destination's launch generation, reject that claim and
+use diagnosed screen fallback. If it invalidates a currently validated binding
+without known retirement, yield unknown until resolved. Never use
+last-callback-wins. These are the adapter's requirements
 on #1500's move transaction; name lookup, move UI and narrow resumed panes
 remain outside this amendment. A rollout copy alone grants no authority.
 
@@ -452,8 +508,10 @@ and [distinct history/ephemeral fields](https://github.com/openai/codex/blob/rus
 | Screen approval/question prompt (`needs_human`), even with lifecycle idle | Attention wins: `turn: unknown`, `attention: needs_human`, `phase: needs_human`, per §1. Preserve the underlying lifecycle boundary for when attention clears. |
 | Available, synchronized start without a matching end | Working until matching end or observed source loss; ignore hook/screen idle, DONE text and hidden Working chrome. |
 | Available, synchronized matching complete/abort, no attention | Idle despite stale Working chrome; background remains independent. |
-| No binding yet, or old binding retired on confirmed replacement | Screen fallback with `awaiting_first_turn`; no lifecycle claim until SessionStart. |
-| Expected/claimed but validating, lost, unreadable, discontinuous or ambiguous | Unknown with source and reason; hook/screen cannot conceal source loss. |
+| No binding yet, or old binding retired on a known launch/resume change (future: attributed in-TUI replacement confirmation) | Screen fallback with `awaiting_first_turn`; no lifecycle claim until SessionStart. |
+| Binding validation failed before this launch generation held a validated lifecycle binding, including after known launch/resume retirement | Reject the claim; screen fallback with `binding_validation_failed`, its reason and selected source. Screen Working stays working; unclassifiable evidence stays unknown. |
+| Claimed and still validating, or current-generation validated source lost, unreadable, discontinuous or ambiguous without known retirement | Unknown with source and reason; hook/screen cannot conceal source loss. |
+| Validated old binding idle, visible Working, file unchanged, no replacement report | Retain lifecycle idle and binding; publish the disagreement diagnostic. This covers the new-thread false-idle window and stale Working chrome. |
 | Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the proposed policy) | Hook then screen fallback for absent/disabled adapters; the proposed unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
 
 **No silence lease.** The last validated lifecycle boundary holds, however old,
@@ -468,9 +526,12 @@ plus source health and degradation reason. Consumers must not reinterpret age as
 a lease or a second idle/unknown timeout. Reader supervision checks flk's own
 progress, including successful EOF checks, not Codex event frequency. Observed
 source loss yields unknown immediately; an idle composer cannot override it.
-After a claimed source is lost it cannot quietly become unavailable for fallback.
-Confirmed launch/thread replacement is the explicit exception: retire ownership
-and return to awaiting-first-turn fallback as specified above.
+After a validated source is lost it cannot quietly become unavailable for fallback.
+Failed initial binding validation in an untrusted launch generation is the
+bootstrap exception above. Known launch/resume retirement explicitly ends the old
+trust scope and returns the new generation to awaiting-first-turn fallback;
+rejected claims without that retirement cannot hide source loss. Confirmed in-TUI
+replacement remains future work.
 Explicit version/config unavailability is diagnosed at binding, under the pending
 policy above. Rebind again to switch policy/version, rather than reinterpret an
 active binding's cached state.
@@ -487,9 +548,10 @@ or a non-contiguous sequence of turn IDs. Legacy files cannot prove that an
 upstream producer silently omitted a well-formed record; this format limitation
 belongs to the owner decision. **Residual risks:** if the writer remains alive
 but its end record is lost, the last start holds working indefinitely. Publish
-a diagnostic when lifecycle and screen disagree, exposing both observations
-and the active boundary so an operator can request a rebind. Neither the
-diagnostic nor requesting a rebind changes state on its own: rebind must validate
+a diagnostic when lifecycle and screen disagree in either direction, including
+the false-idle new-thread window and lost SessionStart report described above.
+Expose both observations and the active boundary so an operator can request a
+rebind. Neither the diagnostic nor requesting a rebind changes state on its own: rebind must validate
 and reconstruct a trustworthy current boundary before publishing a new decision.
 A resume of a file whose last turn never ended is a second residual risk:
 before SessionStart, screen fallback shows the current prompt as idle when the
@@ -497,9 +559,11 @@ existing detector classifies it idle (or working/unknown from its actual screen
 evidence), rather than inheriting the old unmatched start. Submission remains
 eligible under today's screen/composer gates, so that history cannot deadlock
 bootstrap. On binding, the verified new writer's start establishes working;
-ambiguous attribution remains unknown. Revalidation must not conceal an observed
-gap; resynchronize and require a trustworthy current boundary before publishing
-state.
+if attribution fails before validation in this new launch generation, reject the
+candidate and use diagnosed screen fallback. If ambiguity invalidates a currently
+validated authority without known retirement, yield unknown. Revalidation must
+not conceal an observed gap in that authority; resynchronize and require a
+trustworthy current boundary before publishing state.
 
 Background remains independent (§1). A child process or terminal count cannot
 supply missing turn evidence. Completion with a live child remains idle with
@@ -535,13 +599,21 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
    before and passes after implementation through agent get/list, events and waits.
 2. Long tool call with no records and a live writer yields working after hours
    of supplied-clock advance. Silence after completion yields idle after hours.
-   A claimed but unverified binding yields unknown. Writer exit yields unknown;
+   A claimed binding still validating yields unknown. Failed first binding
+   validation before lifecycle trust in this launch generation rejects the claim
+   and returns to screen:
+   test Working, idle and unclassifiable screens independently, plus submission
+   eligibility with no later SessionStart. After a validated binding, a rejected
+   claim without known retirement yields unknown even if that new claim was never
+   validated; changing binding generations must not erase the current launch's
+   trust. Writer exit yields unknown;
    PID reuse yields unknown; a supervised wedged/dead reader yields unknown;
    replacement or truncation yields unknown. Bounded integration waits must name
    a missing condition rather than hang. Test idle wake, self-compact, guarded
    submit, mail delivery and idle waits on quiet known idle: each remains eligible
    under its existing gates. For source-loss unknown, each follows the table above.
-3. Exercise each reducer case independently, with one expected turn state:
+3. After successful binding validation, exercise each reducer case independently,
+   with one expected turn state:
 
    | Input and prior state | Expected turn |
    | --- | --- |
@@ -580,32 +652,64 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
      as working. Cover completed history and a last turn that never ended,
      including verified copied history; neither supplies a bootstrap idle
      lifecycle boundary or blocks screen-based submission.
-   - Confirmed `/clear` or `/new` during a session: retire the old binding,
-     enter screen fallback, then the next turn's SessionStart binds as working.
-     Delayed old callbacks cannot affect the fallback or new active turn.
-   - A manually entered clear/new without observable replacement confirmation
-     retains the old binding until the next SessionStart atomically replaces it.
-     Assert this observability limitation rather than inventing an early signal.
+   - Known resume after lifecycle trust: explicitly retire the old binding,
+     advance the launch generation and reset trust. If the new SessionStart fails
+     validation, publish `binding_validation_failed` and use screen fallback,
+     not unknown. Test Working, idle and unclassifiable screen evidence; no later
+     SessionStart is required to leave the rejected claim. Old callbacks cannot
+     affect the new generation.
+   - Counter-case: a validated binding followed by a rejected SessionStart claim
+     without a known retirement keeps the same launch-generation trust scope and
+     yields unknown. A binding-generation change alone cannot authorize fallback.
+   - Future model-only contract, with no real producer today: an attributed
+     in-TUI replacement confirmation retires the old binding, enters screen
+     fallback, then the next turn's SessionStart binds as working. Delayed old
+     callbacks cannot affect fallback or the new turn. Track the producer in
+     #1479; do not claim this simulated path is runtime integration evidence.
+   - For each in-TUI `/clear`, `/new`, `/resume` and `/fork` without confirmation,
+     start from an old validated idle binding. Feed a new Working screen while
+     the bound file remains unchanged: retain old lifecycle idle and generation,
+     and publish the diagnostic with both observations and the verified cursor.
+     Deliver the deferred SessionStart and validate the new start: only then
+     retire the old generation and report working for the new binding.
+   - Lose that SessionStart report while the writer remains alive. Advance the
+     supplied clock and repeat successful EOF checks: false idle and the
+     diagnostic persist; no silence-based retirement or guessed rebind occurs.
+     Replay the same observations after a real completion with stale Working
+     chrome: the same binding-retention decision must hold.
    - Fork: imported parent completion precedes the child's owned
      thread_settings_applied delimiter; only the child's subsequent start
-     establishes working. Missing/ambiguous delimiter yields unknown.
+     establishes working. Cover missing and ambiguous delimiters separately in
+     both trust scopes: in an untrusted launch generation (including after known
+     retirement), reject the claim and queued callbacks, publish
+     `binding_validation_failed` with the attribution reason and use screen
+     fallback. Test Working, idle and unclassifiable screens plus submission
+     eligibility without another SessionStart. After authority validated in the
+     current generation, the same failures without known retirement yield unknown;
+     changing the binding generation cannot regain fallback. Imported parent
+     boundaries cannot establish child state in either branch.
 
    Same-name/cwd panes with different thread IDs remain isolated: starting only
    pane A yields working for A and idle for an already completed B. Each claimed
-   but unvalidated SessionStart binding yields unknown. Compaction during an
+   but still-validating SessionStart binding yields unknown. Failed initial
+   validation uses screen fallback when the current launch generation is untrusted,
+   including after known launch/resume retirement. Rejection after current-generation
+   trust without known retirement yields unknown. Compaction during an
    active turn with proven writer/thread/file/cursor continuity stays working;
    unproven continuity yields unknown with
    `codex_compaction_continuity_unproven`. A stale callback while the rebound turn
    runs leaves working. After a move the old pane remains hibernated; the
    destination starts in screen fallback until its own deferred hook binds.
-   Duplicate live writers yield unknown. A mismatched transcript_path/meta pair
-   yields unknown. Another thread's end through fork/revert metadata leaves the
-   current active turn working. Private guardian child completions, including
-   their deferred dispatch, cannot complete the parent turn.
+   Duplicate live writers and a mismatched transcript_path/meta pair fail binding
+   validation: untrusted launch generations use screen fallback; current-generation
+   validated authority without known retirement yields unknown. Another thread's
+   end through fork/revert metadata leaves the current active turn working. Private
+   guardian child completions, including their deferred dispatch, cannot complete
+   the parent turn.
 5. Lifecycle start against hook/screen idle yields working. Lifecycle complete
    against stale Working chrome yields idle. A screen approval prompt against
    lifecycle idle yields `phase: needs_human` with turn unknown; clearing that
-   prompt restores idle from the retained completion. Claimed source loss against
+   prompt restores idle from the retained completion. Validated source loss against
    screen idle yields unknown. Unsupported version with a visible Working screen
    yields working from screen with `unsupported_codex_version`; with unclassifiable
    screen it yields unknown. Resume with tested creation metadata but an untested
@@ -618,6 +722,283 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
 The code PR must include captured-frame provenance, the deterministic failing
 baseline, source-loss diagnostics and these results. This docs PR implements
 no reader, hook, detector, protocol field or configuration setting.
+
+### 1b. Proposed: detection-sample receipts and output cursors (#1574)
+
+**Status: Proposed — Owner decision required.** This subsection is a design
+proposal, not part of this ADR's accepted implementation contract yet. Approval
+and implementation are tracked by [#1574](https://github.com/gerchowl/flock/issues/1574).
+No product behavior changes with this amendment. The existing `turn_cursor`,
+lifecycle authority (§1a), and durable event `seq` (§3) retain their meanings.
+
+#### Problem and historical evidence
+
+The consecutive hollow-spinner replay in #1570 can match text already on screen
+and read the old Working status before a detector samples the redraw. A paint
+acknowledgement is insufficient: a detector pass already in flight can later
+publish a result computed from an older snapshot. An unchanged screen also needs
+an acknowledgement, so a content-change counter alone cannot solve the problem.
+
+`git log -S 'revision'` traces the wire field to
+[`fd1e3b8b`](https://github.com/gerchowl/flock/commit/fd1e3b8b056b2937fc0a5c90bf482e01d269f6b2)
+(2026-03-29, initial socket API). That commit introduced `PaneInfo.revision`,
+`PaneReadResult.revision`, `OutputMatched.revision`, and
+`PaneOutputChanged { min_revision }`; its live replies in `src/app/mod.rs`
+already returned zero. The read/wait/filter relationship suggests an output
+snapshot revision, not a detector-sample counter. This is an inference from the
+schema and its consumers, rather than a recovered explicit design decision.
+
+`86adf883` (2026-05-17) forwarded pane revision through the new agent facade;
+`a36da363` extracted `TerminalState.revision`, initialized to zero, and
+`866aaf74` (2026-05-21) retained zero in the split read handlers. Searches with
+`git log -S` and `git log -G` for incrementing writers, plus inspection of these
+commits, found no implemented advancing writer. Today
+`src/app/api/panes.rs` and `src/app/api/agents.rs` hardcode read revision zero;
+`src/app/agents.rs` forwards the terminal field. This is an unfinished output
+revision contract, with no evidence here of a recently removed detection writer.
+
+`turn_cursor` counts execution/state/working transitions, not observations.
+`emit_pane_state_update` emits a status event only when status or presentation
+changes. Neither proves that a stable Working screen was sampled. The current
+screen detector reads the entire current terminal screen: the 24-row constant
+is a geometry fallback, not a guaranteed region in which a visible header is
+ignored (`src/pane/terminal.rs::ghostty_detection_text`).
+
+#### Recommended signal and its causal boundary
+
+Use two distinct opaque cursors, scoped to one local pane runtime incarnation:
+
+| Value | Advances when | Does not mean |
+| --- | --- | --- |
+| `output_cursor` | The parser accepts a nonempty PTY byte batch, including identical redraw bytes, or a resize/restore/style mutation changes inputs available to detection. | A detection pass completed, a turn ended, or an operator viewport changed. |
+| `detection_cursor` | A completed pass captures a snapshot and its result is applied to this pane's server state, including passes over unchanged content. | Content changed, state changed, or lifecycle authority changed. |
+
+Each cursor contains a version, runtime observation epoch, and unsigned 64-bit
+counter; the API represents it as an opaque string, not a JSON number susceptible
+to precision loss. Illustrative forms are `o1:<epoch>:<counter>` and
+`d1:<epoch>:<counter>`. Clients pass these strings back, not parse or compare
+their internal fields. Counter zero means no output/pass yet; it is not a
+completed sample. Counter overflow rotates the observation epoch and invalidates
+old cursors, never wraps or silently saturates.
+
+The scope is the pane's owned terminal runtime, not an agent label, session
+binding or workspace. Renaming an agent or moving its pane within the same
+runtime does not reset the cursors. An agent-facing wait resolves and pins the
+agent identity and pane incarnation at registration; it cannot follow a reused
+name to another agent. A sample does not validate or retire a lifecycle binding.
+
+Capture detection text, relevant styles/geometry and `output_cursor` under the
+same parser lock. Advance the output counter at the parser commit boundary,
+not at socket accept, queued input, or a later API read. Operator scrolling does
+not advance it: detection remains anchored to the bottom, independent of the
+user-visible viewport. The cursor describes parser progress, not equality of
+all possible transformed `pane.read` outputs. Read handlers return the output
+cursor captured with their returned text; they must not fetch a newer cursor
+after releasing the snapshot lock.
+
+After classification, send an internal observation carrying the captured output
+cursor, outcome and raw detector facts. Each producer has an ordered capture
+ordinal within its epoch; discard stale-epoch or out-of-order observations before
+they mutate state. Increment `detection_cursor` only after the app applies that
+observation and arbitrates effective state. Publish one immutable receipt:
+
+- detection cursor and the output cursor actually sampled;
+- classified agent/terminal identity and the existing turn cursor;
+- outcome: `classified`, `skipped`, `unidentified`, or `process_exited`;
+- raw screen state when classified, effective agent status, and its authority.
+
+The receipt is one committed observation, not a mixture of a new cursor and old
+status. Blank or intentionally skipped content still completes a pass and
+advances the detection cursor with its honest outcome; it cannot certify that a
+retained Working state was freshly classified. A pass that fails before capture
+or application does not advance anything. Failure/worker death is surfaced to
+waiters. Both ordinary and adopted-pane detection loops must use this boundary.
+No full screen text is copied into receipts or emitted in telemetry.
+
+#### Runtime lifetime, restart and handoff
+
+**Owner decision required — recommendation: invalidate rather than persist.**
+Mint a fresh cryptographically random 128-bit observation epoch for each owned
+runtime at server startup, pane respawn, and ownership transfer during live
+handoff. Epochs must be unique across process lifetimes, not just within one
+process: never derive them from a process-local counter, pane id or timestamp
+alone, and never restore an old epoch from persisted state. Fail runtime
+observation initialization if secure randomness is unavailable; do not fall back
+to a reusable value. Preserve normal pane/agent identity as today, but reset
+these two counters to zero in the new epoch. Do not restore a receipt as proof
+that the new owner has sampled anything. The importer must capture and apply its own first observation. Old-owner late messages are
+rejected by epoch, even if their numeric counters are larger.
+
+This deliberately does not promise a globally increasing integer across runtime
+replacement. It promises monotonic comparison within an incarnation and explicit
+invalidation across incarnations. Pending waits fail on handoff/restart/respawn,
+producer loss or identity replacement; a caller must re-read and explicitly
+register a new wait. No silent cursor rebasing or automatic successful resume.
+The observation counters are ephemeral: no per-pass session-file writes, fsync,
+or durable event replay. This is independent of ADR-0005's restart-stable `seq`.
+
+#### Reads, waits and mixed versions
+
+Add optional `output_cursor`, `detection_cursor` and `last_detection_sample` to
+local `pane.get` / `agent.get` and their corresponding local list records.
+Before the first applied pass, the detection cursor is zero and the last sample
+is absent. Add `output_cursor` to `pane.read` / `agent.read` and output-match
+replies, captured atomically with the returned text. Remote/fleet summaries
+omit observation fields; absence means unsupported, never a zero sample.
+Advertise this contract with an additive `detection_samples_v1` capability.
+
+Recommend a new read-only method, `pane.wait_for_sample`, and CLI
+`flk pane wait-for-sample <pane> --after-sample <D> --min-output <O>
+--require-classified --timeout <duration>`. An `agent wait-for-sample` alias
+may resolve an agent and call the same method. Parameters are a pinned pane identity, mandatory
+`after_sample`, optional `min_output`, optional `require_classified` (default
+false), and mandatory integer `timeout_ms` in `1..=540000`. Reject zero or a
+value above 540000 with `invalid_sample_timeout` / CLI `USAGE` before admission;
+never clamp it. The maximum is §6's 540 s read-wait ceiling, leaving 60 s below
+the 600 s MCP cap. Tests retain a smaller per-stage failure ceiling (for example
+5000 ms), within their ADR-0037 binary termination ceiling; the API maximum is
+not permission to widen a test deadline. The success predicate is both
+`sample > D` and, when supplied, `sampled_output >= O`, all within the same
+epoch, plus `outcome == classified` when `require_classified` is true. Already
+committed matching receipts may return at once. Return the receipt and its
+effective status together. With the flag false, skipped/unidentified
+observations can return as such; they cannot be read as a Working assertion.
+
+This is a registered, server-woken bounded wait (§5, ADR-0037 §1), with no
+polling loop in the client or server. It owns admission and wakeup independently
+of `WaitRegistry`: that registry records nothing for callers outside agent panes,
+has no held-read admission cap, and its predicate wakeup awaits E6 (#1032).
+Sample waits do not depend on E6 or treat registration as a wake mechanism.
+
+Recommend at most **8 pending sample waits per pane incarnation and 256 globally
+per server**, counting every caller, including operator CLI, tests and unattested
+socket clients. Validate subject, epoch, parameters and producer liveness first.
+An already matching receipt returns immediately without consuming a pending slot.
+Otherwise atomically check both counts and register, or refuse immediately with
+`sample_wait_limit_exceeded` / CLI `REFUSED` if either cap would be exceeded.
+Never queue for admission or allocate an unbounded list of blocked requests.
+Registration and a recheck of the latest receipt, epoch and liveness share the
+receipt-commit synchronization boundary, preventing a lost wakeup. A slot owns
+both counts and releases them on every completion, timeout, cancellation,
+disconnect, producer loss, subject removal or epoch replacement.
+
+Use a dedicated per-pane notification fired by the detection pass's app-side
+receipt commit, after classification and effective-state arbitration, including
+unchanged passes. Notify all registered waiters for that pane, not just one. The waiter suspends on that notification, disconnect/liveness
+signals and its single monotonic deadline. Producer death, pane removal and epoch
+replacement signal pending waiters directly rather than waiting for another
+sample. Wakeups only cause a predicate/liveness recheck; they cannot satisfy the
+wait themselves. Arm notification and recheck atomically with registration (and
+on resuspension), so a commit between checks cannot be lost. There is no periodic
+receipt scan, timer-based retry or client read loop. A live silent producer or a
+stream of nonmatching outcomes fails at the original deadline; neither EOF nor
+missing observations implies success.
+
+Proposed failures are typed `observation_reset` / `subject_replaced` (CLI
+`REFUSED`), `detection_producer_gone` / removed pane (`GONE`), `timeout`
+(`TIMEOUT`), malformed cursors (`USAGE`), and unsupported capability/method
+(`PROTOCOL_GAP`). Register any new codes in `src/api/error_code.rs`; reuse
+ADR-0029's named exits, not new numeric literals. An unavailable detector is
+not a permanent quiet wait. Epoch mismatch fails even if the new counter is
+numerically greater. An agent identity change cannot retarget an open wait.
+
+**Owner decision required — recommendation: dedicated method, no new global
+sample event.** Do not extend an old method with silently ignorable wait fields:
+an old server might ignore them and return stale success. A new method is
+refused by old servers and normalized as `server_version_gap` / exit 78 (§3a).
+New clients must fail closed if capability or required response fields are
+missing; no fallback to text matches, sleep or ordinary status waits. Old clients
+ignore additive response fields. Follow §3a's one protocol bump per release for
+the new request shape, checking the latest released tag at implementation time.
+
+There is no `DetectionSampled` durable or global-ring event. Updating sample
+metadata does not change `state_seq`, working entries, turn cursor, derived
+phase events, seen state, settle/dwell timestamps, or render dirtiness. Repeated
+samples must not restart a settle window or manufacture progress for stall checks.
+Only registered local sample waiters are notified. The dedicated per-pane
+notification is neither a second event broker nor a replayable stream. A
+disconnected waiter must read current cursors and register again, not resume
+from hub `seq`. An attested agent caller may additionally use the existing wait
+registry's attribution/audit rules for registration/closure; this optional record
+provides neither admission nor wakeup. Unattested callers have the same sample
+wait limits and liveness guarantees without an agent-state record.
+
+#### Settle the legacy `revision` contract
+
+**Owner decision required — recommendation: deprecate the legacy field.**
+Keep serializing existing numeric `revision` fields as zero on every old response
+shape. This explicitly includes `EventData::PaneOutputChanged.revision`
+(`src/api/schema.rs`), alongside pane/agent info, read and output-match fields;
+retain that legacy event field/schema without adding a new producer for it. Do
+not reinterpret these fields as detection samples or suddenly mix a new writer
+with old zero read handlers. Add the real parser-progress writer only for
+`output_cursor`, with the snapshot semantics above. New clients use the two new
+cursors; they must not infer capability from a nonzero legacy integer.
+
+Document the deprecation in unreleased API docs/changelog when #1574 implements
+it. Retain the field, wire type, legacy event schemas and old log readability
+through compatible releases; actual removal requires a separately approved major
+wire change. No removal is authorized by this proposal. Legacy
+`PaneOutputChanged.min_revision` is not a detection barrier and has no live
+producer today. A capable server must reject requests relying on that unfinished
+contract with `unsupported_legacy_revision` / `PROTOCOL_GAP`, rather than silently
+translate it or leave it waiting as if it could be satisfied. This named behavior
+change also needs the owner's approval and a release note. Old clients that just
+read revision continue to receive zero; old filter users get a visible refusal.
+Mixed-version and downgrade tests must use released clients/servers, not assume
+that unknown fields or error codes are accepted. No sample events enter old logs.
+
+#### Cost and implementation acceptance
+
+At the current 300 ms detection cadence, N owned panes produce about `3.33 × N`
+receipts/second, even with unchanged content. For 100 panes that is about 333
+internal applications/second. This is an analytic rate, not a measured benchmark.
+Reuse each pass's existing snapshot and classification; add counters and a small
+fixed-size latest receipt, not a new screen parse/hash or full-state copy. Keep
+metadata below 1 KiB per pane as an initial budget, roughly 100 KiB for 100 panes,
+plus the separately capped sample-wait entries (at most 8 per pane and 256
+server-wide). The implementation must measure and report bytes per pending
+wait and total memory at the global cap. No history grows with uptime.
+Output revisions reuse the parser lock already held for writes/snapshots.
+
+No waiters means no sample network traffic, disk I/O, hub sequences, diagnostic
+line per pass or UI redraw. Wake only that pane's registered waiters, and return
+one receipt per satisfied request. Enforce the dedicated admission caps above,
+release slots on every termination path, and do not queue every missed sample
+for slow clients. A later receipt covering the minimum output suffices;
+this is latest-observation progress, not an every-sample delivery guarantee.
+
+**Owner decision required — recommendation:** approve these lifetime/exposure/
+legacy-compatibility choices and a benchmark gate of less than 1% of one core
+additional idle CPU for 100 owned panes, plus the memory bound above, on a
+specified reference environment. Record before/after measurements in the
+implementation PR; the number is a proposed gate, not a performance claim.
+If it fails, revise this proposal rather than dropping unchanged-pass sampling
+or adding unbounded coalescing that hides the requested causal boundary.
+
+Implementation and all cases below belong to #1574. This docs PR neither adds
+those tests nor claims their success. The present baseline lacks the capability,
+method, receipts and advancing output cursor, so the new contract checks must
+fail before implementation. Preserve these failures once as regression evidence.
+
+| Acceptance case | Required evidence / negative control |
+| --- | --- |
+| Unchanged passes | Two captured identical screens advance the sample counter while raw/effective Working, turn cursor and durable `seq` stay unchanged. Current API has no sample field/method. |
+| Parser output progress | Identical PTY bytes advance output cursor although detection text is identical; read text and cursor describe the same locked snapshot. Current read revision remains zero. |
+| Causal race | Hold a classification of output R, paint R+1, then release the old result. `min_output=R+1` must remain pending despite a newer sample number, and only open after a pass covering R+1. |
+| Application boundary | Hold app-side receipt application after capture; no read/wait may advertise the sample as applied yet. Release it and receive one coherent receipt. |
+| Snapshot race / stale producer | Write during capture, reorder queued observations, and deliver an old owner's receipt after handoff. Never attach a newer output cursor to old text or apply stale results. |
+| #1570 redraw | Save prior detection cursor D. With input echo off, issue marker plus the complete identical Working redraw in **one PTY write**. An output match on the unique marker **and redraw tail** in `recent` returns the atomically captured output cursor O. Prove marker absent from `detection` and detection text equal to the original. Call `pane.wait_for_sample` with `after_sample=D`, `min_output=O`, `require_classified=true` and a bounded timeout, then assert the receipt is classified Working. No sleep is needed; the output match acknowledges the entire redraw and the sample wait acknowledges its classification. Neither a status read nor marker alone proves completion. |
+| Marker isolation | Current-screen detection includes all visible rows. The fixture must prove its marker is in scrollback and absent from the detector snapshot; a header assumed to be outside 24 rows is not sufficient. |
+| Real turn end | After a real completed/aborted-turn source, normal authority rules still settle; samples do not revive Working or retire a binding (§1a). Test raw Working with authoritative lifecycle idle separately. |
+| Skipped and unidentified | Blank/skipped/unidentified passes acknowledge their honest outcomes without presenting retained state as fresh classified evidence. |
+| Lifecycle boundaries | Respawn, restart and live handoff issue a new epoch, invalidate open waits, reject old cursors/late receipts and require a fresh applied pass. Rename/move within the runtime does not reset it. |
+| Pre-restart cursor | Save D and O before stopping the server, restart it with counters reset, then submit a wait using those saved cursors. Return typed `observation_reset` / `REFUSED` immediately, even if new counters later exceed the old ones; never return satisfied. Repeat for respawn and handoff, and assert epochs differ across process lifetimes. |
+| Admission / timeout bounds | Keep 8 unmatched waits open on one pane; the ninth returns `sample_wait_limit_exceeded` / `REFUSED`. Reach 256 across distinct panes; the next returns the same refusal. Repeat with unattested operator/test callers. Verify each termination path releases both counts; immediate matches consume no slot. Zero, 540001 and `u64::MAX` timeouts return `invalid_sample_timeout` / `USAGE`; 540000 is admitted when capacity exists, and tests use their smaller failure ceiling. |
+| Liveness / lost wake | Producer dies, peer/subject disappears, a live producer stays silent, caller disconnects, and commit races registration. Each fails/cancels within its existing ceiling or succeeds on an actual matching receipt; never hangs or misses a committed match. |
+| Mixed versions | New client/old server fails with protocol gap; old client/new server still parses zero legacy revision; missing fields never become success. Verify legacy filter refusal and previous-release log readability. |
+| Overflow / identity | Counter exhaustion changes epoch without wrapping; reused pane/agent names cannot satisfy an earlier subject's wait. |
+| Cost / quiet state | Benchmark cadence and memory at 100 panes with and without waiters; no per-sample fsync, hub traffic, render invalidation or unbounded backlog. |
 
 ### 2. Supervisor events are derived facts, persisted once, in the existing log
 
@@ -1041,8 +1422,10 @@ in ADR-0030 §8.
 
 ## Owner decisions
 
-Decided by the operator on 2026-10-11 (PR #1006): every item below was
+Decided by the operator on 2026-10-11 (PR #1006): items 1–6 below were
 accepted as recommended. The rejected alternative is kept for the record.
+Items 7–9 are new §1b proposals and require a separate owner decision; the
+earlier acceptance does not cover them.
 
 1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
@@ -1069,3 +1452,21 @@ accepted as recommended. The rejected alternative is kept for the record.
    plain message answers the oldest open one); `flk question list` / `answer`
    and MCP equivalents; first answer wins, every answer recorded with its
    source. Slices E9a–E9c.
+7. **Observation lifetime (§1b). Owner decision required.** Recommend per-runtime
+   sample/output cursors with fresh cryptographically random 128-bit epochs
+   across process lifetimes. Restart, respawn and handoff invalidate cursors and
+   pending waits; persist no receipts and never silently rebase old cursors.
+8. **Sample wait and event policy (§1b). Owner decision required.** Recommend a
+   dedicated capability-gated `pane.wait_for_sample`, additive local reads, no
+   global/durable sample event, and per-pane receipt-commit notifications
+   independent of E6. Cap pending waits at 8 per pane and 256 per server, with
+   `sample_wait_limit_exceeded` / `REFUSED`; cap timeout at 540000 ms, with
+   `invalid_sample_timeout` / `USAGE` outside `1..=540000`. Approve these bounds
+   and the proposed memory/CPU measurement gate before implementation.
+9. **Legacy revision (§1b). Owner decision required.** Recommend deprecating all
+   legacy numeric revision fields, explicitly including
+   `EventData::PaneOutputChanged.revision`, retaining zero and compatible wire
+   schemas/log readability, and refusing the unfinished `min_revision` filter
+   with `unsupported_legacy_revision` / `PROTOCOL_GAP`. Approve that named
+   behavior change with a release note; removal requires separate major-wire
+   approval. Give only the new output cursor a parser-progress writer.

@@ -933,7 +933,7 @@ pub struct IndexedKeysConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorktreesConfig {
-    /// Root directory under which Flock creates <repo>/<branch-slug> checkouts.
+    /// Root directory under which Flock creates `<repo>/<branch-slug>` checkouts.
     pub directory: String,
     /// Adopt workspaces that sit in linked git worktrees Flock didn't create:
     /// they group under their open parent repo workspace and get the managed
@@ -1320,7 +1320,7 @@ pub struct UiConfig {
     pub agents_agent_label: AgentLabelConfig,
     /// How the SPACES section names the agent in its agent field: "symbol"
     /// (default), "shortcut", or "name". Independent of
-    /// [`agents_agent_label`]; both default to `symbol`. See
+    /// [`Self::agents_agent_label`]; both default to `symbol`. See
     /// [`AgentLabelConfig`].
     pub spaces_agent_label: AgentLabelConfig,
     /// Accent color for highlights, borders, and navigation UI.

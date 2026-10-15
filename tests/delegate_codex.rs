@@ -1390,7 +1390,8 @@ fn worktree_create_base_is_refreshed_from_the_remote() {
     assert_eq!(rev(&repo, "wt/tag"), tagged);
 }
 
-/// #1479: replay the two Codex spinner frames without running a model.
+/// #1552: replay three Codex working frames and identical hollow repeats,
+/// plus idle and finished frames, without running a model.
 #[test]
 fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
     let server = start_server_with_rows(40);
@@ -1403,18 +1404,21 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
     for (name, frame) in [
         ("idle", idle.to_owned()),
         ("hollow", hollow.to_owned()),
+        ("second-hollow", hollow.replace("21m 26s", "21m 27s")),
         ("filled", hollow.replace('◦', "•")),
         ("finished", finished),
     ] {
         fs::write(server.base.join(format!("{name}.txt")), frame).unwrap();
     }
     // This producer blocks on input; each frame is requested, never timed.
+    // Disable input echo so commands cannot become intervening screen frames.
     let script = format!(
         "#!/bin/sh\n\
          draw() {{ printf '\\033[3J\\033[2J\\033[H'; cat '{base}/'$1.txt; }}\n\
+         stty -echo || exit 43\n\
          draw idle\n\
          while IFS= read -r frame; do\n\
-           case \"$frame\" in idle|hollow|filled|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
+           case \"$frame\" in repeated-hollow|consecutive-hollow) draw hollow ;; idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
          done\n",
         base = server.base.display()
     );
@@ -1432,7 +1436,7 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         .as_str()
         .expect("started pane")
         .to_owned();
-    let wait_status = |status: &str| {
+    let wait_status = |status: &str, frame: &str| {
         let out = cli(
             &server,
             &[
@@ -1447,18 +1451,55 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
         );
         assert!(
             out.status.success(),
-            "waiting for {status}: {} {}",
+            "waiting for {status} after {frame}: {} {}",
             stdout(&out),
             stderr(&out)
         );
     };
-    wait_status("idle");
+    let listed_agent = || {
+        let listed = cli(&server, &["agent", "list"]);
+        assert!(listed.status.success(), "{}", stderr(&listed));
+        let result = stdout_json(&listed);
+        result["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["pane_id"] == pane)
+            .expect("listed pane")
+            .clone()
+    };
+    wait_status("idle", "startup");
     for (frame, needle, status) in [
-        ("hollow", "◦ Working (", "working"),
+        ("hollow", "◦ Working (21m 26s", "working"),
+        // No intervening frame: an identical redraw stays working (ADR-0028 §1a).
+        // This guards only against a transient clear or a misread of the redrawn
+        // frame. It cannot prove a detection cycle processed the redraw until
+        // #1574 adds a detection-sample signal; then wait on that signal here.
+        ("consecutive-hollow", "◦ Working (21m 26s", "working"),
+        // Observe settled idle so the working hold cannot satisfy the next step.
+        ("idle", "Bring your unfinished thoughts.", "idle"),
         ("filled", "• Working (", "working"),
-        ("hollow", "◦ Working (", "working"),
+        ("idle", "Bring your unfinished thoughts.", "idle"),
+        ("second-hollow", "◦ Working (21m 27s", "working"),
+        ("idle", "Bring your unfinished thoughts.", "idle"),
+        // Reuse the original file: both the text and spinner timestamp repeat.
+        ("repeated-hollow", "◦ Working (21m 26s", "working"),
         ("finished", "• DONE: fixture turn finished", "idle"),
     ] {
+        if status == "working" {
+            // Guard the replay sequence if an idle-reset step is removed: the
+            // old working hold could otherwise satisfy the next glyph wait.
+            // Both idle and done represent the same settled terminal state.
+            let before = listed_agent();
+            if frame == "consecutive-hollow" {
+                assert_eq!(before["agent_status"], "working", "{frame}: {before}");
+            } else {
+                assert!(
+                    matches!(before["agent_status"].as_str(), Some("idle" | "done")),
+                    "every independent glyph must start settled idle before {frame}: {before}"
+                );
+            }
+        }
         let sent = request(
             &server,
             &serde_json::json!({
@@ -1488,16 +1529,8 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
                 assert!(stdout(&capture).contains(needle), "{painted}");
             }
         }
-        wait_status(status);
-        let listed = cli(&server, &["agent", "list"]);
-        assert!(listed.status.success(), "{}", stderr(&listed));
-        let result = stdout_json(&listed);
-        let agent = result["result"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|agent| agent["pane_id"] == pane)
-            .expect("listed pane");
+        wait_status(status, frame);
+        let agent = listed_agent();
         if status == "working" {
             assert_eq!(agent["agent_status"], "working");
         } else {

@@ -480,6 +480,14 @@ mod tests {
     async fn missing_node_identity_after_edge_close_excludes_direct_custody_route() {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let (mut app, mail, peer) = assigned_direct_custody();
+        let record = crate::mesh::hello::with_store(|store| {
+            store
+                .collection_record(&mail.key, super::super::messages::now_ms() as i64)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!record.next_hop.is_empty());
         app.node_id = None;
         crate::peer_stream::reset_enrollment(&peer.name);
         app.refresh_mesh_routes();

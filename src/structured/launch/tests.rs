@@ -165,7 +165,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             & 0o777,
         0o700
     );
-    for name in ["settings.json", "mcp.json"] {
+    for name in ["settings.json", "mcp.json", "owner.json"] {
         let path = dir.join(name);
         assert_eq!(
             fs::metadata(&path)
@@ -179,7 +179,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             .expect("no secret file")
             .contains(FAKE_TOKEN));
     }
-    assert_eq!(fs::read_dir(dir).expect("session files").count(), 2);
+    assert_eq!(fs::read_dir(dir).expect("session files").count(), 3);
 }
 
 #[test]
@@ -332,8 +332,8 @@ fn config_directory_is_removed_on_unwind_and_writer_error() {
     });
     assert!(result.is_err());
     assert_eq!(
-        fs::read_dir(&fixture.0)
-            .expect("fixture files")
+        fs::read_dir(fixture.0.join("structured/sessions"))
+            .expect("contained session files")
             .filter(|entry| entry
                 .as_ref()
                 .expect("entry")
@@ -564,4 +564,51 @@ fn registry_socket_check_is_conservative_and_distinguishes_no_evidence() {
     fs::remove_file(&path).expect("remove record");
     fs::create_dir(&path).expect("unreadable as file");
     assert!(registry_has_messaging_socket(&fixture.0, pid).is_err());
+}
+
+#[test]
+fn clean_spawn_failure_removes_armed_files_and_preserves_profile() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile();
+    let files = profile.directory.path().to_owned();
+    let persistent = profile.config_dir().to_owned();
+    let missing = fixture.0.join("missing-executable");
+    let error = profile
+        .try_spawn(|| {
+            crate::process::TracedCommand::new(&missing, "owned-missing-spawn").spawn_traced()
+        })
+        .expect_err("missing executable");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(
+        !files.exists(),
+        "no child existed, so no quarantine is needed"
+    );
+    assert!(persistent.exists());
+    assert!(super::super::supervision::sweep_stale_sessions(&fixture.0)
+        .expect("no leftovers")
+        .is_empty());
+}
+
+#[test]
+fn successful_spawn_keeps_armed_files_until_owned_child_is_reaped() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile();
+    let path = profile.directory.path().to_owned();
+    let (mut child, profile) = profile
+        .try_spawn(|| {
+            crate::process::TracedCommand::new("/bin/sh", "owned-spawn-success")
+                .args(["-c", "read value"])
+                .stdin(std::process::Stdio::piped())
+                .spawn_traced()
+        })
+        .expect("owned child");
+    assert!(path.join("owner.json").exists());
+    assert!(profile.directory.retained);
+    child.kill().expect("stop owned child");
+    child.wait().expect("reap owned child");
+    profile
+        .into_session_files()
+        .remove_after_reap()
+        .expect("confirmed cleanup");
+    assert!(!path.exists());
 }
