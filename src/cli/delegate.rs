@@ -150,12 +150,9 @@ const RESULT_POLL: Duration = Duration::from_millis(250);
 /// How often the readiness gate asks whether the agent is at its prompt.
 const READY_POLL: Duration = Duration::from_millis(200);
 
-/// Cap on any single socket request this module makes.
-///
-/// A delegate is a long-lived client and a live handoff replaces the socket
-/// underneath it, so bounding each request means such a stall costs one poll
-/// rather than the whole command. The same cap the settled core uses.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+#[path = "delegate_timeouts.rs"]
+mod timeouts;
+use timeouts::REQUEST_TIMEOUT;
 
 /// Result of a deadline-bounded request (error variant only).
 #[derive(Debug)]
