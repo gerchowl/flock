@@ -244,7 +244,12 @@ def verify(config: Config, leg: str, archive: str) -> int:
     # A shard can be empty on one leg (macOS skips live_handoff), and nextest
     # fails a run that selects nothing, so only non-empty shards get a job.
     matrix = [
-        {"name": s.name, "label": "rest" if s.rest else ", ".join(sorted(matched_binary_names(listings[s.name])))}
+        {
+            "name": s.name,
+            "label": "rest" if s.rest else ", ".join(
+                sorted(matched_binary_names(listings[s.name]))
+            ),
+        }
         for s in config.shards
         if selected[s.name]
     ]

@@ -31,6 +31,12 @@ def job(text, name):
     return match[1]
 
 
+def gate_script(block):
+    gate = block.split('      - name: Require every job of the leg\n', 1)[1]
+    return '\n'.join(line[10:] for line in gate.split('        run: |\n', 1)[1].splitlines()
+                     if line.startswith('          '))
+
+
 class WorkflowFollowups(unittest.TestCase):
     def test_malformed_summary_is_advisory_in_every_summary_step(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -50,22 +56,34 @@ class WorkflowFollowups(unittest.TestCase):
                 with self.subTest(workflow=workflow, step=step):
                     self.assertIn('\n        continue-on-error: true\n', step)
 
-    def test_every_aggregate_retains_its_result_gate_when_not_cancelled(self):
+    def test_every_aggregate_requires_every_leg_to_succeed(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         for name in ['check-ubuntu', 'check-macos']:
             block = job(text, name)
             with self.subTest(job=name):
-                self.assertIn('    if: ${{ !cancelled() }}\n', block)
+                self.assertIn('    if: always()\n', block)
                 self.assertNotRegex(block, r'(?m)^    continue-on-error:')
-                gate = block.split('      - name: Require every job of the leg\n', 1)[1]
-                script = '\n'.join(line[10:] for line in gate.split('        run: |\n', 1)[1].splitlines()
-                                   if line.startswith('          '))
+                script = gate_script(block)
                 for state in ['success', 'failure', 'cancelled', 'skipped']:
                     result = subprocess.run(['/bin/sh', '-c', script],
                                             env={**os.environ, 'RESULT': state},
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0 if state == 'success' else 1,
                                      (state, result.stderr))
+
+    def test_cancelled_leg_runs_required_gate_and_concludes_failure(self):
+        text = (ROOT / '.github/workflows/ci.yml').read_text()
+        for name in ['check-ubuntu', 'check-macos']:
+            with self.subTest(job=name):
+                block = job(text, name)
+                self.assertIn('    if: always()\n', block)
+                gate = block.split('      - name: Require every job of the leg\n', 1)[1]
+                self.assertIn('        if: always()\n', gate)
+                result = subprocess.run(['/bin/sh', '-c', gate_script(block)],
+                                        env={**os.environ, 'RESULT': 'cancelled'},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('leg ended as cancelled', result.stderr)
 
     def test_nix_pushes_include_every_sharding_input(self):
         text = (ROOT / '.github/workflows/nix.yml').read_text()

@@ -3,9 +3,10 @@
 The required platform check succeeds only when its reusable leg succeeds.
 JUnit summaries are advisory in the shard and aggregate jobs: a malformed report
 can produce a diagnostic failure without changing the test/lint result. Aggregate
-jobs use `!cancelled()` so superseded workflow runs can cancel. In a workflow that
-remains active, failed, skipped or cancelled dependencies still fail the result
-gate. See [GitHub status checks](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+jobs and their result gates use `always()` because branch protection treats a
+skipped required check as passing. Failed, skipped or cancelled legs produce an
+explicit failure naming the leg and its result; only successful legs pass.
+See [GitHub status checks](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
 
 Nix push checks include the reusable CI leg and `.config/**`, covering shard
 placement and nextest groups/ceilings. Pull-request checks retain their unfiltered
