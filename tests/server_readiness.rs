@@ -121,14 +121,15 @@ fn measured_binary_exceptions_keep_their_hang_ceilings() {
         let entry = overrides
             .iter()
             .find(|entry| {
-                entry["filter"]
-                    .as_str()
-                    .unwrap()
-                    .contains(&format!("binary(={binary})"))
-                    && test.is_none_or(|test| entry["filter"].as_str().unwrap().contains(&format!("test(={test})")))
+                let filter = entry["filter"].as_str().unwrap();
+                // A binary-wide ceiling also pins every named case in that binary.
+                let matches_test = !filter.contains("test(")
+                    || test.is_some_and(|test| filter.contains(&format!("test(={test})")));
+                filter.contains(&format!("binary(={binary})"))
+                    && matches_test
                     && entry.get("slow-timeout").is_some()
             })
-            .expect("measured binary exception must remain explicit");
+            .expect("measured binary or test ceiling must remain explicit");
         assert_eq!(entry["slow-timeout"]["period"].as_str(), Some("60s"));
         assert_eq!(
             entry["slow-timeout"]["terminate-after"].as_integer(),
