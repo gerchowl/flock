@@ -18,7 +18,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+        Self::under(&std::env::temp_dir())
+    }
+    fn under(parent: &std::path::Path) -> Self {
+        let root = SessionConfigDir::create(parent).expect("fixture root");
         let path = root.path().join("lifetime");
         let name = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
         // SAFETY: private owned fixture path; no ambient process or file is used.
@@ -565,13 +568,16 @@ fn actual_version_recheck_refuses_old_failed_and_timed_out_binaries() {
 
 #[test]
 fn registry_refusal_prevents_first_input_including_null_malformed_and_links() {
+    let parent = SessionConfigDir::create(&std::env::temp_dir()).expect("owned parent");
+    let long_parent = parent.path().join("long-temp-parent-".repeat(7));
+    fs::create_dir(&long_parent).expect("long fixture parent");
     for mode in [
         "registry-socket",
         "registry-null",
         "registry-malformed",
         "registry-link",
     ] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::under(&long_parent);
         let mut running = fixture.launch(mode, "2.1.296").expect("launch");
         assert!(matches!(
             running.receive().event,
@@ -599,12 +605,17 @@ fn registry_refusal_prevents_first_input_including_null_malformed_and_links() {
 
 #[test]
 fn init_socket_presence_refuses_even_null_and_unmodelled_wrong_type() {
+    let parent = SessionConfigDir::create(&std::env::temp_dir()).expect("owned parent");
+    // Exceed Unix sockaddr_un limits regardless of the runner's TMPDIR. The
+    // fixture must bind successfully before it can emit the forbidden init.
+    let long_parent = parent.path().join("long-temp-parent-".repeat(7));
+    fs::create_dir(&long_parent).expect("long fixture parent");
     for mode in [
         "init-socket-string",
         "init-socket-null",
         "init-socket-wrong-type",
     ] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::under(&long_parent);
         let mut running = fixture.launch(mode, "2.1.296").expect("launch");
         running.receive();
         running.submit();

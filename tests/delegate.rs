@@ -1512,11 +1512,13 @@ fn assert_child_exit(mode: &str) {
         )
         .expect("real readiness preflight error");
         assert_eq!(error["id"], "cli:delegate:ready:sub:0:probe", "{result}");
-        assert_eq!(error["error"]["code"], "internal_error", "{result}");
-        // Deliberate "failed to decode pane get error" pin, tracked by product follow-up #1559.
-        assert_eq!(
-            error["error"]["message"], "failed to decode pane get error",
-            "{result}"
+        assert_eq!(error["error"]["code"], "pane_not_found", "{result}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pane exited"),
+            "expected exit context: {result}"
         );
         assert_eq!(
             result["steps"],

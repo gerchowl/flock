@@ -63,17 +63,30 @@ def emit(event, newline=True):
     sys.stdout.write(json.dumps(event) + ("\n" if newline else ""))
     sys.stdout.flush()
 
+def messaging_socket():
+    sockets = root / "cc-socks"
+    sockets.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX)
+    sockpath = sockets / (str(os.getpid()) + ".sock")
+    # macOS TMPDIR plus the private fixture root can exceed sockaddr_un.
+    # Bind relative to the owned directory; report the same absolute socket
+    # path in registry/init so runtime inspection and cleanup remain real.
+    previous = os.open(".", os.O_RDONLY)
+    try:
+        os.chdir(sockets)
+        listener.bind(sockpath.name)
+    finally:
+        os.fchdir(previous)
+        os.close(previous)
+    sockpath.chmod(0o600)
+    registry.write_text(json.dumps({"messagingSocketPath": str(sockpath)}))
+    return listener, sockpath
+
 mode = case["mode"]
 registry = profile / "sessions" / (str(os.getpid()) + ".json")
 if mode.startswith("registry"):
     if mode == "registry-socket":
-        sockets = root / "cc-socks"
-        sockets.mkdir(mode=0o700)
-        listener = socket.socket(socket.AF_UNIX)
-        sockpath = sockets / (str(os.getpid()) + ".sock")
-        listener.bind(str(sockpath))
-        sockpath.chmod(0o600)
-        registry.write_text(json.dumps({"messagingSocketPath": str(sockpath)}))
+        listener, sockpath = messaging_socket()
     elif mode == "registry-malformed":
         registry.write_text("{")
     elif mode == "registry-link":
@@ -110,13 +123,7 @@ if mode in ("init-oversize", "init-invalid-utf8"):
     sys.exit(0)
 if mode.startswith("init-socket"):
     if mode.endswith("string"):
-        sockets = root / "cc-socks"
-        sockets.mkdir(mode=0o700)
-        listener = socket.socket(socket.AF_UNIX)
-        sockpath = sockets / (str(os.getpid()) + ".sock")
-        listener.bind(str(sockpath))
-        sockpath.chmod(0o600)
-        registry.write_text(json.dumps({"messagingSocketPath": str(sockpath)}))
+        listener, sockpath = messaging_socket()
         init["messaging_socket_path"] = str(sockpath)
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
