@@ -1182,6 +1182,8 @@ impl App {
     }
 
     pub(crate) fn finish_delivery_attempt(&self, attempt: &mut Attempt, outcome: &Outcome) {
+        #[cfg(test)]
+        tests::FINISH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if attempt.evidence.finished_at_ms.is_some() {
             return;
         }
@@ -1275,6 +1277,11 @@ impl Attempt {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    // The idempotence guard hides duplicate calls from the event stream. Count
+    // invocations so App-level lifecycle tests can enforce a single finalizer.
+    pub(crate) static FINISH_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     /// Replace the writer boundary after a real App submission, retaining the
     /// receipt while the producer stalls with zero, some, or all bytes written.

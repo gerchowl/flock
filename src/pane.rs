@@ -973,7 +973,17 @@ impl PaneRuntimeIo {
                 }
             }
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes).map(|_| None),
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                sender.try_send(bytes)?;
+                if tracked {
+                    // The test channel models a synchronous completed write.
+                    let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+                    let _ = completion.send(std::time::Instant::now());
+                    Ok(Some(receipt))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -2686,6 +2696,39 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_channel_receipts_follow_successful_tracked_writes() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        assert!(runtime
+            .io
+            .try_send_with_receipt(Bytes::from_static(b"untracked"), false)
+            .unwrap()
+            .is_none());
+        assert!(
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"full")),
+            Err(mpsc::error::TrySendError::Full(bytes)) if bytes == Bytes::from_static(b"full"))
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            Bytes::from_static(b"untracked")
+        );
+        let before = std::time::Instant::now();
+        let receipt = runtime
+            .try_send_flock_authored_tracked(Bytes::from_static(b"paste"))
+            .unwrap()
+            .expect("test channel must return a tracked write receipt");
+        let completed = receipt
+            .try_completed()
+            .expect("successful synchronous write completes");
+        assert!(before <= completed && completed <= std::time::Instant::now());
+        assert_eq!(receiver.try_recv().unwrap(), Bytes::from_static(b"paste"));
+        drop(receiver);
+        assert!(
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"closed")),
+            Err(mpsc::error::TrySendError::Closed(bytes)) if bytes == Bytes::from_static(b"closed"))
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
