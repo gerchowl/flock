@@ -229,7 +229,7 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
 /// order) to its absolute index in [`agent_panel_entries`]. Remote rows are
 /// interleaved by the sort (see #62), so absolute indices are non-contiguous
 /// — this helper is the single source of truth both the render (quick-jump
-/// digits on local rows) and [`focus_agent_entry`] use, so the digit shown on
+/// digits on local rows) and [`AppState::focus_agent_entry`] use, so the digit shown on
 /// row N and the digit that focuses row N cannot drift.
 pub(crate) fn nth_local_agent_entry_index(app: &AppState, n: usize) -> Option<usize> {
     agent_panel_entries(app)

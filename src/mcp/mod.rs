@@ -3,7 +3,7 @@
 //! Bridges MCP `tools/call` invocations to flock's local socket API. Speaks
 //! JSON-RPC 2.0 over newline-delimited stdin/stdout (NOT LSP framing) so it
 //! drops into every MCP client (Claude Desktop, `mcp` CLI, agent runners).
-//! CLI dispatch lives in [`crate::cli::mcp`]; this module owns the wire
+//! CLI dispatch lives in `src/cli/mcp.rs`; this module owns the wire
 //! implementation.
 //!
 //! Structure:
@@ -14,7 +14,7 @@
 //!   - [`channel`] — the opt-in channel push of arriving mail (#438)
 //!   - this file  — the blocking read/write loop
 //!
-//! The loop mirrors [`crate::cli::hook`]'s posture: a blocking `BufReader` on
+//! The loop mirrors `src/cli/hook.rs`'s posture: a blocking `BufReader` on
 //! stdin, no tokio. Newline-delimited JSON is the whole framing protocol; EOF
 //! on stdin means the client hung up and we exit 0 cleanly. It logs nothing —
 //! except with channel push on (#438), when a long-lived feed thread runs
@@ -134,7 +134,7 @@ fn handle_line<F: FlockCall>(line: &str, flock: &F, channel: &ChannelOptions) ->
     }
 }
 
-/// Monotonic per-process id for the flock-side [`Request::id`] the bridge
+/// Monotonic per-process id for the flock-side [`crate::api::schema::Request::id`] the bridge
 /// mints. Bumped on every call so overlapping in-flight requests never share
 /// an id even under a burst of tool calls.
 pub(super) fn next_call_seq() -> u64 {
