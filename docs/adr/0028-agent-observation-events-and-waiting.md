@@ -454,13 +454,16 @@ last-callback-wins. These are the adapter's requirements
 on #1500's move transaction; name lookup, move UI and narrow resumed panes
 remain outside this amendment. A rollout copy alone grants no authority.
 
-#### Owner decision required: format dependency and version policy
+#### Accepted: format dependency and version policy
 
-**Pending owner decision.** Rollout JSONL is an internal storage format, not a
-promised stable integration API. Selecting it requires an explicit compatibility
-policy; the lifecycle-authority decision alone does not settle that policy.
+**Accepted by the owner, 2026-10-16
+([#1479, option 1](https://github.com/gerchowl/flock/issues/1479#issuecomment-6203978023)).**
+Rollout JSONL is an internal storage format, not a promised stable integration
+API. The owner accepted the bounded compatibility policy below for lifecycle
+authority; this decision authorizes implementation, not a claim that it has
+shipped.
 
-The **recommended current proposal** is:
+The **accepted policy** is:
 
 - Record `session_meta.cli_version` for every binding. Initially the tested
   range contains only **0.160.1**; widen it only with explicit compatibility
@@ -483,11 +486,12 @@ An alternative is Codex's supported, versioned **app-server** interface, whose
 v2 notifications include `turn/started` and `turn/completed`; see the pinned
 [versioned protocol modules](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server-protocol/src/protocol/mod.rs#L10-L13)
 and [notifications](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server-protocol/src/protocol/common.rs#L1943-L1947).
-It is not selected by this proposal because flk currently runs the Codex TUI in
-a pane; owning or attaching an app-server connection for that same thread needs
-a separate transport/ownership design. It cannot be replaced by launching a
-second independent session and observing its events. The owner must choose the
-bounded rollout compatibility policy or that interface change before code.
+It is not selected by the accepted policy because flk currently runs the Codex
+TUI in a pane; owning or attaching an app-server connection for that same thread
+needs a separate transport/ownership design. It cannot be replaced by launching a
+second independent session and observing its events. The owner selected the
+bounded rollout compatibility policy; an app-server interface change remains
+a separate transport/ownership design.
 
 **Persistence-disabled configurations:** `codex exec --ephemeral` runs without
 session files; effective `Config.ephemeral` bypasses thread persistence. The
@@ -512,7 +516,7 @@ and [distinct history/ephemeral fields](https://github.com/openai/codex/blob/rus
 | Binding validation failed before this launch generation held a validated lifecycle binding, including after known launch/resume retirement | Reject the claim; screen fallback with `binding_validation_failed`, its reason and selected source. Screen Working stays working; unclassifiable evidence stays unknown. |
 | Claimed and still validating, or current-generation validated source lost, unreadable, discontinuous or ambiguous without known retirement | Unknown with source and reason; hook/screen cannot conceal source loss. |
 | Validated old binding idle, visible Working, file unchanged, no replacement report | Retain lifecycle idle and binding; publish the disagreement diagnostic. This covers the new-thread false-idle window and stale Working chrome. |
-| Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the proposed policy) | Hook then screen fallback for absent/disabled adapters; the proposed unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
+| Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the accepted policy) | Hook then screen fallback for absent/disabled adapters; the accepted unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
 
 **No silence lease.** The last validated lifecycle boundary holds, however old,
 until evidence invalidates the source: writer exit or PID/start-identity change,
@@ -532,7 +536,7 @@ bootstrap exception above. Known launch/resume retirement explicitly ends the ol
 trust scope and returns the new generation to awaiting-first-turn fallback;
 rejected claims without that retirement cannot hide source loss. Confirmed in-TUI
 replacement remains future work.
-Explicit version/config unavailability is diagnosed at binding, under the pending
+Explicit version/config unavailability is diagnosed at binding, under the accepted
 policy above. Rebind again to switch policy/version, rather than reinterpret an
 active binding's cached state.
 

@@ -1,0 +1,1 @@
+- Record the owner-accepted Codex rollout compatibility policy in ADR-0028: initially test 0.160.1, validate metadata and writer versions, diagnose unsupported versions with screen fallback, and require a CI version pin in the implementation.
