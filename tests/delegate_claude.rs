@@ -960,11 +960,36 @@ fn delegate_send_refused_before_typing_exits_10() {
         assert!(Instant::now() < deadline, "the draft was never painted");
         thread::sleep(Duration::from_millis(30));
     }
+    let agent_refusal = cli(
+        &server,
+        &["agent", "send", "--json", "--no-submit", "s1", "extra"],
+    );
+    assert_eq!(
+        agent_refusal.status.code(),
+        Some(10),
+        "{}",
+        stderr(&agent_refusal)
+    );
+    let refusal = stdout_json(&agent_refusal);
+    assert_eq!(refusal["error"]["code"], "input_not_empty");
+    assert_eq!(
+        refusal["error"]["data"]["composer"]["visible_bytes"],
+        "operator draft".len()
+    );
+    assert!(stderr(&agent_refusal).contains("flk delegate send s1 --brief FILE"));
+    assert!(stderr(&agent_refusal).contains("also refuses drafts"));
+    assert!(!stdout(&agent_refusal).contains("operator draft"));
+    assert_eq!(
+        typed(&server).len(),
+        typed_before,
+        "no-submit refusal typed nothing"
+    );
     let b2 = brief(&server, "next.md", "y\n");
     let sent = cli(&server, &["delegate", "send", "s1", "--brief", &b2]);
     let message = stderr(&sent);
     assert_eq!(sent.status.code(), Some(10), "{message}");
     assert!(message.contains("input_not_empty"), "{message}");
+    assert!(message.contains("agent UI"), "{message}");
     assert!(
         message.contains("note: exit code is now 10 (was 1); see CHANGELOG"),
         "{message}"

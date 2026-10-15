@@ -1005,10 +1005,12 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: {AGENT_SEND_USAGE}");
         return Ok(super::exit::USAGE);
     };
-    super::print_send_response(&super::send_request(&Request {
+    let mut response = super::send_request(&Request {
         id: "cli:agent:send".into(),
         method: Method::AgentSend(params),
-    })?)
+    })?;
+    super::delegate::enrich_draft_refusal(&mut response);
+    super::print_send_response(&response)
 }
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
