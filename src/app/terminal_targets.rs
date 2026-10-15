@@ -10,15 +10,21 @@ pub(crate) struct TerminalTarget {
     pub terminal_id: String,
 }
 
-// Staged for #00f: ambiguity details are produced before the agent facade consumes them.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Current placement details returned for an ambiguous target (ADR-0029 §5).
+/// Message refusals serialize these fields as additive `data.candidates` entries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct TerminalTargetCandidate {
+    /// Terminal identity that can select this candidate on this server.
     pub terminal_id: String,
+    /// Public pane address on the resolving server.
     pub pane_id: String,
+    /// Public workspace address containing the pane.
     pub workspace_id: String,
+    /// Public tab address containing the pane.
     pub tab_id: String,
+    /// Last resolved working directory, or `None` when unavailable.
     pub cwd: Option<String>,
+    /// Current agent status, serialized with its stable lowercase spelling.
     pub agent_status: crate::api::schema::AgentStatus,
 }
 
@@ -183,9 +189,8 @@ impl App {
         })
     }
 
-    // Staged for #00f with resolve_terminal_target.
-    #[allow(dead_code)]
-    fn terminal_target_candidate(
+    /// Describe a currently addressable pane for a typed ambiguity refusal.
+    pub(super) fn terminal_target_candidate(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
