@@ -76,3 +76,6 @@ zeroize = { version = "1.9", features = ["serde"] }
 tokio = { version = "1", features = ["net", "io-util", "process"] }
 # Count SQLite VM operations in store complexity regression tests.
 rusqlite = { version = "0.40.2", features = ["hooks"] }
+
+# Parse adapter declarations for the optional-field coverage drift test.
+syn = { version = "2", features = ["full"] }

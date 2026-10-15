@@ -8,7 +8,7 @@ root = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
 events = {signal.SIGTERM, signal.SIGUSR1, signal.SIGUSR2, signal.SIGCHLD}
 signal.pthread_sigmask(signal.SIG_BLOCK, events)
-if mode == "tree":
+def detached_child():
     ready_read, ready_write = os.pipe()
     grandchild = os.fork()
     if grandchild == 0:
@@ -24,13 +24,16 @@ if mode == "tree":
     os.close(ready_write)
     assert os.read(ready_read, 5) == b"ready"
     os.close(ready_read)
-else:
-    grandchild = None
+    return grandchild
+
+grandchild = detached_child() if mode == "tree" else None
 print("ready", flush=True)
 while True:
     event = signal.sigwait(events)
     if event == signal.SIGTERM:
         (root / "term").write_text("term")
+        if mode == "late-tree" and grandchild is None:
+            grandchild = detached_child()
     elif event == signal.SIGUSR2:
         os._exit(7)
     elif event == signal.SIGUSR1:
@@ -40,5 +43,5 @@ while True:
         sys.exit(0)
     elif event == signal.SIGCHLD and grandchild is not None:
         waited, _ = os.waitpid(grandchild, os.WNOHANG)
-        if waited:
+        if waited and mode != "late-tree":
             sys.exit(0)
