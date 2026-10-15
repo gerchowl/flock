@@ -160,7 +160,7 @@ pub struct TerminalState {
     pub(crate) prompt_report_generation: u64,
     /// Per-pane prompt + recap scrollback (issue #96). Chronological,
     /// timestamped entries; capped at
-    /// [`MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
+    /// [`prompt_history::MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
     /// Bumped on every `prompt_history` mutation.
@@ -892,7 +892,7 @@ impl TerminalState {
         self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
     }
 
-    /// Same as [`set_agent_session_ref`] but also honours the Claude Code
+    /// Same as [`Self::set_agent_session_ref`] but also honours the Claude Code
     /// `SessionStart` `source` field. A startup-style report (no source, or
     /// `startup`) that would replace an existing restored Claude id is
     /// rejected — it's almost certainly a nested `claude -p` inheriting the

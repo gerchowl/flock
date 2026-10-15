@@ -6,20 +6,20 @@
 //!
 //! # What pause gates (audit-greppable — grep `US-9` in the tree)
 //!
-//! 1. Check runner tick — [`App::dispatch_due_script_checks`] early-returns
+//! 1. Check runner tick — [`crate::app::App::dispatch_due_script_checks`] early-returns
 //!    at the top when paused, so no built-in fold runs, no script check
 //!    dispatches, and no heartbeat lands.
-//! 2. The message WAKE — [`App::handle_msg_wake`] reports zero when paused,
+//! 2. The message WAKE — [`crate::app::App::handle_msg_wake`] reports zero when paused,
 //!    so no agent is interrupted about its inbox. ADR-0008 (#216) deleted the
 //!    scheduled drain this used to name (`deliver_due_messages`) along with
 //!    the keystrokes it required; the stop-hook wake that replaced it went
 //!    ungated until #316. The TTL sweep
-//!    ([`App::expire_undeliverable_messages`]) is halted too, so a paused
+//!    ([`crate::app::App::expire_undeliverable_messages`]) is halted too, so a paused
 //!    fleet does not quietly age messages out either.
-//! 3. Cron fires ([`App::dispatch_cron_fires`], S1) and the scheduled
-//!    reap / quarantine tick ([`App::evaluate_reap_check`], S2) — both
+//! 3. Cron fires ([`crate::app::App::dispatch_cron_fires`], S1) and the scheduled
+//!    reap / quarantine tick ([`crate::app::App::evaluate_reap_check`], S2) — both
 //!    gated transitively: they are dispatched from inside
-//!    [`App::dispatch_due_script_checks`], below its pause early-return,
+//!    [`crate::app::App::dispatch_due_script_checks`], below its pause early-return,
 //!    so a paused fleet fires no scheduled run and quarantines nothing.
 //!
 //! # What pause does NOT gate
@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// The persisted pause record. Kept a struct (not a bool) so a resume from
-/// a stopped-then-restarted server can render "paused since <ts> because
-/// <reason>" without another RPC round-trip.
+/// a stopped-then-restarted server can render `paused since <ts> because
+/// <reason>` without another RPC round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct FleetPauseState {
     /// True → all three gates fire early. Persisted so restarts stay paused.

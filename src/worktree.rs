@@ -1702,7 +1702,7 @@ fn with_pr_base(
     targets
 }
 
-/// The decision [`gh_pr_merged_evidence`] makes once gh has answered, split out
+/// The decision [`gh_pr_query`] makes once gh has answered, split out
 /// from the subprocess so the tip rules are testable against a real repo with
 /// no GitHub remote and no `gh` on PATH.
 ///

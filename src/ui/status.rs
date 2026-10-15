@@ -378,7 +378,7 @@ pub(super) fn agent_icon(
     )
 }
 
-/// Map a federated peer's [`AgentStatus`] onto the shared `(AgentState, seen)`
+/// Map a federated peer's [`crate::api::schema::AgentStatus`] onto the shared `(AgentState, seen)`
 /// the icon set is keyed on, so remote member rows render the SAME agent-style
 /// icon as local ones (#62). `Done` = an unseen idle (the green ✓), `Idle` = a
 /// settled seen idle.
@@ -603,7 +603,7 @@ pub(super) fn stale_reading_style(p: &crate::app::state::Palette) -> Style {
 /// on AppState would otherwise be rendered indefinitely as if it were now —
 /// the `src/peers.rs:196` "unbounded confident lie" failure mode, on the
 /// most-glanced surface in the app. Past three sample intervals
-/// ([`AppState::system_stats_reading_at`]) the line keeps the last values but
+/// ([`crate::app::state::AppState::system_stats_reading_at`]) the line keeps the last values but
 /// restyles them in the ghost tint the self row and peer rows use (#435), so
 /// one slow sample never blanks it and a frozen reading never passes for live.
 pub(super) fn render_status_line(app: &crate::app::AppState, frame: &mut Frame, area: Rect) {
