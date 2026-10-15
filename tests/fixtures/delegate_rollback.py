@@ -2,9 +2,10 @@
 
 Only agent.start's real response is gated, before the CLI starts its readiness
 clock. All requests and subscription events are relayed unchanged. The child
-acknowledges launch, exits after the real readiness watch is installed, or stays
-gated before logging until rollback kills it. One failure-only deadline covers the protocol and CLI; no timing sleep or
-product hook determines success. Python is already required by just check.
+acknowledges launch and exits before readiness is requested, or stays gated
+before logging until rollback kills it. One failure-only deadline covers the
+protocol and CLI; no timing sleep or product hook determines success. Python
+is already required by just check.
 """
 
 import json
@@ -92,6 +93,26 @@ def request(protocol, path, method, params):
         return json.loads(protocol.line(stream))
 
 
+def delay_exit_delivery(protocol):
+    """Inject >5 s transport latency using a bounded live-silent receive.
+
+    This fault is deliberately longer than the unchanged readiness deadline.
+    It is never used to establish the child-exit condition or make a test pass.
+    """
+    receiver, producer = socket.socketpair()
+    with receiver, producer:
+        receiver.settimeout(min(6, protocol.remaining()))
+        started = time.monotonic()
+        try:
+            receiver.recv(1)
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            if elapsed <= 5:
+                raise ValueError("exit delivery injection did not exceed readiness deadline")
+            return elapsed
+        raise ValueError("silent transport injection unexpectedly produced output")
+
+
 def run(base, server, binary, mode):
     protocol = Protocol()
     base = Path(base)
@@ -100,9 +121,8 @@ def run(base, server, binary, mode):
     controls = []
     failures = []
     stage_finished = threading.Event()
-    subscribed = threading.Event()
-    exit_released = threading.Event()
-    release_lock = threading.Lock()
+    exit_observed = False
+    exit_delivery_delay = 0
     proxy = listener(proxy_path)
     gate = listener(gate_path)
     exits = socket.socket(socket.AF_UNIX)
@@ -118,6 +138,7 @@ def run(base, server, binary, mode):
     (base / "bin" / "opencode").chmod(0o755)
 
     def relay(client):
+        nonlocal exit_delivery_delay, exit_observed
         subscription = False
         try:
             with client, socket.socket(socket.AF_UNIX) as upstream:
@@ -144,27 +165,27 @@ def run(base, server, binary, mode):
                             controls.append(control)
                             break
                     protocol.expect(control, "boot")
-                    control.sendall(b"L" if mode == "exit" else b"H")
-                    if mode == "exit":
+                    control.sendall(b"H" if mode == "timeout" else b"L")
+                    if mode != "timeout":
                         protocol.expect(control, "launched")
+                        control.sendall(b"X")
+                        protocol.eof(control)
+                        # Observe the real server exit before returning agent.start.
+                        # The readiness clock cannot run while this response is gated.
+                        while True:
+                            event = json.loads(protocol.line(exits))
+                            if event.get("event") != "pane_exited":
+                                raise ValueError(f"unexpected exit-monitor event: {event}")
+                            if event["data"]["pane_id"] == agent["pane_id"]:
+                                break
+                        exit_observed = True
+                        if mode == "exit-delayed":
+                            exit_delivery_delay = delay_exit_delivery(protocol)
+                        stage_finished.set()
                     else:
                         stage_finished.set()
-                if subscription:
-                    if json.loads(reply).get("result", {}).get("type") != "subscription_started":
-                        raise ValueError(f"unexpected readiness subscription: {reply}")
-                    subscribed.set()
                 client.sendall(reply.encode() + b"\n")
-                if mode == "exit" and subscribed.is_set() and json.loads(message)["method"] == "agent.get":
-                    with release_lock:
-                        release = not exit_released.is_set()
-                        exit_released.set()
-                    if release:
-                        if not json.loads(reply).get("result", {}).get("agent"):
-                            raise ValueError(f"missing live agent snapshot before exit: {reply}")
-                        controls[0].sendall(b"X")
-                        protocol.eof(controls[0])
-                        stage_finished.set()
-                if subscription:
+                if subscription and "error" not in json.loads(reply):
                     while True:
                         upstream.settimeout(protocol.remaining())
                         chunk = upstream.recv(65536)
@@ -173,7 +194,7 @@ def run(base, server, binary, mode):
                         client.sendall(chunk)
         except (BrokenPipeError, ConnectionResetError):
             # A subscription consumer closes normally when the CLI finishes.
-            if not subscription or not (stage_finished.is_set() or exit_released.is_set()):
+            if not subscription or not stage_finished.is_set():
                 failures.append("unexpected connection closure during fixture transport")
         except Exception as error:
             failures.append(str(error))
@@ -205,7 +226,7 @@ def run(base, server, binary, mode):
             raise ValueError(f"fixture transport failed: {failures}")
         after = request(protocol, server, "workspace.list", {})
         print(json.dumps({"code": child.returncode, "stdout": stdout, "stderr": stderr,
-            "before": before, "after": after}), flush=True)
+            "before": before, "after": after, "exit_delivery_delay": exit_delivery_delay, "exit_observed": exit_observed}), flush=True)
     finally:
         if child.poll() is None:
             child.kill()
