@@ -112,7 +112,13 @@ impl Owner {
         Ok(serde_json::from_slice(&data)?)
     }
     fn write(&self, dir: &Path) -> io::Result<()> {
+        private_fs::check_private_dir(dir)?;
         let path = dir.join("owner.next");
+        match fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+        }
         let mut file = private_fs::create_private_file(&path)?;
         file.write_all(&serde_json::to_vec(self)?)?;
         file.sync_all()?;
@@ -199,6 +205,25 @@ pub fn arm_session_files(files: &mut SessionConfigDir) -> io::Result<()> {
     owner.write(files.path())
 }
 
+/// Timing source and sampling cadence for the owning worker. The default is
+/// monotonic system time and 100 ms snapshots. An injected clock lets callers
+/// drive lifecycle transitions without waiting on elapsed wall time.
+/// Longer sampling intervals can miss ancestry that disappears between samples.
+pub struct Schedule<F = fn() -> Instant> {
+    /// Monotonic, nonblocking clock used for deadlines and periodic sampling.
+    pub clock: F,
+    /// Interval between periodic snapshots; phase transitions always snapshot.
+    pub snapshot_interval: Duration,
+}
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            clock: Instant::now,
+            snapshot_interval: SNAPSHOT,
+        }
+    }
+}
+
 /// Supervise an owned child on a dedicated runtime worker. The caller must arm
 /// files before spawn. `close_stdin` must be a nonblocking transport request.
 /// After tree termination, `finish_io` must cancel/drain and observe both I/O
@@ -212,6 +237,7 @@ pub fn supervise(
     stop: StopRequest,
     close_stdin: impl FnOnce(),
     finish_io: impl FnOnce() -> io::Result<()>,
+    mut schedule: Schedule<impl FnMut() -> Instant>,
 ) -> ExitReport {
     files.retain();
     // Bind and persist immediately, before the first process-tree enumeration.
@@ -232,14 +258,14 @@ pub fn supervise(
     let mut status = None;
     let mut close = Some(close_stdin);
     let mut phase = 0;
-    let mut deadline = Instant::now();
-    let mut snapshot = Instant::now();
+    let mut deadline = (schedule.clock)();
+    let mut snapshot = (schedule.clock)();
     loop {
-        if snapshot.elapsed() >= SNAPSHOT {
+        if (schedule.clock)().saturating_duration_since(snapshot) >= schedule.snapshot_interval {
             if let Err(error) = owner.refresh(files.path()) {
                 failure.get_or_insert(error);
             }
-            snapshot = Instant::now();
+            snapshot = (schedule.clock)();
         }
         if status.is_none() {
             match child.try_wait() {
@@ -268,25 +294,25 @@ pub fn supervise(
                 close();
             }
             phase = 1;
-            deadline = Instant::now() + EOF_GRACE;
+            deadline = (schedule.clock)() + EOF_GRACE;
         }
-        if phase == 1 && Instant::now() >= deadline {
+        if phase == 1 && (schedule.clock)() >= deadline {
             if let Err(error) = owner.snapshot_and_signal(files.path(), Signal::Terminate) {
                 failure.get_or_insert(error);
             }
             phase = 2;
-            deadline = Instant::now() + TERM_GRACE;
+            deadline = (schedule.clock)() + TERM_GRACE;
         }
-        if phase == 2 && Instant::now() >= deadline {
+        if phase == 2 && (schedule.clock)() >= deadline {
             if let Err(error) = owner.snapshot_and_signal(files.path(), Signal::Kill) {
                 failure.get_or_insert(error);
             }
             phase = 3;
-            deadline = Instant::now() + KILL_GRACE;
+            deadline = (schedule.clock)() + KILL_GRACE;
         }
         if phase == 3 {
             owner.signal(Signal::Kill);
-            if Instant::now() >= deadline {
+            if (schedule.clock)() >= deadline {
                 return ExitReport {
                     status,
                     stop_requested: stop.requested(),
@@ -359,7 +385,7 @@ fn cleanup_transient(owner: &Owner, session_dir: &Path) -> io::Result<()> {
     {
         return Err(io::Error::other("profile outside structured namespace"));
     }
-    private_fs::ensure_private_dir(profile)?;
+    private_fs::check_private_dir(profile)?;
     if platform::process_start_time(owner.owner.pid).is_some() {
         return Err(io::Error::other(
             "refusing transient cleanup for a live/reused pid",
@@ -462,7 +488,7 @@ pub fn sweep_stale_sessions(state: &Path) -> io::Result<Vec<SweepEntry>> {
     if parent.canonicalize()? != parent {
         return Err(io::Error::other("redirected structured namespace"));
     }
-    private_fs::ensure_private_dir(&parent)?;
+    private_fs::check_private_dir(&parent)?;
     let mut outcomes = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -491,7 +517,7 @@ pub fn sweep_stale_sessions(state: &Path) -> io::Result<Vec<SweepEntry>> {
 }
 
 fn sweep_entry(directory: &Path) -> io::Result<SweepOutcome> {
-    private_fs::ensure_private_dir(directory)?;
+    private_fs::check_private_dir(directory)?;
     let mut owner = Owner::read(directory)?;
     if let Some(quarantine) = &owner.quarantine {
         return Ok(SweepOutcome::Quarantined {

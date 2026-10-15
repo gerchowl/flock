@@ -435,6 +435,27 @@ impl LaunchProfile {
         super::supervision::arm_session_files(&mut self.directory)
     }
 
+    /// Arm and attempt a spawn, transferring the profile back only with a child.
+    /// An error removes generated files because no child exists; persistent
+    /// profiles remain. The closure must directly return its spawn result, never
+    /// launch a child and then return an unrelated error. Panics retain files.
+    pub fn try_spawn(
+        mut self,
+        spawn: impl FnOnce() -> io::Result<std::process::Child>,
+    ) -> io::Result<(std::process::Child, Self)> {
+        match self.arm_session().and_then(|()| spawn()) {
+            Ok(child) => Ok((child, self)),
+            Err(error) => {
+                if let Err(cleanup) = self.directory.remove_after_reap() {
+                    return Err(io::Error::other(format!(
+                        "{error}; spawn-failure cleanup: {cleanup}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Transfer generated-file ownership to supervision after spawn. Arm first.
     pub fn into_session_files(self) -> SessionConfigDir {
         self.directory

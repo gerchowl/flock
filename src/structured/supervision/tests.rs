@@ -137,6 +137,7 @@ fn stop_intent_precedes_close_and_reaps_detached_grandchild() {
                 drop(stdin);
             },
             || Ok(()),
+            Schedule::default(),
         ))
         .expect("report")
     });
@@ -185,6 +186,7 @@ fn crash_path_uses_retained_snapshot_after_reparenting() {
             StopRequest::default(),
             || drop(stdin),
             || Ok(()),
+            Schedule::default(),
         ))
         .expect("report")
     });
@@ -226,6 +228,7 @@ fn term_resistant_owned_child_escalates_to_kill_after_grace() {
             stop,
             || drop(stdin),
             || Ok(()),
+            Schedule::default(),
         ))
         .expect("shutdown report")
     });
@@ -257,6 +260,7 @@ fn natural_idle_exit_has_no_stop_intent_and_keeps_profile() {
         StopRequest::default(),
         || drop(stdin),
         || Ok(()),
+        Schedule::default(),
     );
     report.cleanup.expect("cleanup");
     assert!(report.status.expect("exit").success());
@@ -506,6 +510,7 @@ fn failed_io_finalization_retains_files_after_tree_is_reaped() {
             assert!(path.exists(), "generated files outlive I/O finalization");
             Err(io::Error::other("fixture reader failed"))
         },
+        Schedule::default(),
     );
     assert!(report.status.expect("reaped").success());
     assert!(!report.stop_requested);
@@ -723,58 +728,6 @@ fn instant_exit_without_captured_identity_is_reaped_and_reported_in_quarantine()
 }
 
 #[test]
-fn kill_phase_discovers_new_descendants_while_parent_is_alive() {
-    let fixture = Fixture::new();
-    let files = fixture.files();
-    let mut child = fixture.child("tree");
-    let root = ProcessIdentity::capture(child.id()).expect("root identity");
-    let grandchild = ProcessIdentity::capture(
-        fs::read_to_string(fixture.root.path().join("grandchild"))
-            .expect("descendant")
-            .parse()
-            .expect("pid"),
-    )
-    .expect("descendant identity");
-    struct Cleanup(ProcessIdentity);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if self.0.alive() {
-                platform::signal_processes(&[self.0.pid], Signal::Kill);
-            }
-        }
-    }
-    let _cleanup = Cleanup(grandchild);
-    let (mut owner, failure) = bind_child(
-        &mut child,
-        &files,
-        fixture.profile.clone(),
-        &StopRequest::default(),
-        ProcessIdentity::capture,
-    )
-    .expect("bind immediately after spawn");
-    assert!(failure.is_none());
-    assert_eq!(
-        Owner::read(files.path())
-            .expect("persisted child identity")
-            .tree,
-        vec![root],
-        "identity persisted before descendant enumeration"
-    );
-    assert!(root.alive(), "parent held alive until the kill phase");
-    owner
-        .snapshot_and_signal(files.path(), Signal::Kill)
-        .expect("kill phase");
-    child.wait().expect("owned root reaped");
-    assert!(Owner::read(files.path())
-        .expect("persisted snapshot")
-        .tree
-        .contains(&grandchild));
-    let (_tx, rx) = mpsc::channel::<ExitReport>();
-    wait(&rx, || (!grandchild.alive()).then_some(()));
-    assert!(!grandchild.alive());
-}
-
-#[test]
 fn failed_initial_identity_persistence_still_reaps_owned_child() {
     let fixture = Fixture::new();
     let files = fixture.files();
@@ -782,8 +735,7 @@ fn failed_initial_identity_persistence_still_reaps_owned_child() {
     let mut child = fixture.child("single");
     let identity = ProcessIdentity::capture(child.id()).expect("owned identity");
     let stdin = child.stdin.take();
-    fs::write(path.join("owner.next"), "interrupted write fixture")
-        .expect("obstruct atomic replacement");
+    fs::create_dir(path.join("owner.next")).expect("obstruct atomic replacement");
     let profile = fixture.profile.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
@@ -794,6 +746,7 @@ fn failed_initial_identity_persistence_still_reaps_owned_child() {
             StopRequest::default(),
             || drop(stdin),
             || Ok(()),
+            Schedule::default(),
         ))
         .expect("report")
     });
@@ -805,4 +758,144 @@ fn failed_initial_identity_persistence_still_reaps_owned_child() {
     assert!(report.status.is_some());
     assert!(!identity.alive());
     assert!(path.exists(), "unpersisted identity retains files");
+}
+
+#[test]
+fn stale_owner_next_does_not_prevent_quarantine() {
+    let fixture = Fixture::new();
+    let files = fixture.files();
+    let path = files.path().to_owned();
+    let mut owner = Owner::read(&path).expect("owner");
+    owner.supervisor.birth = owner.supervisor.birth.wrapping_add(1);
+    owner.write(&path).expect("dead supervisor");
+    fs::write(path.join("owner.next"), "interrupted partial owner record").expect("leftover");
+    let entries = sweep_stale_sessions(fixture.root.path()).expect("sweep");
+    assert!(
+        entries.iter().any(|entry| entry.directory == path
+            && matches!(entry.outcome, SweepOutcome::Quarantined { .. })),
+        "{entries:?}"
+    );
+    assert!(!path.join("owner.next").exists());
+    assert!(Owner::read(&path)
+        .expect("complete replacement")
+        .quarantine
+        .is_some());
+    assert!(path.exists(), "uncertain record never reaped");
+}
+
+#[test]
+fn vanished_sweep_entry_is_reported_without_recreating_it() {
+    let fixture = Fixture::new();
+    let files = fixture.files();
+    let path = files.path().to_owned();
+    fs::remove_dir_all(&path).expect("entry removed after enumeration");
+    assert_eq!(
+        sweep_entry(&path).expect_err("vanished entry").kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(
+        !path.exists(),
+        "validation must not recreate vanished sessions"
+    );
+}
+
+#[test]
+fn supervise_snapshots_late_descendant_at_kill_phase() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    let fixture = Fixture::new();
+    let files = fixture.files();
+    let path = files.path().to_owned();
+    let mut child = fixture.child("late-tree");
+    let root = ProcessIdentity::capture(child.id()).expect("owned parent");
+    let stdin = child.stdin.take();
+    let identities = Arc::new(Mutex::new(vec![root]));
+    struct Cleanup(Arc<Mutex<Vec<ProcessIdentity>>>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for identity in self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .rev()
+                .filter(|identity| identity.alive())
+            {
+                platform::signal_processes(&[identity.pid], Signal::Kill);
+            }
+        }
+    }
+    let _cleanup = Cleanup(identities.clone());
+    let capture = identities.clone();
+    let ready_path = fixture.root.path().join("grandchild");
+    let closed = Arc::new(AtomicBool::new(false));
+    let clock_closed = closed.clone();
+    let base = Instant::now();
+    let mut calls_after_close = 0;
+    let schedule = Schedule {
+        snapshot_interval: Duration::MAX,
+        clock: move || {
+            if !clock_closed.load(Ordering::Acquire) {
+                return base;
+            }
+            calls_after_close += 1;
+            if calls_after_close == 1 {
+                return base;
+            }
+            // Establish EOF/TERM deadlines before advancing to KILL. Hold time
+            // until the real TERM handler has created its detached descendant.
+            if calls_after_close > 3 {
+                if let Some(identity) = fs::read_to_string(&ready_path)
+                    .ok()
+                    .and_then(|pid| pid.parse().ok())
+                    .and_then(|pid| ProcessIdentity::capture(pid).ok())
+                {
+                    let mut known = capture.lock().expect("identities");
+                    if !known.contains(&identity) {
+                        known.push(identity);
+                    }
+                    return base + EOF_GRACE + TERM_GRACE;
+                }
+                if capture.lock().expect("identities").len() == 2 {
+                    return base + EOF_GRACE + TERM_GRACE;
+                }
+            }
+            base + EOF_GRACE
+        },
+    };
+    let stop = StopRequest::default();
+    stop.request();
+    let profile = fixture.profile.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        tx.send(supervise(
+            child,
+            files,
+            profile,
+            stop,
+            || {
+                drop(stdin);
+                closed.store(true, Ordering::Release);
+            },
+            || Ok(()),
+            schedule,
+        ))
+        .expect("supervisor report")
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("bounded supervisor producer");
+    worker.join().expect("supervisor worker");
+    report.cleanup.expect("confirmed descendants gone");
+    assert!(report.stop_requested);
+    let known = identities.lock().expect("identities").clone();
+    assert_eq!(
+        known.len(),
+        2,
+        "TERM created a descendant after the TERM snapshot"
+    );
+    assert!(known.iter().all(|identity| !identity.alive()));
+    assert!(!path.exists());
 }

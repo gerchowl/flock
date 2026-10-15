@@ -336,7 +336,7 @@ async fn a_restart_keeps_the_question_policy_and_its_hint() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing() {
     let mut rig = rig_with_script("#!/bin/sh\nwhile IFS= read -r line; do exit 0; done\n");
     assert!(request(&mut rig).get("result").is_some());
@@ -368,10 +368,65 @@ async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing(
         .unwrap()
         .try_send_bytes(bytes::Bytes::from_static(b"exit\r"))
         .unwrap();
-    wait_for_dead_runtime(&rig).await;
-    while let Ok(event) = rig.app.event_rx.try_recv() {
-        rig.app.handle_internal_event(event);
-    }
+    // Hold the real watcher event after it publishes the exit slot, then
+    // schedule delivery for the next async yield. The old polling/drain path
+    // sees a dead child and an empty queue without settling the retry.
+    let pane_id = rig.app.state.workspaces[0].focused_pane_id().unwrap();
+    let died = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rig
+                .app
+                .event_rx
+                .recv()
+                .await
+                .expect("runtime event channel");
+            if let crate::events::AppEvent::PaneDied { pane_id: id } = &event {
+                assert_eq!(*id, pane_id, "unexpected pane died before resumed child");
+                // The original child's watcher can also arrive late. Only
+                // a death notification after the resumed child is reaped can
+                // settle this retry, as in the production exit handler.
+                if rig.app.restart_runtime_gone(&rig.id) {
+                    break event;
+                }
+                continue;
+            }
+            rig.app.handle_internal_event(event);
+        }
+    })
+    .await
+    .expect("resumed child did not report PaneDied within 5 seconds");
+    assert!(rig.app.restart_runtime_gone(&rig.id));
+    assert!(rig.app.state.terminals[&rig.id].restart_retry.is_some());
+    // Isolate delivery from further watcher notifications, so even the
+    // failing-before schedule cannot accidentally drain a later death event.
+    let (events, delayed_rx) = tokio::sync::mpsc::channel(1);
+    let _held_events = std::mem::replace(&mut rig.app.event_rx, delayed_rx);
+    let delivery =
+        tokio::spawn(async move { events.send(died).await.expect("deferred death event") });
+    // ADR-0037 §1: completion is handling PaneDied, not observing the
+    // watcher's earlier exit slot or finding its queue temporarily empty.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rig
+                .app
+                .event_rx
+                .recv()
+                .await
+                .expect("runtime event channel");
+            let died = if let crate::events::AppEvent::PaneDied { pane_id: id } = &event {
+                assert_eq!(*id, pane_id, "unexpected pane died while settling retry");
+                true
+            } else {
+                false
+            };
+            rig.app.handle_internal_event(event);
+            if died {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("PaneDied was not handled within the 5-second failure ceiling");
     let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
     assert!(terminal.restart_retry.is_none());
     assert_eq!(
@@ -389,6 +444,7 @@ async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing(
         .unwrap()
         .argv
         .contains(&"restart-session".into()));
+    delivery.await.expect("fixture event delivery task");
     assert_eq!(reported_status(&mut rig), "offline");
     let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
     assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
