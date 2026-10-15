@@ -27,13 +27,14 @@
       ];
       forAllSystems = lib.genAttrs systems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      sccacheFor = pkgs: pkgs.callPackage ./nix/sccache.nix { };
       patchedSccacheFor =
         pkgs:
         assert lib.assertMsg (
-          pkgs.sccache.version == "0.15.0"
+          (sccacheFor pkgs).version == "0.18.0"
         ) "Re-evaluate the #1411 startup patch when sccache changes version";
-        pkgs.sccache.overrideAttrs (old: {
-          patches = (old.patches or [ ]) ++ [ ./nix/patches/sccache-0.15.0-startup.patch ];
+        (sccacheFor pkgs).overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/patches/sccache-0.18.0-startup.patch ];
         });
       stableSccacheFor =
         pkgs:
@@ -172,7 +173,7 @@
             # persistent TMPDIR and its own socket (#1325). A wrapper covers
             # lazy startup and idle restarts without changing the shell TMPDIR.
             # SCCACHE_DIR alone only controls artifacts, not temporary files.
-            # sccache 0.15 endpoint contract: https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage
+            # sccache 0.18 endpoint contract: https://github.com/mozilla/sccache/blob/v0.18.0/README.md#usage
             hook = ''
               export PATH="${stableSccache}/bin:$PATH"
               # The isolated cache-reuse probe also needs the unwrapped binary.

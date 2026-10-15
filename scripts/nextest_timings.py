@@ -2,6 +2,8 @@
 
 Download with --download, then render the same input again without network access.
 Missing artifacts fail the download rather than silently shrinking the sample.
+Repository policy is stricter than ADR-0037 §2: CI must inherit the default ceiling,
+with exceptions only in scoped [[profile.default.overrides]].
 """
 from __future__ import annotations
 
@@ -76,6 +78,10 @@ def report(root: Path) -> str:
         "Partially shadowed overrides with a reachable OR arm are deliberately not flagged.",
         "Platform-only overrides without a filter are reported as unproved; their ceilings are still checked.",
         "Regexes, negation, other predicates and unequal platform scopes remain unproved, not rejected.", "",
+        'Repository policy is stricter than ADR-0037 §2: `profile.ci.slow-timeout` must be absent,',
+        'even when an explicit CI ceiling meets the measured sizing rule. CI inherits the checked default.',
+        'Remove that key and put needed exceptions in scoped `[[profile.default.overrides]]`.',
+        "",
         f"Latest {len(runs)} completed dev CI runs at collection time, including cancelled runs.",
         f"Recorded executions: {sum(map(len, values.values())):,}; binaries: {len({binary for binary, _ in values})}.",
         "Partial runs contribute only recorded executions, never zeroes for missing tests.",

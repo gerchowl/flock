@@ -77,7 +77,7 @@ with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
 for the same user. This implements the stable-directory/separate-endpoint design
 accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
 
-The pinned sccache 0.15.0 carries the startup fix approved in
+The pinned sccache 0.18.0 carries the startup fix approved in
 [issue #1411](https://github.com/gerchowl/flock/issues/1411). Unix socket startup
 takes an exclusive lock on `<socket>.lock`, probes for a live listener, and only
 reclaims an owned stale socket after connection refusal or absence. A concurrent
@@ -88,7 +88,8 @@ and crashes. Do not delete it while starters can run. Unsafe paths, permissions,
 and inconclusive probes fail visibly without removing the endpoint. TCP and
 abstract Unix sockets retain upstream behavior. A version assertion requires
 re-evaluating the patch whenever the pinned sccache changes; drop the patch when
-upstream fixes the unlink+bind race.
+an upstream release fixes the unlink+bind race reported in
+[mozilla/sccache#2906](https://github.com/mozilla/sccache/issues/2906).
 
 Each dev shell picks up the patched binary on its next `nix develop`. A running
 shared server keeps its old binary until it next restarts naturally. Nobody
@@ -98,8 +99,8 @@ Artifact storage keeps sccache's existing configuration or platform default, inc
 `~/Library/Caches/Mozilla.sccache` on macOS, so existing caches remain warm.
 The wrapper preserves an explicit `SCCACHE_DIR` and uses its `tmp` subdirectory
 and `flock.sock` for daemon runtime state instead of the default runtime root.
-[sccache 0.15 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.15.0/README.md#usage),
-while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.15.0/docs/Configuration.md#disk-local).
+[sccache 0.18 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.18.0/README.md#usage),
+while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Configuration.md#disk-local).
 There is no server-only temporary-directory setting, so the wrapper sets
 `TMPDIR` for each sccache invocation, including compiler subprocesses. Other
 shell commands retain their own `TMPDIR`. Persistent runtime storage avoids
