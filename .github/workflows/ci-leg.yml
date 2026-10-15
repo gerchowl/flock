@@ -202,6 +202,7 @@ jobs:
         run: just ci-shard '${{ inputs.leg }}' '${{ matrix.shard.name }}' nextest-archive.tar.zst
 
       - name: Summarize
+        continue-on-error: true
         if: always()
         run: python3 scripts/ci_shards.py summary --title '${{ matrix.shard.name }} (${{ inputs.leg }})' '${{ matrix.shard.name }}=target/nextest/ci/junit.xml' >> "$GITHUB_STEP_SUMMARY"
 

@@ -73,13 +73,13 @@ jobs:
   # The required checks. Branch protection and the landing driver wait on
   # exactly `check (macos-15)` and `check (ubuntu-latest)`, so these keep the
   # names of the single job they replace, and pass only when every job of
-  # their leg passed. `always()` rather than `!cancelled()`: a skipped
-  # required check counts as passing, so a leg that was cancelled, timed out
-  # or never started must still run this job and turn it red.
+  # their leg passed. Dependency failure/skipping still runs the result gate.
+  # Whole-workflow cancellation can stop these jobs, so superseded runs stay
+  # cancelled rather than producing misleading red aggregate checks.
   check-ubuntu:
     name: check (ubuntu-latest)
     needs: ubuntu
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -96,6 +96,7 @@ jobs:
           path: junit
 
       - name: Summarize shards
+        continue-on-error: true
         run: python3 scripts/ci_shards.py summary --title 'check (ubuntu-latest)' --strip-prefix junit-ubuntu-latest- junit >> "$GITHUB_STEP_SUMMARY"
 
       - name: Require every job of the leg
@@ -110,7 +111,7 @@ jobs:
   check-macos:
     name: check (macos-15)
     needs: macos
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -127,6 +128,7 @@ jobs:
           path: junit
 
       - name: Summarize shards
+        continue-on-error: true
         run: python3 scripts/ci_shards.py summary --title 'check (macos-15)' --strip-prefix junit-macos-15- junit >> "$GITHUB_STEP_SUMMARY"
 
       - name: Require every job of the leg
