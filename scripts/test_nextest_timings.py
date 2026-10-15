@@ -323,6 +323,16 @@ class Timings(unittest.TestCase):
                 samples(Path(directory), [{"databaseId": 42}])
 
     def assert_ceilings_fit(self, config, minimums):
+        """Check measured ceilings, requiring CI to inherit the default policy.
+
+        ADR-0037 §§1–2 requires finite, measured ceilings in both profiles.
+        The repository keeps CI's profile-wide timeout absent so it inherits
+        the checked default; scoped overrides are checked separately below.
+        """
+        self.assertNotIn(
+            "slow-timeout", config["profile"].get("ci", {}),
+            "ci must inherit the measured default slow-timeout",
+        )
         default = config["profile"]["default"]
 
         def seconds(slow):
@@ -372,6 +382,23 @@ class Timings(unittest.TestCase):
                 minimums[cells[1].strip().strip("`")] = int(cells[-2])
         self.assertGreater(len(minimums), 50)
         self.assert_ceilings_fit(config, minimums)
+
+    def test_ci_profile_must_inherit_the_measured_default_ceiling(self):
+        config = {"profile": {
+            "default": {
+                "slow-timeout": {"period": "60s", "terminate-after": 7},
+                "overrides": [],
+            },
+            "ci": {},
+        }}
+        self.assert_ceilings_fit(config, {"one": 420})
+        for period, count in [("30s", 1), ("60s", 11)]:
+            with self.subTest(period=period, terminate_after=count):
+                config["profile"]["ci"]["slow-timeout"] = {
+                    "period": period, "terminate-after": count,
+                }
+                with self.assertRaisesRegex(AssertionError, "ci.*inherit"):
+                    self.assert_ceilings_fit(config, {"one": 420})
 
     def test_short_per_test_ceiling_is_rejected_even_after_a_binary_override(self):
         for expression in [
