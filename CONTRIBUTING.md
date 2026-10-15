@@ -180,7 +180,19 @@ fix: handle pane focus
 refs #128
 ```
 
-Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Flock closes released issues after a release is published, not when unreleased commits land on `main`.
+Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits.
+
+`Refs #N` is for the issue being fixed. When that commit lands on `dev`, automation
+adds `pending-release` and closes the issue with an unreleased notice. Release
+automation later records the published version.
+
+For a tracking issue or epic, write `Part of #N`, never `Refs #N`. Both automation
+paths exclude issues with a `tracking` or `epic` label, or a title ending in
+`(tracking)`, case-insensitively. The shared rule lives in
+[`scripts/release_issue_excluded.jq`](scripts/release_issue_excluded.jq).
+Existing labels and closed state on trackers are left untouched, so this does
+not reopen trackers closed by older automation. If evaluating the exclusion
+rule fails, the step fails before editing, commenting on, or closing that issue.
 
 ## PR scope
 

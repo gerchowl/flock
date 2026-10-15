@@ -121,14 +121,26 @@ fn opencode_history(
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
+        self.handle_agent_list_with_clock(id, std::time::Instant::now)
+    }
+
+    /// Sample the monotonic clock once for local state ages. The fleet view
+    /// reuses those records, so one response cannot disagree with itself.
+    pub(in crate::app) fn handle_agent_list_with_clock(
+        &mut self,
+        id: String,
+        mut clock: impl FnMut() -> std::time::Instant,
+    ) -> String {
+        let agents = self.collect_agent_infos_at(clock());
+        let fleet = self.collect_fleet_agents(&agents);
         encode_success(
             id,
             ResponseResult::AgentList {
-                agents: self.collect_agent_infos(),
+                agents,
                 // #320: the same call answers "who is here" and "who can I
                 // reach". A separate fleet verb would have been a second
                 // listing to keep in step with this one.
-                fleet: self.collect_fleet_agents(),
+                fleet,
             },
         )
     }

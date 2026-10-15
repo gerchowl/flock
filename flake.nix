@@ -146,8 +146,13 @@
               (callPackage ./nix/nextest.nix { })
               clippy
               cmake
+              # Maintenance tests exercise Git fixtures and workflow/doc scripts.
+              git
+              jq
               just
               ninja
+              nodejs
+              perl
               pkg-config
               rustc
               rustfmt

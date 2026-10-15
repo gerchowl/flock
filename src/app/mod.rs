@@ -14,6 +14,7 @@ mod agents;
 mod api;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
+pub(crate) use api::responses::encode_error_with_data;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;

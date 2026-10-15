@@ -70,6 +70,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
       - name: Prefer official Ubuntu mirrors over Azure
         run: |
@@ -159,6 +160,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
       - name: Install macOS build tools
         run: brew install cmake ninja
