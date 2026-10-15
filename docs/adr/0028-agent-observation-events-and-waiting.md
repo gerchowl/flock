@@ -267,13 +267,17 @@ and [newline/write/flush](https://github.com/openai/codex/blob/rust-v0.160.1/cod
 
 For `type: event_msg`, consume `payload.type: task_started` / `task_complete`,
 including the documented aliases `turn_started` / `turn_complete`. Start means
-working; completion with the matching `turn_id` means idle, including an error
-completion. A matching `turn_aborted` ends the active turn; an abort with no
-attributable turn ID yields unknown, never guessed idle.
+working; completion with the matching `turn_id` means idle. Terminal non-abort
+task failures also emit completion with an error; interruptions emit abort. An
+error notice alone is not an end boundary. A matching `turn_aborted` ends the
+active turn; an abort with no attributable turn ID yields unknown, never guessed
+idle.
 
 See the pinned [names and aliases](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L1406-L1418),
 [start/complete payloads](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L2152-L2198),
-and [abort payload](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L4256-L4277).
+[abort payload](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L4256-L4277),
+[terminal task-error handling](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/tasks/mod.rs#L629-L658),
+and [completion/abort construction and dispatch](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/tasks/mod.rs#L811-L857).
 Tool output, commentary, usage, compaction and subagent completion never start
 or end the parent's turn. In particular, ExecCommandBegin and McpToolCallBegin
 are transient and are not persisted: a long tool call can legitimately produce
@@ -312,16 +316,35 @@ an expected local source initializing; never guess a file by name/cwd or search
 an unrelated profile. Do not follow remote-reported paths. Ambiguous writers
 or mismatched metadata yield unknown.
 
-For a known resume, capture file identity and the last complete-record offset
-before launch. Buffer eligible new records until the writer and SessionStart
-binding are confirmed. A new thread uses its new file/metadata and binding.
-Rebinding invalidates the old decision until resynchronization. A reducer state
-may transfer only with proven continuity of the same local writer, thread,
-file and cursor; equal thread IDs alone do not suffice. Imported history cannot
-publish an old completion as a new launch's idle. An attachment without a
-trustworthy current boundary starts unknown until attributable evidence arrives.
-Delayed records from a revoked binding are discarded, including within one
-launch after `/new` or `/clear`.
+Rebinding invalidates the old decision until resynchronization. Establish a
+checked **no active turn** boundary, which counts as idle, in either case:
+
+- A validated SessionStart with source `startup`, `clear` or `fork`, whose
+  verified transcript has no start without a matching complete/abort. Validate
+  the bound thread's own history; imported parent/fork history cannot end its turn.
+- A known `resume` whose recorded pre-launch file ended in complete or abort,
+  after confirming the new local writer and SessionStart binding and verifying
+  that the writer has appended no start. Capture file identity, verified bytes
+  and the last complete-record offset before launch; a copied file requires
+  verification of that snapshot at the destination as well as local ownership.
+
+In both cases, read through the verified current file boundary and reconcile
+buffered new records before publishing idle. A newly appended start wins; do not
+publish transient idle from a stale snapshot while catch-up is pending. Neither
+an idle composer nor elapsed time establishes this boundary. Missing/bad paths
+or metadata, unverified bindings, unmatched starts in untrusted resumed history
+and incomplete continuity checks remain unknown with their reason. Old completion
+or a rollout copy alone grants no authority. Once the checks establish idle,
+guarded submit can succeed immediately after resume under its existing gates;
+no fresh start or completion is required to unlock input.
+
+A reducer state may transfer only with proven continuity of the same local
+writer, thread, file and cursor; equal thread IDs alone do not suffice. In
+particular, SessionStart `compact` during a running turn preserves working when
+that continuity is proven. Otherwise it yields unknown with
+`codex_compaction_continuity_unproven`; compaction is not a fresh-session idle
+boundary. Delayed records from a revoked binding are discarded, including
+within one launch after `/new` or `/clear`.
 
 A move (#1500) revokes the source pane's binding before the destination claims a
 new launch generation. Rebind to the destination's **local** writer and Codex
@@ -386,7 +409,7 @@ and [distinct history/ephemeral fields](https://github.com/openai/codex/blob/rus
 | --- | --- |
 | Screen approval/question prompt (`needs_human`), even with lifecycle idle | Attention wins: `turn: unknown`, `attention: needs_human`, `phase: needs_human`, per §1. Preserve the underlying lifecycle boundary for when attention clears. |
 | Available, synchronized start without a matching end | Working until matching end or observed source loss; ignore hook/screen idle, DONE text and hidden Working chrome. |
-| Available, synchronized matching complete/abort, no attention | Idle despite stale Working chrome; background remains independent. |
+| Available, synchronized matching complete/abort or checked no-active-turn boundary, no attention | Idle despite stale Working chrome; background remains independent. |
 | Expected/claimed but initializing, lost, unreadable, discontinuous or ambiguous | Unknown with source and reason; hook/screen cannot conceal source loss. |
 | Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the proposed policy) | Hook then screen fallback for absent/disabled adapters; the proposed unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
 
@@ -417,7 +440,13 @@ records. Where ordinals exist, check their format-defined continuity too.
 Do not infer a gap from silence, transient events missing by persistence policy,
 or a non-contiguous sequence of turn IDs. Legacy files cannot prove that an
 upstream producer silently omitted a well-formed record; this format limitation
-belongs to the owner decision. Revalidation must not conceal an observed gap;
+belongs to the owner decision. **Residual risk:** if the writer remains alive
+but its end record is lost, the last start holds working indefinitely. Publish
+a diagnostic when lifecycle and screen disagree, exposing both observations
+and the active boundary so an operator can request a rebind. Neither the
+diagnostic nor requesting a rebind changes state on its own: rebind must validate
+and reconstruct a trustworthy current boundary before publishing a new decision.
+Revalidation must not conceal an observed gap;
 resynchronize and require a trustworthy current boundary before publishing state.
 
 Background remains independent (§1). A child process or terminal count cannot
@@ -428,7 +457,7 @@ holds do not determine turn state.
 
 #### Consumers of unknown and quiet idle
 
-| Consumer | On source-loss `unknown` | On quiet, known idle with a healthy source |
+| Consumer | On source-loss `unknown` | On quiet, known idle with a healthy source (including a checked no-active-turn boundary) |
 | --- | --- | --- |
 | Waiters | An idle/working/settled predicate is not satisfied. An explicit unknown predicate can match with its reason. Keep deadlines, cancellation and source/producer failure reporting bounded (ADR-0037). Mail/event predicates independent of turn still match their own data. | Idle/settled waits satisfy normally after their existing settle condition; growing evidence age does not reset the held interval. |
 | Idle wake | Do not type an idle wake. Retain the pending wake and re-evaluate when idle is known. | Wake normally once the existing idle/injection gates pass; no new rollout record is required. |
@@ -454,35 +483,60 @@ monotonic clock. No live model, sleeps, retries or production-only test hooks.
    before and passes after implementation through agent get/list, events and waits.
 2. Long tool call with no records and a live writer yields working after hours
    of supplied-clock advance. Silence after completion yields idle after hours.
-   Initial binding with no boundary yields unknown. Writer exit yields unknown;
+   Validated startup/clear/fork binding with a verified transcript containing no
+   unmatched start yields idle. Unverified binding yields unknown. Writer exit
+   yields unknown;
    PID reuse yields unknown; a supervised wedged/dead reader yields unknown;
    replacement or truncation yields unknown. Bounded integration waits must name
    a missing condition rather than hang. Test idle wake, self-compact, guarded
    submit, mail delivery and idle waits on quiet known idle: each remains eligible
    under its existing gates. For source-loss unknown, each follows the table above.
-3. Both start aliases yield working; both matching completion aliases yield idle.
-   Duplicate completion yields idle. A partial matching completion line after start
-   yields working; its completed newline-terminated record yields idle. Unknown
-   kinds after start yield working. Malformed complete
-   records yield unknown. Late old-turn completion while a newer turn runs leaves
-   working; conflicting unrecognized turn IDs yield unknown. Matching abort yields
-   idle; unattributable abort yields unknown. Non-boundary output leaves working.
-   A legacy file without ordinals remains working; verified prefix mutation yields
-   unknown; an ordinal discontinuity yields unknown. Valid resynchronization with
-   an attributable current start yields working. Only matching boundaries advance
-   the turn cursor; age metadata alone emits no phase transition.
+3. Exercise each reducer case independently, with one expected turn state:
+
+   | Input and prior state | Expected turn |
+   | --- | --- |
+   | Either start alias | Working |
+   | Either completion alias matching the active turn | Idle |
+   | Duplicate matching completion after completion | Idle |
+   | Partial matching completion line after start | Working |
+   | Completed newline-terminated matching completion record after start | Idle |
+   | Unknown record/event kind after start | Working |
+   | Malformed complete record | Unknown |
+   | Late old-turn completion while a newer turn runs | Working |
+   | Conflicting unrecognized turn ID | Unknown |
+   | Matching abort | Idle |
+   | Unattributable abort | Unknown |
+   | Non-boundary output after start, including an error notice | Working |
+   | Terminal task failure's matching completion with error | Idle |
+   | Legacy file without ordinals after start | Working |
+   | Verified prefix mutation | Unknown |
+   | Ordinal discontinuity | Unknown |
+   | Valid resynchronization with attributable current start | Working |
+
+   Only matching boundaries advance the turn cursor; age metadata alone emits
+   no phase transition. Separately simulate a lost end with a live writer:
+   working persists and screen disagreement publishes a diagnostic. A rebind
+   request alone cannot convert it to idle; reconstructing a verified active
+   start retains working, or failed validation leaves unknown.
 4. Same-name/cwd panes with different thread IDs remain isolated: starting only
    pane A yields working for A and idle for an already completed B. Resume with
-   copied history starts unknown until new attributable evidence. Within one OS
-   launch, `/new` and `/clear` each revoke the old binding: a delayed old completion
-   leaves the new active turn working. For each SessionStart source, the unvalidated
-   binding yields unknown; a validated new start yields working. Same-ID
-   resume/compact with proven continuous completed state restores idle. A stale
-   callback while the rebound turn runs leaves working. After
-   a move the old pane remains hibernated; a start in the destination yields working
-   there. Duplicate live writers yield unknown. A mismatched transcript_path/meta
-   pair yields unknown. Another thread's end through fork/revert metadata leaves
-   the current active turn working.
+   a verified pre-launch complete/abort and a confirmed new writer that appended
+   no start yields idle, including verified copied history at the destination.
+   Guarded submit immediately after that resume succeeds under its existing
+   draft, lease and fresh-composer gates without waiting for a new lifecycle
+   record. A buffered new start during catch-up yields working without transient
+   idle. Untrusted resume history with an unmatched start yields unknown.
+   Within one OS launch, `/new` and `/clear` each revoke the old binding: a delayed
+   old completion leaves the new active turn working. Each unvalidated SessionStart
+   binding yields unknown; a validated startup/clear/fork with no unmatched start
+   yields idle. Same-ID resume with proven continuous completed state restores
+   idle. Compaction during an active turn with proven writer/thread/file/cursor
+   continuity stays working; unproven compaction continuity yields unknown with
+   `codex_compaction_continuity_unproven`. A stale callback while the rebound turn
+   runs leaves working. After a move the old pane remains hibernated; a start in
+   the destination yields working there. Duplicate live writers yield unknown.
+   A mismatched transcript_path/meta pair yields unknown. Another thread's end
+   through fork/revert metadata leaves the current active turn working.
 5. Lifecycle start against hook/screen idle yields working. Lifecycle complete
    against stale Working chrome yields idle. A screen approval prompt against
    lifecycle idle yields `phase: needs_human` with turn unknown; clearing that
