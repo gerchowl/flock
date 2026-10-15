@@ -315,7 +315,11 @@ class Timings(unittest.TestCase):
             data = samples(root, runs)
             self.assertEqual(data["fixture", "macos-15"], [19])
             self.assertIn("| `fixture` | 1 / 19.000 / 19.000 | 1 / 25.000 / 25.000 | 300 |", report(root))
-            self.assertIn("cancelled | 2 |", report(root))
+            text = report(root)
+            self.assertIn("cancelled | 2 |", text)
+            self.assertIn("Repository policy is stricter than ADR-0037 §2", text)
+            self.assertIn("`profile.ci.slow-timeout` must be absent", text)
+            self.assertIn("scoped `[[profile.default.overrides]]`", text)
 
     def test_missing_reports_fail_instead_of_changing_the_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -323,15 +327,19 @@ class Timings(unittest.TestCase):
                 samples(Path(directory), [{"databaseId": 42}])
 
     def assert_ceilings_fit(self, config, minimums):
-        """Check measured ceilings, requiring CI to inherit the default policy.
+        """Check measured ceilings and the stricter repository CI policy.
 
-        ADR-0037 §§1–2 requires finite, measured ceilings in both profiles.
-        The repository keeps CI's profile-wide timeout absent so it inherits
-        the checked default; scoped overrides are checked separately below.
+        ADR-0037 §§1–2 requires finite ceilings meeting the measured minimums.
+        §2 permits an explicit CI ceiling that meets those limits. Repository
+        policy is stricter: profile.ci.slow-timeout must be absent so CI inherits
+        the checked default. Remove that key and put needed exceptions in scoped
+        [[profile.default.overrides]]. Scoped ceilings are checked below.
         """
         self.assertNotIn(
             "slow-timeout", config["profile"].get("ci", {}),
-            "ci must inherit the measured default slow-timeout",
+            "repository policy: ci must inherit the measured default slow-timeout; "
+            "remove profile.ci.slow-timeout and put needed exceptions in "
+            "scoped [[profile.default.overrides]]",
         )
         default = config["profile"]["default"]
 
@@ -397,8 +405,11 @@ class Timings(unittest.TestCase):
                 config["profile"]["ci"]["slow-timeout"] = {
                     "period": period, "terminate-after": count,
                 }
-                with self.assertRaisesRegex(AssertionError, "ci.*inherit"):
+                with self.assertRaisesRegex(AssertionError, "ci.*inherit") as error:
                     self.assert_ceilings_fit(config, {"one": 420})
+                message = str(error.exception)
+                self.assertIn("remove profile.ci.slow-timeout", message)
+                self.assertIn("scoped [[profile.default.overrides]]", message)
 
     def test_short_per_test_ceiling_is_rejected_even_after_a_binary_override(self):
         for expression in [
