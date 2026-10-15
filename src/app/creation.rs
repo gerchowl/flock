@@ -371,7 +371,11 @@ impl App {
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,
             display_agent: presentation.display_agent,
-            agent_status: super::api_helpers::pane_agent_status_from_terminal(terminal, pane.seen),
+            agent_status: super::api_helpers::pane_agent_status_from_terminal(
+                terminal,
+                pane.seen,
+                self.terminal_runtimes.get(&terminal.id).is_some(),
+            ),
             custom_status: presentation.custom_status,
             state_labels: presentation.state_labels,
             agent_session: terminal_agent_session_info(terminal),

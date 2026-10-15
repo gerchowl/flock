@@ -1312,6 +1312,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_snapshot_reports_offline_through_agent_api() {
+        let saved = codex_agent_snapshot(std::env::temp_dir(), None);
+        let snapshot: SessionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let (events, _event_rx) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(runtimes.is_empty());
+        let agent_id = terminals.values().next().unwrap().agent_id.to_string();
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = workspaces;
+        app.state.terminals = terminals;
+        app.terminal_runtimes = runtimes.into();
+        for (method, params, pointer) in [
+            (
+                "agent.get",
+                serde_json::json!({"target":agent_id}),
+                "/result/agent",
+            ),
+            ("agent.list", serde_json::json!({}), "/result/agents/0"),
+            ("pane.list", serde_json::json!({}), "/result/panes/0"),
+        ] {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"restore", "method":method, "params":params}),
+            )
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            let record = response.pointer(pointer).unwrap();
+            assert_eq!(record["agent_status"], "offline", "{response}");
+            assert_eq!(record["agent_session"]["value"], "codex-session");
+            if method != "pane.list" {
+                assert_eq!(record["resumable"], true);
+                assert_eq!(record["state"]["lifecycle"], "offline");
+                assert_eq!(record["state"]["phase"], "offline");
+                assert_eq!(record["state"]["turn"], "unknown");
+            }
+        }
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .next()
+            .unwrap()
+            .pending_agent_resume_plan
+            .is_some());
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
         // Deterministic, existing directory: restore only needs the path to

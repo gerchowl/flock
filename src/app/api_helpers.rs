@@ -176,16 +176,21 @@ pub(super) fn screen_attention(
 /// Same shape as [`pane_agent_status`] but honours the terminal's
 /// `hibernated_resume_plan` — a hibernated pane always reports Hibernated
 /// regardless of the underlying detected state (which will drift to Unknown
-/// once the child exits).
+/// once the child exits). A deferred native restore without a runtime is
+/// offline, not a live idle turn (ADR-0028 §1); its resume plan stays intact.
 pub(super) fn pane_agent_status_from_terminal(
     terminal: &crate::terminal::TerminalState,
     seen: bool,
+    runtime_present: bool,
 ) -> crate::api::schema::AgentStatus {
     if terminal.resume_failed {
         return crate::api::schema::AgentStatus::Offline;
     }
     if terminal.hibernated_resume_plan.is_some() {
         return crate::api::schema::AgentStatus::Hibernated;
+    }
+    if terminal.pending_agent_resume_plan.is_some() && !runtime_present {
+        return crate::api::schema::AgentStatus::Offline;
     }
     pane_agent_status(terminal.state, seen)
 }

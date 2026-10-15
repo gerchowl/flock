@@ -1434,6 +1434,7 @@ impl App {
                 let status = super::api_helpers::pane_agent_status_from_terminal(
                     terminal.expect("terminal for live pane"),
                     detail.seen,
+                    terminal.is_some_and(|t| self.terminal_runtimes.get(&t.id).is_some()),
                 );
                 out.push(crate::checks::HibernationPaneSnapshot {
                     pane_id: detail.pane_id,
