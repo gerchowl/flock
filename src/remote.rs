@@ -1917,9 +1917,62 @@ impl BridgeHealth {
 /// Live ssh children of one bridge, by connection id.
 type ActiveChildPids = Arc<std::sync::Mutex<HashMap<u64, u32>>>;
 
+/// Pipes and lifecycle of one SSH tunnel. An injected spawner can provide an
+/// in-process transport without changing forwarding, health or failure logging.
+/// Implementations must close their pipes on exit. Transports without a PID
+/// must finish when the client disconnects, since teardown cannot signal them.
+trait BridgeChild: Send {
+    /// A real child PID for bridge teardown, or none for an in-process transport.
+    fn id(&self) -> Option<u32>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+    fn take_pipes(&mut self) -> io::Result<BridgePipes>;
+}
+
+struct BridgePipes {
+    stdin: Box<dyn io::Write + Send>,
+    stdout: Box<dyn io::Read + Send>,
+    stderr: Option<Box<dyn io::Read + Send>>,
+}
+
+impl BridgeChild for std::process::Child {
+    fn id(&self) -> Option<u32> {
+        Some(self.id())
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+
+    fn take_pipes(&mut self) -> io::Result<BridgePipes> {
+        let stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
+        let stdout = self.stdout.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing")
+        })?;
+        Ok(BridgePipes {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            stderr: self.stderr.take().map(|pipe| Box::new(pipe) as _),
+        })
+    }
+}
+
+/// Spawn one connection in accept order. Production always starts SSH through
+/// the traced-command funnel. The seam keeps transport policy out of forwarding.
+type BridgeSpawner =
+    Arc<dyn Fn(&mut TracedCommand, u64) -> io::Result<Box<dyn BridgeChild>> + Send + Sync>;
+
 /// Everything one bridge connection needs to dial its ssh, shared by the
 /// connection threads.
 struct BridgeDial {
+    spawn: BridgeSpawner,
     target: String,
     remote_flock: RemoteFlock,
     session_name: String,
@@ -1969,6 +2022,28 @@ impl SshStdioBridge {
         manage_ssh_config: bool,
         proxy_jump: Option<String>,
     ) -> io::Result<Self> {
+        Self::start_with_spawner(
+            target,
+            remote_flock,
+            local_socket,
+            session_name,
+            manage_ssh_config,
+            proxy_jump,
+            Arc::new(|command, _| command.spawn_traced().map(|child| Box::new(child) as _)),
+        )
+    }
+
+    /// Start the same listener and forwarding path with an explicit spawner.
+    /// The spawner owns transport creation only, not health or log decisions.
+    fn start_with_spawner(
+        target: String,
+        remote_flock: RemoteFlock,
+        local_socket: PathBuf,
+        session_name: String,
+        manage_ssh_config: bool,
+        proxy_jump: Option<String>,
+        spawn: BridgeSpawner,
+    ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
         crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
@@ -2008,6 +2083,7 @@ impl SshStdioBridge {
                 .bridge_stderr_settle_ms,
         );
         let dial = Arc::new(BridgeDial {
+            spawn,
             target,
             remote_flock,
             session_name,
@@ -2658,13 +2734,14 @@ fn bridge_connection(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn_traced()
+    let mut child = (dial.spawn)(&mut command, connection)
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
     // Publish the child's pid so bridge Drop can SIGKILL it to unblock the
     // `child.wait()` below on teardown (#176). Removed before returning.
-    if let Ok(mut pids) = active_child_pids.lock() {
-        pids.insert(connection, child.id());
+    if let Some(pid) = child.id() {
+        if let Ok(mut pids) = active_child_pids.lock() {
+            pids.insert(connection, pid);
+        }
     }
     // A teardown that began before the pid was published cannot have killed
     // this child, and the wait below would then park until ssh gave up on its
@@ -2673,15 +2750,11 @@ fn bridge_connection(
     if should_stop.load(Ordering::Acquire) {
         let _ = child.kill();
     }
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let child_stderr = child.stderr.take();
+    let BridgePipes {
+        stdin: mut child_stdin,
+        stdout: mut child_stdout,
+        stderr: child_stderr,
+    } = child.take_pipes()?;
     let mut stream_to_child = stream.try_clone()?;
     let mut child_to_stream = stream;
 
@@ -3492,6 +3565,309 @@ mod tests {
         );
     }
 
+    /// In-process SSH stand-in: real byte pipes, exit status and stderr, with
+    /// no shell startup or counter file inside the socket-read failure ceiling.
+    struct FixtureSsh {
+        pipes: Option<BridgePipes>,
+        control: UnixStream,
+        exited: std::sync::mpsc::Receiver<std::process::ExitStatus>,
+        stderr_read: std::sync::mpsc::Receiver<()>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    struct FixtureStderr {
+        text: io::Cursor<Vec<u8>>,
+        done: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl io::Read for FixtureStderr {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = io::Read::read(&mut self.text, buf)?;
+            if n == 0 {
+                if let Some(done) = self.done.take() {
+                    let _ = done.send(());
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    impl BridgeChild for FixtureSsh {
+        fn id(&self) -> Option<u32> {
+            None
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.control.shutdown(std::net::Shutdown::Both)
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            let status = self
+                .exited
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            // The fixture's exit is gated on stderr consumption, rather than
+            // hoping its reader gets scheduled inside the product settle bound.
+            self.stderr_read
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            self.worker
+                .take()
+                .expect("fixture worker")
+                .join()
+                .expect("fixture SSH worker panicked");
+            Ok(status)
+        }
+
+        fn take_pipes(&mut self) -> io::Result<BridgePipes> {
+            self.pipes
+                .take()
+                .ok_or_else(|| io::Error::other("fixture pipes already taken"))
+        }
+    }
+
+    impl Drop for FixtureSsh {
+        fn drop(&mut self) {
+            let _ = self.control.shutdown(std::net::Shutdown::Both);
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("fixture SSH worker panicked");
+            }
+        }
+    }
+
+    fn fixture_spawner(failures: u64, complaint: &'static str) -> BridgeSpawner {
+        Arc::new(move |_, connection| {
+            use std::os::unix::process::ExitStatusExt;
+            let (stdin, mut input) = UnixStream::pair()?;
+            let (stdout, mut output) = UnixStream::pair()?;
+            let control = input.try_clone()?;
+            let (exit_tx, exited) = std::sync::mpsc::channel();
+            let (stderr_tx, stderr_read) = std::sync::mpsc::channel();
+            let failed = connection <= failures;
+            let worker = thread::spawn(move || {
+                let status = if failed {
+                    std::process::ExitStatus::from_raw(255 << 8)
+                } else {
+                    copy_flush(&mut input, &mut output).expect("fixture echo");
+                    std::process::ExitStatus::from_raw(0)
+                };
+                drop(input);
+                drop(output);
+                let _ = exit_tx.send(status);
+            });
+            Ok(Box::new(FixtureSsh {
+                pipes: Some(BridgePipes {
+                    stdin: Box::new(stdin),
+                    stdout: Box::new(stdout),
+                    stderr: Some(Box::new(FixtureStderr {
+                        text: io::Cursor::new(if failed {
+                            complaint.as_bytes().to_vec()
+                        } else {
+                            vec![]
+                        }),
+                        done: Some(stderr_tx),
+                    })),
+                }),
+                control,
+                exited,
+                stderr_read,
+                worker: Some(worker),
+            }))
+        })
+    }
+
+    /// A process-local log sink and event feed. nextest isolates each test.
+    /// Keep capture and notification under one lock to preserve chunk order.
+    fn capture_bridge_events(f: impl FnOnce(BridgeEvents)) -> String {
+        #[derive(Clone)]
+        struct Sink {
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+            sender: std::sync::mpsc::Sender<Vec<u8>>,
+        }
+        impl io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut captured = self.bytes.lock().unwrap();
+                captured.extend_from_slice(bytes);
+                let _ = self.sender.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Sink {
+                bytes: Arc::clone(&bytes),
+                sender,
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("test owns global log capture");
+        f(BridgeEvents {
+            receiver,
+            pending: String::new(),
+        });
+        let captured = String::from_utf8_lossy(&bytes.lock().unwrap()).into_owned();
+        captured
+    }
+
+    struct BridgeEvents {
+        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: String,
+    }
+
+    impl BridgeEvents {
+        /// Wait for completed failure bookkeeping, never just EOF or a reaped
+        /// PID. Fail on producer exit, unexpected events, or a silent producer.
+        fn failure(
+            &mut self,
+            in_flight: &std::sync::atomic::AtomicUsize,
+            target: &str,
+            attempt: u32,
+        ) -> io::Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "failure event did not arrive",
+                    ));
+                }
+                while let Some(end) = self.pending.find('\n') {
+                    let line: String = self.pending.drain(..=end).collect();
+                    if !line.contains(&format!("target=\"{target}\"")) {
+                        continue;
+                    }
+                    if line.contains("remote.bridge.listener_failed") {
+                        return Err(io::Error::other(format!("bridge producer failed: {line}")));
+                    }
+                    if line.contains("remote.bridge.failed") {
+                        if line.contains("torn_down")
+                            || !line.contains(&format!("attempt={attempt} "))
+                        {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, line));
+                        }
+                        return Ok(line);
+                    }
+                }
+                // Completion is published after logging. Recheck the queue
+                // after observing it to avoid racing the final notification.
+                let chunk = if in_flight.load(Ordering::Acquire) == 0 {
+                    self.receiver.try_recv().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("bridge producer ended without failure event: {err}"),
+                        )
+                    })?
+                } else {
+                    self.receiver
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(|err| {
+                            let kind = match err {
+                                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                                    io::ErrorKind::TimedOut
+                                }
+                                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                                    io::ErrorKind::BrokenPipe
+                                }
+                            };
+                            io::Error::new(
+                                kind,
+                                format!("waiting for failure attempt {attempt}: {err}"),
+                            )
+                        })?
+                };
+                self.pending
+                    .push_str(&String::from_utf8(chunk).expect("log chunks are UTF-8"));
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_failure_events_reject_a_dead_producer() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        for in_flight in [0, 1] {
+            assert_eq!(
+                events
+                    .failure(&AtomicUsize::new(in_flight), "fixture.example", 1)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_failure_events_reject_an_unexpected_attempt() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(b"target=\"fixture.example\" event=\"remote.bridge.failed\" attempt=2 outcome=\"error\"\n".to_vec()).unwrap();
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert_eq!(
+            events
+                .failure(&AtomicUsize::new(1), "fixture.example", 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn bridge_failure_events_bound_a_live_silent_producer() {
+        use std::sync::atomic::AtomicUsize;
+        // The sender stays alive and silent: timeout is failure-only evidence.
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert_eq!(
+            events
+                .failure(&AtomicUsize::new(1), "fixture.example", 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn bridge_failure_events_accept_a_complete_chunked_event_after_producer_exit() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(b"target=\"fixture.example\" event=\"remote.bridge.".to_vec())
+            .unwrap();
+        sender
+            .send(b"failed\" attempt=1 outcome=\"error\"\n".to_vec())
+            .unwrap();
+        drop(sender);
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert!(events
+            .failure(&AtomicUsize::new(0), "fixture.example", 1)
+            .is_ok());
+    }
+
     /// #436 at the bridge: the tunnel's ssh dies (exit 255, a line on stderr),
     /// and a redial of the SAME local socket gets a fresh ssh that works.
     /// ssh's complaint goes to the log, never to the terminal the client
@@ -3501,40 +3877,20 @@ mod tests {
         use std::io::{Read, Write};
 
         let target = "redial-target";
-        let stub_dir = std::env::temp_dir().join(format!("flock-redial-{}", std::process::id()));
-        let counter = stub_dir.join("dials");
-        // First dial: the network is gone. Every later dial: an echo tunnel.
-        let script = format!(
-            "#!/bin/sh\n\
-             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
-             n=$((n+1))\n\
-             echo \"$n\" > '{counter}'\n\
-             if [ \"$n\" -eq 1 ]; then\n\
-               echo 'Connection to atlas closed by remote host.' >&2\n\
-               exit 255\n\
-             fi\n\
-             exec cat\n",
-            counter = counter.display()
-        );
-        let stub_dir = install_stub_ssh("redial", &script);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-redial-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
 
         let mut echoed = Vec::new();
         let mut first_saw_eof = false;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(1, "Connection to atlas closed by remote host.\n"),
             )
             .expect("start bridge listener");
 
@@ -3557,14 +3913,13 @@ mod tests {
             if second.read_exact(&mut buf).is_ok() {
                 echoed = buf.to_vec();
             }
+            events
+                .failure(&bridge.connections_in_flight, target, 1)
+                .expect("first dial failure bookkeeping");
             drop(second);
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert!(
             first_saw_eof,
@@ -3667,27 +4022,6 @@ mod tests {
         }
     }
 
-    /// A stub `ssh` that fails its first `failures` dials with ssh's own
-    /// "Connection refused" on stderr and exit 255, then echoes.
-    fn install_flaky_ssh(name: &str, failures: u32) -> PathBuf {
-        let counter = std::env::temp_dir()
-            .join(format!("flock-{name}-{}", std::process::id()))
-            .join("dials");
-        let script = format!(
-            "#!/bin/sh\n\
-             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
-             n=$((n+1))\n\
-             echo \"$n\" > '{counter}'\n\
-             if [ \"$n\" -le {failures} ]; then\n\
-               echo 'ssh: connect to host flaky port 22: Connection refused' >&2\n\
-               exit 255\n\
-             fi\n\
-             exec cat\n",
-            counter = counter.display()
-        );
-        install_stub_ssh(name, &script)
-    }
-
     /// Dial the bridge once: true when bytes make it through and back.
     fn round_trip(socket: &Path) -> bool {
         use std::io::{Read, Write};
@@ -3708,26 +4042,24 @@ mod tests {
     #[test]
     fn a_first_attempt_failure_the_retry_fixes_is_not_a_warning() {
         let target = "flaky-once";
-        let stub_dir = install_flaky_ssh("flaky-once", 1);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-flaky1-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
         let mut first = true;
         let mut retry = false;
         let mut cleared = false;
         let mut stale_while_live = None;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(
+                    1,
+                    "ssh: connect to host flaky port 22: Connection refused\n",
+                ),
             )
             .expect("start bridge listener");
             first = round_trip(&socket);
@@ -3744,16 +4076,13 @@ mod tests {
             }
             stale_while_live = bridge.failing_reason();
             drop(live);
-            // The retry's tunnel ends cleanly once the client hangs up, and
-            // that closes the run of failures.
-            cleared = wait_until(Duration::from_secs(5), || bridge.failing_reason().is_none());
+            events
+                .failure(&bridge.connections_in_flight, target, 1)
+                .expect("first dial failure bookkeeping");
+            cleared = bridge.failing_reason().is_none();
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert!(
             !first,
@@ -3790,39 +4119,33 @@ mod tests {
     #[test]
     fn a_persisting_bridge_failure_warns_once_with_its_reason() {
         let target = "flaky-always";
-        let stub_dir = install_flaky_ssh("flaky-always", 99);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-flaky9-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
         let mut reason = None;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(
+                    99,
+                    "ssh: connect to host flaky port 22: Connection refused\n",
+                ),
             )
             .expect("start bridge listener");
-            for _ in 0..3 {
+            for attempt in 1..=3 {
                 assert!(!round_trip(&socket));
+                events
+                    .failure(&bridge.connections_in_flight, target, attempt)
+                    .expect("each dial finishes failure bookkeeping before the next");
             }
-            assert!(wait_until(Duration::from_secs(5), || {
-                bridge.failing_reason().is_some() && live_bridge_children(&bridge) == 0
-            }));
             reason = bridge.failing_reason();
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert_eq!(reason, Some(crate::peers::SshFailureReason::ConnectRefused));
         let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();

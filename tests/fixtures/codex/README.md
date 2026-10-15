@@ -57,3 +57,29 @@ the issue's excerpt cut off. The echoed brief, the `⚠ Heads up` warning, the
 `• Working` row and the right-aligned weekly-limit status are unchanged. The
 running turn under the echoed brief confirms the submission. The warning
 between them is history, not a prompt.
+
+# Codex hollow activity-indicator frame (#1479)
+
+`working-hollow-background.txt` composes the recorded
+`../codex-submit-721/inline-working.txt` screen with the issue's elapsed time
+and background-terminal suffix, replacing only the status bullet with `◦`.
+Codex 0.160.1's
+[motion primitive](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/tui/src/motion.rs#L59-L72)
+alternates `•` and `◦` every 600 ms when truecolor is unavailable.
+This is a source-backed alternative frame, not a live-model capture from the
+original incident. Flock normally advertises truecolor; the incident's actual
+color environment was not recorded.
+
+Before editing the detector, `codex_hollow_spinner_stays_working_and_real_turn_end_settles`
+replayed the fixture through a real isolated flk, captured both text and ANSI
+using `pane read --source recent --format text|ansi`, and failed waiting for
+working even though the hollow Working row was in both captures. At the pane's
+width the background suffix wrapped after `backgroun`; that did not change the
+failure. The producer blocks on input and paints requested frames without
+sleeps or a live model. The same test alternates filled/hollow frames and then
+ends the turn while retaining the background-terminal notice, covering #1284.
+
+The invariant is a live status header immediately owning the current composer,
+with either activity glyph. Interrupt/background controls remain alternatives
+for visible-working evidence. A later output block, quoted indented status,
+or background count without a status header must still allow idle/done.
