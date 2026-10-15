@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::config::{ActionSpec, ChecksConfig, CronCheck, ScriptCheck};
 use super::cron::{cron_run_id, CronExpr, CronTz};
-use super::script::Outcome;
+use super::script::{CaptureNotes, Outcome};
 
 /// Per-check runtime state — the runner's authoritative view of one check.
 #[derive(Debug, Clone)]
@@ -39,6 +39,8 @@ pub(crate) struct CheckRuntimeState {
     pub in_flight: bool,
     pub last_outcome: Option<Outcome>,
     pub ack_until: Option<Instant>,
+    /// Most recent stdout/stderr capture failures, reset by complete capture.
+    capture_notes: CaptureNotes,
 }
 
 impl CheckRuntimeState {
@@ -50,6 +52,7 @@ impl CheckRuntimeState {
             in_flight: false,
             last_outcome: None,
             ack_until: None,
+            capture_notes: CaptureNotes::default(),
         }
     }
 
@@ -350,6 +353,18 @@ impl CheckRunner {
         out
     }
 
+    /// Report capture failure on onset or changed diagnostics, once per check.
+    /// A run without capture failures resets the episode. State is bounded by checks
+    /// and discarded when the runner is rebuilt; unknown checks do not warn.
+    pub(crate) fn capture_warning(&mut self, name: &str, notes: &CaptureNotes) -> bool {
+        let Some(state) = self.state.get_mut(name) else {
+            return false;
+        };
+        let changed = state.capture_notes != *notes;
+        state.capture_notes.clone_from(notes);
+        changed && (notes.stdout.is_some() || notes.stderr.is_some())
+    }
+
     /// Fold one completed run's outcome into the state machine. Returns
     /// `Some(FireDecision)` when this outcome crossed the debounce and the
     /// episode hadn't already fired.
@@ -569,6 +584,33 @@ mod tests {
     use super::*;
     use crate::api::schema::NotificationShowSound;
     use std::path::PathBuf;
+
+    #[test]
+    fn capture_warning_episodes_are_independent_per_enrolled_check() {
+        let now = Instant::now();
+        let mut config = config_with_script("one", 1, 1, 1);
+        let mut other = config.scripts[0].clone();
+        other.name = "two".into();
+        config.scripts.push(other);
+        let mut runner = CheckRunner::from_config(&config, now);
+        let failed = CaptureNotes {
+            stdout: Some("held pipe".into()),
+            stderr: None,
+        };
+        assert!(runner.capture_warning("one", &failed));
+        assert!(!runner.capture_warning("one", &failed));
+        assert!(runner.capture_warning("two", &failed));
+        assert!(!runner.capture_warning("missing", &failed));
+        assert!(!runner.capture_warning("one", &CaptureNotes::default()));
+        assert!(runner.capture_warning("one", &failed));
+        assert!(!runner.capture_warning("two", &failed));
+        let changed = CaptureNotes {
+            stdout: None,
+            stderr: Some("reader failed".into()),
+        };
+        assert!(runner.capture_warning("one", &changed));
+        assert!(!runner.capture_warning("one", &changed));
+    }
 
     fn config_with_script(
         name: &str,

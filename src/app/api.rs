@@ -634,9 +634,10 @@ impl App {
             name,
             outcome,
             duration_ms,
+            capture_notes,
         } = ev
         {
-            self.handle_check_completed(name, outcome, duration_ms);
+            self.handle_check_completed(name, outcome, duration_ms, capture_notes);
             return;
         }
 
