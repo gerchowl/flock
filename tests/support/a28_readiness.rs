@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use super::delegate_timeouts::REQUEST_TIMEOUT;
 
 use super::support::readiness::{read_socket_line, Stages};
 
@@ -27,19 +30,29 @@ const FROZEN_METHODS: [&str; 4] = [
     "workspace.get",
 ];
 
+/// Ordered startup evidence preceding the frozen-server proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// The backend committed the agent, before its reply reaches the CLI.
     StartResponseCaptured,
+    /// The proxy received the readiness subscription, held until SIGSTOP.
     ReadinessRequested,
 }
 
+/// Proxy and child-liveness evidence, consumed by the strict proof machine.
 #[derive(Debug)]
 pub enum Event {
+    /// The startup protocol reached the named phase.
     Phase(Phase),
+    /// The next frozen request arrived, indexed by FROZEN_METHODS.
     Requested(usize),
-    Abandoned(usize),
+    /// Client EOF, with elapsed time since the causal agent.start response release.
+    Abandoned(usize, Duration),
+    /// The owned CLI terminated, without reaping or releasing its PID.
     Exited,
+    /// CLI exit was followed by backlog drain and every worker joining.
     Sealed(usize),
+    /// A proxy worker or child observer failed instead of producing evidence.
     Failed(String),
 }
 
@@ -71,6 +84,7 @@ impl ApiProxy {
         let backend = backend.to_path_buf();
         let frozen = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let start_released = Arc::new(Mutex::new(None));
         let worker_frozen = frozen.clone();
         let worker_cancelled = cancelled.clone();
         let supervisor = thread::spawn(move || {
@@ -112,35 +126,49 @@ impl ApiProxy {
                             .ok_or_else(|| invalid("request has no method"))?;
                         let ready =
                             method == "events.subscribe" && value["id"] == "cli:delegate:ready";
-                        let index = if ready || worker_frozen.load(Ordering::Acquire) {
-                            if FROZEN_METHODS.get(count) != Some(&method) {
-                                return Err(invalid(format!(
-                                    "unexpected frozen request {count}: {method}"
-                                )));
-                            }
-                            let index = count;
-                            count += 1;
-                            if ready {
-                                send(&notice, Event::Phase(Phase::ReadinessRequested))?;
+                        let index =
+                            if ready || worker_frozen.load(Ordering::Acquire) {
+                                if FROZEN_METHODS.get(count) != Some(&method) {
+                                    return Err(invalid(format!(
+                                        "unexpected frozen request {count}: {method}"
+                                    )));
+                                }
+                                let index = count;
+                                count += 1;
+                                if ready {
+                                    send(&notice, Event::Phase(Phase::ReadinessRequested))?;
+                                } else {
+                                    send(&notice, Event::Requested(index))?;
+                                }
+                                Some((
+                                    index,
+                                    start_released.lock().expect("release lock").ok_or_else(
+                                        || invalid("readiness preceded agent.start response"),
+                                    )?,
+                                ))
                             } else {
-                                send(&notice, Event::Requested(index))?;
-                            }
-                            Some(index)
-                        } else {
-                            None
-                        };
+                                None
+                            };
                         let backend = backend.clone();
                         let stop = stop.try_clone()?;
                         let notice = notice.clone();
                         let permitted = permitted.clone();
                         let cancelled = worker_cancelled.clone();
                         let stages = stages.clone();
+                        let start_released = start_released.clone();
                         workers.push(thread::spawn(move || {
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     forward(
-                                        client, request, &backend, &stop, &notice, &permitted,
-                                        index, &stages,
+                                        client,
+                                        request,
+                                        &backend,
+                                        &stop,
+                                        &notice,
+                                        &permitted,
+                                        index,
+                                        &start_released,
+                                        &stages,
                                     )
                                 }));
                             if !cancelled.load(Ordering::Acquire) {
@@ -274,10 +302,11 @@ fn forward(
     stop: &UnixStream,
     notice: &mpsc::Sender<Event>,
     permitted: &Mutex<Option<mpsc::Receiver<()>>>,
-    index: Option<usize>,
+    index: Option<(usize, Instant)>,
+    start_released: &Mutex<Option<Instant>>,
     stages: &Stages,
 ) -> io::Result<()> {
-    if index == Some(0) {
+    if matches!(index, Some((0, _))) {
         permitted
             .lock()
             .expect("permission lock")
@@ -288,9 +317,9 @@ fn forward(
     }
     let mut upstream = UnixStream::connect(backend)?;
     writeln!(upstream, "{request}")?;
-    if let Some(index) = index {
+    if let Some((index, released_at)) = index {
         abandoned(&mut client, &upstream, stop, stages)?;
-        return send(notice, Event::Abandoned(index));
+        return send(notice, Event::Abandoned(index, released_at.elapsed()));
     }
     let response = line(&mut upstream, stop, stages)?;
     let value: serde_json::Value = serde_json::from_str(&request)?;
@@ -300,7 +329,12 @@ fn forward(
             return Err(invalid(format!("agent.start failed: {response}")));
         }
         send(notice, Event::Phase(Phase::StartResponseCaptured))?;
-        // The server has committed the agent, but the CLI has not read its reply.
+        // Stamp before writing: the CLI must read this response before it can
+        // start its readiness deadline. Thus this release precedes every timer
+        // in the frozen chain, even if accepting a request or observing EOF is
+        // delayed. None of the four frozen requests receives a response, so
+        // there is no later causal response release for a per-request bound.
+        *start_released.lock().expect("release lock") = Some(Instant::now());
     }
     writeln!(client, "{response}")?;
     Ok(())
@@ -333,11 +367,15 @@ pub fn expect_phase(
 }
 
 /// Require every documented request, client EOF for each, CLI exit and a sealed
-/// backlog. Call after ReadinessRequested and SIGSTOP. EOF/exit notifications
-/// may race across workers, but cannot be lost.
+/// backlog. All four bounds are cumulative from agent.start's response release:
+/// readiness uses its caller budget, then each diagnostic/rollback adds one
+/// REQUEST_TIMEOUT. No frozen response exists to anchor a per-request bound.
+/// There is no success upper bound. Call after ReadinessRequested and SIGSTOP.
+/// EOF/exit notifications may race across workers, but cannot be lost.
 pub fn prove_abandonment(
     events: &mpsc::Receiver<Event>,
     stages: &Stages,
+    ready_budget: Duration,
     mut seal: impl FnMut(),
 ) -> io::Result<()> {
     let mut requested = 1;
@@ -346,7 +384,13 @@ pub fn prove_abandonment(
     loop {
         match receive(events, stages)? {
             Event::Requested(index) if index == requested && index < FROZEN_METHODS.len() => requested += 1,
-            Event::Abandoned(index) if index < requested && !abandoned[index] => abandoned[index] = true,
+            Event::Abandoned(index, elapsed) if index < requested && !abandoned[index] => {
+                let minimum = ready_budget + REQUEST_TIMEOUT * index as u32;
+                if elapsed < minimum {
+                    return Err(invalid(format!("request {index} gave up too soon: {elapsed:?} since agent.start release, expected at least {minimum:?}")));
+                }
+                abandoned[index] = true;
+            },
             Event::Exited if !exited => { exited = true; seal(); }
             Event::Sealed(count) if exited && count == FROZEN_METHODS.len() && requested == count && abandoned.iter().all(|&yes| yes) => return Ok(()),
             event => return Err(invalid(format!("incomplete or unexpected frozen proof: {event:?}; requests={requested}, abandoned={abandoned:?}, exited={exited}"))),
@@ -423,18 +467,19 @@ mod tests {
     use std::time::Duration;
 
     const LIMIT: Duration = Duration::from_secs(2);
+    const READY_BUDGET: Duration = Duration::from_secs(3);
 
     fn complete() -> Vec<Event> {
         // Exit may race the final EOF observer, but sealing follows worker join.
         vec![
             Event::Requested(1),
-            Event::Abandoned(0),
+            Event::Abandoned(0, READY_BUDGET),
             Event::Requested(2),
             Event::Requested(3),
-            Event::Abandoned(2),
+            Event::Abandoned(2, READY_BUDGET + REQUEST_TIMEOUT * 2),
             Event::Exited,
-            Event::Abandoned(1),
-            Event::Abandoned(3),
+            Event::Abandoned(1, READY_BUDGET + REQUEST_TIMEOUT),
+            Event::Abandoned(3, READY_BUDGET + REQUEST_TIMEOUT * 3),
             Event::Sealed(4),
         ]
     }
@@ -445,7 +490,7 @@ mod tests {
             tx.send(event).unwrap();
         }
         drop(tx);
-        prove_abandonment(&rx, &Stages::new(LIMIT), || {})
+        prove_abandonment(&rx, &Stages::new(LIMIT), READY_BUDGET, || {})
     }
 
     #[test]
@@ -459,11 +504,34 @@ mod tests {
     }
 
     #[test]
+    fn every_request_must_wait_out_its_cap() {
+        for index in 0..FROZEN_METHODS.len() {
+            let mut events = complete();
+            for event in &mut events {
+                if let Event::Abandoned(observed, elapsed) = event {
+                    if *observed >= index {
+                        // Remove exactly this wait from every subsequent prefix.
+                        *elapsed -= if index == 0 {
+                            READY_BUDGET
+                        } else {
+                            REQUEST_TIMEOUT
+                        };
+                    }
+                }
+            }
+            assert!(
+                proof(events).is_err(),
+                "request {index} gave up immediately"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_extra_reordered_and_failed_requests_are_rejected() {
         for bad in [
             Event::Requested(4),
             Event::Requested(2),
-            Event::Abandoned(3),
+            Event::Abandoned(3, READY_BUDGET + REQUEST_TIMEOUT * 3),
             Event::Failed("worker died".into()),
             Event::Sealed(0),
         ] {
@@ -472,7 +540,7 @@ mod tests {
             assert!(proof(events).is_err());
         }
         let mut events = complete();
-        events.insert(2, Event::Abandoned(0));
+        events.insert(2, Event::Abandoned(0, READY_BUDGET));
         assert!(proof(events).is_err());
     }
 
@@ -480,9 +548,14 @@ mod tests {
     fn live_silent_producer_fails_at_the_ceiling() {
         let (_tx, rx) = mpsc::channel();
         assert_eq!(
-            prove_abandonment(&rx, &Stages::new(Duration::from_millis(10)), || {})
-                .unwrap_err()
-                .kind(),
+            prove_abandonment(
+                &rx,
+                &Stages::new(Duration::from_millis(10)),
+                READY_BUDGET,
+                || {}
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::TimedOut
         );
     }
