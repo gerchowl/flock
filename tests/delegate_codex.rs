@@ -1389,3 +1389,137 @@ fn worktree_create_base_is_refreshed_from_the_remote() {
     );
     assert_eq!(rev(&repo, "wt/tag"), tagged);
 }
+
+/// #1479: replay the two Codex spinner frames without running a model.
+#[test]
+fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
+    let server = start_server_with_rows(40);
+    let idle = include_str!("fixtures/codex-submit-721/inline-idle.txt");
+    let hollow = include_str!("fixtures/codex/working-hollow-background.txt");
+    let finished = hollow.replace(
+        "◦ Working (21m 26s • esc to interrupt) · 1 background terminal running",
+        "• DONE: fixture turn finished\n  · 1 background terminal running",
+    );
+    for (name, frame) in [
+        ("idle", idle.to_owned()),
+        ("hollow", hollow.to_owned()),
+        ("second-hollow", hollow.replace("21m 26s", "21m 27s")),
+        ("filled", hollow.replace('◦', "•")),
+        ("finished", finished),
+    ] {
+        fs::write(server.base.join(format!("{name}.txt")), frame).unwrap();
+    }
+    // This producer blocks on input; each frame is requested, never timed.
+    let script = format!(
+        "#!/bin/sh\n\
+         draw() {{ printf '\\033[3J\\033[2J\\033[H'; cat '{base}/'$1.txt; }}\n\
+         draw idle\n\
+         while IFS= read -r frame; do\n\
+           case \"$frame\" in idle|hollow|filled|second-hollow|finished) draw \"$frame\" ;; *) exit 42 ;; esac\n\
+         done\n",
+        base = server.base.display()
+    );
+    fs::write(bin_dir(&server.base).join("codex"), script).unwrap();
+    let ws = operator_workspace(&server);
+    let started = request(
+        &server,
+        &serde_json::json!({"id":"start","method":"agent.start","params":{
+            "name":"spinner1479", "workspace_id":ws, "argv":["codex"], "focus":true
+        }})
+        .to_string(),
+    );
+    assert!(started.get("error").is_none(), "{started}");
+    let pane = started["result"]["agent"]["pane_id"]
+        .as_str()
+        .expect("started pane")
+        .to_owned();
+    let wait_status = |status: &str, frame: &str| {
+        let out = cli(
+            &server,
+            &[
+                "agent",
+                "wait",
+                &pane,
+                "--status",
+                status,
+                "--timeout",
+                "5000",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "waiting for {status} after {frame}: {} {}",
+            stdout(&out),
+            stderr(&out)
+        );
+    };
+    let listed_agent = || {
+        let listed = cli(&server, &["agent", "list"]);
+        assert!(listed.status.success(), "{}", stderr(&listed));
+        let result = stdout_json(&listed);
+        result["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["pane_id"] == pane)
+            .expect("listed pane")
+            .clone()
+    };
+    wait_status("idle", "startup");
+    for (frame, needle, status) in [
+        ("hollow", "◦ Working (21m 26s", "working"),
+        // Observe settled idle so the working hold cannot satisfy the next step.
+        ("idle", "Bring your unfinished thoughts.", "idle"),
+        ("filled", "• Working (", "working"),
+        ("idle", "Bring your unfinished thoughts.", "idle"),
+        ("second-hollow", "◦ Working (21m 27s", "working"),
+        ("finished", "• DONE: fixture turn finished", "idle"),
+    ] {
+        if status == "working" {
+            let before = listed_agent();
+            assert!(
+                matches!(before["agent_status"].as_str(), Some("idle" | "done")),
+                "every glyph must start settled idle before {frame}: {before}"
+            );
+        }
+        let sent = request(
+            &server,
+            &serde_json::json!({
+                "id":"frame", "method":"pane.send_text", "params":{
+                    "pane_id":pane, "text":format!("{frame}\n"), "raw":true
+                }
+            })
+            .to_string(),
+        );
+        assert!(sent.get("error").is_none(), "{sent}");
+        let painted = request(&server, &serde_json::json!({
+            "id":"painted", "method":"pane.wait_for_output", "params":{
+                "pane_id":pane, "source":"detection", "match":{"type":"substring","value":needle},
+                "timeout_ms":5000
+            }
+        }).to_string());
+        assert!(painted.get("error").is_none(), "{painted}");
+        for format in ["text", "ansi"] {
+            let capture = cli(
+                &server,
+                &[
+                    "pane", "read", &pane, "--source", "recent", "--format", format,
+                ],
+            );
+            assert!(capture.status.success(), "{}", stderr(&capture));
+            if format == "text" {
+                assert!(stdout(&capture).contains(needle), "{painted}");
+            }
+        }
+        wait_status(status, frame);
+        let agent = listed_agent();
+        if status == "working" {
+            assert_eq!(agent["agent_status"], "working");
+        } else {
+            assert!(matches!(
+                agent["agent_status"].as_str(),
+                Some("idle" | "done")
+            ));
+        }
+    }
+}

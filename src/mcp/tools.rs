@@ -145,7 +145,9 @@ pub(super) fn table() -> &'static [Tool] {
         Tool {
             name: "flock_msg_send",
             description: "Queue a message to another agent, on this host or \
-                          any host in the fleet. Address by `agent` id to \
+                          any host in the fleet. `to` accepts a bare pane id, \
+                          terminal id, unique agent name or fleet agent id, \
+                          or a tagged `pane`, `repo_pane` or `agent` object. Address by `agent` id to \
                           cross machines — a `pane` target names a placement \
                           on THIS server and cannot leave it. Queued to the \
                           recipient's inbox, which it reads with \
@@ -680,7 +682,7 @@ fn schema_msg_send() -> Value {
                 "type": ["object", "string"],
                 "description": "Message recipient: a bare string such as `\"w3:p2\"`, an agent name or an agent id, or one of three objects. \
                                 A bare agent id is sent as the `agent` shape, anything else as the `pane` shape. \
-                                `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` is the ONLY shape that reaches another host — \
+                                A bare fleet agent id or `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` reaches another host — \
                                 `agent_id` is fleet-global and restart-stable. \
                                 `{\"type\":\"pane\",\"pane\":\"<pane>\"}` addresses a pane on THIS server only. \
                                 `{\"type\":\"repo_pane\",\"repo\":\"<repo>\",\"pane\":\"<pane>\"}` restricts pane resolution to workspaces backed by that repo. \
@@ -1079,26 +1081,40 @@ fn build_agent_result(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn invalid_message_target(reason: impl std::fmt::Display) -> McpError {
+    let mut data = super::framing::refusal(
+        crate::api::error_code::ErrorCode::InvalidParams.as_str(),
+        crate::cli::exit::USAGE,
+    );
+    data["kind"] = json!(crate::api::error_code::ErrorCode::InvalidParams.as_str());
+    data["expected"] = MessageTarget::expected_shapes();
+    McpError {
+        data: Some(data),
+        ..McpError::invalid_params(format!(
+            "invalid `to`: {reason}; expected {}",
+            crate::api::schema::MESSAGE_TARGET_EXPECTED
+        ))
+    }
+}
+
 /// `to` as typed by the model: a bare string (ADR-0029 §5) or the tagged
 /// object. The string becomes the structured target here, so the wire keeps
 /// one shape and an older server accepts it unchanged.
 fn message_target(to: Value) -> Result<MessageTarget, McpError> {
-    if let Value::String(target) = to {
-        return Ok(if crate::terminal::AgentId::is_well_formed(&target) {
-            MessageTarget::Agent { agent: target }
-        } else {
-            MessageTarget::Pane { pane: target }
-        });
+    let target = if let Value::String(target) = to {
+        MessageTarget::from_bare(target)
+    } else {
+        serde_json::from_value(to).map_err(invalid_message_target)?
+    };
+    let empty = match &target {
+        MessageTarget::Pane { pane } => pane.trim().is_empty(),
+        MessageTarget::Agent { agent } => agent.trim().is_empty(),
+        MessageTarget::RepoPane { repo, pane } => repo.trim().is_empty() || pane.trim().is_empty(),
+    };
+    if empty {
+        return Err(invalid_message_target("address fields must not be empty"));
     }
-    serde_json::from_value(to).map_err(|e| McpError {
-        data: Some(json!({ "expected": [
-            "a pane id, terminal id, agent name or agent id as a string",
-            {"type": "pane", "pane": "<pane>"},
-            {"type": "repo_pane", "repo": "<repo>", "pane": "<pane>"},
-            {"type": "agent", "agent": "<agent_id>"},
-        ]})),
-        ..McpError::invalid_params(format!("invalid `to`: {e}"))
-    })
+    Ok(target)
 }
 
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
@@ -1106,7 +1122,7 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
     let to_value = args
         .get("to")
         .cloned()
-        .ok_or_else(|| McpError::invalid_params("missing `to`"))?;
+        .ok_or_else(|| invalid_message_target("missing `to`"))?;
     let to = message_target(to_value)?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
@@ -2427,6 +2443,31 @@ mod tests {
         assert_eq!(err.code, -32602);
         let expected = err.data.unwrap()["expected"].as_array().unwrap().len();
         assert_eq!(expected, 4);
+    }
+
+    #[test]
+    fn message_target_shape_errors_are_typed_and_actionable() {
+        for to in [
+            Value::Null,
+            json!(7),
+            json!([]),
+            json!({}),
+            json!({"type":"agent"}),
+            json!({"type":"other"}),
+            json!(""),
+        ] {
+            let err = build_msg_send(json!({"to":to,"body":"x","intent":"fyi"})).unwrap_err();
+            assert_eq!(err.code, -32602);
+            let data = err.data.unwrap();
+            assert_eq!(data["kind"], "invalid_params");
+            assert_eq!(data["exit"], crate::cli::exit::USAGE);
+            assert_eq!(data["retry"], "never");
+            assert!(data["expected"].is_array());
+            assert!(err.message.contains("pane id"));
+            assert!(err.message.contains("agent id"));
+        }
+        let err = build_msg_send(json!({"body":"x","intent":"fyi"})).unwrap_err();
+        assert_eq!(err.data.unwrap()["kind"], "invalid_params");
     }
 
     #[test]

@@ -383,6 +383,146 @@ fn public_pane_sort_key(pane_id: &str) -> (usize, usize, String) {
     (workspace, pane, pane_id.to_string())
 }
 
+/// Retain the failed handoff step and its typed cause through rollback diagnostics.
+#[derive(Debug)]
+struct HandoffRollbackError {
+    context: &'static str,
+    cause: io::Error,
+    restore_error: Option<io::Error>,
+}
+
+impl std::fmt::Display for HandoffRollbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.context, self.cause)?;
+        if let Some(err) = &self.restore_error {
+            write!(f, "; old server could not restore public sockets: {err}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HandoffRollbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+fn handoff_ready_error(cause: io::Error, restore_error: Option<io::Error>) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        HandoffRollbackError {
+            context: "handoff replacement server did not become ready: ",
+            cause,
+            restore_error,
+        },
+    )
+}
+
+/// Leaf operations for the production commit-recovery closure.
+trait HandoffCommitRecovery {
+    fn cleanup_importer(&mut self);
+    fn restore_public_sockets(&mut self) -> io::Result<()>;
+    fn rollback(&mut self);
+}
+
+/// Share the production order so rollback also runs when restoration fails.
+fn commit_recovery(
+    recovery: &mut impl HandoffCommitRecovery,
+) -> impl FnOnce() -> io::Result<()> + '_ {
+    || {
+        recovery.cleanup_importer();
+        let restore_result = recovery.restore_public_sockets();
+        recovery.rollback();
+        restore_result
+    }
+}
+
+struct ServerCommitRecovery<'a> {
+    server: &'a mut HeadlessServer,
+    importer: &'a mut std::process::Child,
+    socket_path: &'a Path,
+    paused_terminal_ids: &'a [crate::terminal::TerminalId],
+}
+
+impl HandoffCommitRecovery for ServerCommitRecovery<'_> {
+    fn cleanup_importer(&mut self) {
+        crate::server::handoff::cleanup_failed_import_child(self.importer);
+    }
+
+    fn restore_public_sockets(&mut self) -> io::Result<()> {
+        self.server
+            .wait_then_restore_public_sockets_after_failed_handoff()
+    }
+
+    fn rollback(&mut self) {
+        self.server
+            .rollback_handoff_before_commit(self.socket_path, self.paused_terminal_ids);
+    }
+}
+
+/// Finish commit or recover the old server, preserving both failure diagnostics.
+fn finish_handoff_commit(
+    commit_result: io::Result<()>,
+    recover: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match commit_result {
+        Ok(()) => Ok(()),
+        Err(err) => match recover() {
+            Ok(()) => Err(err),
+            Err(restore_err) => Err(io::Error::new(
+                err.kind(),
+                HandoffRollbackError {
+                    context: "handoff replacement server was ready, but commit failed: ",
+                    cause: err,
+                    restore_error: Some(restore_err),
+                },
+            )),
+        },
+    }
+}
+
+/// Preserve typed I/O and importer-refusal evidence in ADR-0029 §4 error data.
+/// `error.data.kind` is `import_refused`, `broken_pipe`, `connection_reset`,
+/// `invalid_input`, or `other`. It describes the cause, not the ownership stage.
+fn failed_handoff_response(
+    id: String,
+    err: &io::Error,
+    dropped: &[api::schema::UndrainedPane],
+) -> String {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut import_refused = false;
+    while let Some(error) = cause {
+        if error.is::<crate::server::handoff::ImportRefusal>() {
+            import_refused = true;
+            break;
+        }
+        // io::Error::source skips its payload itself, which may be the refusal.
+        cause = if let Some(io_error) = error.downcast_ref::<io::Error>() {
+            io_error
+                .get_ref()
+                .map(|inner| inner as &dyn std::error::Error)
+        } else {
+            error.source()
+        };
+    }
+    let kind = if import_refused {
+        "import_refused"
+    } else {
+        match err.kind() {
+            io::ErrorKind::BrokenPipe => "broken_pipe",
+            io::ErrorKind::ConnectionReset => "connection_reset",
+            io::ErrorKind::InvalidInput => "invalid_input",
+            _ => "other",
+        }
+    };
+    crate::app::encode_error_with_data(
+        id,
+        api::error_code::ErrorCode::HandoffFailed.as_str(),
+        failed_handoff_message(err, dropped),
+        serde_json::json!({"kind": kind}),
+    )
+}
+
 /// A failed handoff's message, naming any pane whose input `--skip-undrained`
 /// had already dropped before the failure: that input is gone even though
 /// the old server keeps running.
@@ -1278,16 +1418,10 @@ impl HeadlessServer {
                 }
                 Err(restore_err) => {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
-                    ))
-                    .into());
+                    return Err(handoff_ready_error(err, Some(restore_err)).into());
                 }
             }
-            return Err(io::Error::other(format!(
-                "handoff replacement server did not become ready: {err}"
-            ))
-            .into());
+            return Err(handoff_ready_error(err, None).into());
         }
         let commit_result = if cfg!(debug_assertions)
             && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_commit")
@@ -1296,22 +1430,13 @@ impl HeadlessServer {
         } else {
             crate::server::handoff::report_committed(&mut stream)
         };
-        if let Err(err) = commit_result {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            match self.wait_then_restore_public_sockets_after_failed_handoff() {
-                Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                }
-                Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
-                    ))
-                    .into());
-                }
-            }
-            return Err(err.into());
-        }
+        let mut recovery = ServerCommitRecovery {
+            server: self,
+            importer: &mut import_child,
+            socket_path: &socket_path,
+            paused_terminal_ids: &paused_terminal_ids,
+        };
+        finish_handoff_commit(commit_result, commit_recovery(&mut recovery))?;
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
@@ -2778,15 +2903,11 @@ impl HeadlessServer {
                         },
                     })
                 }
-                Err(HandoffError::Failed(err)) => {
-                    serde_json::to_string(&api::schema::ErrorResponse {
-                        id: msg.request.id,
-                        error: api::schema::ErrorBody {
-                            code: "handoff_failed".into(),
-                            message: failed_handoff_message(&err, &dropped_before_failure),
-                        },
-                    })
-                }
+                Err(HandoffError::Failed(err)) => Ok(failed_handoff_response(
+                    msg.request.id,
+                    &err,
+                    &dropped_before_failure,
+                )),
             }
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
@@ -4217,6 +4338,243 @@ mod tests {
         let mut ids = vec!["pane 7", "wA:p1", "w2:p1", "w1:pA", "w1:p2"];
         ids.sort_by_cached_key(|id| public_pane_sort_key(id));
         assert_eq!(ids, vec!["w1:p2", "w1:pA", "w2:p1", "wA:p1", "pane 7"]);
+    }
+
+    #[test]
+    fn failed_handoff_response_preserves_kind_without_parsing_diagnostic() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::InvalidInput, "invalid_input"),
+            (io::ErrorKind::TimedOut, "other"),
+            (io::ErrorKind::WouldBlock, "other"),
+            (io::ErrorKind::Other, "other"),
+        ] {
+            let err = io::Error::new(kind, "diagnostic prose can change");
+            let response = failed_handoff_response("typed-failure".into(), &err, &[]);
+            let json: serde_json::Value =
+                serde_json::from_str(&response).expect("decode failed handoff");
+            assert_eq!(json["error"]["code"], "handoff_failed");
+            assert_eq!(json["error"]["data"]["kind"], expected);
+            assert!(json.get("result").is_none());
+            assert!(json["error"].get("kind").is_none());
+            let old: api::schema::ErrorResponse =
+                serde_json::from_value(json).expect("existing clients ignore additive error.data");
+            assert_eq!(old.error.message, "diagnostic prose can change");
+        }
+    }
+
+    #[test]
+    fn refusal_at_ready_preserves_typed_cause_with_rollback_context() {
+        for restore_error in [None, Some(io::Error::other("restore failed"))] {
+            let (mut exporter, mut importer) = std::os::unix::net::UnixStream::pair().unwrap();
+            crate::server::handoff::report_import_refusal(&mut importer, "generation mismatch")
+                .unwrap();
+            let refusal = crate::server::handoff::wait_ready(&mut exporter).unwrap_err();
+            let restore_failed = restore_error.is_some();
+            let err = handoff_ready_error(refusal, restore_error);
+            let response = failed_handoff_response("ready-refusal".into(), &err, &[]);
+            let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(json["error"]["code"], "handoff_failed");
+            assert_eq!(json["error"]["data"]["kind"], "import_refused");
+            assert!(json.get("result").is_none());
+            assert!(json["error"].get("kind").is_none());
+            assert!(err
+                .to_string()
+                .contains("did not become ready: handoff import refused: generation mismatch"));
+            assert_eq!(
+                err.to_string()
+                    .contains("old server could not restore public sockets: restore failed"),
+                restore_failed
+            );
+        }
+    }
+
+    fn commit_restore_fixture() -> (crate::test_socket_dir::SocketDir, UnixListener, PathBuf) {
+        let directory = crate::test_socket_dir::SocketDir::reserve("hcr");
+        let socket_path = directory.path().join("restore.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        (directory, listener, socket_path)
+    }
+
+    #[test]
+    fn commit_restore_fixture_is_removed_on_unwind() {
+        let mut fixture_path = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (directory, _listener, socket_path) = commit_restore_fixture();
+            fixture_path = Some(directory.path().to_path_buf());
+            assert!(socket_path.exists());
+            panic!("fixture assertion failed");
+        }));
+        assert!(panic.is_err());
+        let path = fixture_path.unwrap();
+        assert!(
+            !path.exists(),
+            "fixture directory leaked on panic: {}",
+            path.display()
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordedCommitRecovery {
+        steps: Vec<&'static str>,
+        restore_fails: bool,
+    }
+
+    impl HandoffCommitRecovery for RecordedCommitRecovery {
+        fn cleanup_importer(&mut self) {
+            self.steps.push("cleanup");
+        }
+        fn restore_public_sockets(&mut self) -> io::Result<()> {
+            self.steps.push("restore");
+            if self.restore_fails {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "fixture restore failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rollback(&mut self) {
+            self.steps.push("rollback");
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_orders_cleanup_restore_rollback() {
+        for restore_fails in [false, true] {
+            let mut recovery = RecordedCommitRecovery {
+                restore_fails,
+                ..Default::default()
+            };
+            let err = finish_handoff_commit(
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "commit failed")),
+                commit_recovery(&mut recovery),
+            )
+            .unwrap_err();
+            assert_eq!(recovery.steps, ["cleanup", "restore", "rollback"]);
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            if restore_fails {
+                let context = err
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<HandoffRollbackError>()
+                    .unwrap();
+                assert_eq!(
+                    context.restore_error.as_ref().unwrap().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_is_unused_after_commit_success() {
+        let mut recovery = RecordedCommitRecovery::default();
+        finish_handoff_commit(Ok(()), commit_recovery(&mut recovery)).unwrap();
+        assert!(recovery.steps.is_empty());
+    }
+
+    #[test]
+    fn commit_and_socket_restore_failures_preserve_original_kind_and_source() {
+        let (mut exporter, importer) = std::os::unix::net::UnixStream::pair().unwrap();
+        exporter
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        drop(importer);
+        let commit_result = crate::server::handoff::report_committed(&mut exporter);
+        let original_kind = commit_result.as_ref().unwrap_err().kind();
+        assert!(matches!(
+            original_kind,
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        ));
+        let (_directory, _occupied, socket_path) = commit_restore_fixture();
+        let mut recovery_attempted = false;
+        let result = finish_handoff_commit(commit_result, || {
+            recovery_attempted = true;
+            UnixListener::bind(&socket_path).map(drop)
+        });
+        let err = result.unwrap_err();
+        assert!(recovery_attempted);
+        assert_eq!(err.kind(), original_kind);
+        let expected = match original_kind {
+            io::ErrorKind::BrokenPipe => "broken_pipe",
+            io::ErrorKind::ConnectionReset => "connection_reset",
+            other => panic!("unexpected commit kind: {other:?}"),
+        };
+        let response = failed_handoff_response("commit-refusal".into(), &err, &[]);
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["error"]["code"], "handoff_failed");
+        assert_eq!(json["error"]["data"]["kind"], expected);
+        assert!(json.get("result").is_none());
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("was ready, but commit failed:"));
+        assert!(message.contains("old server could not restore public sockets:"));
+        let source = err.get_ref().unwrap().source().unwrap();
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            original_kind
+        );
+    }
+
+    #[test]
+    fn commit_recovery_preserves_each_io_kind_with_or_without_restore_failure() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::InvalidInput, "invalid_input"),
+            (io::ErrorKind::TimedOut, "other"),
+        ] {
+            for restore_fails in [false, true] {
+                let err = finish_handoff_commit(
+                    Err(io::Error::new(kind, "diagnostic prose can change")),
+                    || {
+                        if restore_fails {
+                            Err(io::Error::other("restore diagnostic"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind(), kind);
+                let json: serde_json::Value =
+                    serde_json::from_str(&failed_handoff_response("commit-kind".into(), &err, &[]))
+                        .unwrap();
+                assert_eq!(json["error"]["code"], "handoff_failed");
+                assert_eq!(json["error"]["data"]["kind"], expected);
+                assert!(json.get("result").is_none());
+                assert_eq!(
+                    err.to_string().contains(
+                        "old server could not restore public sockets: restore diagnostic"
+                    ),
+                    restore_fails
+                );
+                if !restore_fails {
+                    assert_eq!(err.to_string(), "diagnostic prose can change");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_commit_does_not_recover_old_server() {
+        finish_handoff_commit(Ok(()), || panic!("committed ownership must not roll back")).unwrap();
+    }
+
+    #[test]
+    fn ready_context_preserves_peer_closed_io_kinds() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+        ] {
+            let err = handoff_ready_error(io::Error::new(kind, "changed prose"), None);
+            let json: serde_json::Value =
+                serde_json::from_str(&failed_handoff_response("ready-io".into(), &err, &[]))
+                    .unwrap();
+            assert_eq!(json["error"]["data"]["kind"], expected);
+        }
     }
 
     #[test]

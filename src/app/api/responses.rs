@@ -22,7 +22,7 @@ pub(crate) fn encode_error(id: String, code: &str, message: impl Into<String>) -
 /// shape is `{"id":…,"error":{"code":…,"message":…,"data":…}}` either way, so
 /// clients cannot tell the difference — and `data` stays absent everywhere it
 /// is not deliberately populated.
-pub(super) fn encode_error_with_data(
+pub(crate) fn encode_error_with_data(
     id: String,
     code: &str,
     message: impl Into<String>,

@@ -51,9 +51,9 @@ use serde::{Deserialize, Serialize};
 /// caller names an agent and flock assembles that agent's argv server-side
 /// from the reviewed arms below. It also means this enum is not where an
 /// argv reaches the environment — `allowlist::for_argv` and
-/// `env::agent_for_argv` resolve the child's agent from argv[0], so a kind
+/// `env::agent_for_argv` resolve the child's agent from `argv[0]`, so a kind
 /// only needs a variant here and its own argv to be fully wired, and
-/// `allowlist`'s tests fail the build if a variant assembles an argv[0]
+/// `allowlist`'s tests fail the build if a variant assembles an `argv[0]`
 /// `identify_agent` does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

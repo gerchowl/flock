@@ -35,7 +35,7 @@ pub(crate) struct AgentLocation {
     /// Separate from `host` on purpose. `host` is what the machine calls
     /// itself (`bastion`); the route is what THIS server knows it as
     /// (`kiln`). They routinely differ — a live cross-host send failed with
-    /// "not in this server's [[peers]]" because the relay looked up a peer
+    /// "not in this server's `[[peers]]`" because the relay looked up a peer
     /// named after the reported hostname. Resolution knows which peer the
     /// answer came from, so it should hand that back rather than make the
     /// caller re-derive it.
@@ -275,26 +275,31 @@ impl App {
     /// listing, because it would name a target that delivery then routes
     /// somewhere else. Ids are meant to be fleet-global, so a duplicate is a
     /// stale gossip snapshot of an agent that has since moved here.
-    pub(crate) fn collect_fleet_agents(&self) -> Vec<crate::api::schema::FleetAgentInfo> {
+    /// Local rows must come from the same observation as the caller's listing.
+    /// this projection never observes local agents again.
+    pub(crate) fn collect_fleet_agents(
+        &self,
+        local_agents: &[crate::api::schema::AgentInfo],
+    ) -> Vec<crate::api::schema::FleetAgentInfo> {
         let host = crate::app::short_host_name();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut rows: Vec<crate::api::schema::FleetAgentInfo> = Vec::new();
 
-        // Local rows reuse the ONE local agent walk rather than repeating it.
-        for agent in self.collect_agent_infos() {
+        // Project the caller's local snapshot without another detector read.
+        for agent in local_agents {
             if !seen.insert(agent.agent_id.clone()) {
                 continue;
             }
             rows.push(crate::api::schema::FleetAgentInfo {
-                agent_id: agent.agent_id,
+                agent_id: agent.agent_id.clone(),
                 host: host.clone(),
-                pane_id: agent.pane_id,
+                pane_id: agent.pane_id.clone(),
                 local: true,
                 route: None,
-                agent: agent.agent,
-                name: agent.name,
+                agent: agent.agent.clone(),
+                name: agent.name.clone(),
                 status: agent.agent_status,
-                state: agent.state,
+                state: agent.state.clone(),
             });
         }
 
@@ -492,7 +497,7 @@ mod tests {
         let local_id = name_local_agent(&mut app, "here");
         app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
 
-        let fleet = app.collect_fleet_agents();
+        let fleet = app.collect_fleet_agents(&app.collect_agent_infos());
         assert_eq!(fleet.len(), 2, "one local, one remote: {fleet:?}");
 
         let local = &fleet[0];
@@ -527,7 +532,7 @@ mod tests {
         let local_id = name_local_agent(&mut app, "here");
         app.state.peer_summaries = vec![peer_with_agent("kiln", "kiln-dev", &local_id)];
 
-        let fleet = app.collect_fleet_agents();
+        let fleet = app.collect_fleet_agents(&app.collect_agent_infos());
         let rows: Vec<&crate::api::schema::FleetAgentInfo> = fleet
             .iter()
             .filter(|row| row.agent_id == local_id)
@@ -549,6 +554,8 @@ mod tests {
         // with, so the assertion is that no peer produces a row.
         let app = test_app();
         assert!(app.state.peer_summaries.is_empty());
-        assert!(app.collect_fleet_agents().is_empty());
+        assert!(app
+            .collect_fleet_agents(&app.collect_agent_infos())
+            .is_empty());
     }
 }

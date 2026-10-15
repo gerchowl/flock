@@ -1097,8 +1097,8 @@ impl Workspace {
     }
 
     /// Machine-independent project identity (normalized origin URL or
-    /// "dir:<name>" fallback) used to fold checkouts of the same project
-    /// across federated peer servers. See [[peers]] config.
+    /// `dir:<name>` fallback) used to fold checkouts of the same project
+    /// across federated peer servers. See `[[peers]]` config.
     pub fn project_key(&self) -> Option<&str> {
         self.cached_git_space
             .as_ref()

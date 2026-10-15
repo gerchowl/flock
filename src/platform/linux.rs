@@ -181,7 +181,7 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
 }
 
 /// Get the current working directory of a process.
-/// Uses /proc/<pid>/cwd symlink.
+/// Uses `/proc/<pid>/cwd` symlink.
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;

@@ -121,8 +121,24 @@ fn call_flock<F: FlockCall>(method: Method, flock: &F) -> Result<Value, McpError
         method,
         Method::PaneSubmit(_) | Method::MsgSend(_) | Method::MsgReply(_) | Method::AgentRestart(_)
     );
+    let message_send = matches!(method, Method::MsgSend(_));
     let raw = flock.call(method).map_err(McpError::transport)?;
-    extract_flock_result(raw, send_like)
+    let target_data = message_send
+        .then(|| raw.pointer("/error/data").cloned())
+        .flatten();
+    extract_flock_result(raw, send_like).map_err(|mut error| {
+        if let (Some(data), Some(detail)) = (
+            error.data.as_mut().and_then(Value::as_object_mut),
+            target_data.and_then(|v| v.as_object().cloned()),
+        ) {
+            for key in ["kind", "expected", "candidates"] {
+                if let Some(value) = detail.get(key) {
+                    data.insert(key.into(), value.clone());
+                }
+            }
+        }
+        error
+    })
 }
 
 fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError> {
@@ -167,7 +183,33 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
         }
         _ => None,
     };
-    let flock_result = tools::annotate(name, &arguments, call_flock(method, flock)?);
+    let flock_result = call_flock(method, flock).map_err(|mut error| {
+        if name == "flock_msg_send" {
+            if let Some(data) = error.data.as_mut() {
+                // Branch on stable socket codes, never diagnostic wording.
+                use crate::api::error_code::ErrorCode;
+                if matches!(
+                    data["refusal"].as_str().and_then(ErrorCode::from_code),
+                    Some(
+                        ErrorCode::MsgTargetNotFound
+                            | ErrorCode::MsgTargetAmbiguous
+                            | ErrorCode::AgentTargetAmbiguous
+                    )
+                ) {
+                    data["kind"] = data["refusal"].clone();
+                    if data.get("expected").is_none() {
+                        data["expected"] = crate::api::schema::MessageTarget::expected_shapes();
+                        error.message.push_str(&format!(
+                            "; expected {}",
+                            crate::api::schema::MESSAGE_TARGET_EXPECTED
+                        ));
+                    }
+                }
+            }
+        }
+        error
+    })?;
+    let flock_result = tools::annotate(name, &arguments, flock_result);
     // #854: an older server ignores `instructions` and arms a plain `/compact`.
     // Undo that arming rather than report a success that lost them.
     if let Some(pane) = pane {
@@ -277,6 +319,128 @@ mod tests {
         fn call(&self, method: Method) -> Result<Value, ApiClientError> {
             self.calls.borrow_mut().push(method);
             Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn message_targets_reach_the_real_app_inbox() {
+        struct AppApi(RefCell<crate::app::App>);
+        impl FlockCall for AppApi {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                let raw = self.0.borrow_mut().handle_api_request(Request {
+                    id: "mcp-test".into(),
+                    method,
+                });
+                Ok(serde_json::from_str(&raw).unwrap())
+            }
+        }
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("recipient")];
+        app.state.ensure_test_terminals();
+        let ws = &app.state.workspaces[0];
+        let pane = ws.focused_pane_id().unwrap();
+        let pane_id = app.state.public_pane_id(0, pane).unwrap();
+        let terminal_id = ws.tabs[0].panes[&pane].attached_terminal_id.clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.agent_name = Some("reviewer".into());
+        let agent_id = terminal.agent_id.to_string();
+        let api = AppApi(RefCell::new(app));
+        for (index, to) in [
+            json!(pane_id),
+            json!(terminal_id),
+            json!("reviewer"),
+            json!(agent_id),
+            json!({"type":"pane","pane":pane_id}),
+            json!({"type":"agent","agent":agent_id}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = route(
+                "tools/call",
+                json!({"name":"flock_msg_send", "arguments":{
+                "to":to,"body":"hello","intent":"fyi","correlation_id":format!("shape-{index}")}}),
+                &api,
+                &ChannelOptions::off(),
+            )
+            .unwrap();
+            let queued: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(queued["state"], "queued");
+        }
+        let read = api
+            .call(Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(pane_id),
+            }))
+            .unwrap();
+        assert_eq!(read["result"]["messages"].as_array().unwrap().len(), 6);
+        let unknown = route(
+            "tools/call",
+            json!({"name":"flock_msg_send", "arguments":{
+            "to":"missing-recipient","body":"x","intent":"fyi"}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.data.unwrap()["kind"], "msg_target_not_found");
+        {
+            let mut app = api.0.borrow_mut();
+            app.state
+                .workspaces
+                .push(crate::workspace::Workspace::test_new("other-recipient"));
+            app.state.ensure_test_terminals();
+            let other = app.state.workspaces[1].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            app.state.terminals.get_mut(&other).unwrap().agent_name = Some("reviewer".into());
+        }
+        let ambiguous = route(
+            "tools/call",
+            json!({"name":"flock_msg_send", "arguments":{
+            "to":"reviewer","body":"x","intent":"fyi"}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous.data.unwrap()["kind"], "msg_target_ambiguous");
+        assert!(ambiguous.message.contains("terminal_id="));
+    }
+
+    #[test]
+    fn message_target_resolution_errors_keep_typed_kinds_and_shapes() {
+        for (kind, exit) in [
+            ("msg_target_not_found", crate::cli::exit::FAILURE),
+            ("msg_target_ambiguous", crate::cli::exit::FAILURE),
+        ] {
+            let flock = MockApi::ok(
+                json!({"error":{"code":kind,"message":"diagnostic wording is irrelevant"}}),
+            );
+            let err = route(
+                "tools/call",
+                json!({"name":"flock_msg_send",
+                "arguments":{"to":"reviewer","body":"x","intent":"fyi"}}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            let data = err.data.unwrap();
+            assert_eq!(data["kind"], kind);
+            assert_eq!(data["refusal"], kind);
+            assert_eq!(data["exit"], exit);
+            assert!(data["expected"].is_array());
+            assert!(err.message.contains("pane id"));
         }
     }
 

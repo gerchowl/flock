@@ -388,23 +388,32 @@ fn installed_status_at(
     status
 }
 
+/// Run the installed binary's identity-only `--version` command with null stdin.
+///
+/// Stdin is fixed inside this executor. The caller supplies the output timeout.
+/// Production supplies this executor to [`probe_installed_version`], which
+/// performs canonicalization before invoking it. Tests can inject controlled
+/// output instead. Never run a harness's arbitrary configured MCP command.
 fn execute_installed_version(
     path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    // --version is an identity-only command, including for older installed flk.
-    // Never execute a harness's arbitrary configured MCP command to probe it.
     crate::process::TracedCommand::new(path, "status")
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .output_traced_with_timeout(timeout)
 }
 
+/// Canonicalize the installed path, then call the injected `execute` executor.
+///
+/// Resolve only for this probe; leave the persisted launch command unchanged.
+/// Production supplies [`execute_installed_version`], while tests return
+/// controlled output after real filesystem canonicalization. Resolution,
+/// execution, unsuccessful exit, and invalid `flk VERSION` output are errors.
 fn probe_installed_version(
     path: &std::path::Path,
     execute: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::Output>,
 ) -> std::io::Result<String> {
-    // Resolve only for this probe, never for the persisted launch command.
     let probe_path = std::fs::canonicalize(path)?;
     let output = execute(&probe_path)?;
     if !output.status.success() {
@@ -581,19 +590,15 @@ mod installed_tests {
 
     #[test]
     fn installed_version_probe_reports_three_way_drift_after_symlink_retarget() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::symlink;
         use std::os::unix::process::ExitStatusExt;
         let dir = crate::test_support::unique_temp_path("installed-version-drift");
         std::fs::create_dir_all(&dir).unwrap();
         let launch = dir.join("flk");
         let first = dir.join("first");
         let second = dir.join("second");
-        for (path, version) in [
-            (&first, crate::build_info::version()),
-            (&second, "99.0.0-fixture".to_owned()),
-        ] {
-            std::fs::write(path, format!("#!/bin/sh\nprintf 'flk {version}\\n'\n")).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for path in [&first, &second] {
+            std::fs::write(path, b"version target fixture").unwrap();
         }
         let first_resolved = std::fs::canonicalize(&first).unwrap();
         let second_resolved = std::fs::canonicalize(&second).unwrap();
