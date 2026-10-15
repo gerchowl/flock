@@ -85,6 +85,8 @@ itself the point: the caller's only defence is an exit code it can trust.
   | `abandoned` (reason …) | restored to what it was (the text was removed or never committed) | yes | 9 |
   | `unconfirmed`, reason `typed_not_submitted` | **holds the sent text** | no: inspect or clear first | 8 |
   | `unconfirmed`, reason `confirm_timeout` / `owned_composer_not_visible` | unknown | no: inspect first | 8 |
+  | `unconfirmed`, reason `paste_write_incomplete` | partial paste written; remaining bytes may arrive later or be discarded | no: recover the writer/session, then inspect or clear first | 8 |
+  | `unconfirmed`, reason `paste_written` | full paste written, acceptance unknown after a guard interrupted submission | no: inspect or clear first | 8 |
 
   `typed_not_submitted` is new and is the case the survey and the owner
   describe: the text was observed in the composer and no turn started after
