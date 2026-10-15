@@ -192,6 +192,7 @@ async fn keystrokes_from_both_seams_are_held_and_replay_in_order_after_the_submi
     );
 
     paint(&app, &CLAUDE, "hello");
+    let now = observe_paste_write(&app, &pane, &mut attempt, now);
     assert_eq!(
         app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
         None
@@ -395,7 +396,7 @@ async fn esc_or_ctrl_c_interrupts_the_injection_at_once() {
         paint(&app, &CLAUDE, "hello");
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-            Some(Outcome::Abandoned("operator_active"))
+            Some(Outcome::Unconfirmed("paste_written"))
         );
         assert!(drain(&mut pty).is_empty(), "{key:?}: no Enter");
 
@@ -416,13 +417,14 @@ async fn esc_or_ctrl_c_interrupts_the_injection_at_once() {
         assert_eq!(drain(&mut pty), vec![key.to_vec()]);
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + POLL + GAP),
-            Some(Outcome::Abandoned("operator_active"))
+            Some(Outcome::Unconfirmed("paste_written"))
         );
         assert_eq!(app.kept_drafts.borrow().drafts(&pane), [DRAFT.to_string()]);
     }
 }
 
-/// ADR-0029 §1: an operator event before the first Enter abandons the send.
+/// ADR-0029 §1: interruption after a completed paste leaves its effect unknown.
+/// The caller must inspect the composer before retrying.
 /// The test owns the advancement gate: no app-loop tick runs until Esc has
 /// synchronously traversed the real client-input path and reached the PTY.
 #[tokio::test]
@@ -468,7 +470,7 @@ async fn guarded_submit_operator_before_enter_preserves_interruption_evidence() 
         // when the host delays us beyond the production first-Enter timer.
         assert_eq!(
             app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
-            Some(Outcome::Abandoned("operator_active"))
+            Some(Outcome::Unconfirmed("paste_written"))
         );
         writes.extend(drain(&mut pty));
         assert!(
@@ -476,8 +478,8 @@ async fn guarded_submit_operator_before_enter_preserves_interruption_evidence() 
             "{writes:?}"
         );
         assert!(!attempt.evidence.attempt_id.is_empty());
-        assert_eq!(attempt.evidence.state, "abandoned");
-        assert_eq!(attempt.evidence.reason.as_deref(), Some("operator_active"));
+        assert_eq!(attempt.evidence.state, "unconfirmed");
+        assert_eq!(attempt.evidence.reason.as_deref(), Some("paste_written"));
         assert!(attempt.evidence.submit_sent_at_ms.is_none());
         assert!(attempt.evidence.finished_at_ms.is_some());
         assert!(!attempt.evidence.retried);
