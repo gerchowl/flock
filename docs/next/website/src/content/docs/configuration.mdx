@@ -704,8 +704,8 @@ to 4 KiB per stream. If a background descendant keeps a pipe open, or a reader
 does not finish within the one-second capture bound, Flock marks that stream's
 capture incomplete. One warning per check reports both stream failures when
 capture diagnostics first appear or change. Repeated identical failures stay
-quiet; a run without capture failures resets the warning state. Reloading the
-check configuration also resets it. Capture failures do not change the
+quiet; a run without capture failures resets the warning state. Restarting the
+server (or a handoff) also resets it. Capture failures do not change the
 exit-status decision or suppress alert debounce.
 
 ## Agent messages

@@ -96,6 +96,40 @@ fn validate_private_dir(meta: &fs::Metadata, uid: libc::uid_t) -> io::Result<()>
     Ok(())
 }
 
+/// Set owned session pipes nonblocking so worker cancellation never waits for I/O.
+pub(crate) fn set_nonblocking(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the live file owns this descriptor; fcntl does not access memory.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: preserve existing flags and add nonblocking mode to the owned fd.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Reopen a private regular stream for recovery and append without following links.
+pub(crate) fn open_append_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session stream requires owner-only regular file",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

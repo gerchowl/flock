@@ -78,7 +78,9 @@ pub(crate) struct CapturedOutput {
 /// Failure diagnostics for one capture run, independent of the script outcome.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CaptureNotes {
+    /// Why stdout capture failed, or `None` when capture completed.
     pub stdout: Option<String>,
+    /// Why stderr capture failed, or `None` when capture completed.
     pub stderr: Option<String>,
 }
 

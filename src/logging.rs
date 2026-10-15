@@ -18,6 +18,15 @@ pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
         "failed to remove structured session config directory");
 }
 
+/// Report a rare tail repair without exposing session contents or paths.
+pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
+    tracing::warn!(
+        event = "structured.stream.repaired",
+        bytes_dropped,
+        "removed torn final session record"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
