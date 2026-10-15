@@ -45,6 +45,14 @@ const START_OUTPUT_TAIL_LINES: usize = 40;
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        self.collect_agent_infos_at(Instant::now())
+    }
+
+    /// Observe local agents with one instant for their state ages.
+    pub(super) fn collect_agent_infos_at(
+        &self,
+        now: Instant,
+    ) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
             .iter()
@@ -54,7 +62,7 @@ impl App {
                     tab.layout
                         .pane_ids()
                         .into_iter()
-                        .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
+                        .filter_map(move |pane_id| self.agent_info_at(ws_idx, pane_id, now))
                 })
             })
             .collect()
@@ -1242,6 +1250,16 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<(String, crate::api::agent_state::AgentState)> {
+        self.agent_state_of_at(ws_idx, pane_id, Instant::now())
+    }
+
+    /// Derive the state age at the observation's sampled instant.
+    fn agent_state_of_at(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        now: Instant,
+    ) -> Option<(String, crate::api::agent_state::AgentState)> {
         let pane_state = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
         if !terminal.is_agent_terminal() {
@@ -1257,7 +1275,7 @@ impl App {
             terminal.effective_known_agent(),
             terminal
                 .state_changed_at
-                .map(|changed| changed.elapsed().as_millis() as u64),
+                .map(|changed| now.saturating_duration_since(changed).as_millis() as u64),
             self.agent_background(terminal, status),
             super::api_helpers::screen_attention(
                 provider_wait,
@@ -1273,6 +1291,15 @@ impl App {
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        self.agent_info_at(ws_idx, pane_id, Instant::now())
+    }
+
+    fn agent_info_at(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        now: Instant,
     ) -> Option<crate::api::schema::AgentInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
@@ -1298,7 +1325,9 @@ impl App {
                     pane.agent_status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
-            state: self.agent_state_of(ws_idx, pane_id).map(|(_, state)| state),
+            state: self
+                .agent_state_of_at(ws_idx, pane_id, now)
+                .map(|(_, state)| state),
             agent_status: pane.agent_status,
             blocked_reason: if terminal.resume_failed {
                 Some("resume_failed".into())
