@@ -3834,10 +3834,18 @@ fn delegate_wait_for_ready(
         })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
         return Err((match err {
-            ApiClientError::ErrorResponse(response) => format!(
-                "delegate {name}: {}",
-                serde_json::to_string(&response).unwrap_or_else(|_| String::new())
-            ),
+            ApiClientError::ErrorResponse(mut response) => {
+                if response.error.code == crate::api::error_code::ErrorCode::PaneNotFound.as_str() {
+                    response.error.message = format!(
+                        "the agent's pane exited or no longer resolves before it became ready: {}",
+                        response.error.message
+                    );
+                }
+                format!(
+                    "delegate {name}: {}",
+                    serde_json::to_string(&response).unwrap_or_else(|_| String::new())
+                )
+            }
             _ => format!("delegate {name}: readiness could not be watched: {err}"),
         })
         .into());
