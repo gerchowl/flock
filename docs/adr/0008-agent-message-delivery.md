@@ -392,9 +392,10 @@ protected, not killed or silently "fixed", by the migration policy below.
 The existing removal entry point meant here is `flk pane close <target>`
 ([CLI](../../src/cli/pane.rs), `Method::PaneClose`), routed through
 [handle_pane_close](../../src/app/api/panes.rs) to
-[`RemovalEvent::Close`](../../src/app/agent_removal.rs). The current lifecycle
-classifies this as agent removal only with no resumable session binding;
-these are not proposed `agent remove` or `agent delete` commands. Closing a
+[`RemovalEvent::Close`](../../src/app/agent_removal.rs#L41). A **permanent pane close** means
+a close with no resumable session binding, mapped by the lifecycle to
+`Reason::Closed`; this is the agent removal meant here. These are not proposed
+`agent remove` or `agent delete` commands. Closing a
 resumable pane alone does not surrender its claim: intentional retirement of
 that retained stopped binding requires the explicit-release operation below.
 An ordinary process-exit notification, including `AgentRemoved`, is not proof
@@ -402,8 +403,8 @@ of deliberate claim retirement. Durable claim fencing/release remains proposed
 slice 2 work under #1500, not behavior already supplied by these entry points.
 
 Hibernation, a crash, ordinary process exit, pane detachment and a planned restart
-retain the claim and its resume rights. Deliberate agent removal or permanent
-pane close initiates claim retirement, not immediate key deletion. Persist the
+retain the claim and its resume rights. A permanent pane close initiates claim retirement,
+not immediate key deletion. Persist the
 retirement intent and fence the current generation before removing its visible
 projection; cancel pending launches and invalidate its managed resume plan.
 Only the authoritative current owner may finalize release, after proving its
@@ -416,7 +417,7 @@ For an intentionally retained stopped record, an operator-only explicit-release
 operation supplies the full native-session claim key, owning AgentId and expected
 generation to the same fence and checks. Resolve that exact claim in the registry,
 including retired records, without requiring a live pane projection. It refuses a live, uncertain or foreign-owned claim; it does not kill by an
-unverified PID or offer a force takeover. Confirmed removal/close can finalize
+unverified PID or offer a force takeover. A permanent pane close can finalize
 release automatically once teardown supplies the required evidence; a crash
 between retirement and release replays that intent and the evidence checks.
 Explicit release discards the old binding's managed resume rights. It does not
@@ -595,7 +596,7 @@ against the baseline, then pass with the accepted change, using owned fakes:
 | Operator-verified remote successor link (slice 1) | Create the incident across two owned servers with colliding local pane/terminal ids. Record a verified destination inventory using proposed `flk agent move <source> --verified-successor @<receipt.json>`. After restart/snapshot replay, existing `agent send <source-name>` and explicit old targets refuse with `agent_moved`, `retry: never`, authenticated destination server id plus opaque remote agent/terminal/pane ids. A legacy unknown generation stays unknown. Assert zero bytes/spawns/renames/reaps on either server and no v5 ownership update or mail/history merge. Reject unverified/mismatched inventory before mutation; lose the destination afterward and assert the source remains fenced with an unavailable hint. The equivalent ledger fixture fails the old resolver without relying on the new command's absence. |
 | Native-session exclusivity (slice 2) | Use an owned fake harness and one session namespace/id. Race resume and spawn into distinct panes, including a `moved-` label and a store alias: one durable claim wins and at most one process starts; the other returns `native_session_claimed`. Reopen the registry after restart and repeat. Without the guard both launch. |
 | Claim crash recovery and legacy protection (slice 2) | Crash after reservation, spawn-before-child-record, child record and hibernation. A proven stopped owner can explicitly resume; uncertain identity and a live different owner retain/refuse. Seed legacy source plus running guest-copy records with no new claims; rollout preserves both histories/resources and the current process, marks the conflict, and refuses another launch. Restoring a stale snapshot or waiting cannot clear the claim. Without these checks a duplicate launch or destructive adoption occurs. |
-| Claim release on deliberate retirement (slice 2) | Acquire a session, then independently exercise permanent pane close (the existing removal entry point above) and explicit release of the exact native-session key/owner/generation. Each fences the exact owner/generation, rejects further old resume, and frees the key only after confirmed teardown and no pending transfer/launch. A new owner can acquire it afterward. Hibernate, crash, detached runner, uncertain birth identity and foreign/moved-source removal retain/refuse. Crash between retirement and release, replay the old snapshot, and deliver a delayed old close after a new acquisition: no old resurrection, premature release or release of the new claim. Old missing release handling fails by keeping a confirmed retired key claimed; unsafe eager release fails by permitting concurrent ownership. |
+| Claim release on deliberate retirement (slice 2) | Acquire a session, then independently exercise permanent pane close (as defined above) and explicit release of the exact native-session key/owner/generation. Each fences the exact owner/generation, rejects further old resume, and frees the key only after confirmed teardown and no pending transfer/launch. A new owner can acquire it afterward. Hibernate, crash, resumable pane close, detached runner, uncertain birth identity and foreign/moved-source removal retain/refuse. Crash between retirement and release, replay the old snapshot, and deliver a delayed old close after a new acquisition: no old resurrection, premature release or release of the new claim. Old missing release handling fails by keeping a confirmed retired key claimed; unsafe eager release fails by permitting concurrent ownership. |
 | Fresh-spawn compatibility (slice 2, owner decision pending) | With a harness incapable of caller-selected ids, the recommended guarded mode refuses before creating any process or claim and reports the unsupported capability; no unguarded fallback. A capable owned fake reserves the id before launch and acquires exactly once. Test whichever explicit policy the owner accepts; an existing ordinary launch succeeding must not be counted as guarded exclusivity evidence. |
 | Name and AgentId address the current episode (slice 3) | Begin with a named hibernated source on one server and a differently placed guest destination; transfer, restart both, resolve/send the original identity, and assert only the destination receives bytes. This cross-node assertion is not acceptance evidence for slice 1 alone. |
 | No ambiguous/inactive mutation | Duplicate names/current claims and explicit historical targets refuse with candidate/current hints and zero input, including focus/resume and reap. |
