@@ -64,24 +64,25 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
 /// Create or validate a persistent private directory without following symlinks.
 /// Existing permissions and ownership are never silently changed.
 pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
-    let open = || {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path)
-    };
-    let directory = match open() {
-        Ok(directory) => directory,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+    match check_private_dir(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             match create_private_dir(path) {
                 Ok(()) => (),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => (),
-                Err(err) => return Err(err),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error),
             }
-            open()?
+            check_private_dir(path)
         }
-        Err(err) => return Err(err),
-    };
+        result => result,
+    }
+}
+
+/// Validate an existing private directory; absence is an error, never creation.
+pub(crate) fn check_private_dir(path: &Path) -> io::Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
     // SAFETY: geteuid has no preconditions and accesses no Rust memory.
     validate_private_dir(&directory.metadata()?, unsafe { libc::geteuid() })
 }
@@ -171,7 +172,7 @@ fn remove_transient_in(path: &Path, socket_pid: Option<u32>, roots: &[PathBuf]) 
         {
             return Err(io::Error::other("unsafe Claude socket path"));
         }
-        ensure_private_dir(parent)?;
+        check_private_dir(parent)?;
         let canonical = path.canonicalize()?;
         let root = parent
             .parent()
