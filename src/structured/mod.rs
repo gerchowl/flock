@@ -2,5 +2,6 @@
 
 pub mod claude;
 pub mod launch;
+pub mod runtime;
 pub mod supervision;
 pub mod transport;

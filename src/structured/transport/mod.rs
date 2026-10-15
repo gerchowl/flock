@@ -84,14 +84,45 @@ pub enum Completion {
 
 /// Server handle. Inbound/outbound memory is bounded; there is at most one turn
 /// pending. Any parsed top-level result reopens the private idle gate, including
-/// unmodelled subtypes. The supervisor owns socket refusal and process cleanup (#1462).
+/// unmodelled subtypes. A lossy result header also opens it without claiming turn
+/// success. Indeterminate loss surfaces `structured_turn_end_unknown` until a
+/// result confirms the boundary. The supervisor owns socket refusal and cleanup.
 pub struct Transport {
-    input: Option<mpsc::SyncSender<Vec<u8>>>,
+    input: InputHandle,
     output: mpsc::Receiver<Received>,
     completion: mpsc::Receiver<Completion>,
+}
+
+/// Submission authority separated from worker-owned event receivers.
+#[derive(Clone)]
+pub(super) struct InputHandle {
+    input: Option<mpsc::SyncSender<Vec<u8>>>,
     busy: Arc<AtomicBool>,
+    uncertain: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     close: Arc<AtomicBool>,
+}
+
+/// Cloneable nonblocking shutdown requests for the process supervisor.
+#[derive(Clone)]
+pub(super) struct StopHandle {
+    cancel: Arc<AtomicBool>,
+    close: Arc<AtomicBool>,
+}
+
+impl StopHandle {
+    /// Close stdin; stop intent must already be recorded.
+    pub(super) fn close_stdin(&self) {
+        self.close.store(true, Ordering::Release);
+    }
+    /// Cancel I/O, including blocked notification delivery.
+    pub(super) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    /// Whether cancellation was requested, including by a failed worker.
+    pub(super) fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
 }
 
 impl Transport {
@@ -103,6 +134,18 @@ impl Transport {
         stdin: File,
         location: StreamLocation,
         version: String,
+    ) -> io::Result<Self> {
+        Self::start_guarded(stdout, stdin, location, version, || Ok(()))
+    }
+
+    /// Run the registry refusal on the writer worker immediately before its
+    /// first input bytes. Failure is explicit Writer(Err), with no bytes written.
+    pub(super) fn start_guarded(
+        stdout: File,
+        stdin: File,
+        location: StreamLocation,
+        version: String,
+        before_first_write: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> io::Result<Self> {
         for component in [&location.agent, &location.session] {
             if component.is_empty()
@@ -128,13 +171,19 @@ impl Transport {
         let (output_tx, output) = mpsc::sync_channel(4);
         let (done, completion) = mpsc::sync_channel(2);
         let busy = Arc::new(AtomicBool::new(false));
+        let uncertain = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
         let close = Arc::new(AtomicBool::new(false));
-        let (b, c, d) = (busy.clone(), cancel.clone(), done.clone());
+        let (b, u, c, d) = (
+            busy.clone(),
+            uncertain.clone(),
+            cancel.clone(),
+            done.clone(),
+        );
         thread::Builder::new()
             .name("session-stdout".into())
             .spawn(move || {
-                let result = pump(stdout, location, &version, output_tx, &b, &c);
+                let result = pump(stdout, location, &version, output_tx, &b, &u, &c);
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
@@ -144,7 +193,7 @@ impl Transport {
         if let Err(err) = thread::Builder::new()
             .name("session-stdin".into())
             .spawn(move || {
-                let result = write_inputs(stdin, input_rx, &c, &closed);
+                let result = write_inputs(stdin, input_rx, &c, &closed, before_first_write);
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
@@ -155,24 +204,99 @@ impl Transport {
             return Err(err);
         }
         Ok(Self {
-            input: Some(input),
+            input: InputHandle {
+                input: Some(input),
+                busy,
+                uncertain,
+                cancel,
+                close,
+            },
             output,
             completion,
-            busy,
-            cancel,
-            close,
         })
+    }
+
+    /// Share shutdown flags without sharing receivers or blocking on a mutex.
+    pub(super) fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            cancel: self.input.cancel.clone(),
+            close: self.input.close.clone(),
+        }
+    }
+
+    /// Clone submission authority without sharing or locking event receivers.
+    pub(super) fn input_handle(&self) -> InputHandle {
+        self.input.clone()
+    }
+
+    /// Whether an accepted input lacks any top-level result, including Unknown.
+    pub(super) fn input_inflight(&self) -> bool {
+        self.input.input_inflight()
+    }
+
+    /// Offer a bounded user envelope at idle; WouldBlock means input is in flight.
+    /// Indeterminate loss returns `structured_turn_end_unknown` instead of busy.
+    pub fn try_submit(&self, user: &Value) -> io::Result<()> {
+        self.input.try_submit(user)
+    }
+
+    /// Poll the bounded event queue without waiting. Empty is not EOF.
+    pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
+        self.output.try_recv()
+    }
+
+    /// Poll worker termination/failure without waiting; observe both workers.
+    pub fn try_completion(&self) -> Result<Completion, mpsc::TryRecvError> {
+        self.completion.try_recv()
+    }
+
+    /// Request stdin closure, discarding any unfinished input. Never waits for a
+    /// full pipe; the writer closes its descriptor within one polling interval.
+    /// An in-flight write may leave a partial JSON line before EOF. This is
+    /// acceptable only at stop: no further turn is delivered, and supervision
+    /// records stop intent before closure and never treats truncation as success.
+    pub fn close_stdin(&mut self) {
+        self.input.close.store(true, Ordering::Release);
+        self.input.input.take();
+    }
+
+    /// Cancel both workers, including a reader blocked on consumer back-pressure.
+    /// Cancellation is explicit Interrupted completion, not a silent EOF.
+    /// Like close_stdin, cancellation can leave a partial JSON line on stdin
+    /// before EOF. Record stop intent first; truncation is never turn success.
+    pub fn cancel(&self) {
+        self.input.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Drop requests cancellation without joining. An in-flight stdin write may be
+/// left as a partial JSON line before EOF, just as with close_stdin/cancel.
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl InputHandle {
+    /// Whether an accepted input lacks any top-level result, including Unknown.
+    pub(super) fn input_inflight(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
     }
 
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Only this method can reach the private stdin sender; no control bypass.
-    pub fn try_submit(&self, user: &Value) -> io::Result<()> {
+    /// Loss with no identifiable event type yields `structured_turn_end_unknown`
+    /// until a real result confirms the boundary; never retry it as ordinary busy.
+    pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "transport closed",
             ));
+        }
+        if self.uncertain.load(Ordering::Acquire) {
+            return Err(io::Error::other("structured_turn_end_unknown"));
         }
         if user.get("type").and_then(Value::as_str) != Some("user") {
             return Err(io::Error::other("stdin accepts only user envelopes"));
@@ -200,42 +324,6 @@ impl Transport {
             return Err(io::Error::other(err.to_string()));
         }
         Ok(())
-    }
-
-    /// Poll the bounded event queue without waiting. Empty is not EOF.
-    pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
-        self.output.try_recv()
-    }
-
-    /// Poll worker termination/failure without waiting; observe both workers.
-    pub fn try_completion(&self) -> Result<Completion, mpsc::TryRecvError> {
-        self.completion.try_recv()
-    }
-
-    /// Request stdin closure, discarding any unfinished input. Never waits for a
-    /// full pipe; the writer closes its descriptor within one polling interval.
-    /// An in-flight write may leave a partial JSON line before EOF. This is
-    /// acceptable only at stop: no further turn is delivered, and supervision
-    /// records stop intent before closure and never treats truncation as success.
-    pub fn close_stdin(&mut self) {
-        self.close.store(true, Ordering::Release);
-        self.input.take();
-    }
-
-    /// Cancel both workers, including a reader blocked on consumer back-pressure.
-    /// Cancellation is explicit Interrupted completion, not a silent EOF.
-    /// Like close_stdin, cancellation can leave a partial JSON line on stdin
-    /// before EOF. Record stop intent first; truncation is never turn success.
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
-    }
-}
-
-/// Drop requests cancellation without joining. An in-flight stdin write may be
-/// left as a partial JSON line before EOF, just as with close_stdin/cancel.
-impl Drop for Transport {
-    fn drop(&mut self) {
-        self.cancel();
     }
 }
 
@@ -265,7 +353,9 @@ fn write_inputs(
     rx: mpsc::Receiver<Vec<u8>>,
     cancel: &AtomicBool,
     close: &AtomicBool,
+    before_first_write: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut before_first_write = Some(before_first_write);
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -275,6 +365,9 @@ fn write_inputs(
         }
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
+                if let Some(check) = before_first_write.take() {
+                    check()?;
+                }
                 let mut remaining = bytes.as_slice();
                 while !remaining.is_empty() {
                     if cancel.load(Ordering::Acquire) {
@@ -377,6 +470,7 @@ fn pump(
     version: &str,
     tx: mpsc::SyncSender<Received>,
     busy: &AtomicBool,
+    uncertain: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let (mut file, mut seq) = open_stream(location, cancel)?;
@@ -399,7 +493,7 @@ fn pump(
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, cancel,
+                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
                 )?;
                 line.clear();
                 count = 0;
@@ -413,12 +507,41 @@ fn pump(
         if n == 0 {
             if count > 0 {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, cancel,
+                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
                 )?;
             }
             return Ok(());
         }
     }
+}
+
+/// Inspect a bounded JSON object prefix structurally, never matching nested
+/// text. The harness's top-level type header precedes its potentially lost body.
+/// A deliberate parse abort after that header tolerates a truncated/invalid tail.
+fn prefix_type(prefix: &[u8]) -> Option<String> {
+    struct Header<'a>(&'a mut Option<String>);
+    impl<'de> serde::de::Visitor<'de> for Header<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("event object prefix")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    *self.0 = Some(map.next_value()?);
+                    return Err(serde::de::Error::custom("event header inspected"));
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut kind = None;
+    let _ = serde::de::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(prefix),
+        Header(&mut kind),
+    );
+    kind
 }
 
 fn emit(
@@ -429,6 +552,7 @@ fn emit(
     version: &str,
     tx: &mpsc::SyncSender<Received>,
     busy: &AtomicBool,
+    uncertain: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let origin = if count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err() {
@@ -436,12 +560,22 @@ fn emit(
     } else {
         RecordOrigin::Claude
     };
+    let kind = if origin == RecordOrigin::Flk {
+        prefix_type(&line[..line.len().min(256)])
+    } else {
+        None
+    };
+    let turn_end = match kind.as_deref() {
+        Some("result") => "result",
+        Some(_) => "not_result",
+        None => "unknown",
+    };
     let raw = if count > MAX_LINE_BYTES as u64 {
-        serde_json::json!({"type":"flk_oversize", "bytes":count, "limit":MAX_LINE_BYTES, "prefix_base64":base64::engine::general_purpose::STANDARD.encode(&line[..line.len().min(256)])}).to_string()
+        serde_json::json!({"type":"flk_oversize", "bytes":count, "limit":MAX_LINE_BYTES, "prefix_base64":base64::engine::general_purpose::STANDARD.encode(&line[..line.len().min(256)]), "turn_end":turn_end}).to_string()
     } else {
         match std::str::from_utf8(line) {
             Ok(text) => text.to_owned(),
-            Err(_) => serde_json::json!({"type":"flk_invalid_utf8", "base64":base64::engine::general_purpose::STANDARD.encode(line)}).to_string(),
+            Err(_) => serde_json::json!({"type":"flk_invalid_utf8", "base64":base64::engine::general_purpose::STANDARD.encode(line), "turn_end":turn_end}).to_string(),
         }
     };
     let event = SessionEvent::parse(&raw, version);
@@ -474,8 +608,11 @@ fn emit(
     encoded.push(b'\n');
     file.write_all(&encoded)?;
     file.sync_data()?;
-    if ends_turn {
+    if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
+        uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
+    } else if origin == RecordOrigin::Flk && turn_end == "unknown" && busy.load(Ordering::Acquire) {
+        uncertain.store(true, Ordering::Release);
     }
     let mut received = Received { record, event };
     loop {
