@@ -76,7 +76,10 @@ fn terminal(app: &mut App) -> &mut crate::terminal::TerminalState {
 /// Claude, showing its idle prompt box, since `idle_for` ago, and seen just
 /// now — the state an idle wake is for.
 fn claude_idle_for(app: &mut App, idle_for: Duration) {
-    let now = Instant::now();
+    claude_idle_for_at(app, idle_for, Instant::now());
+}
+
+fn claude_idle_for_at(app: &mut App, idle_for: Duration, now: Instant) {
     let terminal = terminal(app);
     for at in [now - idle_for, now] {
         terminal.set_detected_state_with_screen_signals_at(
@@ -2203,8 +2206,8 @@ async fn pane_read_detection_unfaint_returns_both_texts_from_the_server() {
 #[path = "injection_lock_tests.rs"]
 mod injection_lock_tests;
 
-/// #1019 from the socket: `agent.get` and `agent.list` carry the `state`
-/// a real detector report produces, and the local `fleet` row repeats it.
+/// #1019: detector state reaches `agent.get` through the API and `agent.list`
+/// through its clock-injected handler; the local `fleet` row repeats it.
 #[tokio::test]
 async fn agent_records_carry_the_state_object_from_the_detector() {
     let call = |app: &mut App, method| -> serde_json::Value {
@@ -2228,20 +2231,32 @@ async fn agent_records_carry_the_state_object_from_the_detector() {
     assert!(state["held_ms"].as_u64().unwrap() >= 3_000);
     // The idle start only moves on a change, so the settled case is a fresh pane.
     let Rig { mut app, .. } = rig();
-    claude_idle_for(&mut app, settled());
-    let list = call(
-        &mut app,
-        Method::AgentList(crate::api::schema::EmptyParams {}),
-    );
+    let now = Instant::now();
+    claude_idle_for_at(&mut app, settled(), now);
+    // A second observation would advance by exactly 1 ms without sleeping.
+    let mut clock_reads = 0u64;
+    let list: serde_json::Value =
+        serde_json::from_str(&app.handle_agent_list_with_clock("state".into(), || {
+            let at = now + Duration::from_millis(clock_reads);
+            clock_reads += 1;
+            at
+        }))
+        .unwrap();
     let agent = &list["result"]["agents"][0];
     assert_eq!(
         (&agent["agent_status"], &agent["state"]["phase"]),
         (&"idle".into(), &"unknown".into())
     );
-    let held = agent["state"]["held_ms"].as_u64().unwrap();
-    assert!(
-        (10_000..settled().as_millis() as u64).contains(&held),
-        "{held}"
-    );
+    assert_eq!(agent["state"]["held_ms"], 10_000);
     assert_eq!(list["result"]["fleet"][0]["state"], agent["state"]);
+    assert_eq!(clock_reads, 1, "one state snapshot per response");
+    // The public request path must use the same snapshot-preserving handler.
+    let list = call(
+        &mut app,
+        Method::AgentList(crate::api::schema::EmptyParams {}),
+    );
+    assert_eq!(
+        list["result"]["fleet"][0]["state"],
+        list["result"]["agents"][0]["state"]
+    );
 }
