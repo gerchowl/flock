@@ -6,7 +6,7 @@
 //! - `exit 0` → [`Outcome::Fire`] — the check tripped, the runner will
 //!   consider it toward the debounce.
 //! - any non-zero exit → [`Outcome::Pass`] — the check ran and reported OK.
-//! - timeout / signal termination / spawn failure / capture failure / stuck child →
+//! - timeout / signal termination / spawn failure / stuck child →
 //!   [`Outcome::Error`] — the check MECHANICS failed; the runner leaves the
 //!   debounce counter alone and records the last-outcome as Error.
 //!
@@ -51,19 +51,28 @@ pub(crate) enum Outcome {
     Fire,
     /// non-zero exit — the check ran cleanly and did not trip.
     Pass,
-    /// Spawn, wait, capture failure, timeout, or signal-termination. The `String` is a
+    /// Spawn or wait failure, timeout, or signal-termination. The `String` is a
     /// bounded, human-readable reason.
     Error(String),
 }
 
-/// Bounded stdout/stderr from a completed run. Kept for the executor's
-/// log side; the runner never reads it (Outcome carries the decision).
+/// Bounded stdout/stderr and capture diagnostics from a completed run.
+/// Capture failures mark the affected stream incomplete and emit a warning;
+/// they never change exit classification, even when the caller discards output.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CapturedOutput {
+    /// Captured stdout bytes, bounded to `OUTPUT_CAP_BYTES`.
     pub stdout: Vec<u8>,
+    /// Captured stderr bytes, bounded to `OUTPUT_CAP_BYTES`.
     pub stderr: Vec<u8>,
+    /// Stdout exceeded the byte cap or could not be collected completely.
     pub stdout_truncated: bool,
+    /// Stderr exceeded the byte cap or could not be collected completely.
     pub stderr_truncated: bool,
+    /// Why stdout capture failed; absence alone does not rule out byte truncation.
+    pub stdout_note: Option<String>,
+    /// Why stderr capture failed; absence alone does not rule out byte truncation.
+    pub stderr_note: Option<String>,
 }
 
 /// Run one script check to completion (or timeout). See the module doc for
@@ -76,12 +85,16 @@ pub(crate) fn run_script(check: &ScriptCheck) -> (Outcome, CapturedOutput) {
 /// Production uses the watchdog deadlines. Other callers can wait on completion
 /// with failure-only bounds without charging scheduling delay as a check timeout.
 trait ScriptExecutor {
+    /// Reap the child and return its status plus whether its deadline fired.
     fn wait(&self, child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool), String>;
+    /// Collect bounded bytes or report a capture failure independently of exit status.
     fn collect(&self, rx: CaptureReceiver) -> Result<(Vec<u8>, bool), String>;
 }
 
+/// Production child supervision and one-second capture collection policy.
 struct Watchdog;
 
+/// Share command setup and exit classification across execution policies.
 fn run_script_with_executor(
     check: &ScriptCheck,
     executor: &impl ScriptExecutor,
@@ -141,29 +154,21 @@ fn run_script_with_executor(
     // Attempt both collectors even if one fails, so a completed stream survives.
     let stdout = stdout_rx.map(|rx| executor.collect(rx)).transpose();
     let stderr = stderr_rx.map(|rx| executor.collect(rx)).transpose();
-    let mut output = CapturedOutput::default();
-    let mut errors = Vec::new();
-    match stdout {
-        Ok(Some((bytes, truncated))) => {
-            output.stdout = bytes;
-            output.stdout_truncated = truncated;
-        }
-        Ok(None) => {}
-        Err(reason) => errors.push(format!("stdout capture failed: {reason}")),
-    }
-    match stderr {
-        Ok(Some((bytes, truncated))) => {
-            output.stderr = bytes;
-            output.stderr_truncated = truncated;
-        }
-        Ok(None) => {}
-        Err(reason) => errors.push(format!("stderr capture failed: {reason}")),
-    }
+    let (stdout, stdout_truncated, stdout_note) = finish_capture(&check.name, "stdout", stdout);
+    let (stderr, stderr_truncated, stderr_note) = finish_capture(&check.name, "stderr", stderr);
+    let output = CapturedOutput {
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        stdout_note,
+        stderr_note,
+    };
     if timed_out {
-        errors.insert(0, format!("timed out after {}s", timeout.as_secs()));
-    }
-    if !errors.is_empty() {
-        return (Outcome::Error(errors.join("; ")), output);
+        return (
+            Outcome::Error(format!("timed out after {}s", timeout.as_secs())),
+            output,
+        );
     }
 
     // Signal-terminated → Error. On Unix, `ExitStatus::code()` returns None
@@ -187,6 +192,31 @@ fn run_script_with_executor(
             Outcome::Error("no exit code and not signal-terminated".into()),
             output,
         ),
+    }
+}
+
+/// Preserve a completed stream, or mark failed capture and report its reason.
+/// The runtime consumes only `Outcome`, so the warning keeps diagnostics visible
+/// even when the returned output is discarded. Neither path classifies a check.
+fn finish_capture(
+    check_name: &str,
+    stream: &str,
+    result: Result<Option<(Vec<u8>, bool)>, String>,
+) -> (Vec<u8>, bool, Option<String>) {
+    match result {
+        Ok(Some((bytes, truncated))) => (bytes, truncated, None),
+        Ok(None) => (Vec::new(), false, None),
+        Err(reason) => {
+            tracing::warn!(
+                target: "checks",
+                event = "check.capture.failed",
+                check_name,
+                stream,
+                reason = reason.as_str(),
+                "script output capture incomplete"
+            );
+            (Vec::new(), true, Some(reason))
+        }
     }
 }
 
@@ -248,6 +278,7 @@ fn send_signal(pid: u32, signal: libc::c_int) {
     }
 }
 
+/// One bounded reader result, or its explicit read-failure reason.
 type CaptureReceiver = mpsc::Receiver<Result<(Vec<u8>, bool), String>>;
 
 /// Spawn a reader thread for one bounded pipe. The thread reads up to
@@ -293,13 +324,12 @@ where
     rx
 }
 
-/// Capture failure is a mechanical check error, never an empty successful
-/// capture. The one-second production bound prevents descendants retaining a
-/// pipe from blocking the runner. A late reader, a disconnected reader, or a
-/// read error becomes `Outcome::Error`; output from the other completed stream
-/// is retained. No partial output is represented as complete after a read error.
+/// Collect one stream with the unchanged one-second production bound. A late,
+/// disconnected, or failed reader becomes an output note and warning through
+/// `finish_capture`, never a different `Outcome`. The other stream is retained.
 /// Reader threads can outlive the run until pipe EOF; this bound does not
-/// terminate descendants that inherited the pipe.
+/// terminate descendants that inherited the pipe. Failed reads do not expose
+/// partial bytes as complete output.
 fn collect_bounded(rx: CaptureReceiver) -> Result<(Vec<u8>, bool), String> {
     rx.recv_timeout(Duration::from_secs(1))
         .map_err(|err| match err {
@@ -439,8 +469,12 @@ mod tests {
         let path = write_script(&dir, "silent.sh", "#!/bin/sh\nwhile :; do :; done\n");
         let observer = ObservedWatchdog(Cell::new(0));
         let (outcome, output) = run_script_with_executor(&script(path, 1), &observer);
-        assert_eq!(outcome, Outcome::Error("timed out after 1s".into()));
-        assert_eq!(output, CapturedOutput::default());
+        match outcome {
+            Outcome::Error(reason) => assert!(reason.contains("timed out"), "{reason}"),
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
         let mut status = 0;
         // SAFETY: the recorded pid is our child, and status points to a valid int.
         assert_eq!(
@@ -580,7 +614,7 @@ exit 0
     }
 
     #[test]
-    fn capture_failure_is_error_and_preserves_other_stream() {
+    fn capture_failure_preserves_exit_and_other_stream() {
         use std::cell::Cell;
         struct FailedCapture {
             call: Cell<usize>,
@@ -618,15 +652,94 @@ exit 0
             let stream = if fail_at == 0 { "stdout" } else { "stderr" };
             assert_eq!(
                 outcome,
-                Outcome::Error(format!("{stream} capture failed: fixture capture failure"))
+                Outcome::Fire,
+                "{stream} failure must not change exit classification"
             );
             if fail_at == 0 {
                 assert!(output.stdout.is_empty());
+                assert!(output.stdout_truncated);
+                assert_eq!(
+                    output.stdout_note.as_deref(),
+                    Some("fixture capture failure")
+                );
                 assert_eq!(output.stderr, b"err");
+                assert!(output.stderr_note.is_none());
             } else {
                 assert_eq!(output.stdout, b"out");
+                assert!(output.stdout_note.is_none());
                 assert!(output.stderr.is_empty());
+                assert!(output.stderr_truncated);
+                assert_eq!(
+                    output.stderr_note.as_deref(),
+                    Some("fixture capture failure")
+                );
             }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_descendant_capture_failure_preserves_exit_classification() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = temp_dir("background-capture");
+        let release_path = dir.join("release");
+        let ready_path = dir.join("ready");
+        let pid_path = dir.join("pid");
+        for path in [&release_path, &ready_path] {
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: name is a valid C path in the fixture's own directory.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        for (code, expected) in [(0, Outcome::Fire), (7, Outcome::Pass)] {
+            // EOF releases the background reader if fixture setup panics.
+            let release = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&release_path)
+                .unwrap();
+            let path = write_script(
+                &dir,
+                "background.sh",
+                &format!(
+                    r#"#!/bin/sh
+(
+exec 3<"$1"
+printf 'ready\n' >"$2"
+read -r token <&3
+) 2>/dev/null &
+printf '%s\n' "$!" >"$3"
+read -r ready <"$2" || exit 81
+[ "$ready" = ready ] || exit 82
+exit {code}
+"#
+                ),
+            );
+            let mut check = script(path, 5);
+            for path in [&release_path, &ready_path, &pid_path] {
+                check.args.push(path.to_string_lossy().into_owned());
+            }
+            let mut result = None;
+            let logs = crate::logging::capture_logs(|| {
+                result = Some(run_script(&check));
+            });
+            // The ready handshake proves this owned descendant opened its
+            // release pipe before the script exited. The OS reaps this orphan
+            // after termination, as for real background descendants.
+            let pid = std::fs::read_to_string(&pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            send_signal(pid, libc::SIGKILL);
+            drop(release);
+            let (outcome, output) = result.unwrap();
+            assert_eq!(outcome, expected);
+            assert!(output.stdout_truncated);
+            assert!(output
+                .stdout_note
+                .as_deref()
+                .is_some_and(|note| note.contains("timed out")));
+            assert!(logs.contains("check.capture.failed"), "{logs}");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
