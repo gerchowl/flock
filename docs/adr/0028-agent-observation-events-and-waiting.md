@@ -1237,20 +1237,49 @@ restarts it. Waiting is event-driven and leaves the app loop responsive.
   queued and merely promising to skip them eventually does not meet removal.
 - If some bytes reached the PTY, cancel under the same writer gate and discard
   the remainder before replying. Never roll back or silently replay the prefix.
-- Check expiry before each syscall and compare final completion time with the
-  deadline. Completion by the deadline succeeds; a late final syscall is an
-  error with the actual count, which can equal the total. This late-completion
+  Today `WriteReceipt::cancel()` (`src/pty/write_receipt.rs:66-96`) returns
+  `Partial` without setting `cancelled`, allowing the writer to continue.
+  Implementation must set `cancelled` for partial cancellation under the gate
+  and discard the unsent remainder, while retaining the exact prefix count.
+  Audit the #1522 guarded-submit path (`src/app/guarded_submit.rs:1224`) against
+  this changed shared-receipt semantics: partial paste remains unconfirmed,
+  never safely abandoned/retried, and must not proceed to Enter or emit a second
+  terminal outcome after cancellation.
+- Check expiry **inside the write/cancel gate, before each syscall**, and compare
+  final completion time with the deadline. Completion by the deadline succeeds;
+  a late final syscall is an error with the actual count, which can equal the
+  total. This late-completion
   case does not justify another syscall or a false zero-byte guarantee.
 - Observed caller disconnect, pane death/restart and handoff invalidate pending tickets:
   cancel them under the same gate, release payloads/quotas, and prevent an old
   owner from writing after the transition. Handoff must resolve or cancel each
   pending request before releasing ownership, not migrate an uncorrelated write.
 
+For ordinary single-request connections, `src/api/server.rs::handle_connection`
+waits for `handle_request` before attempting the response write; it does not
+observe socket EOF concurrently with that wait. This design relies on the
+request deadline alone to bound an unobserved caller disconnect, not immediate
+cancellation on client close. Bytes can still be written before expiry after
+that close, so the disconnected caller has an unknown outcome. If disconnect
+is observed earlier, apply the same gated cancellation; no pending request may
+outlive its write deadline merely because the response owner is waiting.
+
 **Owner decision required — deadline interface and bounds.** Propose optional
 `write_timeout_ms` on the affected raw input requests, default `10000`, valid
 `1..=30000`. An omitted field uses the bounded default. Invalid values are
 refused before admission. The CLI's bounded response wait must outlast this
 server deadline and its cancellation reply; propose a `1000` ms reply margin.
+Require `write_timeout_ms` to be strictly below the effective caller cap minus
+that reply margin, accounting also for a shorter remaining caller deadline and
+transport/forwarding time. The implementation must fix the in-tree delegate
+caller (`src/cli/delegate.rs:268`): `PaneSendInput` currently has a 10 s socket
+cap, equal to the proposed default write deadline. Without reserving reply time,
+a valid cancellation or completion reply can be lost and become unknown. Keep
+the caller cap bounded and explicitly select a shorter write budget (for
+example 8000 ms within a 10000 ms cap and 1000 ms reply margin), reducing it
+further when the remaining caller budget requires it; refuse before dispatch
+if no positive write budget fits. Apply this budgeting to the new write method
+cap entries too, rather than letting them inherit the generic 2 s poll cap.
 A client timeout alone is not proof of cancellation. Propose at most 32
 outstanding input requests per pane and 1024 per server, counting held, queued
 and writing requests together, alongside existing actor admission limits;
@@ -1317,8 +1346,10 @@ on a new server. New method tags bind the stronger contract to the operation
 that performs the write, not just a separate preflight observation.
 
 An older client may keep sending the same JSON request and accepting the same
-`Ok` envelope. A new server provides stronger success evidence with the bounded
-default; an old client treating `Ok` as accepted remains correct. Error fields
+`Ok` envelope. Old clients now wait for the write, up to the write deadline
+(default 10 s), instead of receiving an immediate queue-level `Ok`. A new
+server provides stronger success evidence with the bounded default; an old
+client treating `Ok` as accepted remains correct. Error fields
 are additive: tolerant clients ignore unfamiliar details; an older CLI treats
 an unknown error code as failure (1), never success. That older client cannot
 claim exact counts or the new retry classification. Raw JSON consumers that
@@ -1341,6 +1372,25 @@ an older server can ignore unknown parameter fields and still enqueue input.
 After any transport failure following dispatch, report unknown effect, not safe
 cancellation. Disable generic transport retries for these state-changing calls.
 
+Cross-host input forwarding across a mixed-version mesh is included in this
+contract. The node owning the destination PTY must support the completed-write
+contract; a forwarding node's own capability is insufficient. An old remote
+node can return a queue-level `Ok` for a legacy `pane.send_*` request; that is
+not completed-write evidence and must never be upgraded to a strong `Ok` by a
+new forwarding node. Require destination capability and a contract-bound write
+operation through every forwarding hop. An old destination without that
+capability, or an old hop unable to carry the operation and its final receipt,
+must cause the requiring client/forwarder to return `server_version_gap` / 78
+before input is sent. An old destination presented with a new method tag
+rejects it without writing; the client/forwarder normalizes that refusal to 78.
+Never fall back to legacy input forwarding. With capable hops, relay the final
+PTY owner's exact receipt/count/error, not hop admission, and consume one
+end-to-end budget including transit and reply margins; forwarding cannot reset
+it. Loss of the remote reply after dispatch is unknown, never zero-byte
+cancellation. This requirement does not change interactive terminal keystroke
+forwarding into a completed-write RPC or promise that legacy mesh input already
+has receipts.
+
 This proposes NDJSON request/capability/error additions with unchanged success
 shapes, not a new bincode input message. Do not change protocol constants in
 this design PR. If implementation changes binary wire shapes, apply the normal
@@ -1355,11 +1405,14 @@ not allocate a second unreleased bump or conflate it with mesh VERSION.
 | Healthy and empty writes | No success while bytes remain queued; exactly one success after final write. An empty encoded request resolves as a zero-byte completed operation without a syscall. |
 | Lease/backlog expiry | Hold the actual lease or consumer, enqueue, expire the request through the deadline path, receive zero-byte cancellation, then release and drain. No cancelled bytes arrive; later live input still arrives in FIFO order. |
 | Partial failure | Fill/gate a real nonblocking socket to allow an observed prefix, then break it. Error count equals the bytes observed; no suffix is written after error or recovery. No product test write hook. |
-| Deadline after prefix/final syscall | Control write/cancellation order. Check exact positive count, including the late-full-write case, one terminal response, and no further writes. |
+| Partial cancellation / #1522 | Cancel after an observed prefix while the writer remains healthy, then make it writable again. The cancelled flag prevents all remainder writes; guarded paste stays unconfirmed, sends no Enter, and concludes once. |
+| Deadline after prefix/final syscall | Control write/cancellation order, including expiry while waiting to acquire the gate. Expiry is checked inside the gate before the syscall. Check exact positive count, including the late-full-write case, one terminal response, and no further writes. |
 | Many queued requests at break | Mix queued and pending requests; each incomplete request answers once with its own count. A completed request stays successful, and later refused input does not hang. |
 | Competing completion/cancel | Exercise both gate orders. Cancellation before any byte proves permanent removal; completion wins only with timely final-write evidence. |
-| Caller/pane/owner loss | Disconnect caller, close/restart pane and hand off with requests outstanding. Retire response/ticket ownership and payloads; no stale-owner or lease-release ghost writes. |
+| Caller/pane/owner loss | Disconnect a single-request caller while the writer is held: without an EOF observer, the deadline still retires its ticket and payload. Unobserved disconnect permits pre-deadline writes and gives the caller no zero-byte guarantee. Also close/restart the pane and hand off; no stale-owner or post-cancellation lease-release ghost writes. |
 | Live silent producer | Hold a live writer without progress; the existing request deadline produces typed cancellation/failure, not success or an unbounded wait (ADR-0037 §1). |
+| Caller budget / delegate | Exercise the actual delegate call with its 10 s cap and shorter caller deadlines. The selected write deadline stays below the effective cap minus reply margin; replies fit, exhausted budgets refuse before dispatch, and lost replies become unknown without retries. |
+| Mixed-version forwarding | New forwarder to old destination or incapable hop refuses with 78 before input; legacy remote queue-level success is never strong success. With capable hops, hold/break the destination writer and observe its final count/error at the origin, one end-to-end deadline, and unknown effect after a lost remote reply. |
 | API/CLI compatibility | Start at real request dispatch, not a prefilled receipt. Check success/failure codes, byte fields and exits; new client refuses an old server before PTY input (also after a stale capability/restart race), old client reads new-server `Ok`, typed errors are not retried, lost replies become unknown. |
 
 The first row was demonstrated on dev `5c315be5`: two native actor fixtures ran,
