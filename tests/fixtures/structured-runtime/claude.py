@@ -98,6 +98,16 @@ assert json.loads(line)["type"] == "user", "private user envelope seam"
 (root / "input-received").write_text("input")
 emit(find("system", "hook_response"))
 init = json.loads((root / "restricted-init.json").read_text())
+if mode in ("init-oversize", "init-invalid-utf8"):
+    init["padding"] = "x" * (2 * 1024 * 1024) if mode == "init-oversize" else "invalid-byte"
+    init["messaging_socket_path"] = "fixture-socket"
+    raw = json.dumps(init).encode()
+    if mode == "init-invalid-utf8":
+        raw = raw.replace(b"invalid-byte", b"\xff")
+    sys.stdout.buffer.write(raw + b"\n")
+    sys.stdout.buffer.flush()
+    sys.stdin.read()
+    sys.exit(0)
 if mode.startswith("init-socket"):
     if mode.endswith("string"):
         sockets = root / "cc-socks"
@@ -111,6 +121,11 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "idle-turns":
+    emit(find("result", "success"))
+    while sys.stdin.readline():
+        emit(find("result", "success"))
+    sys.exit(0)
 if mode == "interrupt-1":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sys.stdin.read()

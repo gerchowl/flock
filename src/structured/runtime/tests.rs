@@ -253,6 +253,117 @@ impl Drop for Running {
 }
 
 #[test]
+fn natural_exit_with_stalled_consumer_confirms_io_and_cleans_up() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("normal", "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    // Never consume the five subsequent notifications: four slots and one
+    // pending record fill, despite the child and reader reaching natural EOF.
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Exited, "{exit:?}");
+    assert!(exit.status.expect("reaped status").success());
+    assert!(exit.error.is_none());
+    assert!(exit.delivery_cancelled);
+    assert!(!exit.input_inflight);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+    assert!(running.persistent.join("transcript.jsonl").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.stream())
+            .expect("durable replay")
+            .lines()
+            .count(),
+        6
+    );
+}
+
+#[test]
+fn idle_session_submission_never_reports_collector_contention_as_busy() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("idle-turns", "2.1.296").expect("launch");
+    running.receive();
+    running.submit();
+    running.receive();
+    running.receive();
+    running.receive();
+    let input = serde_json::json!({"type":"user","message":{"content":"next"}});
+    for turn in 0..1000 {
+        running
+            .runtime
+            .try_submit(&input)
+            .unwrap_or_else(|error| panic!("idle turn {turn}: {error}"));
+        assert!(matches!(
+            running.receive().event,
+            super::super::claude::SessionEvent::Success(_)
+        ));
+    }
+    running.runtime.stop();
+    assert_eq!(running.finish().outcome, Outcome::Stopped);
+}
+
+fn assert_uninspectable_init_refused(mode: &str) {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch(mode, "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Refused, "{exit:?}");
+    assert!(exit
+        .error
+        .expect("refusal")
+        .contains("structured_uninspectable_output"));
+    assert!(exit.delivery_cancelled);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+    assert!(fs::read_to_string(fixture.stream())
+        .expect("durable evidence")
+        .contains("\"origin\":\"flk\""));
+}
+
+#[test]
+fn oversized_init_cannot_bypass_socket_refusal() {
+    assert_uninspectable_init_refused("init-oversize");
+}
+
+#[test]
+fn non_utf8_init_cannot_bypass_socket_refusal() {
+    assert_uninspectable_init_refused("init-invalid-utf8");
+}
+
+#[test]
+fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile("no-read", "2.1.296");
+    let persistent = profile.config_dir().to_owned();
+    let mut command = TracedCommand::new(profile.binary(), "fixture-no-pipes");
+    command
+        .args(profile.args())
+        .env_clear()
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    profile.configure_environment(|key, value| {
+        command.env(key, value);
+    });
+    let (mut child, profile) = profile
+        .try_spawn(|| command.spawn_traced())
+        .expect("owned child");
+    let files = profile.into_session_files();
+    let generated = files.path().to_owned();
+    let root = ProcessIdentity::capture(child.id()).expect("owned birth");
+    let error = platform::structured::child_pipes(&mut child).expect_err("no piped endpoints");
+    let error = startup_failed(child, files, persistent.clone(), error, true);
+    assert!(error.to_string().contains("missing stdout pipe"));
+    assert!(!root.alive());
+    assert!(!generated.exists());
+    assert!(persistent.is_dir());
+}
+
+#[test]
 fn real_fake_launch_checks_env_argv_hooks_large_line_final_line_and_cleanup() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("normal", "2.1.296").expect("launch");
@@ -475,10 +586,7 @@ fn blocked_stdin_does_not_block_server_stop() {
     running.receive();
     let root = fixture.identity("model.pid");
     running.offer(&serde_json::json!({"type":"user","message":{"content":"x".repeat(1_048_576)}}));
-    running.wait(|| {
-        let transport = running.runtime.transport.try_lock().ok()?;
-        transport.input_inflight().then_some(())
-    });
+    running.wait(|| running.runtime.transport.input_inflight().then_some(()));
     assert!(!fixture.root.path().join("input-received").exists());
     running.runtime.stop();
     let exit = running.finish();

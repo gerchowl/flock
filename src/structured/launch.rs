@@ -167,6 +167,10 @@ impl VerifiedBinary {
 /// Missing files mean no evidence yet, not readiness. Malformed/unreadable
 /// records, symlinks, special files and records over 1 MiB fail closed.
 /// #1438 checks this before writing the first user input.
+/// The leaf is validated through its opened fd, but parent canonicalization is
+/// a separate path lookup: concurrent ancestor replacement can race that check.
+/// Closing this residual window requires a directory-fd walk with no-follow
+/// opens for every component, rather than another path-based metadata check.
 pub fn registry_has_messaging_socket(config_dir: &Path, pid: u32) -> io::Result<bool> {
     let path = config_dir.join("sessions").join(format!("{pid}.json"));
     let file = match private_fs::open_regular_file(&path) {

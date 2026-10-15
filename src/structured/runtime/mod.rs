@@ -10,13 +10,15 @@ use super::launch::{
     registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, VerifiedBinary,
 };
 use super::supervision::{self, StopRequest};
-use super::transport::{Completion, Received, StopHandle, StreamLocation, Transport};
+use super::transport::{
+    Completion, InputHandle, Received, RecordOrigin, StopHandle, StreamLocation, Transport,
+};
 use crate::{platform, process::TracedCommand};
 use serde_json::Value;
 use std::io;
 use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::sync::mpsc;
 use std::time::Duration;
 
 const TICK: Duration = Duration::from_millis(2);
@@ -56,7 +58,7 @@ pub struct Exit {
 
 /// Server-facing session handle; no public raw/control stdin bypass exists.
 pub struct Runtime {
-    transport: Arc<Mutex<Transport>>,
+    transport: InputHandle,
     stop: StopRequest,
     control: StopHandle,
     events: mpsc::Receiver<Received>,
@@ -64,13 +66,7 @@ pub struct Runtime {
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
-        self.transport
-            .try_lock()
-            .map_err(|error| match error {
-                TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
-                TryLockError::Poisoned(_) => io::Error::other("transport mutex poisoned"),
-            })?
-            .try_submit(user)
+        self.transport.try_submit(user)
     }
     /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
@@ -93,8 +89,10 @@ impl Drop for Runtime {
 /// owned shutdown. Default run-as admission belongs to LaunchProfile preparation.
 /// Recheck the exact absolute executable with a timed version reader before spawn.
 /// Path replacement between check and exec remains possible; only fexecve closes
-/// that residual TOCTOU. Forward its returned exit through the caller's event
-/// channel. This API does not expose agent.start or supply a lease.
+/// that residual TOCTOU. Registry parent verification also has a residual path
+/// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
+/// through the caller's event channel. This API does not expose agent.start or
+/// supply a lease.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
@@ -135,37 +133,38 @@ pub fn run(
     let files = profile.into_session_files();
     let pid = child.id();
     let registry = config.clone();
-    let transport = platform::structured::child_pipes(&mut child).and_then(|(stdout, stdin)| {
-        Transport::start_guarded(stdout, stdin, location, version, move || {
-            match registry_has_messaging_socket(&registry, pid) {
-                Ok(false) => Ok(()),
-                Ok(true) => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "structured_messaging_socket_forbidden",
-                )),
-                Err(error) => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("structured_registry_refused: {error}"),
-                )),
-            }
-        })
+    let (stdout, stdin) = match platform::structured::child_pipes(&mut child) {
+        Ok(pipes) => pipes,
+        Err(error) => return Err(startup_failed(child, files, config, error, true)),
+    };
+    let transport = Transport::start_guarded(stdout, stdin, location, version, move || {
+        match registry_has_messaging_socket(&registry, pid) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "structured_messaging_socket_forbidden",
+            )),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("structured_registry_refused: {error}"),
+            )),
+        }
     });
     let transport = match transport {
         Ok(transport) => transport,
-        Err(error) => return Err(startup_failed(child, files, config, error)),
+        Err(error) => return Err(startup_failed(child, files, config, error, false)),
     };
     let control = transport.stop_handle();
-    let transport = Arc::new(Mutex::new(transport));
+    let input = transport.input_handle();
     let stop = StopRequest::default();
     let (events_tx, events) = mpsc::sync_channel(4);
     let (io_tx, io_rx) = mpsc::sync_channel(1);
-    let (pump_transport, pump_stop, pump_control) =
-        (transport.clone(), stop.clone(), control.clone());
+    let (pump_stop, pump_control) = (stop.clone(), control.clone());
     if let Err(error) = std::thread::Builder::new()
         .name("session-events".into())
         .spawn(move || {
             let facts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                collect(&pump_transport, &pump_stop, &pump_control, events_tx)
+                collect(&transport, &pump_stop, &pump_control, events_tx)
             }))
             .unwrap_or_else(|_| {
                 pump_stop.request();
@@ -179,11 +178,11 @@ pub fn run(
         })
     {
         control.cancel();
-        return Err(startup_failed(child, files, config, error));
+        return Err(startup_failed(child, files, config, error, false));
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
-            transport,
+            transport: input,
             stop: stop.clone(),
             control: control.clone(),
             events,
@@ -207,12 +206,12 @@ pub fn run(
                 Ok(received) => facts = received,
                 Err(error) => {
                     control.cancel();
-                    if let Ok(received) = io_rx.recv_timeout(CANCEL_LIMIT) {
-                        facts = received;
-                    }
-                    return Err(io::Error::other(format!(
-                        "session I/O completion failed: {error}"
-                    )));
+                    facts = io_rx.recv_timeout(CANCEL_LIMIT).map_err(|cancel_error| {
+                        io::Error::other(format!(
+                            "session I/O completion failed: {error}; cancellation: {cancel_error}"
+                        ))
+                    })?;
+                    facts.delivery_cancelled = true;
                 }
             }
             if publication_failed {
@@ -253,22 +252,29 @@ fn startup_failed(
     files: SessionConfigDir,
     config: std::path::PathBuf,
     error: io::Error,
+    io_confirmed: bool,
 ) -> LaunchError {
     let stop = StopRequest::default();
     stop.request();
-    // A partially spawned transport has no returned completion receiver. Retain
-    // its files even after process termination rather than claim I/O confirmation.
+    // Missing child pipes precede all I/O workers. A partially started transport
+    // has no completion receiver, so its uncertain ownership retains files.
     let report = supervision::supervise(
         child,
         files,
         config,
         stop,
         || {},
-        || Err(io::Error::other("startup I/O ownership unconfirmed")),
+        || {
+            if io_confirmed {
+                Ok(())
+            } else {
+                Err(io::Error::other("startup I/O ownership unconfirmed"))
+            }
+        },
         supervision::Schedule::default(),
     );
     LaunchError::Io(io::Error::other(format!(
-        "{error}; resources retained: {:?}",
+        "{error}; cleanup: {:?}",
         report.cleanup
     )))
 }
@@ -282,7 +288,7 @@ struct Facts {
 }
 
 fn collect(
-    transport: &Mutex<Transport>,
+    transport: &Transport,
     stop: &StopRequest,
     control: &StopHandle,
     output: mpsc::SyncSender<Received>,
@@ -291,15 +297,6 @@ fn collect(
     let mut done = [false; 2];
     let mut pending = None;
     loop {
-        let transport = match transport.lock() {
-            Ok(transport) => transport,
-            Err(_) => {
-                stop.request();
-                control.cancel();
-                facts.error = Some(io::Error::other("transport mutex poisoned"));
-                return facts;
-            }
-        };
         loop {
             let completion = match transport.try_completion() {
                 Ok(completion) => completion,
@@ -343,14 +340,26 @@ fn collect(
         if pending.is_none() {
             match transport.try_receive() {
                 Ok(received) => {
-                    if serde_json::from_str::<Value>(&received.record.raw).is_ok_and(|value| {
-                        value["type"] == "system"
-                            && value["subtype"] == "init"
-                            && value
-                                .as_object()
-                                .is_some_and(|object| object.contains_key("messaging_socket_path"))
-                    }) {
-                        facts.refusal = Some("structured_messaging_socket_forbidden".into());
+                    // A lossy record can conceal init metadata anywhere in the
+                    // discarded bytes. Refuse all trusted loss summaries.
+                    let uninspectable = received.record.origin == RecordOrigin::Flk;
+                    if uninspectable
+                        || serde_json::from_str::<Value>(&received.record.raw).is_ok_and(|value| {
+                            value["type"] == "system"
+                                && value["subtype"] == "init"
+                                && value.as_object().is_some_and(|object| {
+                                    object.contains_key("messaging_socket_path")
+                                })
+                        })
+                    {
+                        facts.refusal = Some(
+                            if uninspectable {
+                                "structured_uninspectable_output"
+                            } else {
+                                "structured_messaging_socket_forbidden"
+                            }
+                            .into(),
+                        );
                         stop.request();
                         control.cancel();
                         facts.delivery_cancelled = true;
@@ -363,7 +372,6 @@ fn collect(
                 Err(_) => (),
             }
         }
-        drop(transport);
         if let Some(received) = pending.take() {
             match output.try_send(received) {
                 Ok(()) => (),

@@ -86,9 +86,15 @@ pub enum Completion {
 /// pending. Any parsed top-level result reopens the private idle gate, including
 /// unmodelled subtypes. The supervisor owns socket refusal and process cleanup (#1462).
 pub struct Transport {
-    input: Option<mpsc::SyncSender<Vec<u8>>>,
+    input: InputHandle,
     output: mpsc::Receiver<Received>,
     completion: mpsc::Receiver<Completion>,
+}
+
+/// Submission authority separated from worker-owned event receivers.
+#[derive(Clone)]
+pub(super) struct InputHandle {
+    input: Option<mpsc::SyncSender<Vec<u8>>>,
     busy: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     close: Arc<AtomicBool>,
@@ -189,23 +195,78 @@ impl Transport {
             return Err(err);
         }
         Ok(Self {
-            input: Some(input),
+            input: InputHandle {
+                input: Some(input),
+                busy,
+                cancel,
+                close,
+            },
             output,
             completion,
-            busy,
-            cancel,
-            close,
         })
     }
 
     /// Share shutdown flags without sharing receivers or blocking on a mutex.
     pub(super) fn stop_handle(&self) -> StopHandle {
         StopHandle {
-            cancel: self.cancel.clone(),
-            close: self.close.clone(),
+            cancel: self.input.cancel.clone(),
+            close: self.input.close.clone(),
         }
     }
 
+    /// Clone submission authority without sharing or locking event receivers.
+    pub(super) fn input_handle(&self) -> InputHandle {
+        self.input.clone()
+    }
+
+    /// Whether an accepted input lacks any top-level result, including Unknown.
+    pub(super) fn input_inflight(&self) -> bool {
+        self.input.input_inflight()
+    }
+
+    /// Offer a bounded user envelope at idle; WouldBlock means input is in flight.
+    pub fn try_submit(&self, user: &Value) -> io::Result<()> {
+        self.input.try_submit(user)
+    }
+
+    /// Poll the bounded event queue without waiting. Empty is not EOF.
+    pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
+        self.output.try_recv()
+    }
+
+    /// Poll worker termination/failure without waiting; observe both workers.
+    pub fn try_completion(&self) -> Result<Completion, mpsc::TryRecvError> {
+        self.completion.try_recv()
+    }
+
+    /// Request stdin closure, discarding any unfinished input. Never waits for a
+    /// full pipe; the writer closes its descriptor within one polling interval.
+    /// An in-flight write may leave a partial JSON line before EOF. This is
+    /// acceptable only at stop: no further turn is delivered, and supervision
+    /// records stop intent before closure and never treats truncation as success.
+    pub fn close_stdin(&mut self) {
+        self.input.close.store(true, Ordering::Release);
+        self.input.input.take();
+    }
+
+    /// Cancel both workers, including a reader blocked on consumer back-pressure.
+    /// Cancellation is explicit Interrupted completion, not a silent EOF.
+    /// Like close_stdin, cancellation can leave a partial JSON line on stdin
+    /// before EOF. Record stop intent first; truncation is never turn success.
+    pub fn cancel(&self) {
+        self.input.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Drop requests cancellation without joining. An in-flight stdin write may be
+/// left as a partial JSON line before EOF, just as with close_stdin/cancel.
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl InputHandle {
     /// Whether an accepted input lacks any top-level result, including Unknown.
     pub(super) fn input_inflight(&self) -> bool {
         self.busy.load(Ordering::Acquire)
@@ -214,7 +275,7 @@ impl Transport {
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Only this method can reach the private stdin sender; no control bypass.
-    pub fn try_submit(&self, user: &Value) -> io::Result<()> {
+    pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -247,42 +308,6 @@ impl Transport {
             return Err(io::Error::other(err.to_string()));
         }
         Ok(())
-    }
-
-    /// Poll the bounded event queue without waiting. Empty is not EOF.
-    pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
-        self.output.try_recv()
-    }
-
-    /// Poll worker termination/failure without waiting; observe both workers.
-    pub fn try_completion(&self) -> Result<Completion, mpsc::TryRecvError> {
-        self.completion.try_recv()
-    }
-
-    /// Request stdin closure, discarding any unfinished input. Never waits for a
-    /// full pipe; the writer closes its descriptor within one polling interval.
-    /// An in-flight write may leave a partial JSON line before EOF. This is
-    /// acceptable only at stop: no further turn is delivered, and supervision
-    /// records stop intent before closure and never treats truncation as success.
-    pub fn close_stdin(&mut self) {
-        self.close.store(true, Ordering::Release);
-        self.input.take();
-    }
-
-    /// Cancel both workers, including a reader blocked on consumer back-pressure.
-    /// Cancellation is explicit Interrupted completion, not a silent EOF.
-    /// Like close_stdin, cancellation can leave a partial JSON line on stdin
-    /// before EOF. Record stop intent first; truncation is never turn success.
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
-    }
-}
-
-/// Drop requests cancellation without joining. An in-flight stdin write may be
-/// left as a partial JSON line before EOF, just as with close_stdin/cancel.
-impl Drop for Transport {
-    fn drop(&mut self) {
-        self.cancel();
     }
 }
 
