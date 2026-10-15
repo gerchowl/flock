@@ -110,7 +110,7 @@ impl Stages {
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "composer stage stayed silent",
+                    "fixture stage stayed silent",
                 ));
             }
             let mut polls: Vec<_> = descriptors
