@@ -174,6 +174,24 @@ class SccacheStartupProbe(unittest.TestCase):
 
 
 class SccacheProbe(unittest.TestCase):
+    def test_pinned_version(self):
+        wrapper = require_wrapper()
+        with tempfile.TemporaryDirectory(prefix='sc-version-', dir='/tmp') as directory:
+            root = Path(directory)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('SCCACHE_', 'FLOCK_'))}
+            env.update(HOME=directory, TMPDIR=directory,
+                       XDG_CONFIG_HOME=str(root / 'config'),
+                       SCCACHE_DIR=str(root / 'cache'),
+                       SCCACHE_SERVER_UDS=str(root / 'server.sock'))
+            assert_private_endpoint(env, root, None)
+            for binary in (wrapper, os.environ['FLOCK_TEST_SCCACHE_RAW']):
+                with self.subTest(binary=binary):
+                    result = subprocess.run([binary, '--version'], env=env, text=True,
+                                            capture_output=True, timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), 'sccache 0.18.0')
+
     def probe(self, private_port):
         wrapper = require_wrapper()
         # Short roots also keep the default Unix socket below macOS sun_path limits.
