@@ -2260,3 +2260,122 @@ async fn agent_records_carry_the_state_object_from_the_detector() {
         list["result"]["agents"][0]["state"]
     );
 }
+
+fn assert_released_paste(
+    app: &App,
+    completion: &crate::pty::write_receipt::WriteCompletion,
+    written: usize,
+    untouched_reason: &str,
+) {
+    let evidence = app.delivery_attempts().pop().expect("recorded attempt");
+    let (state, reason) = match written {
+        0 => ("abandoned", untouched_reason),
+        5 => ("unconfirmed", "paste_written"),
+        _ => ("unconfirmed", "paste_write_incomplete"),
+    };
+    assert_eq!(evidence.state, state);
+    assert_eq!(evidence.reason.as_deref(), Some(reason));
+    assert!(evidence.finished_at_ms.is_some());
+    if written == 0 {
+        assert!(completion
+            .write(5, || panic!("released paste reached resumed writer"))
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn stalled_idle_wake_inbox_read_cancels_paste_and_records_effect() {
+    for written in [0, 2, 5] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "stalled-read", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        let attempt = app
+            .idle_wake
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .in_flight
+            .as_mut()
+            .unwrap()
+            .attempt
+            .as_mut()
+            .unwrap();
+        let completion = super::super::guarded_submit::tests::stalled_paste(attempt, written);
+        read_inbox(&mut app, &pane);
+        assert_released_paste(&app, &completion, written, "inbox_read");
+        assert!(!app.idle_wake.panes.contains_key(&pane));
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stalled_idle_wake_leaving_idle_cancels_paste_and_records_effect() {
+    for written in [0, 2, 5] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        send(&mut app, &pane, "stalled-busy", MsgIntent::NeedsReply);
+        drain(&mut pty);
+        let flight = app
+            .idle_wake
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .in_flight
+            .as_mut()
+            .unwrap();
+        let completion = super::super::guarded_submit::tests::stalled_paste(
+            flight.attempt.as_mut().unwrap(),
+            written,
+        );
+        // Exercise the release of an in-flight marker without a pending timer.
+        flight.submit_at = None;
+        terminal(&mut app).state = AgentState::Working;
+        app.tick_idle_wakes(Instant::now());
+        assert_released_paste(&app, &completion, written, "turn_started_before_enter");
+        assert!(app.idle_wake.panes[&pane].in_flight.is_none());
+        assert!(drain(&mut pty).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stalled_guarded_submit_operator_interrupt_records_written_effect_without_poll_race() {
+    use super::super::guarded_submit::Outcome;
+    for (written, polled) in [(0, false), (2, false), (5, false), (5, true)] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = rig();
+        claude_idle_for(&mut app, settled());
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        let completion = super::super::guarded_submit::tests::stalled_paste(&mut attempt, written);
+        if polled {
+            assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, now), None);
+        }
+        runtime(&app).test_stamp_operator_input_at(Instant::now());
+        let expected = match written {
+            0 => Outcome::Abandoned("operator_active"),
+            5 => Outcome::Unconfirmed("paste_written"),
+            _ => Outcome::Unconfirmed("paste_write_incomplete"),
+        };
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            Some(expected)
+        );
+        assert_released_paste(&app, &completion, written, "operator_active");
+        assert!(drain(&mut pty).is_empty());
+    }
+}
