@@ -20,6 +20,45 @@ pub(super) enum ResolvedTarget {
 
 use super::responses::{encode_error, encode_error_with_data, encode_success};
 
+/// A resolution refusal retaining typed candidates until the response is encoded.
+/// Metadata is additive: legacy error readers ignore `data` (ADR-0029 §§5, 7).
+pub(super) struct MessageTargetError {
+    /// Stable refusal registered in the shared error-code table.
+    pub code: crate::api::error_code::ErrorCode,
+    /// Human-readable diagnosis, independent of the candidate representation.
+    pub message: String,
+    candidates: Vec<crate::app::terminal_targets::TerminalTargetCandidate>,
+}
+
+impl MessageTargetError {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: crate::api::error_code::ErrorCode::MsgTargetNotFound,
+            message: message.into(),
+            candidates: Vec::new(),
+        }
+    }
+
+    /// Encode consistent target metadata, adding a shape hint only when useful.
+    fn encode(self, id: String, include_shape_hint: bool) -> String {
+        let code = self.code.as_str();
+        let mut data = serde_json::json!({"kind":code,"expected":MessageTarget::expected_shapes()});
+        if self.code == crate::api::error_code::ErrorCode::MsgTargetAmbiguous {
+            data["candidates"] = serde_json::json!(self.candidates);
+        }
+        let message = if include_shape_hint {
+            format!(
+                "{}; expected {}",
+                self.message,
+                crate::api::schema::MESSAGE_TARGET_EXPECTED
+            )
+        } else {
+            self.message
+        };
+        encode_error_with_data(id, code, message, data)
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -189,16 +228,15 @@ impl App {
         }
         let resolved = match self.resolve_message_target(&params.to) {
             Ok(resolved) => resolved,
-            Err((code, message)) => {
-                return encode_error_with_data(
-                    id,
-                    code,
-                    format!(
-                        "{message}; expected {}",
-                        crate::api::schema::MESSAGE_TARGET_EXPECTED
-                    ),
-                    serde_json::json!({"kind":code,"expected":MessageTarget::expected_shapes()}),
-                );
+            Err(error) => {
+                let include_shape_hint = match &params.to {
+                    MessageTarget::Pane { pane: target }
+                    | MessageTarget::Agent { agent: target } => {
+                        !crate::terminal::AgentId::is_well_formed(target)
+                    }
+                    MessageTarget::RepoPane { .. } => true,
+                };
+                return error.encode(id, include_shape_hint);
             }
         };
         let (to_ws_idx, to_pane_id) = match resolved {
@@ -753,14 +791,10 @@ impl App {
                 .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
         };
         resolved.ok_or_else(|| {
-            encode_error(
-                id.to_string(),
-                "msg_target_not_found",
-                format!(
-                    "no pane to {verb}: pass `pane`, or call from inside the pane whose inbox \
-                     you want"
-                ),
-            )
+            MessageTargetError::not_found(format!(
+                "no pane to {verb}: pass `pane`, or call from inside the pane whose inbox you want"
+            ))
+            .encode(id.to_string(), false)
         })
     }
 
@@ -1088,7 +1122,7 @@ impl App {
         let host = location.host.as_str();
         let to_agent = location.agent_id.as_str();
         let Some(owner) = location.node.as_deref() else {
-            return encode_error(id, "msg_target_not_found", "recipient owner is unknown");
+            return MessageTargetError::not_found("recipient owner is unknown").encode(id, false);
         };
         let next = self.request_next_hop(owner);
         if let Some(upgrade) = self.incompatible_request_peer(owner, &next.node) {
@@ -1461,32 +1495,45 @@ impl App {
             .or_else(|| ws.git_space().map(|space| space.label.clone()))
     }
 
+    /// Preserve shared-resolver candidates while translating to message refusal codes.
+    fn message_target_error(
+        &self,
+        error: crate::app::terminal_targets::TerminalTargetError,
+    ) -> MessageTargetError {
+        use crate::app::terminal_targets::TerminalTargetError;
+        let candidates = match &error {
+            TerminalTargetError::Ambiguous { candidates, .. } => candidates.clone(),
+            TerminalTargetError::NotFound { .. } => Vec::new(),
+        };
+        let ambiguous = matches!(error, TerminalTargetError::Ambiguous { .. });
+        MessageTargetError {
+            code: if ambiguous {
+                crate::api::error_code::ErrorCode::MsgTargetAmbiguous
+            } else {
+                crate::api::error_code::ErrorCode::MsgTargetNotFound
+            },
+            message: self.agent_target_error_body(error).message,
+            candidates,
+        }
+    }
+
     pub(super) fn resolve_message_target(
         &mut self,
         target: &MessageTarget,
-    ) -> Result<ResolvedTarget, (&'static str, String)> {
+    ) -> Result<ResolvedTarget, MessageTargetError> {
         match target {
             MessageTarget::Pane { pane } => match self.resolve_terminal_target(pane) {
                 Ok(resolved) => Ok(ResolvedTarget::Local(resolved.ws_idx, resolved.pane_id)),
-                Err(err) => {
-                    let body = self.agent_target_error_body(err);
-                    let code = if body.code == "agent_target_ambiguous" {
-                        "msg_target_ambiguous"
-                    } else {
-                        "msg_target_not_found"
-                    };
-                    Err((code, body.message))
-                }
+                Err(err) => Err(self.message_target_error(err)),
             },
             // ADR-0008: address by identity. Resolution goes through the ONE
             // fleet directory, so messaging, targeting and lineage cannot
             // drift into separate answers for "where is this agent".
             MessageTarget::Agent { agent } => {
                 let Some(location) = self.locate_agent(agent) else {
-                    return Err((
-                        "msg_target_not_found",
-                        format!("no agent with id {agent} anywhere in the fleet"),
-                    ));
+                    return Err(MessageTargetError::not_found(format!(
+                        "no agent with id {agent} anywhere in the fleet"
+                    )));
                 };
                 if !location.local {
                     // Not ours to deliver. Handing back the whole location
@@ -1496,10 +1543,7 @@ impl App {
                 }
                 match self.resolve_terminal_target(&location.pane_id) {
                     Ok(resolved) => Ok(ResolvedTarget::Local(resolved.ws_idx, resolved.pane_id)),
-                    Err(err) => {
-                        let body = self.agent_target_error_body(err);
-                        Err(("msg_target_not_found", body.message))
-                    }
+                    Err(err) => Err(self.message_target_error(err)),
                 }
             }
             MessageTarget::RepoPane { repo, pane } => {
@@ -1533,15 +1577,18 @@ impl App {
                     }
                 }
                 match matches.len() {
-                    0 => Err((
-                        "msg_target_not_found",
-                        format!("no pane {pane} in a workspace of repo {repo}"),
-                    )),
+                    0 => Err(MessageTargetError::not_found(format!(
+                        "no pane {pane} in a workspace of repo {repo}"
+                    ))),
                     1 => Ok(ResolvedTarget::Local(matches[0].0, matches[0].1)),
-                    _ => Err((
-                        "msg_target_ambiguous",
-                        format!("pane {pane} is ambiguous within repo {repo}"),
-                    )),
+                    _ => Err(MessageTargetError {
+                        code: crate::api::error_code::ErrorCode::MsgTargetAmbiguous,
+                        message: format!("pane {pane} is ambiguous within repo {repo}"),
+                        candidates: matches
+                            .into_iter()
+                            .filter_map(|(ws, pane)| self.terminal_target_candidate(ws, pane))
+                            .collect(),
+                    }),
                 }
             }
         }
@@ -1886,6 +1933,68 @@ mod tests {
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "msg_target_not_found");
+    }
+
+    #[tokio::test]
+    async fn message_target_misses_have_consistent_server_data() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        for target in [
+            MessageTarget::Pane {
+                pane: "missing-recipient".into(),
+            },
+            MessageTarget::RepoPane {
+                repo: "fixture-repo".into(),
+                pane: "p1".into(),
+            },
+            MessageTarget::Agent {
+                agent: "agent_nodea_123abc".into(),
+            },
+        ] {
+            let agent = matches!(target, MessageTarget::Agent { .. });
+            let raw: serde_json::Value = serde_json::from_str(&send(
+                &mut app,
+                MsgSendParams {
+                    to: target,
+                    body: "hi".into(),
+                    intent: MsgIntent::Fyi,
+                    correlation_id: None,
+                    in_reply_to: None,
+                    from_agent: None,
+                },
+            ))
+            .unwrap();
+            assert_eq!(raw["error"]["data"]["kind"], "msg_target_not_found");
+            assert_eq!(
+                raw["error"]["data"]["expected"],
+                MessageTarget::expected_shapes()
+            );
+            if agent {
+                assert!(
+                    !raw["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("; expected"),
+                    "{raw}"
+                );
+            }
+            let legacy: ErrorResponse = serde_json::from_value(raw).unwrap();
+            assert_eq!(legacy.error.code, "msg_target_not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_inbox_has_message_target_metadata() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let raw: serde_json::Value =
+            serde_json::from_str(&app.handle_msg_read("req".into(), MsgReadParams { pane: None }))
+                .unwrap();
+        assert_eq!(raw["error"]["code"], "msg_target_not_found");
+        assert_eq!(raw["error"]["data"]["kind"], "msg_target_not_found");
+        assert_eq!(
+            raw["error"]["data"]["expected"],
+            MessageTarget::expected_shapes()
+        );
     }
 
     #[tokio::test]
@@ -2301,6 +2410,12 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         // A display label without an authenticated owning node is unknown.
         assert_eq!(error.error.code, "msg_target_not_found");
+        let raw: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(raw["error"]["data"]["kind"], "msg_target_not_found");
+        assert_eq!(
+            raw["error"]["data"]["expected"],
+            MessageTarget::expected_shapes()
+        );
     }
 
     #[tokio::test]

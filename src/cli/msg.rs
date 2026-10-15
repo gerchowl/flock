@@ -790,6 +790,25 @@ mod tests {
     }
 
     #[test]
+    fn repo_shorthand_requires_a_known_repo_and_preserves_the_pane_suffix() {
+        use crate::api::schema::MessageTarget;
+        let repos = vec!["fixture-repo".into()];
+        assert_eq!(
+            super::shorthand_with_repos("fixture-repo:w3:p2".into(), &repos),
+            MessageTarget::RepoPane {
+                repo: "fixture-repo".into(),
+                pane: "w3:p2".into()
+            }
+        );
+        assert_eq!(
+            super::shorthand_with_repos("other-repo:w3:p2".into(), &repos),
+            MessageTarget::Pane {
+                pane: "other-repo:w3:p2".into()
+            }
+        );
+    }
+
+    #[test]
     fn an_unknown_flag_is_refused_rather_than_sent_as_body_text() {
         // #380. The relay is `flk msg send` run over ssh on the peer that owns
         // the recipient, and a fleet is routinely version-skewed — so before
