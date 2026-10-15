@@ -11,6 +11,10 @@ Partially shadowed overrides with a reachable OR arm are deliberately not flagge
 Platform-only overrides without a filter are reported as unproved; their ceilings are still checked.
 Regexes, negation, other predicates and unequal platform scopes remain unproved, not rejected.
 
+Repository policy is stricter than ADR-0037 §2: `profile.ci.slow-timeout` must be absent,
+even when an explicit CI ceiling meets the measured sizing rule. CI inherits the checked default.
+Remove that key and put needed exceptions in scoped `[[profile.default.overrides]]`.
+
 Latest 20 completed dev CI runs at collection time, including cancelled runs.
 Recorded executions: 240,138; binaries: 52.
 Partial runs contribute only recorded executions, never zeroes for missing tests.
