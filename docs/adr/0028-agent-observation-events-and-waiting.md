@@ -12,7 +12,8 @@
   wake, channel push), ADR-0026 (mesh custody), #850 (injection lock).
 - Decision owner: operator.
 - Amendment (2026-10-15, #1479): §1a records accepted Codex lifecycle authority;
-  its source/freshness contract is proposed for review before implementation.
+  its source/continuity contract is proposed for review before implementation;
+  format/version policy awaits an owner decision (§1a).
 - Implemented: none. Slices (§10) filed 2026-10-11: E1a #1019, E7 #1020, E1b #1022, E1c #1023, E2 #697, E3 #1027, E4a #1028, E4b #1029, E4c #1030, E5 #1031, E6 #1032, E8 #1037, E9a #1038, E9b #1039, E9c #1040. Order: ADR-0030 §8 and #1001.
 
 ## Context
@@ -228,7 +229,7 @@ Rules:
 ### 1a. Codex lifecycle turn authority (#1479, 2026-10-15)
 
 The operator chose **lifecycle event > hook state > screen** for Codex's
-**turn** axis on 2026-10-15. The source and freshness contract below is the
+**turn** axis on 2026-10-15. The source and continuity contract below is the
 proposed amendment implementing that decision, submitted for review before
 code. It amends §1's source table, not the Claude harness or its Stop hook.
 PR #1491 remains independent hollow-glyph hardening; neither that PR nor this
@@ -253,7 +254,7 @@ isolated probes. All upstream references here pin `rust-v0.160.1`.
 
 | Candidate | Baseline behavior | Decision |
 | --- | --- | --- |
-| Hooks | Codex supports SessionStart, UserPromptSubmit, Stop and Interrupt. Flock currently installs SessionStart for identity. Prompt-submit handlers can reject input; Stop handlers can block completion. Invocation alone is not a committed turn boundary. | Keep SessionStart for binding; do not equate these request hooks with completed lifecycle transitions. |
+| Hooks | All 12 are supported: PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop, Stop and Interrupt. Tool, permission, compaction, session and subagent hooks are not parent-turn boundaries. UserPromptSubmit can reject input and Stop can block completion; Interrupt is not a committed paired end. | Keep SessionStart for binding. None supplies a committed parent-turn start/end pair. |
 | Legacy `notify` | `agent-turn-complete` carries thread/turn IDs, but has no paired start notification; dispatch spawns a process without waiting for delivery. | Do not replace the user's notification program or use an unpaired notification as authority. |
 | Rollout JSONL | Turn start, complete and abort are persisted in both legacy and paginated history. Records are newline-delimited and flushed. | Selected: local, attributable and replayable evidence of actual boundaries. |
 
@@ -274,7 +275,10 @@ See the pinned [names and aliases](https://github.com/openai/codex/blob/rust-v0.
 [start/complete payloads](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L2152-L2198),
 and [abort payload](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L4256-L4277).
 Tool output, commentary, usage, compaction and subagent completion never start
-or end the parent's turn. Unknown record/event kinds are skipped without
+or end the parent's turn. In particular, ExecCommandBegin and McpToolCallBegin
+are transient and are not persisted: a long tool call can legitimately produce
+no rollout records. See the pinned [transient-event policy](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/policy.rs#L140-L178).
+Unknown record/event kinds are skipped without
 changing state. Partial final lines wait for a newline; malformed complete
 records, gaps and conflicting turn IDs invalidate authority. Duplicate records
 are idempotent, and a late completion for an older turn cannot end a newer one.
@@ -282,27 +286,42 @@ are idempotent, and a late completion for an older turn cannot end a newer one.
 #### Session attribution, resume and cross-host moves
 
 Bind the reader to `(node identity, pane/terminal ID, launch generation,
-Codex thread ID)`. Use the SessionStart identity report from that pane's current
-launch, its resolved Codex home, and a verified local writer identity (PID plus
+binding generation, Codex thread ID)`. Use the SessionStart report from that
+pane, its resolved Codex home and a verified local writer identity (PID plus
 process start identity). Names, labels, cwd and nearest timestamps are not keys.
 The reader and process/file checks live in runtime; the reducer is pure data.
 
-Validate the rollout's **first** `session_meta.id` against the pane's bound
-thread ID. Do not substitute root `session_id`, parent/fork IDs or a filename:
-physical rollout IDs can differ from stable thread IDs after revert, and root
-sessions can contain multiple threads. See the pinned [metadata definitions](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L3105-L3155)
-and [first-metadata reader rule](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L1116-L1145).
-Resolve an exact local active file using validated metadata/index information.
-Multiple files or writers without a provable active one mean unknown. Never
-follow a remote-reported path or search an unrelated operator profile.
+**Every SessionStart rebinds**, even within one OS launch and even when the
+reported thread ID has not changed. Increment the binding generation and revoke
+old callbacks for `startup`, `resume`, `clear`, `compact` and `fork`. This includes
+`/new` and `/clear`; a launch-generation check alone is insufficient. The pinned
+[source enum](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/hooks/src/events/session_start.rs#L24-L39)
+and [command payload](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/hooks/src/events/session_start.rs#L130-L141)
+provide the source and `transcript_path`.
+
+Use **SessionStart's `transcript_path` as the primary file key**. Resolve and
+validate it as a local file in this launch's Codex home, then validate the first
+`session_meta.id` against the bound thread ID. Do not substitute root
+`session_id`, parent/fork IDs or a filename suffix: physical rollout IDs can
+differ after revert and a root session can contain several threads. See the
+pinned [metadata definitions](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/protocol/src/protocol.rs#L3105-L3155)
+and [first-metadata rule](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L1116-L1145).
+An index may assist validation, not choose a different file over the hook's
+path. A missing path needs an explicit unavailable-source explanation or leaves
+an expected local source initializing; never guess a file by name/cwd or search
+an unrelated profile. Do not follow remote-reported paths. Ambiguous writers
+or mismatched metadata yield unknown.
 
 For a known resume, capture file identity and the last complete-record offset
-before launch. Buffer eligible new records until the live writer and SessionStart
-binding are confirmed. A new thread uses its fresh file/metadata and launch
-binding. History validates continuity but cannot publish an old completion as
-this launch's idle. Attaching to an already running launch without a trustworthy
-boundary starts unknown until new attributable lifecycle evidence arrives.
-Reject callbacks from revoked generations even when the session ID repeats.
+before launch. Buffer eligible new records until the writer and SessionStart
+binding are confirmed. A new thread uses its new file/metadata and binding.
+Rebinding invalidates the old decision until resynchronization. A reducer state
+may transfer only with proven continuity of the same local writer, thread,
+file and cursor; equal thread IDs alone do not suffice. Imported history cannot
+publish an old completion as a new launch's idle. An attachment without a
+trustworthy current boundary starts unknown until attributable evidence arrives.
+Delayed records from a revoked binding are discarded, including within one
+launch after `/new` or `/clear`.
 
 A move (#1500) revokes the source pane's binding before the destination claims a
 new launch generation. Rebind to the destination's **local** writer and Codex
@@ -314,46 +333,113 @@ until resolved, never last-callback-wins. These are the adapter's requirements
 on #1500's move transaction; name lookup, move UI and narrow resumed panes
 remain outside this amendment. A rollout copy alone grants no authority.
 
-#### Precedence, fallback and staleness
+#### Owner decision required: format dependency and version policy
 
-| Lifecycle source for this binding | Turn decision |
+**Pending owner decision.** Rollout JSONL is an internal storage format, not a
+promised stable integration API. Selecting it requires an explicit compatibility
+policy; the lifecycle-authority decision alone does not settle that policy.
+
+The **recommended current proposal** is:
+
+- Record `session_meta.cli_version` for every binding. Initially the tested
+  range contains only **0.160.1**; widen it only with explicit compatibility
+  evidence and review, never an assumed semver-compatible range. Resume preserves
+  creation metadata, so also verify the version of the actual writer executable
+  resolved for the launch; old metadata alone cannot authorize a newer writer.
+  Both must be covered by the tested compatibility declaration. See the pinned
+  [new versus resumed recorder setup](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L935-L994).
+- A version in that range uses the lifecycle adapter. Any other or missing
+  version marks this source unavailable with `unsupported_codex_version` and
+  selects screen fallback, with the reason exposed. A version mismatch itself
+  never means idle: before fresh classifiable screen evidence, state is unknown;
+  a visible Working screen means working. Any later idle must come from actual
+  fallback evidence, not an unsupported-version default or copied completion.
+- CI pins the tested Codex version and versioned fixtures and fails loudly when
+  that pin changes without updating the declared range and compatibility tests.
+  This is a requirement for the later implementation PR, not a CI change here.
+
+An alternative is Codex's supported, versioned **app-server** interface, whose
+v2 notifications include `turn/started` and `turn/completed`; see the pinned
+[versioned protocol modules](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server-protocol/src/protocol/mod.rs#L10-L13)
+and [notifications](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/app-server-protocol/src/protocol/common.rs#L1943-L1947).
+It is not selected by this proposal because flk currently runs the Codex TUI in
+a pane; owning or attaching an app-server connection for that same thread needs
+a separate transport/ownership design. It cannot be replaced by launching a
+second independent session and observing its events. The owner must choose the
+bounded rollout compatibility policy or that interface change before code.
+
+**Persistence-disabled configurations:** `codex exec --ephemeral` runs without
+session files; effective `Config.ephemeral` bypasses thread persistence. The
+baseline also permits a test/debug in-memory thread-store configuration. These are known
+unavailable local sources, with `codex_rollout_disabled`, and use explicit
+fallback as above. An unexplained absent file for an expected persistent source
+is source loss or initialization, not proof of ephemeral mode. `history` controls
+`history.jsonl`, not the canonical turn rollout; do not infer disabled rollouts
+from that setting. Evidence: [exec flag](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/exec/src/cli.rs#L35-L37),
+[ephemeral persistence bypass](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/session/session.rs#L1006-L1012),
+[local versus in-memory store](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/config/mod.rs#L597-L604),
+and [distinct history/ephemeral fields](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/core/src/config/mod.rs#L960-L965).
+
+#### Precedence, fallback and source continuity
+
+| Evidence for this binding | Decision |
 | --- | --- |
-| Available, synchronized, fresh start | Working until matching end or source loss; ignore hook/screen idle, DONE text and hidden Working chrome. |
-| Available, synchronized, fresh matching complete/abort | Idle despite stale Working chrome; attention/lifecycle axes still follow §1. |
-| Expected/claimed but initializing, silent, stale, unreadable, discontinuous or ambiguous | Unknown with source and reason; neither hook nor screen may mask source loss. |
-| Explicitly unavailable (adapter absent/disabled, or unsupported harness before a claim) | Existing hook state, then screen fallback; expose which source supplied the decision. |
+| Screen approval/question prompt (`needs_human`), even with lifecycle idle | Attention wins: `turn: unknown`, `attention: needs_human`, `phase: needs_human`, per §1. Preserve the underlying lifecycle boundary for when attention clears. |
+| Available, synchronized start without a matching end | Working until matching end or observed source loss; ignore hook/screen idle, DONE text and hidden Working chrome. |
+| Available, synchronized matching complete/abort, no attention | Idle despite stale Working chrome; background remains independent. |
+| Expected/claimed but initializing, lost, unreadable, discontinuous or ambiguous | Unknown with source and reason; hook/screen cannot conceal source loss. |
+| Explicitly unavailable (absent/disabled adapter, known disabled persistence, or version excluded by the proposed policy) | Hook then screen fallback for absent/disabled adapters; the proposed unsupported-version policy selects screen. Publish the reason and selected source; unclassifiable evidence stays unknown. |
 
-Availability is sticky once claimed for a binding. A missing file, read/watch
-failure, writer exit or revoked ownership is loss, not unavailability permitting
-fallback. Revalidate metadata, writer and cursor after replacement/truncation;
-a discontinuity requires resynchronization and a new attributable boundary.
-EOF never proves completion. Recovery can confirm working for a continuous
-active turn; idle requires its matching end, not elapsed time or a composer.
+**No silence lease.** The last validated lifecycle boundary holds, however old,
+until evidence invalidates the source: writer exit or PID/start-identity change,
+file replacement or truncation, revoked ownership, supervised failure/stall of
+flk's own reader, or rebind. A successful empty read is normal. An eventless long
+tool call remains working; an eventless idle session remains idle. Neither a
+missing tool-begin record nor increasing age is a state transition.
 
-The proposed initial **event-silence lease is 120 seconds**. It bounds source
-validity; it does not enlarge the redraw hold or the idle settle window.
-Use the server's monotonic clock and the latest newly appended, complete,
-valid record from the bound writer. Non-boundary records can renew freshness
-without changing turn state. Rereading bytes, mtime alone, wall-clock timestamps,
-old copied history and malformed lines cannot renew it. At expiry, turn becomes
-unknown, never idle. Observed reader/writer failure or ownership loss invalidates
-it immediately. Supervise reader progress separately so a wedged reader cannot
-retain a cached decision; successful empty reads cannot renew event freshness.
+Publish `last_evidence_age` as a fact measured with the server's monotonic clock,
+plus source health and degradation reason. Consumers must not reinterpret age as
+a lease or a second idle/unknown timeout. Reader supervision checks flk's own
+progress, including successful EOF checks, not Codex event frequency. Observed
+source loss yields unknown immediately; an idle composer cannot override it.
+After a claimed source is lost it cannot quietly become unavailable for fallback.
+Explicit version/config unavailability is diagnosed at binding, under the pending
+policy above. Rebind again to switch policy/version, rather than reinterpret an
+active binding's cached state.
 
-The pinned rollout has no heartbeat guarantee. Consequently a genuinely quiet
-turn **or an idle session** with no records for 120 seconds also becomes unknown,
-even if the process is alive. This conservative limitation is intentional and
-must be visible, not concealed by screen fallback. Fresh attributable records
-can renew an otherwise continuous state; after a gap or ownership loss require
-a new boundary. An initial binding with no current boundary is unknown, not an
-idle reconstructed from old history. Expose source health, last-evidence age and
-degradation reason with the turn source; additive wire fields follow §3a.
+Define a **gap** as loss of verified file/cursor continuity. Track file identity,
+complete-record byte offsets and verification of previously consumed bytes.
+Legacy mode [emits no ordinal](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/ordinal.rs#L25-L41);
+the serialized [field is optional](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L2061-L2067).
+Missing ordinals are normal for legacy files, not gaps. Detect replacement, shrink/truncation,
+a changed verified prefix, skipped/unreadable byte ranges and malformed complete
+records. Where ordinals exist, check their format-defined continuity too.
+Do not infer a gap from silence, transient events missing by persistence policy,
+or a non-contiguous sequence of turn IDs. Legacy files cannot prove that an
+upstream producer silently omitted a well-formed record; this format limitation
+belongs to the owner decision. Revalidation must not conceal an observed gap;
+resynchronize and require a trustworthy current boundary before publishing state.
 
-Background activity remains independent (§1). A child process or terminal count
-cannot supply turn evidence or renew freshness. A complete turn with a live
-child is idle with background running; stale evidence is unknown, not finished.
-Keep existing attention, process-exit and hibernation precedence. Do not parse
-DONE sentinels, widen holds or infer a turn boundary from changing prose.
+Background remains independent (§1). A child process or terminal count cannot
+supply missing turn evidence. Completion with a live child remains idle with
+background running. Source loss is unknown, not finished. Existing attention,
+process-exit and hibernation precedence remains; DONE text and widened redraw
+holds do not determine turn state.
+
+#### Consumers of unknown and quiet idle
+
+| Consumer | On source-loss `unknown` | On quiet, known idle with a healthy source |
+| --- | --- | --- |
+| Waiters | An idle/working/settled predicate is not satisfied. An explicit unknown predicate can match with its reason. Keep deadlines, cancellation and source/producer failure reporting bounded (ADR-0037). Mail/event predicates independent of turn still match their own data. | Idle/settled waits satisfy normally after their existing settle condition; growing evidence age does not reset the held interval. |
+| Idle wake | Do not type an idle wake. Retain the pending wake and re-evaluate when idle is known. | Wake normally once the existing idle/injection gates pass; no new rollout record is required. |
+| Self-compact | Keep the request armed; do not initiate compaction on an unknown turn. | Compaction remains eligible under its existing gates, including a fresh composer check. |
+| Guarded submit | Refuse submission with the existing not-ready outcome and source reason; send no keys. | Existing idle, draft, lease and fresh-composer gates apply. Read the current buffer; do not require newly emitted PTY bytes or a new lifecycle record. |
+| Mail delivery | Durable routing, custody, enqueue and reads remain available. Hold only automatic typed wake/submission until eligible; do not drop or claim delivery failed merely because turn is unknown. Registered mail waits wake on their own predicates. | Delivery and eligible needs-reply wake work as before; fyi still does not idle-wake (§5). |
+
+Thus a quiet idle agent does not become unknown with age: it can still receive
+mail, satisfy idle waits, wake, compact and accept guarded submissions under
+the existing gates. Source failure, attention or rebind can change eligibility;
+silence cannot. Additive source/age fields follow §3a.
 
 #### Test plan for the subsequent implementation PR
 
@@ -362,28 +448,53 @@ short explicit sockets and inherited FLOCK variables removed. Feed real-shaped
 JSONL and captured bottom-buffer text/ANSI; use a pure reducer with a supplied
 monotonic clock. No live model, sleeps, retries or production-only test hooks.
 
-1. Emit start, then replay the captured hidden-Working commentary with background
-   count and composer. Assert agent get/list, events and registered waits stay
-   working. Emit matching complete while retaining the background notice: idle
-   promptly. Show this reproduction failing before and passing after the code
-   change, including #1284's real-end reverse case.
-2. Keep a fake producer alive but silent after start. Just before/at 120 seconds,
-   assert working/unknown, never idle, despite contradictory screen/hook idle.
-   Test initial silence, silence after completion, a wedged/dead reader, missing
-   file and dead writer. Integration waits must fail with a named condition and
-   a bounded ADR-0037 ceiling if the expected producer never acts; a hang is not
-   success. Expiry tests advance a clock rather than waiting two minutes.
-3. Cover aliases, duplicates, partial lines, unknown kinds, malformed records,
-   wrong-turn completion, abort with/without ID, non-boundary output, gaps,
-   truncation/replacement and recovery. Only matching boundaries advance the
-   existing turn cursor; fresh non-boundary records renew only source validity.
-4. Exercise two same-name/cwd panes with different thread IDs, resume with copied
-   history and delayed old completion, and cross-host move with the old pane
-   hibernated. Only the destination generation consumes new local records;
-   duplicate live writers yield unknown. Fork/revert metadata cannot misattribute.
-5. Test lifecycle > hook > screen contradictions and unavailable versus lost
-   authority. Preserve Claude tests. Check old clients/peers with additive source
-   fields and unknown persisted kinds if any are introduced (§3a).
+1. Hidden-Working replay: after start, commentary/background/composer frames
+   yield working. Matching complete with background retained yields idle.
+   Preserve #1284's reverse case. Demonstrate the streaming reproduction fails
+   before and passes after implementation through agent get/list, events and waits.
+2. Long tool call with no records and a live writer yields working after hours
+   of supplied-clock advance. Silence after completion yields idle after hours.
+   Initial binding with no boundary yields unknown. Writer exit yields unknown;
+   PID reuse yields unknown; a supervised wedged/dead reader yields unknown;
+   replacement or truncation yields unknown. Bounded integration waits must name
+   a missing condition rather than hang. Test idle wake, self-compact, guarded
+   submit, mail delivery and idle waits on quiet known idle: each remains eligible
+   under its existing gates. For source-loss unknown, each follows the table above.
+3. Both start aliases yield working; both matching completion aliases yield idle.
+   Duplicate completion yields idle. A partial matching completion line after start
+   yields working; its completed newline-terminated record yields idle. Unknown
+   kinds after start yield working. Malformed complete
+   records yield unknown. Late old-turn completion while a newer turn runs leaves
+   working; conflicting unrecognized turn IDs yield unknown. Matching abort yields
+   idle; unattributable abort yields unknown. Non-boundary output leaves working.
+   A legacy file without ordinals remains working; verified prefix mutation yields
+   unknown; an ordinal discontinuity yields unknown. Valid resynchronization with
+   an attributable current start yields working. Only matching boundaries advance
+   the turn cursor; age metadata alone emits no phase transition.
+4. Same-name/cwd panes with different thread IDs remain isolated: starting only
+   pane A yields working for A and idle for an already completed B. Resume with
+   copied history starts unknown until new attributable evidence. Within one OS
+   launch, `/new` and `/clear` each revoke the old binding: a delayed old completion
+   leaves the new active turn working. For each SessionStart source, the unvalidated
+   binding yields unknown; a validated new start yields working. Same-ID
+   resume/compact with proven continuous completed state restores idle. A stale
+   callback while the rebound turn runs leaves working. After
+   a move the old pane remains hibernated; a start in the destination yields working
+   there. Duplicate live writers yield unknown. A mismatched transcript_path/meta
+   pair yields unknown. Another thread's end through fork/revert metadata leaves
+   the current active turn working.
+5. Lifecycle start against hook/screen idle yields working. Lifecycle complete
+   against stale Working chrome yields idle. A screen approval prompt against
+   lifecycle idle yields `phase: needs_human` with turn unknown; clearing that
+   prompt restores idle from the retained completion. Claimed source loss against
+   screen idle yields unknown. Unsupported version with a visible Working screen
+   yields working from screen with `unsupported_codex_version`; with unclassifiable
+   screen it yields unknown. Resume with tested creation metadata but an untested
+   writer and a Working screen yields working from screen with the same named
+   version reason. Supported 0.160.1 with a start yields working from
+   lifecycle. Ephemeral/in-memory configuration with a Working screen yields
+   working from fallback with `codex_rollout_disabled`. Preserve Claude tests;
+   validate additive source fields and unknown persisted kinds (§3a).
 
 The code PR must include captured-frame provenance, the deterministic failing
 baseline, source-loss diagnostics and these results. This docs PR implements
