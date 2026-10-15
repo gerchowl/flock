@@ -17,9 +17,14 @@ def parent_gone():
 
 allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
            "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"}
+# Darwin's Python startup adds this CoreFoundation locale marker after exec.
+# It is interpreter metadata, not an inherited launch variable or credential.
+environment = set(os.environ)
+if sys.platform == "darwin":
+    environment.discard("__CF_USER_TEXT_ENCODING")
 assert os.getpgrp() == os.getpid(), "missing process_group(0)"
 if sys.argv[1:] == ["--version"]:
-    assert set(os.environ) == allowed - {"CLAUDE_CODE_OAUTH_TOKEN"}, "version environment leak"
+    assert environment == allowed - {"CLAUDE_CODE_OAUTH_TOKEN"}, "version environment leak"
     (root / "version.pid").write_text(str(os.getpid()))
     if case.get("version") == "hang":
         parent_gone()
@@ -29,7 +34,7 @@ if sys.argv[1:] == ["--version"]:
     print(case.get("version", "2.1.296") + " (Claude Code)", flush=True)
     sys.exit(0)
 assert sys.argv[1:] == json.loads((root / "argv.json").read_text()), "argv drift"
-assert set(os.environ) == allowed, "model environment leak"
+assert environment == allowed, "model environment leak"
 assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "fixture-token-not-a-credential", "token seam"
 assert "fixture-token-not-a-credential" not in json.dumps(sys.argv), "token in argv"
 settings = pathlib.Path(sys.argv[sys.argv.index("--settings") + 1])

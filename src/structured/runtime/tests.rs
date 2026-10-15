@@ -212,11 +212,14 @@ impl Running {
         }
     }
     fn submit(&self) {
-        self.runtime
-            .try_submit(
-                &serde_json::json!({"type":"user","message":{"role":"user","content":"hello"}}),
-            )
-            .expect("user input");
+        self.offer(&serde_json::json!({"type":"user","message":{"role":"user","content":"hello"}}));
+    }
+    fn offer(&self, input: &Value) {
+        self.wait(|| match self.runtime.try_submit(input) {
+            Ok(()) => Some(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("user input: {error}"),
+        });
     }
     fn finish(&mut self) -> Exit {
         let result = self
@@ -366,4 +369,168 @@ fn init_socket_presence_refuses_even_null_and_unmodelled_wrong_type() {
         let records = fs::read_to_string(fixture.stream()).expect("stream");
         assert!(records.contains("messaging_socket_path"));
     }
+}
+
+#[test]
+fn natural_exit_distinguishes_idle_missing_result_and_unexplained_143() {
+    for (mode, expected, code, active) in [
+        ("idle", Outcome::Exited, 0, false),
+        ("missing-result", Outcome::Crashed, 0, true),
+        ("exit-143", Outcome::Crashed, 143, true),
+    ] {
+        let fixture = Fixture::new();
+        let mut running = fixture.launch(mode, "2.1.296").expect("launch");
+        running.receive();
+        if active {
+            running.submit();
+            running.receive();
+            running.receive();
+        }
+        let exit = running.finish();
+        assert_eq!(exit.outcome, expected, "{mode}: {exit:?}");
+        assert_eq!(exit.status.expect("status").code(), Some(code));
+        assert_eq!(exit.input_inflight, active);
+        assert!(!running.generated.exists());
+    }
+}
+
+#[test]
+fn requested_stop_precedes_interrupted_exit_one() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("interrupt-1", "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    running.receive();
+    running.receive();
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert_eq!(exit.status.expect("status").code(), Some(1));
+    assert!(exit.input_inflight);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+}
+
+#[test]
+fn full_output_queue_does_not_block_stop_or_cleanup() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("flood", "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.submit();
+    // More durable records than outward/pending capacity proves backpressure
+    // without consuming notifications or depending on elapsed wall time.
+    running.wait(|| {
+        let records = fs::read_to_string(fixture.stream()).ok()?;
+        (records.lines().count() >= 10).then_some(())
+    });
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert!(exit.delivery_cancelled);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+    assert!(fs::read_to_string(fixture.stream())
+        .expect("stream")
+        .lines()
+        .all(|line| serde_json::from_str::<super::super::transport::StreamRecord>(line).is_ok()));
+}
+
+#[test]
+fn blocked_stdin_does_not_block_server_stop() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("no-read", "2.1.296").expect("launch");
+    running.receive();
+    let root = fixture.identity("model.pid");
+    running.offer(&serde_json::json!({"type":"user","message":{"content":"x".repeat(1_048_576)}}));
+    running.wait(|| {
+        let transport = running.runtime.transport.try_lock().ok()?;
+        transport.input_inflight().then_some(())
+    });
+    assert!(!fixture.root.path().join("input-received").exists());
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert!(exit.input_inflight);
+    assert!(!root.alive());
+    assert!(!running.generated.exists());
+}
+
+#[test]
+fn crash_reaps_previously_observed_detached_descendant() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("tree", "2.1.296").expect("launch");
+    running.receive();
+    running.submit();
+    for _ in 0..3 {
+        running.receive();
+    }
+    let root = fixture.identity("model.pid");
+    let detached = fixture.identity("grandchild.pid");
+    running.wait(|| {
+        let data = fs::read(running.generated.join("owner.json")).ok()?;
+        let owner: Value = serde_json::from_slice(&data).ok()?;
+        owner["tree"]
+            .as_array()?
+            .iter()
+            .any(|entry| {
+                entry["pid"].as_u64() == Some(u64::from(detached.pid))
+                    && entry["birth"].as_u64() == Some(detached.birth)
+            })
+            .then_some(())
+    });
+    assert!(root.alive());
+    // SAFETY: birth-checked process created by this test, never an ambient pid.
+    assert_eq!(unsafe { libc::kill(root.pid as i32, libc::SIGUSR2) }, 0);
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Crashed, "{exit:?}");
+    assert_eq!(exit.status.expect("status").code(), Some(7));
+    assert!(!root.alive());
+    assert!(!detached.alive());
+    assert!(!running.generated.exists());
+}
+
+#[test]
+fn corrupt_durable_stream_reports_failure_and_retains_generated_files() {
+    let fixture = Fixture::new();
+    let stream = fixture.stream();
+    fs::create_dir_all(stream.parent().expect("stream parent")).expect("stream dirs");
+    fs::write(&stream, "{broken}\n").expect("corrupt complete record");
+    let mut running = fixture.launch("normal", "2.1.296").expect("launch");
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Failed, "{exit:?}");
+    assert!(exit.error.is_some());
+    assert!(running.generated.exists());
+    assert_eq!(fs::read_to_string(stream).expect("stream"), "{broken}\n");
+}
+
+#[test]
+fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile("no-read", "2.1.296");
+    let args = profile.args();
+    let index = args
+        .iter()
+        .position(|arg| arg == "--settings")
+        .expect("settings");
+    let generated = PathBuf::from(&args[index + 1])
+        .parent()
+        .expect("parent")
+        .to_owned();
+    let exit = run(
+        fixture.root.path(),
+        profile,
+        StreamLocation {
+            data_dir: fixture.root.path().to_owned(),
+            agent: "fixture-agent".into(),
+            session: SESSION.into(),
+        },
+        |_| panic!("owned publication failure"),
+    )
+    .expect("worker result");
+    assert_eq!(exit.outcome, Outcome::Failed, "{exit:?}");
+    assert!(exit.status.is_some());
+    assert!(exit.error.expect("error").contains("publication panicked"));
+    assert!(generated.exists());
 }
