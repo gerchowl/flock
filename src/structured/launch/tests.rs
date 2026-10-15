@@ -165,7 +165,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             & 0o777,
         0o700
     );
-    for name in ["settings.json", "mcp.json"] {
+    for name in ["settings.json", "mcp.json", "owner.json"] {
         let path = dir.join(name);
         assert_eq!(
             fs::metadata(&path)
@@ -179,7 +179,7 @@ fn exact_launch_profile_and_minimal_typed_files() {
             .expect("no secret file")
             .contains(FAKE_TOKEN));
     }
-    assert_eq!(fs::read_dir(dir).expect("session files").count(), 2);
+    assert_eq!(fs::read_dir(dir).expect("session files").count(), 3);
 }
 
 #[test]
@@ -332,8 +332,8 @@ fn config_directory_is_removed_on_unwind_and_writer_error() {
     });
     assert!(result.is_err());
     assert_eq!(
-        fs::read_dir(&fixture.0)
-            .expect("fixture files")
+        fs::read_dir(fixture.0.join("structured/sessions"))
+            .expect("contained session files")
             .filter(|entry| entry
                 .as_ref()
                 .expect("entry")
