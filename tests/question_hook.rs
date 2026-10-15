@@ -16,14 +16,16 @@ mod support;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use support::environment::Command;
+use support::socket_dir::SocketDir;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
     unregister_spawned_flock_pid, wait_for_socket,
@@ -87,8 +89,20 @@ fn isolation(socket: &Path) -> Vec<(&'static str, PathBuf)> {
     support::environment::isolated_env(&root, &root.join("run"))
 }
 
-fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Duration) {
+fn start_stub(socket: &Path, bin: &Path, hint: Option<&str>) -> FixtureChild {
+    start_stub_with_events(socket, bin, hint, None)
+}
+
+fn start_stub_with_events(
+    socket: &Path,
+    bin: &Path,
+    hint: Option<&str>,
+    events: Option<UnixStream>,
+) -> FixtureChild {
     let mut command = Command::new("/bin/sh");
+    if events.is_some() {
+        command.arg("-x");
+    }
     command
         .arg(stub_path())
         .arg("question")
@@ -107,21 +121,465 @@ fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Durat
     if let Some(hint) = hint {
         command.env("FLOCK_QUESTIONS", hint);
     }
-    let started = Instant::now();
-    let mut child = command.spawn().unwrap();
+    let mut child = FixtureChild::spawn_with_events(command, events);
     child
+        .child()
         .stdin
         .take()
         .unwrap()
         .write_all(ASK.as_bytes())
         .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let elapsed = started.elapsed();
-    assert!(output.status.success(), "the stub never fails its agent");
-    (
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        elapsed,
+    child
+}
+
+fn run_stub_raw(socket: &Path, bin: &Path, hint: Option<&str>) -> (String, Duration) {
+    start_stub(socket, bin, hint).finish()
+}
+
+/// Own a new process group so failed fixture stages cannot leave descendants.
+struct FixtureChild {
+    child: Option<Child>,
+    group: libc::pid_t,
+    started: Instant,
+}
+
+impl FixtureChild {
+    fn spawn_with_events(mut command: Command, events: Option<UnixStream>) -> Self {
+        if let Some(events) = &events {
+            // POSIX shells support these redirection descriptors portably.
+            assert!(
+                (3..=9).contains(&events.as_raw_fd()),
+                "fixture needs an inherited fd in 3..9"
+            );
+            command.env("FLOCK_TEST_EVENT_FD", events.as_raw_fd().to_string());
+        }
+        // SAFETY: only async-signal-safe syscalls run after fork. The stream is
+        // owned and open in the parent before spawn allocates its exec-error
+        // pipe, so their descriptors cannot collide. No descriptor is replaced.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(events) = &events {
+                    if libc::fcntl(events.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        let child = command.spawn().unwrap();
+        Self {
+            group: child.id() as libc::pid_t,
+            child: Some(child),
+            started,
+        }
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("fixture child")
+    }
+
+    /// Drain each readable pipe before waiting again, sharing one fail ceiling.
+    // This test helper prints captured shell evidence into nextest's reports.
+    #[allow(clippy::print_stderr)]
+    fn finish(&mut self) -> (String, Duration) {
+        let deadline = Instant::now() + WITHIN;
+        let stages = support::readiness::Stages::new(WITHIN);
+        let mut stdout = self.child().stdout.take().expect("fixture stdout");
+        let mut stderr = self.child().stderr.take().expect("fixture stderr");
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let mut open = [true, true];
+        while open.iter().any(|&open| open) {
+            let descriptors = [stdout.as_raw_fd(), stderr.as_raw_fd()];
+            let indices: Vec<_> = (0..2).filter(|&i| open[i]).collect();
+            let ready = stages
+                .readable(&indices.iter().map(|&i| descriptors[i]).collect::<Vec<_>>())
+                .expect("hook output stayed silent without completing");
+            let index = indices[ready];
+            let mut bytes = [0; 4096];
+            let count = if index == 0 {
+                stdout.read(&mut bytes)
+            } else {
+                stderr.read(&mut bytes)
+            }
+            .expect("read fixture output");
+            if count == 0 {
+                open[index] = false;
+            } else if index == 0 {
+                output.extend_from_slice(&bytes[..count]);
+            } else {
+                errors.extend_from_slice(&bytes[..count]);
+            }
+        }
+        let status = self
+            .wait_for_exit(deadline.saturating_duration_since(Instant::now()))
+            .expect("hook did not exit after closing output");
+        assert!(
+            status.success(),
+            "hook exit {status}: {}",
+            String::from_utf8_lossy(&errors)
+        );
+        if !errors.is_empty() {
+            eprintln!("hook stderr/trace:\n{}", String::from_utf8_lossy(&errors));
+        }
+        (
+            String::from_utf8_lossy(&output).into_owned(),
+            self.started.elapsed(),
+        )
+    }
+    /// Observe exit without reaping, retaining PID ownership until cleanup ends.
+    fn observe_exit(&mut self, ceiling: Duration) -> io::Result<()> {
+        let pid = self.child().id();
+        let (send, receive) = std::sync::mpsc::channel();
+        let observer = thread::spawn(move || {
+            let result = loop {
+                // WNOWAIT leaves the child waitable, so its PID cannot be reused.
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    break Ok(());
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    break Err(error);
+                }
+            };
+            let _ = send.send(result);
+        });
+        let result = receive.recv_timeout(ceiling).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("fixture exit stayed silent: {error}"),
+            )
+        });
+        if result.is_err() {
+            // The observer has not reaped our leader, reserving this group ID.
+            unsafe {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+        }
+        observer.join().expect("exit observer panicked");
+        result??;
+        Ok(())
+    }
+
+    /// Explicit reaping clears ownership before any later Drop can signal.
+    fn wait_for_exit(&mut self, ceiling: Duration) -> io::Result<std::process::ExitStatus> {
+        self.observe_exit(ceiling)?;
+        let status = self.child().wait()?;
+        self.child.take();
+        Ok(status)
+    }
+}
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            // Even an exited leader reserves its PID until reaped. Signal first
+            // so live descendants cannot survive their leader's exit.
+            unsafe {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn parse_fixture_pid(contents: &str) -> io::Result<libc::pid_t> {
+    contents
+        .trim()
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid fixture PID"))
+}
+
+/// Wait on the inherited evidence pipe. EOF, invalid data and silence fail.
+fn wait_for_pid_event(events: &mut UnixStream, ceiling: Duration) -> io::Result<libc::pid_t> {
+    let line = support::readiness::Stages::new(ceiling).line(events)?;
+    let value = line.strip_prefix("pid ").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected PID event: {line}"),
+        )
+    })?;
+    parse_fixture_pid(value)
+}
+
+/// Preserve the failed protocol stage and error kind in the final hook report.
+fn at_stage(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("fixture {stage}: {error}"))
+}
+
+fn invocation_evidence(
+    events: &mut UnixStream,
+    path: &Path,
+    pid_file: &Path,
+    ceiling: Duration,
+) -> io::Result<libc::pid_t> {
+    let stages = support::readiness::Stages::new(ceiling);
+    let pid = wait_for_pid_event(events, ceiling).map_err(|err| at_stage("pid", err))?;
+    for (stage, expected) in [
+        ("path", format!("path {}", path.display())),
+        ("argv", "argv hook claude question".to_owned()),
+        ("published", "published".to_owned()),
+    ] {
+        stages
+            .expect(events, &expected)
+            .map_err(|err| at_stage(stage, err))?;
+    }
+    let file_pid = fs::read_to_string(pid_file)
+        .and_then(|contents| parse_fixture_pid(&contents))
+        .map_err(|err| at_stage("published", err))?;
+    if pid != file_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("fixture published: PID mismatch: event {pid}, file {file_pid}"),
+        ));
+    }
+    Ok(pid)
+}
+
+/// Publish inside one directory, so readers cannot see a truncated PID.
+fn publish_fixture_pid(pid_file: &Path) -> String {
+    format!(
+        r#"printf '%s\n' "$$" > '{0}.tmp' && mv '{0}.tmp' '{0}' || exit 3"#,
+        pid_file.display()
     )
+}
+
+fn event_publisher(dir: &Path, body: &str) -> (FixtureChild, UnixStream) {
+    let script = fake_flk(dir, "publisher", body);
+    let (events, writer) = UnixStream::pair().unwrap();
+    let mut command = Command::new(script);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    (
+        FixtureChild::spawn_with_events(command, Some(writer)),
+        events,
+    )
+}
+
+#[test]
+fn pid_event_waits_for_a_gated_publisher() {
+    let directory = SocketDir::reserve("hqpid");
+    let (mut publisher, mut events) = event_publisher(directory.path(),
+        "printf 'ready\\n' >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage\n[ \"$stage\" = publish ] || exit 2\nprintf 'pid %s\\n' \"$$\" >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage");
+    let stages = support::readiness::Stages::new(WITHIN);
+    stages.expect(&mut events, "ready").unwrap();
+    let mut gate = publisher.child().stdin.take().unwrap();
+    gate.write_all(b"publish\n").unwrap();
+    assert_eq!(
+        wait_for_pid_event(&mut events, WITHIN).unwrap(),
+        publisher.child().id() as libc::pid_t
+    );
+}
+
+#[test]
+fn pid_event_fails_when_the_publisher_exits() {
+    let directory = SocketDir::reserve("hqdead");
+    let (mut child, mut events) = event_publisher(directory.path(), "exit 7");
+    let error = wait_for_pid_event(&mut events, WITHIN).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    child.wait_for_exit(WITHIN).unwrap();
+}
+
+#[test]
+fn pid_event_fails_when_a_live_publisher_stays_silent() {
+    let directory = SocketDir::reserve("hqsilent");
+    let (mut child, mut events) = event_publisher(directory.path(), "IFS= read -r stage");
+    let error = wait_for_pid_event(&mut events, Duration::from_millis(50)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(
+        unsafe { libc::kill(child.child().id() as libc::pid_t, 0) },
+        0
+    );
+}
+
+#[test]
+fn pid_event_rejects_empty_partial_nonpositive_and_unexpected_publications() {
+    let directory = SocketDir::reserve("hqinvalid");
+    for event in ["pid ", "pid 12partial", "pid 0", "pid -1", "wrong-stage"] {
+        let (_child, mut events) = event_publisher(
+            directory.path(),
+            &format!("printf '%s\\n' '{event}' >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage"),
+        );
+        assert_eq!(
+            wait_for_pid_event(&mut events, WITHIN).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn fixture_finish_drains_output_and_drop_does_not_signal_a_reaped_group() {
+    let directory = SocketDir::reserve("hqfinish");
+    let (mut sentinel, mut events) = event_publisher(
+        directory.path(),
+        "IFS= read -r stage\nprintf 'alive\\n' >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage",
+    );
+    // Each script has a different path while the sentinel is still executing.
+    let script = fake_flk(
+        directory.path(),
+        "finishes",
+        "i=0\nwhile [ \"$i\" -lt 8192 ]; do\nprintf 1234567890abcdef\ni=$((i+1))\ndone\nprintf diagnostic >&2",
+    );
+    let mut command = Command::new(script);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = FixtureChild::spawn_with_events(command, None);
+    assert_eq!(child.finish().0, "1234567890abcdef".repeat(8192));
+    assert!(child.child.is_none());
+    // Point at another owned fixture: a stale-group signal would kill it.
+    child.group = sentinel.child().id() as libc::pid_t;
+    drop(child);
+    sentinel
+        .child()
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"check\n")
+        .unwrap();
+    support::readiness::Stages::new(WITHIN)
+        .expect(&mut events, "alive")
+        .unwrap();
+    // The acknowledgment proves the sentinel survived without reaping it.
+}
+
+#[test]
+fn fixture_exit_wait_fails_when_output_closes_but_the_child_lives() {
+    let directory = SocketDir::reserve("hqexit");
+    let (mut child, mut events) = event_publisher(
+        directory.path(),
+        "exec 1>&- 2>&-\nprintf 'closed\\n' >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage",
+    );
+    support::readiness::Stages::new(WITHIN)
+        .expect(&mut events, "closed")
+        .unwrap();
+    let error = child.wait_for_exit(Duration::from_millis(50)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(!child.wait_for_exit(WITHIN).unwrap().success());
+}
+
+#[test]
+fn invocation_eof_names_each_missing_stage() {
+    let directory = SocketDir::reserve("hqstage");
+    let lines = [
+        "pid 123\n",
+        "path fixture\n",
+        "argv hook claude question\n",
+        "published\n",
+    ];
+    for (index, stage) in ["pid", "path", "argv", "published"].iter().enumerate() {
+        let (mut events, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .write_all(lines[..index].concat().as_bytes())
+            .unwrap();
+        drop(writer);
+        let error = invocation_evidence(
+            &mut events,
+            Path::new("fixture"),
+            &directory.path().join("unused.pid"),
+            WITHIN,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.to_string(),
+            format!("fixture {stage}: stage producer closed")
+        );
+    }
+}
+
+#[test]
+fn invocation_silence_names_each_missing_stage() {
+    let directory = SocketDir::reserve("hqstage");
+    let lines = [
+        "pid 123\n",
+        "path fixture\n",
+        "argv hook claude question\n",
+        "published\n",
+    ];
+    for (index, stage) in ["pid", "path", "argv", "published"].iter().enumerate() {
+        let (mut events, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .write_all(lines[..index].concat().as_bytes())
+            .unwrap();
+        let error = invocation_evidence(
+            &mut events,
+            Path::new("fixture"),
+            &directory.path().join("unused.pid"),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            format!("fixture {stage}: fixture stage stayed silent")
+        );
+    }
+}
+
+#[test]
+fn invocation_pid_mismatch_returns_a_published_error() {
+    let directory = SocketDir::reserve("hqmismatch");
+    let path = directory.path().join("fixture.pid");
+    fs::write(&path, "456\n").unwrap();
+    let (mut events, mut writer) = UnixStream::pair().unwrap();
+    writer
+        .write_all(b"pid 123\npath fixture\nargv hook claude question\npublished\n")
+        .unwrap();
+    let error = invocation_evidence(&mut events, Path::new("fixture"), &path, WITHIN).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "fixture published: PID mismatch: event 123, file 456"
+    );
+}
+
+#[test]
+fn fixture_event_descriptor_is_owned_before_the_exec_error_pipe() {
+    let directory = SocketDir::reserve("hqfd");
+    let _occupied = UnixStream::pair().unwrap();
+    let (mut child, mut events) = event_publisher(
+        directory.path(),
+        "printf 'pid %s\\n' \"$$\" >&\"$FLOCK_TEST_EVENT_FD\"\nIFS= read -r stage",
+    );
+    assert_eq!(
+        wait_for_pid_event(&mut events, WITHIN).unwrap(),
+        child.child().id() as libc::pid_t
+    );
+}
+
+#[test]
+fn fixture_drop_kills_descendants_of_an_exited_unreaped_leader() {
+    let directory = SocketDir::reserve("hqgroup");
+    let (mut child, mut events) = event_publisher(directory.path(),
+        "/bin/sh -c 'printf \"descendant %s\\n\" \"$$\" >&\"$FLOCK_TEST_EVENT_FD\"; IFS= read -r stay' <&0 &\nexit 0");
+    // Keep the stdin writer outside the owner: dropping Child alone must not
+    // release the descendant's gate and disguise a missing group signal.
+    let _gate = child.child().stdin.take().unwrap();
+    let stages = support::readiness::Stages::new(WITHIN);
+    let line = stages.line(&mut events).unwrap();
+    assert!(line.starts_with("descendant "));
+    child.observe_exit(WITHIN).unwrap();
+    drop(child);
+    assert_eq!(
+        stages.line(&mut events).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
 }
 
 fn fake_flk(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -305,30 +763,50 @@ fn a_missing_crashing_or_garbled_flk_refuses_a_hinted_delegate() {
 /// pid, so the test can show the watchdog really ended it.
 #[test]
 fn a_hanging_flk_is_killed_by_the_watchdog_and_the_delegate_refused() {
-    let dir = unique_dir("hang");
+    let directory = SocketDir::reserve("hqhang");
+    let dir = directory.path();
     let pid_file = dir.join("hang.pid");
     let hang = fake_flk(
-        &dir,
+        dir,
         "hang",
-        &format!("echo $$ > '{}'\nexec sleep 60", pid_file.display()),
+        &format!(
+            r#"printf 'pid %s\n' "$$" >&"$FLOCK_TEST_EVENT_FD"
+printf 'path %s\n' "$0" >&"$FLOCK_TEST_EVENT_FD"
+printf 'argv %s\n' "$*" >&"$FLOCK_TEST_EVENT_FD"
+{0}
+printf 'published\n' >&"$FLOCK_TEST_EVENT_FD"
+exec sleep 60"#,
+            publish_fixture_pid(&pid_file)
+        ),
     );
-
-    let (got, elapsed) = run_stub(&dir.join("unused.sock"), &hang, Some("ask_operator"));
+    let (mut events, writer) = UnixStream::pair().unwrap();
+    let mut hook = start_stub_with_events(
+        &dir.join("unused.sock"),
+        &hang,
+        Some("ask_operator"),
+        Some(writer),
+    );
+    let evidence = invocation_evidence(&mut events, &hang, &pid_file, WITHIN);
+    if let Ok(pid) = &evidence {
+        eprintln!("fixture invoked: path={} argv=hook claude question pid={pid}; PID publication confirmed", hang.display());
+    }
+    let (stdout, elapsed) = hook.finish();
+    let pid = evidence.unwrap_or_else(|error| panic!("fixture invocation/publication failed: {error}; elapsed={elapsed:?}; hook stdout={stdout:?}; shell trace above"));
+    // Retain the historical post-completion read: detect lost publication too.
+    let final_pid = fs::read_to_string(&pid_file)
+        .and_then(|contents| parse_fixture_pid(&contents))
+        .unwrap_or_else(|error| panic!("PID publication lost after hook completion: {error}; fixture pid={pid}; elapsed={elapsed:?}; shell trace above"));
+    assert_eq!(final_pid, pid);
+    let got = reason(&stdout);
 
     assert_eq!(got.as_deref(), Some(ASK_OPERATOR));
     assert!(
         elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(30),
         "the watchdog fired, not Claude's timeout: {elapsed:?}"
     );
-    let pid: libc::pid_t = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    // The stub reaped it, so signal 0 finds no such process.
+    // Assert before dropping the group guard: only the watchdog can prove this.
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     assert!(!alive, "the hung flk ({pid}) outlived the hook");
-    cleanup_test_base(&dir);
 }
 
 // ---- the server half ----
