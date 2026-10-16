@@ -150,15 +150,15 @@ per stream, while the connection is Syncing, Live or ReadOnly:
    Replaying or Current ─gap with snapshot─▶ Resyncing ─seq snapshot_to applied─▶ back
 ```
 
-**Connection states.** A dash means the event cannot occur in that state, and the cell says why.
+**Connection states.** A dash means the event cannot occur in that state, and the cell says why. From every state, the user's `disconnect` closes any socket and goes to Disconnected, holding the outbox.
 
 | State | Own exits | Heartbeat missed | Socket lost | `gap` | Auth refused |
 |---|---|---|---|---|---|
 | Disconnected | `connect` → Connecting | — no socket | — no socket | — no socket | — no socket |
 | Connecting | socket open → Hello; failure, or the connect deadline elapsed → Reconnecting | — no heartbeat before `welcome` | → Reconnecting (a failure) | — no `sub` yet | — the token is sent in `hello` |
-| Hello | `welcome`, client not newer → Syncing; `welcome`, client newer → ReadOnly; the handshake deadline elapsed without `welcome` → Reconnecting; any other frame is a protocol error: close, show the error, → Reconnecting | — the handshake deadline covers Hello | → Reconnecting | — no `sub` is sent before `welcome`, so a `gap` here is the protocol error | → NeedsToken |
+| Hello | `welcome`, client not newer → Syncing; `welcome`, client newer → ReadOnly; the handshake deadline elapsed without `welcome` → Reconnecting; any other frame is a protocol error: close, show the error, → Reconnecting. A server that keeps sending protocol errors loops through Reconnecting under capped backoff **by design**: the error stays shown, and a server restart or upgrade can cure it without user action. The user can stop it with `disconnect`. | — the handshake deadline covers Hello | → Reconnecting | — no `sub` is sent before `welcome`, so a `gap` here is the protocol error | → NeedsToken |
 | Syncing | every seq stream is Current → Live | → Stale | → Reconnecting | that stream → Resyncing; the connection stays Syncing | → NeedsToken |
-| Live | — | → Stale | → Reconnecting | that stream → Resyncing; the connection stays Live | → NeedsToken |
+| Live | — Live is the steady state: it ends only on the events in the other columns | → Stale | → Reconnecting | that stream → Resyncing; the connection stays Live | → NeedsToken |
 | ReadOnly | user reload after a server upgrade → Connecting | → Stale | → Reconnecting; the next `welcome` decides again | that stream → Resyncing; the connection stays ReadOnly | → NeedsToken |
 | Stale | → Reconnecting at once: it closes the socket and is entered only to mark tiles while the reconnect begins | ignored: the socket is already being closed | ignored: already leaving | ignored: frames after Stale are discarded, and the stored cursor replays them | ignored: the next `hello` reports it again |
 | Reconnecting | backoff elapsed, or a network-change or foreground event → Connecting | — no socket | — no socket | — no socket | — no socket |
@@ -169,12 +169,14 @@ per stream, while the connection is Syncing, Live or ReadOnly:
 | Stream state | Exits |
 |---|---|
 | Replaying (after `sub`, from the stored cursor) | `synced` → Current; `gap` with `snapshot_to` → Resyncing, returning to Replaying; `gap` without a snapshot (`agent/<id>`) → the marker below, stays Replaying; `lagged` → re-`sub` from the last applied seq, stays Replaying |
-| Current | `gap` with `snapshot_to` → Resyncing, returning to Current; `gap` without a snapshot → the marker, stays Current; `lagged` → re-`sub` from the last applied seq → Replaying |
-| Resyncing | the `ev` with seq `snapshot_to` is applied → it drops every entity still unconfirmed, then returns to the state it came from; another `gap` with `snapshot_to` on the same stream (the log was rewritten again) → restarts Resyncing on the new snapshot, keeping the unconfirmed set; `lagged` → re-`sub` from the last applied seq; the server replays the rest of the snapshot from the log, so it stays Resyncing with the same `snapshot_to`; `synced` cannot arrive first, because it follows seq `snapshot_to` in seq order |
+| Current | `synced` cannot arrive: it is sent once per `sub` and Current was entered by it, so a second one is a protocol error (close → Reconnecting); `gap` with `snapshot_to` → Resyncing, returning to Current; `gap` without a snapshot → the marker, stays Current; `lagged` → re-`sub` from the last applied seq → Replaying |
+| Resyncing | the snapshot ends (below) → it drops every entity still unconfirmed, clears the resync marker, then returns to its return state; another `gap` with `snapshot_to` on the same stream (the log was rewritten again) → restarts Resyncing on the new snapshot and marks **all** of that stream's entities unconfirmed again, including any the earlier partial snapshot confirmed, since one may have been deleted since; `lagged` → re-`sub` from the last applied seq, and the return state becomes Replaying (the new `sub` gets its own `synced`); the server replays the rest of the snapshot from the log, so it stays Resyncing with the same `snapshot_to`; `synced` cannot arrive first, because it follows seq `snapshot_to` in seq order |
+
+- **When a snapshot ends.** A `gap` with `snapshot_to > to` announces snapshot lines with seqs `to + 1` through `snapshot_to`. The snapshot ends when the `ev` with seq `snapshot_to` has been applied. A `gap` with `snapshot_to == to` announces an **empty snapshot**: the stream has no items, for example when every queue item had already been delivered when the rewrite ran. That Resyncing ends as soon as the `gap` is processed, so every entity of the stream is dropped and the stream returns to its return state without waiting for any `ev`. A `gap` without `snapshot_to` is a stream without snapshots (`agent/<id>`), never an empty snapshot.
 
 - **Streams are independent.** A `gap` on a second stream while the first is Resyncing starts the second's own Resyncing. Neither waits for the other.
 - **Syncing ends on Current, not on Resyncing.** If Syncing would end while a stream that was already Current is Resyncing, the connection waits for that resync to finish too. Once the connection is Live, a stream's later Resyncing never takes the connection out of Live. Only that stream's tiles show a "resyncing" marker. The outbox keeps sending, because every verb is verified by the server against its own current state (atomic answers, below).
-- **The resync marker** (`snapshot_to` and the unconfirmed set) is stored with the stream's cursor. A reconnect or reload whose cursor is still below `snapshot_to` resumes Resyncing. A server without the snapshot lines any more sends a new `gap`, which restarts it.
+- **The resync marker** (`snapshot_to` and the unconfirmed set) is stored with the stream's cursor and cleared when the snapshot ends. After a reconnect or reload, the stream's new `sub` from the stored cursor starts in Replaying. If a marker is stored and the cursor is below its `snapshot_to`, the stream enters Resyncing at once with Replaying as its return state, and the server replays the rest of the snapshot from the log. If the server no longer holds those lines, it sends a new `gap`, which restarts Resyncing and marks every entity unconfirmed again.
 
 - **Hello.**
   - It sends `hello { protocol, client, token }`.
@@ -193,7 +195,7 @@ per stream, while the connection is Syncing, Live or ReadOnly:
     - **Streams with snapshots** follow ADR-0036 §4: `queue/<id>`, and this record's §5 streams (`fleet`, `inbox`, `artifacts`, `work`). The server sends the snapshot inline, right after the `gap`. Its lines take the seqs `to + 1` through `snapshot_to`, the field the `gap` carries for exactly this purpose (ADR-0036 §5), and they carry the full current state of every item. That stream enters **Resyncing**:
       - it marks that stream's entities as unconfirmed;
       - it applies the snapshot lines through the normal reducer, advancing the cursor as usual;
-      - when the `ev` with seq `snapshot_to` has been applied, the snapshot has ended. It drops every entity still unconfirmed, because an item the snapshot doesn't mention no longer exists.
+      - when the `ev` with seq `snapshot_to` has been applied, or at once when `snapshot_to == to` (an empty snapshot), the snapshot has ended. It drops every entity still unconfirmed, because an item the snapshot doesn't mention no longer exists.
       - `snapshot_to` is the only way a snapshot ends. The client never infers the end from a frame's content or from timing.
       - Rendering stays batched per animation frame, so a snapshot delivered in one burst never shows an empty list.
       - There is no client-side fetch: the snapshot comes on the same stream as everything else.

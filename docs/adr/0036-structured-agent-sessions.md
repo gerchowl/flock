@@ -746,7 +746,10 @@ back-to-back turns. For a structured agent there is no polling at all:
   last_snapshot_seq }` and then the snapshot lines, which carry the full
   current state of every item. `snapshot_to` is the only end-of-snapshot
   marker: a client knows the snapshot is complete once it has applied the
-  event with that seq (amended 2026-10-16, ADR-0038 §3). A stream without
+  event with that seq. An empty snapshot (a folded queue with no items)
+  has no lines and is sent as `snapshot_to == to`; the snapshot is then
+  complete as soon as the `gap` is processed, and the client drops every
+  item of that stream (amended 2026-10-16, ADR-0038 §3). A stream without
   snapshots (`agent/<id>`) sends `gap` without `snapshot_to`.
 - **Two kinds of seq.** ADR-0005's `seq` stays the one total order of the
   durable event log, and the `events` wire stream uses it. A per-agent
