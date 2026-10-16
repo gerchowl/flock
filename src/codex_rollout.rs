@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// Parent-turn state from verified complete lifecycle records, never screen state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Turn {
     Unknown,
@@ -15,6 +16,7 @@ pub(crate) enum Turn {
     Idle,
 }
 
+/// Diagnostic degradation of this segment. Failures remain sticky until verified reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
     PartialRecord,
@@ -41,6 +43,7 @@ impl Reason {
     }
 }
 
+/// Attributed parent-turn boundary, independent of tool and child activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Start,
@@ -48,15 +51,20 @@ pub(crate) enum Kind {
     Abort,
 }
 
+/// Last accepted matching lifecycle boundary in this verified segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Boundary {
+    /// Opaque owner turn ID, compared for equality rather than ordering.
     pub turn_id: String,
+    /// The matching lifecycle transition that established this evidence.
     pub kind: Kind,
     /// Byte offset after this record, relative to this verified segment.
     pub complete_offset: u64,
+    /// Supplied monotonic observation time, unchanged by duplicates or silence.
     pub at: Instant,
 }
 
+/// Current state and evidence diagnostics. Age is informational, never a lease.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Observation<'a> {
     pub turn: Turn,
@@ -70,6 +78,7 @@ pub(crate) struct Observation<'a> {
 /// Overflow invalidates this reducer; only verified resynchronization may
 /// replace it. `next_ordinal` is None for legacy, or the verified paginated
 /// segment's first ordinal (including any history_base offset).
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub(crate) struct Reducer {
     partial: Vec<u8>,
     complete_offset: u64,
@@ -82,6 +91,9 @@ pub(crate) struct Reducer {
 }
 
 impl Reducer {
+    /// Start only at an independently verified segment boundary. The turn-ID
+    /// budget includes both remembered retired IDs and the current active turn.
+    /// `None` selects legacy records, `Some` requires the exact first ordinal.
     pub fn new(max_record_bytes: usize, max_turn_ids: usize, next_ordinal: Option<u64>) -> Self {
         Self {
             partial: Vec::new(),
@@ -144,6 +156,8 @@ impl Reducer {
         self.partial.clear();
     }
 
+    /// Read current evidence at the supplied clock without advancing state or
+    /// expiring quiet working/idle. Unterminated bytes mask idle as unknown.
     pub fn observe(&self, now: Instant) -> Observation<'_> {
         let working = self
             .boundary
@@ -229,6 +243,7 @@ impl Reducer {
             } else if kind != Kind::Start || current.kind == Kind::Start {
                 return Err(Reason::ConflictingTurn);
             } else {
+                // Count the active turn as well as all remembered retired IDs.
                 if self.retired.len().saturating_add(1) >= self.max_turn_ids {
                     return Err(Reason::CapacityExceeded);
                 }

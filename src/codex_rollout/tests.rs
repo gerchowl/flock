@@ -39,11 +39,12 @@ fn both_start_and_completion_aliases_reduce_independently() {
 }
 
 #[test]
-fn recorded_rollout_reduces_identically_at_every_byte_split() {
+fn synthetic_rollout_reduces_identically_at_every_byte_split() {
     let now = Instant::now();
     for split in 0..=FINISHED.len() {
         let mut reducer = reducer();
         reducer.feed(&FINISHED[..split], now);
+        assert_split_prefix(FINISHED, split, &reducer, None, now);
         reducer.feed(&FINISHED[split..], now);
         let observation = reducer.observe(now);
         assert_eq!(observation.turn, Turn::Idle, "split {split}");
@@ -345,4 +346,121 @@ fn malformed_known_non_boundary_envelopes_invalidate() {
         reducer.feed(format!("{{\"type\":\"{kind}\"}}\n").as_bytes(), now);
         assert_eq!(reducer.observe(now).reason, Some(Reason::MalformedRecord));
     }
+}
+
+/// Independently replay only complete records as the oracle for a split prefix.
+/// Partial bytes retain working, but cannot claim idle or a new boundary.
+fn assert_split_prefix(
+    bytes: &[u8],
+    split: usize,
+    actual: &Reducer,
+    ordinal: Option<u64>,
+    now: Instant,
+) {
+    let complete = bytes[..split]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    let mut expected = Reducer::new(256 * 1024, 256, ordinal);
+    expected.feed(&bytes[..complete], now);
+    let expected = expected.observe(now);
+    let actual = actual.observe(now);
+    assert_eq!(
+        actual.boundary, expected.boundary,
+        "prefix boundary at {split}"
+    );
+    if split == complete {
+        assert_eq!(actual, expected, "complete prefix at {split}");
+    } else {
+        assert_eq!(
+            actual.turn,
+            if expected.turn == Turn::Working {
+                Turn::Working
+            } else {
+                Turn::Unknown
+            },
+            "partial turn at {split}"
+        );
+        assert_eq!(
+            actual.reason,
+            if expected.turn == Turn::Working {
+                None
+            } else {
+                Some(Reason::PartialRecord)
+            },
+            "partial reason at {split}"
+        );
+    }
+}
+
+#[test]
+fn real_01601_rollout_reduces_at_every_byte_split_including_partial_state() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/codex-rollout/real-0.160.1.jsonl"
+    ))
+    .expect("derived real rollout fixture");
+    let now = Instant::now();
+    let mut checkpoint = Reducer::new(256 * 1024, 256, Some(0));
+    let mut offset = 0;
+    for record in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let mut expected = checkpoint.clone();
+        expected.feed(record, now);
+        assert_eq!(
+            expected.observe(now).reason,
+            None,
+            "complete record at {offset}"
+        );
+        for split in 0..=record.len() {
+            // Reuse the exactly replayed prefix, then split this record at every
+            // byte. Full-state equality after its suffix proves that continuing
+            // with the remaining file yields the same final state for every split.
+            let mut actual = checkpoint.clone();
+            actual.feed(&record[..split], now);
+            let prefix = actual.observe(now);
+            if split > 0 && split < record.len() {
+                assert_eq!(
+                    prefix.boundary,
+                    checkpoint.observe(now).boundary,
+                    "boundary at {}",
+                    offset + split
+                );
+                let working = checkpoint.observe(now).turn == Turn::Working;
+                assert_eq!(
+                    prefix.turn,
+                    if working {
+                        Turn::Working
+                    } else {
+                        Turn::Unknown
+                    },
+                    "partial turn at {}",
+                    offset + split
+                );
+                assert_eq!(
+                    prefix.reason,
+                    if working {
+                        None
+                    } else {
+                        Some(Reason::PartialRecord)
+                    },
+                    "partial reason at {}",
+                    offset + split
+                );
+            } else if split == 0 {
+                assert_eq!(actual, checkpoint);
+            }
+            actual.feed(&record[split..], now);
+            assert_eq!(actual, expected, "complete state at {}", offset + split);
+        }
+        checkpoint = expected;
+        offset += record.len();
+    }
+    let final_state = checkpoint.observe(now);
+    assert_eq!(final_state.turn, Turn::Idle);
+    assert_eq!(final_state.reason, None);
+    assert_eq!(final_state.boundary.unwrap().kind, Kind::Complete);
+    assert_eq!(
+        final_state.boundary.unwrap().complete_offset,
+        bytes.len() as u64
+    );
 }
