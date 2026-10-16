@@ -210,20 +210,11 @@ fn draft_refusal_guides_registered_delegates_after_manual_resolution() {
     }
     let (socket, _server) = scripted_server("draft-delegate", refused);
     let state = support::socket_dir::SocketDir::reserve("draft-state");
-    let mut socket_hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in socket.to_string_lossy().as_bytes() {
-        socket_hash ^= u64::from(*byte);
-        socket_hash = socket_hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     let registry = state
         .path()
-        .join(if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        })
+        .join(support::paths::app_dir_name())
         .join("delegates")
-        .join(format!("{socket_hash:016x}"));
+        .join(support::paths::server_key(&socket));
     std::fs::create_dir_all(&registry).unwrap();
     let mut record = json!({"name":"reviewer","agent_id":"agent_nodea_123abc",
         "terminal_id":"term_old","pane_id":"w9:p9","root_pane":"w9:p1","workspace_id":"w9",
@@ -238,7 +229,8 @@ fn draft_refusal_guides_registered_delegates_after_manual_resolution() {
         record["agent_id"] = json!(agent_id);
         record["terminal_id"] = json!(terminal_id);
         std::fs::write(registry.join("reviewer.json"), record.to_string()).unwrap();
-        let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
+        let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
+        command
             .args([
                 "agent",
                 "send",
@@ -250,21 +242,20 @@ fn draft_refusal_guides_registered_delegates_after_manual_resolution() {
             .env("FLOCK_SOCKET_PATH", &socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
-            .env("XDG_STATE_HOME", state.path())
-            .output()
-            .unwrap();
+            .env("XDG_STATE_HOME", state.path());
+        let output = support::scripted::output(command);
         let value = envelope(&output, 10);
         assert_eq!(value["error"]["code"], "input_not_empty");
         assert_eq!(value["error"]["data"]["composer"]["visible_bytes"], 17);
         assert!(stderr(&output).contains("agent UI"));
-        let plain = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
+        let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
+        command
             .args(["agent", "send", "--no-submit", "reviewer", "extra"])
             .env("FLOCK_SOCKET_PATH", &socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
-            .env("XDG_STATE_HOME", state.path())
-            .output()
-            .unwrap();
+            .env("XDG_STATE_HOME", state.path());
+        let plain = support::scripted::output(command);
         assert_eq!(plain.status.code(), Some(10));
         assert!(plain.stdout.is_empty());
         assert!(stderr(&plain).contains("agent UI"));

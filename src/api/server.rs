@@ -232,7 +232,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
     crate::ipc::restrict_socket_permissions(path, SOCKET_PERMISSION_MODE)
 }
 
-fn handle_connection(
+pub(crate) fn handle_connection(
     mut stream: UnixStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -241,6 +241,7 @@ fn handle_connection(
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> std::io::Result<()> {
     let peer_pid = socket_peer_pid(&stream);
+    let peer_birth = peer_pid.and_then(crate::platform::process_start_time);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         crate::logging::api_connection_write_timeout_unavailable(&err.to_string());
     }
@@ -402,6 +403,7 @@ fn handle_connection(
                 api_tx,
                 capabilities,
                 peer_pid,
+                peer_birth,
                 listener_health,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -473,6 +475,7 @@ fn handle_request(
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
     peer_pid: Option<u32>,
+    peer_birth: Option<u64>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> String {
     match request.method {
@@ -504,7 +507,7 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
-        _ => dispatch_to_app(request, api_tx, peer_pid),
+        _ => dispatch_attributed(request, api_tx, None, peer_pid, peer_birth),
     }
 }
 
@@ -875,15 +878,27 @@ fn is_connection_closed_error(err: &std::io::Error) -> bool {
     )
 }
 
-fn dispatch_to_app(request: Request, api_tx: &ApiRequestSender, peer_pid: Option<u32>) -> String {
-    dispatch_to_app_with_timeout(request, api_tx, None, peer_pid)
-}
-
 pub(super) fn dispatch_to_app_with_timeout(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
     peer_pid: Option<u32>,
+) -> String {
+    dispatch_attributed(
+        request,
+        api_tx,
+        timeout,
+        peer_pid,
+        peer_pid.and_then(crate::platform::process_start_time),
+    )
+}
+
+fn dispatch_attributed(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+    peer_pid: Option<u32>,
+    peer_birth: Option<u64>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -891,6 +906,7 @@ pub(super) fn dispatch_to_app_with_timeout(
         request,
         respond_to,
         peer_pid,
+        peer_birth,
     }) {
         return error_response_json(
             request_id,
@@ -1099,6 +1115,7 @@ mod tests {
                 &tx,
                 None,
                 None,
+                None,
                 &health,
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1290,6 +1307,7 @@ mod tests {
                 pane_input_write_ack: false,
             }),
             None,
+            None,
             &Mutex::default(),
         );
 
@@ -1308,7 +1326,7 @@ mod tests {
 
         let request_for_thread = request.clone();
         let thread = std::thread::spawn(move || {
-            handle_request(request_for_thread, &tx, None, None, &Mutex::default())
+            handle_request(request_for_thread, &tx, None, None, None, &Mutex::default())
         });
 
         let msg = rx.blocking_recv().unwrap();

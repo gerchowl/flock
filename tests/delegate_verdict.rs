@@ -219,22 +219,11 @@ impl Pane {
                 }
             }
         });
-        let hash = socket
-            .to_string_lossy()
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            });
-        let app = if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        };
         let registry = base
             .join("state")
-            .join(app)
+            .join(support::paths::app_dir_name())
             .join("delegates")
-            .join(format!("{hash:016x}"));
+            .join(support::paths::server_key(&socket));
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(registry.join("fixture.json"), json!({
             "name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1", "root_pane": "ws_fixture:p0",

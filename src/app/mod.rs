@@ -144,6 +144,7 @@ impl PaneClickState {
 struct ParkedApiRequest {
     request: crate::api::schema::Request,
     peer_pid: Option<u32>,
+    peer_birth: Option<Option<u64>>,
     respond_to: std::sync::mpsc::Sender<String>,
     deadline: Instant,
 }
@@ -172,6 +173,9 @@ pub struct App {
     /// Peer PID of the API request currently being handled; lets pane
     /// reports resolve by process ancestry when env pane-ids are stale.
     pub(crate) current_api_peer_pid: Option<u32>,
+    /// Internal call, captured socket birth, or captured-but-unavailable birth.
+    pub(crate) current_api_peer_birth: Option<Option<u64>>,
+    pub(crate) session_leases: crate::structured::lease::SessionLeases,
     /// Test-only override for pane child PIDs so ancestry reconciliation can
     /// be exercised without spawning real PTYs.
     #[cfg(test)]
@@ -216,7 +220,11 @@ pub struct App {
     /// then would read an empty projection, so they wait for the rebuild.
     recovery_parked: Vec<ParkedApiRequest>,
     /// Set by dispatch, taken by `respond_or_park`, which owns the responder.
-    pub(crate) pending_recovery_park: Option<(crate::api::schema::Request, Option<u32>)>,
+    pub(crate) pending_recovery_park: Option<(
+        crate::api::schema::Request,
+        Option<u32>,
+        Option<Option<u64>>,
+    )>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_forward_generation: Option<u64>,
     pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
@@ -964,6 +972,8 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             current_api_peer_pid: None,
+            current_api_peer_birth: None,
+            session_leases: Default::default(),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
             event_rx,
@@ -1243,11 +1253,13 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
         peer_pid: Option<u32>,
+        peer_birth: Option<Option<u64>>,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         self.recovery_parked.push(ParkedApiRequest {
             request,
             peer_pid,
+            peer_birth,
             respond_to,
             deadline: Instant::now() + RECOVERY_PARK_LIMIT,
         });
@@ -1271,13 +1283,14 @@ impl App {
 
     /// Answer parked mail requests in arrival order, each with its own caller.
     fn replay_recovery_parked(&mut self) {
-        let caller = self.current_api_peer_pid;
+        let caller = (self.current_api_peer_pid, self.current_api_peer_birth);
         for parked in std::mem::take(&mut self.recovery_parked) {
             self.current_api_peer_pid = parked.peer_pid;
+            self.current_api_peer_birth = parked.peer_birth;
             let response = self.handle_api_request_after_internal_events_drained(parked.request);
             self.respond_or_park(parked.respond_to, response);
         }
-        self.current_api_peer_pid = caller;
+        (self.current_api_peer_pid, self.current_api_peer_birth) = caller;
     }
 
     #[cfg(unix)]

@@ -196,6 +196,13 @@ pub(crate) struct WakeSuppression {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
+        if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
+            return encode_error(
+                id,
+                "msg_not_allowed",
+                "structured caller identity is unresolved",
+            );
+        }
         self.send_message(id, params)
     }
 
@@ -250,14 +257,7 @@ impl App {
         let from_repo = sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx));
         // Ancestry attests local identity. Operator tooling may still name an
         // unattested sender with from_agent, which grants no remote authority.
-        let attested_agent = sender.and_then(|(ws_idx, pane_id)| {
-            let ws = self.state.workspaces.get(ws_idx)?;
-            let terminal = self
-                .state
-                .terminals
-                .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
-            Some(terminal.agent_id.to_string())
-        });
+        let attested_agent = self.attested_sender_agent();
         let from_host = attested_agent
             .as_ref()
             .map(|_| crate::app::short_host_name());
@@ -318,6 +318,13 @@ impl App {
     }
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
+        if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
+            return encode_error(
+                id,
+                "msg_not_allowed",
+                "structured caller identity is unresolved",
+            );
+        }
         let correlation_id = params.correlation_id.clone();
         let response = self.route_msg_reply(id, params);
         // Durable acceptance settles channel-pushed mail in the replier's inbox.
@@ -531,14 +538,7 @@ impl App {
         ApiCaller {
             from_pane: sender.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
             from_repo: sender.and_then(|(ws_idx, _)| self.workspace_repo_label(ws_idx)),
-            attested_agent: sender.and_then(|(ws_idx, pane_id)| {
-                let ws = self.state.workspaces.get(ws_idx)?;
-                let terminal = self
-                    .state
-                    .terminals
-                    .get(&ws.pane_state(pane_id)?.attached_terminal_id)?;
-                Some(terminal.agent_id.to_string())
-            }),
+            attested_agent: self.attested_sender_agent(),
         }
     }
 
@@ -1380,6 +1380,11 @@ impl App {
     /// its process ancestry. `None` when the caller is in no pane — an
     /// operator shell, the relay, a hub forwarding for a spoke.
     pub(super) fn attested_sender_agent(&mut self) -> Option<String> {
+        match self.lease_caller() {
+            crate::structured::lease::Caller::Agent { agent, .. } => return Some(agent),
+            crate::structured::lease::Caller::Uncertain => return None,
+            crate::structured::lease::Caller::Unrelated => (),
+        }
         let (ws_idx, pane_id) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)?;
         let ws = self.state.workspaces.get(ws_idx)?;
         let terminal = self
@@ -2050,6 +2055,7 @@ mod tests {
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
         assert!(
             responses.try_recv().is_err(),
@@ -2075,6 +2081,7 @@ mod tests {
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
         assert!(responses.try_recv().is_err(), "parked, not answered");
         responses
@@ -2227,6 +2234,7 @@ mod tests {
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
         let response = answer(&responses);
         assert!(response.get("error").is_none(), "{response}");
