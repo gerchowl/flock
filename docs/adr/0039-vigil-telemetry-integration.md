@@ -1,6 +1,6 @@
 # ADR-0039: flk's logs, metrics and traces go through vig-os/vigil as per-role OTLP/JSON Lines files, carry ids and never content, and are read back only by the flk server
 
-- Status: Proposed; the §8 owner decisions were taken on 2026-10-16
+- Status: Proposed
 - Date: 2026-10-16, amended the same day (#1648: the ratchet's exact type set and baseline)
 - Issues: [#1614](https://github.com/gerchowl/flock/issues/1614) (this record), [#1648](https://github.com/gerchowl/flock/issues/1648) (the ratchet, gates V1a.0), [#1300](https://github.com/gerchowl/flock/issues/1300) (adoption, gated on a vigil release), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the owner's vigil decision), [#1619](https://github.com/gerchowl/flock/issues/1619) (G13, the GUI views)
 - Builds on: ADR-0038 §4a and §11 item 5 (the owner chose vigil on 2026-10-16; the GUI's telemetry views); ADR-0036 §4 and §5 (session streams, wire scopes, `cmd_id`); ADR-0010 (`flk report`); ADR-0005 and ADR-0028 (the durable event log, which stays state, not telemetry); ADR-0014 and ADR-0035 (operator-only verbs); ADR-0026 (mesh)
@@ -243,7 +243,7 @@ Each waits for the vigil release that ships what it uses, and codes against that
 
 ### 8. Owner decisions
 
-**Decided by the owner on 2026-10-16:** all three as recommended. Audit is on by default once V4 ships and fails closed, with the mechanism in §5. The §3 retention defaults stand. Cross-node `traceparent` is deferred to the next mesh protocol version (#1699).
+**Pending the owner's confirmation.** The recommendations below stand until the owner confirms them in writing. The `traceparent` follow-up is filed as #1699 either way.
 
 | # | Question | Recommendation |
 |---|---|---|
