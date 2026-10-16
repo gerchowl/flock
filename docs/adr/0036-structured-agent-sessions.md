@@ -938,6 +938,7 @@ local use, and its types precede G3 in S7a. No deployment is authorized here.
 | --- | --- | --- |
 | Connect deadline | 10 s per attempt, from attempt start through name resolution, TCP/TLS and HTTP upgrade | Bounds a black-holed route without waiting for operating-system timeouts; allows mobile connection setup. |
 | Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes if valid `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
+| Handoff deadline | 10 s from handoff request, across producer quiescence, claim settlement, flush and readiness for exclusive transfer | This is local coordination, not model work. Bound a stuck producer or flush without releasing ownership; fail and continue serving from the old owner rather than half-transfer. |
 | Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
 | Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
 | Subscription progress deadline | 30 s without a frame advancing that subscription while awaiting synced or snapshot completion | Large replays may take longer overall; unrelated traffic and heartbeats cannot hide a stalled stream. Only that stream re-subscribes. |
@@ -1021,7 +1022,10 @@ a delta cannot reconstruct a missing base. As for other snapshots, synced
 follows its completion and never substitutes for the frame. Cursors and
 identity survive reconnect; neither a new socket nor a new server epoch resets
 seqs. A cursor ahead of the restored stream head is refused as `cursor_ahead`,
-not clamped or treated as caught up. Re-subscribe live deltas without `after`.
+not clamped or treated as caught up. Re-subscribe only the cursorless
+`agent/<id>/live` stream without `after`. Terminal recovery always uses its
+full-frame snapshot path; on cursor_ahead it clears that stream's state/cursor
+and bootstraps without `after` as specified below, never starts from a delta.
 
 **Subscription refusal and progress.** `subfail { sub_id, code, message }`
 ends only the named subscription and supplies these typed codes (S7a defines
@@ -1096,27 +1100,56 @@ refuse `resume_only` commands rather than assume an empty cache permits executio
 A revoked token stays revoked; no auth state is inherited from a dead socket.
 
 **Single-writer handoff.** As in ADR-0026's ownership-transfer rule, ownership
-of `wire/commands.jsonl`, every queue/session log, checkpoints and their seq
-allocators transfers **before the new server accepts** any wire connection or
-command. The old server stops admission and command claims, closes all its
-`/v1/ws` sockets, drains or records uncertain in-flight claims, quiesces all
-append/rewrite producers, durably flushes their files, then relinquishes its
-exclusive writer ownership. Only after that transfer may the new server load
-the files, recover pending claims/high-waters, and start accepting. No old writer
-may append, rename a rewrite or mint a seq afterward; reject late callbacks by
-owner generation. Hold an exclusive data-directory writer lock/fence through
-all writes and recover ownership after a crash before loading as the new owner.
-If release cannot be proven, fail handoff rather than run two writers. This
-contract closes the wire/storage overlap gap identified in ADR-0005; it does
-not claim that the existing implementation already enforces it.
+of `wire/commands.jsonl`, every queue/session log and checkpoint, **ADR-0005's
+`event-log.jsonl` (including the `events` stream's seq allocator)**, and all
+other wire-stream seq allocators transfers before the new server loads these
+files or accepts a connection/command. Hold an exclusive data-directory writer
+lock/fence through all writes. Store the owner generation with that lock; every
+append, seq allocation and rename-rewrite checks it before committing, including
+late callbacks. A process overlap never permits two writer generations.
+
+Handoff has the proposed **10 s monotonic deadline** through the ownership
+commit; preparation and every precondition share that deadline, rather than
+receiving new windows at each stage.
+The old server retains ownership and continues serving reads while temporarily
+refusing new command admission/claims with `restart_pending`. It prepares a
+reversible quiescence barrier, drains or durably records uncertain in-flight
+claims, and flushes producers within that one deadline; none of these steps may
+wait indefinitely. Do not close existing wire sockets or release ownership until
+all readiness evidence has arrived. At the final fenced transfer, close the old
+`/v1/ws` sockets, stop all old writes, and transfer ownership before the new
+server loads/replays files and accepts. No old callback may write afterward.
+Crash recovery acquires exclusive ownership before loading as the new owner.
+
+If a producer, flush or ownership-readiness step remains stuck at the deadline,
+**fail the handoff** with the existing `handoff_failed` outcome. Cancel the
+transfer request and discard its late readiness callbacks; keep the old lock,
+owner generation and serving endpoint, resume admission and reversible producers,
+and leave the new server unable to load as owner or accept. No counter, journal
+or checkpoint ownership has been half-transferred. The final ownership commit
+must atomically check deadline/cancellation before transferring; a timed-out
+request can never later release the old fence. A blocked producer remains the
+old owner's responsibility and may fail its own operation; it cannot force
+handoff or hold the handoff caller open. Once ownership has committed, report
+the committed outcome, never turn an acknowledgement delay into a rollback claim.
+This closes the overlap contract gap identified in ADR-0005; it does not claim
+that the existing implementation already enforces these rules.
 
 **Revocation on an open socket.** Re-check the current token file/digest and
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
 cannot be newly admitted after revocation. On detection of a removed/replaced
-token, close **all sockets for that token with 4403**; clients enter NeedsToken.
-Check hello against the file too, with 4401 on refusal. This command-time check
+token, return an error ack for the triggering cmd with `code:"auth_revoked"`
+before closing **all sockets for that token with 4403**; clients enter NeedsToken.
+Order that ack before the close on the triggering socket, without waiting for
+client acknowledgement or relaxing the write/liveness deadline. If the network
+loses the ack, the close still signals revocation. A still-valid token whose
+scopes have shrunk instead gets an error ack with `code:"scope"`; do not claim,
+return a cached result or dispatch an unauthorized verb, and keep the socket
+open for allowed operations. S7a defines these typed error codes and the
+implementation registers new API codes where needed. Check hello against the
+file too, with 4401 on refusal. This command-time check
 is chosen because it does not rely on portable filesystem-watch delivery. Its
 limit is explicit: deletion alone does not proactively close a read-only idle
 socket; the next cmd or reconnect detects it. Revocation prevents subsequent
@@ -1171,8 +1204,10 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
 | Restart, handoff, missing journal or ahead cursor | Token scopes and stream seqs persist; no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
 | Compression disabled | Offer permessage-deflate from browser, webview and native fixtures: every S7 upgrade declines it, all messages including hello have RSV1 unset, and no secret appears in diagnostics. |
-| Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks. New acceptance/loading waits for exclusive ownership; late old callbacks cannot write or allocate seqs. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. Failed release fails handoff. |
-| Open-session revocation | Authenticate two sockets with one token, revoke it, then send a new cmd on one and a duplicate on the other. Neither claims, returns cached ack or dispatches; both close 4403 and enter NeedsToken. Rejected hello closes 4401. An already admitted command is not claimed cancelled. |
+| Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks, including event-log.jsonl writes. New loading/acceptance requires exclusive ownership; every write checks the lock's owner generation. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. |
+| Stuck handoff producer | Keep a producer alive but unable to quiesce (repeat for a stalled flush/readiness step). At the supplied-clock 10 s deadline, handoff fails with handoff_failed: old ownership/generation/serving remain, admission resumes, new owner loads/accepts nothing. Release the delayed callback afterward: it cannot transfer the fence or mint a new-owner seq. No hang or half-transfer. |
+| Open-session revocation | Authenticate two sockets with one token, revoke it, then send a new cmd on one and a duplicate on the other. Neither claims, returns cached result or dispatches; the triggering cmd gets auth_revoked error ack before both sockets close 4403 and enter NeedsToken. Rejected hello closes 4401. An already admitted command is not claimed cancelled. |
+| Scope shrink | Reduce a still-valid token's scope after hello; a newly unauthorized cmd and cached-result lookup both get scope error ack without admission/result disclosure. Socket remains open and an allowed operation still succeeds. |
 | Slow replay heartbeat priority | Queue replay in both directions on a constrained healthy link; ping/pong bypass waiting data and prevent false Stale from backlog. An actually blocked writer or missing pong still fails within the liveness ceiling. |
 | Terminal snapshot recovery | Lose delta history, then receive gap with snapshot_to and a full frame followed by deltas and synced. The old display remains stale until the full frame applies; a delta or early synced cannot clear it. Removed pane refuses unknown_stream. |
 | subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps without after. Other streams continue. |
