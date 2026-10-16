@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const SETTLE_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Turn {
     Working,
@@ -30,6 +31,7 @@ pub enum Turn {
 /// Work the agent left running outside its turn: `"none"`,
 /// `{"running": {"count": N}}` or `"unknown"` on the wire (ADR-0028 §1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Background {
     None,
@@ -56,10 +58,12 @@ impl Background {
 /// "retry_after_ms"?: N}}` or `"unknown"` on the wire. A reason this build
 /// does not know reads as `unknown` and keeps its variant (§3a).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
     None,
     /// A prompt at the pane that a human answers: today's `blocked`.
+    #[cfg_attr(feature = "ts", ts(optional_fields))]
     NeedsHuman {
         #[serde(default, deserialize_with = "or_unknown")]
         reason: HumanReason,
@@ -73,6 +77,7 @@ pub enum Attention {
         question: Option<Box<crate::api::question::Question>>,
     },
     /// A state no quick answer at the pane resolves.
+    #[cfg_attr(feature = "ts", ts(optional_fields))]
     Blocked {
         #[serde(default, deserialize_with = "or_unknown")]
         reason: BlockedReason,
@@ -81,6 +86,8 @@ pub enum Attention {
             deserialize_with = "or_unknown",
             skip_serializing_if = "Option::is_none"
         )]
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
         retry_after_ms: Option<u64>,
     },
     #[default]
@@ -90,6 +97,7 @@ pub enum Attention {
 /// What a `needs_human` prompt asks for. `unknown` is a prompt whose kind
 /// its source cannot name: a hook report, or a harness without matchers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum HumanReason {
     Question,
@@ -102,6 +110,7 @@ pub enum HumanReason {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum BlockedReason {
     ProviderLimit,
@@ -114,6 +123,7 @@ pub enum BlockedReason {
 /// or `"unknown"` on the wire. `since` and `deadline` are Unix ms. With
 /// several waits open, the oldest is reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Waiting {
     None,
@@ -124,8 +134,12 @@ pub enum Waiting {
         #[serde(default, deserialize_with = "or_unknown")]
         predicate: String,
         #[serde(default, deserialize_with = "or_unknown")]
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "f64"))]
         since: u64,
         #[serde(default, deserialize_with = "or_unknown")]
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "f64"))]
         deadline: u64,
     },
     #[default]
@@ -133,6 +147,7 @@ pub enum Waiting {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     Live,
@@ -146,6 +161,7 @@ pub enum Lifecycle {
 /// Ordered as the ADR's phase table, which is the order a predicate's phase
 /// list is rendered in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Gone,
@@ -165,6 +181,7 @@ pub enum Phase {
 
 /// Where an axis's value came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum StateSource {
     Screen,
@@ -180,6 +197,8 @@ pub enum StateSource {
 /// An axis nothing reports has no entry. `lifecycle` has none: it is the
 /// server's own record of the process, not an observation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct StateSources {
     #[serde(
         default,
@@ -208,10 +227,12 @@ pub struct StateSources {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 ///
 /// Every field reads leniently: a missing, renamed or reshaped value (a
 /// newer server's `background: running { … }`) becomes `unknown` on its own
 /// and the other axes survive (ADR-0028 §3a).
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct AgentState {
     #[serde(default, deserialize_with = "or_unknown")]
     pub turn: Turn,
@@ -233,6 +254,8 @@ pub struct AgentState {
         deserialize_with = "or_unknown",
         skip_serializing_if = "Option::is_none"
     )]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub held_ms: Option<u64>,
     #[serde(default, deserialize_with = "or_unknown")]
     pub source: StateSources,

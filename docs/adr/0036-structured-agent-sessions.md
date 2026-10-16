@@ -901,6 +901,31 @@ renders them and compares with the checked-in `web/client/src/gen/*.ts`; a
 difference fails the test and therefore CI, and `just gen-ts` rewrites the
 files. No hand-written TS type may describe a wire shape.
 
+S8a (#1592) starts with the socket API's `AgentInfo`, `FleetAgentInfo`,
+`WorkspaceInfo` and `PaneInfo` records, their transitive dependencies, the
+question types and the Claude adapter's `SessionEvent`. The adapter's custom
+serializer emits an untagged union, so its TS derive explicitly uses that
+representation, with `Unknown` represented by `unknown`. The event catalogue
+also generates Rust discriminator enums for ts-rs to inline as string literals;
+no TypeScript wire declarations are maintained by hand. Extra JSON fields stay
+flattened as an index signature. Clients validate unknown input before narrowing
+known members on `type` and the catalogue's discriminator; unrecognised shapes
+use §8's rendering.
+
+Absent metadata and explicit null remain distinct: `Option<Option<T>>` is
+exported as `?: T | null`. Typed 64-bit durations, timestamps and counters use
+JSON numbers, with exact JavaScript integer precision only below 2^53, documented
+on each field. Opaque identities and turn cursors already use strings. The default
+build excludes ts-rs; `just check` and CI compile and test the `ts` feature.
+`just gen-ts` is an explicit, ignored nextest generator, while the drift test
+only reads files, so a normal test run cannot repair stale generated output.
+The generator normalises trailing whitespace, and checks the complete TS file
+inventory as well as contents. ts-rs reports unsupported custom deserializers;
+these affect lenient input reading, while the emitted types describe serialization.
+`Unknown.raw` retains the exact line. The existing serde_json serializer preserves
+JSON token spelling and interior whitespace, trims surrounding whitespace, and
+encodes non-JSON diagnostics as a JSON string.
+
 ### 7. The Bun/TypeScript reference client
 
 - **Layout.** `web/client/` is a Bun workspace: `src/gen/` (generated, §6),
