@@ -84,6 +84,14 @@ pub(crate) enum ExecCadence {
     Periodic,
 }
 
+fn read_command_pipe(mut pipe: Option<impl std::io::Read>) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Some(pipe) = pipe.as_mut() {
+        pipe.read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 // Landing the wrapper as its own commit means every builder method looks
 // dead until the migration sweep lands next. The struct + impl carry a
 // module-scope allow rather than one #[allow] per fn — the migration commit
@@ -279,8 +287,6 @@ impl TracedCommand {
         input: Option<Vec<u8>>,
         timeout: Duration,
     ) -> io::Result<Output> {
-        use std::io::Read;
-
         let args = shape_args(&self.inner);
         let start = Instant::now();
         self.process_group(0);
@@ -302,64 +308,52 @@ impl TracedCommand {
             let mut stderr_pipe = child.stderr.take();
             let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(pipe) = stdout_pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                let _ = stdout_tx.send(buf);
+                let _ = stdout_tx.send(read_command_pipe(stdout_pipe.take()));
             });
             let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(pipe) = stderr_pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                let _ = stderr_tx.send(buf);
+                let _ = stderr_tx.send(read_command_pipe(stderr_pipe.take()));
             });
 
             let deadline = start + timeout;
             let status = loop {
-                match child.try_wait()? {
-                    Some(status) => break Some(status),
-                    None if Instant::now() >= deadline => {
-                        // SIGKILL, not SIGTERM: this is a probe we already gave
-                        // its full budget, and a child ignoring TERM would just
-                        // extend the stall we are here to bound.
-                        crate::platform::kill_process_group(child.id());
-                        let _ = child.kill();
+                if Instant::now() >= deadline {
+                    crate::platform::kill_process_group(child.id());
+                    let _ = child.kill();
+                    // Reaping must not extend the caller's expired budget.
+                    std::thread::spawn(move || {
                         let _ = child.wait();
-                        break None;
-                    }
+                    });
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
+                }
+                match child.try_wait()? {
+                    Some(status) => break status,
                     None => std::thread::sleep(TIMEOUT_POLL_INTERVAL),
                 }
             };
 
-            if status.is_none() {
-                // Descendants can escape the group and retain pipes. Never join
-                // their readers after the deadline.
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
-            }
-            let read_output = |reader: std::sync::mpsc::Receiver<Vec<u8>>| {
+            let read_output = |reader: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>| {
                 reader
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .map_err(|_| {
                         crate::platform::kill_process_group(child.id());
                         io::Error::new(io::ErrorKind::TimedOut, "output pipes timed out")
-                    })
+                    })?
             };
             let stdout = read_output(stdout_rx)?;
             let stderr = read_output(stderr_rx)?;
-            match status {
-                Some(status) => Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                }),
-                None => Err(io::Error::new(
+            if Instant::now() >= deadline {
+                crate::platform::kill_process_group(child.id());
+                return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("timed out after {}s", timeout.as_secs()),
-                )),
+                    "output pipes timed out",
+                ));
             }
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
         })();
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
@@ -596,6 +590,23 @@ fn shape_args(command: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pipe_error_never_returns_its_valid_looking_partial_prefix() {
+        struct FailedRead(bool);
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("scripted pipe failure"));
+                }
+                self.0 = true;
+                let bytes = b"codex-cli 0.160.1\n";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        assert!(super::read_command_pipe(Some(FailedRead(false))).is_err());
+    }
+
     use super::*;
     use crate::logging::capture_logs;
 

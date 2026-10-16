@@ -37,6 +37,9 @@ mod checksum;
 mod cli;
 mod client;
 mod codex_transcript;
+// Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
+#[allow(dead_code)]
+mod codex_version;
 mod config;
 mod opencode_transcript;
 // #348 / ADR-0014 §4: one definition of "terminal control sequence",
