@@ -74,11 +74,17 @@ pub fn scripted_server(
 }
 
 pub fn flk(socket: &PathBuf, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_flk"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+    command
         .args(args)
         .env("FLOCK_SOCKET_PATH", socket)
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
-        .env_remove("FLOCK_ENV")
-        .output()
-        .expect("flk should run")
+        .env_remove("FLOCK_ENV");
+    output(command)
+}
+
+/// Collect a scripted CLI within its own deadline, including pipe draining.
+pub fn output(command: Command) -> Output {
+    super::command::output(command, None, super::command::CLI_LIMIT)
+        .expect("scripted flk must finish within its command deadline")
 }
