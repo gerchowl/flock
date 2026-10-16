@@ -1,14 +1,24 @@
-/** Test helper: a Vite build of the client into a directory of its own. */
+/**
+ * Test helper: a Vite build of the client into a directory of its own.
+ *
+ * The build runs as a child process: the test process carries happy-dom's
+ * globals (tests/setup.ts), and Vite's Node API must not load into it.
+ */
 import { readdir } from "node:fs/promises";
-
-import { build } from "vite";
 
 /** The client's root directory. */
 export const CLIENT_ROOT = `${import.meta.dir}/..`;
 
 /** Builds the client in `mode` into `outDir` and lists the emitted files. */
 export async function buildClient(mode: "production" | "fixture", outDir: string): Promise<string[]> {
-  await build({ root: CLIENT_ROOT, mode, logLevel: "error", build: { outDir, emptyOutDir: true } });
+  const child = Bun.spawn(
+    [process.execPath, "x", "vite", "build", "--mode", mode, "--outDir", outDir, "--emptyOutDir", "--logLevel", "error"],
+    { cwd: CLIENT_ROOT, stdout: "pipe", stderr: "pipe" },
+  );
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+  if (code !== 0) {
+    throw new Error(`vite build --mode ${mode} exited ${code}: ${stderr}`);
+  }
   const files = await readdir(outDir, { recursive: true, withFileTypes: true });
   return files.filter((file) => file.isFile()).map((file) => `${file.parentPath}/${file.name}`.slice(outDir.length + 1));
 }
