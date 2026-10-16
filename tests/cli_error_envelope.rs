@@ -217,11 +217,7 @@ fn draft_refusal_guides_registered_delegates_after_manual_resolution() {
     }
     let registry = state
         .path()
-        .join(if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        })
+        .join(support::paths::app_dir_name())
         .join("delegates")
         .join(format!("{socket_hash:016x}"));
     std::fs::create_dir_all(&registry).unwrap();

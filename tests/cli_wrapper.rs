@@ -12,6 +12,8 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -204,14 +206,6 @@ fn spawn_flock_with_pane_history(
         None,
         "onboarding = false\n[experimental]\npane_history = true\n",
     )
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    }
 }
 
 fn named_session_socket(config_home: &Path, session: &str) -> PathBuf {

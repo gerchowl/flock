@@ -359,11 +359,7 @@ fn server_state_is_isolated_between_fixtures() {
         let socket = runtime.join("flock.sock");
         servers.push(spawn_flock(&config, &runtime, &socket));
 
-        let app = if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        };
+        let app = support::paths::app_dir_name();
         wait_for_path(
             &config.join("state").join(app).join("mesh-mail.sqlite"),
             Duration::from_secs(5),

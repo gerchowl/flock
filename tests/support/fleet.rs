@@ -477,7 +477,8 @@ impl Fleet {
 
     pub fn set_allow_from(&self, node: &str, list: &[&str]) {
         let node = self.node(node);
-        for app in ["flock", "flock-dev"] {
+        {
+            let app = super::paths::app_dir_name();
             let path = node.config_home.join(app).join("config.toml");
             let mut config: toml::Value =
                 toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -648,8 +649,9 @@ pub fn spawn_with_startup_probe(
             config.push_str(&format!("\n[[peers]]\nname = \"{peer}\"\n"));
         }
         config.push_str(spec.extra_config);
-        // Debug builds read the flock-dev app dir; release builds read flock.
-        for app_dir in ["flock", "flock-dev"] {
+        // Seed only the namespace used by the compiled CLI.
+        {
+            let app_dir = super::paths::app_dir_name();
             let dir = path.config_home.join(app_dir);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("config.toml"), &config).unwrap();

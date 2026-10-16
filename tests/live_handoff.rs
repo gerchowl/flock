@@ -185,10 +185,12 @@ fn spawn_named_session_server(
     session_name: &str,
 ) -> SpawnedFlock {
     let _timing = support::timing::phase(support::timing::Phase::Spawn);
-    fs::create_dir_all(config_home.join("flock-dev")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
-        config_home.join("flock-dev/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -223,7 +225,8 @@ fn spawn_named_session_server(
     support::readiness::wait_for_server(
         spawned.master.as_ref(),
         &config_home
-            .join("flock-dev/sessions")
+            .join(support::paths::app_dir_name())
+            .join("sessions")
             .join(session_name)
             .join("flock.sock"),
     );
@@ -232,10 +235,12 @@ fn spawn_named_session_server(
 
 fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedFlock {
     let _timing = support::timing::phase(support::timing::Phase::Spawn);
-    fs::create_dir_all(config_home.join("flock-dev")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
-        config_home.join("flock-dev/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -269,7 +274,9 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     };
     support::readiness::wait_for_server(
         spawned.master.as_ref(),
-        &config_home.join("flock-dev/flock.sock"),
+        &config_home
+            .join(support::paths::app_dir_name())
+            .join("flock.sock"),
     );
     spawned
 }
@@ -620,8 +627,12 @@ fn handoff_importer_lookup_ignores_importers_outside_the_sandbox() {
             .spawn()
             .unwrap()
     };
-    let outside = elsewhere.join("flock-dev").join(&socket_name);
-    let inside = config_home.join("flock-dev").join(&socket_name);
+    let outside = elsewhere
+        .join(support::paths::app_dir_name())
+        .join(&socket_name);
+    let inside = config_home
+        .join(support::paths::app_dir_name())
+        .join(&socket_name);
     let mut decoys = vec![
         decoy(vec![
             "server".into(),
@@ -754,7 +765,9 @@ fn live_handoff_preserves_named_session_socket_paths() {
     let base = directory.path().to_path_buf();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let session_dir = config_home.join("flock-dev/sessions/work");
+    let session_dir = config_home
+        .join(support::paths::app_dir_name())
+        .join("sessions/work");
     let api_socket = session_dir.join("flock.sock");
     let client_socket = session_dir.join("flock-client.sock");
 
@@ -777,7 +790,10 @@ fn live_handoff_preserves_named_session_socket_paths() {
     wait_for_api(&api_socket, Duration::from_secs(10));
     UnixStream::connect(&client_socket).expect("handoff client listener is bound");
     assert!(
-        !config_home.join("flock-dev/flock.sock").exists(),
+        !config_home
+            .join(support::paths::app_dir_name())
+            .join("flock.sock")
+            .exists(),
         "named handoff unexpectedly bound the default session API socket"
     );
 
@@ -1446,10 +1462,17 @@ fn live_handoff_preserves_http_servers_across_multiple_sessions() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let sessions = [
-        (None, config_home.join("flock-dev/flock.sock")),
+        (
+            None,
+            config_home
+                .join(support::paths::app_dir_name())
+                .join("flock.sock"),
+        ),
         (
             Some("work"),
-            config_home.join("flock-dev/sessions/work/flock.sock"),
+            config_home
+                .join(support::paths::app_dir_name())
+                .join("sessions/work/flock.sock"),
         ),
     ];
     let mut spawned = Vec::new();
@@ -1575,7 +1598,12 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
         );
         assert_eq!(refused["error"]["code"], "msg_not_allowed", "{refused}");
     }
-    let log = fs::read_to_string(config_home.join("flock-dev/flock-server.log")).unwrap();
+    let log = fs::read_to_string(
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("flock-server.log"),
+    )
+    .unwrap();
     assert!(log.contains("config.removed_key"), "{log}");
     assert_ok(request(
         &api,
@@ -1866,7 +1894,10 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         "committed_store" | "slow_store" | "slow_store_rollback" => "",
         other => other,
     };
-    let identity_path = runtime_dir.join("state/flock-dev/mesh/identity.json");
+    let identity_path = runtime_dir
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh/identity.json");
     let mut extra_env = vec![
         ("FLOCK_TEST_HANDOFF_IMPORT_FAIL", hook),
         (
@@ -2057,7 +2088,10 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         ));
     }
     let database = rusqlite::Connection::open_with_flags(
-        runtime_dir.join("state/flock-dev/mesh-mail.sqlite"),
+        runtime_dir
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
@@ -2256,7 +2290,8 @@ fn live_handoff_before_commit_failure_reopens_writer() {
 
 #[test]
 fn handoff_import_stalled_peer_exits_within_deadline() {
-    let base = std::env::temp_dir().join(format!("hi363-{}", std::process::id()));
+    let socket_dir = support::socket_dir::SocketDir::reserve("hi1683");
+    let base = socket_dir.path().to_path_buf();
     fs::create_dir_all(&base).unwrap();
     let socket = base.join("import.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2313,7 +2348,8 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
 
 #[test]
 fn handoff_ready_importer_survives_commit_after_startup_deadline() {
-    let base = std::env::temp_dir().join(format!("hc363-{}", std::process::id()));
+    let socket_dir = support::socket_dir::SocketDir::reserve("hc1683");
+    let base = socket_dir.path().to_path_buf();
     fs::create_dir_all(&base).unwrap();
     let socket = base.join("import.sock");
     let api_socket = base.join("api.sock");
@@ -2375,7 +2411,11 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
         assert_eq!(line.trim_end(), expected);
     }
     // No custody writer or schema migration is allowed before commit.
-    assert!(!base.join("state/flock-dev/mesh-mail.sqlite").exists());
+    assert!(!base
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh-mail.sqlite")
+        .exists());
     // The same clock would have killed the previous importer before commit.
     thread::sleep(Duration::from_secs(6));
     assert!(child.try_wait().unwrap().is_none());

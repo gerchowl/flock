@@ -312,7 +312,10 @@ fn a_broken_session_is_logged_once_not_repeated() {
     // Past one TTL (5s), so at least two probes have happened: the one at
     // startup and one refresh. A per-probe log line would make this 2+.
     std::thread::sleep(Duration::from_secs(7));
-    let log = harness.config_home.join("flock-dev/flock-server.log");
+    let log = harness
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("flock-server.log");
     let text = fs::read_to_string(&log).unwrap_or_default();
     let count = text
         .lines()

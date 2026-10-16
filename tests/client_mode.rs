@@ -482,11 +482,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     let api_socket = runtime_dir.join("flock.sock");
     let client_socket = runtime_dir.join("flock-client.sock");
 
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(
         config_home.join(app_dir).join("config.toml"),

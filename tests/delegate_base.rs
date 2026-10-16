@@ -28,7 +28,9 @@ fn send(round: u64, sha: Option<&str>, json: bool) -> std::process::Output {
         hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     let registry = root
-        .join("state/flock-dev/delegates")
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
         .join(format!("{hash:016x}"));
     fs::create_dir_all(&registry).unwrap();
     fs::write(

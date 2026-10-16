@@ -25,6 +25,8 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -81,14 +83,6 @@ impl Drop for Server {
         }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
-    }
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
     }
 }
 
@@ -526,7 +520,7 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// The test needs it for one thing only: rewriting an entry so its
 /// `workspace_id`, `pane_id`, and `root_pane` name a workspace that is not the
 /// delegate's, which is what a restarted server can leave behind. The key is
-/// FNV-1a 64 over the socket path string, exactly as `cli::delegate::server_key`
+/// FNV-1a 64 over the socket path string, exactly as `support::paths::server_key`
 /// computes it.
 fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub mod composer;
 pub mod fleet;
 pub mod json_api;
+pub mod paths;
 pub mod process_table;
 pub mod readiness;
 pub mod scripted;
