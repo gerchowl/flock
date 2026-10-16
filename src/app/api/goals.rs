@@ -194,11 +194,20 @@ impl App {
         let why = if self.caller_unattested_or_relayed() {
             "this node cannot attest the caller (no readable pid, or relayed from a mesh peer), and goals are per host".to_string()
         } else {
-            let SpawnCaller::Agent {
-                agent_id: caller, ..
-            } = self.spawn_caller()
-            else {
-                return Ok(agent_id);
+            let caller = match self.spawn_caller() {
+                SpawnCaller::Agent { agent_id, .. }
+                | SpawnCaller::Structured {
+                    agent_id: Some(agent_id),
+                    ..
+                } => agent_id,
+                SpawnCaller::Operator { .. } => return Ok(agent_id),
+                SpawnCaller::Structured { agent_id: None, .. } => {
+                    return Err(encode_error(
+                        id.into(),
+                        "goal_caller_refused",
+                        "structured caller identity is unresolved",
+                    ))
+                }
             };
             let supervisor = self
                 .delegations
@@ -227,8 +236,8 @@ impl App {
         };
         if target == "self" {
             return match self.spawn_caller() {
-                SpawnCaller::Agent { agent_id, .. } => Ok(agent_id),
-                SpawnCaller::Operator { .. } => Err(encode_error(
+                SpawnCaller::Agent { agent_id, .. } | SpawnCaller::Structured { agent_id: Some(agent_id), .. } => Ok(agent_id),
+                SpawnCaller::Operator { .. } | SpawnCaller::Structured { agent_id: None, .. } => Err(encode_error(
                     id.into(),
                     "no_caller_pane",
                     "`self` is the agent whose pane runs the caller, and this caller runs in no agent pane: name the agent with --agent",

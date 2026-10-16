@@ -1479,6 +1479,7 @@ mod tests {
             .unwrap(),
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
         response
     }
