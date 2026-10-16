@@ -75,6 +75,13 @@ impl Fixture {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture mode");
         path
     }
+    pub(crate) fn mcp(&self) -> SessionMcp {
+        SessionMcp::new(
+            &self.root.path().join("claude"),
+            &self.root.path().join("api.sock"),
+        )
+        .expect("owned fixture endpoint")
+    }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
         self.file(
             "case.json",
@@ -146,8 +153,9 @@ impl Fixture {
             .leases
             .reserve("fixture-agent", &location.session, None)
             .expect("lease");
+        let mcp = self.mcp();
         let worker = std::thread::spawn(move || {
-            let result = run(&state, profile, lease, location, |runtime| {
+            let result = run(&state, profile, lease, location, mcp, |runtime| {
                 let _ = ready_tx.send(runtime);
             });
             let _ = result_tx.send(result);
@@ -543,6 +551,7 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("failed spawn published a runtime"),
     )
     .expect_err("removed executable cannot spawn");
@@ -802,6 +811,7 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("owned publication failure"),
     )
     .expect("worker result");
@@ -863,6 +873,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
+            fixture.mcp(),
             |_| panic!("mismatched identity must never publish"),
         )
         .expect_err("mismatch");
