@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::App;
-use crate::agent_restart::{fingerprint, rate_limited, resume_launch, RestartPolicy};
+use crate::agent_restart::{
+    fingerprint, rate_limited, resume_launch, RestartLaunch, RestartPolicy,
+};
 use crate::agent_resume::{AgentResumePlan, PersistedAgentSession};
 use crate::api::schema::{
     AgentRestartParams, ErrorBody, EventData, EventEnvelope, EventKind, MessageTarget, MsgIntent,
-    MsgSendParams,
+    MsgSendParams, RestartDroppedFlag,
 };
 use crate::detect::AgentState;
 use crate::terminal::TerminalId;
@@ -26,6 +28,7 @@ pub(crate) struct RestartStates {
 struct RestartRequest {
     session: PersistedAgentSession,
     plan: AgentResumePlan,
+    dropped_flags: Vec<RestartDroppedFlag>,
     reason: String,
     continuation: String,
     requested_at: Instant,
@@ -115,7 +118,7 @@ impl App {
         &mut self,
         params: AgentRestartParams,
         now: Instant,
-    ) -> Result<(String, String, bool), ErrorBody> {
+    ) -> Result<(String, String, bool, Vec<RestartDroppedFlag>), ErrorBody> {
         self.queue_agent_restart_inner(params, now, None)
     }
 
@@ -124,7 +127,7 @@ impl App {
         params: AgentRestartParams,
         now: Instant,
         forced: Option<String>,
-    ) -> Result<(String, String, bool), ErrorBody> {
+    ) -> Result<(String, String, bool, Vec<RestartDroppedFlag>), ErrorBody> {
         let refuse = |code: &str, message: String| ErrorBody {
             code: code.into(),
             message,
@@ -209,7 +212,10 @@ impl App {
         {
             return Err(refuse("restart_unsupported", "restart requires a supported harness with live session-reporting hooks; no confirmed session hook is available".into()));
         }
-        let plan = resume_launch(
+        let RestartLaunch {
+            plan,
+            dropped_flags,
+        } = resume_launch(
             &session,
             terminal.launch_argv.as_deref().unwrap_or_default(),
         )
@@ -253,6 +259,7 @@ impl App {
             RestartRequest {
                 session,
                 plan,
+                dropped_flags: dropped_flags.clone(),
                 reason: params.reason,
                 continuation,
                 requested_at: now,
@@ -274,7 +281,7 @@ impl App {
             terminal.restart_retry = None;
             terminal.restart_in_progress = true;
         }
-        Ok((pane, value, stop_only))
+        Ok((pane, value, stop_only, dropped_flags))
     }
 
     pub(crate) fn tick_agent_restarts(&mut self, now: Instant) -> bool {
@@ -1133,6 +1140,17 @@ impl App {
         phase: &str,
         detail: String,
     ) {
+        let detail = if request.dropped_flags.is_empty() {
+            detail
+        } else {
+            let dropped = request
+                .dropped_flags
+                .iter()
+                .map(|entry| format!("{} ({})", entry.flag, entry.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{detail}; dropped launch flags: {dropped}")
+        };
         let Some((ws, pane)) = self.restart_location(id) else {
             return;
         };

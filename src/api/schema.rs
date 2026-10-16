@@ -1084,6 +1084,15 @@ pub struct AgentSendParams {
     pub raw: bool,
 }
 
+/// A one-time launch selector omitted from a same-session restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartDroppedFlag {
+    /// The option name or alias, without its original value.
+    pub flag: String,
+    /// Why the existing session or working directory replaces this selector.
+    pub reason: String,
+}
+
 /// Queue a server-owned restart. The caller must finish its requesting turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3166,6 +3175,10 @@ pub enum ResponseResult {
         session: String,
         #[serde(default)]
         stop_only: bool,
+        /// One-time selectors replaced by the native session and preserved cwd.
+        /// Older results omit this field; empty reports keep their existing shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped_flags: Vec<RestartDroppedFlag>,
     },
     AgentHistory {
         history: AgentHistoryResult,

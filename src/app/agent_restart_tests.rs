@@ -39,6 +39,10 @@ fn rig() -> Rig {
 }
 
 fn rig_with_script(script: &str) -> Rig {
+    rig_with_launch_options(script, &["--model", "fixture-model"])
+}
+
+fn rig_with_launch_options(script: &str, options: &[&str]) -> Rig {
     let directory = std::env::temp_dir().join(format!(
         "flock-restart-{}-{}",
         std::process::id(),
@@ -65,11 +69,8 @@ fn rig_with_script(script: &str) -> Rig {
         .unwrap()
         .clone();
     let pane = app.public_pane_id(0, pane_id).unwrap();
-    let argv = vec![
-        executable.to_string_lossy().into_owned(),
-        "--model".into(),
-        "fixture-model".into(),
-    ];
+    let mut argv = vec![executable.to_string_lossy().into_owned()];
+    argv.extend(options.iter().map(|arg| (*arg).to_string()));
     let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
         pane_id,
         24,
@@ -1176,4 +1177,88 @@ async fn restart_claude_empty_composer_timeout_reports_missing_idle_observation(
         &event.data, EventData::AgentRestart { phase, detail, .. }
         if phase == "restart_stuck" && detail.contains("verification timed out (idle_observation_missing)")
     )));
+}
+
+/// The native report binds the session before the API reconstructs launch options.
+#[tokio::test]
+async fn restart_optional_1109_reports_drops_and_launches_same_session() {
+    let options = [
+        "--model",
+        "fixture-model",
+        "--prompt-suggestions",
+        "false",
+        "--tools",
+        "Read",
+        "Edit",
+        "--file",
+        "file_one:one.txt",
+        "file_two:two.txt",
+        "--worktree",
+        "fixture-tree",
+        "-w=another-tree",
+        "--from-pr=42",
+        "--resume",
+        "old-session",
+    ];
+    let mut rig = rig_with_launch_options("#!/bin/sh\nif [ \"$1\" = --resume ]; then { printf '%s\\n' \"$@\" \"${RESTART_PROFILE:-unset}\"; pwd -P; } > resumed; fi\nwhile IFS= read -r line; do :; done\n", &options);
+    let cwd = rig.app.state.terminals[&rig.id].cwd.clone();
+    let (mut receiver, _sender) = launch_report(&rig);
+    let response = request(&mut rig);
+    assert!(response.get("result").is_some(), "{response}");
+    let dropped = response["result"]["dropped_flags"].as_array().unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|entry| entry["flag"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["--worktree", "-w", "--from-pr"]
+    );
+    assert!(dropped
+        .iter()
+        .all(|entry| !entry["reason"].as_str().unwrap().is_empty()));
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    let report = read_launch_report(&mut rig, &mut receiver, 14).await;
+    assert_eq!(report, format!("--resume\nrestart-session\n--model\nfixture-model\n--prompt-suggestions\nfalse\n--tools\nRead\nEdit\n--file\nfile_one:one.txt\nfile_two:two.txt\nfixture-env\n{}\n", rig.directory.canonicalize().unwrap().display()));
+    assert_eq!(rig.app.state.terminals[&rig.id].cwd, cwd);
+    report_session(&mut rig, "restart-session", 1);
+    let now = Instant::now() + TICK;
+    idle(&mut rig, now, "");
+    rig.app.tick_agent_restarts(now);
+    assert!(has_phase(&rig, "restarted"));
+    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+        &event.data, EventData::AgentRestart { phase, detail, .. }
+        if phase == "restarted" && detail.contains("--worktree") && detail.contains("--from-pr") && detail.contains("existing cwd")
+    )));
+}
+
+#[tokio::test]
+async fn restart_optional_1109_refuses_open_or_remote_flags_without_stopping() {
+    for option in [
+        "--remote-control=fixture",
+        "--debug=fixture",
+        "--prompt-suggestions=maybe",
+        "--cloud=fixture",
+        "--teleport=fixture",
+    ] {
+        let mut rig = rig_with_launch_options(
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+            &["--model", "fixture-model", option],
+        );
+        let pid = rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid();
+        let response = request(&mut rig);
+        assert_eq!(
+            response["error"]["code"], "restart_unsupported",
+            "{option}: {response}"
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(option.split('=').next().unwrap()));
+        assert_eq!(
+            rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid(),
+            pid
+        );
+        assert!(rig.app.state.agent_restarts.is_empty());
+    }
 }

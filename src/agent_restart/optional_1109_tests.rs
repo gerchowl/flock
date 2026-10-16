@@ -1,0 +1,219 @@
+//! The approved #1109 arity and same-session restart rules.
+use super::*;
+use crate::agent_resume::AgentSessionRef;
+
+fn session() -> PersistedAgentSession {
+    PersistedAgentSession {
+        source: "flock:claude".into(),
+        agent: "claude".into(),
+        session_ref: AgentSessionRef::id("native-fixture").unwrap(),
+    }
+}
+
+fn launch(args: &[&str]) -> Vec<String> {
+    std::iter::once("claude")
+        .chain(args.iter().copied())
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn optional_1109_known_values_and_bare_flag_preserve_next_option() {
+    for value in ["true", "false", "1", "0", "yes", "no", "on", "off"] {
+        for args in [
+            vec![
+                "--prompt-suggestions".to_string(),
+                value.into(),
+                "--model".into(),
+                "fixture".into(),
+            ],
+            vec![
+                format!("--prompt-suggestions={value}"),
+                "--model".into(),
+                "fixture".into(),
+            ],
+        ] {
+            let mut original = vec!["claude".into()];
+            original.extend(args.clone());
+            let result = resume_launch(&session(), &original).unwrap();
+            assert!(
+                result.plan.argv.ends_with(&args),
+                "{value}: {:?}",
+                result.plan.argv
+            );
+        }
+    }
+    let result = resume_launch(
+        &session(),
+        &launch(&[
+            "--prompt-suggestions",
+            "opening prompt",
+            "--model",
+            "fixture",
+        ]),
+    )
+    .unwrap();
+    assert!(result
+        .plan
+        .argv
+        .ends_with(&launch(&["--prompt-suggestions", "--model", "fixture"])[1..]));
+    let result = resume_launch(
+        &session(),
+        &launch(&["--prompt-suggestions", "--model", "fixture"]),
+    )
+    .unwrap();
+    assert!(result
+        .plan
+        .argv
+        .ends_with(&launch(&["--prompt-suggestions", "--model", "fixture"])[1..]));
+}
+
+#[test]
+fn optional_1109_unknown_and_open_values_refuse_even_equals_forms() {
+    for flag in ["--remote-control", "--debug"] {
+        for option in [flag.to_string(), format!("{flag}=fixture")] {
+            let error =
+                resume_launch(&session(), &launch(&[&option, "--model", "fixture"])).unwrap_err();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
+    let error = resume_launch(&session(), &launch(&["--prompt-suggestions=maybe"])).unwrap_err();
+    assert!(error.contains("--prompt-suggestions"), "{error}");
+}
+
+#[test]
+fn optional_1109_tools_preserve_every_value() {
+    for args in [
+        vec!["--tools", "Read", "Edit", "--model", "fixture"],
+        vec!["--tools=Read", "Edit", "--model", "fixture"],
+        vec!["--tools", "", "--model", "fixture"],
+    ] {
+        let original = launch(&args);
+        let result = resume_launch(&session(), &original).unwrap();
+        assert!(
+            result.plan.argv.ends_with(&original[1..]),
+            "{:?}",
+            result.plan.argv
+        );
+    }
+    assert!(resume_launch(&session(), &launch(&["--tools", "--model", "fixture"])).is_err());
+}
+
+#[test]
+fn optional_1109_workspace_and_pr_selectors_are_replaced() {
+    let args = launch(&[
+        "--worktree",
+        "fixture-tree",
+        "-w=another-tree",
+        "--from-pr=42",
+        "--resume",
+        "old-session",
+        "--continue",
+        "--session-id",
+        "old-id",
+        "--model",
+        "fixture",
+    ]);
+    let result = resume_launch(&session(), &args).unwrap();
+    assert_eq!(
+        result.plan.argv,
+        launch(&["--resume", "native-fixture", "--model", "fixture"])
+    );
+}
+
+#[test]
+fn optional_1109_remote_execution_selectors_are_refused() {
+    for flag in ["--cloud", "--teleport"] {
+        for args in [
+            vec![flag.to_string()],
+            vec![flag.to_string(), "fixture-session".into()],
+            vec![format!("{flag}=fixture-session")],
+        ] {
+            let mut original = vec!["claude".into()];
+            original.extend(args);
+            let error = resume_launch(&session(), &original).unwrap_err();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
+}
+
+#[test]
+fn optional_1109_claude_options_do_not_become_other_harness_options() {
+    let mut session = session();
+    session.agent = "codex".into();
+    session.source = "flock:codex".into();
+    let error = resume_launch(
+        &session,
+        &[
+            "codex".into(),
+            "--prompt-suggestions".into(),
+            "false".into(),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.contains("--prompt-suggestions"), "{error}");
+}
+
+#[test]
+fn optional_1109_drop_report_serializes_and_old_results_still_decode() {
+    let report = serde_json::json!({"type":"agent_restart_queued","pane_id":"fixture-pane","session":"fixture-session","stop_only":false,"dropped_flags":[{"flag":"--worktree","reason":"existing cwd is preserved"}]});
+    let result: crate::api::schema::ResponseResult =
+        serde_json::from_value(report.clone()).unwrap();
+    assert_eq!(serde_json::to_value(result).unwrap(), report);
+    let mut legacy = report;
+    legacy.as_object_mut().unwrap().remove("dropped_flags");
+    let result: crate::api::schema::ResponseResult =
+        serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(result).unwrap(), legacy);
+}
+
+#[test]
+fn optional_1109_files_preserve_every_value() {
+    for args in [
+        vec![
+            "--file",
+            "file_one:one.txt",
+            "file_two:two.txt",
+            "--model",
+            "fixture",
+        ],
+        vec![
+            "--file=file_one:one.txt",
+            "file_two:two.txt",
+            "--model",
+            "fixture",
+        ],
+    ] {
+        let original = launch(&args);
+        let result = resume_launch(&session(), &original).unwrap();
+        assert!(
+            result.plan.argv.ends_with(&original[1..]),
+            "{:?}",
+            result.plan.argv
+        );
+    }
+    assert!(resume_launch(&session(), &launch(&["--file", "--model", "fixture"])).is_err());
+}
+
+#[test]
+fn optional_1109_each_dropped_selector_has_a_reason_in_all_forms() {
+    for flag in ["--worktree", "-w", "--from-pr"] {
+        for args in [
+            vec![flag.to_string()],
+            vec![flag.to_string(), "fixture".into()],
+            vec![format!("{flag}=fixture")],
+        ] {
+            let mut original = vec!["claude".into()];
+            original.extend(args);
+            original.extend(["--model".into(), "fixture-model".into()]);
+            let result = resume_launch(&session(), &original).unwrap();
+            assert_eq!(
+                result.plan.argv,
+                launch(&["--resume", "native-fixture", "--model", "fixture-model"])
+            );
+            assert_eq!(result.dropped_flags.len(), 1);
+            assert_eq!(result.dropped_flags[0].flag, flag);
+            assert!(!result.dropped_flags[0].reason.is_empty());
+        }
+    }
+}

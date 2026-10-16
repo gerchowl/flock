@@ -172,13 +172,20 @@ pub(crate) fn rate_limited(
     history.len() >= policy.max_restarts
 }
 
+/// Reconstructed same-session launch and explicit one-time-selector omissions.
+#[derive(Debug)]
+pub(crate) struct RestartLaunch {
+    pub plan: AgentResumePlan,
+    pub dropped_flags: Vec<crate::api::schema::RestartDroppedFlag>,
+}
+
 /// Keep the executable and launch options, replacing previous session selectors
 /// and dropping the original positional opening prompt. Unknown option arities
 /// are refused rather than silently discarding an option's value.
 pub(crate) fn resume_launch(
     session: &PersistedAgentSession,
     launch: &[String],
-) -> Result<AgentResumePlan, String> {
+) -> Result<RestartLaunch, String> {
     let mut plan = crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
         .ok_or_else(|| "agent has no supported resume integration".to_string())?;
     let executable = launch
@@ -192,6 +199,7 @@ pub(crate) fn resume_launch(
         return Err("original executable does not match the session's harness".into());
     }
     plan.argv[0] = executable.clone();
+    let mut dropped_flags = Vec::new();
     let mut index = 1;
     if session.agent == "codex" && launch.get(index).is_some_and(|s| s == "resume") {
         index += 1;
@@ -202,6 +210,66 @@ pub(crate) fn resume_launch(
     while let Some(arg) = launch.get(index) {
         if arg == "--" {
             break;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        if session.agent == "claude" {
+            match flag {
+                "--cloud" | "--remote" | "--teleport" => {
+                    return Err(format!(
+                        "cannot safely preserve launch option {flag}: execution context cannot be changed by a local same-session restart"
+                    ));
+                }
+                "--remote-control" | "--rc" | "--debug" | "-d" => {
+                    return Err(format!(
+                        "cannot safely preserve launch option {flag}: optional value set is open or unknown"
+                    ));
+                }
+                "--worktree" | "-w" | "--from-pr" => {
+                    dropped_flags.push(crate::api::schema::RestartDroppedFlag {
+                        flag: flag.into(),
+                        reason: if flag == "--from-pr" {
+                            "native resume selector determines the session"
+                        } else {
+                            "same-session restart preserves the existing cwd"
+                        }
+                        .into(),
+                    });
+                    index += 1;
+                    // This selector is not replayed. Its optional argument and the
+                    // opening prompt are both one-time input, not launch options.
+                    if inline.is_none()
+                        && launch
+                            .get(index)
+                            .is_some_and(|value| !value.starts_with('-'))
+                    {
+                        index += 1;
+                    }
+                    continue;
+                }
+                "--prompt-suggestions" => {
+                    let known = |value: &str| {
+                        matches!(
+                            value,
+                            "true" | "false" | "1" | "0" | "yes" | "no" | "on" | "off"
+                        )
+                    };
+                    if inline.is_some_and(|value| !known(value)) {
+                        return Err(format!(
+                            "cannot safely preserve launch option {flag}: unknown optional value"
+                        ));
+                    }
+                    plan.argv.push(arg.clone());
+                    index += 1;
+                    if inline.is_none() && launch.get(index).is_some_and(|value| known(value)) {
+                        plan.argv.push(launch[index].clone());
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
         }
         if matches!(arg.as_str(), "--resume" | "--session" | "--session-id") {
             if launch
@@ -232,7 +300,7 @@ pub(crate) fn resume_launch(
         }
         if session.agent == "claude"
             && matches!(
-                arg.as_str(),
+                flag,
                 "--add-dir"
                     | "--allowedTools"
                     | "--allowed-tools"
@@ -241,6 +309,8 @@ pub(crate) fn resume_launch(
                     | "--disallowed-tools"
                     | "--mcp-config"
                     | "--plugin-dir"
+                    | "--tools"
+                    | "--file"
             )
         {
             let start = index;
@@ -251,17 +321,11 @@ pub(crate) fn resume_launch(
             {
                 index += 1;
             }
-            if index == start + 1 {
+            if index == start + 1 && inline.is_none() {
                 return Err(format!("missing launch value for {arg}"));
             }
             plan.argv.extend_from_slice(&launch[start..index]);
             continue;
-        }
-        if session.agent == "claude" && arg == "--debug" {
-            return Err(
-                "use --debug=<categories> to preserve optional debug arguments unambiguously"
-                    .into(),
-            );
         }
         if session.agent == "opencode" && arg == "--prompt" {
             index += 2;
@@ -283,7 +347,6 @@ pub(crate) fn resume_launch(
                 | "--append-system-prompt-file"
                 | "--allowedTools"
                 | "--disallowedTools"
-                | "--tools"
                 | "--agents"
                 | "--agent"
                 | "--add-dir"
@@ -363,7 +426,10 @@ pub(crate) fn resume_launch(
             ));
         }
     }
-    Ok(plan)
+    Ok(RestartLaunch {
+        plan,
+        dropped_flags,
+    })
 }
 
 #[cfg(test)]
@@ -390,14 +456,15 @@ mod tests {
             .map(String::from);
             let result = resume_launch(&session, &launch).unwrap();
             assert!(
-                result.argv.contains(&"same-session".into())
-                    || result.argv.contains(&"--resume=same-session".into())
+                result.plan.argv.contains(&"same-session".into())
+                    || result.plan.argv.contains(&"--resume=same-session".into())
             );
             assert!(result
+                .plan
                 .argv
                 .ends_with(&["--model".into(), "fixture-model".into()]));
-            assert!(!result.argv.contains(&"old-session".into()));
-            assert!(!result.argv.contains(&"original prompt".into()));
+            assert!(!result.plan.argv.contains(&"old-session".into()));
+            assert!(!result.plan.argv.contains(&"original prompt".into()));
         }
     }
 
@@ -436,6 +503,7 @@ mod tests {
             )
             .unwrap();
             assert!(result
+                .plan
                 .argv
                 .iter()
                 .any(|v| v == "model_reasoning_effort=high" || v == "plugin:fixture"));
@@ -487,7 +555,7 @@ mod tests {
         ]
         .map(String::from);
         let result = resume_launch(&session, &args).unwrap();
-        assert!(result.argv.ends_with(&args[1..]));
+        assert!(result.plan.argv.ends_with(&args[1..]));
     }
 
     #[test]
@@ -523,7 +591,7 @@ mod tests {
             args.extend(["--model".into(), "fixture".into()]);
             let result = resume_launch(&session, &args)
                 .unwrap_or_else(|err| panic!("{flag:?} refused: {err}"));
-            assert!(result.argv.ends_with(&args[1..]), "{flag:?} dropped");
+            assert!(result.plan.argv.ends_with(&args[1..]), "{flag:?} dropped");
         }
     }
 
@@ -826,3 +894,7 @@ mod checkpoint_tests {
         assert!(dialog_answer(&policy, "claude", &[], screen).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "agent_restart/optional_1109_tests.rs"]
+mod optional_1109_tests;
