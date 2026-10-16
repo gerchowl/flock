@@ -815,6 +815,9 @@ impl Entry {
     }
 }
 
+mod refusal_guidance;
+pub(super) use refusal_guidance::enrich_draft_refusal;
+
 /// The directory holding this server's delegates: one file per name, under the
 /// process's own state dir.
 ///
