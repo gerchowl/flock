@@ -329,7 +329,7 @@ fn optional_1659_plugin_directories_are_single_valued_and_repeatable() {
 }
 
 #[test]
-fn optional_1659_print_aliases_are_boolean_only_for_claude() {
+fn optional_1659_print_aliases_follow_verified_harness_arities() {
     for flag in ["-p", "--print"] {
         let result = resume_launch(
             &session(),
@@ -342,6 +342,41 @@ fn optional_1659_print_aliases_are_boolean_only_for_claude() {
         );
         assert!(resume_launch(&session(), &launch(&[flag])).is_ok());
     }
+    let mut arity_failures = Vec::new();
+    let mut pi = session();
+    pi.agent = "pi".into();
+    pi.source = "flock:pi".into();
+    for flag in ["-p", "--print"] {
+        for args in [vec!["pi", flag], vec!["pi", flag, "opening prompt"]] {
+            let result = resume_launch(&pi, &args.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+            match result {
+                Ok(result)
+                    if result.plan.argv
+                        == ["pi", "--session", "native-fixture", flag].map(String::from) => {}
+                result => arity_failures.push(format!("{args:?}: {result:?}")),
+            }
+        }
+    }
+    for agent in ["opencode", "copilot", "hermes"] {
+        let mut unknown = session();
+        unknown.agent = agent.into();
+        unknown.source = format!("flock:{agent}");
+        for args in [
+            vec![agent, "-p"],
+            vec![agent, "-p", "opening prompt"],
+            vec![agent, "-p=fixture"],
+        ] {
+            let result = resume_launch(
+                &unknown,
+                &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+            );
+            match result {
+                Err(error) if error.contains("-p") && error.contains("unknown option arity") => {}
+                result => arity_failures.push(format!("{args:?}: {result:?}")),
+            }
+        }
+    }
+    assert!(arity_failures.is_empty(), "{arity_failures:#?}");
     let mut codex = session();
     codex.agent = "codex".into();
     codex.source = "flock:codex".into();

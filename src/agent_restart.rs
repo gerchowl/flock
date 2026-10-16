@@ -352,6 +352,13 @@ pub(crate) fn resume_launch(
             index += 2;
             continue;
         }
+        if flag == "-p" && !matches!(session.agent.as_str(), "claude" | "codex" | "pi") {
+            return Err(format!(
+                "cannot safely preserve launch option {arg}; unknown option arity"
+            ));
+        }
+        // Claude's --plugin-dir reaches this one-value list after its missing-path
+        // check above, so each repeated option preserves exactly one path.
         let takes_value = matches!(
             arg.as_str(),
             "--model"
@@ -389,7 +396,7 @@ pub(crate) fn resume_launch(
                 | "--dangerously-load-development-channels"
                 | "--channels"
                 | "--effort"
-        ) || arg == "-p" && session.agent != "claude"
+        ) || arg == "-p" && session.agent == "codex"
             || arg == "-c" && session.agent == "codex"
             || session.agent == "claude"
                 && matches!(
@@ -431,7 +438,8 @@ pub(crate) fn resume_launch(
                 | "--ide"
                 | "--restricted"
                 | "--safe-mode"
-        ) || session.agent == "claude" && matches!(arg.as_str(), "-p" | "--print");
+        ) || matches!(session.agent.as_str(), "claude" | "pi")
+            && matches!(arg.as_str(), "-p" | "--print");
         if arg.contains('=') || boolean {
             plan.argv.push(arg.clone());
             index += 1;
