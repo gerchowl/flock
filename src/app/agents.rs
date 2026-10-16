@@ -1265,7 +1265,11 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let status = super::api_helpers::pane_agent_status_from_terminal(terminal, pane_state.seen);
+        let status = super::api_helpers::pane_agent_status_from_terminal(
+            terminal,
+            pane_state.seen,
+            self.terminal_runtimes.get(&terminal.id).is_some(),
+        );
         let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
@@ -1488,6 +1492,107 @@ enum StartPlacement {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
+
+    #[test]
+    fn deferred_restore_without_runtime_is_offline_and_resumable() {
+        use crate::api::agent_state::{Lifecycle, Phase, Turn};
+        use crate::api::schema::AgentStatus;
+        let (mut app, _) = app_with_workspace("deferred-restore", None);
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let session = crate::agent_resume::AgentSessionRef::id("saved-session").unwrap();
+        let plan = crate::agent_resume::plan("flock:opencode", "opencode", &session).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:opencode".into(),
+            agent: "opencode".into(),
+            session_ref: session,
+        });
+        terminal.pending_agent_resume_plan = Some(plan.clone());
+        assert_eq!(
+            crate::app::api_helpers::pane_agent_status_from_terminal(terminal, true, true),
+            AgentStatus::Idle,
+            "a pending flag must not hide a live runtime"
+        );
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Offline);
+        assert!(info.resumable);
+        let state = info.state.unwrap();
+        assert_eq!(
+            (state.lifecycle, state.phase, state.turn),
+            (Lifecycle::Offline, Phase::Offline, Turn::Unknown)
+        );
+        assert_eq!(
+            app.pane_info(0, pane).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(
+            app.collect_agent_infos()[0].agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(
+            app.tab_info(0, 0).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Offline);
+        assert_eq!(
+            app.terminal_target_candidate(0, pane).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        let target = app.public_pane_id(0, pane).unwrap();
+        let refusal = app
+            .queue_agent_restart(
+                crate::api::schema::AgentRestartParams {
+                    target,
+                    reason: "fixture restart".into(),
+                    continue_with: None,
+                    when: "after_turn".into(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "restart_busy");
+        assert!(refusal.message.contains("agent resume"));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let presentation = terminal.effective_presentation();
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: Some("opencode".into()),
+            previous_known_agent: Some(crate::detect::Agent::OpenCode),
+            previous_state: crate::detect::AgentState::Working,
+            previous_seen: true,
+            previous_presentation: presentation.clone(),
+            agent_label: Some("opencode".into()),
+            known_agent: Some(crate::detect::Agent::OpenCode),
+            state: crate::detect::AgentState::Idle,
+            seen: true,
+            presentation,
+        });
+        assert!(
+            app.event_hub
+                .events_after(sequence)
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { .. }
+                )),
+            "a stored turn transition cannot emit a live status for an offline binding"
+        );
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        assert_eq!(terminal.pending_agent_resume_plan, Some(plan.clone()));
+        terminal.pending_agent_resume_plan = None;
+        terminal.set_hibernated_resume_plan(Some(plan));
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Hibernated);
+        assert!(info.resumable);
+    }
 
     /// Wait for the watcher's publication, with a failure ceiling for a child
     /// that never exits. A successful wait depends only on the event.
