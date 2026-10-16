@@ -452,13 +452,18 @@ fn editor_shows_paste_chip(
 /// The editor must also be clipped: the sent text cannot fit in the visible
 /// rows at `row_width` columns each, so its start scrolled off. A fully visible
 /// editor that holds only the end of the text lost the start, and stays Other.
+/// The proof ignores whitespace; a truly clipped draft with many wrap spaces
+/// may therefore remain unproven and refuse Enter rather than risk a lost head.
 fn matches_wrapped_tail(rows: &[&str], text: &str, row_width: usize) -> bool {
     let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let tail = squash(&rows.concat());
+    // Wrap whitespace cannot prove clipping: compare the same normalized
+    // content that establishes ownership (ADR-0029 §1, #1141).
+    let sent = squash(text);
     rows.len() > 1
         && !tail.is_empty()
-        && text.trim().chars().count() > rows.len() * row_width
-        && squash(text).ends_with(&tail)
+        && sent.chars().count() > rows.len() * row_width
+        && sent.ends_with(&tail)
 }
 
 fn editor_shows_wrapped_tail(
@@ -788,7 +793,14 @@ impl App {
             Some(draft) => clear_keys(runtime, draft),
             None => bytes,
         };
-        let paste_write = match runtime.try_send_flock_authored_tracked(Bytes::from(first)) {
+        let paste_write = match runtime.try_send_flock_authored_tracked(
+            Bytes::from(first),
+            now + if draft.is_some() {
+                DRAFT_STEP
+            } else {
+                CONFIRM_WINDOW
+            },
+        ) {
             Ok(receipt) => receipt,
             Err(_) => {
                 // Nothing reached the pane, so a draft is still where it was.
@@ -1037,7 +1049,9 @@ impl App {
             return Some(Outcome::Abandoned("draft_not_cleared"));
         }
         let bytes = super::api_helpers::encode_api_text(runtime, &attempt.text);
-        attempt.paste_write = match runtime.try_send_flock_authored_tracked(Bytes::from(bytes)) {
+        attempt.paste_write = match runtime
+            .try_send_flock_authored_tracked(Bytes::from(bytes), now + CONFIRM_WINDOW)
+        {
             Ok(receipt) => receipt,
             Err(_) => return Some(Outcome::Abandoned("write_failed")),
         };
@@ -1496,16 +1510,11 @@ pub(super) mod tests {
         attempt: &mut Attempt,
         written: usize,
     ) -> crate::pty::write_receipt::WriteCompletion {
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"paste"), None);
         attempt.paste_write = Some(receipt);
         if written > 0 {
-            assert_eq!(
-                completion.write(5, || Ok(written)).unwrap().unwrap(),
-                written
-            );
-        }
-        if written == 5 {
-            completion.send(Instant::now()).unwrap();
+            assert_eq!(completion.write(|_| Ok(written)).unwrap().unwrap(), written);
         }
         completion
     }
@@ -1514,14 +1523,22 @@ pub(super) mod tests {
     fn guarded_submit_enter_follows_completed_paste_by_at_least_100ms() {
         let queued = Instant::now();
         let written = queued + Duration::from_millis(400);
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"paste"), None);
         let mut attempt = Attempt::test_new();
         attempt.due = queued + crate::cli::pane::PANE_RUN_SUBMIT_GAP;
         attempt.deadline = queued + CONFIRM_WINDOW;
         attempt.paste_write = Some(receipt);
         // The old enqueue deadline has expired while the actor is still busy.
         assert_eq!(attempt.wait_for_paste_write(written), Ok(true));
-        completion.send(written).unwrap();
+        completion.write(|bytes| Ok(bytes.len())).unwrap().unwrap();
+        let written = attempt
+            .paste_write
+            .as_ref()
+            .unwrap()
+            .progress()
+            .completed_at
+            .unwrap();
         let early = written + Duration::from_millis(99);
         assert_eq!(attempt.wait_for_paste_write(early), Ok(true));
         assert_eq!(attempt.due, written + crate::cli::pane::PANE_RUN_SUBMIT_GAP);
@@ -1534,7 +1551,10 @@ pub(super) mod tests {
     fn pending_paste_write_has_a_bounded_failure_and_rejects_disconnection() {
         let now = Instant::now();
         for disconnected in [false, true] {
-            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel(
+                Bytes::from_static(b"paste"),
+                None,
+            );
             let mut attempt = Attempt::test_new();
             attempt.paste_write = Some(receipt);
             attempt.deadline = now + CONFIRM_WINDOW;
@@ -1553,7 +1573,7 @@ pub(super) mod tests {
             );
             if let Some(completion) = completion {
                 assert!(completion
-                    .write(5, || panic!("abandoned paste reached resumed writer"))
+                    .write(|_| panic!("abandoned paste reached resumed writer"))
                     .is_none());
             }
         }
@@ -1562,10 +1582,13 @@ pub(super) mod tests {
     #[test]
     fn partial_paste_at_deadline_is_unconfirmed_even_if_writer_disconnects() {
         for disconnected in [false, true] {
-            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
+            let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel(
+                Bytes::from_static(b"paste"),
+                None,
+            );
             let mut attempt = Attempt::test_new();
             attempt.paste_write = Some(receipt);
-            assert_eq!(completion.write(5, || Ok(2)).unwrap().unwrap(), 2);
+            assert_eq!(completion.write(|_| Ok(2)).unwrap().unwrap(), 2);
             let mut completion = Some(completion);
             if disconnected {
                 drop(completion.take());
@@ -1581,6 +1604,12 @@ pub(super) mod tests {
                 ),
                 Outcome::Unconfirmed("paste_write_incomplete")
             );
+            if let Some(completion) = completion {
+                assert!(completion
+                    .write(|_| panic!("partial cancelled paste resumed"))
+                    .is_none());
+            }
+            assert!(!attempt.sent, "partial paste must not authorize Enter");
         }
     }
 

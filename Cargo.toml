@@ -33,6 +33,8 @@ dbg_macro = "deny"
 # tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
 web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 
+ts = ["dep:ts-rs"]
+
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
@@ -61,6 +63,7 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
+ts-rs = { version = "=12.0.1", optional = true, features = ["serde-json-impl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "1"
 tracing = "0.1.44"

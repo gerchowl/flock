@@ -378,9 +378,10 @@ impl TerminalRuntime {
     pub(crate) fn try_send_flock_authored_tracked(
         &self,
         bytes: Bytes,
+        deadline: std::time::Instant,
     ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
     {
-        self.0.try_send_flock_authored_tracked(bytes)
+        self.0.try_send_flock_authored_tracked(bytes, deadline)
     }
 
     /// When operator input last reached this pane, if it ever has.

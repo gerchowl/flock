@@ -249,6 +249,7 @@ impl Models {
 struct Catalogue {
     models: Models,
     envelope: Option<Vec<Field>>,
+    event_type_envelope: Option<Vec<Field>>,
     events: Option<Vec<Event>>,
 }
 
@@ -342,14 +343,24 @@ fn collect_items(
                 };
                 collect_items(file.items, parent, &next, read, catalogue);
             }
-            Item::Macro(model) if model.ident.as_ref().is_some_and(|id| id == "events") => {
-                assert!(
-                    catalogue
-                        .envelope
-                        .replace(syn::parse2::<EnvelopeFields>(model.mac.tokens).unwrap().0)
-                        .is_none(),
-                    "duplicate events macro"
-                );
+            Item::Macro(model)
+                if model
+                    .ident
+                    .as_ref()
+                    .is_some_and(|id| id == "events" || id == "event_type") =>
+            {
+                let template = if model.ident.as_ref().is_some_and(|id| id == "event_type") {
+                    &mut catalogue.event_type_envelope
+                } else {
+                    &mut catalogue.envelope
+                };
+                let fields = syn::parse2::<EnvelopeFields>(model.mac.tokens).unwrap().0;
+                if !fields.is_empty() {
+                    assert!(
+                        template.replace(fields).is_none(),
+                        "duplicate envelope template"
+                    );
+                }
             }
             Item::Macro(model) if model.mac.path.is_ident("events") => {
                 assert!(
@@ -378,7 +389,10 @@ fn modeled_cases_with_reader(
         read,
         &mut catalogue,
     );
-    let envelope = catalogue.envelope.expect("events macro definition");
+    let envelope = catalogue
+        .event_type_envelope
+        .or(catalogue.envelope)
+        .expect("event envelope macro definition");
     assert!(!envelope.is_empty(), "missing envelope metadata fields");
     let mut cases = Cases::new();
     for event in catalogue.events.expect("events catalogue") {

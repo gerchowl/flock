@@ -39,6 +39,8 @@ mod client;
 mod codex_transcript;
 mod config;
 mod opencode_transcript;
+#[cfg(all(test, feature = "ts"))]
+mod ts;
 // #348 / ADR-0014 §4: one definition of "terminal control sequence",
 // shared by the handler that strips them and the one that refuses them.
 mod control_bytes;
