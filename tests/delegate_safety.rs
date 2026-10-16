@@ -24,6 +24,7 @@
 #![allow(clippy::disallowed_methods)]
 
 mod support;
+use support::paths::app_dir_name;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -81,14 +82,6 @@ impl Drop for Server {
         }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
-    }
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
     }
 }
 
@@ -529,17 +522,12 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// FNV-1a 64 over the socket path string, exactly as `cli::delegate::server_key`
 /// computes it.
 fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in server.socket.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     server
         .base
         .join("state")
         .join(app_dir_name())
         .join("delegates")
-        .join(format!("{hash:016x}"))
+        .join(support::paths::server_key(&server.socket))
         .join(format!("{name}.json"))
 }
 
