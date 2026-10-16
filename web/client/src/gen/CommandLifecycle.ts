@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Input acknowledgement and completion (A.5, A.14).
  */
-export type CommandLifecycle = { type: "command_lifecycle", subtype?: string,
+export type CommandLifecycle = { type: "command_lifecycle", subtype?: never,
 /**
  * Harness session identifier, if emitted on this envelope.
  */
