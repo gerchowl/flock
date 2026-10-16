@@ -304,7 +304,13 @@ mod tests {
         .map(|(class, codes)| (class, codes.to_string()))
         .collect();
         assert_eq!(actual, expected);
-        assert_eq!(ErrorCode::ALL.len(), 175);
+        // Count the independent expected table so concurrent additions cannot
+        // silently overwrite each other's aggregate count during a merge.
+        let expected_count: usize = expected
+            .iter()
+            .map(|(_, codes)| codes.split_whitespace().count())
+            .sum();
+        assert_eq!(ErrorCode::ALL.len(), expected_count);
     }
 
     #[test]
