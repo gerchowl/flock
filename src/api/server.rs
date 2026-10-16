@@ -82,6 +82,7 @@ pub(crate) fn start_server_for_mode(
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
             agent_questions: true,
+            pane_input_write_ack: false,
         }),
     )
 }
@@ -261,6 +262,7 @@ fn handle_connection(
                 &ErrorResponse {
                     id: String::new(),
                     error: ErrorBody {
+                        data: None,
                         code: "invalid_request".into(),
                         message: format!("invalid request: {err}"),
                     },
@@ -718,6 +720,7 @@ fn stream_subscriptions(
         let refusal = ErrorResponse {
             id: request_id,
             error: ErrorBody {
+                data: None,
                 code: "cursor_ahead".into(),
                 message: format!("cursor {start} is past this server's newest event {head}"),
             },
@@ -929,6 +932,7 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
     serde_json::to_string(&ErrorResponse {
         id,
         error: ErrorBody {
+            data: None,
             code: code.into(),
             message,
         },
@@ -1283,6 +1287,7 @@ mod tests {
                 clone_detection_warning: None,
                 agent_start_label: true,
                 agent_questions: true,
+                pane_input_write_ack: false,
             }),
             None,
             &Mutex::default(),

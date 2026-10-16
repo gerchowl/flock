@@ -226,6 +226,7 @@ impl App {
             .map(|resolved| (resolved.ws_idx, resolved.pane_id))
             .map_err(|error| match error {
                 TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
+                    data: None,
                     code: "pane_not_found".into(),
                     message: format!(
                         "pane {target} not found; expected a {}",
