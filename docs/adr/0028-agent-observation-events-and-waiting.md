@@ -12,9 +12,10 @@
   wake, channel push), ADR-0026 (mesh custody), #850 (injection lock).
 - Decision owner: operator.
 - Amendment (2026-10-15, #1479, clarified by #1519): §1a records accepted
-  Codex lifecycle authority; its source/continuity contract is proposed for
-  review before implementation; format/version policy awaits an owner
-  decision (§1a).
+  Codex lifecycle authority. The owner accepted option 1, the bounded rollout
+  format/version policy, on 2026-10-16. Implementation of the source/continuity
+  contract remains gated on approval of docs PR #1615; policy acceptance alone
+  does not record that review as complete.
 - Proposed amendment (2026-10-15, #1574): §1b specifies detection-sample
   receipts, output cursors and legacy revision deprecation. Owner decision
   required; this subsection is not accepted or implemented.
@@ -233,9 +234,11 @@ Rules:
 ### 1a. Codex lifecycle turn authority (#1479, 2026-10-15)
 
 The operator chose **lifecycle event > hook state > screen** for Codex's
-**turn** axis on 2026-10-15. The source and continuity contract below is the
-proposed amendment implementing that decision, submitted for review before
-code. It amends §1's source table, not the Claude harness or its Stop hook.
+**turn** axis on 2026-10-15 and accepted the option-1 rollout format/version
+policy on 2026-10-16. The source and continuity contract below specifies the
+planned adapter. Its implementation review gate is approval of docs PR #1615;
+the policy decision alone does not claim that contract review is complete.
+It amends §1's source table, not the Claude harness or its Stop hook.
 PR #1491 remains independent hollow-glyph hardening; neither that PR nor this
 amendment implements lifecycle authority.
 
@@ -470,7 +473,13 @@ The **accepted policy** is:
   evidence and review, never an assumed semver-compatible range. Resume preserves
   creation metadata, so also verify the version of the actual writer executable
   resolved for the launch; old metadata alone cannot authorize a newer writer.
-  Both must be covered by the tested compatibility declaration. See the pinned
+  Obtain the actual writer version by running that resolved executable once
+  with `--version`, with a 5000 ms monotonic failure ceiling and no retry
+  (ADR-0037). Spawn/read failure, nonzero exit, unparseable output or exceeding
+  the ceiling counts as a missing version: diagnose
+  `unsupported_codex_version` and select screen fallback as below. Terminate
+  and reap only this version-check child on timeout. Both metadata and writer
+  versions must be covered by the tested compatibility declaration. See the pinned
   [new versus resumed recorder setup](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L935-L994).
 - A version in that range uses the lifecycle adapter. Any other or missing
   version marks this source unavailable with `unsupported_codex_version` and
@@ -478,9 +487,13 @@ The **accepted policy** is:
   never means idle: before fresh classifiable screen evidence, state is unknown;
   a visible Working screen means working. Any later idle must come from actual
   fallback evidence, not an unsupported-version default or copied completion.
-- CI pins the tested Codex version and versioned fixtures and fails loudly when
-  that pin changes without updating the declared range and compatibility tests.
-  This is a requirement for the later implementation PR, not a CI change here.
+- CI pins a declared tested-version constant, initially **0.160.1**, and
+  recorded/scripted rollout fixtures checked against it, rather than installing
+  or launching a real Codex binary. Compatibility tests check fixture metadata
+  and scripted writer `--version` responses against that constant and cover
+  unsupported/missing versions. CI fails when the pin changes without updating
+  the declared range and compatibility tests. This requirement belongs to the
+  implementation PR; this docs PR changes no CI configuration.
 
 An alternative is Codex's supported, versioned **app-server** interface, whose
 v2 notifications include `turn/started` and `turn/completed`; see the pinned
@@ -550,8 +563,9 @@ records. Where ordinals exist, check their format-defined continuity too.
 Do not infer a gap from silence, transient events missing by persistence policy,
 or a non-contiguous sequence of turn IDs. Legacy files cannot prove that an
 upstream producer silently omitted a well-formed record; this format limitation
-belongs to the owner decision. **Residual risks:** if the writer remains alive
-but its end record is lost, the last start holds working indefinitely. Publish
+is accepted as a residual limitation of the policy above. **Residual risks:**
+if the writer remains alive but its end record is lost, the last start holds
+working indefinitely. Publish
 a diagnostic when lifecycle and screen disagree in either direction, including
 the false-idle new-thread window and lost SessionStart report described above.
 Expose both observations and the active boundary so an operator can request a
@@ -1429,7 +1443,8 @@ in ADR-0030 §8.
 Decided by the operator on 2026-10-11 (PR #1006): items 1–6 below were
 accepted as recommended. The rejected alternative is kept for the record.
 Items 7–9 are new §1b proposals and require a separate owner decision; the
-earlier acceptance does not cover them.
+earlier acceptance does not cover them. Item 10 records the separate
+2026-10-16 option-1 acceptance.
 
 1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
@@ -1474,3 +1489,13 @@ earlier acceptance does not cover them.
    with `unsupported_legacy_revision` / `PROTOCOL_GAP`. Approve that named
    behavior change with a release note; removal requires separate major-wire
    approval. Give only the new output cursor a parser-progress writer.
+10. **Codex rollout format/version policy (§1a). Accepted by the owner,
+    2026-10-16, option 1** ([#1479 decision](https://github.com/gerchowl/flock/issues/1479#issuecomment-6203978023)).
+    Use rollout lifecycle authority within the tested compatibility range,
+    initially only 0.160.1; validate creation metadata and the resolved writer's
+    version, diagnose unsupported/missing versions and select screen fallback.
+    CI pins the declared version constant and fixtures checked against it.
+    The format's inability to prove a silently omitted well-formed record is
+    an accepted residual limitation. Implementation of the source/continuity
+    contract still requires approval of docs PR #1615; the option-1 policy
+    decision alone does not record that review as complete.
