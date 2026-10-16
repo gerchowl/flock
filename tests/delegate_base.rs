@@ -23,13 +23,11 @@ fn send(round: u64, sha: Option<&str>, json: bool) -> std::process::Output {
     let root = socket.parent().unwrap();
     let brief = root.join("brief.md");
     fs::write(&brief, "fixture task").unwrap();
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in socket.to_string_lossy().as_bytes() {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
     let registry = root
-        .join("state/flock-dev/delegates")
-        .join(format!("{hash:016x}"));
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&socket));
     fs::create_dir_all(&registry).unwrap();
     fs::write(
         registry.join("fixture.json"),
@@ -56,7 +54,7 @@ fn send(round: u64, sha: Option<&str>, json: bool) -> std::process::Output {
     if json {
         command.arg("--json");
     }
-    let output = command.output().unwrap();
+    let output = support::scripted::output(command);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let updated: serde_json::Value =
         serde_json::from_slice(&fs::read(registry.join("fixture.json")).unwrap()).unwrap();
