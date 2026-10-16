@@ -477,6 +477,12 @@ An `unknown_composer` refusal from a guarded send includes the pane dimensions i
 
 `agent send` moves a one-row draft aside and types it back after the submit, under the [injection lock](./configuration.mdx#injection-lock). While flock types, the pane's own input is held and replayed afterwards. A draft flock could not put back exactly is kept: `flk pane stash show <pane_id>` prints the kept drafts, one per line, and `flk pane stash restore <pane_id>` types the oldest one into the pane's empty composer. Add `--json` for the raw response. A restore refuses `input_not_empty` or `injection_pending` and keeps the draft.
 
+A nonempty composer refusal remains `input_not_empty`, exit 10, with no input bytes sent. The error includes `data.composer.visible_bytes`: the UTF-8 byte count of the visible, trimmed, nonempty composer rows joined with newlines, or `null` if they cannot be read again. The count-only metadata includes no composer text. The re-read snapshot may differ from the refusal snapshot; this count does not measure hidden content or the expanded contents of pasted chips.
+
+`data.remedy` names `clear_or_submit_draft_in_agent_ui` and `retry_when: "composer_empty"`. Clear or submit the existing draft in the agent UI before retrying. There is currently no guarded CLI command to clear or submit an existing draft; `commands` is empty and `follow_up_issue` points to [#1586](https://github.com/gerchowl/flock/issues/1586). Raw append flags and control keys do not provide a guarded draft-resolution operation.
+
+For `agent send` targeting a registered CLI delegate, the client adds `data.remedy.next_round` with `argv: ["flk", "delegate", "send", "<name>", "--brief", "FILE"]` and `requires: "composer_empty"`. Supply the next brief file after resolving the draft. The human error names the same command and explains that `delegate send` also refuses drafts. Registration is checked in the current socket's local registry by durable agent id, or terminal identity for older records; a display-name match alone is insufficient. Missing, unreadable or ambiguous registration records retain the generic remedy. MCP preserves the server's draft data alongside its registered refusal, retry class and exit code. These fields are additive: older clients ignore them and older servers may omit them.
+
 Send outcome codes (`agent send`, `pane send-text`, and guarded `pane run`):
 
 | Code | Outcome |
