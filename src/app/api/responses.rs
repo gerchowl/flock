@@ -8,6 +8,7 @@ pub(crate) fn encode_error(id: String, code: &str, message: impl Into<String>) -
     encode_error_body(
         id,
         ErrorBody {
+            data: None,
             code: code.into(),
             message: message.into(),
         },
@@ -16,12 +17,8 @@ pub(crate) fn encode_error(id: String, code: &str, message: impl Into<String>) -
 
 /// An error carrying structured, caller-actionable detail (#329).
 ///
-/// Built directly rather than through [`ErrorBody`]: that type is constructed
-/// as a literal in ~25 places, and widening it to carry an optional payload
-/// would touch every one of them for the benefit of a single verb. The wire
-/// shape is `{"id":…,"error":{"code":…,"message":…,"data":…}}` either way, so
-/// clients cannot tell the difference — and `data` stays absent everywhere it
-/// is not deliberately populated.
+/// Encodes arbitrary method-specific data without requiring a typed producer.
+/// `ErrorBody` also decodes this additive data, including input-write evidence.
 pub(crate) fn encode_error_with_data(
     id: String,
     code: &str,

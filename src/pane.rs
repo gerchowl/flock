@@ -957,6 +957,16 @@ impl PaneRuntimeIo {
         self.try_send_with_receipt(bytes, false, None).map(|_| ())
     }
 
+    fn write_failure(&self) -> crate::pty::write_receipt::WriteFailure {
+        use crate::pty::write_receipt::WriteFailure;
+        match self {
+            #[cfg(unix)]
+            Self::Actor(actor) => actor.write_refusal().unwrap_or(WriteFailure::PaneGone),
+            #[cfg(test)]
+            Self::TestChannel { .. } => WriteFailure::PaneGone,
+        }
+    }
+
     fn try_send_input(
         &self,
         input: injection_lease::QueuedInput,
@@ -1057,6 +1067,9 @@ impl Drop for PaneRuntime {
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
         self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1272,6 +1285,9 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
 impl PaneRuntime {
     pub fn shutdown(mut self) {
         self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1289,6 +1305,9 @@ impl PaneRuntime {
         grace: std::time::Duration,
     ) -> tokio::sync::oneshot::Receiver<bool> {
         self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         self.io.shutdown();
         let child_pid = self.child_pid.load(Ordering::Acquire);
         pids.extend(crate::platform::session_processes(child_pid));
@@ -1366,6 +1385,7 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
+        self.end_all_injection_leases();
         if let Err(err) = self.io.release_after_commit() {
             crate::logging::pane_pty_release_after_handoff_failed(
                 self.pane_id.raw(),
@@ -2417,9 +2437,7 @@ impl PaneRuntime {
             std::time::Instant::now(),
         ) {
             self.operator_input.stamp();
-            if self.write_in_order(batch).is_err() {
-                receipt.cancel();
-            }
+            let _ = self.write_in_order(batch);
         }
         receipt
     }
@@ -2460,7 +2478,9 @@ impl PaneRuntime {
 
     /// End any lease, for a server that is stopping or handing off.
     pub(crate) fn end_all_injection_leases(&self) {
-        let held = self.injection_lease.release_all();
+        let held = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
         let _ = self.write_held_input(held);
     }
 
@@ -2509,7 +2529,10 @@ impl PaneRuntime {
                         .into_iter()
                         .filter_map(|input| match input {
                             QueuedInput::Operator(bytes) => Some(bytes),
-                            QueuedInput::Tracked(_) => None,
+                            QueuedInput::Tracked(ticket) => {
+                                ticket.retire(self.io.write_failure());
+                                None
+                            }
                         })
                         .flatten()
                         .collect::<Vec<u8>>();
@@ -3987,7 +4010,7 @@ mod tests {
         let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
         let runtime = PaneRuntime::test_with_actor(handle);
         let now = std::time::Instant::now();
-        let deadline = now + std::time::Duration::from_secs(2);
+        let deadline = now + std::time::Duration::from_millis(200);
         assert!(runtime.begin_injection_lease(
             "ticket",
             now + std::time::Duration::from_secs(30),
@@ -4084,8 +4107,8 @@ mod tests {
             runtime.end_all_injection_leases();
             assert_eq!(receipt.progress().bytes_written, 0);
             assert_eq!(
-                receipt.progress().failure,
-                Some(crate::pty::write_receipt::WriteFailure::WriterGone)
+                format!("{:?}", receipt.progress().failure),
+                "Some(OwnerChanged)"
             );
             assert!(receipt.progress().remainder_discarded);
             assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
@@ -4106,10 +4129,9 @@ mod tests {
         let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
         drop(runtime);
         assert_eq!(receipt.progress().bytes_written, 0);
-        // #1638 maps pane teardown to pane_gone at the response-owner boundary.
         assert_eq!(
-            receipt.progress().failure,
-            Some(crate::pty::write_receipt::WriteFailure::WriterGone)
+            format!("{:?}", receipt.progress().failure),
+            "Some(PaneGone)"
         );
         assert!(receipt.progress().remainder_discarded);
         assert!(receiver.try_recv().is_err());
@@ -4143,5 +4165,26 @@ mod tests {
         assert_eq!(&rest[count - 1..], b"after");
         assert_eq!(receipt.progress().bytes_written, count);
         assert!(receipt.progress().remainder_discarded);
+    }
+    #[tokio::test]
+    async fn s3a_closed_actor_retires_every_held_ticket_as_pane_gone() {
+        use crate::pty::write_receipt::WriteFailure;
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        let runtime = PaneRuntime::test_with_actor(handle);
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"operator"))
+            .unwrap();
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until);
+        drop(guard);
+        assert!(!runtime.end_injection_lease("ticket"));
+        for receipt in [first, second] {
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().remainder_discarded);
+        }
     }
 }

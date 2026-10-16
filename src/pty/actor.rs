@@ -1,3 +1,4 @@
+use crate::pty::write_receipt::WriteFailure;
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -220,7 +221,7 @@ pub(crate) struct PtyIoActorHandle {
 
 #[derive(Debug)]
 struct UserWriteGate {
-    accepting: bool,
+    refused: Option<WriteFailure>,
 }
 
 impl PtyIoActorHandle {
@@ -242,7 +243,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !user_writes.accepting {
+            if user_writes.refused.is_some() {
                 return Err(mpsc::error::SendError(bytes));
             }
         }
@@ -256,7 +257,7 @@ impl PtyIoActorHandle {
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !user_writes.accepting {
+        if user_writes.refused.is_some() {
             return Err(mpsc::error::SendError(bytes));
         }
         permit.send(PtyIoDataCommand::WriteUserInput(bytes));
@@ -290,7 +291,8 @@ impl PtyIoActorHandle {
         ticket: crate::pty::write_receipt::WriteCompletion,
     ) -> Result<(), mpsc::error::TrySendError<crate::pty::write_receipt::WriteCompletion>> {
         let gate = self.user_writes.lock().unwrap_or_else(|p| p.into_inner());
-        if !gate.accepting || self.writer_health.is_broken() {
+        if let Some(reason) = self.refusal_with_gate(&gate) {
+            ticket.retire(reason);
             return Err(mpsc::error::TrySendError::Closed(ticket));
         }
         match self.data_tx.try_reserve() {
@@ -301,9 +303,24 @@ impl PtyIoActorHandle {
             }
             Err(mpsc::error::TrySendError::Full(_)) => Err(mpsc::error::TrySendError::Full(ticket)),
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                ticket.retire(WriteFailure::PaneGone);
                 Err(mpsc::error::TrySendError::Closed(ticket))
             }
         }
+    }
+
+    pub(crate) fn write_refusal(&self) -> Option<WriteFailure> {
+        self.refusal_with_gate(&self.user_writes.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn refusal_with_gate(&self, gate: &UserWriteGate) -> Option<WriteFailure> {
+        gate.refused
+            .or_else(|| {
+                self.writer_health
+                    .is_broken()
+                    .then_some(WriteFailure::WriterBroken)
+            })
+            .or_else(|| self.data_tx.is_closed().then_some(WriteFailure::PaneGone))
     }
 
     fn try_write_command(
@@ -319,7 +336,7 @@ impl PtyIoActorHandle {
             return Err(mpsc::error::TrySendError::Closed(rejected(command)));
         }
         let user_writes = self.user_writes.lock().unwrap_or_else(|p| p.into_inner());
-        if !user_writes.accepting {
+        if user_writes.refused.is_some() {
             return Err(mpsc::error::TrySendError::Closed(rejected(command)));
         }
         match self.data_tx.try_send(command) {
@@ -406,7 +423,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            user_writes.accepting = false;
+            user_writes.refused = Some(WriteFailure::OwnerChanged);
             if self
                 .control_tx
                 .send(PtyIoControlCommand::BeginHandoff(BeginHandoffRequest {
@@ -416,7 +433,7 @@ impl PtyIoActorHandle {
                 }))
                 .is_err()
             {
-                user_writes.accepting = true;
+                user_writes.refused = None;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "pty actor closed",
@@ -476,7 +493,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            user_writes.accepting = true;
+            user_writes.refused = None;
         }
         result
     }
@@ -487,7 +504,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            user_writes.accepting = false;
+            user_writes.refused = Some(WriteFailure::OwnerChanged);
         }
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.control_tx
@@ -508,7 +525,7 @@ impl PtyIoActorHandle {
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            user_writes.accepting = false;
+            user_writes.refused.get_or_insert(WriteFailure::PaneGone);
         }
         if self.control_tx.send(PtyIoControlCommand::Shutdown).is_ok() {
             self.wake_actor();
@@ -540,7 +557,9 @@ impl PtyIoActor {
         let (control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe()?;
         let user_writes = Arc::new(Mutex::new(UserWriteGate {
-            accepting: !config.initially_quiesced,
+            refused: config
+                .initially_quiesced
+                .then_some(WriteFailure::OwnerChanged),
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let writer_health = Arc::new(WriterHealth::default());
@@ -678,6 +697,7 @@ impl PtyIoActorRunner {
             }
         }
 
+        self.discard_pending_writes(WriteFailure::PaneGone);
         let rejected = self.writer_health.take_rejected();
         if rejected > 0 {
             crate::logging::pty_writes_rejected_while_broken(self.pane_id, rejected);
@@ -778,11 +798,14 @@ impl PtyIoActorRunner {
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
-                self.pending_writes.clear();
+                self.discard_pending_writes(WriteFailure::OwnerChanged);
                 let _ = reply.send(Ok(()));
                 return true;
             }
-            PtyIoControlCommand::Shutdown => return true,
+            PtyIoControlCommand::Shutdown => {
+                self.discard_pending_writes(WriteFailure::PaneGone);
+                return true;
+            }
         }
         false
     }
@@ -832,8 +855,7 @@ impl PtyIoActorRunner {
                     ));
                 }
                 crate::logging::pty_handoff_dropped_undrained(self.pane_id, pending_bytes);
-                self.pending_writes.clear();
-                self.current_write_offset = 0;
+                self.discard_pending_writes(WriteFailure::OwnerChanged);
                 self.zero_write_streak = 0;
                 quiesce.dropped_bytes = pending_bytes;
                 quiesce.writer_stuck = writer_stuck;
@@ -957,7 +979,7 @@ impl PtyIoActorRunner {
                     Some(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,
                     Some(Err(err)) => {
                         crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                        self.retire_tracked_writes();
+                        self.retire_tracked_writes(WriteFailure::WriteFailed);
                         return;
                     }
                     None => {}
@@ -993,7 +1015,7 @@ impl PtyIoActorRunner {
                 Err(err) => {
                     crate::logging::pty_write_failed(self.pane_id, &err.to_string());
                     self.complete_front_write();
-                    self.retire_tracked_writes();
+                    self.retire_tracked_writes(WriteFailure::WriteFailed);
                     return;
                 }
             }
@@ -1002,11 +1024,10 @@ impl PtyIoActorRunner {
     }
 
     /// A hard error retires tracked requests, retaining later operator keystrokes FIFO.
-    fn retire_tracked_writes(&mut self) {
-        use crate::pty::write_receipt::WriteFailure;
+    fn retire_tracked_writes(&mut self, reason: WriteFailure) {
         self.pending_writes.retain(|(_, ticket)| {
             if let Some(ticket) = ticket {
-                ticket.retire(WriteFailure::WriteFailed);
+                ticket.retire(reason);
                 false
             } else {
                 true
@@ -1016,18 +1037,21 @@ impl PtyIoActorRunner {
             match self.data_rx.try_recv() {
                 Ok(PtyIoDataCommand::WriteUserInput(bytes)) => self.push_pending(bytes),
                 Ok(PtyIoDataCommand::WriteTrackedInput(ticket)) => {
-                    ticket.retire(WriteFailure::WriteFailed);
+                    ticket.retire(reason);
                 }
                 Err(_) => break,
             }
         }
     }
 
-    fn discard_pending_writes(&mut self) {
+    fn discard_pending_writes(&mut self, reason: WriteFailure) {
+        self.retire_tracked_writes(reason);
         self.pending_writes.clear();
         self.current_write_offset = 0;
         for _ in 0..self.data_rx.len() {
-            drop(self.data_rx.try_recv());
+            if let Ok(PtyIoDataCommand::WriteTrackedInput(ticket)) = self.data_rx.try_recv() {
+                ticket.retire(reason);
+            }
         }
     }
 
@@ -1074,7 +1098,7 @@ impl PtyIoActorRunner {
         self.writer_health.set_broken(true);
         self.broken_at = Some(now);
         self.zero_write_streak = 0;
-        self.discard_pending_writes();
+        self.discard_pending_writes(WriteFailure::WriterBroken);
     }
 
     fn maybe_rearm_writer(&mut self) {
@@ -1188,7 +1212,7 @@ impl PtyIoActorHandle {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::default(),
         };
@@ -1403,7 +1427,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::clone(&controls),
             writer_health: Arc::default(),
         };
@@ -1447,7 +1471,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::default(),
         };
@@ -1493,7 +1517,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::default(),
         };
@@ -1551,7 +1575,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::default(),
         };
@@ -1649,7 +1673,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: runner.controls.clone(),
             writer_health: runner.writer_health.clone(),
         };
@@ -1909,7 +1933,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::default(),
         };
@@ -1968,7 +1992,7 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             writer_health: Arc::clone(&runner.writer_health),
         };
@@ -2148,5 +2172,117 @@ mod tests {
 
         let _ = peer.write_all(b"ignored");
         assert!(read_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    }
+
+    #[test]
+    fn s3a_broken_writer_retires_each_ticket_with_exact_native_prefix() {
+        use crate::pty::write_receipt::WriteReceipt;
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
+        let (completed, completed_receipt) =
+            WriteReceipt::channel(Bytes::from_static(b"done"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completed));
+        runner.flush_pending_writes_once();
+        let at = completed_receipt.try_completed().unwrap();
+        let mut done = [0; 4];
+        peer.read_exact(&mut done).unwrap();
+        assert_eq!(&done, b"done");
+        let (partial, partial_receipt) = WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        let mut writer = runner.file.try_clone().unwrap();
+        partial
+            .write(|bytes| writer.write(&bytes[..2]))
+            .unwrap()
+            .unwrap();
+        let mut prefix = [0; 2];
+        peer.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"pa");
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(partial));
+        let (queued, queued_receipt) = WriteReceipt::channel(Bytes::from_static(b"queued"), None);
+        data_tx
+            .try_send(PtyIoDataCommand::WriteTrackedInput(queued))
+            .unwrap();
+        runner.mark_writer_broken();
+        for (receipt, count) in [(&partial_receipt, 2), (&queued_receipt, 0)] {
+            assert_eq!(
+                format!("{:?}", receipt.progress().failure),
+                "Some(WriterBroken)"
+            );
+            assert_eq!(receipt.progress().bytes_written, count);
+            assert!(receipt.progress().remainder_discarded);
+        }
+        assert_eq!(completed_receipt.progress().completed_at, Some(at));
+        assert_eq!(completed_receipt.progress().failure, None);
+        runner.rearm_writer();
+        runner.enqueue_write(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+            b"after",
+        )));
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 5];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"after");
+        assert!(runner.pending_writes.is_empty());
+        assert!(runner.data_rx.is_empty());
+    }
+
+    #[test]
+    fn s3a_actor_owner_release_and_shutdown_retire_pending_and_channel_tickets() {
+        use crate::pty::write_receipt::WriteReceipt;
+        for (owner_changed, reason) in [(true, "Some(OwnerChanged)"), (false, "Some(PaneGone)")] {
+            let (mut runner, _peer, data_tx) = socket_pair_runner();
+            let (pending, first) = WriteReceipt::channel(Bytes::from_static(b"pending"), None);
+            let (queued, second) = WriteReceipt::channel(Bytes::from_static(b"queued"), None);
+            runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(pending));
+            data_tx
+                .try_send(PtyIoDataCommand::WriteTrackedInput(queued))
+                .unwrap();
+            let command = if owner_changed {
+                PtyIoControlCommand::ReleaseAfterCommit(std_mpsc::channel().0)
+            } else {
+                PtyIoControlCommand::Shutdown
+            };
+            assert!(runner.handle_control_command(command));
+            drop(runner);
+            for receipt in [first, second] {
+                assert_eq!(format!("{:?}", receipt.progress().failure), reason);
+                assert_eq!(receipt.progress().bytes_written, 0);
+                assert!(receipt.progress().remainder_discarded);
+            }
+        }
+    }
+    #[test]
+    fn s3a_refused_admission_retires_payload_before_returning_the_ticket() {
+        use crate::pty::write_receipt::WriteReceipt;
+        for reason in [
+            WriteFailure::WriterBroken,
+            WriteFailure::OwnerChanged,
+            WriteFailure::PaneGone,
+        ] {
+            let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+            match reason {
+                WriteFailure::WriterBroken => handle.writer_health.set_broken(true),
+                WriteFailure::OwnerChanged => {
+                    handle.user_writes.lock().unwrap().refused = Some(reason);
+                    // A runtime dropping after committed handoff must retain this cause.
+                    handle.shutdown();
+                }
+                WriteFailure::PaneGone => handle.shutdown(),
+                _ => unreachable!(),
+            }
+            let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"refused"), None);
+            let result = handle.try_write_ticket(ticket);
+            assert_eq!(receipt.progress().failure, Some(reason));
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().remainder_discarded);
+            let Err(mpsc::error::TrySendError::Closed(ticket)) = result else {
+                panic!("expected closed");
+            };
+            assert_eq!(ticket.pending_bytes(), 0);
+            drop(guard);
+        }
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        drop(guard);
+        let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"closed"), None);
+        let _retained = handle.try_write_ticket(ticket);
+        assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
+        assert!(receipt.progress().remainder_discarded);
     }
 }

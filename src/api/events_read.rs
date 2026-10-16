@@ -88,6 +88,7 @@ fn refuse(id: String, code: &str, message: String) -> String {
     encode(&ErrorResponse {
         id,
         error: ErrorBody {
+            data: None,
             code: code.into(),
             message,
         },

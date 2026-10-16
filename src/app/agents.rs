@@ -867,22 +867,27 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
+                data: None,
                 code: "invalid_agent_name".into(),
                 message: "agent name must not be empty".into(),
             },
             AgentStartError::EmptyArgv => crate::api::schema::ErrorBody {
+                data: None,
                 code: "invalid_agent_argv".into(),
                 message: "agent start argv must not be empty".into(),
             },
             AgentStartError::TargetNotFound { target } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_not_found".into(),
                 message: format!("agent placement target {target} not found"),
             },
             AgentStartError::PlacementConflict(reason) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_conflict".into(),
                 message: reason,
             },
             AgentStartError::PlacementRequired => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_required".into(),
                 // #398: naming the remedy is the whole point. A refusal that
                 // only said "no placement" turns a misplacement into a mystery,
@@ -899,12 +904,14 @@ impl App {
                     .into(),
             },
             AgentStartError::NoActiveWorkspace => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_no_active_workspace".into(),
                 message: "--active was passed and no workspace is focused; name a placement \
                           with --workspace or --tab"
                     .into(),
             },
             AgentStartError::NoCallerPane => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_here_unavailable".into(),
                 // Names the alternatives, because "there is no here" is not an
                 // answer a caller can act on — it is the refusal that would
@@ -916,18 +923,22 @@ impl App {
                     .into(),
             },
             AgentStartError::SpawnFailed(message) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_start_failed".into(),
                 message,
             },
             AgentStartError::ExitedAtStart(exit) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_exited_at_start".into(),
                 message: exit.message(),
             },
             AgentStartError::ProfileUnresolved(unresolved) => crate::api::schema::ErrorBody {
+                data: None,
                 code: unresolved.code().into(),
                 message: unresolved.message(),
             },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_name_taken".into(),
                 message: format!(
                     "agent name {name} is already used; candidates: {}",
@@ -955,11 +966,13 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
             },
             TerminalTargetError::Ambiguous { target, candidates } => {
                 crate::api::schema::ErrorBody {
+                    data: None,
                     code: "agent_target_ambiguous".into(),
                     message: format!(
                         "agent target {target} is ambiguous; candidates: {}",
@@ -989,6 +1002,7 @@ impl App {
         match err {
             AgentRenameError::Target(err) => self.agent_target_error_body(err),
             AgentRenameError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_name_taken".into(),
                 message: format!(
                     "agent name {name} is already used; candidates: {}",

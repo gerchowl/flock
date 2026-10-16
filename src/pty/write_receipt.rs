@@ -9,7 +9,9 @@ use std::time::Instant;
 pub(crate) enum WriteFailure {
     Cancelled,
     Deadline,
-    WriterGone,
+    WriterBroken,
+    OwnerChanged,
+    PaneGone,
     WriteFailed,
 }
 
@@ -37,6 +39,29 @@ impl WriteState {
     fn expired(&self, at: Instant) -> bool {
         self.deadline.is_some_and(|deadline| at > deadline)
     }
+    /// The syscall may begin at the deadline; an instant after it must refuse.
+    fn before_syscall(&mut self, at: Instant) -> bool {
+        if self.progress.failure.is_some() || self.progress.completed_at.is_some() {
+            return false;
+        }
+        if self.expired(at) {
+            self.fail(WriteFailure::Deadline);
+            return false;
+        }
+        true
+    }
+
+    /// Record the actual final-write instant before deciding whether it is timely.
+    fn finish_write(&mut self, at: Instant) -> bool {
+        self.progress.completed_at = Some(at);
+        self.payload = Bytes::new();
+        if self.expired(at) {
+            self.fail(WriteFailure::Deadline);
+            return false;
+        }
+        true
+    }
+
     fn fail(&mut self, reason: WriteFailure) {
         self.progress.failure.get_or_insert(reason);
         self.payload = Bytes::new();
@@ -173,11 +198,7 @@ impl WriteCompletion {
         write: impl FnOnce(&[u8]) -> io::Result<usize>,
     ) -> Option<io::Result<usize>> {
         let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.progress.failure.is_some() || state.progress.completed_at.is_some() {
-            return None;
-        }
-        if state.expired(Instant::now()) {
-            state.fail(WriteFailure::Deadline);
+        if !state.before_syscall(Instant::now()) {
             return None;
         }
         let result = if state.payload.is_empty() {
@@ -190,11 +211,7 @@ impl WriteCompletion {
                 state.progress.bytes_written += n;
                 if state.progress.bytes_written == state.progress.bytes_total {
                     let at = Instant::now();
-                    state.progress.completed_at = Some(at);
-                    state.payload = Bytes::new();
-                    if state.expired(at) {
-                        state.fail(WriteFailure::Deadline);
-                    } else {
+                    if state.finish_write(at) {
                         let _ = self.completion.send(at);
                     }
                 }
@@ -214,7 +231,7 @@ impl Drop for WriteCompletion {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.progress.completed_at.is_none() {
-            state.fail(WriteFailure::WriterGone);
+            state.fail(WriteFailure::WriterBroken);
         }
     }
 }
@@ -359,13 +376,13 @@ mod tests {
             );
             let progress = receipt.progress();
             assert_eq!(progress.bytes_written, written);
-            assert_eq!(progress.failure, Some(WriteFailure::WriterGone));
+            assert_eq!(progress.failure, Some(WriteFailure::WriterBroken));
             assert!(progress.remainder_discarded);
         }
     }
 
     fn assert_late_syscall(count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_millis(200);
         let (completion, receipt) = tracked(Some(deadline));
         let (mut socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
@@ -444,40 +461,47 @@ mod tests {
     }
     #[test]
     fn write_deadline_edge_is_inclusive_before_and_after_syscall() {
-        let at = Instant::now();
-        let (expired, receipt) = tracked(Some(at));
-        {
-            let state = receipt.0.state.lock().unwrap();
-            assert!(!state.expired(at));
-            assert!(state.expired(at + Duration::from_nanos(1)));
+        let deadline = Instant::now();
+        for (begin, finish, allowed, timely) in [
+            (deadline, deadline, true, true),
+            (deadline - Duration::from_nanos(1), deadline, true, true),
+            (deadline, deadline + Duration::from_nanos(1), true, false),
+            (deadline + Duration::from_nanos(1), deadline, false, false),
+        ] {
+            let (ticket, receipt) = tracked(Some(deadline));
+            let (mut socket, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut state = receipt.0.state.lock().unwrap();
+            assert_eq!(state.before_syscall(begin), allowed);
+            if allowed {
+                let n = socket.write(&state.payload).unwrap();
+                state.progress.bytes_written += n;
+                assert_eq!(state.finish_write(finish), timely);
+                let mut observed = [0; 5];
+                peer.read_exact(&mut observed).unwrap();
+                assert_eq!(&observed, b"paste");
+                assert_eq!(state.progress.bytes_written, 5);
+                assert_eq!(state.progress.completed_at, Some(finish));
+            } else {
+                assert_eq!(state.progress.bytes_written, 0);
+                assert!(state.payload.is_empty());
+            }
+            assert_eq!(
+                state.progress.failure,
+                (!timely).then_some(WriteFailure::Deadline)
+            );
+            assert!(
+                !state.before_syscall(finish),
+                "terminal write cannot repeat"
+            );
+            drop(state);
+            drop(ticket);
         }
-        // Exercise the pre-syscall gate, not only its time comparison.
-        assert!(expired
-            .write(|_| panic!("expired gate invoked syscall"))
-            .is_none());
-        assert_eq!(receipt.progress().failure, Some(WriteFailure::Deadline));
-        assert_eq!(receipt.progress().bytes_written, 0);
-
-        let (timely, receipt) = tracked(Some(Instant::now() + Duration::from_secs(30)));
-        let (mut socket, mut peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        timely.write(|bytes| socket.write(bytes)).unwrap().unwrap();
-        let mut observed = [0; 5];
-        peer.read_exact(&mut observed).unwrap();
-        assert_eq!(&observed, b"paste");
-        // Exact equality and delayed observation must preserve completed writing.
-        let completed_at = receipt.progress().completed_at.unwrap();
-        receipt.0.state.lock().unwrap().deadline = Some(completed_at);
-        assert_eq!(receipt.try_completed(), Ok(completed_at));
-        assert_eq!(receipt.progress().failure, None);
-
-        // Exercise the post-syscall gate with an actual late native write.
-        assert_late_syscall(5);
     }
 
     #[test]
     fn live_silent_writer_hits_its_own_deadline_before_resuming() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_millis(200);
         let (completion, receipt) = tracked(Some(deadline));
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
