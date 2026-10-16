@@ -12,15 +12,16 @@ use std::time::Instant;
 const TOKEN: &str = "fixture-token-not-a-credential";
 const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
-struct Fixture {
+pub(crate) struct Fixture {
     _lifetime: File,
-    root: SessionConfigDir,
+    pub(crate) root: SessionConfigDir,
+    leases: crate::structured::lease::SessionLeases,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::under(&std::env::temp_dir())
     }
-    fn under(parent: &std::path::Path) -> Self {
+    pub(crate) fn under(parent: &std::path::Path) -> Self {
         let root = SessionConfigDir::create(parent).expect("fixture root");
         let path = root.path().join("lifetime");
         let name = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
@@ -35,6 +36,7 @@ impl Fixture {
         let fixture = Self {
             _lifetime: lifetime,
             root,
+            leases: Default::default(),
         };
         fixture.file("token", TOKEN.as_bytes(), 0o600);
         fixture.file(
@@ -67,13 +69,13 @@ impl Fixture {
         fixture.file("claude", script.as_bytes(), 0o700);
         fixture
     }
-    fn file(&self, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
+    pub(crate) fn file(&self, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
         let path = self.root.path().join(name);
         fs::write(&path, bytes).expect("fixture file");
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture mode");
         path
     }
-    fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
+    pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
         self.file(
             "case.json",
             serde_json::json!({"mode":mode,"version":version})
@@ -140,8 +142,12 @@ impl Fixture {
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let lease = self
+            .leases
+            .reserve("fixture-agent", &location.session, None)
+            .expect("lease");
         let worker = std::thread::spawn(move || {
-            let result = run(&state, profile, location, |runtime| {
+            let result = run(&state, profile, lease, location, |runtime| {
                 let _ = ready_tx.send(runtime);
             });
             let _ = result_tx.send(result);
@@ -466,7 +472,13 @@ fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
     let generated = files.path().to_owned();
     let root = ProcessIdentity::capture(child.id()).expect("owned birth");
     let error = platform::structured::child_pipes(&mut child).expect_err("no piped endpoints");
-    let error = startup_failed(child, files, persistent.clone(), error, true);
+    let mut lease = fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .unwrap();
+    lease.spawned();
+    lease.bind(child.id()).unwrap();
+    let error = startup_failed(child, files, persistent.clone(), error, true, &mut lease);
     assert!(error.to_string().contains("missing stdout pipe"));
     assert!(error.to_string().contains("cleanup confirmed"));
     assert!(!root.alive());
@@ -523,6 +535,9 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
     let error = run(
         fixture.root.path(),
         profile,
+        crate::structured::lease::SessionLeases::default()
+            .reserve("fixture-agent", SESSION, None)
+            .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
             agent: "fixture-agent".into(),
@@ -779,6 +794,9 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
     let exit = run(
         fixture.root.path(),
         profile,
+        crate::structured::lease::SessionLeases::default()
+            .reserve("fixture-agent", SESSION, None)
+            .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
             agent: "fixture-agent".into(),
@@ -791,4 +809,67 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
     assert!(exit.status.is_some());
     assert!(exit.error.expect("error").contains("publication panicked"));
     assert!(generated.exists());
+}
+
+#[test]
+fn lease_is_released_after_model_startup_failure() {
+    let fixture = Fixture::new();
+    assert!(fixture.launch("normal", "remove").is_err());
+    assert!(fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .is_ok());
+}
+
+#[test]
+fn lease_is_released_after_a_crash_with_confirmed_cleanup() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("missing-result", "2.1.296").unwrap();
+    running.receive();
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Crashed, "{exit:?}");
+    assert!(fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .is_ok());
+}
+
+#[test]
+fn lease_is_released_after_a_requested_stop_with_confirmed_cleanup() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("normal", "2.1.296").unwrap();
+    running.receive();
+    running.runtime.stop();
+    let exit = running.finish();
+    assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
+    assert!(fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .is_ok());
+}
+
+#[test]
+fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
+    for (agent, session) in [("other-agent", SESSION), ("fixture-agent", "other-session")] {
+        let fixture = Fixture::new();
+        let lease = fixture.leases.reserve(agent, session, None).unwrap();
+        let error = run(
+            fixture.root.path(),
+            fixture.profile("idle", "2.1.296"),
+            lease,
+            StreamLocation {
+                data_dir: fixture.root.path().to_owned(),
+                agent: "fixture-agent".into(),
+                session: session.into(),
+            },
+            |_| panic!("mismatched identity must never publish"),
+        )
+        .expect_err("mismatch");
+        assert!(
+            error.to_string().contains("lease/stream mismatch"),
+            "{error}"
+        );
+        assert!(fixture.leases.reserve(agent, session, None).is_ok());
+    }
 }

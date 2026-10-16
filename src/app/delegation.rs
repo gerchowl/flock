@@ -183,10 +183,14 @@ impl App {
         pane_id: crate::layout::PaneId,
         label: Option<String>,
     ) -> String {
-        let SpawnCaller::Agent {
+        let (SpawnCaller::Agent {
             agent_id: architect,
             ..
-        } = caller
+        }
+        | SpawnCaller::Structured {
+            agent_id: Some(architect),
+            ..
+        }) = caller
         else {
             return UNATTESTED_EDGE.to_string();
         };

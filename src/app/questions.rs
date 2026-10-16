@@ -138,7 +138,10 @@ impl App {
         unattended: bool,
     ) -> Result<QuestionPolicy, WideningRefused> {
         resolve(
-            matches!(caller, SpawnCaller::Agent { .. }),
+            matches!(
+                caller,
+                SpawnCaller::Agent { .. } | SpawnCaller::Structured { .. }
+            ),
             asked,
             unattended,
         )
