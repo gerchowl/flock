@@ -1236,13 +1236,14 @@ files. No hand-written TS type may describe a wire shape.
 S8a (#1592) starts with the socket API's `AgentInfo`, `FleetAgentInfo`,
 `WorkspaceInfo` and `PaneInfo` records, their transitive dependencies, the
 question types and the Claude adapter's `SessionEvent`. The adapter's custom
-serializer emits an untagged union, so its TS derive explicitly uses that
-representation, with `Unknown` represented by `unknown`. The event catalogue
-also generates Rust discriminator enums for ts-rs to inline as string literals;
-no TypeScript wire declarations are maintained by hand. Extra JSON fields stay
-flattened as an index signature. Clients validate unknown input before narrowing
-known members on `type` and the catalogue's discriminator; unrecognised shapes
-use §8's rendering.
+serializer emits an untagged union; its generated stored form is
+`SessionEvent = KnownSessionEvent | JsonValue`. Clients narrow `KnownSessionEvent`
+on literal `type` and catalogue discriminators, including nested stream and
+control tags. Switching on a nested tag narrows its payload, but TypeScript does
+not correlate that narrowing back to the containing envelope. Absent-only subtypes are `subtype?: never`. The event catalogue
+supplies these literals to ts-rs; no TypeScript wire declarations are maintained
+by hand. Extra JSON fields stay flattened as an index signature. Unknown events
+reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 
 Absent metadata and explicit null remain distinct: `Option<Option<T>>` is
 exported as `?: T | null`. Typed 64-bit durations, timestamps and counters use
