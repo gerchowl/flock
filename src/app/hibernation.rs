@@ -321,6 +321,40 @@ mod tests {
         assert_eq!(err.code(), "already_hibernated");
     }
 
+    #[tokio::test]
+    async fn deferred_1680_resume_does_not_claim_hibernation() {
+        let mut app = test_app();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let ws = crate::workspace::Workspace::test_new("deferred-resume");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces.push(ws);
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "opencode".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()],
+            dedupe_key: "deferred-resume-fixture".into(),
+        });
+        assert!(terminal.hibernated_resume_plan.is_none());
+        let sequence = app.event_hub.current_sequence();
+        let result = app.resume_hibernated_pane(0, pane_id);
+        let events = app.event_hub.events_after(sequence);
+        // Reap the owned fake shell before any assertion can panic.
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            events.iter().all(|(_, envelope)| envelope.event
+                != crate::api::schema::EventKind::AgentResumedFromHibernation),
+            "a never-hibernated pane emitted a hibernation fact: {events:?}"
+        );
+    }
+
     #[test]
     fn resume_refuses_unhibernated_pane() {
         let (mut app, ws_idx, pane_id) = app_with_agent_pane();
