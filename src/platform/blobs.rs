@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs::{File, Metadata};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// A pinned, validated owner-only directory. All names are single components.
@@ -26,7 +26,7 @@ impl Directory {
         CString::new(name).map_err(|_| io::ErrorKind::InvalidInput.into())
     }
     pub(crate) fn file(&self, name: &str, create: bool) -> io::Result<File> {
-        let name = Self::name(name)?;
+        let component = Self::name(name)?;
         let flags = libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | libc::O_NONBLOCK
@@ -36,13 +36,24 @@ impl Directory {
                 libc::O_RDONLY
             };
         // SAFETY: directory owns its fd and name is a valid terminated component.
-        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), component.as_ptr(), flags, 0o600) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: successful openat transfers this new descriptor to File.
         let file = unsafe { File::from_raw_fd(fd) };
-        validate(&file.metadata()?, false)?;
+        let validation = (|| {
+            if create {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            validate(&file.metadata()?, false)
+        })();
+        if let Err(error) = validation {
+            if create {
+                self.remove(name)?;
+            }
+            return Err(error);
+        }
         Ok(file)
     }
     pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -59,6 +70,9 @@ impl Directory {
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
+        self.sync()
+    }
+    pub(crate) fn sync(&self) -> io::Result<()> {
         self.0.sync_all()
     }
     pub(crate) fn remove(&self, name: &str) -> io::Result<()> {
@@ -93,4 +107,32 @@ pub(crate) fn unsafe_path(error: &io::Error) -> bool {
             | io::ErrorKind::NotADirectory
             | io::ErrorKind::InvalidInput
     ) || error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structured::launch::SessionConfigDir;
+    use std::io::{Read, Write};
+    #[test]
+    fn exclusive_creation_collision_preserves_the_existing_entry() {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let directory = Directory::open(&root.path().join("blobs")).unwrap();
+        directory
+            .file(".tmp-collision", true)
+            .unwrap()
+            .write_all(b"owned elsewhere")
+            .unwrap();
+        assert_eq!(
+            directory.file(".tmp-collision", true).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let mut bytes = Vec::new();
+        directory
+            .file(".tmp-collision", false)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"owned elsewhere");
+    }
 }

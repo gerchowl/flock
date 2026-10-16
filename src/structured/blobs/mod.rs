@@ -54,7 +54,6 @@ impl std::error::Error for BlobError {
 impl From<io::Error> for BlobError {
     fn from(error: io::Error) -> Self {
         match error.kind() {
-            io::ErrorKind::NotFound => Self::Missing,
             _ if crate::platform::blobs::unsafe_path(&error) => Self::UnsafePath,
             _ => Self::Io(error),
         }
@@ -89,16 +88,32 @@ impl BlobStore {
         }
         Ok(())
     }
+    fn lookup_error(error: io::Error) -> BlobError {
+        if error.kind() == io::ErrorKind::NotFound {
+            BlobError::Missing
+        } else {
+            error.into()
+        }
+    }
     /// Return the size without reading content. Missing and unsafe entries fail.
     pub fn stat(&self, hash: &str) -> Result<u64, BlobError> {
         Self::check(hash)?;
-        Ok(self.0.file(hash, false)?.metadata()?.len())
+        Ok(self
+            .0
+            .file(hash, false)
+            .map_err(Self::lookup_error)?
+            .metadata()?
+            .len())
     }
     /// Read and verify content, distinguishing absence from hash corruption.
     pub fn get(&self, hash: &str) -> Result<Vec<u8>, BlobError> {
         Self::check(hash)?;
         let mut bytes = Vec::new();
-        self.0.file(hash, false)?.read_to_end(&mut bytes)?;
+        self.0
+            .file(hash, false)
+            .map_err(Self::lookup_error)?
+            .read_to_end(&mut bytes)
+            .map_err(BlobError::Io)?;
         if Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -116,34 +131,34 @@ impl BlobStore {
         let mut entropy = [0; 16];
         getrandom::fill(&mut entropy).map_err(io::Error::other)?;
         let name = format!(".tmp-{:x}", u128::from_ne_bytes(entropy));
+        let mut file = self.0.file(&name, true)?;
         let result = (|| {
-            let mut file = self.0.file(&name, true)?;
             let mut hash = Sha256::new();
             let mut size = 0_u64;
             let mut preview = Vec::new();
             let mut buffer = [0; 8192];
             loop {
-                let n = reader.read(&mut buffer)?;
+                let n = reader.read(&mut buffer).map_err(BlobError::Io)?;
                 if n == 0 {
                     break;
                 }
                 if n as u64 > max_bytes.saturating_sub(size) {
                     return Err(BlobError::TooLarge);
                 }
-                file.write_all(&buffer[..n])?;
+                file.write_all(&buffer[..n]).map_err(BlobError::Io)?;
                 hash.update(&buffer[..n]);
                 size += n as u64;
                 preview
                     .extend_from_slice(&buffer[..n.min(320_usize.saturating_sub(preview.len()))]);
             }
-            file.sync_all()?;
+            file.sync_all().map_err(BlobError::Io)?;
             let blob = hash
                 .finalize()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             match self.get(&blob) {
-                Ok(_) => (),
+                Ok(_) => self.0.sync()?,
                 Err(BlobError::Missing) => self.0.rename(&name, &blob)?,
                 Err(error) => return Err(error),
             }
@@ -171,42 +186,41 @@ impl BlobStore {
         if value.get("type").and_then(Value::as_str) == Some("stream_event") {
             return Ok(None);
         }
-        fn visit(
-            store: &BlobStore,
-            value: &mut Value,
-            threshold: usize,
-        ) -> Result<bool, BlobError> {
-            if matches!(
-                value.get("type").and_then(Value::as_str),
-                Some("tool_result" | "attachment" | "image" | "document" | "thinking")
-            ) {
-                let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-                if bytes.len() > threshold {
-                    *value = serde_json::to_value(store.put(bytes.as_slice(), bytes.len() as u64)?)
-                        .map_err(io::Error::other)?;
-                    return Ok(true);
-                }
-            }
-            let mut changed = false;
-            match value {
-                Value::Object(map) => {
-                    for child in map.values_mut() {
-                        changed |= visit(store, child, threshold)?;
-                    }
-                }
-                Value::Array(items) => {
-                    for child in items {
-                        changed |= visit(store, child, threshold)?;
-                    }
-                }
-                _ => (),
-            }
-            Ok(changed)
+        // Only complete harness message blocks carry this storage meaning.
+        // Tool inputs and unknown diagnostic payloads remain opaque.
+        if !matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("assistant" | "user")
+        ) {
+            return Ok(Some(raw.into()));
         }
-        if visit(self, &mut value, threshold)? {
-            Ok(Some(value.to_string()))
+        let mut changed = false;
+        if let Some(blocks) = value
+            .pointer_mut("/message/content")
+            .and_then(Value::as_array_mut)
+        {
+            for block in blocks {
+                if matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("tool_result" | "attachment" | "image" | "document" | "thinking")
+                ) {
+                    let bytes = serde_json::to_vec(block).map_err(io::Error::other)?;
+                    if bytes.len() > threshold {
+                        *block =
+                            serde_json::to_value(self.put(bytes.as_slice(), bytes.len() as u64)?)
+                                .map_err(io::Error::other)?;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(Some(if changed {
+            value.to_string()
         } else {
-            Ok(Some(raw.into()))
-        }
+            raw.into()
+        }))
     }
 }
+
+#[cfg(test)]
+mod tests;

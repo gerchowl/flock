@@ -616,10 +616,14 @@ fn emit(
         }
         _ => (false, None),
     };
-    let stored_raw = storage
-        .0
-        .project(&raw, storage.1)
-        .map_err(io::Error::other)?;
+    let stored_raw = if kind.as_deref() == Some("stream_event") {
+        None
+    } else {
+        storage
+            .0
+            .project(&raw, storage.1)
+            .map_err(io::Error::other)?
+    };
     let persisted = stored_raw.is_some();
     if persisted {
         *seq = seq
