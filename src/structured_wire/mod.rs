@@ -323,3 +323,6 @@ pub enum ServerFrame {
 fn present_json<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Value::deserialize(d).map(Some)
 }
+
+#[cfg(test)]
+mod round3_tests;

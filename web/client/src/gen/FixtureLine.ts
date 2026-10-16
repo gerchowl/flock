@@ -3,7 +3,9 @@ import type { AppliedCursor } from "./AppliedCursor";
 import type { ClientAction } from "./ClientAction";
 import type { ClientFrame } from "./ClientFrame";
 import type { DeadlineStage } from "./DeadlineStage";
+import type { OutboxStatus } from "./OutboxStatus";
 import type { QueuedCommand } from "./QueuedCommand";
+import type { ResyncMarker } from "./ResyncMarker";
 import type { ServerFrame } from "./ServerFrame";
 import type { SocketTarget } from "./SocketTarget";
 import type { StreamObservation } from "./StreamObservation";
@@ -23,7 +25,19 @@ cursors: { [key in string]: AppliedCursor },
 /**
  * Pending commands restored before any connection attempt.
  */
-outbox: Array<QueuedCommand>, } | { "step": "client",
+outbox: Array<QueuedCommand>,
+/**
+ * Durable resync markers keyed by stream, independent of sub identities.
+ */
+resync: { [key in string]: ResyncMarker },
+/**
+ * Initial virtual clock, allowing expiry before a new welcome.
+ */
+now_ms: number,
+/**
+ * Last known principal window, restored independently of a connection.
+ */
+idempotency_window_ms: number | null, } | { "step": "client",
 /**
  * Operation requested by the caller.
  */
@@ -39,15 +53,36 @@ streams: { [key in string]: StreamObservation },
 /**
  * Assert only the named command statuses.
  */
-outbox: { [key in string]: string }, } | { "step": "quiet",
+outbox: { [key in string]: OutboxStatus },
+/**
+ * Stream entries whose keys must be absent, including null entries.
+ */
+absent_streams: Array<string>,
+/**
+ * Commands whose keys must be absent (for example after principal change).
+ */
+absent_outbox: Array<string>,
+/**
+ * Exact transitions since previous observe, including transient Stale.
+ * Every observe drains the trace, even if this selector is omitted.
+ */
+connection_transitions: Array<string> | null, } | { "step": "quiet",
 /**
  * Positive duration; JSON number, exact in JavaScript below 2^53.
  */
 ceiling_ms: number, } | { "step": "expect_connect",
 /**
+ * Inclusive lower bound, measured from this assertion's virtual instant.
+ */
+not_before_ms: number,
+/**
  * Positive duration; JSON number, exact in JavaScript below 2^53.
  */
-within_ms: number, } | { "step": "open" } | { "step": "send",
+within_ms: number, } | { "step": "expect_close",
+/**
+ * Expected WebSocket close status.
+ */
+code: number, } | { "step": "open" } | { "step": "send",
 /**
  * Current attempt or the most recently abandoned socket generation.
  */

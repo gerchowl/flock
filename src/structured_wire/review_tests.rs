@@ -1,6 +1,6 @@
 use super::*;
 use fixture::FixtureLine;
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[test]
 fn every_registered_and_future_command_error_decodes_without_reconnect() {
@@ -80,43 +80,6 @@ syntax!(
     abandoned_socket_can_deliver_a_frame,
     json!({"v":1,"step":"send","socket":"previous","frame":{"t":"ping","nonce":"old"}})
 );
-
-#[test]
-fn every_script_has_initial_state_and_final_quiet() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/test/fixtures/wire");
-    for path in std::fs::read_dir(root)
-        .unwrap()
-        .map(Result::unwrap)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-    {
-        let content = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<Value> = content
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows[0]["step"], "given", "{}", path.display());
-        assert_eq!(rows.last().unwrap()["step"], "quiet", "{}", path.display());
-    }
-}
-
-#[test]
-fn required_recovery_scenarios_exist() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/test/fixtures/wire");
-    for name in [
-        "subscription-deadline",
-        "bootstrap-snapshot",
-        "stream-independence",
-        "old-socket",
-    ] {
-        assert!(
-            root.join(format!("{name}.jsonl")).exists(),
-            "missing {name}"
-        );
-    }
-}
 
 #[test]
 fn wire_error_constants_match_registered_and_subscription_spellings() {

@@ -4,7 +4,11 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Caller stimuli; supplied subscription identities are deterministic runner inputs.
  */
-export type ClientAction = { "kind": "connect" } | { "kind": "subscribe",
+export type ClientAction = { "kind": "connect" } | { "kind": "disconnect" } | { "kind": "set_token",
+/**
+ * Identity supplied by the fixture credential provider, not a bearer value.
+ */
+principal: string, } | { "kind": "network_change" } | { "kind": "foreground" } | { "kind": "subscribe",
 /**
  * Deterministic subscription identity supplied by the caller.
  */

@@ -1,0 +1,5 @@
+{"v":1,"step":"given","cursors":{},"outbox":[{"cmd_id":"c1","verb":"queue.add","args":{"text":"fixture"},"principal":"fixture-principal","created_ms":0,"status":"sent","first_sent_ms":100}],"now_ms":2099,"idempotency_window_ms":2000}
+{"v":1,"step":"observe","connection":"Disconnected","outbox":{"c1":"sent"}}
+{"v":1,"step":"quiet","ceiling_ms":2}
+{"v":1,"step":"observe","connection":"Disconnected","outbox":{"c1":"unknown_outcome"}}
+{"v":1,"step":"quiet","ceiling_ms":1}

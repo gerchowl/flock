@@ -1,9 +1,9 @@
 {"v":1,"step":"given","cursors":{},"outbox":[]}
 {"v":1,"step":"client","action":{"kind":"connect"}}
-{"v":1,"step":"expect_connect","within_ms":10000}
+{"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
 {"v":1,"step":"open"}
 {"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol"],"absent":[]}
 {"v":1,"step":"deadline","stage":{"kind":"handshake"}}
 {"v":1,"step":"observe","connection":"Reconnecting","streams":{},"outbox":{}}
-{"v":1,"step":"expect_connect","within_ms":500}
+{"v":1,"step":"expect_connect","within_ms":500,"not_before_ms":250}
 {"v":1,"step":"quiet","ceiling_ms":1000}

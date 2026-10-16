@@ -14,19 +14,19 @@ ceiling; mismatch, unexpected output and premature exit fail immediately.
 
 | Step | Fields and meaning |
 | --- | --- |
-| `given` | `cursors{stream:number}`, `outbox:[{cmd_id,verb,args,principal,created_ms}]`. Restore last applied cursors and pending commands before any attempt. Empty maps/lists are explicit. |
+| `given` | `cursors{stream:number}`, `outbox:[{cmd_id,verb,args,principal,created_ms,first_sent_ms,status}]`, optional `resync`, `now_ms` and cached `idempotency_window_ms`. Restore last applied cursors and commands with their explicit status before any attempt. Empty maps/lists are explicit. |
 | `client` | `action:{kind:"connect"}` starts the initial attempt. `subscribe{sub_id,stream}`, `unsubscribe{sub_id}` and `command{cmd_id,verb,args}` are caller inputs. The caller supplies deterministic subscription IDs. The client derives `after` and `resume_only` from its state, never from an expectation. |
-| `expect_connect` | `within_ms` requires the next connection attempt to start within this positive virtual backoff ceiling. It does not start an attempt. |
+| `expect_connect` | `not_before_ms` (default 0) and positive `within_ms` bound the next attempt inclusively. It does not start an attempt. |
 | `open` | Complete upgrade, cancel the connect ceiling, begin the handshake ceiling. Every upgrade declines permessage-deflate. |
 | `send` | `frame:ServerFrame`, optional `socket:"current"` (default) or `"previous"`. Inject into the active or most recently abandoned socket generation. Old callbacks must not send pong, renew liveness, apply events/barriers or change command outcomes. |
 | `expect` | `frame:ClientFrame`, `fields:string[]`, optional `absent:string[]` (default empty). Match `t` plus deep JSON equality of the selected top-level fields. Require each absent optional field to be omitted. Other fields are ignored. The example remains typed; invalid/missing selections, overlap, duplicate absence or nonexistent optional fields fail. |
-| `observe` | Optional `connection:string`, `streams{sub_id:{state:string,cursor:number\|null}}`, `outbox{cmd_id:string}`. Assert only specified entries; null means no applied cursor, while zero is meaningful. G3 owns the state/status values; S7a exports their shape without closing the vocabulary. |
-| `deadline` | `stage:{kind:"connect"\|"handshake"\|"subscription"\|"command_ack",sub_id?,cmd_id?}`. Advance to the named stage's failure ceiling, with no duration override. Subscription and command stages require their identity. |
+| `observe` | Optional `connection:string`, `streams{sub_id:{state:string,cursor:number\|null}}`, `outbox{cmd_id:OutboxStatus}`, optional `absent_streams`, `absent_outbox`, `connection_transitions`. Assert only specified entries; null means no applied cursor, while zero is meaningful. G3 owns connection/stream states; outbox statuses are the closed six-state enum below. |
+| `deadline` | `stage:{kind:"connect"\|"handshake"\|"subscription"\|"command_ack",sub_id?,cmd_id?}`. Advance to the original stage ceiling, rejecting every early effect, with no duration override. Subscription and command stages require their identity. |
 | `heartbeat_missed` | Withhold valid current-socket traffic and advance to 45 s from the last valid current-socket frame. The fake transport determines that instant; an old callback cannot shift it. |
 | `close` | `code`, `reason`. Deliver a WS close; 4401/4403 are rejected here. |
 | `drop` | Lose the active socket without a close, retaining applied state and outbox. |
 | `token_refused` | `code:4401\|4403`. Enter NeedsToken, hold pending outbox and do not reconnect until credentials change. |
-| `quiet` | Positive `ceiling_ms`. Advance the fake clock by that duration, requiring no client frame **or connection attempt** throughout. Required last, also usable between other operations. |
+| `quiet` | Positive `ceiling_ms`. Advance the fake clock by that duration, requiring no client frame, close **or connection attempt** throughout. Required last, also usable between other operations. |
 
 Initial connection and handshake ceilings are 10 s and 5 s. Subscription
 progress and command ack ceilings are independently 30 s; unrelated traffic
@@ -59,5 +59,58 @@ subscribed seq stream gets one synced; a later gap on an already current stream
 does not invent a second barrier. agent/<id>/live has no seq, after or synced.
 Command ack expiry makes only that command uncertain and never resends on the
 same socket. Reconnect lookups retain principal/id/args and use resume_only:true;
-session_unconfirmed remains uncertain with exit UNCONFIRMED and retry later.
+session_unconfirmed becomes unknown_outcome with exit UNCONFIRMED and retry later.
 G3 enforces these stateful rules; the format itself is not a client engine.
+
+Round 3 runner contract (ADR-0038 §3):
+
+- `given` optionally restores `resync{stream:{snapshot_to,unconfirmed:string[]}}`,
+  `now_ms` (default 0) and `idempotency_window_ms` (last known window, optional).
+  The virtual clock starts at `now_ms`; cached expiry runs even before a welcome.
+  Every restored command has a required `status`, never an inferred one.
+  `first_sent_ms` measures age for sent/uncertain entries, independently of
+  `created_ms` (queue time). Missing first-send age after restart means
+  unknown_outcome. Pending entries have no first-send time yet. The expiry
+  scripts use creation at 0, first send at 100 and restore at 2,099 with a
+  2,000 ms window, so using creation time incorrectly expires them early.
+- The closed outbox vocabulary is **pending, sent, uncertain, unknown_outcome,
+  acked, failed**. Pending first sends use `resume_only:false`; restored sent
+  and uncertain sends use `resume_only:true`. A 30 s ack deadline with the
+  socket up enters uncertain, sends nothing, and a late ack can still settle
+  it. Socket loss resends it as a lookup. A `session_unconfirmed` ack enters
+  unknown_outcome. Expired entries become unknown_outcome in every connection
+  state and are never resent. Changing principal drops the old outbox.
+- `disconnect` closes the socket (1000), cancels reconnect and holds the outbox.
+  `set_token{principal}` changes credentials and is the only exit from NeedsToken.
+  For deterministic scripts the initial bearer is `fixture-token`; set_token
+  supplies `fixture-token:<principal>` through the runner's credential provider.
+  `network_change` and `foreground` bypass backoff immediately in Reconnecting;
+  they cannot escape NeedsToken.
+- `expect_connect` matches an attempt in the inclusive interval
+  `[not_before_ms,within_ms]` measured from entry to that assertion, default
+  lower bound zero. An attempt already queued at the same instant has delay zero.
+  Explicit connect/foreground/network/token-change attempts use 0–1 ms.
+  A server retry uses the full equal-jitter interval, including the 30 s cap.
+- `deadline` advances to the original named stage's ceiling, **checking the
+  entire intermediate trace**. No state change, client frame, close or connection
+  attempt may occur strictly before it; the stage effect must occur exactly at
+  the ceiling. An early effect fails immediately, even if the final observation
+  would match. Do not advance first and check only at the end. Unrelated traffic
+  cannot move the stage origin. All waits remain virtual and bounded.
+- `observe` optionally includes `absent_streams` and `absent_outbox`: assert
+  missing keys, not null values or empty maps. Positive and absent selections
+  cannot overlap or repeat. `connection_transitions` asserts the **exact ordered
+  transition trace since the previous observe** (or since given for the first).
+  Every observe drains that trace, including when it does not select it.
+  This exposes Stale before the immediate Reconnecting without freezing a
+  transient state or moving timers. Empty streams/outbox maps assert nothing.
+- `expect_close{code}` matches the next client-initiated socket close, distinct
+  from the server-stimulus `close`. Missing, wrong or extra closes fail. Ordinary
+  `expect` still matches only client JSON frames. `quiet` prohibits frames,
+  closes and connection attempts but permits internal state changes (expiry).
+
+S7a's Rust self-tests feed deliberately wrong synthetic traces into a contract
+oracle: early/late attempts, early deadlines, wrong close codes, missing Stale,
+retained absent entries, wrong restored resume_only, and wrong action outcomes.
+They validate the script assertions; they do not execute G3. G3 must consume the
+same scripts with its actual client, fake transport and virtual clock.

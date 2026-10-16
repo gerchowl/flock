@@ -33,6 +33,17 @@ pub enum FixtureStep {
         cursors: BTreeMap<String, AppliedCursor>,
         /// Pending commands restored before any connection attempt.
         outbox: Vec<QueuedCommand>,
+        /// Durable resync markers keyed by stream, independent of sub identities.
+        #[serde(default)]
+        resync: BTreeMap<String, ResyncMarker>,
+        /// Initial virtual clock, allowing expiry before a new welcome.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        now_ms: u64,
+        /// Last known principal window, restored independently of a connection.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        idempotency_window_ms: Option<u64>,
     },
     /// Explicit caller input, separate from expected transport output.
     Client {
@@ -49,7 +60,17 @@ pub enum FixtureStep {
         streams: BTreeMap<String, StreamObservation>,
         /// Assert only the named command statuses.
         #[serde(default)]
-        outbox: BTreeMap<String, String>,
+        outbox: BTreeMap<String, OutboxStatus>,
+        /// Stream entries whose keys must be absent, including null entries.
+        #[serde(default)]
+        absent_streams: Vec<String>,
+        /// Commands whose keys must be absent (for example after principal change).
+        #[serde(default)]
+        absent_outbox: Vec<String>,
+        /// Exact transitions since previous observe, including transient Stale.
+        /// Every observe drains the trace, even if this selector is omitted.
+        #[serde(default)]
+        connection_transitions: Option<Vec<String>>,
     },
     /// Require no client frames or connection attempts before the virtual ceiling.
     Quiet {
@@ -59,9 +80,18 @@ pub enum FixtureStep {
     },
     /// Expect an attempt to start within the virtual backoff ceiling; no stimulus.
     ExpectConnect {
+        /// Inclusive lower bound, measured from this assertion's virtual instant.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        not_before_ms: u64,
         /// Positive duration; JSON number, exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         within_ms: u64,
+    },
+    /// Require the next client-initiated close, never inject a server close.
+    ExpectClose {
+        /// Expected WebSocket close status.
+        code: u16,
     },
     /// Complete upgrade without compression; starts the handshake deadline.
     Open,
@@ -83,7 +113,9 @@ pub enum FixtureStep {
         #[serde(default)]
         absent: Vec<String>,
     },
-    /// Expire exactly the named stage's virtual failure ceiling.
+    /// Expire exactly the named stage's original virtual ceiling. Fail any
+    /// earlier state change, output, close or attempt, even if final state matches.
+    /// The runner checks the entire intermediate trace, never only the endpoint.
     Deadline {
         /// No duration override, sleep or automatic success exists.
         stage: DeadlineStage,
@@ -132,6 +164,43 @@ pub struct QueuedCommand {
     /// Virtual creation timestamp; JSON number, exact in JavaScript below 2^53.
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub created_ms: u64,
+    /// First send time, distinct from creation. Missing age after restart means
+    /// unknown_outcome, never a new execution (ADR-0038 §3).
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+    pub first_sent_ms: Option<u64>,
+    /// Persisted client state determines first-send versus resume-only lookup.
+    pub status: OutboxStatus,
+}
+
+/// Closed client outbox vocabulary (ADR-0038 §3), distinct from wire retry codes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxStatus {
+    /// Never sent: first send uses resume_only false.
+    Pending,
+    /// Sent but not acknowledged: reconnect uses resume_only true.
+    Sent,
+    /// Ack ceiling elapsed on a live socket; no resend there, late ack can settle.
+    Uncertain,
+    /// Window expired or session_unconfirmed: never automatically execute again.
+    UnknownOutcome,
+    /// A successful acknowledgement settled the command.
+    Acked,
+    /// A terminal refusal settled the command.
+    Failed,
+}
+
+/// Persisted snapshot progress. Re-subscription returns to Replaying at completion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ResyncMarker {
+    /// Sequence at which to remove still-unconfirmed entities and clear the marker.
+    pub snapshot_to: AppliedCursor,
+    /// Entity identifiers still awaiting confirmation by the snapshot.
+    pub unconfirmed: Vec<String>,
 }
 
 /// Subscription observation; string state vocabulary belongs to G3.
@@ -164,6 +233,17 @@ pub enum SocketTarget {
 pub enum ClientAction {
     /// Ask to connect; begins the initial attempt.
     Connect,
+    /// Close any socket, cancel retries and hold the outbox in Disconnected.
+    Disconnect,
+    /// Replace credentials; only exit from NeedsToken. Changed identity drops outbox.
+    SetToken {
+        /// Identity supplied by the fixture credential provider, not a bearer value.
+        principal: String,
+    },
+    /// Immediately retry while Reconnecting, without escaping NeedsToken.
+    NetworkChange,
+    /// Immediately retry while Reconnecting when the client becomes foreground.
+    Foreground,
     /// Ask to subscribe; cursor comes from applied state, not the expectation.
     Subscribe {
         /// Deterministic subscription identity supplied by the caller.
@@ -283,8 +363,35 @@ impl FixtureLine {
             {
                 return Err("authentication closes require token_refused".into());
             }
-            FixtureStep::Quiet { ceiling_ms: 0 } | FixtureStep::ExpectConnect { within_ms: 0 } => {
+            FixtureStep::Quiet { ceiling_ms: 0 }
+            | FixtureStep::ExpectConnect { within_ms: 0, .. } => {
                 return Err("virtual ceiling must be positive".into());
+            }
+            FixtureStep::ExpectConnect {
+                not_before_ms,
+                within_ms,
+            } if not_before_ms > within_ms => {
+                return Err("connection lower bound exceeds ceiling".into());
+            }
+            FixtureStep::Observe {
+                streams,
+                outbox,
+                absent_streams,
+                absent_outbox,
+                ..
+            } => {
+                for (positive, absent) in [
+                    (streams.keys().collect::<Vec<_>>(), absent_streams),
+                    (outbox.keys().collect::<Vec<_>>(), absent_outbox),
+                ] {
+                    let mut seen = std::collections::BTreeSet::new();
+                    if absent
+                        .iter()
+                        .any(|key| positive.contains(&key) || !seen.insert(key))
+                    {
+                        return Err("absent selections overlap or repeat".into());
+                    }
+                }
             }
             FixtureStep::Send {
                 frame: ServerFrame::Ev {
