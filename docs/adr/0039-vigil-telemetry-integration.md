@@ -8,7 +8,7 @@
 
 ## Summary
 
-flk keeps one logging facade (`src/logging.rs`). Behind it, vigil replaces today's hand-rolled rotating JSON writer and adds spans and metrics. Each process role writes its own OTLP/JSON Lines files under the data dir, one file per signal. Telemetry carries ids, enums, numbers, fixed message templates, typed paths, and masked text of flk's own errors only: never message bodies, prompts, tool or harness output, comment text or tokens. That is a schema change from today's facade, which logs free-text errors and raw paths. It is done first, on today's writer (V1a). The flk server is the only reader the GUI uses (ADR-0038 §4a). `flk report`, `peers logs`, `tail_session_logs` and the log-budget gate are migrated in the release that switches the format, not left reading a dead file. Spans correlate with the transcript through ids the session stream already has, so the stored session stream does not change. Cross-node trace propagation waits for the next mesh protocol version.
+flk keeps one logging facade (`src/logging.rs`). Behind it, vigil replaces today's hand-rolled rotating JSON writer and adds spans and metrics. Each process role writes its own OTLP/JSON Lines files under the data dir, one file per signal. Telemetry carries only typed values (ids, enums, numbers, sizes, fixed message templates, path kinds and typed errors), and never free text: no message bodies, prompts, tool or harness output, comment text or tokens. That is a schema change from today's facade, where 247 of 298 functions take string parameters. It is done first, on today's writer (V1a.0 to V1a.6), with no vigil needed. The flk server is the only reader the GUI uses (ADR-0038 §4a). `flk report`, `peers logs`, `tail_session_logs` and the log-budget gate are migrated in the release that switches the format, not left reading a dead file. Spans correlate with the transcript through ids the session stream already has, so the stored session stream does not change. Cross-node trace propagation waits for the next mesh protocol version.
 
 ## Context
 
@@ -46,12 +46,28 @@ Measured in the tree on 2026-10-16 (dev at 8296d8a2):
 | typed fields | attributes under `flk.` (for example `flk.request_id`, `flk.method`) |
 | the message | `body`: the facade's fixed template, never interpolated with free text (§4) |
 
-The event names and their meaning carry over unchanged. **The fields do not: this is a schema change.** Today's facade logs values that §4 forbids:
-- **free-text errors:** about 105 facade functions take `err: &str` and log it verbatim (for example `client.switch.dial_failed` in `src/logging.rs`, which masks credentials but nothing else), plus 4 sites with `error = %err`;
-- **raw paths:** 15 fields are `path = %path.display()`, a path anywhere on disk, including repo and worktree paths that name projects and users;
-- **`ssh_opts`:** `peers` events log the joined ssh options, which can include identity-file paths, host names and `ProxyCommand` strings.
+The event names and their meaning carry over unchanged. **The fields do not: this is a schema change.** Inventory of `src/logging.rs` on dev at 8cae9299, produced by parsing every `pub fn` in the facade:
+- **298 facade functions; 247 of them take a string-typed parameter** (`&str`, `String`, `&[&str]` or a `Display`). That is **371 parameters under 100 distinct names**.
+- **21 raw `.display()` fields:** 14 `path =`, plus `directory` (:22), `exe` (:1720), `api_socket` and `client_socket` (:1884-1885), `socket` (:2094), `to` (:4183) and `target` (:4250).
+- **1 `error = %err` field** (:28), and 105 `err: &str` parameters.
+- **Path-valued string parameters:** `path` (10), `checkout_path` (4), `dest` (4), `repo_root` (2), `to` and `from`, `cwd`, `file_name`.
+- **Content-bearing free text, by name.** Each can carry agent-, harness-, remote- or user-written text:
+  - `message` (3), including `notification_toast_forwarded(message)` (:2125), whose text agents write (via `src/server/headless.rs` :1606 and :3004);
+  - `line` in `remote_bridge_ssh_stderr` (:1053), and `stderr_tail` (:1169);
+  - `stdout`, `stderr` and `response`;
+  - `args` in `process_exec_failed` and `process_spawn_failed` (:1521, :1569), and `command` and `remote_command`;
+  - `url` in `pane_open_url_failed` (:2328);
+  - `err` (105), `reason` (14), `detail` (4), `diagnostic` (4), `diagnostics`, `content`, `context`, `note`, `notice`, `hint`, `warning`, `refusal`, `value`, `source_description`;
+  - `ssh_opts`, `branch` (5, user-named), and `host` and `proxy_jump` (raw host strings).
 
-V1a (§7) rewrites them all into the typed values of §4, on today's writer, before the switch.
+**The rule covers every string parameter, not a list.** After V1a, no facade function takes `&str`, `String`, `&[&str]`, `Display` or `Debug` input. Each of the 371 parameters becomes one of the typed values of §4:
+- an id newtype (`workspace_id`, `pane`, `agent`, `request_id`, `peer` as the operator's configured peer name, and so on);
+- a closed enum (`kind`, `status`, `prev_state`, `new_state`, `program` as known programs or `other`, and so on);
+- a path kind;
+- a `TelemetryError`;
+- a size or count of the text it replaces (for the content-bearing fields above, which keep only their byte length).
+
+A ratchet test parses the facade and fails if the number of string-typed parameters rises above the recorded count. The count only goes down, reaching 0 with V1a's last sub-PR.
 
 **Spans.** Named `flk.<area>.<op>` and opened only through facade functions:
 
@@ -96,7 +112,12 @@ V1a (§7) rewrites them all into the typed values of §4, on today's writer, bef
 - **Files, per role and signal:** `<data dir>/telemetry/<role>/{logs,metrics,traces}.jsonl`, plus rotated files. `<data dir>` is `session::data_dir()`, so a named session keeps its own.
 - **Roles:** `server` (including the handoff importer, which is the new server process), `client`, `cli` (today's `flock.log`, including `remote`), `relay`, and `mcp-<pid>`. Dead-pid `mcp-*` directories are pruned as dead-pid logs are today.
 - **One writer per file stays the rule,** even though vigil documents multi-process safety. The per-role split already exists, keeps rotation simple, and doesn't depend on an unverified property.
-- **A total disk cap.** `[telemetry] max_total_bytes` (default 512 MiB) bounds every role's files together, `mcp-<pid>` directories included. When the total passes the cap, the oldest rotated files across all roles are deleted first. Active files are never deleted, and the per-signal limits of §3 still apply within it. The `audit` trail is outside this cap (§5).
+- **A real total bound.**
+  - `[telemetry] max_total_bytes` (default 512 MiB) bounds **rotated** files across every role. When it is passed, the oldest rotated files are deleted first.
+  - Active files are never deleted, but each is bounded by its per-signal cap (§3), because the writer rotates at that size. So each fixed role (`server`, `client`, `cli`, `relay`) holds at most 16 + 32 + 8 = 56 MiB of active files.
+  - `mcp-<pid>` roles use a smaller profile (logs 2 MiB, traces 4 MiB, metrics 1 MiB, with one rotated file each, counted in the total), so each holds at most 7 MiB active. Their number is bounded by the live MCP processes, one per live agent session; dead-pid roles are pruned at startup and by the server's periodic sweep.
+  - The bound is therefore `max_total_bytes + 4 × 56 MiB + 7 MiB × live MCP processes`: 736 MiB plus 7 MiB per live agent with the defaults, and `flk report` states it.
+  - The `audit` trail is outside it (§5).
 - **Emission never blocks a hot path.** Records from the wire, delivery, queue and API paths go into a bounded in-memory channel, drained by a writer thread. When the channel is full, records are dropped and counted (`flk.telemetry.dropped`, surfaced in `flk report` and on the `node` tile). Telemetry never waits on disk inside a request. V0 checks whether vigil's writer already behaves this way; if not, flk wraps it. Audit is the one synchronous exception (§5).
 - **No network export in flk.** flk writes files only. An operator who wants Loki, Tempo, Prometheus or any OTLP backend points a collector's file receiver at these files. The GUI and `flk report` never need one.
 - **The GUI reads through the server.** It uses `telemetry/traces`, `telemetry/logs` and `audit` as ADR-0038 §4a and §5 define them, decoded into generated types. A client never reads the files.
@@ -115,17 +136,32 @@ V1a (§7) rewrites them all into the typed values of §4, on today's writer, bef
 
 - **Never in telemetry:** message bodies, prompts, harness or tool output, comment text, artifact content, file contents, environment values, client tokens or channel tokens (#1614 item 4).
 - **Allowed attribute values:** id newtypes, enums, numbers, booleans, sizes, durations, the facade's fixed templates, flk's own `ErrorCode` (`src/api/error_code.rs`), and the typed errors and paths below.
-- **Errors: `TelemetryError`, replacing `err: &str`.** Every facade function that logs a failure takes a `TelemetryError`, built in one of two ways:
-  - `TelemetryError::own(&e)`, for failures of flk's own I/O, OS calls, protocol and config. It carries `flk.error.class` (an enum: `io`, `spawn`, `ssh`, `protocol`, `timeout`, `config`, `auth`, `other`), `flk.error.code` (the `ErrorCode`, when there is one) and `flk.error.message`. That message is the error's text after the same masking `flk report` applies (`mask_credentials`, then `Scrubber`'s home and user masking), clamped to 512 bytes.
-  - `TelemetryError::external(class, len)`, for failures whose text comes from an agent, a harness, a tool or a remote body (a harness's stderr, a tool result, an HTTP body). It carries the class and the byte length, and never the text.
-  - **Diagnostic cost, owned:** `src/report/redact.rs` calls `err` the single most diagnostic field in a bug report. flk's own failures keep a masked message, so most reports lose nothing. Failures inside external output lose their text in telemetry. The full text stays where it already lives: in the session stream (ADR-0036 §4), or in the harness's own output, which the operator can open. That loss is accepted, because that text is exactly the content #1614 item 4 excludes.
+- **Errors: `TelemetryError`, typed by construction.** It replaces every `err: &str` and every free-text `reason`, `detail` and `diagnostic`. It has **no string field and no constructor that takes text**: no `&str`, `String`, `Display`, `anyhow::Error` or `serde_json::Error` input.
+  - Fields:
+    - `flk.error.class`: an enum: `io`, `spawn`, `ssh`, `protocol`, `parse`, `timeout`, `config`, `auth`, `external`, `other`;
+    - `flk.error.io_kind`: `std::io::ErrorKind`, when the source is an `io::Error`;
+    - `flk.error.os_code`: the raw OS error number;
+    - `flk.error.code`: flk's `ErrorCode`;
+    - `flk.error.what`: a closed enum of flk's own failure messages, each with a fixed template and only typed parameters;
+    - `flk.error.position`: line and column, for `serde_json` parse errors;
+    - `flk.error.len`: the byte length of external text, when the failure is inside external output.
+  - Constructors:
+    - `From<&io::Error>` (kind and OS code only);
+    - `From<ErrorCode>`;
+    - `From<FlkFailure>` (the closed enum);
+    - `parse(&serde_json::Error)` (classification, line and column only);
+    - `external(class, len)`.
+  - An `anyhow` chain is reduced to its root cause, downcast to one of those sources; if none matches, it becomes `other`.
+  - **Why typed, not a masked message:** masking (`mask_credentials`, then `Scrubber`) is a denylist. It cannot be shown complete: `serde_json` echoes input values, `anyhow` chains carry remote stderr, and unlabelled flk tokens match no pattern. Whether a call site said "own" or "external" would also be a judgement at every one of 105 sites. With no text input, nothing free-form can enter by construction, and the canary test (below) proves it, including against `serde_json` and `anyhow` fixtures.
+  - **Diagnostic cost, owned:** `src/report/redact.rs` calls `err` the single most diagnostic field in a bug report, and this record removes it from telemetry. What a report keeps is the event name, the class, the io kind, the OS code, the `ErrorCode`, the closed `what` and parse positions, which identify most failures of flk's own code. What it loses is the free text: remote stderr, harness output, and messages from third-party crates. That text still reaches the operator through the command's own error output at the time it happens, and through the session stream (ADR-0036 §4) for agent output. The loss is accepted, because that text is the content #1614 item 4 excludes. A follow-up after V1a measures whether `flk report` still identifies the failures in the last month's filed bugs, and grows `FlkFailure` where it does not. `redact.rs`'s `SCRUBBED_FIELDS` shrinks to `message`, which is always the fixed template.
 - **Paths** are emitted as `flk.path.kind` (an enum: `state`, `config`, `socket`, `repo`, `worktree`, `other`) plus the path relative to its root for `state`, `config` and `socket`. Repo and worktree paths are emitted as the flk worktree or repo id where one exists, and otherwise as the kind alone.
 - **`ssh_opts`** is emitted as the list of option **names** (for example `ConnectTimeout,ControlMaster`); values are dropped.
 - **Enforcement:**
   - the facade signatures take those types, not `&str`;
   - the `no-raw-trace-fields` gate extends to span and metric macros;
   - a **canary test** asserts that the canary never appears in the written files. The canary is planted:
-    - in every string-typed argument of every facade function, including `TelemetryError::external`'s source and any path;
+    - in the source of every `TelemetryError`: an `io::Error` with a custom message, a `serde_json::Error` built by parsing input that contains the canary, and an `anyhow` chain whose context and root carry the canary;
+    - in every path, peer name and branch passed into a facade function, and in every content-bearing field of the inventory (§1), driven at the call sites;
     - in a fixture's message body, question prompt, tool input, tool output and comment text, which are driven through a message delivery, a question, a tool call and an artifact comment;
     - in an environment variable's value and in a client token.
 - **`flk report`'s allowlist scrubber stays** as defence in depth. It is rewritten against OTLP attribute keys in the switch slice (§6).
@@ -138,10 +174,17 @@ V1a (§7) rewrites them all into the typed values of §4, on today's writer, bef
   - the server verifies the chain when it serves the `audit` stream (ADR-0038 §5: `operate` scope only) and reports "verified up to segment N" or "broken link at segment M";
   - `flk audit verify` does the same offline;
   - a broken chain is surfaced, never repaired.
-- **Synchronous, and fail-closed.** vigil's audit is lossless and fsynced per record, so each audited request pays one fsync. Only operator-only verbs are audited, they are rare, and none is on a hot path, so that cost is accepted.
-  - If a record cannot be written (for example a full disk), the verb is refused with `audit_unavailable` before it acts. Reads are never audited and never blocked.
-  - **Reserved headroom**, so a full disk can't lock the operator out of the verbs that free space: the trail keeps a pre-allocated reserve (default 1 MiB, thousands of records). When the disk is full, audited verbs write into the reserve, and `flk report` and the `node` tile warn. Only once the reserve is used up does the verb fail closed.
-- **On or off, and fail-closed or fail-open:** owner decision 1.
+- **Synchronous, bounded, and fail-closed.** vigil's audit is lossless and fsynced per record, so each audited request pays one fsync. Only operator-only verbs are audited; they are rare, and none is on a hot path.
+  - **Intent, then outcome.** Each audited verb writes an `intent` record before it acts and an `outcome` record after. The verb acts only once its `intent` record is durable.
+  - **A deadline that fails closed.** The audit write runs on a dedicated audit thread. The request waits for it at most `[telemetry] audit_write_deadline_ms` (default 2000). If the deadline passes or the write fails, the verb is refused with `audit_unavailable` and does not act. An `intent` that lands after its deadline is followed by an `outcome: abandoned` record, so the trail never shows a verb as run when it was refused. Writes queue behind a stuck write, and each fails at its own deadline. The request never hangs (ADR-0037).
+  - Reads are never audited and never blocked.
+- **The reserve: a balloon file, owned by flk, not vigil.**
+  - **Mechanism.** vigil owns the trail file and its fsync, so the reserve can't live inside that file. Instead, flk keeps `<data dir>/audit/reserve.balloon`: 4 MiB of written zero bytes (not sparse, not a clone), fsynced, created when audit is enabled.
+  - **When it is spent.** When an `intent` write fails with `ENOSPC`, or the server's free-space check finds less than 2 × the balloon size free on the trail's filesystem, flk deletes the balloon. It then checks with `statvfs` that free space actually rose, and retries the write once.
+  - **Filesystem caveats.** On APFS (and on btrfs or ZFS) a local snapshot, such as Time Machine's, can still reference the balloon's blocks, so deleting it frees nothing. Preallocation through `F_PREALLOCATE` or `fallocate` makes no promise either, because it doesn't protect against snapshots, clones or compression. That is why flk checks that free space rose, rather than assuming it did. If it did not, the reserve counts as spent, the verb fails closed, and the operator docs name local snapshots as the cause to check.
+  - **Who may spend it.** Only verbs that free space, a closed `FreesSpace` set in code pinned by a test: `worktree.remove` and `worktree.kill` (`src/api/schema.rs`), whenever they are audited, plus ADR-0036 S16's retention prune once it exists. Once the balloon is gone, every other audited verb fails closed with `audit_unavailable`, and its error says which verbs can free space.
+  - **Refill.** The server's periodic check re-creates the balloon once free space is at least 4 × its size, before any audited verb outside `FreesSpace` is admitted again. `flk report` and the `node` tile show the reserve's state: present, spent, or refill pending.
+- **On or off, the mechanism and its defaults** (balloon size, deadline): owner decision 1. If vigil 0.3's audit API can't express the intent-and-outcome pair, or can't bound a write by running it on a separate thread, V4 stops and returns to the owner. It does not weaken the rule.
 - **Retention:** whole sealed segments only, by age (default 180 days). The chain records each removal, so a gap is visible rather than a false "verified".
 
 ### 6. Readers to migrate, in the switch release
@@ -160,25 +203,26 @@ There is no dual-write period. Until the switch, the format is today's. After it
 
 ### 7. Slices
 
-Each waits for the vigil release that ships what it uses, and codes against that release's API, never the README. V1a needs no vigil and can start once this record is accepted.
+Each waits for the vigil release that ships what it uses, and codes against that release's API, never the README. V1a.0 to V1a.6 need no vigil and can start once this record is accepted.
 
 **Packaging.** vigil's first crates.io release is planned for 0.4.0. Until then, V0 to V3 take vigil as a **git dependency pinned to a release tag's commit**, behind the `vigil` cargo feature. This affects the Nix build: the flake's cargo vendoring needs an output hash for each git dependency (`cargoLock.outputHashes` or the vendoring tool's equivalent), updated with every pin bump, and `cargo-deny` must allow that git source explicitly. When 0.4.0 is on crates.io, the dependency moves there and the git allowance is removed.
 
 | # | Slice | Needs |
 |---|---|---|
 | V0 | #1300 step 1: spike `vigil::init` behind a `vigil` cargo feature; confirm the file layout, rotation options and per-role init; report deviations from this record | vigil 0.1.0 |
-| V1a | The schema rewrite on today's writer, needing no vigil: `TelemetryError` replaces about 105 `err: &str` sites and the 4 `error = %err` sites; path kinds replace the 15 `path.display()` fields; `ssh_opts` becomes option names; the name clamps of §1; the canary test of §4; and `redact.rs`'s allowlist updated to match. Split into sub-PRs by subsystem if it passes ~400 hand-written lines. | — |
-| V1b | The switch: logs through vigil, `[telemetry]` retention and the total cap, the non-blocking channel, and every §6 reader | V0, V1a |
+| V1a.0 | The types, needing no vigil: `TelemetryError` with its constructors, the path kinds, the id newtypes and enums the facade needs, the canary harness, and the ratchet test (§1), recorded at 371 | — |
+| V1a.1–V1a.6 | The rewrite of all 371 string parameters, with their call sites, one sub-PR per subsystem: (1) api and server; (2) client and switch; (3) peers, ssh and remote; (4) pane, terminal and UI; (5) process, spawn and platform; (6) notifications, hooks, structured and MCP. Each lowers the ratchet and stays within ~400 hand-written lines. The whole is an estimated 1,200–1,800 changed lines, which is why it is split. The last one brings the ratchet to 0 and updates `redact.rs` | V1a.0 |
+| V1b | The switch: logs through vigil, `[telemetry]` retention and the total bound, the non-blocking channel, and every §6 reader | V0, V1a.6 |
 | V2 | Spans: `flk.api.request`, `flk.cmd`, `flk.question`, `flk.mesh.hop`; id newtypes | V1b, vigil 0.2.0 |
 | V3 | Spans and metrics for structured agents: `flk.turn`, `flk.tool_call`, `flk.queue.deliver`, the §1 instruments | V2, ADR-0036 S4/S5 |
-| V4 | Audit: signing key, recorded verbs, reserved headroom, `flk audit verify` | V1b, vigil 0.3.0, owner decision 1 |
+| V4 | Audit: signing key, recorded verbs, intent and outcome records, the write deadline, the balloon reserve, `flk audit verify` | V1b, vigil 0.3.0, owner decision 1 |
 | G13 | The GUI views (#1619) | ADR-0036 S7, V2, and V4 for the audit tile |
 
 ### 8. Owner decisions
 
 | # | Question | Recommendation |
 |---|---|---|
-| 1 | Audit on by default once V4 ships, or opt-in? And when a record can't be written: fail-closed (refuse the verb) or fail-open (run it and record a gap)? | **On by default, fail-closed with reserved headroom (§5).** Operator-only verbs are rare, and a trail that is off, or silently skips records, is worthless when it is needed. Costs: one fsync per audited verb; one more key to back up; and on a disk that stays full past the reserve, operator-only verbs are refused until space is freed by other means (reads and non-audited verbs keep working). Fail-open is the rejected alternative: it keeps verbs available on a full disk, but its "verified" status could then cover a trail with holes that only an explicit gap record reveals. |
+| 1 | Audit on by default once V4 ships, or opt-in? And when a record can't be written: fail-closed (refuse the verb) or fail-open (run it and record a gap)? | **On by default, fail-closed, with intent and outcome records, a 2 s write deadline, and a 4 MiB balloon reserve that only `FreesSpace` verbs may spend (§5).** Operator-only verbs are rare, and a trail that is off, or silently skips records, is worthless when it is needed. Costs: one fsync per audited verb, and up to 2 s before `audit_unavailable` on a stuck disk; one more key to back up; 4 MiB held on disk; and on a disk that stays full past the reserve, or whose freed blocks a local snapshot pins, every audited verb except worktree removal is refused until space is freed (reads and non-audited verbs keep working). Fail-open is the rejected alternative: it keeps verbs available on a full disk, but its "verified" status could then cover a trail with holes that only an explicit gap record reveals. |
 | 2 | The retention defaults in §3 | As written. The owner may prefer longer trace retention for G13. |
 | 3 | Defer cross-node `traceparent` to the next mesh protocol version | **Yes.** Joining hops by `MessageKey` covers the GUI's waterfall per node now, with no protocol change. |
 
@@ -200,7 +244,7 @@ Each waits for the vigil release that ships what it uses, and codes against that
 ## Consequences
 
 - The facade in `src/logging.rs` becomes the single place that defines flk's telemetry schema, and the redaction rule is testable there.
-- Bug reports lose the text of failures inside external output (§4). flk's own failures keep a masked message.
+- Bug reports lose free error text (§4). They keep the class, io kind, OS code, `ErrorCode` and flk's closed failure enum, and a follow-up checks that this still identifies filed bugs.
 - Audited, operator-only verbs can be refused on a disk that stays full past the reserve (§5, owner decision 1).
 - `flock-*.log` paths disappear in the switch release. Scripts that tail them must move to `telemetry/<role>/logs.jsonl`, and the release note must say so.
 - ADR-0038 §4a's trace affordance becomes a server-side lookup. G13 depends on V2, not only on a vigil release.
