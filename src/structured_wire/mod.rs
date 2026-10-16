@@ -7,11 +7,13 @@
 //! All u64 wire numbers are JSON numbers, exact in JavaScript below 2^53.
 #![deny(missing_docs)]
 
-use crate::structured::claude::SessionEvent;
+use crate::structured::claude::KnownSessionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) mod fixture;
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,8 +27,20 @@ pub const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 /// Missing valid frame/pong ceiling; unrelated streams do not renew progress.
 pub const LIVENESS_WINDOW_MS: u64 = 45_000;
-/// Upgrade must decline permessage-deflate, including for native clients in S7.
-pub const PERMESSAGE_DEFLATE: bool = false;
+/// Subscription progress ceiling, independent of unrelated traffic.
+pub const SUBSCRIPTION_DEADLINE_MS: u64 = 30_000;
+/// Command acknowledgement ceiling; expiry marks only that command uncertain.
+pub const ACK_DEADLINE_MS: u64 = 30_000;
+/// First reconnect backoff ceiling, before equal jitter.
+pub const BACKOFF_BASE_MS: u64 = 500;
+/// Exponential multiplier per unsuccessful attempt.
+pub const BACKOFF_FACTOR: u32 = 2;
+/// Maximum reconnect backoff ceiling.
+pub const BACKOFF_CAP_MS: u64 = 30_000;
+/// Equal jitter lower bound is the ceiling divided by this value.
+pub const BACKOFF_JITTER_DIVISOR: u32 = 2;
+/// Continuous healthy interval before backoff resets.
+pub const BACKOFF_RESET_MS: u64 = 60_000;
 /// Hello authentication refusal: hold outbox until a new token.
 pub const AUTH_REFUSED_CLOSE: u16 = 4401;
 /// Open-socket token revocation: hold outbox until a new token.
@@ -63,6 +77,7 @@ pub enum ClientFrame {
         sub_id: String,
         /// ADR-0036 §5 stream path; an unknown/removed path gets unknown_stream.
         stream: String,
+        /// JSON number; exact in JavaScript below 2^53.
         /// Omitted for bootstrap and cursorless agent/<id>/live.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
@@ -106,26 +121,18 @@ pub enum SubfailCode {
     Scope,
 }
 
-/// Transport/recovery command codes; per-verb additions belong to S8b #1677.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum WireErrorCode {
-    /// Token removed/replaced; ack precedes close 4403.
-    AuthRevoked,
-    /// Valid token lacks command scope; keep allowed operations connected.
-    Scope,
-    /// Original effect is uncertain; never dispatch a missing resume-only claim.
-    SessionUnconfirmed,
-    /// Unknown command on an older server, exit PROTOCOL_GAP.
-    ServerVersionGap,
-    /// Same command id reused with different arguments.
-    InvalidParams,
-    /// Cross-node command refused until #1380.
-    UnsupportedForAgent,
-    /// Old writer temporarily refuses admission during handoff preparation.
-    RestartPending,
-}
+/// Token removed/replaced; ack precedes close 4403. Registered when S7 emits it.
+pub const AUTH_REVOKED: &str = "auth_revoked";
+/// Valid token lacks scope. Registered when S7 emits it.
+pub const SCOPE: &str = "scope";
+/// Unsupported subscription path. Registered when S7 emits it.
+pub const UNKNOWN_STREAM: &str = "unknown_stream";
+/// Cursor exceeds the stream head; clear it and bootstrap.
+pub const CURSOR_AHEAD: &str = "cursor_ahead";
+/// Stream requires an operator principal.
+pub const OPERATOR_ONLY: &str = "operator_only";
+/// Original command effect remains uncertain; never dispatch a missing claim.
+pub const SESSION_UNCONFIRMED: &str = "session_unconfirmed";
 
 /// ADR-0029 retry spellings; these do not override §5a's resume-only safety rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,7 +163,7 @@ pub enum WireRetry {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WireError {
     /// Registered API code, including auth_revoked, scope and session_unconfirmed.
-    pub code: WireErrorCode,
+    pub code: String,
     /// Human diagnosis, without bearer values or secret command content.
     pub message: String,
     /// cli::exit status; session_unconfirmed uses UNCONFIRMED for this surface.
@@ -190,33 +197,21 @@ pub enum UnknownTag {
     Unknown,
 }
 
-/// Untagged stream payload: known S8a agent event, §8 wrapper, or S8b opaque JSON.
+/// Untagged payload: explicit unknown wrapper, known catalogue, or S8b JSON.
 ///
-/// Opaque is for non-agent streams only (#1677). SessionEvent's raw Unknown is
-/// never sent directly: the sender wraps it with its shape. S8a's TS union still
-/// includes unknown; narrowability is tracked separately in #1656.
+/// JsonValue is reserved for non-agent streams until #1677. Agent payloads must
+/// decode as KnownSessionEvent or use the sender's explicit unknown wrapper.
+/// #1656 owns the remaining nested literal discriminators in the catalogue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(untagged)]
 pub enum WireEvent {
-    /// Unknown wrapper is recognized before known/opaque payloads.
+    /// Exact §8 wrapper, recognized before other payloads.
     Unknown(UnknownEvent),
-    /// Known Claude adapter event, serialized with its existing S8a shape.
-    Session(#[serde(deserialize_with = "known_session")] Box<SessionEvent>),
-    /// Other stream payload, deliberately uninterpreted until #1677.
-    Opaque(Value),
-}
-
-fn known_session<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Box<SessionEvent>, D::Error> {
-    let raw = Value::deserialize(d)?;
-    // Only known events use this path; unknown shape identity comes from the sender.
-    let event = SessionEvent::parse(&raw.to_string(), "wire");
-    if matches!(event, SessionEvent::Unknown { .. }) {
-        return Err(serde::de::Error::custom(
-            "agent payload requires the unknown wrapper",
-        ));
-    }
-    Ok(Box::new(event))
+    /// Known catalogue projection, with no adapter raw fallback.
+    Session(Box<KnownSessionEvent>),
+    /// Deliberate non-agent JSON, not a fallback accepted on agent streams.
+    Json(Value),
 }
 
 /// One server JSON text frame. Stateful ordering/authorization belongs to S7/G3.
@@ -237,6 +232,7 @@ pub enum ServerFrame {
         /// Fresh random diagnostic epoch; never resets cursors or dedupe.
         server_epoch: String,
         /// Effective first-admission retention window, in milliseconds.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         idempotency_window_ms: u64,
     },
@@ -251,11 +247,13 @@ pub enum ServerFrame {
         sub_id: String,
         /// Same stream identity supplied in sub.
         stream: String,
+        /// JSON number; exact in JavaScript below 2^53.
         /// Seq streams only; agent/<id>/live omits seq and never advances a cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         seq: Option<u64>,
         /// Server receive timestamp in milliseconds, not a liveness clock.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         ts_ms: u64,
         /// Known agent event, explicit unknown wrapper, or opaque S8b payload.
@@ -266,6 +264,7 @@ pub enum ServerFrame {
         /// Subscription identity.
         sub_id: String,
         /// Captured head; zero only for a genuinely new empty stream.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         seq: u64,
     },
@@ -283,11 +282,14 @@ pub enum ServerFrame {
         /// Subscription identity.
         sub_id: String,
         /// First missing seq; bootstrap starts at one.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         from: u64,
         /// Last pre-checkpoint seq; bootstrap may be an empty 1..0 range.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         to: u64,
+        /// JSON number; exact in JavaScript below 2^53.
         /// Required for snapshot streams; equal to to means immediate empty completion.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
@@ -298,6 +300,7 @@ pub enum ServerFrame {
         /// Subscription identity.
         sub_id: String,
         /// Diagnostic only; never a cursor to apply.
+        /// JSON number; exact in JavaScript below 2^53.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         skipped_to: u64,
     },

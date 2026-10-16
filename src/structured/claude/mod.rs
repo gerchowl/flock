@@ -249,6 +249,27 @@ macro_rules! events {
             },
         }
 
+        /// Known-only catalogue projection for the structured wire; no raw fallback.
+        #[cfg(test)]
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        #[serde(untagged)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub enum KnownSessionEvent {
+            $($(#[$doc])* $name(Box<$name>),)*
+        }
+
+        #[cfg(test)]
+        impl<'de> Deserialize<'de> for KnownSessionEvent {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let value = Value::deserialize(d)?;
+                match SessionEvent::parse(&value.to_string(), "wire") {
+                    $(SessionEvent::$name(event) => Ok(Self::$name(event)),)*
+                    SessionEvent::Unknown { .. } => Err(serde::de::Error::custom(
+                        "unknown agent payload requires {type:unknown,raw,shape}")),
+                }
+            }
+        }
+
         impl SessionEvent {
             /// Parse one stdout line using the observed Claude version.
             ///

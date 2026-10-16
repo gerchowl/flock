@@ -30,6 +30,7 @@ principal: string,
 server_epoch: string,
 /**
  * Effective first-admission retention window, in milliseconds.
+ * JSON number; exact in JavaScript below 2^53.
  */
 idempotency_window_ms: number, } | { "t": "ping",
 /**
@@ -45,11 +46,13 @@ sub_id: string,
  */
 stream: string,
 /**
+ * JSON number; exact in JavaScript below 2^53.
  * Seq streams only; agent/<id>/live omits seq and never advances a cursor.
  */
 seq?: number,
 /**
  * Server receive timestamp in milliseconds, not a liveness clock.
+ * JSON number; exact in JavaScript below 2^53.
  */
 ts_ms: number,
 /**
@@ -62,6 +65,7 @@ ev: WireEvent, } | { "t": "synced",
 sub_id: string,
 /**
  * Captured head; zero only for a genuinely new empty stream.
+ * JSON number; exact in JavaScript below 2^53.
  */
 seq: number, } | { "t": "subfail",
 /**
@@ -82,13 +86,16 @@ message: string, } | { "t": "gap",
 sub_id: string,
 /**
  * First missing seq; bootstrap starts at one.
+ * JSON number; exact in JavaScript below 2^53.
  */
 from: number,
 /**
  * Last pre-checkpoint seq; bootstrap may be an empty 1..0 range.
+ * JSON number; exact in JavaScript below 2^53.
  */
 to: number,
 /**
+ * JSON number; exact in JavaScript below 2^53.
  * Required for snapshot streams; equal to to means immediate empty completion.
  */
 snapshot_to?: number, } | { "t": "lagged",
@@ -98,6 +105,7 @@ snapshot_to?: number, } | { "t": "lagged",
 sub_id: string,
 /**
  * Diagnostic only; never a cursor to apply.
+ * JSON number; exact in JavaScript below 2^53.
  */
 skipped_to: number, } | { "t": "ack",
 /**

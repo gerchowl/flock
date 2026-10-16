@@ -1249,7 +1249,9 @@ Literal nested discriminators and a narrowable known-event union are tracked in
 
 S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
 `t`, with unknown transport tags rejected as protocol errors and additive fields
-ignored. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
+projection is generated from the S8a catalogue, with remaining nested literal
+discriminators coordinated in #1656. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
 client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
 the exact original line as a string (including non-JSON diagnostics); `shape`
 is the sender's §8 canonical key, never recomputed with the client version.
@@ -1264,6 +1266,12 @@ unknown paths decode so the server can return `subfail unknown_stream`. The
 a newer client's read-only welcome advertises no command capability. `ev.seq`
 is omitted only for `agent/<id>/live`; its timestamp is still present. Ack
 success/error fields are exclusive; successful void commands may omit result.
+Ack error codes are open strings covering the full ADR-0029 registry and future
+codes; transport additions have documented constants rather than a closed enum.
+Fixture scripts require initial `given`, separate caller `client` actions,
+state `observe` assertions and final bounded `quiet`. `expect.absent` requires
+omission, `expect_connect` asserts reconnect timing, and `send.socket:previous`
+injects abandoned-generation callbacks without granting them authority.
 S7a's scripts and validators are test-only until S7 consumes the contracts, so
 there is no endpoint or default-binary behavior change.
 

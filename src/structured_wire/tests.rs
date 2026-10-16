@@ -1,6 +1,7 @@
 use super::*;
+use crate::structured::claude::SessionEvent;
 use fixture::{FixtureLine, FixtureStep};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::BTreeSet;
 
 fn fixtures() -> Vec<(String, String)> {
@@ -28,19 +29,14 @@ fn every_script_parses_and_round_trips_all_frame_kinds() {
     let mut client = BTreeSet::new();
     let files = fixtures();
     for (name, content) in &files {
-        assert!(!content.is_empty(), "empty script {name}");
+        FixtureLine::parse_script(content).unwrap_or_else(|err| panic!("{name}: {err}"));
         for (i, line) in content.lines().enumerate() {
             let parsed =
                 FixtureLine::parse(line).unwrap_or_else(|err| panic!("{name}:{}: {err}", i + 1));
             let value = serde_json::to_value(&parsed).unwrap();
-            assert_eq!(
-                value,
-                serde_json::from_str::<Value>(line).unwrap(),
-                "{name}:{}",
-                i + 1
-            );
+            assert_eq!(FixtureLine::parse(&value.to_string()).unwrap(), parsed);
             match parsed.step {
-                FixtureStep::Send { frame } => {
+                FixtureStep::Send { frame, .. } => {
                     server.insert(value["frame"]["t"].as_str().unwrap().to_owned());
                     let encoded = serde_json::to_string(&frame).unwrap();
                     assert_eq!(
@@ -194,13 +190,15 @@ fn settled_parameters_and_uncertain_ack_use_existing_exit_constant() {
         ),
         (10_000, 5_000, 15_000, 45_000)
     );
-    assert!(!std::hint::black_box(PERMESSAGE_DEFLATE));
     let files = fixtures();
     let (_, script) = files
         .iter()
         .find(|(name, _)| name == "uncertain-command")
         .unwrap();
-    let line = script.lines().last().unwrap();
+    let line = script
+        .lines()
+        .find(|line| line.contains("session_unconfirmed"))
+        .unwrap();
     let FixtureStep::Send {
         frame:
             ServerFrame::Ack {
@@ -208,12 +206,13 @@ fn settled_parameters_and_uncertain_ack_use_existing_exit_constant() {
                 ok: false,
                 ..
             },
+        ..
     } = FixtureLine::parse(line).unwrap().step
     else {
         panic!("uncertain ack");
     };
     assert_eq!(error.exit, crate::cli::exit::UNCONFIRMED);
-    assert_eq!(error.code, WireErrorCode::SessionUnconfirmed);
+    assert_eq!(error.code, SESSION_UNCONFIRMED);
     assert_eq!(error.retry, WireRetry::Later);
 }
 
