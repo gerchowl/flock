@@ -51,16 +51,23 @@ impl App {
         branch: Option<&str>,
         repo: Option<&str>,
     ) -> Vec<DelegateRow> {
-        let agents: HashMap<String, AgentInfo> = self
-            .collect_agent_infos()
-            .into_iter()
-            .map(|agent| (agent.agent_id.clone(), agent))
-            .collect();
-        let known: HashSet<String> = self
+        let local_agents = self.collect_agent_infos();
+        let mut known: HashSet<String> = self
             .state
             .terminals
             .values()
             .map(|terminal| terminal.agent_id.to_string())
+            .collect();
+        // Architect presence includes the same cached gossip as the fleet directory.
+        // Reuse the local snapshot; listing must not poll peers or observe it again.
+        known.extend(
+            self.collect_fleet_agents(&local_agents)
+                .into_iter()
+                .map(|agent| agent.agent_id),
+        );
+        let agents: HashMap<String, AgentInfo> = local_agents
+            .into_iter()
+            .map(|agent| (agent.agent_id.clone(), agent))
             .collect();
         let now = crate::app::notifications::now_ms();
         self.delegations
@@ -406,5 +413,140 @@ mod handler_tests {
         );
         shutdown(app);
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
+    }
+    const REMOTE_1114: &str = "agent_architect.example_1";
+
+    fn remote_1114_app() -> (App, String) {
+        let mut app = app_on(EventHub::default());
+        caller_is_an_agent(&mut app);
+        let (delegate, _) = start(&mut app, None);
+        let original = app
+            .delegations
+            .edges()
+            .find(|edge| edge.delegate == delegate)
+            .unwrap()
+            .clone();
+        // Replay the durable edge whose architect is on another node.
+        let event = crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::AgentDelegated,
+            data: crate::api::schema::EventData::AgentDelegated {
+                architect: REMOTE_1114.into(),
+                delegate: delegate.clone(),
+                via: original.via,
+                workspace: original.workspace,
+                worktree: None,
+                branch: None,
+                repo: None,
+                label: None,
+                reissued: true,
+            },
+        };
+        app.delegations.fold([(0, &event)]);
+        app.state
+            .peer_summaries
+            .push(crate::peers::PeerSummaryState::new(
+                &crate::config::PeerConfig {
+                    name: "hub.example".into(),
+                    ..Default::default()
+                },
+            ));
+        app.current_api_peer_pid = None;
+        (app, delegate)
+    }
+
+    fn publish_remote_1114(app: &mut App, relayed: bool, present: bool) {
+        let workspace: crate::api::schema::PeerWorkspaceSummary =
+            serde_json::from_value(serde_json::json!({
+                "workspace":"fixture", "status":"idle", "agents":[{
+                    "agent_id":REMOTE_1114, "pane_id":"w1:p1", "agent":"claude", "status":"idle"
+                }]
+            }))
+            .unwrap();
+        let workspaces = if present { vec![workspace] } else { Vec::new() };
+        let relay: crate::api::schema::RelayedFleetPeer = serde_json::from_value(serde_json::json!({
+            "name":"architect.example", "ssh_target":"architect.example", "host":"architect.example",
+            "origin":"hub.example", "workspaces":workspaces, "age_secs":0, "origin_last_ok_secs":0
+        })).unwrap();
+        app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "hub.example".into(),
+                stream_error: None,
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
+                    outbound_pending: false,
+                    host: if relayed {
+                        "hub.example"
+                    } else {
+                        "architect.example"
+                    }
+                    .into(),
+                    version: Some("fixture".into()),
+                    protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                    icon: None,
+                    system: None,
+                    latency_ms: 0,
+                    workspaces: if relayed { Vec::new() } else { workspaces },
+                    relayed_fleet: if relayed { vec![relay] } else { Vec::new() },
+                }),
+            },
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_1114_direct_gossip_prevents_false_orphan_and_removal_restores_it() {
+        let (mut app, delegate) = remote_1114_app();
+        assert_eq!(
+            list(&mut app, &["--architect", REMOTE_1114]).unwrap()[0].state,
+            "orphaned"
+        );
+        publish_remote_1114(&mut app, false, true);
+        let locals = app.collect_agent_infos();
+        assert!(!locals.iter().any(|agent| agent.agent_id == REMOTE_1114));
+        assert!(app
+            .collect_fleet_agents(&locals)
+            .iter()
+            .any(|agent| agent.agent_id == REMOTE_1114 && !agent.local));
+        let rows = list(&mut app, &["--architect", REMOTE_1114]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].delegate, delegate);
+        assert_eq!(rows[0].state, "live", "a gossiped architect is present");
+        let rendered = crate::cli::delegate_list::render(&rows);
+        assert!(!rendered.contains("orphaned"), "{rendered}");
+        app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "hub.example".into(),
+                stream_error: None,
+                result: Err("fixture unavailable".into()),
+            },
+        ));
+        assert_eq!(
+            list(&mut app, &["--all"]).unwrap()[0].state,
+            "live",
+            "unreachable is not removed"
+        );
+        publish_remote_1114(&mut app, false, false);
+        assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "orphaned");
+        assert!(
+            crate::cli::delegate_list::render(&list(&mut app, &["--all"]).unwrap())
+                .contains("orphaned")
+        );
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn remote_1114_relayed_gossip_prevents_false_orphan_without_reviving_gone_delegate() {
+        let (mut app, delegate) = remote_1114_app();
+        publish_remote_1114(&mut app, true, true);
+        assert!(
+            !app.state.relayed_fleet_cache.is_empty(),
+            "real gossip merge cached the relay"
+        );
+        assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "live");
+        app.state.relayed_fleet_cache.clear();
+        assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "orphaned");
+        publish_remote_1114(&mut app, true, true);
+        app.delegations.mark_gone(&delegate);
+        assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "gone");
+        shutdown(app);
     }
 }
