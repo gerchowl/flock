@@ -482,9 +482,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_resume_emits_one_live_status_event_from_either_entry_point() {
+    async fn resume_emits_one_live_status_and_orders_explicit_hibernation_events() {
         use crate::api::schema::{AgentStatus, EventData};
-        for explicit in [false, true] {
+        for (explicit, hibernated) in [(false, false), (true, false), (true, true)] {
             let mut app = test_app();
             let log =
                 crate::test_support::unique_temp_path("1650-resume-event").with_extension("jsonl");
@@ -506,14 +506,23 @@ mod tests {
                 Some(crate::detect::Agent::OpenCode),
                 crate::detect::AgentState::Idle,
             );
-            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            let plan = crate::agent_resume::AgentResumePlan {
                 agent: "opencode".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()],
                 dedupe_key: "resume-event-fixture".into(),
-            });
+            };
+            if hibernated {
+                terminal.set_hibernated_resume_plan(Some(plan));
+            } else {
+                terminal.pending_agent_resume_plan = Some(plan);
+            }
             assert_eq!(
                 app.pane_info(0, pane).unwrap().agent_status,
-                AgentStatus::Offline
+                if hibernated {
+                    AgentStatus::Hibernated
+                } else {
+                    AgentStatus::Offline
+                }
             );
             let sequence = app.event_hub.current_sequence();
             // Theme deferral cannot claim that a live execution exists.
@@ -560,6 +569,19 @@ mod tests {
                 vec![(&public_pane, &public_workspace, AgentStatus::Idle)],
                 "explicit={explicit}: {events:?}"
             );
+            if explicit {
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|(_, event)| &event.event)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        &crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        &crate::api::schema::EventKind::AgentResumedFromHibernation
+                    ],
+                    "live status must precede the explicit resume fact: {events:?}"
+                );
+            }
             assert!(!repeated);
             assert_eq!(events.len(), repeated_events.len());
         }
