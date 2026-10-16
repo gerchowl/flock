@@ -3999,6 +3999,8 @@ mod tests {
             None,
             "admitted before its deadline"
         );
+        // Expire the original request on the real clock while its lease stays held.
+        // This bounded receive covers that boundary without a product clock hook.
         let (keep_alive, never_ready) = std::sync::mpsc::channel::<()>();
         assert_eq!(
             never_ready.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
@@ -4081,7 +4083,10 @@ mod tests {
             }
             runtime.end_all_injection_leases();
             assert_eq!(receipt.progress().bytes_written, 0);
-            assert!(receipt.progress().failure.is_some());
+            assert_eq!(
+                receipt.progress().failure,
+                Some(crate::pty::write_receipt::WriteFailure::WriterGone)
+            );
             assert!(receipt.progress().remainder_discarded);
             assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
             let drain = runtime.drain_held_input();
@@ -4101,7 +4106,11 @@ mod tests {
         let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
         drop(runtime);
         assert_eq!(receipt.progress().bytes_written, 0);
-        assert!(receipt.progress().failure.is_some());
+        // #1638 maps pane teardown to pane_gone at the response-owner boundary.
+        assert_eq!(
+            receipt.progress().failure,
+            Some(crate::pty::write_receipt::WriteFailure::WriterGone)
+        );
         assert!(receipt.progress().remainder_discarded);
         assert!(receiver.try_recv().is_err());
     }

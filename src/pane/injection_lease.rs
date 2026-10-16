@@ -167,6 +167,8 @@ impl InjectionLease {
         None
     }
     /// Ownership transitions cancel tracked input; operator input keeps its place.
+    /// Drop currently records WriterGone. #1638 must retire through its response
+    /// owner with owner_changed or pane_gone before calling this transport drain.
     pub(crate) fn release_all(&self) -> Option<InputBatch> {
         self.backlog
             .borrow_mut()

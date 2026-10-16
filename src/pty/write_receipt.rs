@@ -94,15 +94,17 @@ impl WriteReceipt {
         )
     }
 
+    /// Snapshot byte evidence, retiring an expired pending request under its gate.
     pub(crate) fn progress(&self) -> WriteProgress {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .progress
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.progress.completed_at.is_none() && state.expired(Instant::now()) {
+            state.fail(WriteFailure::Deadline);
+        }
+        state.progress
     }
 
-    /// A failed or cancelled producer never masquerades as completed writing.
+    /// Observe expiry under the writer gate even when a live producer is silent.
+    /// A timely completion stays successful when observed after its deadline.
     pub(crate) fn try_completed(&self) -> Result<Instant, mpsc::TryRecvError> {
         if self.progress().failure.is_some() {
             return Err(mpsc::TryRecvError::Disconnected);
@@ -130,6 +132,14 @@ impl WriteReceipt {
 }
 
 impl WriteCompletion {
+    /// Retire authority and release bytes without losing the actual terminal cause.
+    pub(crate) fn retire(&self, reason: WriteFailure) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.progress.completed_at.is_none() {
+            state.fail(reason);
+        }
+    }
+
     /// Prune cancelled/expired tickets before replay without borrowing their bytes.
     pub(crate) fn is_pending(&self) -> bool {
         let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -435,14 +445,38 @@ mod tests {
     #[test]
     fn write_deadline_edge_is_inclusive_before_and_after_syscall() {
         let at = Instant::now();
-        let (_completion, receipt) = tracked(Some(at));
-        let state = receipt.0.state.lock().unwrap();
-        assert!(!state.expired(at));
-        assert!(state.expired(at + Duration::from_nanos(1)));
+        let (expired, receipt) = tracked(Some(at));
+        {
+            let state = receipt.0.state.lock().unwrap();
+            assert!(!state.expired(at));
+            assert!(state.expired(at + Duration::from_nanos(1)));
+        }
+        // Exercise the pre-syscall gate, not only its time comparison.
+        assert!(expired
+            .write(|_| panic!("expired gate invoked syscall"))
+            .is_none());
+        assert_eq!(receipt.progress().failure, Some(WriteFailure::Deadline));
+        assert_eq!(receipt.progress().bytes_written, 0);
+
+        let (timely, receipt) = tracked(Some(Instant::now() + Duration::from_secs(30)));
+        let (mut socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        timely.write(|bytes| socket.write(bytes)).unwrap().unwrap();
+        let mut observed = [0; 5];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"paste");
+        // Exact equality and delayed observation must preserve completed writing.
+        let completed_at = receipt.progress().completed_at.unwrap();
+        receipt.0.state.lock().unwrap().deadline = Some(completed_at);
+        assert_eq!(receipt.try_completed(), Ok(completed_at));
+        assert_eq!(receipt.progress().failure, None);
+
+        // Exercise the post-syscall gate with an actual late native write.
+        assert_late_syscall(5);
     }
 
     #[test]
-    fn live_silent_writer_is_cancelled_after_admission_before_resuming() {
+    fn live_silent_writer_hits_its_own_deadline_before_resuming() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (completion, receipt) = tracked(Some(deadline));
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -460,11 +494,16 @@ mod tests {
             done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
             Err(mpsc::RecvTimeoutError::Timeout)
         );
-        assert_eq!(receipt.cancel(), WriteDisposition::Cancelled);
-        assert!(receipt.progress().remainder_discarded);
-        assert_eq!(receipt.progress().bytes_written, 0);
+        // The producer is still alive and has not attempted a syscall. Observing
+        // expiry must retire the request without an explicit caller cancellation.
+        let outcome = receipt.try_completed();
+        let progress = receipt.progress();
         release_tx.send(()).unwrap();
         assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         writer.join().unwrap();
+        assert_eq!(outcome, Err(mpsc::TryRecvError::Disconnected));
+        assert_eq!(progress.failure, Some(WriteFailure::Deadline));
+        assert!(progress.remainder_discarded);
+        assert_eq!(progress.bytes_written, 0);
     }
 }
