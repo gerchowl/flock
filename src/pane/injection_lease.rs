@@ -15,23 +15,64 @@
 //! Held bytes that meet a full PTY channel when the lease ends are not
 //! dropped. They wait in a backlog, and every later operator write queues
 //! behind them until the loop drains it, so the order still holds.
+//! Tracked requests stay separate from operator bytes: the receipt gate owns
+//! their payload, deadline and cancellation. Expired/cancelled tickets are inert.
+//! Ownership transitions retire held/backlogged tracked requests before replaying
+//! operator bytes; they never migrate an uncorrelated write to the next owner.
 
-use std::cell::RefCell;
-use std::time::Instant;
-
+use crate::pty::write_receipt::WriteCompletion;
 use bytes::{Bytes, BytesMut};
+use std::{cell::RefCell, collections::VecDeque, time::Instant};
 
-/// Past this many held bytes the lease ends early rather than growing, so a
-/// huge paste reaches the pane instead of memory.
+// Reaching this byte bound ends the lease and flushes live entries, as before.
 const MAX_HELD_BYTES: usize = 256 * 1024;
-
-/// A backlog past this size is reported, though still kept.
+// This is a warning threshold, not permission to discard live input.
 const BACKLOG_WARN_BYTES: usize = 1024 * 1024;
 
+/// Keep tracked requests separate: their gate owns the payload and cancellation.
+#[derive(Debug)]
+pub(crate) enum QueuedInput {
+    Operator(Bytes),
+    Tracked(WriteCompletion),
+}
+pub(crate) type InputBatch = VecDeque<QueuedInput>;
+/// Preserve legacy operator bursts without ever merging a tracked request.
+fn push_input(batch: &mut InputBatch, input: QueuedInput) {
+    match (batch.back_mut(), input) {
+        (Some(QueuedInput::Operator(previous)), QueuedInput::Operator(bytes)) => {
+            let mut joined = std::mem::take(previous)
+                .try_into_mut()
+                .unwrap_or_else(|bytes| BytesMut::from(bytes.as_ref()));
+            joined.extend_from_slice(&bytes);
+            *previous = joined.freeze();
+        }
+        (_, input) => batch.push_back(input),
+    }
+}
+
+impl From<Bytes> for QueuedInput {
+    fn from(bytes: Bytes) -> Self {
+        Self::Operator(bytes)
+    }
+}
+impl QueuedInput {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Operator(bytes) => bytes.len(),
+            Self::Tracked(ticket) => ticket.pending_bytes(),
+        }
+    }
+    pub(super) fn pending(&self) -> bool {
+        match self {
+            Self::Operator(bytes) => !bytes.is_empty(),
+            Self::Tracked(ticket) => ticket.is_pending(),
+        }
+    }
+}
 #[derive(Debug, Default)]
 pub(crate) struct InjectionLease {
     held: RefCell<Option<Held>>,
-    backlog: RefCell<BytesMut>,
+    backlog: RefCell<InputBatch>,
 }
 
 /// Esc or Ctrl-C as a terminal sends it: legacy bytes, or the kitty
@@ -66,119 +107,103 @@ pub(crate) fn is_interrupt(bytes: &[u8]) -> bool {
 struct Held {
     token: String,
     until: Instant,
-    buffered: BytesMut,
+    buffered: InputBatch,
 }
 
 impl InjectionLease {
-    /// Take the lease for `token` until `until`. Another injection's live
-    /// lease refuses it. An expired one is ended first, and its held bytes are
-    /// returned to be written before anything else.
     pub(crate) fn acquire(
         &self,
         token: &str,
         until: Instant,
         now: Instant,
-    ) -> Result<Option<Bytes>, ()> {
+    ) -> Result<Option<InputBatch>, ()> {
         let mut held = self.held.borrow_mut();
         if held.as_ref().is_some_and(|lease| lease.until > now) {
             return Err(());
         }
-        let flush = held.take().map(|lease| lease.buffered.freeze());
+        let flush = held.take().map(|lease| lease.buffered);
         *held = Some(Held {
             token: token.to_owned(),
             until,
-            buffered: BytesMut::new(),
+            buffered: InputBatch::new(),
         });
-        Ok(flush.filter(|bytes| !bytes.is_empty()))
+        Ok(flush.filter(|batch| !batch.is_empty()))
     }
-
-    /// Hold `bytes` if the lease is live, or return what must be written now:
-    /// anything held by a lease that has just run out, then `bytes`.
-    pub(crate) fn intercept(&self, bytes: Bytes, now: Instant) -> Option<Bytes> {
-        let mut held = self.held.borrow_mut();
-        match held.as_mut() {
-            Some(lease)
-                if lease.until > now
-                    && lease.buffered.len() + bytes.len() <= MAX_HELD_BYTES
-                    && !is_interrupt(&bytes) =>
-            {
-                lease.buffered.extend_from_slice(&bytes);
-                None
-            }
-            Some(_) => {
-                let mut out = held.take().map(|lease| lease.buffered).unwrap_or_default();
-                out.extend_from_slice(&bytes);
-                Some(out.freeze())
-            }
-            None => Some(bytes),
+    pub(crate) fn intercept(
+        &self,
+        input: impl Into<QueuedInput>,
+        now: Instant,
+    ) -> Option<InputBatch> {
+        let input = input.into();
+        if !input.pending() {
+            return None;
         }
+        let mut held = self.held.borrow_mut();
+        let interrupt = matches!(&input, QueuedInput::Operator(bytes) if is_interrupt(bytes));
+        if let Some(lease) = held.as_mut() {
+            lease.buffered.retain(QueuedInput::pending);
+            let len: usize = lease.buffered.iter().map(QueuedInput::len).sum();
+            if lease.until > now && len + input.len() <= MAX_HELD_BYTES && !interrupt {
+                push_input(&mut lease.buffered, input);
+                return None;
+            }
+        }
+        let mut batch = held.take().map(|lease| lease.buffered).unwrap_or_default();
+        push_input(&mut batch, input);
+        Some(batch)
     }
-
-    /// End `token`'s lease and return what it held. A stale token (its lease
-    /// already expired and was retaken) releases nothing.
-    pub(crate) fn release(&self, token: &str) -> Option<Bytes> {
+    pub(crate) fn release(&self, token: &str) -> Option<InputBatch> {
         let mut held = self.held.borrow_mut();
         if held.as_ref().is_some_and(|lease| lease.token == token) {
-            return held.take().map(|lease| lease.buffered.freeze());
+            return held.take().map(|lease| lease.buffered);
         }
         None
     }
-
-    /// End the lease if it ran out by `now`, returning what it held (possibly
-    /// nothing) so the caller can write it. `None` means nothing ended.
-    pub(crate) fn expire(&self, now: Instant) -> Option<Bytes> {
+    pub(crate) fn expire(&self, now: Instant) -> Option<InputBatch> {
         let mut held = self.held.borrow_mut();
         if held.as_ref().is_some_and(|lease| lease.until <= now) {
-            return held.take().map(|lease| lease.buffered.freeze());
+            return held.take().map(|lease| lease.buffered);
         }
         None
     }
-
-    /// End whatever lease is held, for a server about to stop or hand off.
-    pub(crate) fn release_all(&self) -> Option<Bytes> {
-        self.held
+    /// Ownership transitions cancel tracked input; operator input keeps its place.
+    pub(crate) fn release_all(&self) -> Option<InputBatch> {
+        self.backlog
             .borrow_mut()
-            .take()
-            .map(|lease| lease.buffered.freeze())
+            .retain(|input| matches!(input, QueuedInput::Operator(_)));
+        self.held.borrow_mut().take().map(|lease| {
+            lease
+                .buffered
+                .into_iter()
+                .filter(|input| matches!(input, QueuedInput::Operator(_)))
+                .collect()
+        })
     }
-
-    /// Put `bytes` behind anything already waiting in the backlog, and return
-    /// everything to write now, in order.
-    pub(crate) fn behind_backlog(&self, bytes: Bytes) -> Bytes {
+    pub(crate) fn behind_backlog(&self, batch: InputBatch) -> InputBatch {
         let mut backlog = self.backlog.borrow_mut();
-        if backlog.is_empty() {
-            return bytes;
+        for input in batch {
+            push_input(&mut backlog, input);
         }
-        backlog.extend_from_slice(&bytes);
-        std::mem::take(&mut *backlog).freeze()
+        std::mem::take(&mut *backlog)
     }
-
-    /// Keep bytes a full channel refused. They are older than anything already
-    /// in the backlog, so they go in front of it.
-    /// True when the backlog has grown past the size worth reporting.
-    pub(crate) fn defer(&self, bytes: Bytes) -> bool {
+    pub(crate) fn defer(&self, mut batch: InputBatch) -> bool {
         let mut backlog = self.backlog.borrow_mut();
-        let mut kept = BytesMut::from(&bytes[..]);
-        kept.extend_from_slice(&backlog);
-        *backlog = kept;
-        backlog.len() > BACKLOG_WARN_BYTES
+        batch.append(&mut *backlog);
+        *backlog = batch;
+        backlog.iter().map(QueuedInput::len).sum::<usize>() > BACKLOG_WARN_BYTES
     }
-
-    pub(crate) fn take_backlog(&self) -> Option<Bytes> {
+    pub(crate) fn take_backlog(&self) -> Option<InputBatch> {
         let mut backlog = self.backlog.borrow_mut();
-        (!backlog.is_empty()).then(|| std::mem::take(&mut *backlog).freeze())
+        backlog.retain(QueuedInput::pending);
+        (!backlog.is_empty()).then(|| std::mem::take(&mut *backlog))
     }
-
     pub(crate) fn has_backlog(&self) -> bool {
+        self.backlog.borrow_mut().retain(QueuedInput::pending);
         !self.backlog.borrow().is_empty()
     }
-
     pub(crate) fn until(&self) -> Option<Instant> {
         self.held.borrow().as_ref().map(|lease| lease.until)
     }
-
-    /// Does `token` still hold a live lease? An injection checks this before
-    /// each step it takes on the operator's behalf.
     pub(crate) fn holds(&self, token: &str, now: Instant) -> bool {
         self.held
             .borrow()
@@ -191,6 +216,58 @@ impl InjectionLease {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // Preserve the existing byte-stream assertions across packet boundaries.
+    #[derive(Default)]
+    struct InjectionLease(super::InjectionLease);
+    fn flatten(batch: InputBatch) -> Bytes {
+        Bytes::from(
+            batch
+                .into_iter()
+                .flat_map(|input| match input {
+                    QueuedInput::Operator(bytes) => bytes.to_vec(),
+                    QueuedInput::Tracked(_) => panic!("legacy fixture contains a ticket"),
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+    impl InjectionLease {
+        fn acquire(&self, token: &str, until: Instant, now: Instant) -> Result<Option<Bytes>, ()> {
+            self.0
+                .acquire(token, until, now)
+                .map(|batch| batch.map(flatten))
+        }
+        fn intercept(&self, bytes: Bytes, now: Instant) -> Option<Bytes> {
+            self.0.intercept(bytes, now).map(flatten)
+        }
+        fn release(&self, token: &str) -> Option<Bytes> {
+            self.0.release(token).map(flatten)
+        }
+        fn expire(&self, now: Instant) -> Option<Bytes> {
+            self.0.expire(now).map(flatten)
+        }
+        fn release_all(&self) -> Option<Bytes> {
+            self.0.release_all().map(flatten)
+        }
+        fn behind_backlog(&self, bytes: Bytes) -> Bytes {
+            flatten(self.0.behind_backlog([QueuedInput::Operator(bytes)].into()))
+        }
+        fn defer(&self, bytes: Bytes) -> bool {
+            self.0.defer([QueuedInput::Operator(bytes)].into())
+        }
+        fn take_backlog(&self) -> Option<Bytes> {
+            self.0.take_backlog().map(flatten)
+        }
+        fn has_backlog(&self) -> bool {
+            self.0.has_backlog()
+        }
+        fn until(&self) -> Option<Instant> {
+            self.0.until()
+        }
+        fn holds(&self, token: &str, now: Instant) -> bool {
+            self.0.holds(token, now)
+        }
+    }
 
     fn bytes(text: &'static str) -> Bytes {
         Bytes::from_static(text.as_bytes())

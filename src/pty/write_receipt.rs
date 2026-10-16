@@ -33,6 +33,10 @@ struct WriteState {
 }
 
 impl WriteState {
+    /// ADR-0028 §5a: completion at the deadline is timely on both gate edges.
+    fn expired(&self, at: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| at > deadline)
+    }
     fn fail(&mut self, reason: WriteFailure) {
         self.progress.failure.get_or_insert(reason);
         self.payload = Bytes::new();
@@ -126,6 +130,18 @@ impl WriteReceipt {
 }
 
 impl WriteCompletion {
+    /// Prune cancelled/expired tickets before replay without borrowing their bytes.
+    pub(crate) fn is_pending(&self) -> bool {
+        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.progress.failure.is_some() || state.progress.completed_at.is_some() {
+            return false;
+        }
+        if state.expired(Instant::now()) {
+            state.fail(WriteFailure::Deadline);
+        }
+        state.progress.failure.is_none()
+    }
+
     pub(crate) fn pending_bytes(&self) -> usize {
         let state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -150,10 +166,7 @@ impl WriteCompletion {
         if state.progress.failure.is_some() || state.progress.completed_at.is_some() {
             return None;
         }
-        if state
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if state.expired(Instant::now()) {
             state.fail(WriteFailure::Deadline);
             return None;
         }
@@ -169,7 +182,7 @@ impl WriteCompletion {
                     let at = Instant::now();
                     state.progress.completed_at = Some(at);
                     state.payload = Bytes::new();
-                    if state.deadline.is_some_and(|deadline| at > deadline) {
+                    if state.expired(at) {
                         state.fail(WriteFailure::Deadline);
                     } else {
                         let _ = self.completion.send(at);
@@ -351,7 +364,8 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let result = completion.write(|bytes| {
                 let written = socket.write(&bytes[..count])?;
-                // Hold the syscall return gate until its actual request deadline.
+                // Use the real clock to cover the syscall-return boundary without a product clock hook.
+                // This bounded receive holds the producer alive through its actual deadline.
                 assert_eq!(
                     release.recv_timeout(deadline.saturating_duration_since(Instant::now())),
                     Err(mpsc::RecvTimeoutError::Timeout)
@@ -417,5 +431,40 @@ mod tests {
         );
         assert_eq!(receipt.progress().failure, Some(WriteFailure::Deadline));
         assert_eq!(completion.pending_bytes(), 0);
+    }
+    #[test]
+    fn write_deadline_edge_is_inclusive_before_and_after_syscall() {
+        let at = Instant::now();
+        let (_completion, receipt) = tracked(Some(at));
+        let state = receipt.0.state.lock().unwrap();
+        assert!(!state.expired(at));
+        assert!(state.expired(at + Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn live_silent_writer_is_cancelled_after_admission_before_resuming() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (completion, receipt) = tracked(Some(deadline));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = completion.write(|_| panic!("cancelled silent producer replayed input"));
+            done_tx.send(result.is_none()).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(receipt.try_completed(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(
+            done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(receipt.cancel(), WriteDisposition::Cancelled);
+        assert!(receipt.progress().remainder_discarded);
+        assert_eq!(receipt.progress().bytes_written, 0);
+        release_tx.send(()).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        writer.join().unwrap();
     }
 }

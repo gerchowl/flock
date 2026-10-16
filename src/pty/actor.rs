@@ -285,6 +285,27 @@ impl PtyIoActorHandle {
         Ok(receipt)
     }
 
+    pub(crate) fn try_write_ticket(
+        &self,
+        ticket: crate::pty::write_receipt::WriteCompletion,
+    ) -> Result<(), mpsc::error::TrySendError<crate::pty::write_receipt::WriteCompletion>> {
+        let gate = self.user_writes.lock().unwrap_or_else(|p| p.into_inner());
+        if !gate.accepting || self.writer_health.is_broken() {
+            return Err(mpsc::error::TrySendError::Closed(ticket));
+        }
+        match self.data_tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(PtyIoDataCommand::WriteTrackedInput(ticket));
+                self.wake_actor();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(mpsc::error::TrySendError::Full(ticket)),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(ticket))
+            }
+        }
+    }
+
     fn try_write_command(
         &self,
         command: PtyIoDataCommand,
@@ -936,7 +957,7 @@ impl PtyIoActorRunner {
                     Some(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,
                     Some(Err(err)) => {
                         crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                        self.discard_pending_writes();
+                        self.retire_tracked_writes();
                         return;
                     }
                     None => {}
@@ -971,12 +992,23 @@ impl PtyIoActorRunner {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
                     crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                    self.discard_pending_writes();
+                    self.complete_front_write();
+                    self.retire_tracked_writes();
                     return;
                 }
             }
         }
         let _ = self.file.flush();
+    }
+
+    /// A hard error retires tracked requests, retaining later operator keystrokes FIFO.
+    fn retire_tracked_writes(&mut self) {
+        self.pending_writes.retain(|(_, ticket)| ticket.is_none());
+        for _ in 0..self.data_rx.len() {
+            if let Ok(PtyIoDataCommand::WriteUserInput(bytes)) = self.data_rx.try_recv() {
+                self.push_pending(bytes);
+            }
+        }
     }
 
     fn discard_pending_writes(&mut self) {
@@ -1703,6 +1735,36 @@ mod tests {
             runner.zero_write_streak, 3,
             "no successful syscall to reset the streak"
         );
+    }
+
+    #[test]
+    fn hard_error_preserves_queued_operator_keys_in_order_on_recovery() {
+        let (mut runner, peer, data_tx) = socket_pair_runner();
+        let (ticket, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"fail"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(ticket));
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                b"older",
+            )))
+            .unwrap();
+        drop(peer);
+        runner.flush_pending_writes_once();
+        assert!(receipt.progress().failure.is_some());
+        assert!(!runner.writer_health.is_broken());
+        let (socket, mut recovered_peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        recovered_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        runner.file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) });
+        runner.enqueue_write(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+            b"later",
+        )));
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 10];
+        recovered_peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"olderlater");
     }
 
     #[test]

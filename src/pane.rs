@@ -957,6 +957,61 @@ impl PaneRuntimeIo {
         self.try_send_with_receipt(bytes, false, None).map(|_| ())
     }
 
+    fn try_send_input(
+        &self,
+        input: injection_lease::QueuedInput,
+    ) -> Result<(), mpsc::error::TrySendError<injection_lease::QueuedInput>> {
+        use injection_lease::QueuedInput;
+        match input {
+            QueuedInput::Operator(bytes) => self.try_send_bytes(bytes).map_err(|err| match err {
+                mpsc::error::TrySendError::Full(bytes) => {
+                    mpsc::error::TrySendError::Full(QueuedInput::Operator(bytes))
+                }
+                mpsc::error::TrySendError::Closed(bytes) => {
+                    mpsc::error::TrySendError::Closed(QueuedInput::Operator(bytes))
+                }
+            }),
+            QueuedInput::Tracked(ticket) => match self {
+                #[cfg(unix)]
+                Self::Actor(actor) => actor.try_write_ticket(ticket).map_err(|err| match err {
+                    mpsc::error::TrySendError::Full(ticket) => {
+                        mpsc::error::TrySendError::Full(QueuedInput::Tracked(ticket))
+                    }
+                    mpsc::error::TrySendError::Closed(ticket) => {
+                        mpsc::error::TrySendError::Closed(QueuedInput::Tracked(ticket))
+                    }
+                }),
+                #[cfg(test)]
+                Self::TestChannel { sender, .. } => {
+                    let result = ticket.write(|bytes| {
+                        sender
+                            .try_send(Bytes::copy_from_slice(bytes))
+                            .map(|_| bytes.len())
+                            .map_err(|err| {
+                                std::io::Error::from(match err {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        std::io::ErrorKind::WouldBlock
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => {
+                                        std::io::ErrorKind::BrokenPipe
+                                    }
+                                })
+                            })
+                    });
+                    match result {
+                        Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => Err(
+                            mpsc::error::TrySendError::Full(QueuedInput::Tracked(ticket)),
+                        ),
+                        Some(Err(_)) => Err(mpsc::error::TrySendError::Closed(
+                            QueuedInput::Tracked(ticket),
+                        )),
+                        _ => Ok(()),
+                    }
+                }
+            },
+        }
+    }
+
     fn try_send_with_receipt(
         &self,
         bytes: Bytes,
@@ -2309,39 +2364,64 @@ impl PaneRuntime {
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.has_been_typed_into.set(true);
-        let Some(bytes) = self
+        let Some(mut batch) = self
             .injection_lease
             .intercept(bytes, std::time::Instant::now())
         else {
             return Ok(());
         };
         self.operator_input.stamp();
-        if self.injection_lease.has_backlog() {
-            return self.write_in_order(bytes).map_err(mpsc::error::SendError);
+        if !self.injection_lease.has_backlog() && batch.len() == 1 {
+            if let Some(injection_lease::QueuedInput::Operator(bytes)) = batch.pop_front() {
+                return self.io.send_bytes(bytes).await;
+            }
         }
-        self.io.send_bytes(bytes).await
+        self.write_in_order(batch)
+            .map_err(|(bytes, _)| mpsc::error::SendError(bytes))
     }
 
-    /// Operator input: held, not written, while an injection lease is live
-    /// (#850), and stamped as operator input only when it is written.
+    /// Operator input retains FIFO order behind held or backlogged requests.
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.has_been_typed_into.set(true);
-        let Some(bytes) = self
+        let Some(mut batch) = self
             .injection_lease
             .intercept(bytes, std::time::Instant::now())
         else {
             return Ok(());
         };
         self.operator_input.stamp();
-        if self.injection_lease.has_backlog() {
-            // #1011 review: behind a backlog the write can still be refused
-            // (closed pane, broken writer), and then the backlog AND these
-            // bytes are gone, so the caller is told.
-            return self
-                .write_in_order(bytes)
-                .map_err(mpsc::error::TrySendError::Closed);
+        if !self.injection_lease.has_backlog() && batch.len() == 1 {
+            if let Some(injection_lease::QueuedInput::Operator(bytes)) = batch.pop_front() {
+                return self.io.try_send_bytes(bytes);
+            }
         }
-        self.io.try_send_bytes(bytes)
+        self.write_in_order(batch)
+            .map_err(|(bytes, _)| mpsc::error::TrySendError::Closed(bytes))
+    }
+
+    /// Queue a caller-owned request through the same operator lease/backlog path.
+    /// The returned receipt carries admission failure or later completion;
+    /// returning a ticket is never an acknowledgement of a completed write.
+    // #1638 connects this transport foundation to API response ownership.
+    #[allow(dead_code)]
+    pub(crate) fn try_send_tracked(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+    ) -> crate::pty::write_receipt::WriteReceipt {
+        let (ticket, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(bytes, Some(deadline));
+        self.has_been_typed_into.set(true);
+        if let Some(batch) = self.injection_lease.intercept(
+            injection_lease::QueuedInput::Tracked(ticket),
+            std::time::Instant::now(),
+        ) {
+            self.operator_input.stamp();
+            if self.write_in_order(batch).is_err() {
+                receipt.cancel();
+            }
+        }
+        receipt
     }
 
     /// Hold this pane's operator input for `token`'s injection until `until`
@@ -2392,44 +2472,60 @@ impl PaneRuntime {
         self.injection_lease.holds(token, now)
     }
 
-    fn write_held_input(&self, held: Option<Bytes>) -> bool {
-        let Some(bytes) = held.filter(|bytes| !bytes.is_empty()) else {
+    fn write_held_input(&self, held: Option<injection_lease::InputBatch>) -> bool {
+        let Some(mut batch) = held else {
             return true;
         };
+        batch.retain(injection_lease::QueuedInput::pending);
+        if batch.is_empty() {
+            return true;
+        }
         self.operator_input.stamp();
-        self.write_in_order(bytes).is_ok()
+        self.write_in_order(batch).is_ok()
     }
 
-    /// Write behind any backlog. A full channel keeps the bytes for the loop
-    /// to drain rather than dropping them; only a closed pane or a broken
-    /// writer refuses them, and then the refused bytes (the old backlog with
-    /// these appended) are logged and returned as the error.
-    fn write_in_order(&self, bytes: Bytes) -> Result<(), Bytes> {
-        let bytes = self.injection_lease.behind_backlog(bytes);
-        match self.io.try_send_bytes(bytes) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(bytes)) => {
-                let len = bytes.len();
-                if self.injection_lease.defer(bytes) {
-                    crate::logging::pane_held_input_write_failed(&format!(
-                        "pane input channel full; {len} held bytes still waiting"
-                    ));
-                }
-                Ok(())
+    fn write_in_order(&self, batch: injection_lease::InputBatch) -> Result<(), (Bytes, usize)> {
+        use injection_lease::QueuedInput;
+        let mut batch = self.injection_lease.behind_backlog(batch);
+        while let Some(input) = batch.pop_front() {
+            if matches!(&input, QueuedInput::Tracked(ticket) if !ticket.is_pending()) {
+                continue;
             }
-            Err(mpsc::error::TrySendError::Closed(bytes)) => {
-                let reason = if self.io.writer_broken() {
-                    "pane writer accepts zero bytes"
-                } else {
-                    "pane input channel closed"
-                };
-                crate::logging::pane_held_input_write_failed(&format!(
-                    "{reason}; {} held bytes not written",
-                    bytes.len()
-                ));
-                Err(bytes)
+            let refused_count = input.len() + batch.iter().map(QueuedInput::len).sum::<usize>();
+            match self.io.try_send_input(input) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(input)) => {
+                    batch.push_front(input);
+                    if self.injection_lease.defer(batch) {
+                        crate::logging::pane_held_input_write_failed(
+                            "pane input backlog exceeds warning limit",
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(input)) => {
+                    batch.push_front(input);
+                    let bytes = batch
+                        .into_iter()
+                        .filter_map(|input| match input {
+                            QueuedInput::Operator(bytes) => Some(bytes),
+                            QueuedInput::Tracked(_) => None,
+                        })
+                        .flatten()
+                        .collect::<Vec<u8>>();
+                    let reason = if self.io.writer_broken() {
+                        "pane writer accepts zero bytes"
+                    } else {
+                        "pane input channel closed"
+                    };
+                    crate::logging::pane_held_input_write_failed(&format!(
+                        "{reason}; {refused_count} held bytes not written"
+                    ));
+                    return Err((Bytes::from(bytes), refused_count));
+                }
             }
         }
+        Ok(())
     }
 
     pub(crate) fn has_held_backlog(&self) -> bool {
@@ -2442,7 +2538,7 @@ impl PaneRuntime {
             .injection_lease
             .take_backlog()
             .and_then(|bytes| self.write_in_order(bytes).err())
-            .map_or(0, |bytes| bytes.len());
+            .map_or(0, |(_, count)| count);
         HeldInputDrain {
             still_waiting: self.injection_lease.has_backlog(),
             refused_bytes,
@@ -3885,5 +3981,158 @@ mod tests {
                 observed_at: _,
             } if delivered_pane == pane_id
         ));
+    }
+    #[tokio::test]
+    async fn tracked_lease_deadline_removes_input_before_release() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle);
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(2);
+        assert!(runtime.begin_injection_lease(
+            "ticket",
+            now + std::time::Duration::from_secs(30),
+            now
+        ));
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"expired"), deadline);
+        assert_eq!(
+            receipt.progress().failure,
+            None,
+            "admitted before its deadline"
+        );
+        let (keep_alive, never_ready) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            never_ready.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(keep_alive);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"after"))
+            .unwrap();
+        assert!(runtime.end_injection_lease("ticket"));
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut observed = [0; 5];
+        std::io::Read::read_exact(&mut peer, &mut observed).unwrap();
+        assert_eq!(&observed, b"after");
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert_eq!(
+            receipt.progress().failure,
+            Some(crate::pty::write_receipt::WriteFailure::Deadline)
+        );
+        assert!(receipt.progress().remainder_discarded);
+    }
+
+    #[tokio::test]
+    async fn tracked_backlog_preserves_ticket_counts_fifo_and_cancellation() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        let cancelled = runtime.try_send_tracked(Bytes::from_static(b"cancelled"), until);
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until);
+        assert!(runtime.end_injection_lease("ticket"));
+        assert!(runtime.has_held_backlog());
+        assert_eq!(
+            cancelled.cancel(),
+            crate::pty::write_receipt::WriteDisposition::Cancelled
+        );
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
+        let drain = runtime.drain_held_input();
+        assert_eq!(drain.refused_bytes, 0);
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"first");
+        assert!(first.try_completed().is_ok());
+        assert_eq!(
+            (first.progress().bytes_written, first.progress().bytes_total),
+            (5, 5)
+        );
+        assert_eq!(second.progress().bytes_written, 0);
+        let drain = runtime.drain_held_input();
+        assert_eq!(drain.refused_bytes, 0);
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"second");
+        assert!(second.try_completed().is_ok());
+        assert_eq!(
+            (
+                second.progress().bytes_written,
+                second.progress().bytes_total
+            ),
+            (6, 6)
+        );
+        assert_eq!(cancelled.progress().bytes_written, 0);
+        assert!(!runtime.has_held_backlog());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ownership_transition_cancels_held_and_backlogged_tickets() {
+        for backlogged in [false, true] {
+            let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+            runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+            let now = std::time::Instant::now();
+            let until = now + std::time::Duration::from_secs(30);
+            assert!(runtime.begin_injection_lease("ticket", until, now));
+            let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
+            runtime
+                .try_send_bytes(Bytes::from_static(b"operator"))
+                .unwrap();
+            if backlogged {
+                assert!(runtime.end_injection_lease("ticket"));
+            }
+            runtime.end_all_injection_leases();
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().failure.is_some());
+            assert!(receipt.progress().remainder_discarded);
+            assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
+            let drain = runtime.drain_held_input();
+            assert_eq!(drain.refused_bytes, 0);
+            assert!(!drain.still_waiting);
+            assert_eq!(receiver.try_recv().unwrap().as_ref(), b"operator");
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_retires_a_held_ticket_without_replaying_its_payload() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
+        drop(runtime);
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert!(receipt.progress().failure.is_some());
+        assert!(receipt.progress().remainder_discarded);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tracked_runtime_partial_cancel_retains_native_prefix_evidence() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle);
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let receipt = runtime.try_send_tracked(
+            Bytes::from(vec![b'p'; 16 * 1024 * 1024]),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let mut first = [0; 1];
+        std::io::Read::read_exact(&mut peer, &mut first).unwrap();
+        assert_eq!(first, [b'p']);
+        assert_eq!(
+            receipt.cancel(),
+            crate::pty::write_receipt::WriteDisposition::Partial
+        );
+        let count = receipt.progress().bytes_written;
+        assert!(count > 0 && count < receipt.progress().bytes_total);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"after"))
+            .unwrap();
+        let mut rest = vec![0; count - 1 + 5];
+        std::io::Read::read_exact(&mut peer, &mut rest).unwrap();
+        assert!(rest[..count - 1].iter().all(|byte| *byte == b'p'));
+        assert_eq!(&rest[count - 1..], b"after");
+        assert_eq!(receipt.progress().bytes_written, count);
+        assert!(receipt.progress().remainder_discarded);
     }
 }
