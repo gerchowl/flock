@@ -79,6 +79,8 @@ pub struct ApiRequestMessage {
     /// platform exposes it. Lets pane reports resolve by process ancestry
     /// when their env-baked pane id has gone stale.
     pub peer_pid: Option<u32>,
+    /// Process birth captured with socket credentials, before queueing the request.
+    pub peer_birth: Option<u64>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

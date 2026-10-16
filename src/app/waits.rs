@@ -266,7 +266,7 @@ impl App {
                     Duration::from_millis(hold_ms).saturating_add(HOLD_GRACE),
                 )
                 .map(|(wait_id, _)| wait_id),
-            SpawnCaller::Operator { .. } => None,
+            SpawnCaller::Operator { .. } | SpawnCaller::Structured { .. } => None,
         };
         encode_success(id, ResponseResult::WaitHeld { wait_id })
     }

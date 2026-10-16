@@ -1,6 +1,22 @@
 use super::App;
 
 impl App {
+    /// Preserve socket attribution across queued or parked requests and lease release.
+    pub(super) fn lease_caller(&self) -> crate::structured::lease::Caller {
+        if let Some(birth) = self.current_api_peer_birth {
+            if self.current_api_peer_pid.is_some()
+                && (birth.is_none()
+                    || self
+                        .current_api_peer_pid
+                        .and_then(crate::platform::process_start_time)
+                        != birth)
+            {
+                return crate::structured::lease::Caller::Uncertain;
+            }
+        }
+        self.session_leases.caller(self.current_api_peer_pid)
+    }
+
     pub(crate) fn find_pane(
         &self,
         pane_id: crate::layout::PaneId,

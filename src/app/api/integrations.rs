@@ -124,6 +124,7 @@ mod tests {
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
 
         // The loop is back while the probe is still held.
