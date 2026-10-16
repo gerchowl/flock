@@ -3,6 +3,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
  * A stdio permission request, including AskUserQuestion (A.6, A.12-A.13).
+ * Its TypeScript discriminator comes from the known request catalogue entry.
  */
 export type ToolRequest = {
 /**
@@ -20,7 +21,7 @@ tool_use_id: string,
 /**
  * Required control discriminator; null is an unknown wire shape (§8).
  */
-subtype: string,
+subtype: "can_use_tool",
 /**
  * Harness `display_name` metadata from Appendix A.
  */

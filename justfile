@@ -52,8 +52,9 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint:
+lint: ts-check
     cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
@@ -209,3 +210,7 @@ default-config:
 # Rewrite the Rust-derived client contracts (ADR-0036 §6).
 gen-ts:
     cargo nextest run --locked --features ts --run-ignored ignored-only generate_wire_ts_types
+
+# Strict contract checks, including the Rust-classified recorded fixtures.
+ts-check:
+    bunx --bun --package typescript@7.0.2 tsc --noEmit -p web/client/tsconfig.json
