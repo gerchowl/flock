@@ -3,7 +3,11 @@
 - Status: Accepted (2026-10-13, owner decisions recorded); amended
   2026-10-14 with the S0 probe findings (#1324, "S0 findings for the
   architect" says where each landed), and with the A.13 controls, the A.16
-  login results and the owner's narrowing of decision 1 (#1404)
+  login results and the owner's narrowing of decision 1 (#1404); amended
+  2026-10-16 (#1606, ADR-0038): the Vite client build (§7), the `synced`
+  frame and the `gap` frame's `snapshot_to` (§4, §5), and the owner's
+  decision that flk's log, metric and trace output goes through vig-os/vigil,
+  which resolves #1323 so it no longer gates S7 (§5, decision 6, S7)
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -26,7 +30,8 @@
 - Follow-ups: #1307 (slice tracking), #1305 (the cache tests; test 4 is
   measured in A.7.1, test 6 in A.7.2), #1308
   (TUI parity gaps P16, P17), #1309 (live Codex and opencode runs), #1323
-  (the Grafana Labs stack versus our own for the stream and history, §5).
+  (the Grafana Labs stack versus our own for the stream and history, §5;
+  resolved 2026-10-16 in favour of vig-os/vigil for telemetry, #1614).
 - Decision owner: operator.
 - Evidence: Appendix A was measured on 2026-10-13 against Claude Code
   2.1.296 (this host's `latest` channel; the fleet `stable` pin is 2.1.287,
@@ -737,8 +742,12 @@ back-to-back turns. For a structured agent there is no polling at all:
   over the old one; `seq` continues across the rewrite: the snapshot's
   lines take the next seqs, so the stream stays dense from the snapshot on.
   A `sub` whose cursor is older than the first seq of the snapshot gets
-  `gap { from: cursor + 1, to: first_snapshot_seq - 1 }` and then the
-  snapshot lines, which carry the full current state of every item.
+  `gap { from: cursor + 1, to: first_snapshot_seq - 1, snapshot_to:
+  last_snapshot_seq }` and then the snapshot lines, which carry the full
+  current state of every item. `snapshot_to` is the only end-of-snapshot
+  marker: a client knows the snapshot is complete once it has applied the
+  event with that seq (amended 2026-10-16, ADR-0038 §3). A stream without
+  snapshots (`agent/<id>`) sends `gap` without `snapshot_to`.
 - **Two kinds of seq.** ADR-0005's `seq` stays the one total order of the
   durable event log, and the `events` wire stream uses it. A per-agent
   stream (`agent/<id>`, `queue/<id>`) has its own `seq`, starting at 1,
@@ -793,12 +802,13 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
-Whether the stream and its history should run on the Grafana Labs stack
-(Loki for history and queries, Tempo for spans, Grafana Live for the live
-push) instead of the JSONL store of §4 and the endpoint below is an open
-item, evaluated in #1323. It reports before S7 starts; S1 to S6 do not
-depend on it, and the contract below is what S7 builds unless #1323 decides
-otherwise.
+The stream and its history stay the JSONL store of §4 and the endpoint
+below. The open item of whether they should run on the Grafana Labs stack
+(#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):
+flk's log, metric and trace output goes through vig-os/vigil's OTLP/JSON
+Lines files and its optional signed audit trail, not through Grafana and not
+through a separate pipeline. The integration is #1614. #1323 no longer gates
+S7; #1546 (liveness and recovery on unstable connections) does.
 
 One endpoint serves every frontend: `GET /v1/ws` (WebSocket) and
 `GET /v1/blob/<sha256>` (HTTP). It runs inside the flk server process,
@@ -821,13 +831,19 @@ client → server
 server → client
   welcome { protocol, server_version, capabilities, principal }
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
-  gap     { sub_id, from, to }                as events.read (ADR-0028 §3)
+  synced  { sub_id, seq }                     replay reached the head (seq 0: empty)
+  gap     { sub_id, from, to, snapshot_to? }  as events.read (ADR-0028 §3);
+                                              snapshot_to as §4
   lagged  { sub_id, skipped_to }
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
 
 - **Cursors.** Every stream except `agent/<id>/live` is a log with `seq`.
-  `sub` with `after` replays from the cursor, then goes live. Reconnect,
+  `sub` with `after` replays from the cursor, then goes live. The server
+  sends `synced { sub_id, seq }` exactly once per `sub`, when the replay has
+  reached the stream's head at `seq`; every frame after it is live. A
+  re-`sub` after `lagged` gets its own `synced`. `agent/<id>/live` has no
+  `synced` (amended 2026-10-16, ADR-0038 §3). Reconnect,
   sleep and a second device are all "subscribe from my last seq". Delivery
   is at-least-once; clients dedupe on `(stream, seq)`. `agent/<id>/live`
   carries partial deltas only, has no cursor, and is sent only to
@@ -1304,7 +1320,10 @@ decision by the owner.
    carries only state and messages between nodes, with no hopping between
    servers except to open a real terminal. Open item: evaluate the Grafana
    Labs stack (Loki, Tempo, Grafana Live) against our own for the stream
-   and history, filed as #1323, reporting before S7. (§5)
+   and history, filed as #1323, reporting before S7. (§5) Resolved
+   2026-10-16 by the owner (ADR-0038 §11 item 5): log, metric and trace
+   output goes through vig-os/vigil, the stream and history stay §4/§5's
+   own, and #1323 no longer gates S7 (integration: #1614).
 7. **TS generation.** As recommended: `ts-rs`. (§6)
 8. **Web client framework.** Not as recommended (none): Solid, for its
    fine-grained reactivity under streaming updates. (§7)
@@ -1353,7 +1372,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |
 | S5b | Turn-end work through the queue: armed self-compact and its continuation on `result`, recap lift, wake of parked waits (§3a, #697) | S5 | 200 |
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
-| S7 | Wire endpoint in the server process (after #1323 reports): `/v1/ws` hello / sub / cmd (a `cmd` for another node's agent is refused until #1380), cursors, gap / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
+| S7 | Wire endpoint in the server process (with #1546's liveness: connect and handshake deadlines, heartbeat): `/v1/ws` hello / sub / cmd (a `cmd` for another node's agent is refused until #1380), cursors, `synced`, gap with `snapshot_to` / lagged, idempotency window, `/v1/blob`, `WIRE_JSON_VERSION` gate, client tokens, `web` on in release builds | S3 | 400 |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |

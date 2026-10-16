@@ -130,31 +130,51 @@ The client must never derive:
 - goal or work state;
 - anything sent to an agent other than a `cmd`.
 
-**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters: heartbeat interval, liveness window and backoff caps. The diagram shows the main path. The table is complete and wins where they differ.
+**Connection lifecycle.** The states and transitions below are normative. #1546 settles the liveness parameters: the connect deadline, the handshake deadline, the heartbeat interval, the liveness window and the backoff caps. Every state that waits on the server has a deadline that ends it (ADR-0037: waits fail, they never hang). The diagram shows the main path. The tables are complete and win where they differ.
+
+The lifecycle has two levels. The **connection** has one state at a time. Each **stream** subscribed on that connection has its own state, because `synced`, `gap` and `lagged` (ADR-0036 §5) are per `sub`.
 
 ```text
-Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─caught up─▶ Live
-                  ▲    │ fail        │ │               ▲   │ gap             │ gap
-                  │    ▼             │ │ client newer  │   ▼                 ▼
-                  │  Reconnecting ◀──┘ ▼               └─ Resync ◀───────────┘
-                  └── backoff ──┘    ReadOnly         (inline snapshot lines)
-   from Hello, Syncing, Resync, Live, ReadOnly: socket lost ──▶ Reconnecting
-   from Syncing, Resync, Live: heartbeat missed ──▶ Stale ──▶ Reconnecting
-   from any state: auth refused ──▶ NeedsToken ──new token──▶ Connecting
+Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─every stream Current─▶ Live
+                  ▲    │ fail or     │ │ │ client
+                  │    │ connect     │ │ │ newer
+                  │    ▼ deadline    │ │ ▼
+                  │  Reconnecting ◀──┘ │ ReadOnly
+                  └── backoff ──┘ handshake deadline, protocol error
+   from Hello, Syncing, Live, ReadOnly: socket lost ──▶ Reconnecting
+   from Syncing, Live, ReadOnly: heartbeat missed ──▶ Stale ──▶ Reconnecting
+   from Hello, Syncing, Live, ReadOnly: auth refused ──▶ NeedsToken ──new token──▶ Connecting
+
+per stream, while the connection is Syncing, Live or ReadOnly:
+   sub ─▶ Replaying ─synced─▶ Current
+   Replaying or Current ─gap with snapshot─▶ Resyncing ─seq snapshot_to applied─▶ back
 ```
 
-| State | Exits |
+**Connection states.** A dash means the event cannot occur in that state, and the cell says why.
+
+| State | Own exits | Heartbeat missed | Socket lost | `gap` | Auth refused |
+|---|---|---|---|---|---|
+| Disconnected | `connect` → Connecting | — no socket | — no socket | — no socket | — no socket |
+| Connecting | socket open → Hello; failure, or the connect deadline elapsed → Reconnecting | — no heartbeat before `welcome` | → Reconnecting (a failure) | — no `sub` yet | — the token is sent in `hello` |
+| Hello | `welcome`, client not newer → Syncing; `welcome`, client newer → ReadOnly; the handshake deadline elapsed without `welcome` → Reconnecting; any other frame is a protocol error: close, show the error, → Reconnecting | — the handshake deadline covers Hello | → Reconnecting | — no `sub` is sent before `welcome`, so a `gap` here is the protocol error | → NeedsToken |
+| Syncing | every seq stream is Current → Live | → Stale | → Reconnecting | that stream → Resyncing; the connection stays Syncing | → NeedsToken |
+| Live | — | → Stale | → Reconnecting | that stream → Resyncing; the connection stays Live | → NeedsToken |
+| ReadOnly | user reload after a server upgrade → Connecting | → Stale | → Reconnecting; the next `welcome` decides again | that stream → Resyncing; the connection stays ReadOnly | → NeedsToken |
+| Stale | → Reconnecting at once: it closes the socket and is entered only to mark tiles while the reconnect begins | ignored: the socket is already being closed | ignored: already leaving | ignored: frames after Stale are discarded, and the stored cursor replays them | ignored: the next `hello` reports it again |
+| Reconnecting | backoff elapsed, or a network-change or foreground event → Connecting | — no socket | — no socket | — no socket | — no socket |
+| NeedsToken | new token → Connecting | — the socket was closed on entry | — the socket was closed on entry | — the socket was closed on entry | — the socket was closed on entry |
+
+**Stream states.** Each seq stream (every stream but `*/live`, ADR-0036 §5) has one. `*/live` streams have no cursor and no `synced`, and do not count toward Live. A connection-level exit (socket lost, Stale, NeedsToken) ends every stream's state. After the reconnect, each `sub` starts from its stored cursor and its stored resync marker.
+
+| Stream state | Exits |
 |---|---|
-| Disconnected | `connect` → Connecting |
-| Connecting | socket open → Hello; failure → Reconnecting |
-| Hello | `welcome`, client not newer → Syncing; `welcome`, client newer → ReadOnly; auth refused → NeedsToken; socket lost → Reconnecting |
-| Syncing | every subscribed stream caught up → Live; `gap` on a snapshot stream → Resync; socket lost → Reconnecting; heartbeat missed → Stale; auth refused → NeedsToken |
-| Resync | the snapshot is applied (the first frame on that stream that is not a snapshot line, or the stream is caught up) → the state it came from (Syncing or Live); socket lost → Reconnecting, after which the `sub` from the stored cursor gets the `gap` and the snapshot again; heartbeat missed → Stale; auth refused → NeedsToken |
-| Live | `gap` on a snapshot stream → Resync; socket lost → Reconnecting; heartbeat missed → Stale; auth refused → NeedsToken |
-| ReadOnly | user reload after a server upgrade → Connecting; socket lost → Reconnecting (the next `welcome` decides again); auth refused → NeedsToken |
-| Stale | → Reconnecting at once (it is entered only to mark tiles while reconnect begins) |
-| Reconnecting | backoff elapsed, network-change or foreground event → Connecting |
-| NeedsToken | new token → Connecting |
+| Replaying (after `sub`, from the stored cursor) | `synced` → Current; `gap` with `snapshot_to` → Resyncing, returning to Replaying; `gap` without a snapshot (`agent/<id>`) → the marker below, stays Replaying; `lagged` → re-`sub` from the last applied seq, stays Replaying |
+| Current | `gap` with `snapshot_to` → Resyncing, returning to Current; `gap` without a snapshot → the marker, stays Current; `lagged` → re-`sub` from the last applied seq → Replaying |
+| Resyncing | the `ev` with seq `snapshot_to` is applied → it drops every entity still unconfirmed, then returns to the state it came from; another `gap` with `snapshot_to` on the same stream (the log was rewritten again) → restarts Resyncing on the new snapshot, keeping the unconfirmed set; `lagged` → re-`sub` from the last applied seq; the server replays the rest of the snapshot from the log, so it stays Resyncing with the same `snapshot_to`; `synced` cannot arrive first, because it follows seq `snapshot_to` in seq order |
+
+- **Streams are independent.** A `gap` on a second stream while the first is Resyncing starts the second's own Resyncing. Neither waits for the other.
+- **Syncing ends on Current, not on Resyncing.** If Syncing would end while a stream that was already Current is Resyncing, the connection waits for that resync to finish too. Once the connection is Live, a stream's later Resyncing never takes the connection out of Live. Only that stream's tiles show a "resyncing" marker. The outbox keeps sending, because every verb is verified by the server against its own current state (atomic answers, below).
+- **The resync marker** (`snapshot_to` and the unconfirmed set) is stored with the stream's cursor. A reconnect or reload whose cursor is still below `snapshot_to` resumes Resyncing. A server without the snapshot lines any more sends a new `gap`, which restarts it.
 
 - **Hello.**
   - It sends `hello { protocol, client, token }`.
@@ -163,20 +183,18 @@ Disconnected ─▶ Connecting ─open─▶ Hello ─welcome─▶ Syncing ─c
     - Only a client **newer** than the server enters **ReadOnly**: the server's `welcome` carries read-only capabilities. The client can view, but cannot send verbs the server doesn't know.
     - A client **older** than the server keeps working normally. Event types it doesn't know arrive in the §8 unknown wrapper and render as the JSON dump.
 - **ReadOnly.**
-  - Subscriptions and rendering work as in Live.
+  - Subscriptions, stream states and rendering work as in Live, including Stale on a missed heartbeat and Resyncing on a `gap`.
   - The outbox is **held**, not sent and not dropped, and the composer and answer controls are disabled with a banner naming the version gap.
-  - ReadOnly exits:
-    - to **Connecting** when the user reloads after the server is upgraded;
-    - to **Reconnecting** when the socket is lost; the next `welcome` decides again.
-- **Syncing and Live** handle the same stream signals. They differ only in that Syncing has not yet caught up on every subscribed stream.
+  - Its exits are in the connection table: Connecting on a reload after the server is upgraded, Reconnecting when the socket is lost (the next `welcome` decides again), Stale, and NeedsToken.
+- **Syncing and Live** handle the same stream signals. They differ only in that Syncing has not yet seen every seq stream reach Current (its `synced` frame, ADR-0036 §5).
   - **`ev`:** dedupe on `(stream, seq)`. Apply through the stream's reducer. Advance that stream's cursor **only after** the reducer has applied the event.
   - **`lagged { skipped_to }`:** the server dropped events for a slow subscriber. Re-subscribe with `after: <cursor>`, the last applied seq, so the log replays everything after it. Never jump to `skipped_to`, because that would skip replayable entries.
   - **`gap { from, to }`:** the log no longer holds that range.
-    - **Streams with snapshots** follow ADR-0036 §4 unchanged: `queue/<id>`, and this record's §5 streams (`fleet`, `inbox`, `artifacts`, `work`). The server sends the snapshot inline, right after the `gap`. Its lines take the next seqs and carry the full current state of every item. The client enters **Resync**:
+    - **Streams with snapshots** follow ADR-0036 §4: `queue/<id>`, and this record's §5 streams (`fleet`, `inbox`, `artifacts`, `work`). The server sends the snapshot inline, right after the `gap`. Its lines take the seqs `to + 1` through `snapshot_to`, the field the `gap` carries for exactly this purpose (ADR-0036 §5), and they carry the full current state of every item. That stream enters **Resyncing**:
       - it marks that stream's entities as unconfirmed;
       - it applies the snapshot lines through the normal reducer, advancing the cursor as usual;
-      - when the snapshot ends, it drops every entity still unconfirmed, because an item the snapshot doesn't mention no longer exists.
-      - The snapshot ends at the first frame on that stream that is not a snapshot line, or when the stream is caught up.
+      - when the `ev` with seq `snapshot_to` has been applied, the snapshot has ended. It drops every entity still unconfirmed, because an item the snapshot doesn't mention no longer exists.
+      - `snapshot_to` is the only way a snapshot ends. The client never infers the end from a frame's content or from timing.
       - Rendering stays batched per animation frame, so a snapshot delivered in one burst never shows an empty list.
       - There is no client-side fetch: the snapshot comes on the same stream as everything else.
     - **`agent/<id>` has no snapshot and no other source.** It is the stored session stream itself (ADR-0036 §4). A gap there means flk no longer holds those lines, for example after retention removed them (ADR-0036 S16). Nothing else holds them either: the harness's native transcript is a disposable working copy that flk does not serve.
@@ -247,7 +265,7 @@ The owner chose vig-os/vigil for flk's telemetry (§11 item 5). vigil bridges `t
   - `telemetry/traces` (a `sub` with a filter: trace id, agent id or time range);
   - `telemetry/logs` (filter: level, target, agent id, time range);
   - `audit` (verification status per segment).
-  - Each needs the `read` scope. `audit` is operator-only, because it names actors.
+  - `telemetry/traces` and `telemetry/logs` need the `read` scope. `audit` is operator-only: it needs the `operate` scope, because it names actors (§5).
   - Clients get records already decoded from OTLP/JSON into the same generated-type discipline as §5. There are no hand-written shapes.
 - **Correlation, not a second history.**
   - Spans carry the agent id, session, `cmd_id` and turn as attributes (decided in #1614).
@@ -275,12 +293,18 @@ All types are Rust types with `ts_rs::TS` derives behind the `ts` feature (S8) a
 | `inbox` | yes | open questions, permission prompts and feedback requests across agents in scope: opened, updated, closed | open items |
 | `artifacts` | yes | artifact record versions in scope, plus comments | records and the latest N comments per artifact |
 | `work` | yes | goal and work node upserts and edges | the goal and work subgraph in scope |
+| `telemetry/traces` (G13, §4a) | yes, the unfiltered stream's | decoded OTLP spans matching the `sub`'s filter (trace id, agent id, time range) | none: a `gap` means vigil's retention removed those files, and the tile shows a "no longer retained" marker, as for `agent/<id>` |
+| `telemetry/logs` (G13, §4a) | yes, the unfiltered stream's | decoded OTLP log records matching the filter (level, target, agent id, time range) | none, as `telemetry/traces` |
+| `audit` (G13, §4a) | yes, in chain order | audit segments with their verification status, plus actor and action rows | none: a `gap` means retention removed segments, and the status covers only the retained segments, saying so |
+
+- **Telemetry streams.** A filtered `sub` sees the seqs of the unfiltered stream, so they are sparse. The client relies only on the `gap` frames the server sends, never on holes in the seqs. All three are read-only: no `cmd` verb writes them. `telemetry/traces` and `telemetry/logs` need the `read` scope. `audit` needs the `operate` scope (ADR-0036 §5's token scopes), the scope that carries the operator's identity, because the trail names actors and records operator-only verbs (ADR-0014; #1614 item 5). Any other token's `sub` is refused with `operator_only`. They ship in G13's release, which bumps `WIRE_JSON_VERSION` once under the rule above. An older server refuses the `sub` as an unknown stream, and the client hides the tiles.
 
 **Types** (sketch; names final in S8):
 
 ```rust
 pub enum StreamId { Agent(AgentId), AgentLive(AgentId), Queue(AgentId), Events,
-                    Terminal(PaneId), Fleet, Inbox, Artifacts(ArtifactScope), Work(WorkScope) }
+                    Terminal(PaneId), Fleet, Inbox, Artifacts(ArtifactScope), Work(WorkScope),
+                    TelemetryTraces(TraceFilter), TelemetryLogs(LogFilter), Audit }
 
 pub struct NodeSummary { node_id: NodeId, name: String, online: bool, route: Route,
                          health: Option<NodeHealth>, counts: AgentCounts }
@@ -442,7 +466,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | # | Slice | Depends on | Before S3? | Est. |
 |---|---|---|---|---|
 | S8a | `ts` feature and ts-rs derives for types that exist today: the socket API types the client needs first (agents, workspaces, panes, questions) and ADR-0036 S1's `SessionEvent` (landed). Drift test, `just gen-ts`. This splits ADR-0036 S8. | — | yes | 200 |
-| S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `gap`, `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1546 settled | yes | 200 |
+| S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `synced`, `gap` (with `snapshot_to`), `lagged`, `ack`, and the heartbeat #1546 settles. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1546 settled | yes | 200 |
 | G1 | Client shell skeleton (Solid, built with Vite + `vite-plugin-solid`, Bun as package manager and test runner), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
 | G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode | G1 | yes | 400 TS |
 | G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server built on S7a's types (connect, gap, lagged, stale, protocol gap, token refusal) | G1, S7a | yes | 400 TS |
