@@ -39,6 +39,9 @@ mod client;
 // Pure rollout foundation; runtime consumers follow in #1662–#1664.
 #[allow(dead_code)]
 mod codex_rollout;
+// Binding foundation, connected to the reader and authority in #1663/#1664.
+#[allow(dead_code)]
+mod codex_binding;
 mod codex_transcript;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]

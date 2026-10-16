@@ -1238,6 +1238,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_sessionstart_forwards_every_source_and_transcript_path() {
+        for source in ["startup", "resume", "clear", "compact", "fork"] {
+            let out = plan(
+                Agent::Codex,
+                Action::Session,
+                &json!({"session_id":"child", "source":source, "transcript_path":"/fixture/rollout.jsonl"}),
+                "SessionStart",
+                "p_9",
+                0,
+                None,
+            );
+            let Method::PaneReportAgentSession(params) = &out.reports[0] else {
+                panic!("session report")
+            };
+            assert_eq!(params.session_start_source.as_deref(), Some(source));
+            assert_eq!(
+                params.agent_session_path.as_deref(),
+                Some("/fixture/rollout.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_other_events_cannot_forward_binding_claims() {
+        let out = plan_session(
+            Agent::Codex,
+            &json!({"session_id":"child", "source":"fork", "transcript_path":"/fixture/rollout.jsonl"}),
+            "Stop",
+            "p_9",
+            None,
+        );
+        let Method::PaneReportAgentSession(params) = &out.reports[0] else {
+            panic!("session report")
+        };
+        assert!(params.session_start_source.is_none());
+        assert!(params.agent_session_path.is_none());
+    }
+
+    #[test]
     fn stop_is_a_no_op_for_the_non_claude_agents() {
         for agent in [Agent::Codex, Agent::Kimi, Agent::Qodercli] {
             let outcome = plan(agent, Action::Stop, &json!({}), "Stop", "p_1", 3, None);
