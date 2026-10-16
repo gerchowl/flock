@@ -75,10 +75,12 @@ impl Harness {
         let base = PathBuf::from(format!("/tmp/fs-{label}-{}-{nanos}", std::process::id()));
         let config_home = base.join("cfg");
         let runtime_dir = base.join("rt");
-        fs::create_dir_all(config_home.join("flock")).expect("config home");
+        fs::create_dir_all(config_home.join(support::paths::app_dir_name())).expect("config home");
         fs::create_dir_all(&runtime_dir).expect("runtime dir");
         fs::write(
-            config_home.join("flock/config.toml"),
+            config_home
+                .join(support::paths::app_dir_name())
+                .join("config.toml"),
             "onboarding = false\n",
         )
         .expect("seed config");
