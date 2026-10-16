@@ -414,26 +414,34 @@ fn optional_1659_bare_debug_alias_is_refused() {
 fn restart_refusals_name_options_without_their_values() {
     let value = "fixture-sensitive-profile";
     let mut failures = Vec::new();
-    for agent in ["hermes", "opencode", "copilot"] {
+    for agent in ["claude", "codex", "pi", "hermes", "opencode", "copilot"] {
         let session = PersistedAgentSession {
             source: format!("flock:{agent}"),
             agent: agent.into(),
             session_ref: AgentSessionRef::id("native-fixture").unwrap(),
         };
-        for (flag, args) in [
-            ("-p", vec![agent.into(), format!("-p={value}")]),
-            ("-p", vec![agent.into(), "-p".into(), value.into()]),
-            (
-                "--unverified",
-                vec![agent.into(), "--unverified".into(), value.into()],
-            ),
-        ] {
-            let error = resume_launch(&session, &args).unwrap_err();
-            if !error.contains(flag)
-                || !error.contains("unknown option arity")
-                || error.contains(value)
-            {
-                failures.push(format!("{agent}: {error}"));
+        let mut cases = vec![
+            ("-p", format!("-p{value}"), value, true),
+            ("-m", format!("-m{value}"), value, true),
+            ("-a", "-abc".into(), "bc", true),
+            ("--unverified", format!("--unverified={value}"), value, true),
+            ("--unverified", "--unverified".into(), value, false),
+        ];
+        if !matches!(agent, "claude" | "codex" | "pi") {
+            cases.extend([
+                ("-p", format!("-p={value}"), value, true),
+                ("-p", "-p".into(), value, false),
+            ]);
+        }
+        for (flag, option, omitted, attached) in cases {
+            let args = vec![agent.into(), option.clone(), value.into()];
+            match resume_launch(&session, &args) {
+                Err(error)
+                    if error.contains(flag)
+                        && !error.contains(omitted)
+                        && !error.contains(value)
+                        && (!attached || error.contains("(attached value omitted)")) => {}
+                result => failures.push(format!("{agent} {option}: {result:?}")),
             }
         }
     }
@@ -441,4 +449,33 @@ fn restart_refusals_name_options_without_their_values() {
         failures.is_empty(),
         "option values leaked or refusal changed: {failures:?}"
     );
+}
+
+#[test]
+fn restart_launch_preserves_verified_inline_option_values() {
+    for agent in ["claude", "codex", "pi", "hermes", "opencode", "copilot"] {
+        let session = PersistedAgentSession {
+            source: format!("flock:{agent}"),
+            agent: agent.into(),
+            session_ref: AgentSessionRef::id("native-fixture").unwrap(),
+        };
+        let args = vec![
+            agent.into(),
+            "--model=fixture-model".into(),
+            "opening prompt".into(),
+        ];
+        let result = resume_launch(&session, &args).unwrap();
+        assert!(result
+            .plan
+            .argv
+            .ends_with(&["--model=fixture-model".into()]));
+        if agent == "codex" {
+            let args = vec![agent.into(), "-p=fixture-profile".into()];
+            assert!(resume_launch(&session, &args)
+                .unwrap()
+                .plan
+                .argv
+                .ends_with(&args[1..]));
+        }
+    }
 }

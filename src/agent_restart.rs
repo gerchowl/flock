@@ -211,14 +211,40 @@ pub(crate) fn resume_launch(
         if arg == "--" {
             break;
         }
-        let (flag, inline) = arg
-            .split_once('=')
-            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        let short_end = (arg.starts_with('-') && !arg.starts_with("--"))
+            .then(|| arg.char_indices().nth(2).map(|(end, _)| end))
+            .flatten();
+        let (flag, inline, attached_short) = if let Some(end) = short_end {
+            let (flag, remainder) = arg.split_at(end);
+            (
+                flag,
+                Some(remainder.strip_prefix('=').unwrap_or(remainder)),
+                !remainder.starts_with('='),
+            )
+        } else {
+            let (flag, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+            (flag, inline, false)
+        };
+        let refusal_flag = if inline.is_some() {
+            format!("{flag} (attached value omitted)")
+        } else {
+            flag.to_string()
+        };
+        if attached_short {
+            // Claude's Commander combines short booleans and permits attached values.
+            // https://github.com/tj/commander.js/blob/master/docs/options-in-depth.md
+            // Name only the first option; restart cannot infer the remainder's arity.
+            return Err(format!(
+                "cannot safely preserve launch option {refusal_flag}: attached short option arity is unverified"
+            ));
+        }
         if session.agent == "claude" {
             match flag {
                 "--cloud" | "--teleport" => {
                     return Err(format!(
-                        "cannot safely preserve launch option {flag}: execution context cannot be changed by a local same-session restart"
+                        "cannot safely preserve launch option {refusal_flag}: execution context cannot be changed by a local same-session restart"
                     ));
                 }
                 "--debug" | "-d" if inline.is_some() => {
@@ -228,7 +254,7 @@ pub(crate) fn resume_launch(
                 }
                 "--remote-control" | "--debug" | "-d" => {
                     return Err(format!(
-                        "cannot safely preserve launch option {flag}: optional value set is open or unknown"
+                        "cannot safely preserve launch option {refusal_flag}: optional value set is open or unknown"
                     ));
                 }
                 "--worktree" | "-w" | "--from-pr" => {
@@ -262,7 +288,7 @@ pub(crate) fn resume_launch(
                     };
                     if inline.is_some_and(|value| !known(value)) {
                         return Err(format!(
-                            "cannot safely preserve launch option {flag}: unknown optional value"
+                            "cannot safely preserve launch option {refusal_flag}: unknown optional value"
                         ));
                     }
                     plan.argv.push(arg.clone());
@@ -284,7 +310,7 @@ pub(crate) fn resume_launch(
                 .is_none_or(|value| value.starts_with('-'))
             {
                 return Err(format!(
-                    "cannot safely preserve {arg}: session value is missing or is another flag"
+                    "cannot safely preserve {refusal_flag}: session value is missing or is another flag"
                 ));
             }
             index += 2;
@@ -315,7 +341,7 @@ pub(crate) fn resume_launch(
                 .get(index + 1)
                 .is_none_or(|value| value.starts_with('-'))
         {
-            return Err(format!("missing launch value for {arg}"));
+            return Err(format!("missing launch value for {refusal_flag}"));
         }
         if session.agent == "claude"
             && matches!(
@@ -343,7 +369,7 @@ pub(crate) fn resume_launch(
                 index += 1;
             }
             if index == start + 1 && inline.is_none() {
-                return Err(format!("missing launch value for {arg}"));
+                return Err(format!("missing launch value for {refusal_flag}"));
             }
             plan.argv.extend_from_slice(&launch[start..index]);
             continue;
@@ -354,13 +380,13 @@ pub(crate) fn resume_launch(
         }
         if flag == "-p" && !matches!(session.agent.as_str(), "claude" | "codex" | "pi") {
             return Err(format!(
-                "cannot safely preserve launch option {flag}; unknown option arity"
+                "cannot safely preserve launch option {refusal_flag}; unknown option arity"
             ));
         }
         // Claude's --plugin-dir reaches this one-value list after its missing-path
         // check above, so each repeated option preserves exactly one path.
         let takes_value = matches!(
-            arg.as_str(),
+            flag,
             "--model"
                 | "-m"
                 | "--permission-mode"
@@ -396,11 +422,11 @@ pub(crate) fn resume_launch(
                 | "--dangerously-load-development-channels"
                 | "--channels"
                 | "--effort"
-        ) || arg == "-p" && session.agent == "codex"
-            || arg == "-c" && session.agent == "codex"
+        ) || flag == "-p" && session.agent == "codex"
+            || flag == "-c" && session.agent == "codex"
             || session.agent == "claude"
                 && matches!(
-                    arg.as_str(),
+                    flag,
                     "--autocompact"
                         | "--debug-file"
                         | "--fallback-model"
@@ -411,7 +437,7 @@ pub(crate) fn resume_launch(
                         | "--system-prompt-snapshot"
                 );
         let boolean = matches!(
-            arg.as_str(),
+            flag,
             "--dangerously-skip-permissions"
                 | "--allow-dangerously-skip-permissions"
                 | "--dangerously-bypass-approvals-and-sandbox"
@@ -439,19 +465,19 @@ pub(crate) fn resume_launch(
                 | "--restricted"
                 | "--safe-mode"
         ) || matches!(session.agent.as_str(), "claude" | "pi")
-            && matches!(arg.as_str(), "-p" | "--print");
-        if arg.contains('=') || boolean {
+            && matches!(flag, "-p" | "--print");
+        if boolean || inline.is_some() && takes_value {
             plan.argv.push(arg.clone());
             index += 1;
         } else if takes_value {
             let value = launch
                 .get(index + 1)
-                .ok_or_else(|| format!("missing launch value for {arg}"))?;
+                .ok_or_else(|| format!("missing launch value for {refusal_flag}"))?;
             plan.argv.extend([arg.clone(), value.clone()]);
             index += 2;
         } else {
             return Err(format!(
-                "cannot safely preserve launch option {flag}; unknown option arity"
+                "cannot safely preserve launch option {refusal_flag}; unknown option arity"
             ));
         }
     }
