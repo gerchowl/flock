@@ -23,6 +23,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "questions",
     "remote",
     "session",
+    "sessions",
     "slots",
     "spawn",
     "structured",

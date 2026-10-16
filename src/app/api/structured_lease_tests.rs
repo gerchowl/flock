@@ -96,6 +96,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
     let profile = fixture.profile("lease-calls", "2.1.296");
     let location = StreamLocation {
         data_dir: root.clone(),
+        storage: Default::default(),
         agent: AGENT.into(),
         session: SESSION.into(),
     };

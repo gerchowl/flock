@@ -623,6 +623,8 @@ pub enum SystemOneTier {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Structured persistence policy (ADR-0036 §4).
+    pub sessions: crate::structured::blobs::StorageConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.
     pub structured: crate::structured::launch::StructuredConfig,
     /// Friendly display name for THIS node (#42), shown on the local status

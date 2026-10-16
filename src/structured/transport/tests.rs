@@ -76,6 +76,7 @@ fn worker_done(transport: &Transport, reader: bool) -> io::Result<()> {
 fn location(root: &SessionConfigDir) -> StreamLocation {
     StreamLocation {
         data_dir: root.path().to_owned(),
+        storage: Default::default(),
         agent: "fixture-agent".into(),
         session: "fixture-session".into(),
     }
@@ -511,7 +512,11 @@ fn failed_persistence_never_publishes_or_reopens_idle_gate() {
         &tx,
         &busy,
         &AtomicBool::new(false),
-        &cancel
+        &cancel,
+        (
+            &super::super::blobs::BlobStore::open(root.path()).expect("store"),
+            2048
+        )
     )
     .is_err());
     assert!(busy.load(Ordering::Acquire));

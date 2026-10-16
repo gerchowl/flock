@@ -137,6 +137,7 @@ impl Fixture {
         let state = self.root.path().to_owned();
         let location = StreamLocation {
             data_dir: state.clone(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: session.into(),
         };
@@ -540,6 +541,7 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -799,6 +801,7 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -860,6 +863,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
             lease,
             StreamLocation {
                 data_dir: fixture.root.path().to_owned(),
+                storage: Default::default(),
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
